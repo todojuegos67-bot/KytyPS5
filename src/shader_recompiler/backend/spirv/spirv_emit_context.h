@@ -261,12 +261,6 @@ public:
         return sw_stage == SwStage::Fragment && runtime_info.hw.fs.bb_objmv &&
                !runtime_info.hw.fs.dual_source_blending;
     }
-    // bb-mv-gate: blended / effect fragment shaders count their bright pixels through a buffer
-    // device address (emit_spirv_bb_objmv2.cpp CountBright).
-    bool ObjMvFragmentCounts() const {
-        return ObjMvFragment() && profile.support_bda && runtime_info.hw.fs.bb_objmv_count &&
-               (runtime_info.hw.fs.bb_objmv_blend || runtime_info.hw.fs.bb_objmv_add);
-    }
     bool objmv_prev_mode = false; // emitting the previous-frame function
     Id objmv_prev_func{};         // called at the start of main
     bool objmv_prev_called = false;

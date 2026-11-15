@@ -255,7 +255,9 @@ struct State {
     std::unordered_map<u64, u64> large_until; // draw key -> last frame it is large
     std::unordered_map<u64, u64> large_vs_px; // vs hash -> bright px (this second, large draws)
     u64 cur_draw_key = 0;
-    float spark_draw_pct = 0.003f; // BB_FG_SPARKS_DRAWPCT (percent of the render area)
+    // BB_FG_SPARKS_DRAWPCT: share of the viewport a draw's screen bounding box may cover and still
+    // be marked (bb-mv-dots: bounding box from the vertex shader, default 4 %).
+    float spark_draw_pct = 0.04f;
     u64 sec_cnt_draws = 0, sec_cnt_large = 0, sec_marked_draws = 0, sec_held_draws = 0;
     u64 sec_spark_sky = 0; // bb-mv-sky: bright blended pixels over the sky (the moon): not sparks
     // bb-mv-fill: end-of-frame copies of the 1-slot ring slots (compose time).
@@ -700,10 +702,10 @@ bool Init(const Vulkan::Instance& instance) {
                                 "premultiplied / screen effect draws, and the bright pixels of alpha-blended draws "
                                 "(candle flames), write their static-world vector and "
                                 "class 5 where their own contribution > {:.3f} (BB_FG_SPARKS_LUM); "
-                                "those pixels: reactive for the upscaler, \"UI\" in the HUD-less "
+                                "those pixels: \"UI\" in the HUD-less (not reactive for the upscaler) "
                                 "image for frame generation (taken from the real frame) while the marked area "
-                                "stays under {:.1f}% (BB_FG_SPARKS_MAXPCT); a draw whose bright "
-                                "area exceeds {:.2f}% (BB_FG_SPARKS_DRAWPCT) is never marked",
+                                "stays under {:.1f}% (BB_FG_SPARKS_MAXPCT); a draw whose screen "
+                                "bounding box exceeds {:.2f}% (BB_FG_SPARKS_DRAWPCT) is never marked",
                                 g.sparks ? "on" : "off", lum, g.spark_max * 100.0f,
                                 g.spark_draw_pct * 100.0f));
             }
@@ -1910,7 +1912,9 @@ void VelocityDraw(Shader::PushData& push, const Shader::Info& vs, Core::MemoryMa
     bool large = false;
     if (counted) {
         const u64 coff = SlotTableOffset(g.slot) + g.table_used;
-        *reinterpret_cast<u32*>(g.mapped + coff) = 0u;
+        u32* bb = reinterpret_cast<u32*>(g.mapped + coff); // min x, min y, max x, max y
+        bb[0] = bb[1] = 0xffffffffu;
+        bb[2] = bb[3] = 0u;
         g.table_used += 16;
         g.cnt_list[g.slot].push_back({coff, g.cur_draw_key, vs.pgm_hash});
         const auto it = g.large_until.find(g.cur_draw_key);
@@ -2485,17 +2489,15 @@ void OnFlip() {
     g.arena_used = 0;
     g.table_used = 0;
     // bb-mv-gate: the counters of this slot's last use (kSlots frames ago, long finished).
-    const u64 draw_limit =
-        g.last_render.width != 0
-            ? u64(double(g.spark_draw_pct) * double(g.last_render.width) *
-                  double(g.last_render.height))
-            : ~0ull;
+    // bb-mv-dots: the draw's screen bounding box (vertex shader atomics), share of the viewport.
     for (const auto& c : g.cnt_list[g.slot]) {
-        const u64 px = u64(*reinterpret_cast<const u32*>(g.mapped + c.off)) * 16u;
+        const u32* bb = reinterpret_cast<const u32*>(g.mapped + c.off);
         ++g.sec_cnt_draws;
-        if (px > draw_limit) {
+        if (bb[0] > bb[2] || bb[1] > bb[3]) continue; // no vertex ran
+        const double area = double(bb[2] - bb[0]) / 65535.0 * (double(bb[3] - bb[1]) / 65535.0);
+        if (area > double(g.spark_draw_pct)) {
             g.large_until[c.key] = g.frame;
-            g.large_vs_px[c.vs] += px;
+            g.large_vs_px[c.vs] += u64(area * 1000.0); // per mille of the viewport
             ++g.sec_cnt_large;
         }
     }
@@ -2691,14 +2693,14 @@ void OnFlip() {
                           [](const auto& a, const auto& b) { return a.second > b.second; });
                 std::string ls;
                 for (size_t i = 0; i < lv.size() && i < 6; ++i) {
-                    ls += fmt::format(" {:#x}:{:.0f}px", lv[i].first,
+                    ls += fmt::format(" {:#x}:{:.1f}pm", lv[i].first,
                                       double(lv[i].second) / std::max<u64>(1, u64(f)));
                 }
                 Log(fmt::format("[sparks-gate] blended / effect draws counted {:.1f}/frame: marked "
-                                "{:.1f}/frame, held as large {:.1f}/frame (bright area > {:.2f}% "
+                                "{:.1f}/frame, held as large {:.1f}/frame (screen bounding box > {:.2f}% "
                                 "of the frame in one draw: never marked for {} frames; "
                                 "BB_FG_SPARKS_DRAWPCT) | measured large {:.1f}/frame | large "
-                                "draws' vs (bright px/frame):{}",
+                                "draws' vs (bounding box, per mille of the viewport, summed per frame):{}",
                                 double(g.sec_cnt_draws) / f,
                                 double(g.sec_marked_draws) / f, double(g.sec_held_draws) / f,
                                 g.spark_draw_pct * 100.0f, kLargeHold,

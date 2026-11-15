@@ -37,35 +37,71 @@ Id PushF32(EmitContext& ctx, u32 member) {
                       ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[1]),
                                         ctx.push_data_block, ctx.ConstU32(member)));
 }
-// bb-mv-gate: count this draw's bright pixels (1 in 16: x and y multiples of 4) in the u32 the host
-// reserved 16 bytes before the draw's table entry (push flags bit 5). Read back a few frames
-// later: a draw whose bright pixels cover a large area (fog gate, mist wall, moon) is never
-// marked (bit 4), on every frame and every tile alike.
-void CountBright(EmitContext& ctx, Id flags, Id bright) {
-    if (!ctx.ObjMvFragmentCounts() || !Sirit::ValidId(ctx.frag_coord)) {
-        return;
-    }
+// bb-mv-dots: the draw's screen bounding box, from its vertices (vertex shader; push flags bit
+// 5): u32 [min x, min y, max x, max y] in 1/65535 of the viewport, 16 bytes before the draw's
+// table entry, read back a few frames later. A blended / effect draw covering a large area (fog
+// gate, mist wall, moon) is never marked as spark (bit 4), on every frame and tile alike.
+// bb-mv-gate counted bright pixels in the fragment shader (1 in 16 by position): the user's
+// capture showed a dot grid of exactly 4 render pixels on blended surfaces (puntos.mp4): no
+// fragment side effects any more.
+void ScreenBounds(EmitContext& ctx, Id position) {
     const Id b = ctx.U1[1];
-    const Id has = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(32u)),
+    const Id f32 = ctx.F32[1];
+    const Id ut = ctx.U32[1];
+    const Id flags = PushU32(ctx, PushData::ObjMvFlagsIndex);
+    const Id has = ctx.OpINotEqual(b, ctx.OpBitwiseAnd(ut, flags, ctx.ConstU32(32u)),
                                    ctx.u32_zero_value);
-    const Id fc = ctx.OpLoad(ctx.F32[4], ctx.frag_coord);
-    const Id x = ctx.OpConvertFToU(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], fc, 0u));
-    const Id y = ctx.OpConvertFToU(ctx.U32[1], ctx.OpCompositeExtract(ctx.F32[1], fc, 1u));
-    const Id sample = ctx.OpIEqual(
-        b, ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpBitwiseOr(ctx.U32[1], x, y), ctx.ConstU32(3u)),
-        ctx.u32_zero_value);
-    const Id cond = ctx.OpLogicalAnd(b, ctx.OpLogicalAnd(b, has, bright), sample);
-    const Id count_label = ctx.OpLabel();
+    const Id bounds_label = ctx.OpLabel();
     const Id merge_label = ctx.OpLabel();
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    ctx.OpBranchConditional(cond, count_label, merge_label);
-    ctx.AddLabel(count_label);
-    const Id addr = ctx.OpISub(ctx.U64, PushAddress(ctx, PushData::ObjMvEntryIndex),
+    ctx.OpBranchConditional(has, bounds_label, merge_label);
+    ctx.AddLabel(bounds_label);
+    const Id w = ctx.OpCompositeExtract(f32, position, 3u);
+    const Id front = ctx.OpFOrdGreaterThan(b, w, ctx.Constant(f32, 1e-6f));
+    const Id neg = ctx.Constant(f32, -1.0f);
+    const Id pos1 = ctx.Constant(f32, 1.0f);
+    const Id ndc_x = ctx.OpFDiv(f32, ctx.OpCompositeExtract(f32, position, 0u), w);
+    const Id ndc_y = ctx.OpFDiv(f32, ctx.OpCompositeExtract(f32, position, 1u), w);
+    // (review) a NaN position (culled vertex: its triangles are not rasterized) or a NaN
+    // projection (inf / inf) adds nothing; NClamp keeps the conversion below defined.
+    const Id nan_vtx = ctx.OpLogicalOr(
+        b, ctx.OpIsNan(b, w),
+        ctx.OpLogicalAnd(b, front,
+                         ctx.OpLogicalOr(b, ctx.OpIsNan(b, ndc_x), ctx.OpIsNan(b, ndc_y))));
+    const Id write_label = ctx.OpLabel();
+    const Id write_merge = ctx.OpLabel();
+    ctx.OpSelectionMerge(write_merge, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(nan_vtx, write_merge, write_label);
+    ctx.AddLabel(write_label);
+    const auto ndc = [&](Id v) { return ctx.OpNClamp(f32, v, neg, pos1); };
+    const auto fixed = [&](Id v) {
+        return ctx.OpConvertFToU(
+            ut, ctx.OpFMul(f32, ctx.OpFAdd(f32, ctx.OpFMul(f32, v, ctx.Constant(f32, 0.5f)),
+                                            ctx.Constant(f32, 0.5f)),
+                            ctx.Constant(f32, 65535.0f)));
+    };
+    // A vertex behind the camera: the draw may cover anything (whole viewport).
+    const Id x = fixed(ndc(ndc_x));
+    const Id y = fixed(ndc(ndc_y));
+    const Id zero = ctx.u32_zero_value;
+    const Id full = ctx.ConstU32(65535u);
+    const Id lo_x = ctx.OpSelect(ut, front, x, zero);
+    const Id lo_y = ctx.OpSelect(ut, front, y, zero);
+    const Id hi_x = ctx.OpSelect(ut, front, x, full);
+    const Id hi_y = ctx.OpSelect(ut, front, y, full);
+    const Id base = ctx.OpISub(ctx.U64, PushAddress(ctx, PushData::ObjMvEntryIndex),
                                ctx.Constant(ctx.U64, u64(16)));
-    const Id ptr = ctx.OpConvertUToPtr(
-        ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.U32[1]), addr);
-    ctx.OpAtomicIAdd(ctx.U32[1], ptr, ctx.ConstU32(u32(spv::Scope::Device)),
-                     ctx.u32_zero_value, ctx.u32_one_value);
+    const Id ptr_type = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ut);
+    const Id scope = ctx.ConstU32(static_cast<std::uint32_t>(spv::Scope::Device));
+    const auto at = [&](u64 off) {
+        return ctx.OpConvertUToPtr(ptr_type, ctx.OpIAdd(ctx.U64, base, ctx.Constant(ctx.U64, off)));
+    };
+    ctx.OpAtomicUMin(ut, at(0), scope, zero, lo_x);
+    ctx.OpAtomicUMin(ut, at(4), scope, zero, lo_y);
+    ctx.OpAtomicUMax(ut, at(8), scope, zero, hi_x);
+    ctx.OpAtomicUMax(ut, at(12), scope, zero, hi_y);
+    ctx.OpBranch(write_merge);
+    ctx.AddLabel(write_merge);
     ctx.OpBranch(merge_label);
     ctx.AddLabel(merge_label);
 }
@@ -139,6 +175,7 @@ void EmitBBObjMvVertex(EmitContext& ctx) {
     }
     // z of the previous position carries "valid" (screen motion needs x, y, w only).
     previous = ctx.OpCompositeInsert(ctx.F32[4], valid, previous, 2u);
+    ScreenBounds(ctx, position);
     ctx.OpStore(ctx.objmv_out_cur, position);
     ctx.OpStore(ctx.objmv_out_prev, previous);
 }
@@ -244,7 +281,6 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
                 b, ctx.OpLogicalAnd(b, spark_on, written),
                 ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, added, sthr),
                                  ctx.OpLogicalNot(b, ctx.OpIsInf(b, added))));
-            CountBright(ctx, flags, measured);
             // bb-mv-gate: flags bit 4: a large draw (measured): never marked, on any pixel.
             const Id large = ctx.OpINotEqual(
                 b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(16u)), ctx.u32_zero_value);
@@ -291,7 +327,6 @@ void EmitBBObjMvFragment(EmitContext& ctx) {
             const Id measured = ctx.OpLogicalAnd(
                 b, written, ctx.OpLogicalAnd(b, ctx.OpFOrdGreaterThan(b, lum, thr),
                                              ctx.OpLogicalNot(b, ctx.OpIsInf(b, lum))));
-            CountBright(ctx, flags, measured);
             const Id large = ctx.OpINotEqual(
                 b, ctx.OpBitwiseAnd(ctx.U32[1], flags, ctx.ConstU32(16u)), ctx.u32_zero_value);
             weight = ctx.OpSelect(f32, ctx.OpLogicalAnd(b, measured, ctx.OpLogicalNot(b, large)),
