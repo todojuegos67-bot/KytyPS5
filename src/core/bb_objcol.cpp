@@ -727,9 +727,14 @@ void StoreMsbParts(const std::string& map, const std::vector<u8>& mod_msb,
         }
     }
     std::string mods;
+    u32 listed = 0;
     for (auto& p : parts) {
         p.mod_only = have_vanilla && !vanilla_parts.contains(p.name);
-        if (p.mod_only) {
+        if (p.mod_only && ++listed > 60) {
+            if (listed == 61) {
+                mods += " (more not listed)";
+            }
+        } else if (p.mod_only) {
             const auto it = vanilla_index.find(p.index);
             mods += fmt::format("{}{} index {} type {} model {} at ({:.1f}, {:.1f}, {:.1f}){}",
                                 mods.empty() ? "" : "; ", p.name, p.index, p.type, p.model,
@@ -1342,7 +1347,7 @@ void SystemsReport(double now) {
 // committed), so pending adds are only watched and logged here.
 
 bool IsPtr(u64 v);
-void FixPass(double now);
+void FixPass(double now, u64 world);
 
 struct PendingWatch {
     u32 c0 = 0, d0 = 0;
@@ -1356,7 +1361,10 @@ void OnFlush(u64 fd4) {
     const double now = Now();
     u64 world = 0;
     u32 counts[5];
-    if (Rd(fd4 + 8, world) && IsPtr(world) && SafeCopy(counts, world + 0xc0, sizeof(counts))) {
+    if (!Rd(fd4 + 8, world) || !IsPtr(world)) {
+        return;
+    }
+    if (SafeCopy(counts, world + 0xc0, sizeof(counts))) {
         const u32 c0 = counts[0], d0 = counts[4];
         std::scoped_lock lk{g_mutex};
         ++st_flush;
@@ -1372,7 +1380,7 @@ void OnFlush(u64 fd4) {
         }
     }
     if (g_fix) {
-        FixPass(now);
+        FixPass(now, world);
     }
 }
 
@@ -1393,7 +1401,7 @@ struct Wrapper {
 std::unordered_map<u64, Wrapper> g_wrap; // under g_mutex
 std::recursive_mutex g_wrap_call;        // held while the game's addToWorld runs on a wrapper
 u64 g_add_wrap = 0, g_wrap_vt = 0, g_sys_vt = 0;
-double g_fix_pass = 0.0;
+std::unordered_map<u64, double> g_fix_pass; // by world, under g_mutex
 std::map<std::string, u32> g_fixed_by_map;
 
 void OnWrapCtor(u64 w) {
@@ -1508,6 +1516,9 @@ void PartsReport(double now) {
         }
         ++mod_n;
         mod_hit_world += in_world;
+        if (mod_n > 60) {
+            continue;
+        }
         mods += fmt::format(
             "{}{} ({:.1f}, {:.1f}, {:.1f}): {}", mods.empty() ? "" : "; ", p.name, p.pos[0],
             p.pos[1], p.pos[2],
@@ -1523,7 +1534,9 @@ void PartsReport(double now) {
              g_map, g_map_visit, now - g_map_open, parts.size(), off[0], off[1], off[2], top,
              vanilla_hit, vanilla, vanilla_hit_world, mod_n, mod_hit_world,
              g_fixed_by_map.contains(g_map) ? g_fixed_by_map[g_map] : 0u,
-             mods.empty() ? "none" : mods);
+             mods.empty() ? "none"
+             : mod_n > 60 ? mods + " (more not listed)"
+                          : mods);
 }
 
 // BB_OBJCOL_FIX: for the parts of a served MSB that the vanilla MSB of the same map does not
@@ -1531,26 +1544,93 @@ void PartsReport(double now) {
 // (static or keyframed bodies, at most 8; fragment systems are dynamic) that the game built
 // but never added, never removed, whose wrapper's "in world" byte is 0, at the part's position
 // (MSB->world offset voted from the vanilla parts) is added the way a map reload adds it: the
-// game's own wrapper addToWorld 0xa7f2d0, on the game thread, at the physics command flush.
+// game's own wrapper addToWorld 0xa7f2d0, on the game thread, at the entry of the physics command
+// flush of the system's own world (the flush adds bodies to that world itself at +0x242). Only
+// wrappers whose bodies were all never added (or added with mode 0) qualify, and the offset vote
+// runs only when such a wrapper exists, for the maps opened in the last 90 s.
 // Vanilla parts are never touched; a mod object that was added and later broken or removed is
 // never re-added.
-void FixPass(double now) {
-    if (g_add_wrap == 0 || now - g_fix_pass < 5.0) {
+void FixPass(double now, u64 world) {
+    if (g_add_wrap == 0) {
         return;
     }
     std::vector<std::pair<u64, std::string>> todo;
     {
         std::scoped_lock lk{g_mutex};
-        g_fix_pass = now;
-        bool recent = false;
-        for (const auto& pc : g_pending_cmp) {
-            recent = recent || now - pc.open < 180.0;
+        double& last = g_fix_pass[world];
+        if (now - last < 5.0) {
+            return;
         }
-        if (!recent || g_wrap.empty()) {
+        last = now;
+        std::set<std::string> maps;
+        for (const auto& pc : g_pending_cmp) {
+            if (now - pc.open < 180.0) {
+                maps.insert(pc.map);
+            }
+        }
+        if (maps.empty() || g_wrap.empty()) {
+            return;
+        }
+        // Wrappers of this flush's world that were built, never added and never removed (system
+        // and every body), intact (static / keyframed, at most 8 bodies).
+        struct Cand {
+            u64 w;
+            SysRec r;
+            Wrapper* rec;
+        };
+        std::vector<Cand> cands;
+        const auto wit = g_worlds.find(world);
+        u64 data = 0;
+        s32 size = 0;
+        if (!BodyArray(world, data, size)) {
+            return;
+        }
+        for (auto& [w, rec] : g_wrap) {
+            if (rec.fixed || now - rec.since < 3.0) {
+                continue;
+            }
+            u64 vt = 0, sys = 0, svt = 0;
+            u8 in = 1;
+            if (!Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) || in != 0 ||
+                !Rd(w + 0x18, sys) || !IsPtr(sys) || !Rd(sys, svt) || svt != g_sys_vt) {
+                continue;
+            }
+            u8 h[0x30];
+            if (!SafeCopy(h, sys, sizeof(h)) || Le64(h + 0x18) != world) {
+                continue;
+            }
+            if (const auto it = g_systems.find(sys);
+                it != g_systems.end() && (it->second.adds || it->second.removes)) {
+                continue;
+            }
+            SysRec r;
+            SysInfo(sys, r);
+            if (r.n == 0 || r.n > 8 || (r.flags & 5) == 0) {
+                continue;
+            }
+            u32 ids[8];
+            bool fresh = SafeCopy(ids, Le64(h + 0x20), r.n * 4);
+            for (u32 k = 0; k < r.n && fresh; ++k) {
+                BodyBytes bb;
+                fresh = ids[k] < u32(size) && SafeCopy(bb.b, data + u64(ids[k]) * 0x90, 0x90);
+                if (fresh && wit != g_worlds.end()) {
+                    const char* st = StateName(&wit->second, ids[k], bb.Shape());
+                    fresh =
+                        std::strcmp(st, "never-added") == 0 || std::strcmp(st, "add-ignored") == 0;
+                }
+            }
+            if (fresh) {
+                cands.push_back({w, r, &rec});
+            }
+        }
+        if (cands.empty()) {
             return;
         }
         const auto inworld = Snapshot();
         for (const auto& [map, parts] : g_msb_parts) {
+            if (!maps.contains(map)) {
+                continue;
+            }
             std::vector<const MsbPart*> mods;
             for (const auto& p : parts) {
                 if (p.mod_only) {
@@ -1560,7 +1640,7 @@ void FixPass(double now) {
             if (mods.empty()) {
                 continue;
             }
-            std::map<std::tuple<int, int, int>, int> votes;
+            std::unordered_map<u64, int> votes;
             size_t used = 0;
             for (const auto& p : parts) {
                 if (p.mod_only || used >= 400) {
@@ -1568,9 +1648,13 @@ void FixPass(double now) {
                 }
                 ++used;
                 for (const auto& b : inworld) {
-                    ++votes[{int(std::lround((b.p[0] - p.pos[0]) * 2.f)),
-                             int(std::lround((b.p[1] - p.pos[1]) * 2.f)),
-                             int(std::lround((b.p[2] - p.pos[2]) * 2.f))}];
+                    u64 key = 0;
+                    for (int k = 0; k < 3; ++k) {
+                        key = (key << 21) |
+                              (u64(u32(std::lround((b.p[k] - p.pos[k]) * 2.f)) + (1u << 20)) &
+                               0x1fffff);
+                    }
+                    ++votes[key];
                 }
             }
             float off[3] = {};
@@ -1578,45 +1662,30 @@ void FixPass(double now) {
             for (const auto& [k, v] : votes) {
                 if (v > top) {
                     top = v;
-                    off[0] = std::get<0>(k) * 0.5f;
-                    off[1] = std::get<1>(k) * 0.5f;
-                    off[2] = std::get<2>(k) * 0.5f;
+                    for (int i = 0; i < 3; ++i) {
+                        off[i] = float(s64((k >> (42 - 21 * i)) & 0x1fffff) - (1 << 20)) * 0.5f;
+                    }
                 }
             }
             if (top < 20) {
                 continue; // offset not established
             }
-            for (auto& [w, rec] : g_wrap) {
-                if (rec.fixed || now - rec.since < 3.0) {
-                    continue;
-                }
-                u64 vt = 0, sys = 0, svt = 0;
-                u8 in = 1;
-                if (!Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) || in != 0 ||
-                    !Rd(w + 0x18, sys) || !IsPtr(sys) || !Rd(sys, svt) || svt != g_sys_vt) {
-                    continue;
-                }
-                if (const auto it = g_systems.find(sys);
-                    it != g_systems.end() && (it->second.adds || it->second.removes)) {
-                    continue;
-                }
-                SysRec r;
-                SysInfo(sys, r);
-                if (r.n == 0 || r.n > 8 || (r.flags & 5) == 0) {
+            for (auto& c : cands) {
+                if (c.rec->fixed) {
                     continue;
                 }
                 for (const MsbPart* p : mods) {
                     float d2 = 0.f;
                     for (int k = 0; k < 3; ++k) {
-                        const float t = r.pos[k] - p->pos[k] - off[k];
+                        const float t = c.r.pos[k] - p->pos[k] - off[k];
                         d2 += t * t;
                     }
                     if (d2 < 0.36f) {
-                        todo.emplace_back(w, fmt::format("{} {} at ({:.1f}, {:.1f}, {:.1f}) {} "
-                                                         "bodies {}",
-                                                         map, p->name, r.pos[0], r.pos[1], r.pos[2],
-                                                         r.n, Motion(r.flags)));
-                        rec.fixed = true;
+                        todo.emplace_back(c.w, fmt::format("{} {} at ({:.1f}, {:.1f}, {:.1f}) {} "
+                                                           "bodies {}",
+                                                           map, p->name, c.r.pos[0], c.r.pos[1],
+                                                           c.r.pos[2], c.r.n, Motion(c.r.flags)));
+                        c.rec->fixed = true;
                         break;
                     }
                 }
