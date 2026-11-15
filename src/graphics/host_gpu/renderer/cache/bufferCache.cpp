@@ -1203,6 +1203,11 @@ bool BufferCache::WriteGuestBytes(uint64_t vaddr, const void* data, uint64_t siz
 	WriteDataBuffer(m_slot_buffers[FindBuffer(vaddr, size)], vaddr, data, size);
 	// A pre-flushed copy from before this store would undo it on the backing.
 	PreflushWrite(vaddr, size);
+	// The backing now holds these bytes, and the buffer copy above lands after every earlier GPU write to them, so a
+	// read back would only copy the same bytes again: they are no longer GPU-dirty. Later GPU writes mark them anew.
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	m_known_written.Subtract(vaddr, size);
+	ForgetColorMetadataChecks(vaddr, size);
 	return true;
 }
 
