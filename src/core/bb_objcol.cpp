@@ -1339,6 +1339,8 @@ std::string SysText(const SysRec& r) {
 
 // The game's wrappers seen rebuilding a system whose "in world" byte is still 0, and systems
 // removed and not added again.
+extern std::map<std::string, u32> g_path_counts;
+extern std::map<u64, u64> g_producers;
 void SystemsReport(double now) {
     std::vector<std::string> removed, idle;
     u32 in_world = 0;
@@ -1362,6 +1364,16 @@ void SystemsReport(double now) {
         SysInfo(sys, r);
         idle.push_back(SysText(r) + fmt::format(" (rebuilt {} times, never added)", r.rebuilds));
     }
+    std::string counts;
+    for (const auto& [vt, v] : g_producers) {
+        counts +=
+            fmt::format("{}producer vtable eboot+{:#x}: {}", counts.empty() ? "" : "; ", vt, v);
+    }
+    for (const auto& [k, v] : g_path_counts) {
+        counts += fmt::format("{}{}: {}", counts.empty() ? "" : "; ", k, v);
+    }
+    LOG_INFO(Core, "[objcol] map {} visit #{} (+{:.0f} s): body adds by kind and caller: {}", g_map,
+             g_map_visit, now - g_map_open, counts.empty() ? "none" : counts);
     LOG_INFO(Core,
              "[objcol] map {} visit #{} (+{:.0f} s): physics systems addToWorld {} (mode != 1: "
              "{}), removeFromWorld {}, in the world now {} | removed and not added again {}: {} "
@@ -1386,8 +1398,32 @@ struct PendingWatch {
 std::unordered_map<u64, PendingWatch> g_pending_watch;
 u64 st_flush = 0;
 
+std::map<u64, u64> g_producers; // producer vtable (eboot offset) -> times seen in a flush
+
+// 0x1806e90 (decompiled): for (p = [fd4+0x30]; p != [fd4+0x38]; p += 8) if (*p) (*(*p)+0x18)(*p,
+// lists) collects the body adds / removes the flush applies; the producers' vtables are counted.
+void CountProducers(u64 fd4) {
+    u64 range[2];
+    if (!SafeCopy(range, fd4 + 0x30, sizeof(range)) || range[1] < range[0] ||
+        range[1] - range[0] > 0x8000) {
+        return;
+    }
+    std::vector<u64> list((range[1] - range[0]) / 8);
+    if (list.empty() || !SafeCopy(list.data(), range[0], list.size() * 8)) {
+        return;
+    }
+    std::scoped_lock lk{g_mutex};
+    for (const u64 obj : list) {
+        u64 vt = 0;
+        if (IsPtr(obj) && Rd(obj, vt)) {
+            ++g_producers[vt >= g_eboot ? vt - g_eboot : vt];
+        }
+    }
+}
+
 void OnFlush(u64 fd4) {
     const double now = Now();
+    CountProducers(fd4);
     u64 world = 0;
     u32 counts[5];
     if (!Rd(fd4 + 8, world) || !IsPtr(world)) {
@@ -1806,6 +1842,7 @@ void MapTick(double now) {
 }
 
 std::set<std::string> g_paths;
+std::map<std::string, u32> g_path_counts;
 u32 g_path_lines = 0;
 
 // The game's functions keep rbp frames (push rbp; mov rbp,rsp): from addBodies' entry, the
@@ -1896,6 +1933,8 @@ void OnAdd(u64 world, u64 ids_ptr, s32 n, s32 mode, u64 ret, u64 caller_rbp) {
                 path = CallPath(ret, caller_rbp);
             }
             const std::string key = fmt::format("{} {:#x} {}", Motion(b.flags), bb.Filter(), path);
+            ++g_path_counts[fmt::format("{} {:#x} mode {} via eboot+{:#x}", Motion(b.flags),
+                                        bb.Filter(), mode, ret - g_eboot)];
             if (g_paths.insert(key).second) {
                 ++g_path_lines;
                 LOG_INFO(Core,
