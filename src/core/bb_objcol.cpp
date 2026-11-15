@@ -1338,63 +1338,73 @@ void SystemsReport(double now) {
 
 // ---------------------------------------------------------------- BB_OBJCOL_FIX
 // The world step (0xb597d0, timer "StAddBodies") commits the pending (mode 2) adds of
-// [world+0xb8]/[world+0xc0] and [world+0xc8]/[world+0xd0] unconditionally, as 0xb56360 does.
-// A world that holds pending adds for 2 s without them changing is not being stepped: at the
-// entry of the game's physics command flush (0x1806e90, which itself calls addBodies /
-// removeBodies on that world, so the world is not being stepped there) the game's own commit
-// 0xb56360(world) is called for it.
+// [world+0xb8]/[world+0xc0] and [world+0xc8]/[world+0xd0] unconditionally (field run 3: always
+// committed), so pending adds are only watched and logged here.
 
 bool IsPtr(u64 v);
+void FixPass(double now);
 
-u64 g_commit = 0;
 struct PendingWatch {
     u32 c0 = 0, d0 = 0;
     double since = -1.0;
+    bool logged = false;
 };
 std::unordered_map<u64, PendingWatch> g_pending_watch;
-u64 st_flush = 0, st_fix_commits = 0;
+u64 st_flush = 0;
 
 void OnFlush(u64 fd4) {
+    const double now = Now();
     u64 world = 0;
-    if (!Rd(fd4 + 8, world) || !IsPtr(world)) {
-        return;
-    }
     u32 counts[5];
-    if (!SafeCopy(counts, world + 0xc0, sizeof(counts))) {
-        return;
-    }
-    const u32 c0 = counts[0], d0 = counts[4];
-    bool commit = false;
-    double age = 0.0;
-    {
+    if (Rd(fd4 + 8, world) && IsPtr(world) && SafeCopy(counts, world + 0xc0, sizeof(counts))) {
+        const u32 c0 = counts[0], d0 = counts[4];
         std::scoped_lock lk{g_mutex};
         ++st_flush;
         auto& pw = g_pending_watch[world];
-        const double now = Now();
         if (c0 == 0 && d0 == 0) {
             pw = PendingWatch{};
-            return;
+        } else if (pw.since < 0.0 || pw.c0 != c0 || pw.d0 != d0) {
+            pw = PendingWatch{c0, d0, now, false};
+        } else if (now - pw.since >= 2.0 && !pw.logged) {
+            pw.logged = true;
+            LOG_INFO(Core, "[objcol] world {:#x}: {} + {} pending body adds unchanged for {:.1f} s",
+                     world, c0, d0, now - pw.since);
         }
-        if (pw.since < 0.0 || pw.c0 != c0 || pw.d0 != d0) {
-            pw = PendingWatch{c0, d0, now};
-            return;
-        }
-        age = now - pw.since;
-        if (!g_fix || g_commit == 0 || age < 2.0) {
-            return;
-        }
-        commit = true;
-        pw = PendingWatch{};
-        ++st_fix_commits;
     }
-    if (commit) {
-        LOG_INFO(Core,
-                 "[objcol-fix] world {:#x}: {} + {} pending body adds unchanged for {:.1f} s (not "
-                 "stepped); calling the game's commit eboot+{:#x} from the physics command flush",
-                 world, c0, d0, age, g_commit - g_eboot);
-        using CommitFn = void(PS4_SYSV_ABI*)(u64);
-        reinterpret_cast<CommitFn>(g_commit)(world);
+    if (g_fix) {
+        FixPass(now);
     }
+}
+
+// ---------------------------------------------------------------- object physics wrappers
+// Decompiled (1.09): every object physics system is built by the game's wrapper (ctor 0xa7d4a0,
+// vtable 0x52978a0, system at +0x18, "in world" byte at +0x40) through 0x6e8700 ->
+// hknpPhysicsSystem ctor 0xb359c0 with r8 = r9 = 0 (all four call sites 0xa7d592, 0xa7dcae,
+// 0xa7efcd, 0x180c374: "xor r8d,r8d; xor r9d,r9d"). r8 is the addition mode the ctor passes to
+// hknpWorld::createBody 0xb564a0 (0xb35e4a "mov edx,[rbp-0x11c]"), and addBodies with mode 0
+// returns at once: the bodies are created outside the world. Only the wrapper's slot +0x78
+// (0xa7f2d0: addToWorld(sys, 1, 0); [w+0x40] = 1) puts them in; slot +0x80 (0xa7f300) takes them
+// out and clears +0x40; the rebuild slot +0x38 (0xa7ed70) re-adds only when +0x40 is set.
+
+struct Wrapper {
+    double since;
+    bool fixed;
+};
+std::unordered_map<u64, Wrapper> g_wrap; // under g_mutex
+std::recursive_mutex g_wrap_call;        // held while the game's addToWorld runs on a wrapper
+u64 g_add_wrap = 0, g_wrap_vt = 0, g_sys_vt = 0;
+double g_fix_pass = 0.0;
+std::map<std::string, u32> g_fixed_by_map;
+
+void OnWrapCtor(u64 w) {
+    std::scoped_lock lk{g_mutex};
+    g_wrap[w] = Wrapper{Now(), false};
+}
+
+void OnWrapDtor(u64 w) {
+    std::scoped_lock call{g_wrap_call};
+    std::scoped_lock lk{g_mutex};
+    g_wrap.erase(w);
 }
 
 // MSB object parts against the bodies in the world: the MSB-to-world offset is voted from the
@@ -1509,10 +1519,136 @@ void PartsReport(double now) {
              "[objcol] map {} visit #{} (+{:.0f} s): MSB object parts {} | MSB->world offset "
              "({:.1f}, {:.1f}, {:.1f}) ({} votes) | parts in the vanilla MSB with a body within "
              "0.6 m: {} of {} ({} in the world) | mod-only parts {} ({} with an in-world body "
-             "within 0.6 m): {}",
+             "within 0.6 m; added by BB_OBJCOL_FIX so far {}): {}",
              g_map, g_map_visit, now - g_map_open, parts.size(), off[0], off[1], off[2], top,
              vanilla_hit, vanilla, vanilla_hit_world, mod_n, mod_hit_world,
+             g_fixed_by_map.contains(g_map) ? g_fixed_by_map[g_map] : 0u,
              mods.empty() ? "none" : mods);
+}
+
+// BB_OBJCOL_FIX: for the parts of a served MSB that the vanilla MSB of the same map does not
+// have (found per map from the two files, no list of names), an intact object physics system
+// (static or keyframed bodies, at most 8; fragment systems are dynamic) that the game built
+// but never added, never removed, whose wrapper's "in world" byte is 0, at the part's position
+// (MSB->world offset voted from the vanilla parts) is added the way a map reload adds it: the
+// game's own wrapper addToWorld 0xa7f2d0, on the game thread, at the physics command flush.
+// Vanilla parts are never touched; a mod object that was added and later broken or removed is
+// never re-added.
+void FixPass(double now) {
+    if (g_add_wrap == 0 || now - g_fix_pass < 5.0) {
+        return;
+    }
+    std::vector<std::pair<u64, std::string>> todo;
+    {
+        std::scoped_lock lk{g_mutex};
+        g_fix_pass = now;
+        bool recent = false;
+        for (const auto& pc : g_pending_cmp) {
+            recent = recent || now - pc.open < 180.0;
+        }
+        if (!recent || g_wrap.empty()) {
+            return;
+        }
+        const auto inworld = Snapshot();
+        for (const auto& [map, parts] : g_msb_parts) {
+            std::vector<const MsbPart*> mods;
+            for (const auto& p : parts) {
+                if (p.mod_only) {
+                    mods.push_back(&p);
+                }
+            }
+            if (mods.empty()) {
+                continue;
+            }
+            std::map<std::tuple<int, int, int>, int> votes;
+            size_t used = 0;
+            for (const auto& p : parts) {
+                if (p.mod_only || used >= 400) {
+                    continue;
+                }
+                ++used;
+                for (const auto& b : inworld) {
+                    ++votes[{int(std::lround((b.p[0] - p.pos[0]) * 2.f)),
+                             int(std::lround((b.p[1] - p.pos[1]) * 2.f)),
+                             int(std::lround((b.p[2] - p.pos[2]) * 2.f))}];
+                }
+            }
+            float off[3] = {};
+            int top = 0;
+            for (const auto& [k, v] : votes) {
+                if (v > top) {
+                    top = v;
+                    off[0] = std::get<0>(k) * 0.5f;
+                    off[1] = std::get<1>(k) * 0.5f;
+                    off[2] = std::get<2>(k) * 0.5f;
+                }
+            }
+            if (top < 20) {
+                continue; // offset not established
+            }
+            for (auto& [w, rec] : g_wrap) {
+                if (rec.fixed || now - rec.since < 3.0) {
+                    continue;
+                }
+                u64 vt = 0, sys = 0, svt = 0;
+                u8 in = 1;
+                if (!Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) || in != 0 ||
+                    !Rd(w + 0x18, sys) || !IsPtr(sys) || !Rd(sys, svt) || svt != g_sys_vt) {
+                    continue;
+                }
+                if (const auto it = g_systems.find(sys);
+                    it != g_systems.end() && (it->second.adds || it->second.removes)) {
+                    continue;
+                }
+                SysRec r;
+                SysInfo(sys, r);
+                if (r.n == 0 || r.n > 8 || (r.flags & 5) == 0) {
+                    continue;
+                }
+                for (const MsbPart* p : mods) {
+                    float d2 = 0.f;
+                    for (int k = 0; k < 3; ++k) {
+                        const float t = r.pos[k] - p->pos[k] - off[k];
+                        d2 += t * t;
+                    }
+                    if (d2 < 0.36f) {
+                        todo.emplace_back(w, fmt::format("{} {} at ({:.1f}, {:.1f}, {:.1f}) {} "
+                                                         "bodies {}",
+                                                         map, p->name, r.pos[0], r.pos[1], r.pos[2],
+                                                         r.n, Motion(r.flags)));
+                        rec.fixed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (todo.empty()) {
+        return;
+    }
+    using AddFn = void(PS4_SYSV_ABI*)(u64);
+    u32 done = 0;
+    std::string list;
+    for (const auto& [w, what] : todo) {
+        std::scoped_lock call{g_wrap_call};
+        {
+            std::scoped_lock lk{g_mutex};
+            u64 vt = 0;
+            u8 in = 1;
+            if (!g_wrap.contains(w) || !Rd(w, vt) || vt != g_wrap_vt || !Rd(w + 0x40, in) ||
+                in != 0) {
+                continue;
+            }
+            ++g_fixed_by_map[what.substr(0, what.find(' '))];
+        }
+        reinterpret_cast<AddFn>(g_add_wrap)(w);
+        ++done;
+        list += (list.empty() ? "" : "; ") + what;
+    }
+    LOG_INFO(Core,
+             "[objcol-fix] {} mod-added object(s) whose collision the game built but never added "
+             "now added with the game's wrapper addToWorld eboot+{:#x}: {}",
+             done, g_add_wrap - g_eboot, list.empty() ? "none" : list);
 }
 
 void MapTick(double now) {
@@ -2119,6 +2255,20 @@ void PS4_SYSV_ABI HookRebuild(const u64* regs) {
     }
 }
 
+void PS4_SYSV_ABI HookWrapCtor(const u64* regs) {
+    try {
+        OnWrapCtor(regs[5]);
+    } catch (...) {
+    }
+}
+
+void PS4_SYSV_ABI HookWrapDtor(const u64* regs) {
+    try {
+        OnWrapDtor(regs[5]);
+    } catch (...) {
+    }
+}
+
 void PS4_SYSV_ABI HookFlush(const u64* regs) {
     try {
         OnFlush(regs[5]);
@@ -2183,6 +2333,18 @@ constexpr int SigAddWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0x
 constexpr int SigRemoveWrap[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x48, 0x8b,
                                  0x7b, 0x18, 0xe8, W,    W,    W,    W,    0xc6, 0x43, 0x40, 0x00};
 constexpr u64 WrapperVtable = 0x52978a0;
+constexpr u64 SystemVtable = 0x5261c40; // the game's hknpPhysicsSystem subclass (0x6e8700)
+// Wrapper ctor 0xa7d4a0 (15 relocated; lea of the vtable at +30) and dtor 0xa7d930 (14
+// relocated; lea of the vtable at +14).
+constexpr int SigWrapCtor[] = {
+    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x10,
+    0x49, 0x89, 0xd6, 0x49, 0x89, 0xfc, 0x41, 0xc7, 0x44, 0x24, 0x08, 0x01, 0x00, 0xff, 0xff,
+    0x48, 0x8d, 0x05, W,    W,    W,    W,    0x48, 0x83, 0xc0, 0x10, 0x49, 0x89, 0x04, 0x24};
+constexpr u32 WrapCtorPrologue = 15;
+constexpr int SigWrapDtor[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53,
+                               0x49, 0x89, 0xfe, 0x48, 0x8d, 0x05, W,    W,    W,    W,    0x48,
+                               0x83, 0xc0, 0x10, 0x49, 0x89, 0x06, 0x49, 0x8b, 0x7e, 0x18};
+constexpr u32 WrapDtorPrologue = 14;
 // The game's physics command flush (20 relocated); its addBodies call at +0x242.
 constexpr int SigFlush[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
                             0x53, 0x48, 0x81, 0xec, 0xe8, 0x00, 0x00, 0x00, 0x49, 0x89, 0xfc, 0x48,
@@ -2190,15 +2352,6 @@ constexpr int SigFlush[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41
                             0xd0, 0x49, 0x83, 0x7c, 0x24, 0x08, 0x00, 0x0f, 0x84, W,    W,    W,
                             W,    0x48, 0xc7, 0x85, 0xf8, 0xfe, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
 constexpr u32 FlushPrologue = 20, FlushAddCall = 0x242;
-// hknpWorld commit of the pending adds 0xb56360: two addBodies calls at +0x26 / +0x4e.
-constexpr int SigCommit[] = {
-    0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x48, 0x89, 0xfb, 0x8b, 0x93, 0xc0, 0x00, 0x00, 0x00,
-    0x85, 0xd2, 0x74, 0x17, 0x48, 0x8b, 0xb3, 0xb8, 0x00, 0x00, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00,
-    0x45, 0x31, 0xc0, 0x48, 0x89, 0xdf, 0xe8, W,    W,    W,    W,    0x4c, 0x8d, 0x73, 0x10, 0x8b,
-    0x93, 0xd0, 0x00, 0x00, 0x00, 0x85, 0xd2, 0x74, 0x1a, 0x48, 0x8b, 0xb3, 0xc8, 0x00, 0x00, 0x00,
-    0xb9, 0x01, 0x00, 0x00, 0x00, 0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0xdf, 0xe8, W,
-    W,    W,    W,    0x4c, 0x89, 0xf7, 0x5b, 0x41, 0x5e, 0x5d, 0xe9};
-
 s64 CallTarget(const u8* img, u64 at) {
     if (img[at] != 0xe8) {
         return -1;
@@ -2502,7 +2655,6 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
     const auto add_wrap = Find(img, code, SigAddWrap, std::size(SigAddWrap));
     const auto rem_wrap = Find(img, code, SigRemoveWrap, std::size(SigRemoveWrap));
     const auto flush = Find(img, code, SigFlush, std::size(SigFlush));
-    const auto commit = Find(img, code, SigCommit, std::size(SigCommit));
     // Called before the relocations: a slot holds 0 (RELA), the offset or the address.
     const auto slot_is = [&](u32 off, std::optional<u64> fn) {
         u64 v = 1;
@@ -2527,21 +2679,37 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
     } else {
         objs = "physics-system hooks off (signature, call target or vtable check failed)";
     }
-    const bool commit_ok = commit && CallTarget(img, *commit + 38) == s64(*add) &&
-                           CallTarget(img, *commit + 78) == s64(*add);
     const bool flush_ok = cave_b && flush && CallTarget(img, *flush + FlushAddCall) == s64(*add);
     if (flush_ok) {
         hook(*flush, reinterpret_cast<u64>(&HookFlush), FlushPrologue);
-        if (commit_ok) {
-            g_commit = eboot_base + *commit;
-        }
     }
-    LOG_INFO(Core,
-             "[objcol] {}; physics command flush {} ; pending-add commit {}; BB_OBJCOL_FIX {}",
+    // Wrapper ctor (sets the vtable 0x5297890 + 0x10) and dtor (0xa7d930, slot 0's callee).
+    const auto wctor = Find(img, code, SigWrapCtor, std::size(SigWrapCtor));
+    const auto wdtor = Find(img, code, SigWrapDtor, std::size(SigWrapDtor));
+    const auto lea_vt = [&](std::optional<u64> f, u32 at) {
+        if (!f || img[*f + at] != 0x48 || img[*f + at + 1] != 0x8d) {
+            return false;
+        }
+        s32 d;
+        std::memcpy(&d, img + *f + at + 3, 4);
+        return s64(*f) + at + 7 + d == s64(WrapperVtable - 0x10);
+    };
+    const bool fix_ok = sys_ok && flush_ok && lea_vt(wctor, 30) && lea_vt(wdtor, 14) &&
+                        slot_is(0x00, wdtor) && CallTarget(img, *add_wrap + 25) == s64(*sys_add);
+    if (fix_ok) {
+        hook(*wctor, reinterpret_cast<u64>(&HookWrapCtor), WrapCtorPrologue);
+        hook(*wdtor, reinterpret_cast<u64>(&HookWrapDtor), WrapDtorPrologue);
+        g_add_wrap = eboot_base + *add_wrap;
+        g_wrap_vt = eboot_base + WrapperVtable;
+        g_sys_vt = eboot_base + SystemVtable;
+    }
+    LOG_INFO(Core, "[objcol] {}; physics command flush {}; wrapper ctor/dtor {}; BB_OBJCOL_FIX {}",
              objs, flush_ok ? fmt::format("eboot+{:#x} hooked", *flush) : std::string("not hooked"),
-             commit_ok ? fmt::format("eboot+{:#x}", *commit) : std::string("not found"),
-             g_fix ? (g_commit ? "on (commits pending adds a world holds for 2 s unstepped)"
-                               : "requested but the commit or flush check failed: off")
+             fix_ok ? fmt::format("eboot+{:#x} / eboot+{:#x} hooked", *wctor, *wdtor)
+                    : std::string("checks failed"),
+             g_fix ? (fix_ok ? "on (mod-added objects' built-but-never-added collision is added "
+                               "with the game's wrapper addToWorld)"
+                             : "requested but a check failed: off")
                    : "off");
 }
 
