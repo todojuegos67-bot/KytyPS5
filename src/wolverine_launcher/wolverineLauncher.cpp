@@ -725,15 +725,18 @@ QString WolverineLauncher::HintsFile() const {
 	return QFileInfo::exists(file) ? file : QString();
 }
 
-// What a complete precompile was made for: the graphics card, its driver and the shipped hints. A change of any
-// needs another precompile.
+// What a complete precompile was made for: the graphics card, its driver, the shipped hints and the emulator build. A
+// change of any needs another precompile.
 QString WolverineLauncher::PrecompileStamp() const {
 	const QFileInfo hints(HintsFile());
-	return QStringLiteral("%1|%2|%3|%4:%5")
+	const QFileInfo emulator(Emulator());
+	return QStringLiteral("%1|%2|%3|%4:%5|%6:%7")
 	    .arg(m_gpu.name, m_gpu.driver)
 	    .arg(m_settings.value("gpu", -1).toInt())
 	    .arg(hints.exists() ? hints.size() : 0)
-	    .arg(hints.exists() ? hints.lastModified().toSecsSinceEpoch() : 0);
+	    .arg(hints.exists() ? hints.lastModified().toSecsSinceEpoch() : 0)
+	    .arg(emulator.size())
+	    .arg(emulator.lastModified().toSecsSinceEpoch());
 }
 
 // A package that lost its hints never looks precompiled, whatever an older stamp says.
@@ -1050,6 +1053,7 @@ void WolverineLauncher::Precompile(const QStringList& extra) {
 			options << QStringLiteral("--precompile-threads") << QString::number(threads);
 		}
 	}
+	m_precompile_stamp = PrecompileStamp(); // the settings it starts with; the card can be changed while it runs
 	m_precompile = new QProcess(this);
 	m_precompile->setProgram(Emulator());
 	// The game's own arguments: the same device and options, so the game's pipelines are the ones compiled.
@@ -1079,7 +1083,7 @@ void WolverineLauncher::Precompile(const QStringList& extra) {
 	});
 	connect(m_precompile, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
 		const bool complete = status == QProcess::NormalExit && code == 0 && m_precompile_status == QStringLiteral("complete");
-		if (complete) m_settings.setValue("precompiled", PrecompileStamp());
+		if (complete) m_settings.setValue("precompiled", m_precompile_stamp);
 		if (status != QProcess::NormalExit || (code != 0 && code != 3)) {
 			for (auto* text: {m_progress_text, m_play_progress_text}) {
 				text->setText(tr("The precompile ended (code %1); see _precompile_log.txt.").arg(code));

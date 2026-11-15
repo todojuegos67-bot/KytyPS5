@@ -144,6 +144,7 @@ private:
 	QProcess*  m_precompile = nullptr;
 	QByteArray m_pending;
 	QString    m_precompile_status;
+	QString    m_precompile_stamp;
 	bool       m_play_after = false;
 	qint64     m_game_pid   = 0;
 	QTimer*    m_game_watch = nullptr;
