@@ -177,6 +177,10 @@ private:
     // bb-menu-ui: the texture of the game image ImGui drew in the last Present (the draw data
     // BbPresentGenerated draws again belongs to that Present, not to the frame being presented).
     ImTextureID bb_imgui_game_tex{};
+    // bb-menu-ui2: the draw lists holding the game window in that Present: its own (the image)
+    // and, docked, the dock host's, where ImGui draws a docked window's background (the opaque
+    // black WindowBg). Both are left out on generated frames.
+    std::array<const ImDrawList*, 2> bb_imgui_game_lists{};
     // bb-menu-ui: presents while an overlay is up (F1 menu / toasts: MustKeepDrawing; F8 or any
     // ImGui UI: bb_imgui_ui_shown), for the "[menu-ui]" lines.
     struct BbMenuUi {

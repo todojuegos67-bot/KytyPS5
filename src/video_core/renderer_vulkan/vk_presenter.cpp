@@ -13,6 +13,7 @@
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
+#include <imgui_internal.h>
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
 #include "imgui/shadnet_notifications_layer.h"
@@ -871,6 +872,12 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
             // frame->imgui_texture matched nothing, so every generated frame got the previous
             // real frame drawn over it (DLSS-G looked off with F8 / F1 up) from a frame image the
             // GPU thread may already be rendering the next frame into (the menu glitches).
+            // bb-menu-ui2: also the dock host's list. The game window is docked, so ImGui draws
+            // its opaque black WindowBg into the host window's list (imgui.cpp Begin:
+            // bg_draw_list = DockNode->HostWindow->DrawList), which has no game texture: hiding
+            // only the image's list left that full-screen black quad over every generated frame
+            // (black + UI with F8 / F1 / toasts up, the DLSS-G image gone).
+            game = std::ranges::find(bb_imgui_game_lists, list) != bb_imgui_game_lists.end();
             for (const ImDrawCmd& c : list->CmdBuffer) {
                 if (c.UserCallback == nullptr && bb_imgui_game_tex != nullptr &&
                     c.GetTexID() == bb_imgui_game_tex) {
@@ -1710,6 +1717,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
     BB::Upscale::DrawOverlay(); // bb-clean-021 F8 (nothing while hidden)
     bb_imgui_game_tex = nullptr;
+    bb_imgui_game_lists = {};
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
@@ -1779,7 +1787,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
             ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
             ImGui::SetNextWindowDockID(dockId, ImGuiCond_Once);
-            if (ImGui::Begin("Display##game_display", nullptr, ImGuiWindowFlags_NoNav)) {
+            const bool bb_game_window = ImGui::Begin("Display##game_display", nullptr,
+                                                     ImGuiWindowFlags_NoNav);
+            {
+                const ImGuiWindow* w = ImGui::GetCurrentWindow();
+                bb_imgui_game_lists[0] = w->DrawList;
+                if (w->DockIsActive && w->DockNode != nullptr && w->DockNode->HostWindow != nullptr) {
+                    bb_imgui_game_lists[1] = w->DockNode->HostWindow->DrawList;
+                }
+            }
+            if (bb_game_window) {
                 auto game_texture = frame->imgui_texture;
                 auto game_width = frame->width;
                 auto game_height = frame->height;
