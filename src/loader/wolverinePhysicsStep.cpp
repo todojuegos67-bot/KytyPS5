@@ -37,7 +37,7 @@ void InstallWolverinePhysicsStep(Program* main_program) {
 	auto* hook = reinterpret_cast<uint8_t*>(main_program->title_hook_vaddr);
 	std::memset(hook, 0, 16); // the state: last stored phys, manager's phys
 	Xbyak::CodeGenerator gen(TITLE_HOOK_SIZE - 16, hook + 16);
-	EmitPhysicsStep(gen, {base + PHYS_VA, base + REF_VA, base + OVR_VA, base + MIN_VA, main_program->title_hook_vaddr},
+	EmitPhysicsStep(gen, {base + PHYS_VA, base + OVR_VA, base + MIN_VA, main_program->title_hook_vaddr},
 	                code + ORIGINAL.size());
 	EXIT_IF(Xbyak::GetError() != 0);
 	EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(main_program->title_hook_vaddr, 16 + gen.getSize()));

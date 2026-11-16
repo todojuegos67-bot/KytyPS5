@@ -22,7 +22,6 @@ bool Near(float a, float b) {
 
 // The game's globals, as the hook sees them.
 float    g_phys     = 0.0f;
-float    g_ref      = 1.0f / 60.0f;
 uint64_t g_ovr      = 0;
 float    g_min      = 1.0f / 90.0f;
 float    g_state[2] = {};
@@ -38,8 +37,8 @@ void TestPhysicsStep() {
 	Xbyak::CodeGenerator gen;
 	Loader::WolverinePhysicsStep::EmitPhysicsStep(
 	    gen,
-	    {reinterpret_cast<uint64_t>(&g_phys), reinterpret_cast<uint64_t>(&g_ref), reinterpret_cast<uint64_t>(&g_ovr),
-	     reinterpret_cast<uint64_t>(&g_min), reinterpret_cast<uint64_t>(g_state)},
+	    {reinterpret_cast<uint64_t>(&g_phys), reinterpret_cast<uint64_t>(&g_ovr), reinterpret_cast<uint64_t>(&g_min),
+	     reinterpret_cast<uint64_t>(g_state)},
 	    nullptr);
 	gen.ready();
 	auto hook = gen.getCode<Hook>();
@@ -58,13 +57,18 @@ void TestPhysicsStep() {
 	Check(Near(Frame(hook, 1.0f / 60.0f), 1.0f / 60.0f), "at the target: not the game's 1/60");
 	Check(Near(Frame(hook, 0.01f), 1.0f / 60.0f), "above the target: not the game's 1/60");
 
-	// The manager's slow motion (scale 0.5) still applies, on top of the real frame time.
+	// The manager's slow motion (scale 0.5): it stores 0.5 * ref, and the frame step arrives scaled too (0.5 * frame
+	// time; 73-trask-fight, 2026-11-16: 0.0175 at a 0.035 s frame). Havok gets that step, not the scale twice.
 	g_phys = 0.5f / 60.0f;
-	Check(Near(Frame(hook, 0.05f), 0.025f), "slow motion at 20 fps: not 0.5 * 0.05");
-	Check(Near(Frame(hook, 0.04f), 0.02f), "slow motion kept: not 0.5 * 0.04");
+	Check(Near(Frame(hook, 0.0175f), 0.0175f), "slow motion at 28 fps: not the scaled step (0.5 * 0.035)");
+	Check(Near(Frame(hook, 0.025f), 0.025f), "slow motion kept at 20 fps: not 0.5 * 0.05");
+	Check(Near(Frame(hook, 0.5f / 60.0f), 0.5f / 60.0f), "slow motion at the target: not the game's 0.5 / 60");
+	Check(Near(Frame(hook, 0.004f), 0.5f / 60.0f), "slow motion above the target: not the game's 0.5 / 60");
+	// Deep slow motion (0.3) at 40 fps: the step (0.0075) is under ref but over the manager's 0.3 / 60.
+	g_phys = 0.3f / 60.0f;
+	Check(Near(Frame(hook, 0.0075f), 0.0075f), "deep slow motion at 40 fps: not the scaled step (the old fixed step)");
 
 	// A mode change stores phys = ref (1/30 in Fidelity).
-	g_ref  = 1.0f / 30.0f;
 	g_phys = 1.0f / 30.0f;
 	Check(Near(Frame(hook, 0.05f), 0.05f), "1/30 mode at 20 fps: not 0.05");
 	Check(Near(Frame(hook, 0.02f), 1.0f / 30.0f), "1/30 mode above its target: not 1/30");

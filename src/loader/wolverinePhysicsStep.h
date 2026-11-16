@@ -21,16 +21,18 @@ struct Program;
 //
 // The hook replaces sub_3E87D40's choice of phys (0x3E87DBF, where xmm0 = phys and xmm1 = (float) frame step):
 //   no manager (0xBDC26D8 == 0): phys = max(step, 1/90)            (the game's own code, unchanged)
-//   manager:                     phys = manager_phys * max(step, ref) / ref
+//   manager:                     phys = max(step, manager_phys)
 // manager_phys is the last value the manager stored (the hook keeps it beside its code, as phys now changes every
-// frame). So at the target rate nothing changes, the manager's slow motion still applies, and below the target
-// physics keeps real time in steps of at most the game's own 1/15 s cap.
+// frame). The step already carries the manager's scale (measured 2026-11-16: at scale 0.5 and a 0.035 s frame it reads
+// 0.0175), as manager_phys does (scale * ref), so the larger of the two is scale * max(frame time, ref): at the target
+// rate nothing changes, and below it physics advances by the same time as the rest of the game, in slow motion too.
+// (Until 2026-11-16 this was manager_phys * max(step, ref) / ref, which applied the scale twice: slow-motion set
+// pieces ran at scale^2, or at the old fixed step when scale * frame time was under ref.)
 namespace WolverinePhysicsStep {
 
 constexpr uint64_t PATCH_VA  = 0x3E87DBF; // cmp qword [0xBDC26D8], 0 ; jne 0x3E87DD9 ; vmaxss ; vmovss [phys], xmm0
 constexpr uint64_t RESUME_VA = 0x3E87DD9;
 constexpr uint64_t PHYS_VA   = 0xBDC26D0;
-constexpr uint64_t REF_VA    = 0xBDC26D4;
 constexpr uint64_t OVR_VA    = 0xBDC26D8;
 constexpr uint64_t MIN_VA    = 0x77E5B5C; // the game's float 1/90
 
@@ -40,14 +42,13 @@ constexpr std::array<uint8_t, 26> ORIGINAL = {0x48, 0x83, 0x3d, 0x11, 0xa9, 0xf3
 
 struct Addresses {
 	uint64_t phys;
-	uint64_t ref;
 	uint64_t ovr;
 	uint64_t min_step;
 	uint64_t state; // two floats: the phys this hook last stored, the manager's last phys
 };
 
-// The hook's code: in xmm0 = phys and xmm1 = frame step, out xmm0 = phys (also stored). Uses rax, rcx, xmm2, xmm3,
-// which sub_3E87D40 sets before reading after RESUME_VA. Ends with a jump to `resume`, or a ret when it is null (tests).
+// The hook's code: in xmm0 = phys and xmm1 = frame step, out xmm0 = phys (also stored). Uses rax, which sub_3E87D40
+// sets before reading after RESUME_VA. Ends with a jump to `resume`, or a ret when it is null (tests).
 inline void EmitPhysicsStep(Xbyak::CodeGenerator& g, const Addresses& a, const void* resume) {
 	using namespace Xbyak::util;
 	Xbyak::Label scaled;
@@ -65,11 +66,7 @@ inline void EmitPhysicsStep(Xbyak::CodeGenerator& g, const Addresses& a, const v
 	g.je(keep);
 	g.vmovss(dword[rax + 4], xmm0);
 	g.L(keep);
-	g.mov(rcx, a.ref);
-	g.vmovss(xmm2, dword[rcx]);
-	g.vmaxss(xmm3, xmm1, xmm2);
-	g.vdivss(xmm3, xmm3, xmm2);
-	g.vmulss(xmm0, xmm3, dword[rax + 4]);
+	g.vmaxss(xmm0, xmm1, dword[rax + 4]);
 	g.L(store);
 	g.mov(rax, a.state);
 	g.vmovss(dword[rax], xmm0);
