@@ -997,7 +997,7 @@ std::chrono::steady_clock::time_point Presenter::BbDlssgPaceOrigin(
     static const double margin_cfg_s = [] {
         const char* v = std::getenv("BB_DLSSG_PACE_MARGIN_MS");
         const double ms = v != nullptr && *v != '\0' ? std::strtod(v, nullptr) : 2.0;
-        return std::clamp(ms, 0.0, 20.0) / 1e3;
+        return std::isfinite(ms) ? std::clamp(ms, 0.0, 20.0) / 1e3 : 2e-3;
     }();
     auto& p = bb_dlssg_pace;
     const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
