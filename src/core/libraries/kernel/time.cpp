@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_reflex.h"
 
 #ifdef _WIN64
 #include <windows.h>
@@ -99,6 +100,16 @@ s32 PS4_SYSV_ABI sceKernelUsleep(u32 microseconds) {
         .tv_nsec = (microseconds % 1'000'000) * 1'000,
     };
     return sceKernelNanosleep(&ts, nullptr);
+}
+
+// bb-reflex-native (BB_REFLEX_NATIVE only, see RegisterTime): sceKernelUsleep linked without
+// HOST_CALL's forwarder, so __builtin_return_address(0) is the guest's return address; the frame
+// limiter's call (eboot 0x2034BD2) becomes NVIDIA Reflex's sleep, every other call sleeps as usual.
+static s32 PS4_SYSV_ABI sceKernelUsleepBbReflex(u32 microseconds) {
+    if (BB::Reflex::OnGuestUsleep(__builtin_return_address(0), microseconds)) {
+        return ORBIS_OK;
+    }
+    return sceKernelUsleep(microseconds);
 }
 
 u32 PS4_SYSV_ABI posix_sleep(u32 seconds) {
@@ -603,7 +614,13 @@ void RegisterTime(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("-2IRUCO--PM", "libkernel", 1, "libkernel", sceKernelReadTsc);
     LIB_FUNCTION("1j3S3n-tTW4", "libkernel", 1, "libkernel", sceKernelGetTscFrequency);
     LIB_FUNCTION("QvsZxomvUHs", "libkernel", 1, "libkernel", sceKernelNanosleep);
-    LIB_FUNCTION("1jfXLRVzisc", "libkernel", 1, "libkernel", sceKernelUsleep);
+    if (BB::Reflex::NativeEnv()) {
+        LinkSymbolImpl(sym, "1jfXLRVzisc", "libkernel", 1, "libkernel",
+                       reinterpret_cast<u64>(&sceKernelUsleepBbReflex),
+                       Core::Loader::SymbolType::Function);
+    } else {
+        LIB_FUNCTION("1jfXLRVzisc", "libkernel", 1, "libkernel", sceKernelUsleep);
+    }
     LIB_FUNCTION("-ZR+hG7aDHw", "libkernel", 1, "libkernel", sceKernelSleep);
     LIB_FUNCTION("QBi7HCK03hw", "libkernel", 1, "libkernel", sceKernelClockGettime);
     LIB_FUNCTION("wRYVA5Zolso", "libkernel", 1, "libkernel", sceKernelClockGetres);

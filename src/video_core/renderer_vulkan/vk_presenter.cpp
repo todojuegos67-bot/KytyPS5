@@ -21,6 +21,7 @@
 #include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/bb/bb_reflex.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -480,6 +481,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
+    present_scheduler.bb_reflex_tag = false; // bb-reflex: not the game's GPU work
 
     // bb-gpu-prof (BB_GPU_PROFILE=1): GPU timestamps per pass; each scheduler's submits are timed
     // whole as well (the GPU's busy time).
@@ -2010,7 +2012,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!BB::FG::Fsr3Active()) {
             submit_lock.lock();
         }
-        if (!swapchain.Present()) {
+        bool presented = false;
+        // bb-reflex: PRESENT_START / END and the present id of the game frame (its generated
+        // frames, presented before it, have none).
+        const u64 reflex_id = !is_reusing_frame && is_game_frame
+                                  ? BB::Reflex::BeginPresent(std::exchange(frame->bb_reflex_id, 0))
+                                  : 0;
+        presented = swapchain.Present(reflex_id);
+        BB::Reflex::EndPresent(reflex_id, presented);
+        if (!is_reusing_frame && is_game_frame) {
+            BB::Reflex::OnGameFramePresented(); // bb-reflex-native: [reflex-native] line
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

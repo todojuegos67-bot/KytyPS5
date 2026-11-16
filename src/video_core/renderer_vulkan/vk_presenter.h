@@ -42,6 +42,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    u64 bb_reflex_id = 0; // bb-reflex: the game frame's Reflex frame id (0: none)
     BB::FG::Inputs fg{}; // bb-clean-021-fg: this frame's frame generation inputs (valid: 3D frame)
     // bb-hudless: the upscaled scene without the HUD, through the same post-process pass as the
     // frame (its size and format): FSR 3 FG's HUD-less colour (DLSS-G: kBufferTypeHUDLessColor).
