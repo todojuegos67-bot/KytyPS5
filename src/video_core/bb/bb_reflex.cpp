@@ -124,6 +124,16 @@ std::atomic<uintptr_t> g_usleep_return{0};
 std::mutex g_guest_mutex;      // one guest wait at a time (the game's main thread)
 uint64_t g_last_frame_key = 0; // under g_guest_mutex: this+0x20 of the frame that slept
 std::atomic<uint32_t> g_timeouts_total{0};
+uint64_t g_eboot_size = 0; // image size (OnEbootLoaded), for the diagnostics' addresses
+// Diagnostics (BB_REFLEX_NATIVE only): which guest calls reach the native sceKernelUsleep, and
+// whether the limiter's call site (return address) matches. Per second, with the [reflex-native]
+// line; the first few of each kind are logged once.
+std::atomic<uint32_t> g_usleep_all{0};     // every guest call that reaches the native usleep
+std::atomic<uint32_t> g_usleep_limiter{0}; // return address == the limiter's call site (0x2034BD7)
+std::atomic<uint32_t> g_usleep_other{0};   // any other return address (the game's own wait)
+std::atomic<uint32_t> g_limiter_silent{0}; // GuestWait left before its sleep (no limiter / period)
+std::atomic<uintptr_t> g_last_other_ra{0};
+std::atomic<uint32_t> g_other_logged{0}, g_hit_logged{0};
 // Per-second counters ([reflex-native] line).
 std::atomic<uint32_t> g_markers{0}, g_sleeps{0}, g_sleep_failed{0}, g_timeouts{0}, g_topups{0},
     g_fallbacks{0};
@@ -355,12 +365,16 @@ T ReadAt(const uint8_t* base, uint32_t off) {
 // no swapchain, errors, timeouts).
 bool GuestWait(uint32_t usec) {
     const uint8_t* lim = Limiter();
-    if (lim == nullptr)
+    if (lim == nullptr) {
+        g_limiter_silent.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
     const float period = ReadAt<float>(lim, kOffPeriod);
     const uint64_t frame_key = ReadAt<uint64_t>(lim, kOffFrameKey);
-    if (!(period > 0.0005f && period < 0.2f))
+    if (!(period > 0.0005f && period < 0.2f)) {
+        g_limiter_silent.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
     std::scoped_lock guest_lock{g_guest_mutex};
     if (frame_key == g_last_frame_key) {
         // The limiter's loop again in the same frame: Reflex's sleep ended before the game's own
@@ -612,6 +626,7 @@ void OnEbootLoaded(uintptr_t eboot_base, uint64_t image_size) {
         return;
     }
     g_eboot_base = eboot_base;
+    g_eboot_size = image_size;
     g_usleep_return = eboot_base + kUsleepReturnVa;
     BB::Upscale::Checkpoint(
         "[reflex-native] hook armed: the frame limiter's (0x2034770) sceKernelUsleep at 0x2034BD2 "
@@ -624,10 +639,54 @@ bool NativeEnv() {
     return v != nullptr && (std::strcmp(v, "1") == 0 || std::strcmp(v, "force") == 0);
 }
 
+// Where a guest return address is: the eboot image (as the vaddr of the 1.09 build) or outside it.
+// Diagnostics only (the one-time lines of an unmatched call).
+static std::string DescribeGuestAddress(uintptr_t ra) {
+    if (g_eboot_base != 0 && ra >= g_eboot_base && ra < g_eboot_base + g_eboot_size) {
+        std::string s = fmt::format("eboot vaddr 0x{:x}", ra - g_eboot_base);
+        // The 5 bytes before the return address: a call's E8 rel32 and where it goes.
+        if (ra - 5 >= g_eboot_base) {
+            uint8_t b[5]{};
+            std::memcpy(b, reinterpret_cast<const void*>(ra - 5), 5);
+            int32_t rel = 0;
+            std::memcpy(&rel, b + 1, 4);
+            s += fmt::format(" (bytes {:02x} {:02x} {:02x} {:02x} {:02x}", b[0], b[1], b[2], b[3],
+                             b[4]);
+            if (b[0] == 0xE8) {
+                s += fmt::format(": call vaddr 0x{:x}", ra - g_eboot_base + rel);
+            }
+            s += ")";
+        }
+        return s;
+    }
+    return fmt::format("outside the eboot image (0x{:x})", ra);
+}
+
 bool OnGuestUsleep(const void* return_address, uint32_t usec) {
+    const uintptr_t ra = reinterpret_cast<uintptr_t>(return_address);
+    g_usleep_all.fetch_add(1, std::memory_order_relaxed);
     const uintptr_t hook = g_usleep_return.load(std::memory_order_relaxed);
-    if (hook == 0 || reinterpret_cast<uintptr_t>(return_address) != hook)
+    if (hook == 0 || ra != hook) {
+        // Not the frame limiter's call: the game's own wait, as before. Counted (per second and
+        // the first three with their addresses) so a run shows whether the limiter's call ever
+        // arrives here and from where.
+        g_usleep_other.fetch_add(1, std::memory_order_relaxed);
+        g_last_other_ra.store(ra, std::memory_order_relaxed);
+        if (g_other_logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[reflex-native] guest sceKernelUsleep({} us) from {}, not the frame limiter's "
+                "call at 0x2034BD2 (return 0x2034BD7): the game's own wait",
+                usec, DescribeGuestAddress(ra)));
+        }
         return false;
+    }
+    g_usleep_limiter.fetch_add(1, std::memory_order_relaxed);
+    if (g_hit_logged.exchange(1, std::memory_order_relaxed) == 0) {
+        BB::Upscale::Checkpoint(fmt::format(
+            "[reflex-native] hook fired: the frame limiter's sceKernelUsleep({} us) reached the "
+            "native path from {} (Reflex {})",
+            usec, DescribeGuestAddress(ra), Active() ? "active" : "not active: the game's wait"));
+    }
     if (!Active()) {
         g_fallbacks.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -755,14 +814,27 @@ void OnGameFramePresented() {
         const uint64_t us = g_sleep_us.exchange(0);
         const uint8_t* lim = Limiter();
         const float period = lim != nullptr ? ReadAt<float>(lim, kOffPeriod) : 0.0f;
+        const uint32_t usleep_all = g_usleep_all.exchange(0);
+        const uint32_t usleep_limiter = g_usleep_limiter.exchange(0);
+        const uint32_t usleep_other = g_usleep_other.exchange(0);
+        const uint32_t limiter_silent = g_limiter_silent.exchange(0);
+        const uintptr_t last_other = g_last_other_ra.load(std::memory_order_relaxed);
+        const bool last_inside = g_eboot_base != 0 && last_other >= g_eboot_base &&
+                                 last_other < g_eboot_base + g_eboot_size;
+        const std::string last_other_text =
+            last_other == 0 ? std::string("none")
+            : last_inside   ? fmt::format("vaddr 0x{:x}", last_other - g_eboot_base)
+                            : fmt::format("0x{:x}", last_other);
         line = fmt::format(
             "[reflex-native] {:.2f} s: sleeps {} (avg {:.2f} ms, {} failed), timeouts {} ({} "
-            "total), game top-ups {}, fallbacks {} | state {} | period {:.2f} ms | game dt "
-            "(this+0x264) {:.2f} ms sd {:.2f} (n {}) vs present interval {:.2f} ms sd {:.2f} (n "
-            "{}) | markers {}",
+            "total), game top-ups {}, fallbacks {} | usleep calls {} (limiter site {}, other {}, "
+            "last other return {}), limiter exits before sleep {} | state {} | period {:.2f} ms | "
+            "game dt (this+0x264) {:.2f} ms sd {:.2f} (n {}) vs present interval {:.2f} ms sd "
+            "{:.2f} (n {}) | markers {}",
             sec, sleeps, sleeps ? us / 1e3 / sleeps : 0.0, g_sleep_failed.exchange(0),
             g_timeouts.exchange(0), g_timeouts_total.load(), g_topups.exchange(0),
-            g_fallbacks.exchange(0),
+            g_fallbacks.exchange(0), usleep_all, usleep_limiter, usleep_other, last_other_text,
+            limiter_silent,
             Active()     ? std::string("reflex")
             : g_disabled ? std::string("fallback (disabled)")
             : !g_ready   ? "fallback (" +

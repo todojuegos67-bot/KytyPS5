@@ -21,7 +21,9 @@
 // / END (first guest submit / guest flip), PRESENT_START / END (around the game frame's present).
 // Every VK_NV_low_latency2 call runs on host threads (ReflexSleep, ReflexMarks, present thread).
 // Log: one [reflex-native] line per second (sleeps, timeouts, fallback state, the game's dt vs
-// the present interval).
+// the present interval, and the guest sceKernelUsleep calls: all, at the limiter's return address,
+// and elsewhere with the last such return address). The first limiter hit and the first unmatched
+// calls are logged once each.
 
 // Device and swapchain set-up: bb_reflex_vk.h.
 #pragma once
