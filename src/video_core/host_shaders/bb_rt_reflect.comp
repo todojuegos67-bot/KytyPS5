@@ -1,27 +1,38 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bb-rt-reflect (BB_RT_REFLECT=1): ray-traced reflections over the game's SSR output. Runs right
-// after the SSR draw on its 854x480 RGBA16F target. Per pixel: view-space position from depth,
-// normal from G-buffer RT0 (world normal, rgb * 2 - 1, accepted only when unit length and in
-// agreement with the depth normal) or else from depth derivatives, the reflected view ray traced
-// (ray query) against the depth mesh (bb_rt_mesh.comp), the hit projected back to the screen and
-// the lit scene colour sampled there. A miss keeps the game's SSR value.
+// bb-rt-reflect (BB_RT_REFLECT=1): ray-traced reflections over the game's SSR output, trace step.
+// Runs right after the SSR draw at the SSR target's size (854x480). Per pixel: view-space position
+// from depth, normal from G-buffer RT0 (world normal, rgb * 2 - 1, accepted only when unit length
+// and in agreement with the depth normal) or else from depth derivatives; N rays (quality knob)
+// around the reflected view ray, jittered in a cone that widens with roughness (1 - shininess of
+// G-buffer RT1 when bound, else a small default), traced (ray query) against the depth mesh
+// (bb_rt_mesh.comp); a hit is projected back to the screen and the lit scene colour sampled there.
+// A miss contributes the game's SSR colour. Output (own images, not the target):
+//   raw   = (mean colour, hit fraction)      guide = (view normal, view distance; 0 = no depth)
+// bb_rt_post.comp then accumulates (temporal), filters (bilateral) and blends into the target.
 #version 460
 #extension GL_EXT_ray_query : require
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D depth_tex;   // 854x480 (nearest)
 layout(binding = 1) uniform sampler2D normal_tex;  // 1708x960 RGBA8 (nearest)
 layout(binding = 2) uniform sampler2D color_tex;   // 1708x960 RGBA16F lit scene (linear)
-layout(binding = 3, rgba16f) uniform image2D ssr_out;
+layout(binding = 3, rgba16f) uniform readonly image2D ssr_out; // the game's SSR result
 layout(binding = 4) uniform accelerationStructureEXT tlas;
-layout(std430, binding = 5) buffer Counters { uint n[8]; } cnt; // pixels, valid, hits, g-normal, d-normal
+layout(std430, binding = 5) buffer Counters { uint n[8]; } cnt; // pixels, valid, hits, g-normal, d-normal, temporal ok
 layout(std140, binding = 6) uniform Params {
     mat4 proj;
     mat4 inv_proj;
     mat4 view;
-    uvec4 size;  // depth w, h, grid w, grid h
-    vec4 misc;   // far distance, y sign, cell size, debug tint (1)
+    mat4 reproj;     // current view -> previous view
+    mat4 prev_proj;
+    uvec4 size;      // depth w, h, grid w, grid h
+    vec4 misc;       // far distance, y sign, cell size, debug tint (1)
+    vec4 misc2;      // history valid, frame index, rays per pixel, flags (1 shine, 2 more)
+    vec4 misc3;      // temporal blend, default roughness, filter strength, 0
 } p;
+layout(binding = 7) uniform sampler2D shine_tex;   // G-buffer RT1 (R: shininess) or RT0 when absent
+layout(binding = 8, rgba16f) uniform writeonly image2D raw_out;
+layout(binding = 9, rgba16f) uniform writeonly image2D guide_out;
 
 shared uint s_cnt[5];
 
@@ -38,6 +49,17 @@ vec3 Unproject(ivec2 px, out bool ok) {
     return r;
 }
 
+uint Hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+float Rand(inout uint s) {
+    s = Hash(s);
+    return float(s >> 8) * (1.0 / 16777216.0);
+}
+
 void main() {
     if (gl_LocalInvocationIndex < 5u) {
         s_cnt[gl_LocalInvocationIndex] = 0u;
@@ -47,6 +69,9 @@ void main() {
     bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
     uint valid = 0u, hit = 0u, used_g = 0u, used_d = 0u;
     if (inside) {
+        vec4 game = imageLoad(ssr_out, c);
+        vec4 raw = vec4(game.rgb, 0.0);
+        vec4 guide = vec4(0.0);
         bool ok;
         vec3 P = Unproject(c, ok);
         bool okx1, okx0, oky1, oky0;
@@ -56,14 +81,12 @@ void main() {
         vec3 py0 = Unproject(c - ivec2(0, 1), oky0);
         if (ok) {
             valid = 1u;
-            // Depth normal: the smaller of the two one-sided differences on each axis.
             vec3 dx = (okx1 && (!okx0 || abs(px1.z - P.z) < abs(P.z - px0.z))) ? px1 - P : P - px0;
             vec3 dy = (oky1 && (!oky0 || abs(py1.z - P.z) < abs(P.z - py0.z))) ? py1 - P : P - py0;
             vec3 Nd = normalize(cross(dx, dy));
             if (dot(Nd, P) > 0.0) {
                 Nd = -Nd;
             }
-            // G-buffer normal (RT0 RGB: world-space normal, unorm).
             ivec2 nsz = textureSize(normal_tex, 0);
             ivec2 nc = clamp(ivec2((vec2(c) + 0.5) * vec2(nsz) / vec2(p.size.xy)), ivec2(0), nsz - 1);
             vec3 nw = texelFetch(normal_tex, nc, 0).rgb * 2.0 - 1.0;
@@ -80,44 +103,77 @@ void main() {
             if (any(isnan(N))) {
                 N = vec3(0.0);
             }
+            uint flags = uint(p.misc2.w);
+            float rough = p.misc3.y;
+            float shine = 0.0;
+            if ((flags & 1u) != 0u) {
+                ivec2 ssz = textureSize(shine_tex, 0);
+                ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(p.size.xy)), ivec2(0), ssz - 1);
+                shine = texelFetch(shine_tex, sc, 0).r;
+                rough = clamp(1.0 - shine, 0.0, 1.0);
+            }
+            // Cone half-angle: near zero for mirrors, wide for rough surfaces.
+            float cone = 0.004 + 0.5 * rough * rough;
+            int rays = int(p.misc2.z);
+            if ((flags & 2u) != 0u && shine > 0.7) {
+                rays *= 2; // BB_RT_REFLECT_MORE: more rays on very shiny pixels
+            }
             vec3 V = normalize(P);
-            vec3 R = reflect(V, N);
+            vec3 R0 = reflect(V, N);
             float dist = length(P);
-            if (dot(R, N) > 0.01 && dot(N, N) > 0.5) {
+            guide = vec4(N, dist);
+            if (dot(R0, N) > 0.01 && dot(N, N) > 0.5) {
+                vec3 T = normalize(abs(R0.z) < 0.9 ? cross(R0, vec3(0, 0, 1)) : cross(R0, vec3(1, 0, 0)));
+                vec3 B = cross(R0, T);
+                uint seed = Hash(uint(c.x) * 1973u + uint(c.y) * 9277u + uint(p.misc2.y) * 26699u);
                 vec3 O = P + N * (0.02 * dist);
-                rayQueryEXT rq;
-                rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, O, 0.03 * dist, R,
-                                      p.misc.x);
-                while (rayQueryProceedEXT(rq)) {
-                }
-                if (rayQueryGetIntersectionTypeEXT(rq, true) ==
-                    gl_RayQueryCommittedIntersectionTriangleEXT) {
-                    float t = rayQueryGetIntersectionTEXT(rq, true);
-                    vec3 H = O + R * t;
-                    vec4 clip = p.proj * vec4(H, 1.0);
-                    if (clip.w > 1e-6) {
-                        vec2 ndc = clip.xy / clip.w;
-                        vec2 uv = vec2(ndc.x * 0.5 + 0.5,
-                                       p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
-                        if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
-                            vec3 col = textureLod(color_tex, uv, 0.0).rgb;
-                            if (!any(isnan(col)) && !any(isinf(col))) {
-                                hit = 1u;
-                                // Fade towards the screen edges (as an SSR would).
-                                vec2 e = min(uv, 1.0 - uv);
-                                float w = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0);
-                                vec4 game = imageLoad(ssr_out, c);
-                                if (p.misc.w > 0.5) {
-                                    col = mix(col, vec3(1.0, 0.0, 1.0), 0.5);
-                                    w = 1.0;
+                vec3 sum = vec3(0.0);
+                float hits = 0.0;
+                for (int i = 0; i < rays; ++i) {
+                    float u1 = Rand(seed), u2 = Rand(seed);
+                    float a = cone * sqrt(u1), ph = 6.2831853 * u2;
+                    vec3 R = normalize(R0 + tan(a) * (cos(ph) * T + sin(ph) * B));
+                    if (dot(R, N) < 0.01) {
+                        R = R0;
+                    }
+                    vec3 col = game.rgb;
+                    float w = 0.0;
+                    rayQueryEXT rq;
+                    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, O, 0.03 * dist, R,
+                                          p.misc.x);
+                    while (rayQueryProceedEXT(rq)) {
+                    }
+                    if (rayQueryGetIntersectionTypeEXT(rq, true) ==
+                        gl_RayQueryCommittedIntersectionTriangleEXT) {
+                        float t = rayQueryGetIntersectionTEXT(rq, true);
+                        vec3 H = O + R * t;
+                        vec4 clip = p.proj * vec4(H, 1.0);
+                        if (clip.w > 1e-6) {
+                            vec2 ndc = clip.xy / clip.w;
+                            vec2 uv = vec2(ndc.x * 0.5 + 0.5,
+                                           p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+                            if (all(greaterThanEqual(uv, vec2(0.0))) &&
+                                all(lessThanEqual(uv, vec2(1.0)))) {
+                                vec3 sc = textureLod(color_tex, uv, 0.0).rgb;
+                                if (!any(isnan(sc)) && !any(isinf(sc))) {
+                                    vec2 e = min(uv, 1.0 - uv);
+                                    w = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0);
+                                    // Soft clamp of fireflies (bright specks from single texels).
+                                    sc = sc / (1.0 + max(0.0, max(sc.r, max(sc.g, sc.b)) - 8.0) * 0.125);
+                                    col = mix(game.rgb, sc, w);
                                 }
-                                imageStore(ssr_out, c, mix(game, vec4(col, 1.0), w));
                             }
                         }
                     }
+                    sum += col;
+                    hits += w;
                 }
+                raw = vec4(sum / float(rays), hits / float(rays));
+                hit = hits > 0.0 ? 1u : 0u;
             }
         }
+        imageStore(raw_out, c, raw);
+        imageStore(guide_out, c, guide);
     }
     if (inside) {
         atomicAdd(s_cnt[0], 1u);

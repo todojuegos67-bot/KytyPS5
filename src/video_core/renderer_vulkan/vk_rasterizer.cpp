@@ -424,6 +424,7 @@ void Rasterizer::BbRtReflectRun() {
     VideoCore::Image* depth = nullptr;
     VideoCore::Image* normal = nullptr;
     VideoCore::Image* color = nullptr;
+    VideoCore::Image* shine = nullptr; // G-buffer RT1 (R: shininess) when the draw samples it
     for (const auto& image_id : bound_images) {
         auto& img = texture_cache.GetImage(image_id);
         const auto f = img.info.pixel_format;
@@ -438,6 +439,11 @@ void Rasterizer::BbRtReflectRun() {
         } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm &&
                    area(&img) > area(normal)) {
             normal = &img;
+            shine = nullptr;
+        } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm && normal &&
+                   &img != normal && area(&img) == area(normal) && !shine) {
+            // The second full-size RGBA8 the draw samples (after RT0): taken as RT1.
+            shine = &img;
         } else if (!img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat &&
                    area(&img) > area(color)) {
             color = &img;
@@ -459,6 +465,12 @@ void Rasterizer::BbRtReflectRun() {
     }
     if (!bb_rt_reflect) {
         bb_rt_reflect = std::make_unique<BB::RtReflect>(instance);
+        LOG_INFO(Render_Vulkan,
+                 "[rt-reflect] inputs: RT0 guest={:#x} {}x{}, RT1 candidate {}",
+                 normal->info.guest_address, normal->info.size.width, normal->info.size.height,
+                 shine ? fmt::format("guest={:#x} {}x{}", shine->info.guest_address,
+                                     shine->info.size.width, shine->info.size.height)
+                       : std::string("none"));
     }
     const auto layout_of = [](const VideoCore::Image& img) {
         return img.backing->subresource_states.empty()
@@ -488,6 +500,9 @@ void Rasterizer::BbRtReflectRun() {
         .color = color->GetImage(),
         .color_view = *color->FindView(cv, false).image_view,
         .color_layout = layout_of(*color),
+        .shine = shine ? shine->GetImage() : vk::Image{},
+        .shine_view = shine ? *shine->FindView(nv, false).image_view : vk::ImageView{},
+        .shine_layout = shine ? layout_of(*shine) : vk::ImageLayout::eUndefined,
         .width = target->info.size.width,
         .height = target->info.size.height,
     };

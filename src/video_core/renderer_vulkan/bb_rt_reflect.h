@@ -36,6 +36,9 @@ public:
         vk::Image color;          // RGBA16F lit scene
         vk::ImageView color_view;
         vk::ImageLayout color_layout;
+        vk::Image shine;          // G-buffer RT1 (R: shininess), null when not bound
+        vk::ImageView shine_view;
+        vk::ImageLayout shine_layout;
         u32 width, height;        // SSR target / depth size
     };
 
@@ -59,6 +62,13 @@ private:
     bool MakeBuffer(Buf& b, vk::DeviceSize size, vk::BufferUsageFlags usage, bool host,
                     vk::DeviceSize alignment = 0);
     void FreeBuffer(Buf& b);
+    struct Img {
+        vk::Image image{};
+        VmaAllocation alloc{};
+        vk::ImageView view{};
+    };
+    bool MakeImage(Img& i, u32 width, u32 height);
+    void FreeImage(Img& i);
     void FreeSized();
     void Log();
 
@@ -66,14 +76,26 @@ private:
     bool tried = false, ok = false;
     bool debug = false;
     vk::Sampler nearest{}, linear{};
-    vk::DescriptorSetLayout mesh_set{}, ray_set{};
-    vk::PipelineLayout mesh_layout{}, ray_layout{};
-    vk::Pipeline mesh_pipe{}, ray_pipe{};
+    vk::DescriptorSetLayout mesh_set{}, ray_set{}, post_set{};
+    vk::PipelineLayout mesh_layout{}, ray_layout{}, post_layout{};
+    vk::Pipeline mesh_pipe{}, ray_pipe{}, post_pipe{};
+    // Quality (BB_RT_REFLECT_QUALITY=1..3, default 2) and BB_RT_REFLECT_MORE.
+    u32 quality = 2, rays = 2;
+    float temporal_blend = 0.1f, filter_strength = 1.0f;
+    bool more = false, use_shine = true;
+    // Own images (RGBA16F, SSR size): raw trace, guide (normal, distance) x2, history x2, temp.
+    Img raw, tmp;
+    std::array<Img, 2> guide, hist;
+    bool images_fresh = false;
+    // Previous camera (row-major 4x4, column vectors) for the temporal reprojection.
+    double prev_view[16]{}, prev_proj[16]{};
+    bool have_prev = false;
+    u64 frame = 0;
     vk::QueryPool queries{};
 
-    static constexpr u32 Cell = 4;
+    u32 Cell = 4;
     static constexpr u32 Ring = 8;
-    static constexpr vk::DeviceSize ParamSize = 256;
+    static constexpr vk::DeviceSize ParamSize = 512;
     u32 w = 0, h = 0, gw = 0, gh = 0, tris = 0;
     Buf verts, blas_buf, tlas_buf, scratch, instances, params, counters;
     vk::AccelerationStructureKHR blas{}, tlas{};
@@ -83,10 +105,10 @@ private:
 
     // Stats (logged every 5 s).
     u64 dispatches = 0, last_dispatches = 0;
-    std::array<u32, 5> last_counts{};
+    std::array<u32, 6> last_counts{};
     double gpu_ms_sum = 0.0;
     u32 gpu_ms_n = 0;
-    bool logged_camera = false;
+    bool logged_camera = false, logged_shine = false;
     std::chrono::steady_clock::time_point last_log{};
 };
 

@@ -1,0 +1,159 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-reflect (BB_RT_REFLECT=1): denoise + blend of the ray-traced reflections.
+//   mode 0  temporal: reproject the previous accumulated result with the previous camera
+//           (current view -> previous view -> previous projection), reject on depth / normal
+//           mismatch, clamp the history to the 3x3 neighbourhood statistics of this frame's raw
+//           result (no ghosting on camera motion), blend.
+//   mode 1  edge-aware a-trous filter (depth + normal bilateral, roughness aware), step 1.
+//   mode 2  same with step 2, then blended into the game's SSR target: colour replaced by the
+//           filtered RT colour (misses already carry the game's colour), alpha raised smoothly by
+//           the filtered hit fraction instead of a hard 0/1 replace (faint puddles fade).
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src_tex;    // this frame's input (texelFetch)
+layout(binding = 1) uniform sampler2D hist_tex;   // previous accumulated result (linear)
+layout(binding = 2) uniform sampler2D guide_tex;  // (view normal, view distance)
+layout(binding = 3) uniform sampler2D pguide_tex; // previous frame's guide
+layout(binding = 4, rgba16f) uniform writeonly image2D dst;
+layout(binding = 5, rgba16f) uniform image2D ssr_out;
+layout(binding = 6) uniform sampler2D shine_tex;
+layout(std140, binding = 7) uniform Params {
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 view;
+    mat4 reproj;
+    mat4 prev_proj;
+    uvec4 size;
+    vec4 misc;
+    vec4 misc2;
+    vec4 misc3;
+} p;
+layout(binding = 8) uniform sampler2D depth_tex;
+layout(std430, binding = 9) buffer Counters { uint n[8]; } cnt;
+layout(push_constant) uniform Push { uint mode; } pc;
+
+shared uint s_ok;
+
+vec3 Unproject(ivec2 px) {
+    float d = texelFetch(depth_tex, px, 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc.y > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    return v.xyz / v.w;
+}
+
+float Rough(ivec2 c) {
+    if ((uint(p.misc2.w) & 1u) == 0u) {
+        return p.misc3.y;
+    }
+    ivec2 ssz = textureSize(shine_tex, 0);
+    ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(p.size.xy)), ivec2(0), ssz - 1);
+    return clamp(1.0 - texelFetch(shine_tex, sc, 0).r, 0.0, 1.0);
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        s_ok = 0u;
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = ivec2(p.size.xy);
+    bool inside = all(lessThan(c, sz));
+    uint ok_hist = 0u;
+    if (inside) {
+        vec4 g = texelFetch(guide_tex, c, 0);
+        vec4 cur = texelFetch(src_tex, c, 0);
+        if (pc.mode == 0u) {
+            vec4 outv = cur;
+            if (g.w > 0.0) {
+                // Neighbourhood statistics (3x3) of this frame's raw result.
+                vec4 m1 = vec4(0.0), m2 = vec4(0.0);
+                for (int y = -1; y <= 1; ++y) {
+                    for (int x = -1; x <= 1; ++x) {
+                        vec4 s = texelFetch(src_tex, clamp(c + ivec2(x, y), ivec2(0), sz - 1), 0);
+                        m1 += s;
+                        m2 += s * s;
+                    }
+                }
+                m1 /= 9.0;
+                vec4 sigma = sqrt(max(m2 / 9.0 - m1 * m1, vec4(0.0)));
+                float alpha = 1.0;
+                if (p.misc2.x > 0.5) {
+                    vec3 P = Unproject(c);
+                    vec3 Q = (p.reproj * vec4(P, 1.0)).xyz;
+                    vec4 clip = p.prev_proj * vec4(Q, 1.0);
+                    if (clip.w > 1e-6) {
+                        vec2 ndc = clip.xy / clip.w;
+                        vec2 uv = vec2(ndc.x * 0.5 + 0.5,
+                                       p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+                        if (all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+                            ivec2 pc2 = clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1);
+                            vec4 pg = texelFetch(pguide_tex, pc2, 0);
+                            float qd = length(Q);
+                            vec3 nprev = mat3(p.reproj) * g.xyz;
+                            if (pg.w > 0.0 && abs(pg.w - qd) < 0.04 * qd + 0.05 &&
+                                dot(pg.xyz, nprev) > 0.9) {
+                                vec4 h = textureLod(hist_tex, uv, 0.0);
+                                // Variance clipping: history outside this frame's spread is pulled in.
+                                h = clamp(h, m1 - 1.5 * sigma, m1 + 1.5 * sigma);
+                                if (!any(isnan(h))) {
+                                    outv = mix(h, cur, p.misc3.x);
+                                    ok_hist = 1u;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            imageStore(dst, c, outv);
+        } else {
+            int step = pc.mode == 1u ? 1 : 2;
+            vec4 res = cur;
+            if (g.w > 0.0) {
+                float rough = Rough(c);
+                // Mirrors stay sharp, rough surfaces get the full blur.
+                float spread = mix(0.15, 1.0, clamp(rough * 3.0, 0.0, 1.0)) * p.misc3.z;
+                vec4 sum = cur;
+                float wsum = 1.0;
+                for (int y = -1; y <= 1; ++y) {
+                    for (int x = -1; x <= 1; ++x) {
+                        if (x == 0 && y == 0) continue;
+                        ivec2 q = c + ivec2(x, y) * step;
+                        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, sz))) continue;
+                        vec4 gq = texelFetch(guide_tex, q, 0);
+                        if (gq.w <= 0.0) continue;
+                        float k = (x == 0 || y == 0) ? 0.5 : 0.25;
+                        float wd = exp(-abs(gq.w - g.w) / (0.02 * g.w + 0.01));
+                        float wn = pow(max(dot(gq.xyz, g.xyz), 0.0), 32.0);
+                        float w = k * wd * wn * spread;
+                        sum += texelFetch(src_tex, q, 0) * w;
+                        wsum += w;
+                    }
+                }
+                res = sum / wsum;
+            }
+            if (pc.mode == 1u) {
+                imageStore(dst, c, res);
+            } else if (g.w > 0.0) {
+                vec4 game = imageLoad(ssr_out, c);
+                float a = clamp(res.a, 0.0, 1.0);
+                if ((uint(p.misc2.w) & 2u) != 0u) {
+                    a = sqrt(a); // BB_RT_REFLECT_MORE: faint hits count more
+                }
+                vec4 o = vec4(res.rgb, mix(game.a, max(game.a, 1.0), a));
+                if (p.misc.w > 0.5) {
+                    o.rgb = mix(o.rgb, vec3(1.0, 0.0, 1.0), 0.5 * a);
+                }
+                if (!any(isnan(o)) && !any(isinf(o))) {
+                    imageStore(ssr_out, c, o);
+                }
+            }
+        }
+    }
+    if (ok_hist != 0u) atomicAdd(s_ok, 1u);
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && pc.mode == 0u) {
+        atomicAdd(cnt.n[5], s_ok);
+    }
+}
