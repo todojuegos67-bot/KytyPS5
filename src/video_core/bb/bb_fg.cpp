@@ -162,7 +162,14 @@ int AmdActiveFrames() {
 
 void ApplyAmdEnv() {
     if (Cfg().kind != Kind::Amd) return;
-    WriteAmdEnv(AmdFrames(), AmdActiveFrames());
+    // A SetAmdActive on another thread between the load and the write would be overwritten with
+    // the older value until the next dynamic change: write again until the value read is stable.
+    for (int active = AmdActiveFrames();;) {
+        WriteAmdEnv(AmdFrames(), active);
+        const int now = AmdActiveFrames();
+        if (now == active) break;
+        active = now;
+    }
 }
 
 void SetAmdActive(int multiplier) {
