@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -432,6 +435,56 @@ bool Instance::CreateDevice() {
         }
     }
 
+    // bb-rt-reflect (BB_RT_REFLECT=1, default off): ray query + acceleration structures for the
+    // ray-traced reflection pass that will replace the game's SSR. Unset: nothing changes.
+    bool bb_rt_on = false;
+    if (const char* e = std::getenv("BB_RT_REFLECT"); e && e[0] == '1') {
+        const auto has = [&](std::string_view n) {
+            return std::find(available_extensions.begin(), available_extensions.end(), n) !=
+                   available_extensions.end();
+        };
+        const bool ext_ok = has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+                            has(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+                            has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        bool rq = false, as = false, bda = false;
+        u32 max_geom = 0, max_inst = 0;
+        if (ext_ok) {
+            const auto fc = physical_device.getFeatures2<
+                vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
+                vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+                vk::PhysicalDeviceRayQueryFeaturesKHR>();
+            rq = fc.get<vk::PhysicalDeviceRayQueryFeaturesKHR>().rayQuery;
+            as = fc.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>()
+                     .accelerationStructure;
+            bda = fc.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress;
+            const auto pc = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2,
+                vk::PhysicalDeviceAccelerationStructurePropertiesKHR>();
+            const auto& asp = pc.get<vk::PhysicalDeviceAccelerationStructurePropertiesKHR>();
+            max_geom = static_cast<u32>(asp.maxGeometryCount);
+            max_inst = static_cast<u32>(asp.maxInstanceCount);
+        }
+        bb_rt_on = ext_ok && rq && as && bda;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-reflect] device: extensions {}, ray query {}, AS {}, bufferDeviceAddress {}, "
+                 "maxGeometryCount {}, maxInstanceCount {} -> {}",
+                 ext_ok ? "yes" : "no", rq ? "yes" : "no", as ? "yes" : "no", bda ? "yes" : "no",
+                 max_geom, max_inst, bb_rt_on ? "ENABLED" : "disabled (unsupported)");
+        if (bb_rt_on) {
+            for (const char* n : {VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                                  VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                                  VK_KHR_RAY_QUERY_EXTENSION_NAME}) {
+                if (std::find_if(enabled_extensions.begin(), enabled_extensions.end(),
+                                 [&](const char* x) { return std::string_view{x} == n; }) ==
+                    enabled_extensions.end()) {
+                    LOG_INFO(Render_Vulkan, "Enabling extension: {} (rt-reflect)", n);
+                    enabled_extensions.push_back(n);
+                }
+            }
+        }
+    }
+    bb_rt_reflect = bb_rt_on;
+
     static constexpr std::array queue_priorities = {1.0f, 1.0f};
     // bb-clean-021-fg: FSR 3 frame generation (BB_FG=amd-x2) adds a second graphics queue for its
     // presents and two async compute queues; with BB_FG off one graphics queue as before.
@@ -674,6 +727,20 @@ bool Instance::CreateDevice() {
         reflex_ci.pNext = BB::Reflex::ChainDeviceFeatures(const_cast<void*>(reflex_ci.pNext));
         reflex_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         reflex_ci.ppEnabledExtensionNames = enabled_extensions.data();
+    }
+    // bb-rt-reflect: chain the AS / ray query features (bufferDeviceAddress is already set
+    // from vk12_features above when supported, which bb_rt_reflect requires).
+    static vk::PhysicalDeviceAccelerationStructureFeaturesKHR bb_rt_as{};
+    static vk::PhysicalDeviceRayQueryFeaturesKHR bb_rt_rq{};
+    if (bb_rt_reflect) {
+        auto& rt_ci = device_chain.get<vk::DeviceCreateInfo>();
+        bb_rt_rq = vk::PhysicalDeviceRayQueryFeaturesKHR{.rayQuery = true};
+        bb_rt_as = vk::PhysicalDeviceAccelerationStructureFeaturesKHR{
+            .pNext = &bb_rt_rq, .accelerationStructure = true};
+        bb_rt_rq.pNext = const_cast<void*>(rt_ci.pNext);
+        rt_ci.pNext = &bb_rt_as;
+        rt_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+        rt_ci.ppEnabledExtensionNames = enabled_extensions.data();
     }
     if (BB::Upscale::Capture()) {
         std::string names;

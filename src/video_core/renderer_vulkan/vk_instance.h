@@ -80,6 +80,11 @@ public:
     }
 
     /// Returns true if anisotropic filtering is supported
+    /// bb-rt-reflect: BB_RT_REFLECT=1 and the device got AS + ray query.
+    bool IsRtReflectEnabled() const {
+        return bb_rt_reflect;
+    }
+
     bool IsAnisotropicFilteringSupported() const {
         return features.samplerAnisotropy;
     }
@@ -548,6 +553,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool bb_rt_reflect{}; // bb-rt-reflect: BB_RT_REFLECT=1 and AS + ray query enabled
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
