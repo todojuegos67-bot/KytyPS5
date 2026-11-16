@@ -8679,6 +8679,61 @@ public:
               ReadBuffer(name, raw_d16_rg8_readback, 1)[0] == 0x40004000u,
               "D16 sampled as 8_8 UNORM lost the depth bytes");
 
+      // A depth target asked for wider than the cached depth image at the same
+      // address and guest size is re-created at the requested extent with the
+      // old contents: the render area follows the request (Wolverine's
+      // CHK_GP_CAN_DOCKS_CHASE_LOGGING_03 lost the device rendering past it).
+      constexpr uint64_t grow_depth_offset = 0x27d8000;
+      const auto make_grow_depth = [&](uint32_t width) {
+        auto desc = MakeLinearDesc(base + grow_depth_offset, 4 * sizeof(float),
+                                   vk::Format::eD32Sfloat,
+                                   Prospero::BufferFormat::k32Float,
+                                   Prospero::ImageType::kColor2D, {width, 1, 1},
+                                   1, sizeof(float), 1);
+        // One guest pitch for every width, as the game's tiled depth has: the
+        // extents differ, the guest layout does not.
+        desc.info.pitch = 4;
+        desc.info.mip_layout[0].pitch = 4;
+        desc.info.mip_layout[0].linear_pitch = 4;
+        desc.type = BindingType::DepthTarget;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      auto narrow_depth = make_grow_depth(2);
+      const auto narrow_depth_image = texture_cache.FindImage(narrow_depth);
+      (void)texture_cache.FindDepthTarget(narrow_depth_image, narrow_depth);
+      auto &narrow_depth_native = texture_cache.GetImage(narrow_depth_image);
+      narrow_depth_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                  vk::AccessFlagBits2::eTransferWrite, {},
+                                  scheduler.Current().Handle());
+      const vk::ClearDepthStencilValue narrow_depth_clear{0.25f, 0};
+      const vk::ImageSubresourceRange narrow_depth_range{
+          vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          narrow_depth_native.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, &narrow_depth_clear, 1,
+          &narrow_depth_range);
+      texture_cache.MarkGpuWritten(narrow_depth_image);
+      auto wide_depth = make_grow_depth(4);
+      const auto wide_depth_image = texture_cache.FindImage(wide_depth);
+      (void)texture_cache.FindDepthTarget(wide_depth_image, wide_depth);
+      Require(name, "wider depth target re-created",
+              wide_depth_image && wide_depth_image != narrow_depth_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    narrow_depth_image) &&
+                  texture_cache.GetImage(wide_depth_image).backing.extent.width ==
+                      4,
+              "a wider depth-target request kept the narrower native image");
+      Require(name, "wider depth target keeps the old contents",
+              ReadCachedTexel(name, context, wide_depth_image, {1, 0, 0})[0] ==
+                  std::bit_cast<u32>(0.25f),
+              "the re-created depth target lost the narrower image's depth");
+      auto narrow_depth_again = make_grow_depth(2);
+      Require(name, "narrower depth target reuses the wider image",
+              texture_cache.FindImage(narrow_depth_again) == wide_depth_image,
+              "a narrower depth-target request re-created the wider image");
+
       constexpr uint64_t layered_raw_d16_offset = raw_d16_offset + 0x1000;
       constexpr std::array<uint16_t, 12> layered_raw_d16_values{
           0x0102u, 0x0304u, 0x1112u, 0x1314u, 0x2122u, 0x2324u,
