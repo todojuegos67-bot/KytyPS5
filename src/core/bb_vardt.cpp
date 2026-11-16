@@ -668,18 +668,26 @@ float CapPeriod() {
 }
 
 void SetLimiterExternal(bool external) {
-    if (!g_installed || !g_cap_real || external == g_limiter_external) {
+    if (!g_installed || !g_cap_real) {
         return;
     }
-    g_limiter_external = external;
+    // Data only, no code patch: the limiter (0x2034770) stores its period into this+0x18 from
+    // the immediate at 0x203485A every frame (jump table entry 0 after the kLimiter patch), then
+    // calls gettimeofday (0x2034977, where this runs) and reads this+0x18 at 0x2034991. A write
+    // here therefore holds for this frame and must be repeated every frame; when it stops, the
+    // next frame's immediate (g_period, never rewritten) gives the cap back by itself. Same
+    // thread as the limiter, between its store and its read: nothing to synchronize, no page
+    // protection to change, and immune to the static patcher relocating that code.
     const float period = external ? 0.001f : g_period;
-    MakeWritable(PeriodImmVa[0], PeriodImmVa[3] + 9);
-    for (const u32 p : PeriodImmVa) Write32(p + 5, Bits(period));
     u64 frame = 0;
     std::memcpy(&frame, AtV(FramePtrVa), 8);
     if (frame >= 0x10000 && (frame & 3) == 0) {
         std::memcpy(reinterpret_cast<void*>(frame + OffPeriod), &period, 4);
     }
+    if (external == g_limiter_external) {
+        return;
+    }
+    g_limiter_external = external;
     LOG_INFO(Lib_VideoOut,
              "[vardt] frame cap {:.0f} fps: {} (game limiter period {:.3f} ms)", 1.0f / g_period,
              external ? "paced by NVIDIA Reflex's sleep" : "back in the game's limiter",

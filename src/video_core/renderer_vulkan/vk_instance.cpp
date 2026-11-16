@@ -668,7 +668,8 @@ bool Instance::CreateDevice() {
         bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
         Core::ReleaseDlssAddressHole();
     }
-    {
+    if (BB::Reflex::Requested()) {
+        // bb-reflex: not requested, the device create info is left exactly as before.
         auto& reflex_ci = device_chain.get<vk::DeviceCreateInfo>();
         reflex_ci.pNext = BB::Reflex::ChainDeviceFeatures(const_cast<void*>(reflex_ci.pNext));
         reflex_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());

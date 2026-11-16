@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bb-reflex: NVIDIA Reflex through VK_NV_low_latency2 when the launcher selects it (BB_FG=dlss-*
-// with BB_ANTILAG_DLSSG=reflex, or no frame generation with BB_ANTILAG=auto on an NVIDIA GPU;
-// BB_REFLEX=1 forces it, BB_REFLEX=off turns it off). Streamline's Reflex is not used: Streamline
+// with BB_ANTILAG_DLSSG=reflex) or BB_REFLEX=1 (any mode but FSR 3 FG; it is the only way to get
+// it without frame generation: opt-in, see Cfg() in bb_reflex.cpp); BB_REFLEX=0 / off turns it
+// off. Not requested: no device extension, no latency swapchain, nothing else changes. Streamline's Reflex is not used: Streamline
 // runs with manual hooking and DLSS only (the present never goes through it), it is loaded only
 // with the DLSS upscaler, and its frame token is made per DLSS evaluate on the GPU thread, while
 // the DLSS-G frames come from NGX (bbport_dlss) in the presenter.
@@ -15,7 +16,8 @@
 // first guest submit), RENDERSUBMIT_START / END (first guest submit / guest flip), PRESENT_START /
 // END (around the game frame's present). Sleep: vkLatencySleepNV at the game's frame start.
 // Frame cap: with BB_VARIABLE_DT's BB_GAME_FPS_CAP, Reflex's minimumIntervalUs and a 1 ms period
-// in the game's limiter (bb_vardt.cpp), so only one of the two waits.
+// in the game's limiter (written each frame into the limiter object, bb_vardt.cpp; no code
+// patch), so only one of the two waits. BB_REFLEX_CAP=0 leaves the cap to the game's limiter.
 
 // Device and swapchain set-up: bb_reflex_vk.h.
 #pragma once

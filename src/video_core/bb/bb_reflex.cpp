@@ -53,8 +53,10 @@ const Settings& Cfg() {
         const auto kind = BB::FG::Cfg().kind;
         const bool fg_off = kind == BB::FG::Kind::Off &&
                             (fg_raw.empty() || fg_raw == "off" || fg_raw == "0");
-        if (force == "off") {
-            r.why = "BB_REFLEX=off";
+        // BB_REFLEX: "1" asks for it, "0" / "off" turns it off (the launcher writes "0" whenever
+        // it does not pick Reflex), unset follows the DLSS-G setting below.
+        if (force == "off" || force == "0") {
+            r.why = fmt::format("BB_REFLEX={}", force);
         } else if (kind == BB::FG::Kind::Amd) {
             r.why = "FSR 3 frame generation paces its own frames (its interpolation swapchain)";
         } else if (force == "1") {
@@ -65,10 +67,14 @@ const Settings& Cfg() {
             r.why = fmt::format("DLSS-G with BB_ANTILAG_DLSSG={}",
                                 al_dlssg.empty() ? "(unset)" : al_dlssg);
         } else if (fg_off) {
-            r.requested = al == "auto";
-            r.why = fmt::format("no frame generation, BB_ANTILAG={}{}",
-                                al.empty() ? "(unset)" : al,
-                                r.requested ? " (Reflex on NVIDIA)" : "");
+            // Opt-in only (BB_REFLEX=1). BB_ANTILAG=auto, the launcher's default, used to turn it
+            // on for every NVIDIA user without frame generation; review (bb-reflex-rv) made it
+            // opt-in: it is untested on hardware and changes the default path (latency-mode
+            // swapchain, a sleep inside the game's frame limiter, the fps cap moved from the
+            // game's limiter to the driver), which the port's rules keep behind a switch.
+            r.requested = false;
+            r.why = fmt::format("no frame generation, BB_ANTILAG={}: Reflex only with BB_REFLEX=1",
+                                al.empty() ? "(unset)" : al);
         } else {
             r.why = fmt::format("BB_FG={}: not DLSS-G", fg_raw);
         }
@@ -89,7 +95,7 @@ const Settings& Cfg() {
 
 // Device.
 bool g_ext_added = false;
-bool g_ready = false;
+std::atomic<bool> g_ready{false}; // set once on the render thread, read by the game threads
 std::atomic<bool> g_disabled{false};
 std::string g_off_reason;
 vk::Device g_device{};
@@ -246,10 +252,12 @@ void FrameStart() {
     // (minimized: no swapchain, errors) the game's limiter has it.
     const uint32_t interval = g_applied_interval_us.load();
     const bool own = slept && interval != 0 && interval != UINT32_MAX;
-    if (own != g_cap_owned) {
-        g_cap_owned = own;
+    // Every frame while Reflex owns the cap (the limiter rewrites its period from its own code
+    // each frame); once more when it gives it back.
+    if (own || g_cap_owned) {
         BB::VarDt::SetLimiterExternal(own);
     }
+    g_cap_owned = own;
     uint64_t id = 0;
     {
         std::scoped_lock lock{g_frames_mutex};
@@ -368,7 +376,7 @@ void OnDevice(vk::Device device) {
     }
     g_device = device;
     g_sleep_semaphore = semaphore;
-    g_ready = true;
+    g_ready.store(true, std::memory_order_release);
     BB::Upscale::Checkpoint("[reflex] VK_NV_low_latency2 ready on the device (the swapchain "
                             "is made with latency mode on)");
 }
@@ -530,7 +538,8 @@ void EndPresent(uint64_t id, bool presented) {
 }
 
 bool Active() {
-    return g_ready && g_latency_swapchain.load(std::memory_order_relaxed) &&
+    return g_ready.load(std::memory_order_acquire) &&
+           g_latency_swapchain.load(std::memory_order_relaxed) &&
            !g_disabled.load(std::memory_order_relaxed);
 }
 
