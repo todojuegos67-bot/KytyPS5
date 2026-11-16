@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <filesystem>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -117,6 +123,30 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
+    // bb-precompile: cached pipelines built into VkPipelines on worker threads at boot.
+    struct PrecompileJob {
+        std::atomic<u32> state{0}; // 0 queued, 1 building, 2 done
+        std::mutex m;
+        std::condition_variable cv;
+        bool is_compute{};
+        GraphicsPipelineKey gkey{};
+        ComputePipelineKey ckey{};
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        GraphicsPipeline::SerializationSupport gsdata{};
+        ComputePipeline::SerializationSupport csdata{};
+        std::unique_ptr<GraphicsPipeline> gp;
+        std::unique_ptr<ComputePipeline> cp;
+    };
+    void BuildJob(PrecompileJob& job);
+    // Claims the job (builds it on this thread if no worker started it) or waits for it.
+    void FinishJob(PrecompileJob& job);
+    void StartPrecompile();
+    void StopPrecompile();
+    void SaveDriverCacheFromWorker();
+
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
@@ -147,6 +177,18 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // bb-precompile state. The two pending maps are filled during WarmUp (before the game runs)
+    // and afterwards touched only by the game thread; workers only see the job objects.
+    bool precompile_async{};
+    std::vector<std::shared_ptr<PrecompileJob>> precompile_jobs;
+    std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PrecompileJob>> pending_graphics;
+    std::unordered_map<ComputePipelineKey, std::shared_ptr<PrecompileJob>> pending_compute;
+    std::vector<std::jthread> precompile_workers;
+    std::atomic<size_t> precompile_next{0};
+    std::atomic<size_t> precompile_done{0};
+    std::atomic<bool> precompile_stop{false};
+    std::chrono::steady_clock::time_point precompile_start{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

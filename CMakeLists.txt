@@ -1253,6 +1253,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/fsr411/fsr411_vk.h
                src/video_core/bb/bb_upscale.cpp
                src/video_core/bb/bb_perf2.h
+               src/video_core/bb/bb_precompile.cpp
+               src/video_core/bb/bb_precompile.h
                src/video_core/bb/bb_gpu_profile.cpp
                src/video_core/bb/bb_gpu_profile.h
                src/video_core/bb/bb_objmv2.cpp

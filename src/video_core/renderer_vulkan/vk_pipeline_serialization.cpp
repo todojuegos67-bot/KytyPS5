@@ -5,6 +5,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "video_core/bb/bb_precompile.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -156,6 +157,23 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         return false;
     }
 
+    if (precompile_async) {
+        // bb-precompile: built on a worker thread; GetComputePipeline picks it up.
+        if (!compute_pipelines.contains(compute_key) && !pending_compute.contains(compute_key)) {
+            auto job = std::make_shared<PrecompileJob>();
+            job->is_compute = true;
+            job->ckey = compute_key;
+            job->infos = infos;
+            job->modules = modules;
+            job->csdata = sdata;
+            pending_compute.emplace(compute_key, job);
+            precompile_jobs.push_back(std::move(job));
+        }
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
+
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
@@ -231,6 +249,29 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         }
     }
 
+    if (precompile_async) {
+        // bb-precompile: built on a worker thread; GetGraphicsPipeline picks it up. The fetch
+        // shader data is copied because the program's permutation vector may reallocate.
+        if (!graphics_pipelines.contains(graphics_key) &&
+            !pending_graphics.contains(graphics_key)) {
+            auto job = std::make_shared<PrecompileJob>();
+            job->gkey = graphics_key;
+            job->infos = infos;
+            job->modules = modules;
+            job->runtime_infos = runtime_infos;
+            if (fetch_shader) {
+                job->fetch = *fetch_shader;
+            }
+            job->gsdata = sdata;
+            pending_graphics.emplace(graphics_key, job);
+            precompile_jobs.push_back(std::move(job));
+        }
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
+
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
@@ -302,7 +343,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
-    if (!EmulatorSettings.IsPipelineCacheEnabled()) {
+    // bb-precompile (default on, BB_PRECOMPILE=0 to disable) turns the pipeline cache on.
+    if (!EmulatorSettings.IsPipelineCacheEnabled() && !BBPrecompile::Enabled()) {
         return;
     }
 
@@ -329,6 +371,32 @@ void PipelineCache::WarmUp() {
         Storage::DataBase::Instance().Reset();
         profile_data.clear();
     }
+    // bb-precompile: pull in the shipped cache entries this user cache lacks (directory mode).
+    if (BBPrecompile::Enabled() && !EmulatorSettings.IsPipelineCacheArchived()) {
+        std::vector<u8> cur(sizeof(profile));
+        std::memcpy(cur.data(), &profile, sizeof(profile));
+        const auto matches = [this](std::span<const u8> p) {
+            if (p.size() != sizeof(Shader::Profile)) {
+                return false;
+            }
+            Shader::Profile other{};
+            std::memcpy(&other, p.data(), sizeof(other));
+            return other == profile;
+        };
+        const BBPrecompile::CacheVersions versions{Serialization::ShaderBinaryVersion,
+                                                   Serialization::ShaderMetaVersion,
+                                                   Serialization::PipelineKeyVersion};
+        const u32 imported = BBPrecompile::ImportShipped(
+            Storage::DataBase::Instance().GetCachePath(), cur, versions, matches);
+        if (imported > 0 && profile_data.empty()) {
+            // Fresh user cache seeded from the shipped one: write the profile now so the
+            // entries load below (and on later runs).
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::vector<u8>{cur});
+            profile_data = std::move(cur);
+        }
+    }
+
     if (profile_data.empty()) {
         Storage::DataBase::Instance().FinishPreload();
 
@@ -357,6 +425,8 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    precompile_async = BBPrecompile::Enabled();
+    const auto load_start = std::chrono::steady_clock::now();
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -387,6 +457,14 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (precompile_async) {
+        LOG_INFO(Render,
+                 "[precompile] {} cached pipelines read in {} ms; building them on worker threads",
+                 precompile_jobs.size(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - load_start)
+                     .count());
+    }
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

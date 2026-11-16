@@ -5,6 +5,7 @@
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "common/thread.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -16,6 +17,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/bb/bb_objmv2.h"
 #include "video_core/bb/bb_perf2.h"
+#include "video_core/bb/bb_precompile.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -343,13 +345,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .fast_shader_math = EmulatorSettings.IsFastShaderMath(),
         .support_bda = instance_.IsBufferDeviceAddressSupported(),
     };
-    WarmUp();
-
     // bb-perf-2 (BB_PERF2=1): seed the driver pipeline cache from the last run, so pipelines the
     // game already used skip the driver's SPIR-V -> ISA step (the driver validates the header and
     // ignores data from another GPU/driver version).
+    // bb-precompile: also on by default (BB_PRECOMPILE), and created BEFORE WarmUp so the
+    // pipelines built from the shader cache go through (and fill) the driver cache.
     std::vector<u8> initial_data;
-    if (BBPerf2::Enabled()) {
+    if (BBPerf2::Enabled() || BBPrecompile::Enabled()) {
         const auto props = instance.GetPhysicalDevice().getProperties();
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
                             fmt::format("bb-driver-cache-{:08x}-{:08x}.bin", props.deviceID,
@@ -380,14 +382,111 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                vk::to_string(created.result));
     pipeline_cache = std::move(created.value);
     driver_cache_save_time = std::chrono::steady_clock::now();
+
+    WarmUp();
+    StartPrecompile();
 }
 
 PipelineCache::~PipelineCache() {
+    StopPrecompile();
     MaybeSaveDriverCache(true);
 }
 
+void PipelineCache::BuildJob(PrecompileJob& job) {
+    if (job.is_compute) {
+        job.cp = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                   *pipeline_cache, job.ckey, *job.infos[0],
+                                                   job.modules[0], job.csdata, true);
+    } else {
+        job.gp = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, job.gkey, *pipeline_cache, job.infos,
+            job.runtime_infos, job.fetch ? &*job.fetch : nullptr, job.modules, job.gsdata, true);
+    }
+    {
+        std::scoped_lock lk{job.m};
+        job.state.store(2, std::memory_order_release);
+    }
+    job.cv.notify_all();
+}
+
+void PipelineCache::FinishJob(PrecompileJob& job) {
+    u32 expected = 0;
+    if (job.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        BuildJob(job); // no worker reached it yet: build it here, like a normal compile
+        precompile_done.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::unique_lock lk{job.m};
+    job.cv.wait(lk, [&] { return job.state.load(std::memory_order_acquire) == 2; });
+}
+
+void PipelineCache::StartPrecompile() {
+    if (precompile_jobs.empty()) {
+        return;
+    }
+    precompile_start = std::chrono::steady_clock::now();
+    const u32 n = std::min<u32>(BBPrecompile::NumThreads(), static_cast<u32>(precompile_jobs.size()));
+    LOG_INFO(Render, "[precompile] building {} pipelines on {} worker thread(s)",
+             precompile_jobs.size(), n);
+    for (u32 t = 0; t < n; ++t) {
+        precompile_workers.emplace_back([this, t] {
+            Common::SetCurrentThreadName(fmt::format("shadPS4:Precompile{}", t).c_str());
+            const size_t total = precompile_jobs.size();
+            const size_t step = std::max<size_t>(total / 10, 1);
+            while (!precompile_stop.load(std::memory_order_relaxed)) {
+                const size_t i = precompile_next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= total) {
+                    break;
+                }
+                auto& job = *precompile_jobs[i];
+                u32 expected = 0;
+                if (!job.state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                    continue; // the game thread needed it first and built it itself
+                }
+                BuildJob(job);
+                const size_t done = precompile_done.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (done % step == 0 || done == total) {
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - precompile_start)
+                                        .count();
+                    LOG_INFO(Render, "[precompile] {}/{} pipelines built ({} ms)", done, total,
+                             ms);
+                    if (done == total) {
+                        LOG_INFO(Render, "[precompile] done: all cached pipelines are ready");
+                        SaveDriverCacheFromWorker();
+                    }
+                }
+            }
+        });
+    }
+}
+
+void PipelineCache::StopPrecompile() {
+    precompile_stop.store(true, std::memory_order_relaxed);
+    for (auto& w : precompile_workers) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    precompile_workers.clear();
+}
+
+void PipelineCache::SaveDriverCacheFromWorker() {
+    if (driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    // vkGetPipelineCacheData needs no external synchronization; a separate tmp name keeps this
+    // from colliding with a save from the game thread.
+    auto [res, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (res == vk::Result::eSuccess && !data.empty() &&
+        BBPrecompile::WriteFileAtomic(driver_cache_path, data, ".pre.tmp")) {
+        LOG_INFO(Render, "[precompile] driver pipeline cache saved: {} KiB", data.size() / 1024);
+    }
+}
+
 void PipelineCache::MaybeSaveDriverCache(bool force) {
-    if (!BBPerf2::Enabled() || driver_cache_path.empty() || !pipeline_cache) {
+    if (!(BBPerf2::Enabled() || BBPrecompile::Enabled()) || driver_cache_path.empty() ||
+        !pipeline_cache) {
         return;
     }
     if (!force) {
@@ -433,6 +532,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (is_new && !pending_graphics.empty()) {
+        // bb-precompile: built (or being built) from the shader cache at boot.
+        if (const auto pit = pending_graphics.find(graphics_key); pit != pending_graphics.end()) {
+            auto job = std::move(pit->second);
+            pending_graphics.erase(pit);
+            FinishJob(*job);
+            it.value() = std::move(job->gp);
+            return it->second.get();
+        }
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
@@ -469,6 +578,15 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         return nullptr;
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    if (is_new && !pending_compute.empty()) {
+        if (const auto pit = pending_compute.find(compute_key); pit != pending_compute.end()) {
+            auto job = std::move(pit->second);
+            pending_compute.erase(pit);
+            FinishJob(*job);
+            it.value() = std::move(job->cp);
+            return it->second.get();
+        }
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
