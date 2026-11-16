@@ -353,6 +353,61 @@ void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
              d.empty() ? " none" : d);
 }
 
+void Rasterizer::BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect) {
+    static u64 n_direct = 0;
+    static u64 n_indirect = 0;
+    static u64 n_null = 0;
+    static std::vector<u64> logged;
+    static auto last = std::chrono::steady_clock::time_point{};
+    if (!pipeline) {
+        ++n_null;
+    } else if (indirect) {
+        ++n_indirect;
+    } else {
+        ++n_direct;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (last == std::chrono::steady_clock::time_point{} || now - last >= std::chrono::seconds(5)) {
+        last = now;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-reflect] graphics draws: Draw {}, DrawIndirect {}, no pipeline {}", n_direct,
+                 n_indirect, n_null);
+    }
+    if (!pipeline || logged.size() >= 3) {
+        return;
+    }
+
+    const auto& regs = liverpool->regs;
+    const Shader::Info* ps = nullptr;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && stage->sw_stage == Shader::SwStage::Fragment) {
+            ps = stage;
+        }
+    }
+    if (!ps || !regs.depth_buffer.DepthValid() ||
+        std::ranges::find(logged, ps->pgm_hash) != logged.end()) {
+        return;
+    }
+    bool sized_target = false;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col = regs.color_buffers[cb];
+        if (!col || regs.color_target_mask.GetMask(cb) == 0) {
+            continue;
+        }
+        const u32 w = col.Pitch();
+        const u32 h = col.Height();
+        sized_target |= (w == 1280 && h == 720) || (w == 1024 && h == 512) ||
+                        (w == 640 && h == 360);
+    }
+    if (!sized_target) {
+        return;
+    }
+    logged.push_back(ps->pgm_hash);
+    LOG_INFO(Render_Vulkan, "[rt-reflect] candidate PS #{} {:#x} after {} draws: {}", logged.size(),
+             ps->pgm_hash, n_direct + n_indirect,
+             BbSsrDesc(*pipeline, regs, indirect ? "DrawIndirect" : "Draw", true));
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -364,6 +419,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    if (BbRtReflectRequested()) {
+        BbRtReflectSeeDraw(pipeline, false);
+    }
     if (!pipeline) {
         return;
     }
@@ -446,6 +504,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    if (BbRtReflectRequested()) {
+        BbRtReflectSeeDraw(pipeline, true);
+    }
     if (!pipeline) {
         return;
     }
@@ -456,6 +517,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (BbRtReflectRequested()) {
+        BbRtReflectProbe(*pipeline);
+    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
