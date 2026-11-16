@@ -68,6 +68,11 @@ struct Camera {
     float view_to_clip[16]{};
     float fov_y = 1.0f, z_near = 0.1f, z_far = 1000.0f;
     bool reset = false;
+    // bb-dlssg-inputs: the game camera in world space (inverse view of the scene block: columns
+    // 0 / 1 / 2 / 3 = right / up / view z / position; forward = the view z column signed towards
+    // where clip w grows). DLSS-G's cameraPos / Up / Right / Fwd (were placeholders).
+    bool basis_valid = false;
+    float cam_pos[3]{}, cam_up[3]{}, cam_right[3]{}, cam_fwd[3]{};
     // bb-clean-021-bbport (Supermedo's camera_motion.comp): previous view * inverse current view
     // (3x4 rows), current and previous projection (x scale, y scale, z scale, z offset).
     bool mv_valid = false;

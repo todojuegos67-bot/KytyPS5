@@ -750,6 +750,32 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
             cam.z_far = zf > 1e7 ? 0.0f : static_cast<float>(zf);
             cam.valid = true;
             cam.reset = !prev.valid;
+            // bb-dlssg-inputs: world-space camera basis from the inverse view (3x4 rows: column
+            // j = (iv[j], iv[4 + j], iv[8 + j])), checked orthonormal; forward signed so that
+            // clip w grows along it (in front of the camera, whatever the view's handedness).
+            const float* iv = cur.inv_view;
+            double col[4][3];
+            for (int j = 0; j < 4; ++j) {
+                col[j][0] = iv[j];
+                col[j][1] = iv[4 + j];
+                col[j][2] = iv[8 + j];
+            }
+            const double l0 = Len3(col[0]), l1 = Len3(col[1]), l2 = Len3(col[2]);
+            const bool unit = std::fabs(l0 - 1.0) < 0.02 && std::fabs(l1 - 1.0) < 0.02 &&
+                              std::fabs(l2 - 1.0) < 0.02;
+            const bool ortho = std::fabs(Dot3(col[0], col[1])) < 0.02 &&
+                               std::fabs(Dot3(col[0], col[2])) < 0.02 &&
+                               std::fabs(Dot3(col[1], col[2])) < 0.02;
+            const double fwd_sign = Dot3(col[2], r3) >= 0.0 ? 1.0 : -1.0;
+            if (unit && ortho && std::isfinite(col[3][0] + col[3][1] + col[3][2])) {
+                for (int k = 0; k < 3; ++k) {
+                    cam.cam_right[k] = static_cast<float>(col[0][k]);
+                    cam.cam_up[k] = static_cast<float>(col[1][k]);
+                    cam.cam_fwd[k] = static_cast<float>(fwd_sign * col[2][k]);
+                    cam.cam_pos[k] = static_cast<float>(col[3][k]);
+                }
+                cam.basis_valid = true;
+            }
         }
         // The motion-vector camera (bb_mv.comp): previous view * inverse current view.
         if (cur.valid && prev.valid && prev.proj[0] != 0.0f) {

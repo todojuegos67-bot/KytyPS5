@@ -630,6 +630,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     ImGui::InvitationPrompt::Register();
 }
 
+static void BbDlssgProbeDestroy(VmaAllocator allocator); // bb-dlssg-inputs
+
 Presenter::~Presenter() {
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
@@ -655,6 +657,7 @@ Presenter::~Presenter() {
                             frame.hudless_allocation);
         }
     }
+    BbDlssgProbeDestroy(instance.GetAllocator());
 }
 
 // bb-hudless: (re)creates a frame's HUD-less image at the frame's size and format.
@@ -730,6 +733,327 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
 // bb-clean-021-bbport: Supermedo's DestroyGenerated / EnsureGenerated (vk_presenter.cpp, GPL-2.0):
 // only as many as asked; every presentation frame has its own (the frame's fence was waited for
 // in GetRenderFrame, so the GPU is done with them).
+// bb-dlssg-inputs: what DLSS-G's HUD-less input is. NVIDIA (Streamline ProgrammingGuideDLSS_G.md,
+// "Hudless"): "Same color space and post-processing effects (e.g., tonemapping, blur, etc.) as
+// the color back buffer". Ours is the UI target copied at the HUD cut and run through our
+// post-process pass, but not through the game's display pass: outside the HUD it differed from
+// the finished frame on 87-92% of the pixels ("[fsr3-hudless] 1 s: ... outside the HUD,
+// post-processed copy != finished frame on 91.92%"). FSR 3 got it corrected
+// (bb_hudless_fix.comp: the finished frame's own pixels outside the HUD) since bb-mv-only;
+// DLSS-G got the raw copy, so it saw nearly the whole picture as UI (pixels not interpolated:
+// generated frames close to the real one, motion less fluid with no artifact).
+// BB_DLSSG_HUDLESS=fix (default: the same corrected image FSR 3 gets; none when the correction
+// could not run) | raw (the uncorrected copy, as before) | off (no HUD-less image).
+enum class BbDlssgHudless { Fix, Raw, Off };
+static BbDlssgHudless BbDlssgHudlessMode() {
+    static const BbDlssgHudless mode = [] {
+        const char* v = std::getenv("BB_DLSSG_HUDLESS");
+        const std::string s = v != nullptr ? v : "";
+        const BbDlssgHudless m = s == "raw"   ? BbDlssgHudless::Raw
+                                 : s == "off" || s == "0" ? BbDlssgHudless::Off
+                                                          : BbDlssgHudless::Fix;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[dlssg-in] HUD-less image for DLSS-G: {} (BB_DLSSG_HUDLESS=fix|raw|off)",
+            m == BbDlssgHudless::Fix   ? "fix: equal to the finished frame outside the HUD "
+                                         "(bb_hudless_fix.comp, as FSR 3), none if that fails"
+            : m == BbDlssgHudless::Raw ? "raw: the post-processed copy at the cut (as before)"
+                                       : "off: none"));
+        return m;
+    }();
+    return mode;
+}
+static std::atomic<u32> bb_sec_dlssg_hl_fixed{0}, bb_sec_dlssg_hl_raw{0}, bb_sec_dlssg_hl_none{0};
+
+// bb-dlssg-inputs: BB_DLSSG_SHOW (diagnostic, default off).
+//   generated: every present shows a generated frame (the real frame's slot gets a copy of the
+//              generated frame made for it): the generated frames alone, at the game's rate.
+//   real:      generated frames are made but not shown: the real frames alone.
+//   probe:     both shown as usual, only the measurement below.
+// Any of them adds "[dlssg-probe]" once a second: each generated frame compared (downscaled to
+// 240x135) with the real frame after it (N) and the one before it (N-1). A frame halfway in time
+// is about as far from both: midpoint ~0.5. ~0 = a copy of the newer real frame (no motion
+// between the two), ~1 = a copy of the older one.
+enum class BbDlssgShow { Normal, Generated, Real, Probe };
+static BbDlssgShow BbDlssgShowMode() {
+    static const BbDlssgShow mode = [] {
+        const char* v = std::getenv("BB_DLSSG_SHOW");
+        const std::string s = v != nullptr ? v : "";
+        const BbDlssgShow m = s == "generated" || s == "gen" ? BbDlssgShow::Generated
+                              : s == "real"                  ? BbDlssgShow::Real
+                              : s == "probe" || s == "1"     ? BbDlssgShow::Probe
+                                                             : BbDlssgShow::Normal;
+        if (m != BbDlssgShow::Normal) {
+            BB::Upscale::Checkpoint(fmt::format(
+                "[dlssg-probe] BB_DLSSG_SHOW={}: {}; \"[dlssg-probe] 1 s\" lines compare each "
+                "generated frame with the real frames around it",
+                s,
+                m == BbDlssgShow::Generated ? "ONLY GENERATED FRAMES are shown (the real "
+                                              "frame's present shows its generated frame again)"
+                : m == BbDlssgShow::Real    ? "ONLY REAL FRAMES are shown (generated frames are "
+                                              "made but not presented)"
+                                            : "frames shown as usual"));
+        }
+        return m;
+    }();
+    return mode;
+}
+
+namespace {
+struct BbDlssgProbe {
+    static constexpr u32 W = 240, H = 135, Slots = 12, Lag = 9;
+    static constexpr vk::DeviceSize ImageBytes = vk::DeviceSize(W) * H * 4;
+    bool tried = false, ok = false;
+    vk::Format format = vk::Format::eUndefined;
+    VkImage tiny[2]{}; // 0: the real frame, 1: its generated frame
+    VmaAllocation tiny_alloc[2]{};
+    VkBuffer buffer{};
+    VmaAllocation buffer_alloc{};
+    const u8* map = nullptr;
+    u64 seq = 0;
+    u64 slot_seq[Slots]{};
+    std::vector<u8> prev_real;
+    u64 prev_seq = ~0ull;
+    // Per second.
+    std::chrono::steady_clock::time_point start{};
+    u32 pairs = 0, still = 0, unpaired = 0;
+    double sum_mid = 0.0, sum_dn = 0.0, sum_dp = 0.0, sum_rr = 0.0;
+    double min_mid = 1.0, max_mid = 0.0;
+};
+BbDlssgProbe bb_probe;
+} // namespace
+
+static void BbDlssgProbeDestroy(VmaAllocator allocator) {
+    auto& p = bb_probe;
+    for (int i = 0; i < 2; ++i) {
+        if (p.tiny[i]) vmaDestroyImage(allocator, p.tiny[i], p.tiny_alloc[i]);
+        p.tiny[i] = VK_NULL_HANDLE;
+    }
+    if (p.buffer) vmaDestroyBuffer(allocator, p.buffer, p.buffer_alloc);
+    p.buffer = VK_NULL_HANDLE;
+    p.map = nullptr;
+    p.ok = false;
+}
+
+static double BbMeanAbs(const u8* a, const u8* b, size_t n) {
+    u64 sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if ((i & 3) == 3) continue; // alpha
+        sum += static_cast<u64>(std::abs(int(a[i]) - int(b[i])));
+    }
+    return static_cast<double>(sum) / static_cast<double>(n / 4 * 3);
+}
+
+// Reads the slot written Lag frames ago (its GPU work long finished: fewer frames are in
+// flight), then records this frame's two downscaled copies into the next slot.
+static void BbDlssgProbeRecord(const Instance& instance, vk::CommandBuffer cmd, vk::Image real,
+                               vk::Image generated, vk::Format format, u32 width, u32 height) {
+    auto& p = bb_probe;
+    if (!p.tried || p.format != format) {
+        if (p.tried) {
+            (void)instance.GetDevice().waitIdle(); // a format change only
+            BbDlssgProbeDestroy(instance.GetAllocator());
+        }
+        p.tried = true;
+        p.format = format;
+        const auto props = instance.GetPhysicalDevice().getFormatProperties(format);
+        const auto need = vk::FormatFeatureFlagBits::eBlitSrc |
+                          vk::FormatFeatureFlagBits::eBlitDst |
+                          vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+        const bool bytes4 = format == vk::Format::eB8G8R8A8Unorm ||
+                            format == vk::Format::eR8G8B8A8Unorm ||
+                            format == vk::Format::eB8G8R8A8Srgb ||
+                            format == vk::Format::eR8G8B8A8Srgb;
+        bool ok = bytes4 && (props.optimalTilingFeatures & need) == need;
+        for (int i = 0; ok && i < 2; ++i) {
+            const VkImageCreateInfo ici = vk::ImageCreateInfo{
+                .imageType = vk::ImageType::e2D,
+                .format = format,
+                .extent = {BbDlssgProbe::W, BbDlssgProbe::H, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eTransferDst |
+                         vk::ImageUsageFlagBits::eTransferSrc,
+            };
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            ok = vmaCreateImage(instance.GetAllocator(), &ici, &aci, &p.tiny[i],
+                                &p.tiny_alloc[i], nullptr) == VK_SUCCESS;
+        }
+        if (ok) {
+            const VkBufferCreateInfo bci = vk::BufferCreateInfo{
+                .size = BbDlssgProbe::ImageBytes * 2 * BbDlssgProbe::Slots,
+                .usage = vk::BufferUsageFlagBits::eTransferDst,
+                .sharingMode = vk::SharingMode::eExclusive,
+            };
+            VmaAllocationCreateInfo aci{};
+            aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                        VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            VmaAllocationInfo info{};
+            ok = vmaCreateBuffer(instance.GetAllocator(), &bci, &aci, &p.buffer,
+                                 &p.buffer_alloc, &info) == VK_SUCCESS &&
+                 info.pMappedData != nullptr;
+            if (ok) p.map = static_cast<const u8*>(info.pMappedData);
+        }
+        p.ok = ok;
+        if (!ok) BbDlssgProbeDestroy(instance.GetAllocator());
+        BB::Upscale::Checkpoint(fmt::format("[dlssg-probe] {} ({})",
+                                            ok ? "measurement ready" : "unavailable: no measurement",
+                                            vk::to_string(format)));
+    }
+    if (!p.ok) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (p.start.time_since_epoch().count() == 0) p.start = now;
+
+    // 1) The slot written Lag frames ago.
+    if (p.seq >= BbDlssgProbe::Lag) {
+        const u64 r = p.seq - BbDlssgProbe::Lag;
+        const u32 slot = static_cast<u32>(r % BbDlssgProbe::Slots);
+        if (p.slot_seq[slot] == r + 1) { // written for frame r (stored + 1: 0 = never)
+            const u8* real_px = p.map + BbDlssgProbe::ImageBytes * 2 * slot;
+            const u8* gen_px = real_px + BbDlssgProbe::ImageBytes;
+            const size_t n = static_cast<size_t>(BbDlssgProbe::ImageBytes);
+            if (p.prev_seq == r - 1 && p.prev_real.size() == n) {
+                const double dn = BbMeanAbs(gen_px, real_px, n);
+                const double dp = BbMeanAbs(gen_px, p.prev_real.data(), n);
+                const double rr = BbMeanAbs(real_px, p.prev_real.data(), n);
+                if (rr < 0.75) {
+                    ++p.still; // too little change between the two real frames to tell
+                } else {
+                    const double mid = dn + dp > 1e-9 ? dn / (dn + dp) : 0.5;
+                    ++p.pairs;
+                    p.sum_mid += mid;
+                    p.sum_dn += dn;
+                    p.sum_dp += dp;
+                    p.sum_rr += rr;
+                    p.min_mid = std::min(p.min_mid, mid);
+                    p.max_mid = std::max(p.max_mid, mid);
+                }
+            } else {
+                ++p.unpaired;
+            }
+            p.prev_real.assign(real_px, real_px + n);
+            p.prev_seq = r;
+        }
+    }
+    if (const double el = std::chrono::duration<double>(now - p.start).count(); el >= 1.0) {
+        const double k = p.pairs ? 1.0 / p.pairs : 0.0;
+        BB::Upscale::Checkpoint(fmt::format(
+            "[dlssg-probe] 1 s: {} pairs measured ({} with a still picture, {} unpaired) | "
+            "generated vs real N {:.2f}, vs real N-1 {:.2f}, real N vs N-1 {:.2f} (mean |diff| of "
+            "8-bit channels, 240x135) | midpoint {:.3f} (min {:.3f} max {:.3f}; 0.5 = halfway "
+            "between N-1 and N, 0 = a copy of N, 1 = a copy of N-1) | {:.2f} s",
+            p.pairs, p.still, p.unpaired, p.sum_dn * k, p.sum_dp * k, p.sum_rr * k,
+            p.sum_mid * k, p.pairs ? p.min_mid : 0.0, p.pairs ? p.max_mid : 0.0, el));
+        p.pairs = p.still = p.unpaired = 0;
+        p.sum_mid = p.sum_dn = p.sum_dp = p.sum_rr = 0.0;
+        p.min_mid = 1.0;
+        p.max_mid = 0.0;
+        p.start = now;
+    }
+
+    // 2) This frame: real and generated downscaled into the slot for frame seq.
+    const u32 slot = static_cast<u32>(p.seq % BbDlssgProbe::Slots);
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    std::array<vk::ImageMemoryBarrier2, 2> to_dst{};
+    for (int i = 0; i < 2; ++i) {
+        to_dst[i] = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = vk::Image{p.tiny[i]},
+            .subresourceRange = range,
+        };
+    }
+    const vk::MemoryBarrier2 written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1,
+                          .pMemoryBarriers = &written,
+                          .imageMemoryBarrierCount = u32(to_dst.size()),
+                          .pImageMemoryBarriers = to_dst.data()});
+    const vk::Image sources[2] = {real, generated};
+    for (int i = 0; i < 2; ++i) {
+        const vk::ImageBlit region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(width), s32(height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{s32(BbDlssgProbe::W), s32(BbDlssgProbe::H), 1}},
+        };
+        cmd.blitImage(sources[i], vk::ImageLayout::eGeneral, vk::Image{p.tiny[i]},
+                      vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eLinear);
+    }
+    std::array<vk::ImageMemoryBarrier2, 2> to_src{};
+    for (int i = 0; i < 2; ++i) {
+        to_src[i] = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .image = vk::Image{p.tiny[i]},
+            .subresourceRange = range,
+        };
+    }
+    cmd.pipelineBarrier2(
+        {.imageMemoryBarrierCount = u32(to_src.size()), .pImageMemoryBarriers = to_src.data()});
+    for (int i = 0; i < 2; ++i) {
+        const vk::BufferImageCopy copy{
+            .bufferOffset = BbDlssgProbe::ImageBytes * (2 * slot + i),
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .imageExtent = {BbDlssgProbe::W, BbDlssgProbe::H, 1},
+        };
+        cmd.copyImageToBuffer(vk::Image{p.tiny[i]}, vk::ImageLayout::eTransferSrcOptimal,
+                              vk::Buffer{p.buffer}, copy);
+    }
+    const vk::MemoryBarrier2 to_host{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    p.slot_seq[slot] = p.seq + 1;
+    ++p.seq;
+}
+
+// BB_DLSSG_SHOW=generated: the generated frame copied into the real frame's image (after DLSS-G
+// read it and after the probe), so the real frame's present shows the generated frame again.
+static void BbDlssgShowGenerated(vk::CommandBuffer cmd, vk::Image real, vk::Image generated,
+                                 u32 width, u32 height) {
+    const vk::MemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+    const vk::ImageCopy region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {width, height, 1},
+    };
+    cmd.copyImage(generated, vk::ImageLayout::eGeneral, real, vk::ImageLayout::eGeneral, region);
+    const vk::MemoryBarrier2 after{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+}
+
 static vk::Format BbUnorm(vk::Format f) {
     switch (f) {
     case vk::Format::eB8G8R8A8Srgb:
@@ -1662,8 +1986,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // differ as UI (the real frame's pixel in generated frames). The HUD-less copy went through
     // our post-process pass but not the game's display pass, so it differed everywhere and the
     // generated frames repeated the real one. Outside the HUD it now is the finished frame itself.
-    // FSR 3 only (DLSS-G keeps its input as before).
-    if (frame->fg.has_hudless && BB::FG::Fsr3Active() && !frame->is_hdr) {
+    // bb-dlssg-inputs: DLSS-G too (BB_DLSSG_HUDLESS, default fix): NVIDIA's HUD-less input must
+    // have the back buffer's colour and post-processing; the uncorrected copy differed nearly
+    // everywhere and DLSS-G took those pixels as UI.
+    const bool bb_dlssg_fix =
+        frame->fg.has_hudless && BB::FG::Dlss::Ready() && BbDlssgHudlessMode() == BbDlssgHudless::Fix;
+    bool bb_hudless_fixed = false;
+    if (frame->fg.has_hudless && (BB::FG::Fsr3Active() || bb_dlssg_fix) && !frame->is_hdr) {
         const vk::Format fmt = swapchain.GetSurfaceFormat().format;
         const vk::MemoryBarrier2 written{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1674,7 +2003,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         cmdbuf.pipelineBarrier2(
             vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
         BB_GPU_SCOPE(cmdbuf, "ours: HUD-less fix + sparks (bb_hudless_fix.comp)");
-        bb_hud_fg->FixHudless(cmdbuf, frame->image_view, bb_hud_raw, bb_hudless_scene,
+        bb_hudless_fixed = bb_hud_fg->FixHudless(cmdbuf, frame->image_view, bb_hud_raw, bb_hudless_scene,
                               frame->hudless_image, frame->hudless_rgba_view,
                               {frame->width, frame->height}, fmt == vk::Format::eB8G8R8A8Unorm,
                               bb_hudless_swapped);
@@ -1761,9 +2090,25 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const BB::FG::Image backbuffer{frame->image, frame->unorm_view, frame->unorm_format,
                                            {frame->width, frame->height},
                                            vk::ImageUsageFlagBits::eSampled};
+            // bb-dlssg-inputs: the HUD-less image DLSS-G gets (BB_DLSSG_HUDLESS).
+            BB::FG::Inputs dlssg_in = frame->fg;
+            if (dlssg_in.has_hudless) {
+                const auto mode = BbDlssgHudlessMode();
+                if (mode == BbDlssgHudless::Off ||
+                    (mode == BbDlssgHudless::Fix && !bb_hudless_fixed)) {
+                    dlssg_in.has_hudless = false;
+                    ++bb_sec_dlssg_hl_none;
+                } else if (mode == BbDlssgHudless::Fix) {
+                    ++bb_sec_dlssg_hl_fixed;
+                } else {
+                    ++bb_sec_dlssg_hl_raw;
+                }
+            } else {
+                ++bb_sec_dlssg_hl_none;
+            }
             // bb-gpu-prof: DLSS-G may continue in another command buffer: its time is in the
             // "draw" envelope only.
-            frame->generated_count = BB::FG::Dlss::Generate(cmdbuf, backbuffer, frame->fg,
+            frame->generated_count = BB::FG::Dlss::Generate(cmdbuf, backbuffer, dlssg_in,
                                                             outputs.data(), count,
                                                             instance.GetDevice());
             // A DLSS interposer may continue the recording in another command buffer.
@@ -1774,6 +2119,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 for (u32 i = 0; i < frame->generated_count; ++i) {
                     bb_hud_fg->Overlay(draw_scheduler.CommandBuffer(), frame->generated[i].rgba_view,
                                        {frame->width, frame->height}, bgra);
+                }
+            }
+            // bb-dlssg-inputs: BB_DLSSG_SHOW (diagnostic, off by default).
+            if (frame->generated_count > 0 && BbDlssgShowMode() != BbDlssgShow::Normal) {
+                const auto dcmd = draw_scheduler.CommandBuffer();
+                BbDlssgProbeRecord(instance, dcmd, frame->image, frame->generated[0].image,
+                                   frame->generated[0].format, frame->width, frame->height);
+                if (BbDlssgShowMode() == BbDlssgShow::Generated) {
+                    BbDlssgShowGenerated(dcmd, frame->image, frame->generated[0].image,
+                                         frame->width, frame->height);
                 }
             }
             std::vector<vk::ImageMemoryBarrier2> back;
@@ -1792,6 +2147,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     } else if (!BB::FG::Dlss::Ready() && frame->generated[0].image) {
         BbDestroyGenerated(frame);
+    }
+    // bb-dlssg-inputs: a game frame without an evaluation: NGX's previous frame is now older
+    // than the frame before the next one, which therefore resets instead of pairing with it.
+    if (BB::FG::Dlss::Ready() && frame->generated_count == 0) {
+        BB::FG::Dlss::NoteSkipped();
     }
     bb_sr->FrameEnd(draw_scheduler.CommandBuffer());
     // bb-velocity: the guest frame ended, after its compose pass (bb_sr->Run) was recorded.
@@ -1948,6 +2308,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // frames (the generated ones belong to the time before this frame). A frame shown again has
     // none.
     u32 bb_generated = is_reusing_frame ? 0 : frame->generated_count;
+    // bb-dlssg-inputs: BB_DLSSG_SHOW=real: generated frames made but not shown.
+    if (BbDlssgShowMode() == BbDlssgShow::Real) bb_generated = 0;
     const auto bb_start = std::chrono::steady_clock::now();
     if (!is_reusing_frame && is_game_frame) {
         const double ms =
@@ -2355,6 +2717,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             if (BB::FG::Dlss::Ready()) {
                 BB::FG::NoteDlssPanel(float(game / sec), float((presents + shown) / sec));
                 BbDlssgPaceLogSecond(sec);
+                BB::Upscale::Checkpoint(fmt::format(
+                    "[dlssg-in] 1 s: HUD-less given to DLSS-G: fixed (finished frame outside "
+                    "the HUD) {}, raw copy {}, none {} (BB_DLSSG_HUDLESS={})",
+                    bb_sec_dlssg_hl_fixed.exchange(0), bb_sec_dlssg_hl_raw.exchange(0),
+                    bb_sec_dlssg_hl_none.exchange(0),
+                    BbDlssgHudlessMode() == BbDlssgHudless::Fix   ? "fix"
+                    : BbDlssgHudlessMode() == BbDlssgHudless::Raw ? "raw"
+                                                                  : "off"));
             }
             bb_hud_fg->LogSecond(sec);
             bb_hud_fg->LogHudlessSecond(sec);

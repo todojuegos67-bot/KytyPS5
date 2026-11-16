@@ -11,6 +11,8 @@
 // refresh rate leaves room for), capped by NGX's MultiFrameCountMax.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +45,7 @@ int g_max = 0;
 BbDlssgFeature g_feature{};
 bool g_has_feature = false;
 std::wstring g_dll_dir, g_data_dir;
+std::atomic<bool> g_skipped{false}; // bb-dlssg-inputs: a frame went by without an evaluation
 
 void BridgeLog(int warning, const char* message) {
     BBLogf("DLSS-G (NGX)%s: %s", warning ? " warning" : "", message ? message : "");
@@ -183,6 +186,10 @@ uint32_t WantedCount() {
     return std::min(want, uint32_t(g_max));
 }
 
+void NoteSkipped() {
+    g_skipped.store(true, std::memory_order_relaxed);
+}
+
 static BbDlssImage Wrap(const Image& img, vk::ImageAspectFlags aspect) {
     BbDlssImage out{};
     out.image = img.image;
@@ -219,15 +226,68 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
         g_has_feature = true;
         reset = true;
     }
+    // bb-dlssg-inputs: a pair is only interpolated when the previous evaluation was the game
+    // frame just before this one. After a gap (menu, loading, frames without the scene, frames
+    // the refresh limit gave no generated frame) NGX's previous frame is an old one: the first
+    // generated frame would sit between two frames far apart. Reset when the presenter prepared
+    // a frame without an evaluation since the last one (NoteSkipped), or when longer than
+    // BB_DLSSG_GAP_RESET_MS (default 100; 0 off) and 3 average frame intervals have passed.
+    static const double gap_ms = [] {
+        const char* v = std::getenv("BB_DLSSG_GAP_RESET_MS");
+        return v != nullptr && *v != '\0' ? std::max(0.0, std::atof(v)) : 100.0;
+    }();
+    static std::chrono::steady_clock::time_point last_eval{};
+    static uint64_t last_color = ~0ull;
+    const auto now = std::chrono::steady_clock::now();
+    const bool had_eval = last_eval.time_since_epoch().count() != 0;
+    const double since_ms =
+        had_eval ? std::chrono::duration<double, std::milli>(now - last_eval).count() : 0.0;
+    // Relative to the game's own frame interval too (a slow scene is not a gap every frame).
+    static double avg_ms = 0.0;
+    const bool gap = had_eval && gap_ms > 0.0 && since_ms > std::max(gap_ms, 3.0 * avg_ms);
+    if (had_eval && !gap) avg_ms = avg_ms == 0.0 ? since_ms : avg_ms + (since_ms - avg_ms) * 0.1;
+    const bool same_color = in.color_frame != ~0ull && in.color_frame == last_color;
+    const bool skipped = g_skipped.exchange(false, std::memory_order_relaxed) && had_eval;
+    if (gap || skipped) reset = true;
+    static struct {
+        std::chrono::steady_clock::time_point start{};
+        uint32_t evals = 0, frames = 0, reset_cam = 0, reset_gap = 0, reset_skip = 0, reset_feature = 0,
+                 matrices = 0, basis = 0, hudless = 0, same_color = 0;
+        double max_since = 0.0;
+        float jitter_max = 0.0f;
+    } st;
+    if (st.start.time_since_epoch().count() == 0) st.start = now;
+    ++st.frames;
+    st.reset_cam += in.reset ? 1 : 0;
+    st.reset_gap += gap ? 1 : 0;
+    st.reset_skip += skipped && !gap ? 1 : 0;
+    st.reset_feature += (reset && !in.reset && !gap && !skipped) ? 1 : 0;
+    st.matrices += in.camera_valid ? 1 : 0;
+    st.basis += in.basis_valid ? 1 : 0;
+    st.hudless += in.has_hudless ? 1 : 0;
+    st.same_color += same_color ? 1 : 0;
+    st.max_since = std::max(st.max_since, since_ms);
+    st.jitter_max = std::max(st.jitter_max, std::max(std::fabs(in.jitter[0]), std::fabs(in.jitter[1])));
+    last_eval = now;
+    last_color = in.color_frame;
+
     BbDlssgEvaluate e{};
     e.backbuffer = Wrap(backbuffer, vk::ImageAspectFlagBits::eColor);
     e.depth = Wrap(in.depth, vk::ImageAspectFlagBits::eDepth);
     e.motion = Wrap(in.motion, vk::ImageAspectFlagBits::eColor);
     if (in.has_hudless) e.hudless = Wrap(in.hudless, vk::ImageAspectFlagBits::eColor);
-    e.jitter_x = in.jitter[0];
-    e.jitter_y = in.jitter[1];
+    // BB_DLSSG_JITTER=0: no jitter offset (A/B test; render pixels by default, as DLSS SR and
+    // Streamline's sl::Constants::jitterOffset take it).
+    static const bool no_jitter = [] {
+        const char* v = std::getenv("BB_DLSSG_JITTER");
+        return v != nullptr && v[0] == '0';
+    }();
+    e.jitter_x = no_jitter ? 0.0f : in.jitter[0];
+    e.jitter_y = no_jitter ? 0.0f : in.jitter[1];
     e.camera_near = in.z_near;
-    e.camera_far = in.z_far;
+    // Upscale::EndFrame reports an infinite far plane as 0: NGX and the projection below need a
+    // finite one (Bloodborne's scene block says 3000).
+    e.camera_far = in.z_far > in.z_near * 2.0f ? in.z_far : 3000.0f;
     e.camera_fov = in.fov_y;
     e.depth_inverted = in.depth_inverted ? 1 : 0;
     e.reset = reset ? 1 : 0;
@@ -260,7 +320,7 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
             const float aspect = float(in.render.width) / float(std::max(in.render.height, 1u));
             const float y = 1.0f / std::tan(std::max(in.fov_y, 0.01f) * 0.5f);
             const float n = std::max(in.z_near, 1e-4f);
-            const float f = std::max(in.z_far, n * 2.0f);
+            const float f = std::max(e.camera_far, n * 2.0f);
             float p[16]{};
             p[0] = y / aspect;
             p[5] = y;
@@ -313,6 +373,40 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
             e.has_matrices = 0;
         }
     }
+    // bb-dlssg-inputs: the game camera's world position and axes (BB_DLSSG_CAMERA=placeholder:
+    // the old 0 / +y / +x / +z).
+    static const bool basis_placeholder = [] {
+        const char* v = std::getenv("BB_DLSSG_CAMERA");
+        return v != nullptr && std::strcmp(v, "placeholder") == 0;
+    }();
+    if (in.basis_valid && !basis_placeholder) {
+        e.camera_magic = BBPORT_DLSSG_CAMERA_MAGIC;
+        std::memcpy(e.camera_pos, in.cam_pos, sizeof(e.camera_pos));
+        std::memcpy(e.camera_up, in.cam_up, sizeof(e.camera_up));
+        std::memcpy(e.camera_right, in.cam_right, sizeof(e.camera_right));
+        std::memcpy(e.camera_fwd, in.cam_fwd, sizeof(e.camera_fwd));
+    }
+    {
+        static bool said = false;
+        if (!said && in.camera_valid) {
+            said = true;
+            BBLogf("[dlssg-in] constants: jitter %.4f %.4f px%s, near %.5g far %.5g fov %.5f rad, "
+                   "depth %s, reset %d, camera matrices %s, camera pos (%.2f %.2f %.2f) up (%.3f "
+                   "%.3f %.3f) right (%.3f %.3f %.3f) fwd (%.3f %.3f %.3f)%s, render %ux%u, "
+                   "output %ux%u, frames per pair %u",
+                   e.jitter_x, e.jitter_y, no_jitter ? " (BB_DLSSG_JITTER=0)" : "",
+                   e.camera_near, e.camera_far, e.camera_fov,
+                   e.depth_inverted ? "inverted" : "forward", e.reset, e.has_matrices ? "yes" : "no",
+                   e.camera_pos[0], e.camera_pos[1], e.camera_pos[2], e.camera_up[0],
+                   e.camera_up[1], e.camera_up[2], e.camera_right[0], e.camera_right[1],
+                   e.camera_right[2], e.camera_fwd[0], e.camera_fwd[1], e.camera_fwd[2],
+                   e.camera_magic == BBPORT_DLSSG_CAMERA_MAGIC
+                       ? ""
+                       : (basis_placeholder ? " (BB_DLSSG_CAMERA=placeholder: not sent)"
+                                            : " (no game camera basis: not sent)"),
+                   want.render_width, want.render_height, want.width, want.height, count);
+        }
+    }
     uint32_t made = 0;
     for (uint32_t index = 1; index <= count; ++index) {
         e.output = Wrap(outputs[index - 1], vk::ImageAspectFlagBits::eColor);
@@ -324,6 +418,20 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
             return 0;
         }
         ++made;
+    }
+    st.evals += made;
+    if (const double el = std::chrono::duration<double>(now - st.start).count(); el >= 1.0) {
+        // bb-dlssg-inputs: once a second, what DLSS-G was given.
+        BBLogf("[dlssg-in] %.2f s: %u game frames, %u evaluations | resets: camera %u, gap %u "
+               "(> %.0f ms since the last evaluation; longest %.1f ms), frame without evaluation "
+               "before %u, feature %u | camera "
+               "matrices %u, camera basis %u, HUD-less %u | same colour frame twice %u | jitter "
+               "max %.3f px",
+               el, st.frames, st.evals, st.reset_cam, st.reset_gap, gap_ms, st.max_since,
+               st.reset_skip, st.reset_feature, st.matrices, st.basis, st.hudless, st.same_color, st.jitter_max);
+        const auto keep = now;
+        st = {};
+        st.start = keep;
     }
     static bool said = false;
     if (!said) {
@@ -354,6 +462,7 @@ uint32_t MaxCount() {
 uint32_t WantedCount() {
     return 0;
 }
+void NoteSkipped() {}
 uint32_t Generate(vk::CommandBuffer, const Image&, const Inputs&, const Image*, uint32_t,
                   vk::Device) {
     return 0;
