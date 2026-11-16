@@ -15,6 +15,7 @@
 #include <xxhash.h>
 #include "common/debug.h"
 #include "core/bb_hud_native_hook.h"
+#include "core/bb_ssr_probe.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -258,6 +259,55 @@ void Rasterizer::BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32
                        bb_cut.UiPhase(), effect);
 }
 
+namespace {
+// BB_SSR_PROBE=1: one line per draw/dispatch (shaders, colour targets, depth, sampled images).
+template <typename R>
+std::string BbSsrDesc(const Pipeline& pipeline, const R& regs, std::string kind, bool graphics) {
+    std::string d = std::move(kind);
+    std::string reads;
+    for (const auto* stage : pipeline.GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        d += fmt::format(" {}:{:#x}", u32(stage->sw_stage), stage->pgm_hash);
+        for (const auto& image_desc : stage->images) {
+            const auto tsharp = image_desc.GetSharp(*stage);
+            if (tsharp.Address() == 0 || reads.size() > 400) {
+                continue;
+            }
+            reads += fmt::format(" {:#x}:{}x{}:fmt{}/{}", tsharp.Address(), u32(tsharp.width) + 1,
+                                 u32(tsharp.height) + 1, u32(tsharp.GetDataFmt()),
+                                 u32(tsharp.GetNumberFmt()));
+        }
+    }
+    if (graphics) {
+        d += " rt:";
+        bool any = false;
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col = regs.color_buffers[cb];
+            if (!col || regs.color_target_mask.GetMask(cb) == 0) {
+                continue;
+            }
+            any = true;
+            d += fmt::format(" cb{}={:#x}:{}x{}:fmt{}/{}", cb, VAddr(col.Address()), col.Pitch(),
+                             col.Height(), u32(col.GetDataFmt()), u32(col.GetNumberFmt()));
+        }
+        if (!any) {
+            d += " none";
+        }
+        if (regs.depth_buffer.DepthValid()) {
+            d += fmt::format(" depth={:#x}:{}x{}{}{}", regs.depth_buffer.DepthAddress(),
+                             regs.depth_buffer.Pitch(), regs.depth_buffer.Height(),
+                             regs.depth_control.depth_enable ? " test" : "",
+                             regs.depth_control.depth_write_enable ? " write" : "");
+        }
+    }
+    d += " reads:";
+    d += reads.empty() ? " none" : reads;
+    return d;
+}
+} // namespace
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -279,6 +329,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (BB::SsrProbe::Enabled()) {
+        BB::SsrProbe::OnDraw(BbSsrDesc(*pipeline, regs,
+                                       fmt::format("draw{} n{}", is_indexed ? "-idx" : "",
+                                                   regs.num_indices),
+                                       true));
+    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -444,6 +500,13 @@ void Rasterizer::DispatchDirect() {
 
     if (!BindResources(pipeline)) {
         return;
+    }
+
+    if (BB::SsrProbe::Enabled()) {
+        BB::SsrProbe::OnDraw(BbSsrDesc(*pipeline, liverpool->regs,
+                                       fmt::format("dispatch {}x{}x{}", cs_program.dim_x,
+                                                   cs_program.dim_y, cs_program.dim_z),
+                                       false));
     }
 
     if (needs_barrier) {

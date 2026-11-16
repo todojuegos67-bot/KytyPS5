@@ -19,6 +19,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_upscale.h"
+#include "core/bb_ssr_probe.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -304,6 +305,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        BB::SsrProbe::OnPacket(header);
 
         switch (type) {
         default:
@@ -1336,6 +1338,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
+    BB::SsrProbe::OnSubmit();
     auto task = ProcessGraphics(dcb);
     {
         std::scoped_lock lock{submit_mutex, queue.m_access};
