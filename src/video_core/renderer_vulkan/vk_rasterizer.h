@@ -132,6 +132,7 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void BbRtReflectProbe(const GraphicsPipeline& pipeline); // bb-rt-reflect
+    void BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr); // bb-rt-fullres
     void BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect); // bb-rt-reflect
     void BbRtReflectRun(); // bb-rt-reflect: the ray-query pass after the SSR draw
     bool BindResources(const Pipeline* pipeline);

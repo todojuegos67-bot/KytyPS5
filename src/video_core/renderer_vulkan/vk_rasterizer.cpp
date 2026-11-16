@@ -319,7 +319,96 @@ bool BbRtReflectRequested() {
     return on;
 }
 constexpr u64 BbSsrPsHash = 0x6c2323c2; // fragment shader of the SSR draw (stage 0 in the probe log; 0x5a619b89 is its vertex shader)
+bool BbRtFullresRequested() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_REFLECT_FULLRES");
+        return BbRtReflectRequested() && e && e[0] == '1';
+    }();
+    return on;
+}
 } // namespace
+
+// bb-rt-fullres (BB_RT_REFLECT=1 + BB_RT_REFLECT_FULLRES=1, default off): step 1 of full-res
+// reflections. Logs, for the first 2 frames that have an SSR draw, every later draw (up to 400)
+// that samples the SSR target or a target written from it (the downsample chain), with its
+// shaders, targets, blend state and reads, so the game's composite draw can be identified by
+// hash. Diagnostic only: nothing is changed.
+void Rasterizer::BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr) {
+    if (!BbRtFullresRequested()) {
+        return;
+    }
+    static std::vector<VAddr> chain;
+    static int since = -1;
+    static int sequences = 0;
+    if (sequences >= 2) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    const auto blend = [&] {
+        std::string b;
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            if (!regs.color_buffers[cb] || regs.color_target_mask.GetMask(cb) == 0) {
+                continue;
+            }
+            const auto& bc = regs.blend_control[cb];
+            b += fmt::format(" cb{}:blend={} src={} dst={} func={} asrc={} adst={} mask={:#x}", cb,
+                             u32(bc.enable), u32(bc.color_src_factor), u32(bc.color_dst_factor),
+                             u32(bc.color_func), u32(bc.alpha_src_factor),
+                             u32(bc.alpha_dst_factor), regs.color_target_mask.GetMask(cb));
+        }
+        return b;
+    };
+    if (is_ssr) {
+        if (since >= 0) {
+            ++sequences; // a new SSR draw ends the previous sequence
+            if (sequences >= 2) {
+                return;
+            }
+        }
+        chain.clear();
+        for (const auto& image_id : bound_images) {
+            const auto& img = texture_cache.GetImage(image_id);
+            if (img.binding.is_target) {
+                chain.push_back(img.info.guest_address);
+            }
+        }
+        since = 0;
+        LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} SSR draw: {}{}", sequences,
+                 BbSsrDesc(pipeline, regs, "draw", true), blend());
+        return;
+    }
+    if (since < 0) {
+        return;
+    }
+    if (++since > 400) {
+        LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} end: {} chain targets", sequences,
+                 chain.size());
+        since = -1;
+        ++sequences;
+        return;
+    }
+    bool reads = false;
+    for (const auto& image_id : bound_images) {
+        const auto& img = texture_cache.GetImage(image_id);
+        if (!img.binding.is_target &&
+            std::ranges::find(chain, img.info.guest_address) != chain.end()) {
+            reads = true;
+        }
+    }
+    if (!reads) {
+        return;
+    }
+    for (const auto& image_id : bound_images) {
+        const auto& img = texture_cache.GetImage(image_id);
+        if (img.binding.is_target &&
+            std::ranges::find(chain, img.info.guest_address) == chain.end()) {
+            chain.push_back(img.info.guest_address);
+        }
+    }
+    LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} +{} draws after SSR, reads the SSR chain: {}{}",
+             sequences, since, BbSsrDesc(pipeline, regs, "draw", true), blend());
+}
+
 
 void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
     bool is_ssr = false;
@@ -330,6 +419,7 @@ void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
         }
     }
     bb_rt_ssr_draw = is_ssr;
+    BbRtFullresChain(pipeline, is_ssr);
     if (!is_ssr) {
         return;
     }
