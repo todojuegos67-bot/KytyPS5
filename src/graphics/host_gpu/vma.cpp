@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdlib>
 
@@ -152,7 +153,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	EXIT_IF(allocator == nullptr || image.image != nullptr || image.allocation != nullptr);
 
 	VmaAllocationCreateInfo alloc_info {};
-	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT; // see AllocateSparse
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
 	const auto        result       = static_cast<vk::Result>(
@@ -163,6 +164,7 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 		LogMemoryBudget();
 		return false;
 	}
+	LogFallback(image.allocation, "image");
 
 	image.format     = image_info.format;
 	image.image_type = image_info.imageType;
@@ -196,17 +198,31 @@ bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& image_info, Vu
 	return true;
 }
 
+// The first allocation that went to system memory because video memory is full.
+void GraphicContext::LogFallback(VmaAllocation allocation, const char* what) const {
+	VkMemoryPropertyFlags flags = 0;
+	vmaGetAllocationMemoryProperties(allocator, allocation, &flags);
+	if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) return;
+	static std::atomic_bool logged = false;
+	if (logged.exchange(true)) return;
+	LOGF("Video memory full: a %s placed in system memory (slower; logged for the first one only)\n", what);
+	LogMemoryBudget();
+}
+
 VmaAllocation GraphicContext::AllocateSparse(const vk::MemoryRequirements& image, uint64_t size,
                                              vk::DeviceMemory& memory, uint64_t& offset) {
 	const VkMemoryRequirements need {size, image.alignment, image.memoryTypeBits};
 	VmaAllocationCreateInfo    create {};
-	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	// Preferred, not required: when video memory runs out (a 12 GB card in Telambang, 2026-11-16), VMA goes on to the
+	// other memory types the resource allows, i.e. system memory over PCIe: slower, but drawn, where required exits.
+	create.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 	VmaAllocation     allocation = nullptr;
 	VmaAllocationInfo info {};
 	if (vmaAllocateMemory(allocator, &need, &create, &allocation, &info) != VK_SUCCESS) {
 		LogMemoryBudget();
 		return nullptr;
 	}
+	LogFallback(allocation, "sparse page");
 	memory = vk::DeviceMemory(info.deviceMemory);
 	offset = info.offset;
 	return allocation;
