@@ -973,8 +973,8 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
     return true;
 }
 
-// bb-dlssg-pace (BB_DLSSG_PACE, default 1; 0: each game frame's generated frame goes out the
-// moment the game frame arrives, its own one game-frame-average / 2 later, as before).
+// bb-dlssg-pace (BB_DLSSG_PACE=1; default off since bb-fg-revert: each game frame's generated
+// frame goes out the moment the game frame arrives, its own one game-frame-average / 2 later).
 // log-dlssg (40 FPS cap, x2, 240 Hz): 41 generated / 41 presented each second, but the frames were
 // shown when each game frame happened to arrive, so any jitter in the arrivals (the game's own
 // limiter sleeps with sceKernelUsleep, then the GPU work) reached the screen unchanged, and the
@@ -988,9 +988,9 @@ std::chrono::steady_clock::time_point Presenter::BbDlssgPaceOrigin(
     std::chrono::steady_clock::time_point now, bool generating, bool may_wait, double& step_ms) {
     static const bool pace_on = [] {
         const char* v = std::getenv("BB_DLSSG_PACE");
-        const bool on = v == nullptr || v[0] != '0';
+        const bool on = v != nullptr && v[0] == '1';
         BB::Upscale::Checkpoint(fmt::format(
-            "[fg-pacing] DLSS-G present grid {} (BB_DLSSG_PACE; 0: frames go out as they arrive)",
+            "[fg-pacing] DLSS-G present grid {} (BB_DLSSG_PACE=1 turns it on; default off)",
             on ? "on" : "off"));
         return on;
     }();
