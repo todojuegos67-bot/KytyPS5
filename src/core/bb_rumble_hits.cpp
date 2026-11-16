@@ -5,19 +5,20 @@
 // object (crate, barrel...) or on the level geometry (wall / floor hit).
 //
 // Decompiled (eboot-patch-v2.elf, vaddr = eboot offset; Ghidra = vaddr + 0x400000):
-//  - Attack-hit dispatcher 0x185b200(hit = rdi -> r14): rbx = [hit+0x1e0] = attacker entity,
-//    r15 = [hit+0x1e8] = hit target; switch on attacker kind ([rbx]->vtbl+0x18, 0..3), then on
-//    target kind. In attacker case 3 (0x185b29d):
-//      target 1 -> 0x19ed020(hit, chr, attacker)  enemy/character hit; calls the target's
-//                  damage module [[chr+0x3b0]+0x98]->vtbl+0x60(.., hit); returns 1 when applied
-//      target 2 -> 0x19ed3d0(hit, obj, attacker)  object hit; calls 0x15a50b0(obj, hit), the
-//                  object damage: durability u16 at obj+0x1fa, break 0x15a5970 -> 0x15a13a0
-//      target 0 -> 0x19ed7d0(hit, coll, attacker) level-collision hit; 0x1dfb3b0 + 0x1c83770,
-//                  returns 1 when the hit registers
-//    Each site is `mov rdi,r14; mov rsi,r15; mov rdx,rbx; call X; jmp 0x185b3bd` (epilogue that
-//    returns eax). The detour runs the same call, then reports (kind, eax, attacker).
-//  - Local player: 0x15a50b0 compares [hit+0x1e0] with [[0x553e878]+0x60] (the attacker is the
-//    player character); the same pointer is used here.
+//  - 0x18d6160(attacker ChrIns = rdi, hit position = rsi, ...) is the attacker-side "attack hit"
+//    feedback: it reads the attacker's modules [rdi+0x3b0] and its weapon/hit entries
+//    [[rdi+0x1c8]+8] (chain +0x58), then calls 0x1a55230([[rdi+0x3b0]+0x40]+8, pos, ...) which
+//    runs every hit-effect emitter of the manager [0x553b0a0] (+0x28, 0xd8 each, 0x12e5480).
+//    It is the single common call of every per-target hit handler of the hit dispatcher
+//    0x185b200 (attacker kind 1 = character):
+//      0x18b8730 terrain   -> call at 0x18b890e
+//      0x18b79e0 character -> call at 0x18b7b13
+//      0x18b8430 object    -> call at 0x18b8703 (after the object damage 0x15a50b0 at 0x18b8507)
+//      0x18b8940 kind 3    -> call at 0x18b89e7 (unconditional; returns 0)
+//    and of 0x18648c1 / 0x19fe52c. Field log 902fc5a: the dispatcher return value (al) is 0 for
+//    every player call, so it does not tell a landed hit; the effect spawn does.
+//  - Local player: [[0x553e878]+0x60] (0x15a50b0 compares the attacker with it at 0x15a52ad;
+//    log 902fc5a: attacker == player 0x211e0ae30).
 //  - Game vibration option: [[0x553b130]+0x48] byte +1, divided by 10.0 (0x4926814) by the
 //    rumble mixer 0x15715f0 before 0xf91940 (pad setter).
 // The game's own rumbles are data driven (TAE event 0x17b97d0 -> 0x131f5e0 and the Lua binding
@@ -50,51 +51,26 @@ namespace {
 
 constexpr u64 PlayerHolderVaddr = 0x553e878; // [[x]+0x60] = local player ChrIns
 constexpr u64 OptionHolderVaddr = 0x553b130; // [[x]+0x48]+1 = vibration option byte
-constexpr u64 EpilogueVaddr = 0x185b3bd;
+constexpr u64 HitFxVaddr = 0x18d6160;
+// push rbp; mov rbp,rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp,0x58
+constexpr u8 HitFxPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x58};
 
-struct Site {
+struct Caller {
     const char* name;
-    u64 at;     // first byte of `mov rdi,r14`
-    u32 len;    // bytes replaced (call + jmp included)
-    u64 target; // call target
-    u8 bytes[19];
+    u64 ret; // return address of the call 0x18d6160
 };
-// mov rdi,r14 / mov rsi,r15 / mov rdx,rbx / call rel32 / jmp epilogue (rel32, rel8 or none:
-// the last site falls through into the epilogue 0x185b3bd).
-// The dispatcher switches first on the attacker kind ([rbx]->vtbl+0x18, table 0x185b3d8):
-//  kind 1 (0x185b24f, the character attacker: 0x18b8430 reads its module [r14+0x58]+0x98 and
-//   vtbl+0x1a8, the ChrIns layout) -> target kind via table 0x185b3e8: 0 terrain 0x18b8730,
-//   1 character 0x18b79e0, 2 object 0x18b8430 (-> 0x15a50b0 object damage at 0x18b8507),
-//   3 0x18b8940 (returns 0). The player's melee arrives here.
-//  kind 3 (0x185b29d, attackers with +0x2e0/+0x2fc/+0x7f8.. bullet-like records): 0x19ed7d0,
-//   0x19ed020, 0x19ed3d0 (the first sites, kept).
-// All six return a bool in al.
-constexpr Site Sites[] = {
-    {"object(k3)", 0x185b2be, 19, 0x19ed3d0,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0x04, 0x21, 0x19, 0x00, 0xe9,
-      0xec, 0x00, 0x00, 0x00}},
-    {"terrain(k3)", 0x185b33c, 16, 0x19ed7d0,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0x86, 0x24, 0x19, 0x00, 0xeb,
-      0x71}},
-    {"enemy(k3)", 0x185b351, 16, 0x19ed020,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0xc1, 0x1c, 0x19, 0x00, 0xeb,
-      0x5c}},
-    {"terrain(k1)", 0x185b2e1, 19, 0x18b8730,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0x41, 0xd4, 0x05, 0x00, 0xe9,
-      0xc9, 0x00, 0x00, 0x00}},
-    {"enemy(k1)", 0x185b39f, 16, 0x18b79e0,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0x33, 0xc6, 0x05, 0x00, 0xeb,
-      0x0e}},
-    {"object(k1)", 0x185b3af, 14, 0x18b8430,
-     {0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xe8, 0x73, 0xd0, 0x05, 0x00}},
+constexpr Caller Callers[] = {
+    {"terrain", 0x18b8913}, {"enemy", 0x18b7b18},  {"object", 0x18b8708},
+    {"kind3", 0x18b89ec},   {"other1", 0x18648c6}, {"other2", 0x19fe531},
 };
-constexpr u32 NumSites = static_cast<u32>(std::size(Sites));
+constexpr u32 NumCallers = static_cast<u32>(std::size(Callers));
 
 uintptr_t g_base = 0;
 std::atomic<s64> g_last_ms{-1000000};
-std::atomic<u32> g_count[NumSites]{};
-// diagnostic: calls per site x (al != 0) x (attacker == player)
-std::atomic<u32> g_diag[NumSites][2][2]{};
+std::atomic<u32> g_count[NumCallers + 1]{};
+// diagnostic: calls per caller (last slot: unknown caller) x (attacker == player)
+std::atomic<u32> g_diag[NumCallers + 1][2]{};
 std::atomic<u32> g_diag_total{0};
 std::atomic<s64> g_diag_last_ms{0};
 
@@ -110,37 +86,45 @@ T Read(u64 addr) {
     return v;
 }
 
+const char* CallerName(u32 k) {
+    return k < NumCallers ? Callers[k].name : "unknown";
+}
+
 void LogDiag(s64 now) {
     s64 last = g_diag_last_ms.load();
     if (now - last < 5000 || !g_diag_last_ms.compare_exchange_strong(last, now)) {
         return;
     }
     std::string line;
-    for (u32 k = 0; k < NumSites; ++k) {
-        line += fmt::format(" {}[ret0 other {} ret0 player {} ret1 other {} ret1 player {}]",
-                            Sites[k].name, g_diag[k][0][0].load(), g_diag[k][0][1].load(),
-                            g_diag[k][1][0].load(), g_diag[k][1][1].load());
+    for (u32 k = 0; k <= NumCallers; ++k) {
+        line += fmt::format(" {}[other {} player {}]", CallerName(k), g_diag[k][0].load(),
+                            g_diag[k][1].load());
     }
-    LOG_INFO(Core, "[rumble-hits] diag calls{}", line);
+    LOG_INFO(Core, "[rumble-hits] diag hit-fx calls{}", line);
 }
 
-void PS4_SYSV_ABI OnHit(u64 kind, u64 ret, u64 attacker) {
-    if (g_base == 0 || kind >= NumSites) {
+// regs: rbx, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax, then the return address
+void PS4_SYSV_ABI OnHitFx(const u64* regs) {
+    if (g_base == 0) {
         return;
     }
-    // the hit functions return bool: only al is defined
-    const bool hit = static_cast<u8>(ret) != 0;
+    const u64 attacker = regs[5];
+    const u64 ret = regs[10] - g_base;
+    u32 k = 0;
+    while (k < NumCallers && Callers[k].ret != ret) {
+        ++k;
+    }
     const u64 holder = Read<u64>(g_base + PlayerHolderVaddr);
     const u64 player = holder != 0 ? Read<u64>(holder + 0x60) : 0;
     const bool is_player = attacker != 0 && attacker == player;
-    g_diag[kind][hit ? 1 : 0][is_player ? 1 : 0].fetch_add(1);
+    g_diag[k][is_player ? 1 : 0].fetch_add(1);
     const s64 now = NowMs();
     if (g_diag_total.fetch_add(1) < 12) {
-        LOG_INFO(Core, "[rumble-hits] diag call {} al {} attacker {:#x} player {:#x} (holder {:#x})",
-                 Sites[kind].name, static_cast<u8>(ret), attacker, player, holder);
+        LOG_INFO(Core, "[rumble-hits] diag hit-fx from {} (eboot+{:#x}) attacker {:#x} player {:#x}",
+                 CallerName(k), ret, attacker, player);
     }
     LogDiag(now);
-    if (!hit || !is_player) {
+    if (!is_player) {
         return;
     }
     s64 last = g_last_ms.load();
@@ -162,9 +146,9 @@ void PS4_SYSV_ABI OnHit(u64 kind, u64 ret, u64 attacker) {
         }
         return;
     }
-    if (g_count[kind].fetch_add(1) == 0) {
+    if (g_count[k].fetch_add(1) == 0) {
         LOG_INFO(Core, "[rumble-hits] first player {} hit: pulse (game option {:.1f})",
-                 Sites[kind].name, option);
+                 CallerName(k), option);
     }
     Input::RumblePulse(0.35f * option, 1.0f * option, 120);
 }
@@ -179,9 +163,9 @@ void* AllocExec(size_t n) {
 #endif
 }
 
-// mov rdi,r14; mov rsi,r15; mov rdx,rbx; call target; then OnHit(kind, eax, rbx) with rax kept;
-// jmp epilogue. At the site rsp is 16-aligned (it was a call site), so the first call is too.
-std::vector<u8> BuildCave(u32 kind, u64 target, u64 host, u64 back) {
+// Saves the caller-saved registers and xmm0..7, calls host(regs), restores them, runs the
+// relocated prologue and jumps back after it (same cave layout as bb_objcol.cpp).
+std::vector<u8> BuildCave(u64 host, const u8* prologue, u32 len, u64 back) {
     std::vector<u8> e;
     const auto put = [&](std::initializer_list<u8> v) { e.insert(e.end(), v); };
     const auto put64 = [&](u64 v) {
@@ -189,27 +173,32 @@ std::vector<u8> BuildCave(u32 kind, u64 target, u64 host, u64 back) {
             e.push_back(u8(v >> (i * 8)));
         }
     };
-    put({0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda}); // original argument moves
-    put({0x48, 0xb8});                                             // mov rax, target
-    put64(target);
-    put({0xff, 0xd0});                         // call rax
-    put({0x55});                               // push rbp
-    put({0x48, 0x89, 0xe5});                   // mov rbp, rsp
-    put({0x48, 0x83, 0xe4, 0xf0});             // and rsp, -16
-    put({0x50, 0x50});                         // push rax x2 (keeps alignment)
-    put({0xbf});                               // mov edi, kind
-    for (int i = 0; i < 4; ++i) {
-        e.push_back(u8(kind >> (i * 8)));
+    put({0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x53});
+    put({0x48, 0x89, 0xe3});
+    put({0x48, 0x83, 0xe4, 0xf0});
+    put({0x48, 0x81, 0xec, 0x80, 0x00, 0x00, 0x00});
+    for (u8 i = 0; i < 8; ++i) {
+        if (i == 0) {
+            put({0xf3, 0x0f, 0x7f, 0x04, 0x24});
+        } else {
+            put({0xf3, 0x0f, 0x7f, u8(0x44 | (i << 3)), 0x24, u8(i * 16)});
+        }
     }
-    put({0x89, 0xc6});                         // mov esi, eax
-    put({0x48, 0x89, 0xda});                   // mov rdx, rbx (attacker)
-    put({0x48, 0xb8});                         // mov rax, host
+    put({0x48, 0x89, 0xdf});
+    put({0x48, 0xb8});
     put64(host);
-    put({0xff, 0xd0});                         // call rax
-    put({0x58, 0x58});                         // pop rax x2
-    put({0x48, 0x89, 0xec});                   // mov rsp, rbp
-    put({0x5d});                               // pop rbp
-    put({0xff, 0x25, 0x00, 0x00, 0x00, 0x00}); // jmp [rip]
+    put({0xff, 0xd0});
+    for (u8 i = 0; i < 8; ++i) {
+        if (i == 0) {
+            put({0xf3, 0x0f, 0x6f, 0x04, 0x24});
+        } else {
+            put({0xf3, 0x0f, 0x6f, u8(0x44 | (i << 3)), 0x24, u8(i * 16)});
+        }
+    }
+    put({0x48, 0x89, 0xdc});
+    put({0x5b, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58});
+    e.insert(e.end(), prologue, prologue + len);
+    put({0xff, 0x25, 0x00, 0x00, 0x00, 0x00});
     put64(back);
     return e;
 }
@@ -226,41 +215,44 @@ void OnEbootPatched(uintptr_t eboot_base, u64 image_size) {
         LOG_INFO(Core, "[rumble-hits] off (BB_RUMBLE_HITS=0)");
         return;
     }
-    for (const auto& s : Sites) {
-        if (s.at + s.len > image_size ||
-            std::memcmp(reinterpret_cast<const void*>(eboot_base + s.at), s.bytes, s.len) != 0) {
-            LOG_WARNING(Core,
-                        "[rumble-hits] {} site eboot+{:#x}: bytes differ (not eboot 1.09?), "
-                        "game code untouched",
-                        s.name, s.at);
+    constexpr u32 len = sizeof(HitFxPrologue);
+    u8* at = reinterpret_cast<u8*>(eboot_base + HitFxVaddr);
+    if (HitFxVaddr + len > image_size || std::memcmp(at, HitFxPrologue, len) != 0) {
+        LOG_WARNING(Core,
+                    "[rumble-hits] hit-fx eboot+{:#x}: bytes differ (not eboot 1.09?), game code "
+                    "untouched",
+                    HitFxVaddr);
+        return;
+    }
+    for (const auto& c : Callers) {
+        const u8* call = reinterpret_cast<const u8*>(eboot_base + c.ret - 5);
+        s32 rel;
+        std::memcpy(&rel, call + 1, 4);
+        if (call[0] != 0xe8 || c.ret + rel != HitFxVaddr) {
+            LOG_WARNING(Core, "[rumble-hits] caller eboot+{:#x} is not `call hit-fx`: game code "
+                              "untouched",
+                        c.ret - 5);
             return;
         }
     }
     u8* cave = static_cast<u8*>(AllocExec(4096));
     if (cave == nullptr) {
-        LOG_WARNING(Core, "[rumble-hits] no executable memory for the detours");
+        LOG_WARNING(Core, "[rumble-hits] no executable memory for the detour");
         return;
     }
     g_base = eboot_base;
-    u8* w = cave;
-    for (u32 k = 0; k < NumSites; ++k) {
-        const auto& s = Sites[k];
-        const auto c = BuildCave(k, eboot_base + s.target, reinterpret_cast<u64>(&OnHit),
-                                 eboot_base + EpilogueVaddr);
-        std::memcpy(w, c.data(), c.size());
-        u8* at = reinterpret_cast<u8*>(eboot_base + s.at);
-        u8 j[14] = {0xff, 0x25, 0, 0, 0, 0};
-        const u64 to = reinterpret_cast<u64>(w);
-        std::memcpy(j + 6, &to, 8);
-        std::memcpy(at, j, sizeof(j));
-        std::memset(at + sizeof(j), 0x90, s.len - sizeof(j));
-        w += (c.size() + 15) & ~size_t(15);
-    }
+    const auto c = BuildCave(reinterpret_cast<u64>(&OnHitFx), at, len,
+                             reinterpret_cast<u64>(at + len));
+    std::memcpy(cave, c.data(), c.size());
+    u8 j[14] = {0xff, 0x25, 0, 0, 0, 0};
+    const u64 to = reinterpret_cast<u64>(cave);
+    std::memcpy(j + 6, &to, 8);
+    std::memcpy(at, j, sizeof(j));
+    std::memset(at + sizeof(j), 0x90, len - sizeof(j));
     LOG_INFO(Core,
-             "[rumble-hits] on: attack-hit dispatcher eboot+0x185b200 enemy/object/terrain calls "
-             "detoured (attacker kinds 1 and 3, {} sites); pulse 120 ms (large 0.35, small on) x game option, 1 per 80 ms, player "
-             "attacks only",
-             NumSites);
+             "[rumble-hits] on: attack hit-fx eboot+{:#x} (attacker = rdi) detoured; pulse 120 ms "
+             "(large 0.35, small on) x game option, 1 per 80 ms, player attacks only",
+             HitFxVaddr);
 }
 
 } // namespace BB::RumbleHits
