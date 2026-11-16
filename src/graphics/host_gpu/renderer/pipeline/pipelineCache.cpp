@@ -202,27 +202,46 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 
 bool WriteDriverCacheFile(const std::filesystem::path& path, std::string_view signature,
                           std::span<const uint8_t> payload) {
-	if (payload.empty() || payload.size() > std::numeric_limits<uint32_t>::max() ||
+	DriverCacheFileWriter writer;
+	if (!writer.Open(path, signature, payload.size())) {
+		return false;
+	}
+	std::memcpy(writer.Payload().data(), payload.data(), payload.size());
+	return writer.Finish(payload.size());
+}
+
+bool DriverCacheFileWriter::Open(const std::filesystem::path& path, std::string_view signature, size_t payload_size) {
+	if (payload_size == 0 || payload_size > std::numeric_limits<uint32_t>::max() ||
 	    !Common::File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
-	std::string prefix(signature);
-	const auto  payload_hash = XXH3_64bits(payload.data(), payload.size());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	m_path      = path;
+	m_signature = signature;
 	auto temp_path = path;
 	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+	return m_file.Create(temp_path, signature.size() + sizeof(uint64_t) + payload_size);
+}
+
+std::span<uint8_t> DriverCacheFileWriter::Payload() const {
+	const auto prefix = m_signature.size() + sizeof(uint64_t);
+	return m_file.Data() != nullptr ? std::span<uint8_t>(m_file.Data() + prefix, m_file.Size() - prefix) : std::span<uint8_t>();
+}
+
+bool DriverCacheFileWriter::Finish(size_t payload_size) {
+	const auto payload = Payload();
+	if (payload_size == 0 || payload_size > payload.size()) {
+		return false;
 	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
+	const auto payload_hash = XXH3_64bits(payload.data(), payload_size);
+	std::memcpy(m_file.Data(), m_signature.data(), m_signature.size());
+	std::memcpy(m_file.Data() + m_signature.size(), &payload_hash, sizeof(payload_hash));
+	if (!m_file.Close(m_signature.size() + sizeof(payload_hash) + payload_size)) {
+		return false;
+	}
+	auto temp_path = m_path;
+	temp_path += ".tmp";
 	std::error_code error;
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed) return false;
-	std::filesystem::rename(temp_path, path, error);
+	std::filesystem::rename(temp_path, m_path, error);
 	return !error;
 }
 
@@ -1244,9 +1263,11 @@ std::function<void()> PipelineCache::SnapshotDriverCache() {
 	// The pipelines marked warm until now are all in the data taken below (shaderPrecompile.h, WarmList).
 	auto marked = m_warm != nullptr ? m_warm->TakeMarked() : std::vector<uint64_t> {};
 
-	size_t               size = 0;
-	vk::Result           result;
-	std::vector<uint8_t> payload;
+	// The driver writes its data straight into the mapped file (DriverCacheFileWriter): no copy on the heap.
+	size_t     size   = 0;
+	bool       opened = true;
+	vk::Result result;
+	auto       writer = std::make_shared<DriverCacheFileWriter>(); // shared: std::function copies its target
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
@@ -1254,34 +1275,35 @@ std::function<void()> PipelineCache::SnapshotDriverCache() {
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+		opened = writer->Open(m_driver_cache_path, DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), size);
+		if (!opened) {
+			break;
+		}
+		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, writer->Payload().data());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
 	}
-	if (result != vk::Result::eSuccess || size == 0 ||
+	if (!opened || result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
-		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
+		                 opened ? vk::to_string(result) : "no temporary file", static_cast<double>(size) / 1'000'000.0);
 		if (m_warm != nullptr) m_warm->Commit(std::move(marked), false, 0);
 		return {};
 	}
-	payload.resize(size);
 	// Pipelines made from here on mark the cache dirty again; a failed write keeps it dirty.
 	m_driver_cache_dirty = false;
-	return [this, payload = std::move(payload), signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()),
-	        path = m_driver_cache_path, marked = std::move(marked)]() mutable {
-		if (!WriteDriverCacheFile(path, signature, payload)) {
+	return [this, writer = std::move(writer), size, path = m_driver_cache_path, marked = std::move(marked)]() mutable {
+		if (!writer->Finish(size)) {
 			m_driver_cache_dirty       = true;
 			m_driver_cache_save_failed = true;
 			if (m_warm != nullptr) m_warm->Commit(std::move(marked), false, 0);
 			PipelineCacheLog("Vulkan pipeline cache: failed to write {}", Common::PathToString(path));
 			return;
 		}
-		if (m_warm != nullptr) m_warm->Commit(std::move(marked), true, payload.size());
+		if (m_warm != nullptr) m_warm->Commit(std::move(marked), true, size);
 		PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
-		                 static_cast<double>(payload.size()) / 1'000'000.0, Common::PathToString(path));
+		                 static_cast<double>(size) / 1'000'000.0, Common::PathToString(path));
 	};
 }
 

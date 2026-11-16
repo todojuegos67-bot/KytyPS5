@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/mappedFile.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -142,6 +143,20 @@ struct ShaderProgram {
 bool WriteDriverCacheFile(const std::filesystem::path& path, std::string_view signature,
                           std::span<const uint8_t> payload);
 bool ReadDriverCacheFile(const std::filesystem::path& path, std::string_view signature, std::vector<uint8_t>& payload);
+// Writes that file with the payload filled in place: Payload() is a mapping of a temporary file, so a cache of over
+// 1 GB is not charged to commit a second time, as a copy on the heap was at every checkpoint and at exit. Finish hashes
+// the bytes used, writes the prefix and renames the file into place.
+class DriverCacheFileWriter {
+public:
+	bool                             Open(const std::filesystem::path& path, std::string_view signature, size_t payload_size);
+	[[nodiscard]] std::span<uint8_t> Payload() const;
+	bool                             Finish(size_t payload_size);
+
+private:
+	std::filesystem::path m_path;
+	std::string           m_signature;
+	Common::MappedFile    m_file;
+};
 // Graphics pipeline library parts (KYTY_GPL, GraphicContext::SplitsFragmentSet), shared by the GPU thread and the
 // ahead workers: a part another thread is building is waited for, not built twice.
 class PipelineLibraries {

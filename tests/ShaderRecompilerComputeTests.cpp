@@ -1424,6 +1424,17 @@ void CheckDriverCacheFileRoundTrip() {
   }
   Require(name, "damaged", !Libs::Graphics::ReadDriverCacheFile(path, "KytyPC2:test\n", read) && read.empty(),
           "a damaged driver cache file was accepted");
+  // The driver may fill fewer bytes than it asked for: the file is cut to what was used, and replaces the old one.
+  Libs::Graphics::DriverCacheFileWriter writer;
+  Require(name, "writer open", writer.Open(path, "KytyPC2:test\n", payload.size() + 4096) &&
+                                   writer.Payload().size() == payload.size() + 4096,
+          "the driver cache file writer did not open");
+  std::memcpy(writer.Payload().data(), payload.data(), payload.size());
+  Require(name, "writer finish", writer.Finish(payload.size()), "the driver cache file writer did not finish");
+  Require(name, "writer round trip", Libs::Graphics::ReadDriverCacheFile(path, "KytyPC2:test\n", read) && read == payload,
+          "a driver cache file filled short did not read back as written");
+  Require(name, "writer too long", !writer.Finish(1) && !Libs::Graphics::DriverCacheFileWriter().Finish(1),
+          "a closed driver cache file writer finished again");
   std::error_code error;
   std::filesystem::remove_all(folder, error);
   std::printf("[host]    %-32s ok\n", name);
