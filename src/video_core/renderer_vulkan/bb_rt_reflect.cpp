@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -13,6 +14,7 @@
 #include "video_core/host_shaders/bb_rt_mesh_comp.h"
 #include "video_core/host_shaders/bb_rt_post_comp.h"
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
+#include "video_core/host_shaders/bb_rt_vol_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -77,8 +79,30 @@ struct alignas(16) Params {
     float misc[4];
     float misc2[4];      // history valid, frame, rays, flags (1 shine, 2 more)
     float misc3[4];      // temporal blend, default roughness, filter strength
+    float misc4[4];      // strength, hit refinement
 };
 static_assert(sizeof(Params) <= 512);
+
+struct alignas(16) VolParams {
+    float proj[16];
+    float inv_proj[16];
+    float reproj[16];
+    float prev_proj[16];
+    u32 size[4];
+    float light[4];
+    float color[4];
+    float misc[4];  // density, max march distance, steps, frame
+    float misc2[4]; // history valid, temporal blend, far distance, y sign
+};
+static_assert(sizeof(VolParams) <= 512);
+
+float EnvFloat(const char* name, float def, float lo, float hi) {
+    const char* e = std::getenv(name);
+    if (!e || !e[0]) return def;
+    char* end = nullptr;
+    const float v = std::strtof(e, &end);
+    return end != e && std::isfinite(v) ? std::clamp(v, lo, hi) : def;
+}
 
 bool EnvOn(const char* name) {
     const char* e = std::getenv(name);
@@ -96,6 +120,11 @@ RtReflect::~RtReflect() {
     FreeBuffer(instances);
     FreeBuffer(params);
     FreeBuffer(counters);
+    FreeBuffer(vol_params);
+    if (vol_pipe) device.destroyPipeline(vol_pipe);
+    if (vol_layout) device.destroyPipelineLayout(vol_layout);
+    if (vol_set) device.destroyDescriptorSetLayout(vol_set);
+    if (vol_queries) device.destroyQueryPool(vol_queries);
     if (post_pipe) device.destroyPipeline(post_pipe);
     if (post_layout) device.destroyPipelineLayout(post_layout);
     if (post_set) device.destroyDescriptorSetLayout(post_set);
@@ -194,6 +223,10 @@ void RtReflect::FreeSized() {
     FreeImage(full);
     for (auto& i : guide) FreeImage(i);
     for (auto& i : hist) FreeImage(i);
+    FreeImage(vraw);
+    for (auto& i : vacc) FreeImage(i);
+    vol_w = vol_h = 0;
+    vol_fresh = true;
     have_prev = false;
     if (blas) device.destroyAccelerationStructureKHR(blas);
     if (tlas) device.destroyAccelerationStructureKHR(tlas);
@@ -216,6 +249,10 @@ bool RtReflect::Init() {
     debug = EnvOn("BB_RT_REFLECT_DEBUG");
     scale = EnvOn("BB_RT_REFLECT_FULLRES") ? 2u : 1u;
     more = EnvOn("BB_RT_REFLECT_MORE");
+    strength = EnvFloat("BB_RT_REFLECT_STRENGTH", 1.5f, 0.0f, 4.0f);
+    if (const char* e = std::getenv("BB_RT_REFLECT_REFINE"); e && e[0] == '0') {
+        refine = false;
+    }
     if (const char* q = std::getenv("BB_RT_REFLECT_QUALITY"); q && q[0] >= '1' && q[0] <= '3') {
         quality = u32(q[0] - '0');
     }
@@ -345,6 +382,16 @@ bool RtReflect::Init() {
         queries = qp;
     }
     ok = true;
+    LOG_INFO(Render_Vulkan,
+             "[rt-reflect] strength {:.2f} (BB_RT_REFLECT_STRENGTH: hit weight x strength, hit "
+             "colour x(1 + (strength-1)/2)), depth-buffer hit refinement {} (BB_RT_REFLECT_REFINE), "
+             "mirrors (roughness < 0.05): 1 exact ray, no spatial blur, 40% temporal weight",
+             strength, refine ? "on" : "off");
+    vol_on = EnvOn("BB_RT_VOLUMETRIC");
+    if (vol_on && !InitVolumetric()) {
+        vol_on = false;
+        LOG_ERROR(Render_Vulkan, "[rt-vol] init failed: volumetric light off");
+    }
     LOG_INFO(Render_Vulkan,
              "[rt-reflect] ray-traced reflections ON: quality {} (depth mesh {}x{} px cells, {} "
              "rays/px, temporal blend {:.2f}, 2-pass bilateral x{:.1f}), more {}, shininess {}, "
@@ -508,10 +555,15 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     prm.misc[3] = debug ? 1.0f : 0.0f;
     // Temporal reprojection: current view -> world -> previous view.
     double inv_view[16];
-    const bool hist_ok = have_prev && !images_fresh && Invert4(vd, inv_view);
-    if (hist_ok) {
-        double rp[16];
+    double rp[16]{};
+    const bool cam_prev_ok = have_prev && Invert4(vd, inv_view);
+    const bool hist_ok = cam_prev_ok && !images_fresh;
+    if (cam_prev_ok) {
         Mul4(prev_view, inv_view, rp);
+    }
+    double vol_prev_proj[16];
+    std::memcpy(vol_prev_proj, prev_proj, sizeof(vol_prev_proj));
+    if (hist_ok) {
         ToGlsl(rp, prm.reproj);
         ToGlsl(prev_proj, prm.prev_proj);
     }
@@ -532,6 +584,8 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     prm.misc3[1] = 0.12f; // default roughness without RT1
     prm.misc3[2] = filter_strength;
     prm.misc3[3] = float(scale);
+    prm.misc4[0] = strength;
+    prm.misc4[1] = refine ? 1.0f : 0.0f;
     std::memcpy(prev_view, vd, sizeof(prev_view));
     std::memcpy(prev_proj, pd, sizeof(prev_proj));
     have_prev = true;
@@ -607,7 +661,9 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     if (!sampleable(in.normal_layout)) {
         trs[ntr++] = {in.normal, in.normal_layout, vk::ImageAspectFlagBits::eColor};
     }
-    if (!sampleable(in.color_layout)) {
+    const bool vol_run = vol_on && vol_ok && in.color_storage_view;
+    const bool color_general = vol_run || !sampleable(in.color_layout);
+    if (color_general && in.color_layout != vk::ImageLayout::eGeneral) {
         trs[ntr++] = {in.color, in.color_layout, vk::ImageAspectFlagBits::eColor};
     }
     if (shine_on && in.shine != in.normal && in.shine != in.color && !sampleable(in.shine_layout)) {
@@ -754,7 +810,9 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     // 3. One ray per SSR pixel.
     {
         const vk::DescriptorImageInfo normal_info{nearest, in.normal_view, lay(in.normal_layout)};
-        const vk::DescriptorImageInfo color_info{linear, in.color_view, lay(in.color_layout)};
+        const vk::DescriptorImageInfo color_info{
+            linear, in.color_view,
+            color_general ? vk::ImageLayout::eGeneral : in.color_layout};
         const vk::DescriptorImageInfo target_info{{}, in.target_view, vk::ImageLayout::eGeneral};
         const vk::DescriptorBufferInfo counters_info{counters.buffer, 0, counters.size};
         const vk::WriteDescriptorSetAccelerationStructureKHR as_info{
@@ -859,6 +917,9 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     if (queries) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, queries, slot * 2 + 1);
     }
+    if (vol_run) {
+        Volumetric(cmd, in, proj, inv, vd, rp, vol_prev_proj, cam_prev_ok, depth_info);
+    }
     // Back to the layouts the texture cache tracks; the writes visible to whatever comes next.
     layouts(false);
     if (ntr == 0 || scale > 1) {
@@ -879,10 +940,10 @@ void RtReflect::Log() {
     }
     last_log = now;
     // Counters written by the GPU (cumulative, wrapping): the last 5 s by difference.
-    std::array<u32, 6> c{};
+    std::array<u32, 8> c{};
     std::memcpy(c.data(), counters.mapped, sizeof(c));
-    std::array<u32, 6> d{};
-    for (int i = 0; i < 6; ++i) d[i] = c[i] - last_counts[i];
+    std::array<u32, 8> d{};
+    for (int i = 0; i < 8; ++i) d[i] = c[i] - last_counts[i];
     last_counts = c;
     const double valid = std::max<double>(d[1], 1.0);
     LOG_INFO(Render_Vulkan,
@@ -893,9 +954,355 @@ void RtReflect::Log() {
              100.0 * d[2] / valid, 100.0 * d[3] / valid, 100.0 * d[4] / valid,
              100.0 * d[5] / valid, quality, rays, Cell, w * scale, h * scale,
              gpu_ms_n ? gpu_ms_sum / gpu_ms_n : 0.0, debug ? " (debug tint)" : "");
+    LOG_INFO(Render_Vulkan,
+             "[rt-reflect] 5 s precision: {} mesh hits refined against the depth buffer, {} "
+             "rejected (hidden / fake surface -> game SSR colour), strength {:.2f}",
+             d[6], d[7], strength);
     last_dispatches = dispatches;
     gpu_ms_sum = 0.0;
     gpu_ms_n = 0;
+}
+
+bool RtReflect::InitVolumetric() {
+    const auto device = instance.GetDevice();
+    vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", 1.0f, 0.0f, 10.0f);
+    vol_density = EnvFloat("BB_RT_VOLUMETRIC_DENSITY", 0.02f, 0.0001f, 1.0f);
+    vol_dist = EnvFloat("BB_RT_VOLUMETRIC_DIST", 60.0f, 2.0f, 1000.0f);
+    vol_steps = u32(EnvFloat("BB_RT_VOLUMETRIC_STEPS", 12.0f, 2.0f, 64.0f));
+    if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DIR"); e && e[0]) {
+        float v[3]{};
+        if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
+            const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (l > 1e-4f) {
+                for (int i = 0; i < 3; ++i) light_env_dir[i] = v[i] / l;
+                light_env = true;
+            }
+        }
+    }
+    if (const char* e = std::getenv("BB_RT_VOLUMETRIC_LIGHT_OFS"); e && e[0]) {
+        light_forced_ofs = std::clamp(std::atoi(e), 0, 213);
+    }
+    if (const char* e = std::getenv("BB_RT_VOLUMETRIC_COLOR"); e && e[0]) {
+        float v[3]{};
+        if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
+            for (int i = 0; i < 3; ++i) vol_color[i] = std::clamp(v[i], 0.0f, 100.0f);
+        }
+    }
+    constexpr auto C = vk::ShaderStageFlagBits::eCompute;
+    const std::array<vk::DescriptorSetLayoutBinding, 8> vb{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {1, vk::DescriptorType::eAccelerationStructureKHR, 1, C},
+        {2, vk::DescriptorType::eUniformBuffer, 1, C},
+        {3, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {4, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {5, vk::DescriptorType::eStorageImage, 1, C},
+        {6, vk::DescriptorType::eStorageImage, 1, C},
+        {7, vk::DescriptorType::eStorageBuffer, 1, C},
+    }};
+    auto [lr, l] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(vb.size()),
+        .pBindings = vb.data(),
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    vol_set = l;
+    const vk::PushConstantRange range{C, 0, 4};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &vol_set,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess) return false;
+    vol_layout = pl;
+    const auto module = Vulkan::CompileSPV(BB_RT_VOL_COMP, device);
+    if (!module) return false;
+    auto [cr, pipe] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{.stage = C, .module = module, .pName = "main"},
+                .layout = vol_layout,
+            });
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess) return false;
+    vol_pipe = pipe;
+    if (!MakeBuffer(vol_params, ParamSize * Ring, vk::BufferUsageFlagBits::eUniformBuffer, true)) {
+        return false;
+    }
+    auto [qr, qp] = device.createQueryPool({
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = Ring * 2,
+    });
+    if (qr == vk::Result::eSuccess) vol_queries = qp;
+    vol_ok = true;
+    LOG_INFO(Render_Vulkan,
+             "[rt-vol] ray-traced volumetric light ON: half res (depth size) trace, {} steps, "
+             "march {:.0f} units, density {:.4f}, strength {:.2f}, colour ({:.2f}, {:.2f}, {:.2f}), "
+             "light dir: {}; temporal + depth-bilateral upsample, added into the lit scene "
+             "before the composite",
+             vol_steps, vol_dist, vol_density, vol_strength, vol_color[0], vol_color[1],
+             vol_color[2],
+             light_env ? "BB_RT_VOLUMETRIC_DIR"
+             : light_forced_ofs >= 0 ? "BB_RT_VOLUMETRIC_LIGHT_OFS"
+                                     : "searched in the scene constant block, else fixed fallback");
+    return true;
+}
+
+// The main light's direction. The scene constant block (864 bytes, the camera block) is searched
+// for a unit vec3 at a vec4 boundary that is not a camera matrix row (rows come in orthogonal
+// groups and match the view's axes). This is a heuristic: which float the game really uses for
+// the sun / moon is unverified. Fallback: a fixed high moonlight direction.
+bool RtReflect::LightDir(const double* view, float out_view[3]) {
+    double lw[3] = {-0.3, 0.8, 0.5};
+    const char* src = "fallback (fixed world dir -0.3,0.8,0.5; no unit vector in the scene block)";
+    float b[216];
+    const bool have_block = BB::Upscale::RtSceneBlock(b);
+    if (have_block && !logged_block) {
+        logged_block = true;
+        for (int i = 0; i < 216; i += 8) {
+            LOG_INFO(Render_Vulkan,
+                     "[rt-vol] scene block [{:3}] {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} "
+                     "{:.4f}",
+                     i, b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5], b[i + 6], b[i + 7]);
+        }
+    }
+    const auto unit = [&](int i) {
+        if (i < 0 || i + 2 >= 216) return false;
+        const float x = b[i], y = b[i + 1], z = b[i + 2];
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return false;
+        const float l = std::sqrt(x * x + y * y + z * z);
+        return std::fabs(l - 1.0f) < 0.01f;
+    };
+    const auto candidate = [&](int i) {
+        if ((i >= 8 && i < 20) || (i >= 52 && i < 68) || (i >= 180 && i < 192)) return false;
+        if (!unit(i)) return false;
+        const double v[3] = {b[i], b[i + 1], b[i + 2]};
+        if (std::max({std::fabs(v[0]), std::fabs(v[1]), std::fabs(v[2])}) > 0.999) return false;
+        for (int n : {i - 4, i + 4}) {
+            if (unit(n) && std::fabs(b[n] * v[0] + b[n + 1] * v[1] + b[n + 2] * v[2]) < 0.02) {
+                return false; // a row of a rotation matrix
+            }
+        }
+        for (int r = 0; r < 3; ++r) {
+            const double row = view[r * 4] * v[0] + view[r * 4 + 1] * v[1] + view[r * 4 + 2] * v[2];
+            const double col = view[r] * v[0] + view[4 + r] * v[1] + view[8 + r] * v[2];
+            if (std::fabs(row) > 0.995 || std::fabs(col) > 0.995) return false;
+        }
+        return true;
+    };
+    static char src_buf[96];
+    if (light_env) {
+        for (int i = 0; i < 3; ++i) lw[i] = light_env_dir[i];
+        src = "BB_RT_VOLUMETRIC_DIR";
+    } else if (have_block) {
+        int ofs = -1;
+        if (light_forced_ofs >= 0) {
+            ofs = unit(light_forced_ofs) ? light_forced_ofs : -1;
+        } else if (light_ofs >= 0 && candidate(light_ofs)) {
+            ofs = light_ofs;
+        } else {
+            for (int i = 20; i + 2 < 216 && ofs < 0; i += 4) {
+                if (candidate(i)) ofs = i;
+            }
+        }
+        if (ofs >= 0) {
+            if (ofs != light_ofs) {
+                LOG_INFO(Render_Vulkan,
+                         "[rt-vol] light direction candidate: scene block floats {}-{} = ({:.3f}, "
+                         "{:.3f}, {:.3f}){}",
+                         ofs, ofs + 2, b[ofs], b[ofs + 1], b[ofs + 2],
+                         light_forced_ofs >= 0 ? " (forced)" : " (heuristic, unverified)");
+            }
+            light_ofs = ofs;
+            for (int i = 0; i < 3; ++i) lw[i] = b[ofs + i];
+            std::snprintf(src_buf, sizeof(src_buf), "scene block floats %d-%d%s", ofs, ofs + 2,
+                          light_forced_ofs >= 0 ? " (forced)" : " (heuristic)");
+            src = src_buf;
+        }
+    }
+    // Toward the light, assumed above the horizon (world y up).
+    if (lw[1] < 0.0) {
+        for (double& v : lw) v = -v;
+    }
+    double lv[3];
+    for (int r = 0; r < 3; ++r) {
+        lv[r] = view[r * 4] * lw[0] + view[r * 4 + 1] * lw[1] + view[r * 4 + 2] * lw[2];
+    }
+    const double l = std::sqrt(lv[0] * lv[0] + lv[1] * lv[1] + lv[2] * lv[2]);
+    if (!(l > 1e-6)) return false;
+    for (int i = 0; i < 3; ++i) out_view[i] = static_cast<float>(lv[i] / l);
+    light_src = src;
+    return true;
+}
+
+void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* proj,
+                           const double* inv, const double* view, const double* reproj,
+                           const double* prev_proj_, bool reproj_ok,
+                           const vk::DescriptorImageInfo& depth_info) {
+    float lv[3];
+    if (!LightDir(view, lv)) return;
+    const auto device = instance.GetDevice();
+    if (vol_w != w || vol_h != h || !vraw.image) {
+        FreeImage(vraw);
+        for (auto& i : vacc) FreeImage(i);
+        if (!MakeImage(vraw, w, h) || !MakeImage(vacc[0], w, h) || !MakeImage(vacc[1], w, h)) {
+            FreeImage(vraw);
+            for (auto& i : vacc) FreeImage(i);
+            vol_ok = false;
+            LOG_ERROR(Render_Vulkan, "[rt-vol] images {}x{} failed: volumetric light off", w, h);
+            return;
+        }
+        vol_w = w;
+        vol_h = h;
+        vol_fresh = true;
+    }
+    const u32 slot = u32(vol_dispatches % Ring);
+    const u32 cur = u32(vol_dispatches & 1), prv = cur ^ 1u;
+    VolParams vp{};
+    double pd[16];
+    for (int i = 0; i < 16; ++i) pd[i] = proj[i];
+    ToGlsl(pd, vp.proj);
+    ToGlsl(inv, vp.inv_proj);
+    const bool hist = reproj_ok && !vol_fresh;
+    if (hist) {
+        ToGlsl(reproj, vp.reproj);
+        ToGlsl(prev_proj_, vp.prev_proj);
+    }
+    vp.size[0] = w;
+    vp.size[1] = h;
+    vp.size[2] = in.color_width;
+    vp.size[3] = in.color_height;
+    vp.light[0] = lv[0];
+    vp.light[1] = lv[1];
+    vp.light[2] = lv[2];
+    vp.color[0] = vol_color[0];
+    vp.color[1] = vol_color[1];
+    vp.color[2] = vol_color[2];
+    vp.color[3] = vol_strength;
+    vp.misc[0] = vol_density;
+    vp.misc[1] = vol_dist;
+    vp.misc[2] = float(vol_steps);
+    vp.misc[3] = float(vol_dispatches & 0xffff);
+    vp.misc2[0] = hist ? 1.0f : 0.0f;
+    vp.misc2[1] = 0.1f;
+    float far_dist = 3000.0f;
+    {
+        float pj[16], vw[12];
+        if (BB::Upscale::RtCamera(pj, vw, far_dist) && !(far_dist > 1.0f)) far_dist = 3000.0f;
+    }
+    vp.misc2[2] = far_dist;
+    vp.misc2[3] = 1.0f;
+    std::memcpy(static_cast<u8*>(vol_params.mapped) + slot * ParamSize, &vp, sizeof(vp));
+
+    if (vol_queries && vol_query_used[slot]) {
+        std::array<u64, 2> ts{};
+        if (device.getQueryPoolResults(vol_queries, slot * 2, 2, sizeof(ts), ts.data(),
+                                       sizeof(u64), vk::QueryResultFlagBits::e64) ==
+            vk::Result::eSuccess) {
+            const double period =
+                instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+            const double ms = double(ts[1] - ts[0]) * period * 1e-6;
+            if (ms > 0.0 && ms < 1000.0) {
+                vol_ms_sum += ms;
+                ++vol_ms_n;
+            }
+        }
+    }
+    if (vol_queries) {
+        cmd.resetQueryPool(vol_queries, slot * 2, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, vol_queries, slot * 2);
+        vol_query_used[slot] = true;
+    }
+    if (vol_fresh) {
+        std::array<vk::ImageMemoryBarrier2, 3> b{};
+        const std::array<vk::Image, 3> imgs{vraw.image, vacc[0].image, vacc[1].image};
+        for (u32 i = 0; i < 3; ++i) {
+            b[i] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = imgs[i],
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 3,
+                                                .pImageMemoryBarriers = b.data()});
+        vol_fresh = false;
+    }
+    const vk::MemoryBarrier2 cc{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    const vk::DescriptorBufferInfo params_info{vol_params.buffer, slot * ParamSize, ParamSize};
+    const vk::DescriptorBufferInfo counters_info{counters.buffer, 0, counters.size};
+    const vk::DescriptorImageInfo scene_info{{}, in.color_storage_view, vk::ImageLayout::eGeneral};
+    const vk::WriteDescriptorSetAccelerationStructureKHR as_info{
+        .accelerationStructureCount = 1,
+        .pAccelerationStructures = &tlas,
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, vol_pipe);
+    const auto pass = [&](u32 mode, const Img& src, const Img& hst, const Img& dst, u32 dw,
+                          u32 dh) {
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &cc});
+        const vk::DescriptorImageInfo src_i{nearest, src.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo hist_i{linear, hst.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo dst_i{{}, dst.view, vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 8> wr{{
+            {.dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &depth_info},
+            {.pNext = &as_info, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eAccelerationStructureKHR},
+            {.dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &params_info},
+            {.dstBinding = 3, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &src_i},
+            {.dstBinding = 4, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &hist_i},
+            {.dstBinding = 5, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst_i},
+            {.dstBinding = 6, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &scene_info},
+            {.dstBinding = 7, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &counters_info},
+        }};
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, vol_layout, 0, wr);
+        cmd.pushConstants(vol_layout, vk::ShaderStageFlagBits::eCompute, 0, 4, &mode);
+        cmd.dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
+    };
+    pass(0, vacc[prv], vacc[prv], vraw, w, h);                         // trace
+    pass(1, vraw, vacc[prv], vacc[cur], w, h);                         // temporal
+    pass(2, vacc[cur], vacc[prv], vraw, in.color_width, in.color_height); // upsample + add
+    if (vol_queries) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, vol_queries, slot * 2 + 1);
+    }
+    ++vol_dispatches;
+    LogVolumetric();
+}
+
+void RtReflect::LogVolumetric() {
+    const auto now = std::chrono::steady_clock::now();
+    if (vol_last_log != std::chrono::steady_clock::time_point{} &&
+        now - vol_last_log < std::chrono::seconds(5)) {
+        return;
+    }
+    vol_last_log = now;
+    u32 c[2];
+    std::memcpy(c, static_cast<const u32*>(counters.mapped) + 8, sizeof(c));
+    const u32 samples = c[0] - vol_last_counts[0], lit = c[1] - vol_last_counts[1];
+    vol_last_counts[0] = c[0];
+    vol_last_counts[1] = c[1];
+    LOG_INFO(Render_Vulkan,
+             "[rt-vol] 5 s: {} dispatches, {}x{} trace, {} light rays, {:.1f}% unshadowed, GPU "
+             "{:.3f} ms per pass, strength {:.2f}, light dir source: {}",
+             vol_dispatches - vol_last_dispatches, vol_w, vol_h, samples,
+             samples ? 100.0 * lit / samples : 0.0, vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0,
+             vol_strength, light_src);
+    vol_last_dispatches = vol_dispatches;
+    vol_ms_sum = 0.0;
+    vol_ms_n = 0;
 }
 
 } // namespace BB

@@ -60,6 +60,8 @@ void OnConstants(const u32* data, size_t count);
 // the projection (floats 52-67, row-major, column vectors) and the view (floats 8-19, 3x4 rows)
 // and the far distance (float 0). False until one was seen.
 bool RtCamera(float proj[16], float view[12], float& far_dist);
+// bb-rt-vol: the same block's first 216 floats (light direction search).
+bool RtSceneBlock(float out[216]);
 // This frame's jitter in render pixels (zero when off).
 void Jitter(float& x, float& y);
 // bb-hudjitter: a depth-target bind of a draw (rasterizer): jittered (scene), skipped (after the

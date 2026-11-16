@@ -1,0 +1,164 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-vol (BB_RT_VOLUMETRIC=1): ray-traced volumetric light, run right after the RT reflections
+// (same depth-mesh TLAS) and added into the lit scene the game's composite reads.
+//   mode 0  trace at the depth size (half the lit scene): march the view ray through depth in
+//           `steps` jittered steps; at each sample one ray query toward the main light
+//           (terminate on first hit) decides visibility; in-scattering with a Henyey-Greenstein
+//           phase and exponential transmittance. Output (rgb in-scatter, view distance).
+//   mode 1  temporal: reprojected history (previous camera), clamped to the 3x3 neighbourhood.
+//   mode 2  joint-bilateral upsample (depth weights) to the lit scene size, added to it.
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1) uniform accelerationStructureEXT tlas;
+layout(std140, binding = 2) uniform Params {
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 reproj;     // current view -> previous view
+    mat4 prev_proj;
+    uvec4 size;      // depth w, h, scene w, h
+    vec4 light;      // view-space direction toward the light, 0
+    vec4 color;      // light colour, strength
+    vec4 misc;       // density, max march distance, steps, frame
+    vec4 misc2;      // history valid, temporal blend, far distance, y sign
+} p;
+layout(binding = 3) uniform sampler2D src_tex;  // mode 1: raw, mode 2: accumulated (nearest)
+layout(binding = 4) uniform sampler2D hist_tex; // previous accumulated (linear)
+layout(binding = 5, rgba16f) uniform writeonly image2D dst;
+layout(binding = 6, rgba16f) uniform image2D scene;
+layout(std430, binding = 7) buffer Counters { uint n[16]; } cnt; // [8] samples, [9] lit samples
+layout(push_constant) uniform Push { uint mode; } pc;
+
+shared uint s_n[2];
+
+vec3 Unproject(ivec2 px, out float dist) {
+    px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
+    float d = texelFetch(depth_tex, px, 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc2.w > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    vec3 r = v.xyz / (abs(v.w) > 1e-8 ? v.w : 1.0);
+    dist = length(r);
+    if (isnan(dist) || isinf(dist) || dist > p.misc2.z * 0.95) {
+        dist = p.misc2.z; // sky
+        vec4 f = p.inv_proj * vec4(ndc.xy, 0.5, 1.0);
+        r = normalize(f.xyz / f.w) * dist;
+    }
+    return r;
+}
+
+uint Hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < 2u) {
+        s_n[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    uint ns = 0u, nl = 0u;
+    if (pc.mode == 0u && all(lessThan(c, ivec2(p.size.xy)))) {
+        float dist;
+        vec3 P = Unproject(c, dist);
+        vec3 V = normalize(P);
+        vec3 L = p.light.xyz;
+        float march = min(dist, p.misc.y);
+        int steps = max(int(p.misc.z), 1);
+        float dt = march / float(steps);
+        // Interleaved gradient noise + frame rotation: the temporal pass integrates the jitter.
+        float ign = fract(52.9829189 * fract(0.06711056 * float(c.x) + 0.00583715 * float(c.y)));
+        float j = fract(ign + float(Hash(uint(p.misc.w)) & 0xffffu) / 65536.0);
+        float dens = p.misc.x;
+        float acc = 0.0;
+        for (int i = 0; i < steps; ++i) {
+            float t = (float(i) + j) * dt;
+            vec3 S = V * t;
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas,
+                                  gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+                                  S, 0.05 + 0.002 * t, L, p.misc.y * 2.0);
+            while (rayQueryProceedEXT(rq)) {
+            }
+            bool lit = rayQueryGetIntersectionTypeEXT(rq, true) ==
+                       gl_RayQueryCommittedIntersectionNoneEXT;
+            ++ns;
+            if (lit) {
+                ++nl;
+                acc += exp(-dens * t) * dens * dt;
+            }
+        }
+        const float g = 0.55;
+        float ct = dot(V, L);
+        float phase = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * ct, 1e-4), 1.5);
+        vec3 o = p.color.rgb * (acc * phase * p.color.w);
+        imageStore(dst, c, vec4(any(isnan(o)) ? vec3(0.0) : o, dist));
+    } else if (pc.mode == 1u && all(lessThan(c, ivec2(p.size.xy)))) {
+        vec4 cur = texelFetch(src_tex, c, 0);
+        vec4 outv = cur;
+        if (p.misc2.x > 0.5) {
+            vec3 m0 = vec3(1e9), m1 = vec3(-1e9);
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    vec3 s = texelFetch(src_tex, clamp(c + ivec2(x, y), ivec2(0),
+                                                       ivec2(p.size.xy) - 1), 0).rgb;
+                    m0 = min(m0, s);
+                    m1 = max(m1, s);
+                }
+            }
+            float dist;
+            vec3 P = Unproject(c, dist);
+            vec3 Q = (p.reproj * vec4(P, 1.0)).xyz;
+            vec4 clip = p.prev_proj * vec4(Q, 1.0);
+            if (clip.w > 1e-6) {
+                vec2 ndc = clip.xy / clip.w;
+                vec2 uv = vec2(ndc.x * 0.5 + 0.5,
+                               p.misc2.w > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+                if (all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+                    vec4 h = textureLod(hist_tex, uv, 0.0);
+                    float qd = length(Q);
+                    if (!any(isnan(h)) && abs(h.a - qd) < 0.05 * qd + 0.1) {
+                        outv = vec4(mix(clamp(h.rgb, m0, m1), cur.rgb, p.misc2.y), cur.a);
+                    }
+                }
+            }
+        }
+        imageStore(dst, c, outv);
+    } else if (pc.mode == 2u && all(lessThan(c, ivec2(p.size.zw)))) {
+        vec2 hp = (vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw) - 0.5;
+        ivec2 b = ivec2(floor(hp));
+        vec2 f = hp - vec2(b);
+        ivec2 hc = clamp(ivec2((vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw)), ivec2(0),
+                         ivec2(p.size.xy) - 1);
+        float dref = texelFetch(src_tex, hc, 0).a;
+        vec3 sum = vec3(0.0);
+        float ws = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            ivec2 o = ivec2(k & 1, k >> 1);
+            ivec2 q = clamp(b + o, ivec2(0), ivec2(p.size.xy) - 1);
+            vec4 s = texelFetch(src_tex, q, 0);
+            float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+            float w = (bw + 1e-3) * exp(-abs(s.a - dref) / (0.02 * dref + 0.05));
+            sum += s.rgb * w;
+            ws += w;
+        }
+        vec3 add = ws > 1e-5 ? sum / ws : texelFetch(src_tex, hc, 0).rgb;
+        if (!any(isnan(add)) && !any(isinf(add))) {
+            vec4 sc = imageLoad(scene, c);
+            imageStore(scene, c, vec4(sc.rgb + max(add, vec3(0.0)), sc.a));
+        }
+    }
+    if (ns != 0u) {
+        atomicAdd(s_n[0], ns);
+        atomicAdd(s_n[1], nl);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < 2u && pc.mode == 0u) {
+        atomicAdd(cnt.n[8 + gl_LocalInvocationIndex], s_n[gl_LocalInvocationIndex]);
+    }
+}

@@ -302,6 +302,7 @@ struct RtCam {
     float proj[16]{};
     float view[12]{};
     float far_dist = 3000.0f;
+    float block[216]{};
     bool valid = false;
 } g_rt_cam;
 
@@ -675,6 +676,14 @@ bool RtCamera(float proj[16], float view[12], float& far_dist) {
     far_dist = g_rt_cam.far_dist;
     return true;
 }
+bool RtSceneBlock(float out[216]) {
+    std::scoped_lock lk{g_cam_mutex};
+    if (!g_rt_cam.valid) {
+        return false;
+    }
+    std::memcpy(out, g_rt_cam.block, sizeof(g_rt_cam.block));
+    return true;
+}
 void OnConstants(const u32* data, size_t count) {
     if (count < 216) {
         return;
@@ -689,6 +698,7 @@ void OnConstants(const u32* data, size_t count) {
     std::memcpy(g_rt_cam.proj, d + 52, sizeof(g_rt_cam.proj));
     std::memcpy(g_rt_cam.view, d + 8, sizeof(g_rt_cam.view));
     g_rt_cam.far_dist = d[0];
+    std::memcpy(g_rt_cam.block, d, sizeof(g_rt_cam.block));
     g_rt_cam.valid = d[52] != 0.0f && d[57] != 0.0f;
     if (g_frame_has_camera) {
         return; // the first one of a frame is the main camera

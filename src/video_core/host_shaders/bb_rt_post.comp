@@ -33,6 +33,7 @@ layout(std140, binding = 7) uniform Params {
     vec4 misc;
     vec4 misc2;
     vec4 misc3;
+    vec4 misc4; // strength, hit refinement
 } p;
 layout(binding = 8) uniform sampler2D depth_tex;
 layout(std430, binding = 9) buffer Counters { uint n[8]; } cnt;
@@ -99,7 +100,11 @@ void main() {
                 }
                 m1 /= 9.0;
                 vec4 sigma = sqrt(max(m2 / 9.0 - m1 * m1, vec4(0.0)));
-                float alpha = 1.0;
+                // Mirrors: less history (no smearing of sharp reflections), tighter clamp.
+                float rough0 = Rough(c);
+                float mirror = 1.0 - clamp((rough0 - 0.03) * 6.0, 0.0, 1.0);
+                float blend = mix(p.misc3.x, max(p.misc3.x, 0.4), mirror);
+                float clip_k = mix(1.5, 0.75, mirror);
                 if (p.misc2.x > 0.5) {
                     vec3 P = Unproject(c);
                     vec3 Q = (p.reproj * vec4(P, 1.0)).xyz;
@@ -117,9 +122,9 @@ void main() {
                                 dot(pg.xyz, nprev) > 0.9) {
                                 vec4 h = textureLod(hist_tex, uv, 0.0);
                                 // Variance clipping: history outside this frame's spread is pulled in.
-                                h = clamp(h, m1 - 1.5 * sigma, m1 + 1.5 * sigma);
+                                h = clamp(h, m1 - clip_k * sigma, m1 + clip_k * sigma);
                                 if (!any(isnan(h))) {
-                                    outv = mix(h, cur, p.misc3.x);
+                                    outv = mix(h, cur, blend);
                                     ok_hist = 1u;
                                 }
                             }
@@ -134,7 +139,7 @@ void main() {
             if (g.w > 0.0) {
                 float rough = Rough(c);
                 // Mirrors stay sharp, rough surfaces get the full blur.
-                float spread = mix(0.15, 1.0, clamp(rough * 3.0, 0.0, 1.0)) * p.misc3.z;
+                float spread = mix(0.0, 1.0, clamp((rough - 0.03) * 3.5, 0.0, 1.0)) * p.misc3.z;
                 vec4 sum = cur;
                 float wsum = 1.0;
                 for (int y = -1; y <= 1; ++y) {
@@ -162,7 +167,11 @@ void main() {
                 if ((uint(p.misc2.w) & 2u) != 0u) {
                     a = sqrt(a); // BB_RT_REFLECT_MORE: faint hits count more
                 }
-                vec4 o = vec4(res.rgb, mix(game.a, max(game.a, 1.0), a));
+                // BB_RT_REFLECT_STRENGTH: partial hits count more and hit colour is lifted.
+                float st = p.misc4.x > 0.0 ? p.misc4.x : 1.0;
+                a = clamp(a * st, 0.0, 1.0);
+                vec3 rgb = res.rgb * (1.0 + max(st - 1.0, 0.0) * 0.5 * a);
+                vec4 o = vec4(rgb, mix(game.a, max(game.a, 1.0), a));
                 if (p.misc.w > 0.5) {
                     o.rgb = mix(o.rgb, vec3(1.0, 0.0, 1.0), 0.5 * a);
                 }

@@ -18,7 +18,7 @@ layout(binding = 1) uniform sampler2D normal_tex;  // 1708x960 RGBA8 (nearest)
 layout(binding = 2) uniform sampler2D color_tex;   // 1708x960 RGBA16F lit scene (linear)
 layout(binding = 3, rgba16f) uniform readonly image2D ssr_out; // the game's SSR result
 layout(binding = 4) uniform accelerationStructureEXT tlas;
-layout(std430, binding = 5) buffer Counters { uint n[8]; } cnt; // pixels, valid, hits, g-normal, d-normal, temporal ok
+layout(std430, binding = 5) buffer Counters { uint n[16]; } cnt; // pixels, valid, hits, g-normal, d-normal, temporal ok, refined, rejected
 layout(std140, binding = 6) uniform Params {
     mat4 proj;
     mat4 inv_proj;
@@ -29,12 +29,13 @@ layout(std140, binding = 6) uniform Params {
     vec4 misc;       // far distance, y sign, cell size, debug tint (1)
     vec4 misc2;      // history valid, frame index, rays per pixel, flags (1 shine, 2 more)
     vec4 misc3;      // temporal blend, default roughness, filter strength, trace scale (1 or 2)
+    vec4 misc4;      // strength, hit refinement (1), 0, 0
 } p;
 layout(binding = 7) uniform sampler2D shine_tex;   // G-buffer RT1 (R: shininess) or RT0 when absent
 layout(binding = 8, rgba16f) uniform writeonly image2D raw_out;
 layout(binding = 9, rgba16f) uniform writeonly image2D guide_out;
 
-shared uint s_cnt[5];
+shared uint s_cnt[8];
 
 // Trace resolution = depth / SSR size (p.size.xy) * scale (BB_RT_REFLECT_FULLRES=1: 2).
 int Scale() { return max(int(p.misc3.w + 0.5), 1); }
@@ -79,8 +80,67 @@ float Rand(inout uint s) {
     return float(s >> 8) * (1.0 / 16777216.0);
 }
 
+vec2 ToUv(vec3 H, out bool on) {
+    vec4 clip = p.proj * vec4(H, 1.0);
+    on = clip.w > 1e-6;
+    vec2 ndc = clip.xy / (on ? clip.w : 1.0);
+    vec2 uv = vec2(ndc.x * 0.5 + 0.5, p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+    on = on && all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));
+    return uv;
+}
+
+// Distance from the eye to the depth-buffer surface under H's screen position (-1: off screen).
+float SceneDist(vec3 H) {
+    bool on;
+    vec2 uv = ToUv(H, on);
+    if (!on) {
+        return -1.0;
+    }
+    bool ok;
+    vec3 S = Unproject(ivec2(uv * vec2(p.size.xy)), ok);
+    return ok ? length(S) : p.misc.x;
+}
+
+// The depth mesh is Cell px coarse: binary search of the ray against the depth buffer itself
+// around the mesh hit t. Returns the refined t; conf = 0 when the depth buffer disagrees (the
+// mesh hit a fake / hidden surface).
+float RefineHit(vec3 O, vec3 R, float t, out float conf, out bool refined) {
+    conf = 1.0;
+    refined = false;
+    vec3 H = O + R * t;
+    float px_world = 2.0 * length(H) / (abs(p.proj[1][1]) * float(p.size.y));
+    float dt = max(1.5 * p.misc.z * px_world, 0.01 * t);
+    float lo = max(t - dt, 0.0), hi = t + dt;
+    float slo = SceneDist(O + R * lo), shi = SceneDist(O + R * hi);
+    if (slo > 0.0 && shi > 0.0 && length(O + R * lo) < slo && length(O + R * hi) >= shi) {
+        for (int i = 0; i < 6; ++i) {
+            float mid = 0.5 * (lo + hi);
+            vec3 M = O + R * mid;
+            float sm = SceneDist(M);
+            if (sm < 0.0) {
+                break;
+            }
+            if (length(M) >= sm) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        t = 0.5 * (lo + hi);
+        refined = true;
+    }
+    H = O + R * t;
+    float sd = SceneDist(H);
+    if (sd > 0.0) {
+        float gap = abs(length(H) - sd);
+        float tol = 0.03 * sd + 4.0 * p.misc.z * px_world;
+        conf = clamp(2.0 - gap / tol, 0.0, 1.0);
+    }
+    return t;
+}
+
 void main() {
-    if (gl_LocalInvocationIndex < 5u) {
+    if (gl_LocalInvocationIndex < 8u) {
         s_cnt[gl_LocalInvocationIndex] = 0u;
     }
     barrier();
@@ -88,7 +148,7 @@ void main() {
     const ivec2 ts = TraceSize();
     const int sc_ = Scale();
     bool inside = c.x < ts.x && c.y < ts.y;
-    uint valid = 0u, hit = 0u, used_g = 0u, used_d = 0u;
+    uint valid = 0u, hit = 0u, used_g = 0u, used_d = 0u, n_ref = 0u, n_rej = 0u;
     if (inside) {
         vec4 game = imageLoad(ssr_out, c / sc_);
         vec4 raw = vec4(game.rgb, 0.0);
@@ -135,8 +195,8 @@ void main() {
                 rough = clamp(1.0 - shine, 0.0, 1.0);
             }
             // Cone half-angle: near zero for mirrors, wide for rough surfaces.
-            float cone = 0.004 + 0.5 * rough * rough;
-            int rays = int(p.misc2.z);
+            float cone = rough < 0.05 ? 0.0 : 0.004 + 0.5 * rough * rough;
+            int rays = rough < 0.05 ? 1 : int(p.misc2.z); // mirrors: one exact ray
             if ((flags & 2u) != 0u && shine > 0.7) {
                 rays *= 2; // BB_RT_REFLECT_MORE: more rays on very shiny pixels
             }
@@ -168,22 +228,26 @@ void main() {
                     if (rayQueryGetIntersectionTypeEXT(rq, true) ==
                         gl_RayQueryCommittedIntersectionTriangleEXT) {
                         float t = rayQueryGetIntersectionTEXT(rq, true);
+                        float conf = 1.0;
+                        if (p.misc4.y > 0.5) {
+                            bool refined;
+                            t = RefineHit(O, R, t, conf, refined);
+                            n_ref += refined ? 1u : 0u;
+                            n_rej += conf <= 0.0 ? 1u : 0u;
+                        }
                         vec3 H = O + R * t;
-                        vec4 clip = p.proj * vec4(H, 1.0);
-                        if (clip.w > 1e-6) {
-                            vec2 ndc = clip.xy / clip.w;
-                            vec2 uv = vec2(ndc.x * 0.5 + 0.5,
-                                           p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
-                            if (all(greaterThanEqual(uv, vec2(0.0))) &&
-                                all(lessThanEqual(uv, vec2(1.0)))) {
-                                vec3 sc = textureLod(color_tex, uv, 0.0).rgb;
-                                if (!any(isnan(sc)) && !any(isinf(sc))) {
-                                    vec2 e = min(uv, 1.0 - uv);
-                                    w = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0);
-                                    // Soft clamp of fireflies (bright specks from single texels).
-                                    sc = sc / (1.0 + max(0.0, max(sc.r, max(sc.g, sc.b)) - 8.0) * 0.125);
-                                    col = mix(game.rgb, sc, w);
-                                }
+                        bool on;
+                        vec2 uv = ToUv(H, on);
+                        if (on && conf > 0.0) {
+                            vec3 sc = textureLod(color_tex, uv, 0.0).rgb;
+                            if (!any(isnan(sc)) && !any(isinf(sc))) {
+                                vec2 e = min(uv, 1.0 - uv);
+                                w = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0) * conf;
+                                // Soft clamp of fireflies (bright specks from single texels).
+                                sc = sc / (1.0 + max(0.0, max(sc.r, max(sc.g, sc.b)) - 8.0) * 0.125);
+                                // Low confidence / screen edge: the lit scene under the pixel's
+                                // own reflection falls back to the game's SSR colour.
+                                col = mix(game.rgb, sc, w);
                             }
                         }
                     }
@@ -204,8 +268,10 @@ void main() {
     if (hit != 0u) atomicAdd(s_cnt[2], 1u);
     if (used_g != 0u) atomicAdd(s_cnt[3], 1u);
     if (used_d != 0u) atomicAdd(s_cnt[4], 1u);
+    if (n_ref != 0u) atomicAdd(s_cnt[6], n_ref);
+    if (n_rej != 0u) atomicAdd(s_cnt[7], n_rej);
     barrier();
-    if (gl_LocalInvocationIndex < 5u) {
+    if (gl_LocalInvocationIndex < 8u && gl_LocalInvocationIndex != 5u) {
         atomicAdd(cnt.n[gl_LocalInvocationIndex], s_cnt[gl_LocalInvocationIndex]);
     }
 }

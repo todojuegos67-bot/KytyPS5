@@ -585,6 +585,10 @@ void Rasterizer::BbRtReflectRun() {
     nv.format = vk::Format::eR8G8B8A8Unorm;
     VideoCore::ImageViewInfo cv{};
     cv.format = vk::Format::eR16G16B16A16Sfloat;
+    static const bool bb_vol = [] {
+        const char* e = std::getenv("BB_RT_VOLUMETRIC");
+        return e && e[0] == '1';
+    }();
     const BB::RtReflect::Input in{
         .target = target->GetImage(),
         .target_view = *target->FindView(tv, false).image_view,
@@ -598,12 +602,15 @@ void Rasterizer::BbRtReflectRun() {
         .normal_layout = layout_of(*normal),
         .color = color->GetImage(),
         .color_view = *color->FindView(cv, false).image_view,
+        .color_storage_view = bb_vol ? *color->FindView(tv, false).image_view : vk::ImageView{},
         .color_layout = layout_of(*color),
         .shine = shine ? shine->GetImage() : vk::Image{},
         .shine_view = shine ? *shine->FindView(nv, false).image_view : vk::ImageView{},
         .shine_layout = shine ? layout_of(*shine) : vk::ImageLayout::eUndefined,
         .width = target->info.size.width,
         .height = target->info.size.height,
+        .color_width = color->info.size.width,
+        .color_height = color->info.size.height,
     };
     scheduler.EndRendering();
     const bool ran = bb_rt_reflect->Run(scheduler.CommandBuffer(), in);

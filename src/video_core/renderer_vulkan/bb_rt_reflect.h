@@ -35,11 +35,13 @@ public:
         vk::ImageLayout normal_layout;
         vk::Image color;          // RGBA16F lit scene
         vk::ImageView color_view;
+        vk::ImageView color_storage_view; // BB_RT_VOLUMETRIC=1: in-scattering is added here
         vk::ImageLayout color_layout;
         vk::Image shine;          // G-buffer RT1 (R: shininess), null when not bound
         vk::ImageView shine_view;
         vk::ImageLayout shine_layout;
         u32 width, height;        // SSR target / depth size
+        u32 color_width, color_height; // lit scene size
     };
 
     explicit RtReflect(const Vulkan::Instance& instance);
@@ -78,6 +80,15 @@ private:
     void FreeImage(Img& i);
     void FreeSized();
     void Log();
+    // bb-rt-vol (BB_RT_VOLUMETRIC=1): volumetric light pass, recorded inside Run after the
+    // reflections (same TLAS). The lit scene is in GENERAL.
+    bool InitVolumetric();
+    void Volumetric(vk::CommandBuffer cmd, const Input& in, const float* proj, const double* inv,
+                    const double* view, const double* reproj, const double* prev_proj_,
+                    bool reproj_ok,
+                    const vk::DescriptorImageInfo& depth_info);
+    bool LightDir(const double* view, float out_view[3]);
+    void LogVolumetric();
 
     const Vulkan::Instance& instance;
     bool tried = false, ok = false;
@@ -113,10 +124,39 @@ private:
 
     // Stats (logged every 5 s).
     u64 dispatches = 0, last_dispatches = 0;
-    std::array<u32, 6> last_counts{};
+    std::array<u32, 8> last_counts{};
     double gpu_ms_sum = 0.0;
     u32 gpu_ms_n = 0;
     bool logged_camera = false, logged_shine = false;
+    // Strength (BB_RT_REFLECT_STRENGTH, default 1.5) and hit refinement (BB_RT_REFLECT_REFINE=0 off).
+    float strength = 1.5f;
+    bool refine = true;
+
+    // bb-rt-vol state.
+    bool vol_on = false, vol_ok = false, vol_fresh = true;
+    float vol_strength = 1.0f, vol_density = 0.02f, vol_dist = 60.0f;
+    float vol_color[3]{0.55f, 0.62f, 0.80f};
+    u32 vol_steps = 12;
+    vk::DescriptorSetLayout vol_set{};
+    vk::PipelineLayout vol_layout{};
+    vk::Pipeline vol_pipe{};
+    Buf vol_params;
+    Img vraw;
+    std::array<Img, 2> vacc;
+    u32 vol_w = 0, vol_h = 0;
+    vk::QueryPool vol_queries{};
+    std::array<bool, Ring> vol_query_used{};
+    u64 vol_dispatches = 0, vol_last_dispatches = 0;
+    double vol_ms_sum = 0.0;
+    u32 vol_ms_n = 0;
+    u32 vol_last_counts[2]{};
+    int light_ofs = -1;           // scene block float offset of the light direction, -1: none
+    int light_forced_ofs = -1;    // BB_RT_VOLUMETRIC_LIGHT_OFS
+    bool light_env = false;       // BB_RT_VOLUMETRIC_DIR given
+    float light_env_dir[3]{};
+    const char* light_src = "none";
+    bool logged_block = false;
+    std::chrono::steady_clock::time_point vol_last_log{};
     std::chrono::steady_clock::time_point last_log{};
 };
 
