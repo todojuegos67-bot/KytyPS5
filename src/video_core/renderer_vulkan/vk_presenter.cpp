@@ -653,6 +653,167 @@ void Presenter::BbDestroyGenerated(Frame* frame, u32 from) {
     }
 }
 
+// bb-dlssg-blur (BB_DLSSG_PROBE=1, default off): is DLSS-G's generated frame an in-between image?
+// Every DLSS-G frame the real frame is blitted (linear) to a 256x144 band (two bands, alternating),
+// and once a second the first generated frame too; that 256x432 image is copied to a host buffer
+// and read 8 frames later (no wait). Per pixel and channel (0..255) it logs the mean |gen - prev|,
+// |gen - next|, |prev - next| and sum = (gp + gn) / pn: a copy of one real frame gives ~0 on one
+// side; a 50/50 blend gives gp ~ gn ~ pn / 2 and sum 1.00 exactly (every pixel between the two);
+// a motion-warped midpoint gives both sides below pn and sum clearly above 1.
+static void BbDlssgProbe(const Vulkan::Instance& instance, vk::CommandBuffer cmd, vk::Image real,
+                         vk::Image gen, u32 width, u32 height) {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_DLSSG_PROBE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!on || !real || !gen || width == 0 || height == 0) return;
+    constexpr u32 W = 256, H = 144, Bands = 3;
+    static vk::Image img{};
+    static VmaAllocation img_alloc{};
+    static vk::Buffer buf{};
+    static VmaAllocation buf_alloc{};
+    static const u8* map = nullptr;
+    static bool failed = false, fresh = true;
+    static u32 parity = 0, frames = 0, pending_age = 0;
+    static bool pending = false, have_prev = false;
+    static u32 pending_prev = 0, pending_next = 0;
+    static auto last = std::chrono::steady_clock::now();
+    if (failed) return;
+    if (!img) {
+        const VkImageCreateInfo ici = vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .extent = {W, H * Bands, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc,
+        };
+        VmaAllocationCreateInfo iaci{};
+        iaci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        VkImage raw_img{};
+        const VkBufferCreateInfo bci = vk::BufferCreateInfo{
+            .size = W * H * Bands * 4,
+            .usage = vk::BufferUsageFlagBits::eTransferDst,
+            .sharingMode = vk::SharingMode::eExclusive,
+        };
+        VmaAllocationCreateInfo baci{};
+        baci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        baci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        baci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkBuffer raw_buf{};
+        VmaAllocationInfo info{};
+        if (vmaCreateImage(instance.GetAllocator(), &ici, &iaci, &raw_img, &img_alloc, nullptr) !=
+                VK_SUCCESS ||
+            vmaCreateBuffer(instance.GetAllocator(), &bci, &baci, &raw_buf, &buf_alloc, &info) !=
+                VK_SUCCESS ||
+            info.pMappedData == nullptr) {
+            LOG_WARNING(Render_Vulkan, "[dlssg-probe] could not allocate its images: off");
+            failed = true;
+            return;
+        }
+        img = vk::Image{raw_img};
+        buf = vk::Buffer{raw_buf};
+        map = static_cast<const u8*>(info.pMappedData);
+        LOG_INFO(Render_Vulkan, "[dlssg-probe] on: generated frame vs the real frames around it, "
+                                "once a second (BB_DLSSG_PROBE)");
+    }
+    ++frames;
+    // Read the copy made at least 8 frames ago (the GPU has long finished it).
+    if (pending && ++pending_age >= 8) {
+        pending = false;
+        const u8* p = map + pending_prev * W * H * 4;
+        const u8* n = map + pending_next * W * H * 4;
+        const u8* g = map + 2 * W * H * 4;
+        double gp = 0, gn = 0, pn = 0;
+        for (u32 i = 0; i < W * H * 4; ++i) {
+            if ((i & 3) == 3) continue; // alpha
+            gp += std::abs(int(g[i]) - int(p[i]));
+            gn += std::abs(int(g[i]) - int(n[i]));
+            pn += std::abs(int(p[i]) - int(n[i]));
+        }
+        const double count = double(W) * H * 3;
+        gp /= count;
+        gn /= count;
+        pn /= count;
+        LOG_INFO(Render_Vulkan,
+                 "[dlssg-probe] gen vs prev {:.2f} | gen vs next {:.2f} | prev vs next {:.2f} | "
+                 "sum (gp+gn)/pn {:.2f} (copy: one side ~0; 50/50 blend: ~pn/2 each and sum 1.00; "
+                 "warped midpoint: both < pn, sum > 1)",
+                 gp, gn, pn, pn > 0.05 ? (gp + gn) / pn : 0.0);
+    }
+    const vk::MemoryBarrier2 to_transfer{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    };
+    if (fresh) {
+        fresh = false;
+        const vk::ImageMemoryBarrier2 init{
+            .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = img,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &init});
+    }
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_transfer});
+    const auto blit = [&](vk::Image src, u32 band) {
+        const vk::ImageBlit region{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array<vk::Offset3D, 2>{
+                vk::Offset3D{0, 0, 0}, vk::Offset3D{s32(width), s32(height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array<vk::Offset3D, 2>{
+                vk::Offset3D{0, s32(band * H), 0}, vk::Offset3D{s32(W), s32((band + 1) * H), 1}},
+        };
+        cmd.blitImage(src, vk::ImageLayout::eGeneral, img, vk::ImageLayout::eGeneral, region,
+                      vk::Filter::eLinear);
+    };
+    const u32 next_band = parity;
+    parity ^= 1u;
+    blit(real, next_band);
+    const auto now = std::chrono::steady_clock::now();
+    // A gap (no DLSS-G frame for 100 ms): the other band is not the previous real frame.
+    static auto last_call = now;
+    if (now - last_call > std::chrono::milliseconds(100)) have_prev = false;
+    last_call = now;
+    if (have_prev && !pending && now - last >= std::chrono::seconds(1)) {
+        last = now;
+        blit(gen, 2);
+        const vk::MemoryBarrier2 to_copy{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        };
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_copy});
+        const vk::BufferImageCopy copy{
+            .bufferOffset = 0,
+            .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .imageExtent = {W, H * Bands, 1},
+        };
+        cmd.copyImageToBuffer(img, vk::ImageLayout::eGeneral, buf, copy);
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+        pending = true;
+        pending_age = 0;
+        pending_prev = next_band ^ 1u;
+        pending_next = next_band;
+    }
+    have_prev = true;
+}
+
 u32 Presenter::BbEnsureGenerated(Frame* frame, u32 count) {
     count = std::min<u32>(count, u32(frame->generated.size()));
     BbDestroyGenerated(frame, count == 0 ? 0 : count);
@@ -1399,8 +1560,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // differ as UI (the real frame's pixel in generated frames). The HUD-less copy went through
     // our post-process pass but not the game's display pass, so it differed everywhere and the
     // generated frames repeated the real one. Outside the HUD it now is the finished frame itself.
-    // FSR 3 only (DLSS-G keeps its input as before).
-    if (frame->fg.has_hudless && BB::FG::Fsr3Active() && !frame->is_hdr) {
+    // bb-dlssg-blur: DLSS-G too. NGX DLSS-G also keeps every pixel where pHudless differs from
+    // the back buffer as UI (the real frame's pixel in the generated frame), so with the raw copy
+    // (~90% different) its generated frames were close to copies of the real one: 80 fps shown,
+    // 40 felt, smeared turns. BB_DLSSG_HUDLESS=fix (default: the corrected image FSR 3 gets; the
+    // raw copy when the pass cannot run) | raw (as before) | off (no HUD-less image).
+    static const int bb_dlssg_hudless = [] {
+        const char* v = std::getenv("BB_DLSSG_HUDLESS");
+        const int m = v && std::strcmp(v, "raw") == 0 ? 1 : v && std::strcmp(v, "off") == 0 ? 2 : 0;
+        LOG_INFO(Render_Vulkan, "[dlssg] HUD-less image for DLSS-G: {} (BB_DLSSG_HUDLESS)",
+                 m == 0 ? "fix (as FSR 3)" : m == 1 ? "raw (as before)" : "off");
+        return m;
+    }();
+    const bool bb_dlssg_on = BB::FG::Dlss::Ready() && frame->fg.valid;
+    if (frame->fg.has_hudless && !frame->is_hdr &&
+        (BB::FG::Fsr3Active() || (bb_dlssg_on && bb_dlssg_hudless == 0))) {
         const vk::Format fmt = swapchain.GetSurfaceFormat().format;
         const vk::MemoryBarrier2 written{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1500,7 +1674,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                            vk::ImageUsageFlagBits::eSampled};
             // bb-gpu-prof: DLSS-G may continue in another command buffer: its time is in the
             // "draw" envelope only.
-            frame->generated_count = BB::FG::Dlss::Generate(cmdbuf, backbuffer, frame->fg,
+            BB::FG::Inputs dlssg_in = frame->fg;
+            if (bb_dlssg_hudless == 2) dlssg_in.has_hudless = false;
+            frame->generated_count = BB::FG::Dlss::Generate(cmdbuf, backbuffer, dlssg_in,
                                                             outputs.data(), count,
                                                             instance.GetDevice());
             // A DLSS interposer may continue the recording in another command buffer.
@@ -1512,6 +1688,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     bb_hud_fg->Overlay(draw_scheduler.CommandBuffer(), frame->generated[i].rgba_view,
                                        {frame->width, frame->height}, bgra);
                 }
+            }
+            if (frame->generated_count) {
+                BbDlssgProbe(instance, draw_scheduler.CommandBuffer(), frame->image,
+                             frame->generated[0].image, frame->width, frame->height);
             }
             std::vector<vk::ImageMemoryBarrier2> back;
             for (auto b : to_general) {
