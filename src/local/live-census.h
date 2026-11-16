@@ -6,9 +6,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <x86intrin.h>
 
 #include "blackbox.h"
+#include "render5.h"
 #include "sync-stats.h"
 
 namespace LiveCensus {
@@ -42,6 +44,9 @@ constexpr size_t Phases = 16;
 inline uint64_t g_dispatch_phase_cycles[Phases] {};
 inline uint64_t g_draw_phase_cycles[Phases] {};
 inline uint64_t g_xpr_cycles[4] {}; // NativeXpr scopes by their a (graphicsRun.cpp: 0 try/emit, 1 store, 2 direct)
+// (render2) ... and the table path's phases (table-xpr.inc: DrawPhase scopes of a = 0x7ab1e for draws, 0x7ab1f for
+// dispatches, by their b), for the [render] line (KYTY_RENDER_STATS, live-control.h).
+inline uint64_t g_table_phase_cycles[2][Phases] {};
 inline constexpr const char* DispatchPhaseNames[Phases] = {"program", "consume", "pipeline", "bindings", "find_buffers", "bda",
                                                            "rebind_buffers", "rebind_images", "commit", "barrier", "table", "linear_copy",
                                                            "lock", "p13", "p14", "p15"};
@@ -51,6 +56,77 @@ inline constexpr const char* DrawPhaseNames[Phases] = {"start", "color_target", 
 inline constexpr const char* KindNames[Kinds] = {"dispatch", "draw", "xpr", "dispatch_phase", "gpu_wait_c", "readback_wait_c",
                                                  "sync_download", "programs", "gather", "queue_run", "srt", "command_sync",
                                                  "draw_phase", "barrier", "guest_command", "submission"};
+
+// (render3) KYTY_RENDER_STATS=1 (the [render] line, live-control.h): read once, at its first use on the render thread
+// (the port sets its settings' variables after the process started, so not at static initialization). The scopes and
+// counters below that only that line prints are taken only with it (StatScope, Pm4Clock): nothing but a predicted
+// branch otherwise.
+[[nodiscard]] inline bool RenderStatsOn() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_RENDER_STATS");
+		return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
+	}();
+	return on;
+}
+// (render3) GpuResourceManager::PrepareBdaReadRanges' memo (KYTY_BDA_MEMO): calls it answered, calls that did the work.
+// GPU thread only.
+inline uint64_t g_bda_memo[2] {};
+// (render3) Write windows opened in the big-window granules (KYTY_BIG_WINDOW; GpuResourceManager's fault handler, any
+// thread): flat 1 MiB windows, grown windows (KYTY_BIG_WINDOW_GROW) and the grown windows' pages.
+inline std::atomic<uint64_t> g_big_window[3] {};
+// (render3) The PM4 walk by packet class (CommandProcessor::ProcessPm4, render thread, KYTY_RENDER_STATS only): the
+// cycles from a packet's start to the next packet's (its draw, dispatch or handler included) and the packets.
+enum Pm4Class : uint32_t {
+	Pm4Draw, Pm4Dispatch, Pm4ShReg, Pm4ContextReg, Pm4UconfigReg, Pm4Nop, Pm4IndirectBuffer, Pm4Other, Pm4Classes
+};
+inline uint64_t g_pm4_cycles[Pm4Classes] {};
+inline uint64_t g_pm4_packets[Pm4Classes] {};
+inline constexpr const char* Pm4ClassNames[Pm4Classes] = {"draws", "dispatches", "sh_reg", "context_reg", "uconfig_reg",
+                                                          "nop", "indirect_buffer", "rest"};
+// (render4) KYTY_RENDER_STATS only, render thread: the dispatches (the Dispatch scopes) and the whole PM4 runs (the
+// QueueRun scopes) by queue, 0 the graphics queue (DCB) and 1 an async compute queue (ACB), calls and cycles; and the
+// dispatches by compute shader. The shader is the program's hash when the dispatch's path knows it (g_dispatch_shader,
+// set by the table path and the normal path once they have the program), LinearCopyShader for a dispatch the linear
+// copy's register check took (no program there), else the shader's address.
+inline uint64_t g_queue_dispatches[2][2] {}; // [queue][0 calls, 1 cycles]
+inline uint64_t g_queue_runs[2][2] {};
+inline uint64_t g_dispatch_shader = 0;
+constexpr uint64_t LinearCopyShader = 1;
+// (The render thread's dispatches only: g_render is declared below.)
+inline void SetDispatchShader(uint64_t shader);
+struct ShaderStat {
+	uint64_t shader = 0, calls = 0, cycles = 0;
+};
+constexpr size_t  ShaderStats = 2048; // (open addressing, 16 probes; a 5 s window sees a few hundred shaders)
+inline ShaderStat g_shader_stats[ShaderStats] {};
+inline uint64_t   g_shader_stats_dropped = 0;
+inline void NoteDispatchShader(uint64_t shader, uint64_t cycles) {
+	const uint64_t hash = shader * 0x9e3779b97f4a7c15ull >> 32u;
+	for (size_t probe = 0; probe < 16; ++probe) {
+		auto& entry = g_shader_stats[(hash + probe) & (ShaderStats - 1)];
+		if (entry.calls != 0 && entry.shader != shader) continue;
+		entry.shader = shader;
+		entry.calls += 1;
+		entry.cycles += cycles;
+		return;
+	}
+	++g_shader_stats_dropped;
+}
+// (render4) KYTY_RENDER_STATS only, render thread: what the table path's blocks (RenderExecutor::TableBlocks, the
+// table dispatches' phase 6 and the table draws' phase 13) did with the V#s: 0 written ones, 1 those of them that went
+// through BufferCache::ObtainBuffer (no memo), 2 read-only ones, 3 those of them resolved again (not held), 4 those
+// whose range was proved clean again (another page of its regions written).
+inline uint64_t g_table_blocks[5] {};
+// (thread1) KYTY_RENDER_STATS only, render thread: what a frame's draws are. The NativeXpr scopes' calls by their a
+// (g_xpr_cycles has their time): 0 runs of DRAW_INDEX_INDIRECT and multi draws, 1 direct indexed draws, 2 draws of
+// vertices. The calls a clean continuation took (RenderExecutor::TableContinue): 0 runs, 1 direct draws. And the table
+// draws by what they draw into (RenderExecutor::TableDraw), calls and draws: a depth image of 4 layers or more alone
+// (the sun's cascades), another depth image alone (depth passes, other shadows), anything with a color target.
+inline uint64_t g_xpr_calls[4] {};
+inline uint64_t g_continued_calls[2] {};
+enum DrawTarget : uint32_t { DrawDepthLayered, DrawDepthOnly, DrawColor, DrawTargets };
+inline uint64_t g_draw_targets[DrawTargets][2] {}; // [target][0 calls, 1 draws]
+inline constexpr const char* DrawTargetNames[DrawTargets] = {"depth_layered", "depth", "color"};
 
 struct Entry {
 	uint64_t a = 0, b = 0, calls = 0, cycles = 0;
@@ -66,6 +142,9 @@ inline thread_local bool g_render = false;
 // graphics queue, QueueAsync inside an async compute queue, QueueNone outside both.
 constexpr uint64_t      QueueAsync = 1ull << 63, QueueNone = 1ull << 62;
 inline thread_local uint64_t g_queue = QueueNone;
+inline void SetDispatchShader(uint64_t shader) {
+	if (g_render) g_dispatch_shader = shader;
+}
 inline Entry            g_table[TableSize];
 
 inline void Add(uint32_t kind, uint64_t a, uint64_t b, uint64_t cycles) {
@@ -83,14 +162,177 @@ inline void Add(uint32_t kind, uint64_t a, uint64_t b, uint64_t cycles) {
 	}
 }
 
+// (thread1) KYTY_RENDER_STATS only, render thread, measurement only (nothing is run differently): what the frame's
+// translation would take with the async compute queues' submissions (ACB) on a thread of their own and the graphics
+// queue's (DCB) on another, at no cost for the hand-over - the ceiling of that split. Each side has a virtual clock
+// that advances by the time its slices take here (GuestGpu::ThreadRun, around GuestGpu::Process). The game orders the
+// queues with labels only (a pass writes its label at its end, the passes that need it start with WAIT_REG_MEM on it:
+// eboot 0x9151d0 / 0x912890 write, sceAgcAcbWaitRegMem / sceAgcDcbWaitRegMem wait): a memory write of a command
+// processor notes its side's virtual time there (Write), and a wait found satisfied (Waited) holds its side back to
+// the time of the last write at its address when that is later - the other side had not got there yet. The flip
+// brings both clocks together (Frame). The [render] line prints, a frame: the slices' time (serial), each side's,
+// the virtual time both sides took (two_threads) and the time a side was held back for the other (stalled).
+// Not modelled (so the real split would gain less): when the game submits each command buffer, the frame boundary's
+// order (GuestGpu::CanProcessSubmission), the caches both sides share, and what the game reads back between them.
+namespace Par2 {
+struct Label {
+	uint64_t address = 0, time = 0;
+};
+constexpr size_t Labels = 4096; // (a slot an address: a collision forgets the older one, whose waits then hold nothing)
+inline Label     g_labels[Labels] {};
+inline bool      g_active = false;
+inline uint32_t  g_side   = 0;
+inline uint64_t  g_real_start = 0, g_virtual_start = 0;
+inline uint64_t  g_clock[2] {};       // each side's virtual clock (TSC cycles)
+inline uint64_t  g_side_cycles[2] {}; // each side's slices, cycles
+inline uint64_t  g_slices[2][2] {};   // [side][0 slices, 1 those that stopped at a wait]
+inline uint64_t  g_waits[2] {};       // waits found satisfied at an address written here: 0 all, 1 that held their side back
+inline uint64_t  g_stalled = 0;       // cycles a side was held back
+inline uint64_t  g_elapsed = 0;       // virtual cycles of the frames ended so far (both sides)
+inline uint64_t  g_frame_start = 0;   // both clocks at the last flip
+[[nodiscard]] inline size_t SlotOf(uint64_t address) {
+	return static_cast<size_t>(((address >> 2u) * 0x9e3779b97f4a7c15ull) >> 52u) & (Labels - 1);
+}
+// A slice of a submission begins: 0 the graphics queue, 1 an async compute queue.
+inline void Begin(uint32_t side) {
+	if (!g_render || !RenderStatsOn()) return;
+	g_active        = true;
+	g_side          = side & 1u;
+	g_virtual_start = g_clock[g_side];
+	g_real_start    = __rdtsc();
+}
+// ... and ends, done or stopped at a wait.
+inline void End(bool complete) {
+	if (!g_render || !g_active) return;
+	const uint64_t cycles = __rdtsc() - g_real_start;
+	g_clock[g_side]       = g_virtual_start + cycles;
+	g_side_cycles[g_side] += cycles;
+	g_slices[g_side][0] += 1;
+	if (!complete) g_slices[g_side][1] += 1;
+	g_active = false;
+}
+// A command processor wrote guest memory at `address` (a label, an end-of-pipe value).
+inline void Write(uint64_t address) {
+	if (!g_render || !g_active) return;
+	g_labels[SlotOf(address)] = {address & ~uint64_t {3}, g_virtual_start + (__rdtsc() - g_real_start)};
+}
+// A WAIT_REG_MEM at `address` was found satisfied.
+inline void Waited(uint64_t address) {
+	if (!g_render || !g_active) return;
+	const auto& label = g_labels[SlotOf(address)];
+	if (label.address != (address & ~uint64_t {3}) || label.time == 0) return;
+	g_waits[0] += 1;
+	const uint64_t now = g_virtual_start + (__rdtsc() - g_real_start);
+	if (label.time <= now) return;
+	g_waits[1] += 1;
+	g_stalled += label.time - now;
+	g_virtual_start += label.time - now;
+}
+// (trust1) The game's flip (CommandProcessor::Flip -> LiveControl::Flip), noted while its slice still runs: the slice's
+// end closes the frame (TakeFlip, GuestGpu::ThreadRun). Frame() was only called for FlipPreparation submissions,
+// which a game session never makes: two_threads stayed 0 and the clocks never met again (stalled ~ the whole frame).
+inline bool g_flip_pending = false;
+inline void Flipped() {
+	if (g_render && RenderStatsOn()) g_flip_pending = true;
+}
+[[nodiscard]] inline bool TakeFlip() {
+	const bool flipped = g_flip_pending;
+	g_flip_pending     = false;
+	return flipped;
+}
+// The flip: both sides are done with the frame.
+inline void Frame() {
+	if (!g_render || !RenderStatsOn()) return;
+	const uint64_t end = g_clock[0] > g_clock[1] ? g_clock[0] : g_clock[1];
+	g_elapsed += end - g_frame_start;
+	g_clock[0] = g_clock[1] = g_frame_start = end;
+}
+} // namespace Par2
+
+// (render5) KYTY_CENSUS_LIGHT (render5.h). The scopes of these kinds come once or several times a draw or dispatch (at
+// Boletaria ~40 000 a frame: NativeXpr, the table path's DrawPhase scopes 0-4 and 9, Dispatch, DispatchPhase, the
+// blocks' resolve and reprove scopes...); what they sum is read only by the [render] line (KYTY_RENDER_STATS), the
+// live census (g_on) and the SLOW Frame lines' breakdown. With 1 they are not taken while neither of the first two
+// reads them (the SLOW Frame lines then show no time for these kinds); the waits, queue runs, submissions and guest
+// commands are always taken. With 2 every scope is taken and those 1 would skip are counted, with a scope's cost
+// measured once at start (the [render5] line: what 1 would save). Nothing but these sums changes: no scope decides
+// anything that is drawn. Render thread only (a scope is taken only there, g_render).
+namespace Light {
+constexpr uint32_t LightKinds = (1u << Dispatch) | (1u << Draw) | (1u << NativeXpr) | (1u << DispatchPhase) |
+                           (1u << GraphicsPrograms) | (1u << NativeGather) | (1u << SrtInterpreter) | (1u << CommandSync) |
+                           (1u << DrawPhase) | (1u << Barrier);
+// -1 not read yet, 0 off (or KYTY_RENDER_STATS on with 1: its line needs every scope), 1 skip, 2 count.
+inline int32_t g_state = -1;
+// A scope's own cost, as Scope takes it (thread-local flags, two TSC reads, the sums): TSC cycles each, the mean of
+// 64 rounds of 64.
+[[nodiscard]] inline uint64_t MeasureScopeCycles() {
+	static uint64_t sink_cycles[16] {}, sink_calls[16] {};
+	uint64_t        best = UINT64_MAX;
+	for (uint32_t round = 0; round < 64; ++round) {
+		const uint64_t start = __rdtsc();
+		for (uint32_t i = 0; i < 64; ++i) {
+			const bool     on    = g_render;
+			const uint64_t queue = g_queue;
+			const uint64_t begin = __rdtsc();
+			const uint32_t kind  = (i & 7u) + (on ? 0u : 8u);
+			const uint64_t spent = __rdtsc() - begin + (queue & 1u);
+			sink_cycles[kind & 15u] += spent;
+			sink_calls[kind & 15u] += 1;
+		}
+		const uint64_t cycles = (__rdtsc() - start) / 64u;
+		if (cycles < best) best = cycles;
+	}
+	return best;
+}
+inline int32_t Init() {
+	const auto mode = Render5::Mode(Render5::CensusLight);
+	int32_t    state = static_cast<int32_t>(mode);
+	if (mode == 1 && RenderStatsOn()) {
+		state = 0;
+		std::printf("render5: KYTY_CENSUS_LIGHT=1 does nothing while KYTY_RENDER_STATS is on (its [render] line reads every "
+		            "scope); compare the [fps] lines' cpu without KYTY_RENDER_STATS\n");
+		std::fflush(stdout);
+	}
+	if (mode == 2) {
+		Render5::g_census_scope_cycles = MeasureScopeCycles();
+		std::printf("render5: KYTY_CENSUS_LIGHT=2: a census scope costs ~%" PRIu64 " TSC cycles on this thread\n",
+		            Render5::g_census_scope_cycles);
+		std::fflush(stdout);
+	}
+	g_state = state;
+	return state;
+}
+// A scope of `kind` is not taken (counted with 2).
+[[nodiscard]] inline bool Skips(uint32_t kind) {
+	if (kind >= 32u || ((LightKinds >> kind) & 1u) == 0) return false;
+	int32_t state = g_state;
+	if (state < 0) state = Init();
+	if (state == 0) return false;
+	if (state == 2) {
+		++Render5::g_census[Render5::CensusWouldSkip];
+		return false;
+	}
+	if (g_on.load(std::memory_order_relaxed)) return false; // (the live census table wants them all)
+	++Render5::g_census[Render5::CensusSkipped];
+	return true;
+}
+} // namespace Light
+
 class Scope {
 public:
 	Scope(uint32_t kind, uint64_t a, uint64_t b = 0): m_on(g_render) {
 		if (m_on) {
+			if (Light::Skips(kind)) { // (render5, KYTY_CENSUS_LIGHT)
+				m_on = false;
+				return;
+			}
 			m_kind  = kind;
 			m_a     = a;
 			m_b     = b | g_queue;
 			m_table = g_on.load(std::memory_order_relaxed);
+			// (render4) The dispatch's or the PM4 run's share by queue, and the dispatch's shader.
+			m_stats = (kind == Dispatch || kind == QueueRun) && RenderStatsOn();
+			if (m_stats && kind == Dispatch) g_dispatch_shader = 0;
 			m_start = __rdtsc();
 		}
 	}
@@ -100,7 +342,17 @@ public:
 			g_kind_cycles[m_kind] += cycles;
 			g_kind_calls[m_kind] += 1;
 			if (m_kind == DispatchPhase) g_dispatch_phase_cycles[m_b & (Phases - 1)] += cycles;
-			if (m_kind == NativeXpr) g_xpr_cycles[m_a & 3] += cycles;
+			if (m_kind == NativeXpr) {
+				g_xpr_cycles[m_a & 3] += cycles;
+				g_xpr_calls[m_a & 3] += 1; // (thread1)
+			}
+			if (m_kind == DrawPhase && (m_a | 1u) == 0x7ab1fu) g_table_phase_cycles[m_a & 1u][m_b & (Phases - 1)] += cycles;
+			if (m_stats) {
+				auto& by_queue = m_kind == Dispatch ? g_queue_dispatches : g_queue_runs;
+				by_queue[(m_b & QueueAsync) != 0 ? 1 : 0][0] += 1;
+				by_queue[(m_b & QueueAsync) != 0 ? 1 : 0][1] += cycles;
+				if (m_kind == Dispatch) NoteDispatchShader(g_dispatch_shader != 0 ? g_dispatch_shader : m_a, cycles);
+			}
 			if (m_table) Add(m_kind, m_a, m_b, cycles);
 		}
 	}
@@ -110,8 +362,83 @@ public:
 private:
 	bool     m_on;
 	bool     m_table = false;
+	bool     m_stats = false;
 	uint32_t m_kind  = 0;
 	uint64_t m_a     = 0, m_b = 0, m_start = 0;
+};
+
+// (render3) As Scope for the table path's phases (a = 0x7ab1e draws, 0x7ab1f dispatches; b the phase), but taken only
+// with KYTY_RENDER_STATS: the finer phases the [render] line prints (table-xpr.inc).
+class StatScope {
+public:
+	// (render5: with KYTY_CENSUS_LIGHT=1 taking effect KYTY_RENDER_STATS is off: no need to ask it.)
+	StatScope(uint32_t table, uint32_t phase): m_on(g_render && Light::g_state != 1 && RenderStatsOn()) {
+		if (m_on) {
+			m_table = table & 1u;
+			m_phase = phase & (Phases - 1);
+			m_start = __rdtsc();
+		}
+	}
+	~StatScope() {
+		if (m_on) g_table_phase_cycles[m_table][m_phase] += __rdtsc() - m_start;
+	}
+	StatScope(const StatScope&)            = delete;
+	StatScope& operator=(const StatScope&) = delete;
+
+private:
+	bool     m_on;
+	uint32_t m_table = 0, m_phase = 0;
+	uint64_t m_start = 0;
+};
+
+// (render3) The PM4 walk's clock (see g_pm4_cycles). One per CommandProcessor::ProcessPm4 call; a nested call's time is
+// its own (the outer one's clock stops meanwhile).
+class Pm4Clock;
+inline thread_local Pm4Clock* t_pm4_clock = nullptr;
+class Pm4Clock {
+public:
+	Pm4Clock(): m_on(g_render && RenderStatsOn()) {
+		if (m_on) {
+			m_parent = t_pm4_clock;
+			m_start  = __rdtsc();
+			if (m_parent != nullptr) m_parent->Mark(m_start);
+			t_pm4_clock = this;
+		}
+	}
+	~Pm4Clock() {
+		if (m_on) {
+			const uint64_t now = __rdtsc();
+			Mark(now);
+			t_pm4_clock = m_parent;
+			if (m_parent != nullptr) m_parent->m_start = now;
+		}
+	}
+	Pm4Clock(const Pm4Clock&)            = delete;
+	Pm4Clock& operator=(const Pm4Clock&) = delete;
+	// A packet begins: the time since the last one began was that one's.
+	void Next() {
+		if (m_on) {
+			Mark(__rdtsc());
+			m_class = Pm4Other;
+		}
+	}
+	// The class of the packet that began.
+	void Class(uint32_t packet_class) {
+		if (m_on) {
+			m_class = packet_class < Pm4Classes ? packet_class : static_cast<uint32_t>(Pm4Other);
+			g_pm4_packets[m_class] += 1;
+		}
+	}
+
+private:
+	void Mark(uint64_t now) {
+		g_pm4_cycles[m_class] += now - m_start;
+		m_start = now;
+	}
+	bool      m_on;
+	uint32_t  m_class  = Pm4Other;
+	uint64_t  m_start  = 0;
+	Pm4Clock* m_parent = nullptr;
 };
 
 // Render-thread waits, always summed (the slow-frame lines, LiveControl::Flip): for GPU work, for a guest

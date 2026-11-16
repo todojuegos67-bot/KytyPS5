@@ -27,12 +27,17 @@ inline std::atomic<uint64_t> g_pending[Words] = {};
 inline std::atomic<uint64_t> g_pending_words[Words / 64] = {};
 inline std::atomic<uint64_t> g_pending_groups {0};
 inline thread_local bool     g_translating = false;
+// (render3) Moves whenever a bit of g_bits may have been set (a translating thread's Mark, Publish, MarkAll): while it
+// stands, no region's bit was set since it was read (GpuResourceManager::PrepareBdaReadRanges' memo, KYTY_BDA_MEMO).
+inline std::atomic<uint64_t> g_generation {1};
+[[nodiscard]] inline uint64_t Generation() noexcept { return g_generation.load(std::memory_order_acquire); }
 
 inline void Mark(uint64_t region) {
 	const auto word = region / 64;
 	const auto bit  = uint64_t {1} << (region % 64);
 	if (g_translating) {
 		g_bits[word].fetch_or(bit, std::memory_order_release);
+		g_generation.fetch_add(1, std::memory_order_acq_rel);
 		return;
 	}
 	// The summary bits after the region's, even when another write set the region's first: a write
@@ -54,10 +59,12 @@ inline void Publish() {
 				g_bits[word].fetch_or(bits, std::memory_order_release);
 		}
 	}
+	g_generation.fetch_add(1, std::memory_order_acq_rel); // (after the bits: a reader of the old value scans again)
 }
 
 inline void MarkAll() {
 	for (auto& word: g_bits) word.store(~uint64_t {0}, std::memory_order_release);
+	g_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 } // namespace Libs::Graphics::BdaDirtyRegions

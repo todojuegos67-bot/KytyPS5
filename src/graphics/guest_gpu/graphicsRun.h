@@ -32,6 +32,10 @@ public:
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	// (parpadeo7) As SendCommand, but always queued, from the GPU thread too: run by the GPU thread between packets
+	// (ProcessCommands) or by its loop, never inside the caller; the caller hands over no recording. False (nothing queued)
+	// once the GPU no longer accepts commands.
+	bool               PostCommand(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void              Submit(std::span<const uint32_t> draw_commands,
@@ -42,6 +46,9 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// (par1, KYTY_PAR_QUEUES=1) A command processor wrote guest memory (a label): a queue waiting at a WAIT_REG_MEM on
+	// the other translating thread checks again now.
+	void ParWake();
 	// The GPU thread, or the speculation's thread while the GPU thread waits for its translation (KYTY_SPECULATE=2):
 	// what reads the GPU thread's caches to translate (not what may fault: only the GPU thread reads back).
 	[[nodiscard]] static bool IsTranslatingThread() noexcept;
@@ -74,6 +81,10 @@ private:
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  frame_epoch       = 0;
 		uint64_t                  serial            = 0; // its place in its queue (from 1)
+		uint64_t                  sweep_stamp       = 0; // (ww2) PageManager::SweepStamp when it was queued (Enqueue)
+		uint64_t                  block_epoch       = 0; // (par1) ParQueues::WakeEpoch when its slice that blocked began
+		int64_t                   enqueue_ns        = 0; // (serie1, KYTY_SERIE1) when it was queued (steady clock)
+		uint8_t                   serie1_kind       = 0; // (serie1) Serie1::Kind of a queue-0 graphics one (first slice)
 		// KYTY_SPECULATE=4: the chunk committed next; whether the one it is in is translated the normal way, up to where
 		// the next begins (none: to the end).
 		uint32_t                    spec_chunk  = 0;
@@ -87,6 +98,11 @@ private:
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
+	// (par1, KYTY_PAR_QUEUES=1) The ACB thread: the compute queues' submissions (ids 1..), recording into the GPU
+	// thread's Vulkan recording stream (`stream`).
+	static void       AcbThreadRun(GuestGpu* gpu, void* stream);
+	// (par1) Whether the blocked submission at the front of a queue may be tried again (caller holds m_queue_mutex).
+	[[nodiscard]] bool ParRetry(const Submission& submission) const;
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
 	RenderContext&                                 m_renderer;
@@ -119,6 +135,13 @@ private:
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
+	// (par1, KYTY_PAR_QUEUES=1) The ACB thread (started and joined by the GPU thread), its round robin and whether it
+	// runs a submission now (of which frame): m_queue_mutex.
+	std::thread     m_acb_thread;
+	uint32_t        m_acb_next_queue  = 1;
+	bool            m_acb_processing  = false;
+	uint64_t        m_acb_epoch       = 0;
+	bool            m_acb_stop        = false;
 
 	friend class CommandProcessor;
 };

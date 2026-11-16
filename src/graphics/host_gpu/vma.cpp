@@ -336,6 +336,29 @@ void GraphicContext::LogMemoryBudget() const {
 	}
 }
 
+// (ram4) The "[ram+]" line (ram-guard.cpp, KYTY_RAM_LINE=1; its own thread): the emulator's own Vulkan memory blocks,
+// bytes, in the device-local heaps (video memory; the ballast is not VMA's and comes apart) and in the others (system
+// memory: the host-visible upload and readback rings, and the driver's plain system type). VMA's per-heap counters
+// only (atomics; no walk of its blocks). False before the allocator is made or after it is gone.
+bool RamLineVulkan(uint64_t* video_blocks, uint64_t* system_blocks, uint64_t* ballast);
+bool RamLineVulkan(uint64_t* video_blocks, uint64_t* system_blocks, uint64_t* ballast) {
+	const VmaAllocator    allocator = g_report_allocator;
+	const GraphicContext* context   = g_report_context;
+	if (allocator == nullptr || context == nullptr) return false;
+	const auto& properties = context->GetPhysicalDeviceMemoryProperties();
+	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	uint64_t video = 0, host_side = 0;
+	for (uint32_t heap = 0; heap < properties.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; heap++) {
+		const bool local = static_cast<bool>(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal);
+		(local ? video : host_side) += budgets[heap].statistics.blockBytes;
+	}
+	*video_blocks  = video;
+	*system_blocks = host_side;
+	*ballast       = LocalPlatform::SimulationBallast();
+	return true;
+}
+
 void GraphicContext::RefreshMemoryBudget() {
 	static std::atomic<uint32_t> frame {0};
 	if (allocator != nullptr) vmaSetCurrentFrameIndex(allocator, frame.fetch_add(1, std::memory_order_relaxed) + 1);

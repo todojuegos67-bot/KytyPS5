@@ -23,6 +23,7 @@
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "libs/trim.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
@@ -390,6 +391,35 @@ static bool PlanEvictionEnabled() {
 		return value == nullptr || std::string_view(value) != "0";
 	}();
 	return enabled;
+}
+
+// (ram7) The flips a plan stays unused before it may leave (KYTY_PLAN_IDLE_FLIPS, 3600 by default, at least 30): was a
+// static of SweepPlans, the preloads use it too.
+static uint32_t PlanIdleFlips() {
+	static const uint32_t flips = [] {
+		const char* value = std::getenv("KYTY_PLAN_IDLE_FLIPS");
+		return value != nullptr && *value != '\0' ? std::max(30u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+		                                          : 3600u;
+	}();
+	return flips;
+}
+// (ram7) KYTY_PLAN_BUDGET_MB set: plans a worker brought back beside one used (PreloadPlans: up to 256 of the 600 flips
+// around its last use) count as used KYTY_PLAN_PRELOAD_GRACE_FLIPS (600) flips ago only, not now: one not used by then
+// may leave at the next sweep. Before, each one came back as just used and stayed PlanIdleFlips: with a budget of
+// 64 MiB, 6464 plans came back beside the render thread and 971 of them were used (log 21:56); the budget was never met.
+static bool PlanBudgetSet() {
+	static const bool set = [] {
+		const char* value = std::getenv("KYTY_PLAN_BUDGET_MB");
+		return value != nullptr && *value != '\0';
+	}();
+	return set;
+}
+static uint32_t PlanPreloadGraceFlips() {
+	static const uint32_t flips = [] {
+		const char* value = std::getenv("KYTY_PLAN_PRELOAD_GRACE_FLIPS");
+		return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 600u;
+	}();
+	return std::min(flips, PlanIdleFlips());
 }
 
 // A plan's bytes written (any thread: the file's end reserved atomically).
@@ -766,7 +796,11 @@ struct PipelineCache::ProgramCache {
 			entry->plan_loading = false;
 			if (!entry->plan_out || loaded.linear != (entry->plan_linear != nullptr)) continue;
 			RestorePlan(*entry, std::move(loaded.plan));
-			entry->plan_use       = plan_clock;
+			entry->plan_use = plan_clock;
+			if (PlanBudgetSet()) {
+				const uint32_t age = PlanIdleFlips() - PlanPreloadGraceFlips(); // (ram7: idle once the grace is over)
+				entry->plan_use    = plan_clock - std::min(plan_clock, age);
+			}
 			entry->plan_preloaded = true;
 			plan_preloads++;
 		}
@@ -802,17 +836,19 @@ struct PipelineCache::ProgramCache {
 	void SweepPlans() {
 		// (KYTY_PLAN_IDLE_FLIPS=<n>: another idle time, and a sweep each n/30 flips: a test of plans leaving and coming
 		// back all the time.)
-		static const uint32_t PlanIdleFlips = [] {
-			const char* value = std::getenv("KYTY_PLAN_IDLE_FLIPS");
-			return value != nullptr && *value != '\0' ? std::max(30u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
-			                                          : 3600u;
-		}();
+		const uint32_t IdleFlips = PlanIdleFlips(); // (ram7: a function of its own, the same value)
 		static constexpr uint32_t PlanWritesPerSweep = 4;
-		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
+		const uint32_t            PlanSweepFlips     = IdleFlips / 30u;
 		DrainLoadedPlans();
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
 		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
+		// (ram5) KYTY_PLAN_BUDGET_MB=<n> (unset: 1/128 of the RAM, as before): plans kept in memory by that many MiB, at
+		// 77 KiB a plan (the prefetch's mean: 1146 MiB for 15153 plans). On 64 GB the default is 512 MiB (~6800 plans):
+		// no plan ever left ("Shader plans: 0 out of memory at the end"). Only idle ones leave (KYTY_PLAN_IDLE_FLIPS,
+		// 3600 flips) and come back from the scratch file when used (on the workers first: PreloadPlans).
 		static const size_t budget = [] {
+			if (const char* value = std::getenv("KYTY_PLAN_BUDGET_MB"); value != nullptr && *value != '\0')
+				return static_cast<size_t>((std::strtoull(value, nullptr, 10) << 20u) / (77u * 1024u));
 			const uint64_t ram = LocalPlatform::PhysicalMemory();
 			return static_cast<size_t>(ram / 128u / (77u * 1024u));
 		}();
@@ -822,7 +858,7 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			if (source.plan_out) continue;
 			in_memory++;
-			if (plan_clock - source.plan_use >= PlanIdleFlips) idle.push_back(&source);
+			if (plan_clock - source.plan_use >= IdleFlips) idle.push_back(&source);
 		}
 		if (in_memory <= budget || idle.empty()) return;
 		std::ranges::sort(idle, {}, [](const SourceEntry* source) { return source->plan_use; });
@@ -1011,6 +1047,76 @@ struct PipelineCache::ProgramCache {
 		for (const auto& input: info.inputs) n += input.debug_name.capacity() > 15 ? input.debug_name.capacity() + 1 : 0;
 		for (const auto& output: info.outputs) n += output.debug_name.capacity() > 15 ? output.debug_name.capacity() + 1 : 0;
 		return n;
+	}
+	// (ram5) A resident plan's heap bytes, as AddGroupMemory counts them (values, memory infos, the rest, its info).
+	static uint64_t PlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan) {
+		uint64_t n = 0;
+		for (const auto& inst: plan.value_storage)
+			n += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
+			     inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
+		n += Capacity(plan.memory_info) + Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
+		     Capacity(plan.materialization_sources) + Capacity(plan.srt_reads) + Capacity(plan.clean_flat_slots);
+		for (const auto& block: plan.control_flow) n += Capacity(block.successors) + Capacity(block.sources);
+		return n + InfoBytes(plan.info);
+	}
+	// (ram5, KYTY_RAM_LINE=1; render thread, the cache's lock held) Every 60 s: what the program cache holds. One plan in
+	// 16 is measured (PlanBytes) and the rest counted at their mean: ~1 ms a minute.
+	void RamCensus(size_t graphics_pipelines, size_t compute_pipelines, size_t pending) {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_RAM_LINE");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (!on) return;
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(60)) return;
+		last = now;
+		const auto begin = now;
+		size_t   in_memory = 0, out = 0, measured = 0, permutations = 0, prefetched = 0, jobs = 0, n = 0;
+		// (ram7) Plans in memory by their last use: within 10 s, 30 s, 60 s (600, 1800, 3600 flips; at most what a budget
+		// can keep without reloads while playing), and brought back by a worker and not used since.
+		size_t used_10 = 0, used_30 = 0, used_60 = 0, preloaded_unused = 0;
+		uint64_t measured_bytes = 0, warm_bytes = 0, spilled_bytes = 0, info_bytes = 0;
+		for (const auto& [key, source]: programs) {
+			(void)key;
+			if (source.plan_out) {
+				out++;
+			} else {
+				in_memory++;
+				const uint32_t age = plan_clock - std::min(plan_clock, source.plan_use);
+				used_10 += age < 600u ? 1 : 0;
+				used_30 += age < 1800u ? 1 : 0;
+				used_60 += age < 3600u ? 1 : 0;
+				preloaded_unused += source.plan_preloaded ? 1 : 0;
+				if (n++ % 16 == 0) {
+					measured++;
+					measured_bytes += PlanBytes(source.resource_plan);
+				}
+			}
+			spilled_bytes += source.plan_spilled.bytes;
+			permutations += source.permutations.size();
+			for (const auto& permutation: source.permutations) info_bytes += InfoBytes(permutation.program.info);
+			prefetched += source.prefetched.size();
+			for (const auto& module: source.prefetched) info_bytes += InfoBytes(module.program.info);
+			jobs += source.table_jobs.size();
+			warm_bytes += Capacity(source.warm_code) + Capacity(source.warm_back_code);
+		}
+		const uint64_t plan_bytes = measured != 0 ? measured_bytes / measured * in_memory : 0;
+		const auto*    p          = prefetch_live.load(std::memory_order_acquire);
+		std::printf("Heap census, pipeline cache (KYTY_RAM_LINE=1, %.1f ms): %zu programs; plans in memory %zu = ~%llu MiB "
+		            "(%llu KiB each, %zu measured), out %zu (%llu MiB written to the scratch file, not RAM); permutations %zu, prefetched not "
+		            "used %zu, their infos %llu MiB; table jobs %zu; warm code %llu MiB; pipelines graphics %zu compute %zu "
+		            "pending %zu; prefetch groups %zu; JIT %llu MiB (KYTY_PLAN_BUDGET_MB: plans kept)\n",
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), programs.size(),
+		            in_memory, static_cast<unsigned long long>(plan_bytes >> 20u),
+		            static_cast<unsigned long long>(measured != 0 ? measured_bytes / measured >> 10u : 0), measured, out,
+		            static_cast<unsigned long long>(spilled_bytes >> 20u), permutations, prefetched,
+		            static_cast<unsigned long long>(info_bytes >> 20u), jobs, static_cast<unsigned long long>(warm_bytes >> 20u),
+		            graphics_pipelines, compute_pipelines, pending, p != nullptr ? p->groups.size() : size_t {0},
+		            static_cast<unsigned long long>(JitArena::Used() >> 20u));
+		std::printf("Heap census, plans in memory by last use: %zu within 10 s, %zu within 30 s, %zu within 60 s; %zu brought "
+		            "back beside the render thread and not used since (KYTY_PLAN_IDLE_FLIPS %u, KYTY_PLAN_BUDGET_MB %s)\n",
+		            used_10, used_30, used_60, preloaded_unused, PlanIdleFlips(), PlanBudgetSet() ? "set" : "unset");
 	}
 	static void AddGroupMemory(Prefetch& p, const Prefetch::Group& group) {
 		std::array<uint64_t, PrefetchMemoryParts> n {};
@@ -1262,6 +1368,7 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plans.load(std::memory_order_relaxed),
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_verify_failures.load(std::memory_order_relaxed));
+				Libs::Trim::AfterShaderPrefetch(); // (recorte1: KYTY_TRIM=1, the heap pass on its own thread)
 			}
 		}
 	}
@@ -2450,6 +2557,7 @@ struct PipelineCache::PendingComputePipeline {
 	std::unique_ptr<Pipeline> pipeline = std::make_unique<Pipeline>();
 	ShaderComputeInputInfo    input_info;
 	vk::ShaderModule          module = nullptr;
+	bool                      from_store = false; // (render2) the worker's LastPipelineFromStore, read once done
 	std::atomic<bool>         done {false};
 };
 
@@ -2492,6 +2600,14 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			m_jobs.push_back(std::move(job));
+		}
+		m_wake.notify_one();
+	}
+	// (render2) Ahead of the queued jobs: a pipeline the GPU thread skips work for until it is made.
+	void PushFront(std::function<void()> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_jobs.push_front(std::move(job));
 		}
 		m_wake.notify_one();
 	}
@@ -2590,6 +2706,8 @@ void PipelineCache::PromoteFinished() {
 	Common::LockGuard lock(m_mutex);
 	PromoteOptimized();
 	m_program_cache->SweepPlans();
+	m_program_cache->RamCensus(m_graphics_pipelines.size(), m_compute_pipelines.size(),
+	                           m_pending_graphics_pipelines.size() + m_pending_compute_pipelines.size());
 	EvictIdlePipelines();
 }
 
@@ -2975,6 +3093,13 @@ void PipelineCache::FinishCompileWorkers() {
 		}
 	}
 	m_pending_graphics_pipelines.clear();
+	// (render2) The normal path's compute pipelines a worker finished and no dispatch took: destroyed with the rest.
+	for (auto& [id, pending]: m_pending_normal_compute_pipelines) {
+		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
+			m_compute_pipelines.emplace(id, std::move(pending->pipeline));
+		}
+	}
+	m_pending_normal_compute_pipelines.clear();
 }
 
 // The compiler inputs the static precompile compiled, as a warmup file: what the shader prefetch
@@ -4901,6 +5026,96 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 	LiveCounters::Add(LiveCounters::AsyncPipelines);
 	m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 	return nullptr;
+}
+
+// (render2, KYTY_ASYNC_COMPUTE_PIPELINES) See pipelineCache.h. What a worker makes is what CreateComputePipeline makes
+// (FirstBuild, the main driver cache, no native bindings); what CreateComputePipeline does after the driver's call
+// (the remake, the optimized build, the recording's recipe) is done here, on the GPU thread under m_mutex, when the
+// finished pipeline is taken in.
+PipelineCache::Pipeline* PipelineCache::TryCreateComputePipelineAsync(const ShaderComputeInputInfo& input_info,
+                                                                      const ShaderProgram& compute_program, AsyncCompute how,
+                                                                      bool* compiling) {
+	EXIT_IF(!compute_program);
+	if (compiling != nullptr) *compiling = false;
+	std::shared_ptr<PendingComputePipeline> job;
+	{
+		Common::LockGuard lock(m_mutex);
+		PromoteOptimized();
+		if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end()) {
+			// (Made meanwhile by CreateComputePipeline: the worker's copy, if any, stays with its job until the end.)
+			return iter->second.get();
+		}
+		if (auto pending = m_pending_normal_compute_pipelines.find(compute_program.id);
+		    pending != m_pending_normal_compute_pipelines.end()) {
+			job = pending->second;
+		} else if (how == AsyncCompute::Queue) {
+			job             = std::make_shared<PendingComputePipeline>();
+			job->input_info = input_info;
+			job->module     = compute_program.module;
+			m_pending_normal_compute_pipelines.emplace(compute_program.id, job);
+			const auto build = FirstBuild(m_graphics);
+			Workers().PushFront([this, job, build] {
+				const auto begin = std::chrono::steady_clock::now();
+				SlowLog::Scope slow([&](double ms) {
+					std::printf("SLOW AsyncComputePipeline %.1f ms normal CS=0x%016llx; %s\n", ms,
+					            static_cast<unsigned long long>(job->input_info.stage.program->shader_hash),
+					            LastPipelineStoreOutcome());
+				}, SlowLog::HitchThreshold());
+				CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, m_driver_cache, build);
+				job->from_store = LastPipelineFromStore();
+				CountRuntimePipeline(job->from_store);
+				MainPipelineDone();
+				m_async_compute_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				                                                       std::chrono::steady_clock::now() - begin)
+				                                                       .count()),
+				                             std::memory_order_relaxed);
+				m_async_compute_done.fetch_add(1, std::memory_order_relaxed);
+				job->done.store(true, std::memory_order_release);
+			});
+			LiveCounters::Add(LiveCounters::AsyncPipelines);
+		}
+		if (job != nullptr && !job->done.load(std::memory_order_acquire) && how != AsyncCompute::Block) {
+			if (compiling != nullptr) *compiling = true;
+			m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+			return nullptr;
+		}
+	}
+	if (job == nullptr) {
+		// (Neither made nor compiling.)
+		return how == AsyncCompute::Block ? &CreateComputePipeline(input_info, compute_program) : nullptr;
+	}
+	// (Block: the worker has it, or will take it ahead of its queue. Not under m_mutex: the workers' other jobs go on.)
+	while (!job->done.load(std::memory_order_acquire)) {
+		// (The window closes: the workers drop the jobs still queued. The caller skips its dispatch.)
+		if (m_stopping.load(std::memory_order_relaxed)) return nullptr;
+		std::this_thread::yield();
+	}
+	Common::LockGuard lock(m_mutex);
+	if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end()) return iter->second.get();
+	auto pending = m_pending_normal_compute_pipelines.find(compute_program.id);
+	// (Only the GPU thread takes jobs in: the job is still there.)
+	EXIT_IF(pending == m_pending_normal_compute_pipelines.end() || pending->second != job || job->pipeline == nullptr);
+	auto       finished   = std::move(job->pipeline);
+	const bool from_store = job->from_store;
+	m_pending_normal_compute_pipelines.erase(pending);
+	EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
+	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(finished));
+	EXIT_IF(!inserted);
+	m_render_pipelines++;
+	// (As CreateComputePipeline, from here on.)
+	const auto make = [this, kept_info = job->input_info, module = job->module](PipelineBuild build) {
+		return [=, this](Pipeline& target) { CreatePipelineInternal(m_graphics, target, kept_info, module, m_driver_cache, build); };
+	};
+	if (KeepsRemake(m_graphics, *iter->second, from_store))
+		iter->second->remake = std::make_shared<const std::function<void(Pipeline&)>>(make(PipelineBuild::Full));
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.compute = m_program_cache->RecordedIndex(compute_program);
+	if (recipe.compute != LocalShaderWarmup::NoShader) {
+		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+	}
+	return iter->second.get();
 }
 #ifdef KYTY_STATIC_PRECOMPILE
 #include "staticPrecompile.inc"

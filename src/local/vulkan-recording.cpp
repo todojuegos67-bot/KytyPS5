@@ -293,11 +293,18 @@ private:
     }
 };
 
-thread_local std::unique_ptr<Stream> producer;
+thread_local std::unique_ptr<Stream> owned_producer;
+// (par1, KYTY_PAR_QUEUES=1) The ACB thread records into the GPU thread's stream (AdoptProducer): one stream, one open
+// command buffer, in the order the queue lock gives; only the lock's holder records, so the stream keeps one producer
+// at a time.
+thread_local Stream* adopted_producer = nullptr;
+// This thread's stream: its own, or the one it adopted (null: none).
+inline Stream* Producer() { return owned_producer ? owned_producer.get() : adopted_producer; }
 Stream* RecordingStream() {
+    auto* producer = Producer();
     if (producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0) {
         producer->was_recording = true;
-        return producer.get();
+        return producer;
     }
     return nullptr;
 }
@@ -305,7 +312,7 @@ void InvalidateRawState() {
     if (executing) executing->state_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 [[gnu::noinline]] void BeforeDirect() {
-    if (producer) {
+    if (auto* producer = Producer()) {
         // Diagnostic (live timecensus, source DirectDrain): direct calls made while packets are pending.
         if (producer->Pending()) KYTY_TIME_CENSUS(DirectDrain, 0);
         producer->BeforeDirect();
@@ -330,9 +337,9 @@ void* ReplaceBindPipeline(void* entry) {
 uint64_t WorkCalls() { return g_work_calls; }
 uint64_t RecordedWork() { return g_work_calls + g_packets; }
 uint64_t RecordedWrites() { return g_writing_calls + g_packets; }
-void Drain() { if (producer) producer->Drain(); }
+void Drain() { if (auto* producer = Producer()) producer->Drain(); }
 bool PacketsEnabled() {
-    return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
+    return Producer() && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
 }
 uint64_t StateEpoch() {
     return executing ? executing->state_epoch.load(std::memory_order_relaxed) : UINT64_MAX;
@@ -353,7 +360,7 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
     });
 }
 bool DeferredSubmitEnabled() {
-    return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
+    return Producer() && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
         kyty_local_deferred_submit_mode.load(std::memory_order_relaxed) != 0;
 }
 bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish) {
@@ -388,13 +395,18 @@ void WaitDeferredSubmits() {
          done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
-    if (producer) producer->BeforeDirect();
+    if (auto* producer = Producer()) producer->BeforeDirect();
     replay(segments, original);
 }
 void InvalidateReplayState() { InvalidateRawState(); }
 ProducerScope::ProducerScope() {
-    if (producer) std::abort();
-    producer = std::make_unique<Stream>();
+    if (owned_producer || adopted_producer) std::abort();
+    owned_producer = std::make_unique<Stream>();
 }
-ProducerScope::~ProducerScope() { producer.reset(); }
+ProducerScope::~ProducerScope() { owned_producer.reset(); }
+void* CurrentProducer() { return owned_producer.get(); }
+void AdoptProducer(void* stream) {
+    if (owned_producer) std::abort();
+    adopted_producer = static_cast<Stream*>(stream);
+}
 } // namespace LocalVulkanRecording

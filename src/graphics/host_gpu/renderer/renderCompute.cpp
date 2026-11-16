@@ -35,6 +35,8 @@
 #include "native-preparation-state.h"
 #include "live-counters.h"
 
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <xxhash.h>
 #include "xpr-capture.h"
@@ -708,6 +710,105 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 		record.PredictClear(found->second);
 }
 
+namespace {
+// (render2) KYTY_ASYNC_COMPUTE_PIPELINES=1 (off by default): a normal-path dispatch whose compute pipeline is not made
+// yet no longer always stops the GPU thread for the driver. Each frame the first KYTY_ASYNC_COMPUTE_SYNC_MS (default
+// 2) of such compiles are made here as before, so a frame that brings a few new pipelines dispatches them all; past
+// that the pipeline goes to a compile worker (PipelineCache::TryCreateComputePipelineAsync), the GPU thread waits for
+// it at most KYTY_ASYNC_COMPUTE_WAIT_MS a frame (default 2) and the dispatch is skipped while it compiles, as a draw
+// is with KYTY_ASYNC_DRAW_PIPELINES. Never skipped: the TAA pass (frame generation and the upscalers hang on it), a
+// captured frame, and a dispatch whose pipeline has been compiling for KYTY_ASYNC_COMPUTE_HOLD_MS (default 250):
+// those wait for the worker. Measured basis (16 GB profile, no pipeline warmup): 14-145 compute pipelines in one
+// frame at a zone's load, ~0.6 ms each, 13-132 ms of dispatch.pipeline in that frame.
+struct AsyncComputeDispatches {
+	bool    on             = false;
+	int64_t sync_budget_us = 2000, wait_budget_us = 2000, hold_ms = 250;
+	// The GPU thread's: this frame's compiles made here and waits for the workers, and when each program's dispatch
+	// was first skipped.
+	uint64_t frame   = UINT64_MAX;
+	int64_t  sync_us = 0, waited_us = 0;
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> skipping;
+	// Since the start, and as the last [async-compute] line had them.
+	struct Totals {
+		uint64_t made_here = 0, made_here_us = 0, queued = 0, waited_us = 0, skipped = 0, held = 0, held_us = 0;
+		uint64_t compiled = 0, compiled_us = 0;
+	};
+	Totals                                total, reported;
+	bool                                  active = false;
+	std::chrono::steady_clock::time_point reported_at {};
+};
+AsyncComputeDispatches& AsyncComputeState() {
+	static AsyncComputeDispatches state = [] {
+		AsyncComputeDispatches made;
+		const auto             number = [](const char* name, double fallback, double low, double high) {
+			const char* value = std::getenv(name);
+			return std::clamp(value != nullptr && *value != '\0' ? std::atof(value) : fallback, low, high);
+		};
+		const char* value   = std::getenv("KYTY_ASYNC_COMPUTE_PIPELINES");
+		made.on             = value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		made.sync_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_SYNC_MS", 2.0, 0.0, 1000.0) * 1000.0);
+		made.wait_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_WAIT_MS", 2.0, 0.0, 1000.0) * 1000.0);
+		made.hold_ms        = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_HOLD_MS", 250.0, 0.0, 60000.0));
+		if (made.on) {
+			std::printf("Async compute pipelines: on (KYTY_ASYNC_COMPUTE_PIPELINES=1): %.1f ms of compiles a frame on the "
+			            "GPU thread (KYTY_ASYNC_COMPUTE_SYNC_MS), then on the compile workers, waited for %.1f ms a frame "
+			            "(KYTY_ASYNC_COMPUTE_WAIT_MS), the dispatch skipped meanwhile for at most %lld ms "
+			            "(KYTY_ASYNC_COMPUTE_HOLD_MS)\n",
+			            static_cast<double>(made.sync_budget_us) / 1000.0, static_cast<double>(made.wait_budget_us) / 1000.0,
+			            static_cast<long long>(made.hold_ms));
+			std::fflush(stdout);
+		}
+		return made;
+	}();
+	return state;
+}
+// A line at most every 5 s, only after something happened: what the switch did since the last one.
+void AsyncComputeReport(AsyncComputeDispatches& state, const PipelineCache& cache) {
+	if (!state.active) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - state.reported_at < std::chrono::seconds(5)) return;
+	state.total.compiled    = cache.AsyncComputeCompiled();
+	state.total.compiled_us = cache.AsyncComputeCompileUs();
+	const auto& t = state.total;
+	const auto& r = state.reported;
+	const auto  ms = [](uint64_t us) { return static_cast<double>(us) / 1000.0; };
+	std::printf("[async-compute] since the last line: %llu pipelines made on the GPU thread (%.1f ms), %llu sent to the "
+	            "workers, %llu compiled there (%.1f ms off the GPU thread), waited %.1f ms, %llu dispatches skipped, %llu "
+	            "held (%.1f ms); total skipped %llu\n",
+	            static_cast<unsigned long long>(t.made_here - r.made_here), ms(t.made_here_us - r.made_here_us),
+	            static_cast<unsigned long long>(t.queued - r.queued), static_cast<unsigned long long>(t.compiled - r.compiled),
+	            ms(t.compiled_us - r.compiled_us), ms(t.waited_us - r.waited_us),
+	            static_cast<unsigned long long>(t.skipped - r.skipped), static_cast<unsigned long long>(t.held - r.held),
+	            ms(t.held_us - r.held_us), static_cast<unsigned long long>(t.skipped));
+	std::fflush(stdout);
+	state.reported    = state.total;
+	state.reported_at = now;
+	state.active      = false; // (until a dispatch next finds its pipeline not made)
+}
+} // namespace
+
+// (render4) KYTY_DS_LINEAR_COPY_HOOK: the copy an announcement of the game's linear copy function makes, under the
+// terms DispatchDirect's register check below copies under: the copy shader proved by its program (m_linear_copy_shader)
+// and the shader map unchanged since, no frame capture, no speculation, no live shader skip; every 64th use is left to
+// the game's packets, whose dispatch takes the normal path and proves the program again. The census scopes are the
+// dispatch's (the [render] line counts it as a dispatch and its time as linear_copy).
+bool RenderExecutor::DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t src, uint32_t count, uint32_t period,
+                                  uint64_t commands, uint64_t commands_bytes) {
+	if (buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed))
+		return false;
+	auto&      learned = Catalog();
+	const auto shader  = learned.m_linear_copy_shader.load(std::memory_order_relaxed);
+	if (shader == 0 || ShaderMapGeneration() != learned.m_linear_copy_generation) return false;
+	if ((++m_linear_copy_hook_uses & 63u) == 0) return false;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	LiveCensus::Scope census(LiveCensus::Dispatch, shader, 0);
+	LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader);
+	RenderLockGuard   lock(m_context.GetMutex());
+	LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, shader, 11);
+	return DemonsSouls::TryLinearCopyRanges(m_context.GetBufferCache(), dst, src, count, period, commands, commands_bytes);
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode,
@@ -843,6 +944,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 11);
 		if (DemonsSouls::TryLinearCopy(dispatch, m_context.GetBufferCache(), thread_group_x, thread_group_y,
 		                               thread_group_z, mode)) {
+			LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader); // (render4, KYTY_RENDER_STATS: the "cs" part)
 			TableDispatchSeen(sh_ctx.GetCs(), "dispatch: linear copy", thread_dimensions);
 			ResetBindings();
 			return;
@@ -892,6 +994,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	LiveCensus::SetDispatchShader(program.shader_hash); // (render4, KYTY_RENDER_STATS: the "cs" part)
 	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
 		// Local diagnostic: is a dispatch (shader, user data, groups) repeated from last frame, and
 		// with the same materialized resources? (What a per-object native dispatch record could reuse.)
@@ -1050,9 +1153,75 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 2);
 	TableDispatchSeen(sh_ctx.GetCs(), nullptr, use_thread_dimensions);
+	// (render2) KYTY_ASYNC_COMPUTE_PIPELINES (AsyncComputeDispatches above): the pipeline before anything of the
+	// dispatch is recorded or resolved, so that a skipped dispatch leaves nothing behind.
+	PipelineCache::Pipeline* async_pipeline = nullptr;
+	if (auto& async = AsyncComputeState(); async.on && Role() == 0 && !FrameCapture::Active()) {
+		using How        = PipelineCache::AsyncCompute;
+		auto& cache      = m_context.GetPipelineCache();
+		bool  compiling  = false;
+		const auto time_now = [] { return std::chrono::steady_clock::now(); };
+		const auto us    = [](std::chrono::steady_clock::duration time) {
+			return std::chrono::duration_cast<std::chrono::microseconds>(time).count();
+		};
+		if (const auto frame = m_context.FrameNumber(); frame != async.frame) {
+			async.frame     = frame;
+			async.sync_us   = 0;
+			async.waited_us = 0;
+			AsyncComputeReport(async, cache);
+		}
+		async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Find, &compiling);
+		if (async_pipeline == nullptr) {
+			async.active     = true;
+			const auto begin = time_now();
+			// (The TAA pass: one dispatch a frame that frame generation, the upscalers and the scene's notes hang on.)
+			const bool keep = FrameGen::IsTaaShader(program.shader_hash);
+			if (!compiling && (keep || async.sync_us < async.sync_budget_us)) {
+				// Within the frame's budget: made here, as before.
+				async_pipeline   = &cache.CreateComputePipeline(input_info, compute_program);
+				const auto spent = us(time_now() - begin);
+				async.sync_us += spent;
+				async.total.made_here++;
+				async.total.made_here_us += static_cast<uint64_t>(spent);
+			} else {
+				if (!compiling) async.total.queued++;
+				async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Queue);
+				if (async_pipeline == nullptr && async.waited_us < async.wait_budget_us) {
+					const auto waiting  = cache.PipelineWaiting();
+					const auto deadline = begin + std::chrono::microseconds(async.wait_budget_us - async.waited_us);
+					while (waiting != nullptr && !waiting->load(std::memory_order_acquire) && time_now() < deadline)
+						std::this_thread::yield();
+					const auto spent = us(time_now() - begin);
+					async.waited_us += spent;
+					async.total.waited_us += static_cast<uint64_t>(spent);
+					async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Find);
+				}
+				if (async_pipeline == nullptr) {
+					const auto first = async.skipping.try_emplace(compute_program.id, begin).first->second;
+					if (keep || begin - first >= std::chrono::milliseconds(async.hold_ms)) {
+						const auto held_begin = time_now();
+						async_pipeline        = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Block);
+						async.total.held++;
+						async.total.held_us += static_cast<uint64_t>(us(time_now() - held_begin));
+					}
+				}
+				if (async_pipeline == nullptr) {
+					const auto skipped = ++async.total.skipped;
+					if ((skipped & (skipped - 1)) == 0) {
+						std::printf("Async compute pipelines: %llu dispatches skipped while their pipelines compile\n",
+						            static_cast<unsigned long long>(skipped));
+					}
+					ResetBindings();
+					return;
+				}
+			}
+			async.skipping.erase(compute_program.id);
+		}
+	}
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	auto& pipeline = async_pipeline != nullptr
+	                     ? *async_pipeline
+	                     : m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 3);
 	NativePreparationScratch<PreparedBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);

@@ -140,6 +140,17 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// KYTY_NATIVE_MEMORY=1 (GpuResourceManager::SweepCpuWrites): InvalidateMemory for whole pages the write watch saw
+	// written, which knows no bytes. An image GPU work wrote that only shares a page at its first or last page with what
+	// the game wrote is left alone (its write fault saw a byte outside the image: the image stayed valid); a page all
+	// inside an image invalidates it as before.
+	void               InvalidateCpuWrittenPages(uint64_t address, uint64_t size);
+	// KYTY_NATIVE_MEMORY=1 (GPU thread; GpuResourceManager::NativeFlushGpuWrites): whether GPU work wrote an image since the
+	// last call below, and those images (render targets, storage images, copy destinations) downloaded to their guest
+	// memory (TryDownloadImage: written back when the GPU is done; the caller waits for that). Returns the images whose
+	// download was recorded, adds their bytes to `bytes` and the refused ones to `refused`.
+	[[nodiscard]] bool NativeHasGpuWrites() const noexcept { return !m_native_written.empty(); }
+	uint64_t           NativeDownloadWritten(uint64_t* bytes, uint64_t* refused);
 	// `fill`: the GPU wrote the range with that one 32-bit value (a compute fill): the images over it note it
 	// (Image::MarkBufferFilled).
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "",
@@ -184,6 +195,8 @@ public:
 	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
 	// till then). Takes m_lock unless the caller holds it.
 	void RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch, bool async = false);
+	// (ram17) The native offload's dropped bytes over an upload's guest range back first (textureCache.cpp).
+	void RestoreBeforeUpload(uint64_t vaddr, uint64_t size);
 	struct OffloadCheck;
 	struct OffloadRestore;
 	std::vector<std::unique_ptr<OffloadRestore>> m_offload_restores;   // asynchronous restores (until done)
@@ -381,7 +394,8 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// `written_pages`: InvalidateCpuWrittenPages' (whole pages the write watch saw written).
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size, bool written_pages = false);
 	[[nodiscard]] bool TryDownloadImage(ImageId id);
 
 	GraphicContext&                                   m_graphics;
@@ -421,6 +435,9 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// KYTY_NATIVE_MEMORY: the serials of the images GPU work wrote since the last NativeDownloadWritten (NoteNativeGpuWrite).
+	std::unordered_set<uint64_t>                      m_native_written;
+	void                                              NoteNativeGpuWrite(const Image& image);
 	// UploadImagePartial: the transfer plan of each large image it uploads (by Image::serial);
 	// a 256-layer mip-mapped array has 2816 subresources to plan otherwise on every refresh.
 	struct PartialPlan {

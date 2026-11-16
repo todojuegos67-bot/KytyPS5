@@ -148,6 +148,10 @@ constexpr uint32_t WStatsCount   = 3;
 // (des-refl2-1108) the shader's PSTATS: which path the floors' reflection pixels take (PathStat; logged every second)
 constexpr uint32_t PStatsIndex   = 1404;
 constexpr uint32_t PStatsCount   = 20;
+// (rtrefl1) the shader's RSTATS: the reflection's history reprojection in motion (KYTY_RT_REFLECTIONS_REPROJ; logged every
+// 10 s, "RT reflections: reprojection:"): see the shader's RStat
+constexpr uint32_t RStatsIndex   = 1424;
+constexpr uint32_t RStatsCount   = 8;
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -171,6 +175,7 @@ static_assert(HeaderBytes + (StatsIndex + StatsCount) * 4 <= FrameBytes);
 static_assert(SurveyIndex + SurveyCount <= WStatsIndex && HeaderBytes + (WStatsIndex + WStatsCount) * 4 <= FrameBytes);
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
 static_assert(WStatsIndex + WStatsCount <= PStatsIndex && HeaderBytes + (PStatsIndex + PStatsCount) * 4 <= FrameBytes);
+static_assert(PStatsIndex + PStatsCount <= RStatsIndex && HeaderBytes + (RStatsIndex + RStatsCount) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
@@ -227,6 +232,10 @@ struct RtPass {
 	std::array<uint64_t, PStatsCount> path_sum {};
 	uint64_t                path_frames = 0, path_hw_frames = 0, path_guide_frames = 0;
 	std::chrono::steady_clock::time_point path_time = std::chrono::steady_clock::now();
+	// (rtrefl1) the reprojection's counters (KYTY_RT_REFLECTIONS_REPROJ): last values, sums since the last line (10 s)
+	std::array<uint32_t, RStatsCount> rep_last {};
+	std::array<uint64_t, RStatsCount> rep_sum {};
+	std::chrono::steady_clock::time_point rep_time = std::chrono::steady_clock::now();
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -865,6 +874,60 @@ void LogFloorPaths() {
 	g_rt.path_time = now;
 }
 
+// (rtrefl1) KYTY_RT_REFLECTIONS_REPROJ=1 (default 0: exactly as before): the reflection's history in motion.
+// Why (user report 11-15: "al moverse el reflejo se difumina a modo de ondas; parado bien"): the temporal pass fetched each
+// trace pixel's history at the surface's motion vector plus the reflected point's parallax computed from THAT pixel's own
+// hit distance of this frame. On a glossy surface that distance comes from one GGX-sampled ray per pixel (a different
+// direction each pixel and each frame) and on any surface it jumps at a reflected object's edge, so neighbouring pixels
+// fetched their history from scattered positions (a warp that moves with the noise: "ondas"); pixels without a ray this
+// frame (checkerboard, misses) used the surface's motion alone; between roughness 0.1 and 0.45 the parallax was applied
+// only partly (neither position right: a drag). The bilinear history fetch blurs it a little more every frame in motion,
+// and the composite's own stabilisation (Stabilize) measured "moving" by the surface's motion only, so a reflection
+// sliding over a slow-moving floor kept up to 70 % of the last frame's (dragged) contribution.
+// With it: (1) two more candidates for the history position, the parallax from the 3x3 same-surface neighbours' mean hit
+// distance and from this pixel's own (full parallax, every roughness), next to the surface's motion; the one whose
+// history agrees best with this frame's neighbourhood (YCoCg distance in sigmas) is taken (a still camera: all three are
+// the same point, nothing changes); (2) that history read with a 5-tap Catmull-Rom (no blur accumulating frame after
+// frame) only while it moves (> 0.5 px); (3) Stabilize counts the reflected point's own screen motion as motion. Cost:
+// ~3 bilinear fetches more per trace pixel and 4 more for the history in motion, ~0.05-0.1 ms at 1280x720 (estimate).
+bool ReprojWanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
+		const bool  v = e != nullptr && e[0] == '1';
+		std::printf("RT reflections: reprojection fix (rtrefl1) %s (KYTY_RT_REFLECTIONS_REPROJ=%s): %s\n", v ? "on" : "off",
+		            e != nullptr ? e : "(unset)",
+		            v ? "history at the best of surface / reflected-point (own and 3x3 hit distance) positions, Catmull-Rom in "
+		                "motion, the reflection's own motion in the stabilisation"
+		              : "as before");
+		std::fflush(stdout);
+		return v;
+	}();
+	return on;
+}
+
+// (rtrefl1) Every 10 s: how the history was chosen in motion and how far it was from this frame's neighbourhood (both
+// with the fix on and off: the mismatch is the measure to compare).
+void LogReproj() {
+	const auto* c = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + RStatsIndex);
+	for (uint32_t k = 0; k < RStatsCount; ++k) {
+		if (g_rt.frame > 8) g_rt.rep_sum[k] += static_cast<uint32_t>(c[k] - g_rt.rep_last[k]);
+		g_rt.rep_last[k] = c[k];
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_rt.rep_time < std::chrono::seconds(10)) return;
+	const auto&  r  = g_rt.rep_sum;
+	const double mv = static_cast<double>(std::max<uint64_t>(r[0], 1));
+	const double cm = static_cast<double>(std::max<uint64_t>(r[6], 1));
+	if (r[0] > 0 || r[6] > 0)
+		std::printf("RT reflections: reprojection 10 s (rtrefl1, fix %s): %llu moving trace samples with history: surface %.1f%%, "
+		            "own hit %.1f%%, 3x3 hit %.1f%%; history vs this frame %.2f sigma (mean), > 2 sigma %.1f%%; composite: %llu "
+		            "moving reflection samples, moving only by the reflection's own motion %.1f%%\n",
+		            ReprojWanted() ? "on" : "off", static_cast<unsigned long long>(r[0]), 100.0 * r[1] / mv, 100.0 * r[2] / mv,
+		            100.0 * r[3] / mv, r[4] / 100.0 / mv, 100.0 * r[5] / mv, static_cast<unsigned long long>(r[6]), 100.0 * r[7] / cm);
+	g_rt.rep_sum.fill(0);
+	g_rt.rep_time = now;
+}
+
 void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (g_rt.mapped == nullptr) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
@@ -888,6 +951,7 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		if (g_rt.frame > 8 && !g_rt.water_max_clear) g_rt.wshow_max = std::max(g_rt.wshow_max, w[2]);
 	}
 	LogFloorPaths(); // (des-refl2-1108)
+	LogReproj();     // (rtrefl1)
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
 	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
@@ -1545,7 +1609,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	               (g_rt.moving_on && !g_rt.moving_auto_off ? 128 : 0) | (have_guide ? 256 : 0) | (guide_mode && have_guide ? 512 : 0) |
 	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
 	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0) | // (water-1030)
-	               (FlatFloorWanted() ? 8192 : 0); // (des-refl2-1108)
+	               (FlatFloorWanted() ? 8192 : 0) | // (des-refl2-1108)
+	               (ReprojWanted() ? 16384 : 0);    // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1855,7 +1920,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (PStatsIndex + PStatsCount) * 4}; // (water2-1030 + des-refl2-1108: the water / floor stats)
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (RStatsIndex + RStatsCount) * 4}; // (water2-1030 + des-refl2-1108 + rtrefl1: the water / floor / reprojection stats)
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		if (hw_on) {
 			const vk::BufferCopy hw_region {HwHeaderBytes, HwHeaderBytes, HwStatsCount * 4};

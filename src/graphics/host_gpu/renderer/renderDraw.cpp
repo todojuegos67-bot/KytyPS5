@@ -39,6 +39,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "trusted-depth.h" // (trust1: table-xpr.inc)
 #include "live-counters.h"
 #include "device-fault.h"
 #include "frame-capture.h"

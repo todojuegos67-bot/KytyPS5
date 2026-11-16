@@ -186,6 +186,9 @@ void      KeepResident();
 // How the trim runs its system call: set by the guest memory (kernel/memory.cpp) so that no mapping, unmapping or
 // protection change of the guest's views runs meanwhile (Windows' memory manager bug-checked, 0x1A, PCs that trim).
 void      SetTrimRunner(void (*runner)(void (*call)()));
+// `call` through the trim runner: no guest map, unmap or protection change runs meanwhile (paging pages while their
+// protection changes is the bug check 0x1A reproducer). Without a runner, `call` directly.
+void      RunTrimQuiet(void (*call)());
 // The RAM budget (ram-guard.h, KYTY_RAM_BUDGET_MB): the working set trimmed down to target_bytes now (a hard maximum set
 // and made soft again in one call through the trim runner: pages leave only while no guest map, unmap or protection
 // change runs; they go to the standby list / page file and fault back in on use), keeping a hard minimum of min_bytes

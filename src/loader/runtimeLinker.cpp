@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "local/raiz-wb-guard.h" // (crash-ba2b1f: PrintGuestPageState)
 #include "local/mem-guard.h"
 #include "loader/gameArgs.h"
 
@@ -21,6 +22,7 @@
 #include "loader/demonsSoulsIdle.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
+#include "loader/demonsSoulsWriteAudit.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsSuperResolution.h"
@@ -871,6 +873,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
+		// (audit1, KYTY_DS_WRITE_AUDIT: the writer of a write fault, for the audit's FUGA table. Measurement only.)
+		// (policy1: and the reader of a read fault, for the "[read-audit]" table.)
+		if (DemonsSoulsWriteAudit::On())
+			DemonsSoulsWriteAudit::NoteFaultSite(info->exception_address, info->rsp);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			return true;
@@ -950,6 +956,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			bool any = false;
 			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
 			if (!any) std::printf("  none\n");
+			// (crash-ba2b1f) Their state now: host protection, the trackers' bits (read without locks), kept GPU bytes,
+			// the write watch since the GPU took them (KYTY_RAIZ_WB_GUARD) and the guard's marks.
+			std::printf("State of those pages:\n");
+			for (const auto page: pages) Libs::LibKernel::Memory::PrintGuestPageState(page);
 		}
 		// The memory the registers point at (the object a bad pointer came from: its fields and lists).
 		{
@@ -1637,6 +1647,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSkipIntro::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsCamera::InstallNoRamp(m_programs.empty() ? nullptr : m_programs.front());
+	// (audit1) KYTY_DS_WRITE_AUDIT=1, off by default. Last: DemonsSoulsGpuPages (above) verifies whole functions this
+	// patches the entries of, and every patch above has checked the game's own bytes by now.
+	DemonsSoulsWriteAudit::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1660,6 +1673,7 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	DemonsSoulsWriteAudit::Clear(); // (audit1; first: its patches were the last ones written)
 	DemonsSoulsIdle::Clear();
 	DemonsSoulsCopy::Clear();
 	DemonsSoulsGpuPages::Clear();

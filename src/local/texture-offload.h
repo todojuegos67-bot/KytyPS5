@@ -28,6 +28,22 @@
 // Logged: "GPU-only offload: ..." (ranges, MiB, restores and their time), and every 30 s "Guest RAM by GPU cache" (what
 // the GPU caches know of the guest bytes: what could be dropped and why the rest cannot).
 //
+// (ram15) KYTY_NATIVE_TEXTURE_OFFLOAD=1 (off by default) with native guest memory (KYTY_NATIVE_MEMORY / KYTY_RAIZ, where
+// the offload was off: no backing view). The same textures are taken, their pages made no-access by the page manager's
+// read watchers (never protected here: every protection change of guest memory goes through the page manager or the
+// gate), and their RAM dropped at their guest address by the offload worker (MEM_RESET + out of the working set,
+// memory.cpp NativeOffloadDrop: no page-file or compression copy). A touch waits for the render thread to download the
+// bytes back from the image (written through a write window, NativeOffloadWrite) - a game thread's fault, a window of
+// the emulator's over them (NativeGuardedAccess's hook: its copies do not fault) -; a touch that cannot wait (the upload
+// worker, deferred GPU work, a recorder, a window inside a window) is a miss: counted, its pages opened as they are,
+// restored after (Drain). An image gone (evicted) gives its bytes back first, as before; the collector takes the stale
+// images whose bytes are still in RAM before those whose bytes it would have to download (KYTY_NATIVE_OFFLOAD_EVICT_LAST=0:
+// LRU order only). Ghidra 01.007.000: the streamed textures are written by the file read (0x8fed14) and the chunk memcpy
+// 0x901459 (CTexture::SetCurrentStreamingChunk 0x901330) into VirtualMemoryGPU (0x2f64438) and decommitted (op 2,
+// 0x9014f4); no read of their bytes by the CPU found in CTexture's code. Measured (backing view, 11-15, 18 runs): 0 game
+// reads of taken ranges, 1-15 game writes (memory reused) a run. Every 30 s: "Native texture offload (30 s ...)" (RAM
+// saved now in GB, downloads back and why, misses, windows checked, the worker's time).
+//
 // Read watchers go at once after a touch by game code (a guest thread holds no lock of the emulator's) or a host write or
 // unmap (normal context); after one by the emulator's own code the fault handler only gives the pages a protection that
 // lets the access through, and the render thread removes them (Drain).
@@ -40,6 +56,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -49,9 +66,11 @@
 #include <vector>
 
 #include "local-platform.h"
+#include "raiz.h" // (ram15: KYTY_RAIZ forces KYTY_NATIVE_MEMORY=1 at its first read)
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <psapi.h> // (ram5: K32QueryWorkingSetEx)
 #endif
 
 namespace TextureOffload {
@@ -63,6 +82,23 @@ enum class Mode { Off, Probe, Offload };
 inline Mode GetMode() {
 #if defined(_WIN32)
 	static const Mode mode = [] {
+		// KYTY_NATIVE_MEMORY=1 (kernel/memoryAddressSpace.inc, NativeMemoryRequested): no backing view - the "backing
+		// pieces" are the guest addresses themselves -, so the offload would change the guest view's protection (which
+		// that mode never does), drop the game's own pages (DiscardVirtualMemory, KYTY_OFFLOAD_PAGEOUT=0) and restore
+		// into guest memory the game may have unmapped since. Off then.
+		(void)Raiz::On(); // (ram15: sets KYTY_NATIVE_MEMORY=1 with KYTY_RAIZ=1 first)
+		if (const char* native = std::getenv("KYTY_NATIVE_MEMORY"); native != nullptr && native[0] == '1') {
+			// (ram15) KYTY_NATIVE_TEXTURE_OFFLOAD=1: on, at the guest addresses themselves (above).
+			const char* on = std::getenv("KYTY_NATIVE_TEXTURE_OFFLOAD");
+			if (on != nullptr && on[0] == '1') {
+				std::printf("Texture offload: on with native memory (KYTY_NATIVE_TEXTURE_OFFLOAD=1): verified clean textures' guest "
+				            "pages dropped from RAM at their guest address, downloaded back from the image on any touch\n");
+				std::fflush(stdout);
+				return Mode::Offload;
+			}
+			std::printf("Texture offload: off (KYTY_NATIVE_MEMORY: no backing view; KYTY_NATIVE_TEXTURE_OFFLOAD=1 turns it on)\n");
+			return Mode::Off;
+		}
 		const char* offload = std::getenv("KYTY_TEXTURE_OFFLOAD");
 		if (offload != nullptr && offload[0] != '\0') {
 			if (offload[0] == '1') return Mode::Offload;
@@ -80,6 +116,20 @@ inline Mode GetMode() {
 
 inline bool Enabled() {
 	return GetMode() != Mode::Off;
+}
+
+// (ram15) The offload over native guest memory: its "backing pieces" are the guest pages themselves.
+inline bool Native() {
+#if defined(_WIN32)
+	static const bool native = [] {
+		if (GetMode() != Mode::Offload) return false;
+		const char* value = std::getenv("KYTY_NATIVE_MEMORY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return native;
+#else
+	return false;
+#endif
 }
 
 enum class Touch : uint8_t {
@@ -129,6 +179,11 @@ struct Range {
 	bool                                  restoring = false; // (its restore runs: other touches wait for its end)
 	std::thread::id                       restorer {};       // (the thread restoring it; none: the offload worker)
 	bool                                  gpu       = false; // (KYTY_GPU_ONLY_OFFLOAD: a GPU-written image's range)
+	uint64_t                              dropped   = 0;     // (ram15, native: bytes the worker reset, not given back yet)
+	// (ram17, KYTY_RAM17) Its guest bytes in the disk store (file_len 0: none), guest byte begin + i at file_off + i; an
+	// orphan: its image went, its bytes are only there (no download, nothing back in RAM until a touch).
+	uint64_t                              file_off  = 0, file_len = 0;
+	bool                                  orphan    = false;
 };
 
 // Set by the texture cache: the page manager's read watchers of a guest range removed; a restore of the discarded ranges
@@ -137,6 +192,13 @@ struct Range {
 using RemoveWatchers = void (*)(uint64_t vaddr, uint64_t size);
 using Restore        = void (*)(uint64_t vaddr, uint64_t size, Touch touch);
 using CanWait        = bool (*)();
+// (ram15, native memory; set by the texture cache: memory.cpp's NativeOffloadDrop / Write / Open.)
+using NativeDrop  = uint64_t (*)(uint64_t vaddr, uint64_t size, uint64_t* refused);
+using NativeWrite = bool (*)(uint64_t vaddr, const void* data, uint64_t size);
+using NativeOpen  = bool (*)(uint64_t vaddr, uint64_t size, bool write);
+// (ram17; set by the texture cache: memory.cpp's NativeGuardedRead / NativeForgetWrites.)
+using NativeRead   = bool (*)(void* destination, const void* guest, uint64_t size);
+using NativeForget = void (*)(uint64_t vaddr, uint64_t size);
 
 struct State {
 	std::mutex                   mutex;
@@ -144,6 +206,10 @@ struct State {
 	std::map<uint64_t, uint64_t> backing; // backing piece start -> guest start
 	std::vector<uint64_t>        pending; // touched ranges (guest starts) whose read watchers go (Drain)
 	std::unordered_set<uint64_t> touched_serials; // images touched once: not taken again
+	// (ram16, KYTY_RAM16: KYTY_RAM16_RETAKE_S) When each image of touched_serials was touched: taken again once it has been
+	// that long since (TouchedLocked). Only filled with the retake on.
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> touched_at;
+	uint64_t retaken = 0; // (ram16: images let back in after their wait, in all)
 	std::atomic<RemoveWatchers>  remove {nullptr};
 	std::atomic<Restore>         restore {nullptr};
 	std::atomic<CanWait>         can_wait {nullptr};
@@ -152,6 +218,12 @@ struct State {
 	uint64_t now = 0, peak = 0, total = 0, ranges_total = 0;
 	uint64_t touches[static_cast<int>(Touch::Count)] {}, touch_bytes[static_cast<int>(Touch::Count)] {};
 	uint64_t ages[4] {}; // <1 s, <10 s, <60 s, later
+	uint64_t pageout_bytes = 0; // (KYTY_OFFLOAD_PAGEOUT: bytes taken out of the working set)
+	uint64_t unmap_splits  = 0; // (ram3, KYTY_OFFLOAD_UNMAP_SPLIT: ranges an unmap took only a part of)
+	// (ram5, KYTY_OFFLOAD_PAGEOUT=0) Bytes DiscardVirtualMemory took, refused (then MEM_RESET + VirtualUnlock: taken by
+	// that or still refused), and the backing view's pages still in the working set right after (sampled, a page a MiB).
+	uint64_t discard_ok = 0, discard_refused = 0, reset_ok = 0, reset_refused = 0, resident_after = 0, sampled_after = 0;
+	uint32_t discard_error = 0;
 	uint64_t restores = 0, restore_bytes = 0, restore_us = 0, restore_us_max = 0, lost = 0, missed = 0, missed_bytes = 0;
 	uint64_t checked = 0, checked_bytes = 0, check_failed = 0;
 	// KYTY_GPU_ONLY_OFFLOAD: the GPU-written images' ranges (render targets, storage images) among the above.
@@ -161,6 +233,24 @@ struct State {
 	std::atomic<uint64_t> restoring_ranges {0}, read_waits {0}, read_wait_bytes {0};
 	std::unordered_map<uint64_t, uint64_t> rips;    // the emulator's instructions -> touches
 	std::unordered_map<uint64_t, uint64_t> callers; // their callers (one frame unwound) -> touches
+	// (ram15) Native memory: its calls, and what it dropped and gave back.
+	std::atomic<NativeDrop>  native_drop {nullptr};
+	std::atomic<NativeWrite> native_write {nullptr};
+	std::atomic<NativeOpen>  native_open {nullptr};
+	uint64_t native_now = 0, native_peak = 0, native_total = 0, native_refused = 0, native_drops = 0, native_drop_us = 0;
+	uint64_t native_drop_us_max = 0, native_write_failed = 0, native_opened = 0;
+	uint64_t restores_by[static_cast<int>(Touch::Count) + 1] {}, restore_bytes_by[static_cast<int>(Touch::Count) + 1] {};
+	uint64_t evict_offloaded = 0, evict_deferred = 0; // (the collector: offloaded images evicted, put after the others)
+	uint64_t trusted = 0, trusted_bytes = 0;          // (KYTY_NATIVE_OFFLOAD_TRUST_FORMAT: taken by their format's proof)
+	std::atomic<uint64_t> window_calls {0}, window_lookups {0}, window_hits {0}, window_missed {0}, window_ns {0};
+	// (ram17, KYTY_RAM17) The disk store: its calls, what it wrote and read back, the images gone with no download (their
+	// ranges left as orphans), the takes held back after a quick return, and when each range read back did so.
+	std::atomic<NativeRead>   native_read {nullptr};
+	std::atomic<NativeForget> native_forget {nullptr};
+	uint64_t file_writes = 0, file_write_bytes = 0, file_write_us = 0, file_write_failed = 0;
+	uint64_t file_reads = 0, file_read_bytes = 0, file_read_us = 0, file_read_us_max = 0, file_read_failed = 0, file_quick = 0;
+	uint64_t orphaned = 0, orphaned_bytes = 0, held = 0;
+	std::map<uint64_t, std::pair<uint64_t, std::chrono::steady_clock::time_point>> recent; // begin -> (end, when back)
 };
 
 inline State& Get() {
@@ -168,8 +258,275 @@ inline State& Get() {
 	return state;
 }
 
+// (ram17) KYTY_RAM17=1 (off by default; only with the native offload: KYTY_RAM16=1 / KYTY_NATIVE_TEXTURE_OFFLOAD=1, which
+// ram-guard.cpp turns on with it). The guest bytes of a texture taken are written to a file of the emulator's own (the
+// disk store, kyty-ram17-<pid>.tmp next to the exe or in KYTY_RAM17_DIR, unbuffered, deleted on close; at most
+// KYTY_RAM17_FILE_MB, default 8192, and 2 GB of the disk left free) before their RAM is dropped. Then:
+//  - an image gone (evicted) leaves its bytes there: no download from the GPU, nothing back in RAM (its ranges stay
+//    taken, as orphans, until something touches them);
+//  - a touch, by any thread (a game thread's fault, a window of the emulator's, the upload worker), reads them back from
+//    the file itself: no wait for the render thread or the GPU, never a miss;
+//  - a range read back is not taken again for KYTY_RAM17_HOLD_S (default 30; 0 off): the textures that leave and come
+//    back at once stay in RAM meanwhile.
+// Ranges over KYTY_RAM17_MAX_MB (default 32) are not written (a touch would wait for the write). A write or read of the
+// file that fails leaves the range as before (GPU download; a read failure is a miss, counted). Measured before
+// (11-16 11:01, RAM16): 1633 of the 1657 downloads back were images gone (1080 MiB, 6.9 s), 1321 of 1937 touches came
+// less than 10 s after the take, and VirtualMemo held >= 0.87 GB in RAM in no image of the cache. Line: "[ram17]".
+inline bool Ram17On() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RAM17");
+		return value != nullptr && value[0] == '1' && Native();
+	}();
+	return on;
+}
+inline int Ram17HoldSeconds() {
+	static const int seconds = [] {
+		if (!Ram17On()) return 0;
+		const char* value = std::getenv("KYTY_RAM17_HOLD_S");
+		if (value == nullptr || value[0] == '\0') return 30;
+		const long asked = std::strtol(value, nullptr, 10);
+		return asked <= 0 ? 0 : static_cast<int>(std::min<long>(asked, 3600));
+	}();
+	return seconds;
+}
+inline void FileFree(uint64_t offset, uint64_t bytes); // (any thread; never takes the state's lock)
+
+// (state.mutex held) The range's bytes in the disk store forgotten.
+inline void DropFileLocked(Range& range) {
+	if (range.file_len == 0) return;
+	FileFree(range.file_off, range.file_len);
+	range.file_len = 0;
+	range.file_off = 0;
+}
+
+// (ram16) KYTY_RAM16=1 (KYTY_RAM16_RETAKE_S=<s>, default 60; 0 off): an image touched once (its bytes given back) may be
+// taken again once it has been clean that long after the touch, instead of never (touched_serials). It has to pass the
+// same gates as the first time (registered, clean at two scans, sampled only, a format a check proved exact), so its
+// bytes in RAM are again those of its image; the wait bounds a texture the game keeps rewriting to one take and one
+// restore a minute. Measured before (11-16 07:41, "touched once"): 140 MiB of sampled textures held in RAM that way.
+// Without KYTY_RAM16 nothing changes.
+inline int Ram16RetakeSeconds() {
+	static const int seconds = [] {
+		const char* on = std::getenv("KYTY_RAM16");
+		if (on == nullptr || on[0] != '1') return 0;
+		const char* value = std::getenv("KYTY_RAM16_RETAKE_S");
+		if (value == nullptr || value[0] == '\0') return 60;
+		const long asked = std::strtol(value, nullptr, 10);
+		return asked <= 0 ? 0 : static_cast<int>(std::min<long>(asked, 3600));
+	}();
+	return seconds;
+}
+
+// (state.mutex held) Whether image `serial` was touched once and may not be taken now (ram16: its wait over, it is let
+// back in and forgotten).
+inline bool TouchedLocked(State& state, uint64_t serial) {
+	if (state.touched_serials.count(serial) == 0) return false;
+	const int seconds = Ram16RetakeSeconds();
+	if (seconds == 0) return true;
+	const auto at = state.touched_at.find(serial);
+	if (at == state.touched_at.end() || std::chrono::steady_clock::now() - at->second < std::chrono::seconds(seconds)) return true;
+	state.touched_at.erase(at);
+	state.touched_serials.erase(serial);
+	state.retaken++;
+	return false;
+}
+
+// (ram16) The "[ram16]" line's numbers (ram-guard.cpp, its thread): the native offload's bytes out of RAM now and its
+// counters so far. Never waits: false (nothing read) when the state's lock is busy or the native offload is off.
+struct Ram16View {
+	uint64_t saved = 0, total = 0, restores = 0, restore_bytes = 0, restore_us = 0, missed = 0, retaken = 0, trusted_bytes = 0;
+	// (ram17) The disk store (FileUse below: in use / file size), its writes, reads back, orphans, holds, failures.
+	uint64_t file_used = 0, file_size = 0, file_writes = 0, file_write_bytes = 0, file_write_us = 0, file_reads = 0;
+	uint64_t file_read_bytes = 0, file_read_us = 0, file_read_us_max = 0, file_quick = 0, orphaned = 0, orphaned_bytes = 0;
+	uint64_t held = 0, file_failed = 0;
+};
+inline void FileUse(uint64_t* used, uint64_t* size);
+inline bool Ram16Read(Ram16View* out) {
+	if (!Native()) return false;
+	auto&                        state = Get();
+	std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return false;
+	out->saved         = state.native_now;
+	out->total         = state.native_total;
+	out->restores      = state.restores;
+	out->restore_bytes = state.restore_bytes;
+	out->restore_us    = state.restore_us;
+	out->missed        = state.missed;
+	out->retaken       = state.retaken;
+	out->trusted_bytes = state.trusted_bytes;
+	// (ram17)
+	out->file_writes      = state.file_writes;
+	out->file_write_bytes = state.file_write_bytes;
+	out->file_write_us    = state.file_write_us;
+	out->file_reads       = state.file_reads;
+	out->file_read_bytes  = state.file_read_bytes;
+	out->file_read_us     = state.file_read_us;
+	out->file_read_us_max = state.file_read_us_max;
+	out->file_quick       = state.file_quick;
+	out->orphaned         = state.orphaned;
+	out->orphaned_bytes   = state.orphaned_bytes;
+	out->held             = state.held;
+	out->file_failed      = state.file_write_failed + state.file_read_failed;
+	lock.unlock();
+	FileUse(&out->file_used, &out->file_size);
+	return true;
+}
+
+// (ram17, state.mutex held) Whether [vaddr, vaddr + size) was read back from the disk store less than KYTY_RAM17_HOLD_S
+// ago: not taken again yet (Taken). Old entries forgotten as the map grows.
+inline bool HeldLocked(State& state, uint64_t vaddr, uint64_t size) {
+	const int hold = Ram17HoldSeconds();
+	if (hold == 0 || state.recent.empty()) return false;
+	const auto now    = std::chrono::steady_clock::now();
+	const auto window = std::chrono::seconds(hold);
+	if (state.recent.size() > 4096)
+		std::erase_if(state.recent, [&](const auto& item) { return now - item.second.second >= window; });
+	auto it = state.recent.upper_bound(vaddr);
+	if (it != state.recent.begin()) --it;
+	for (; it != state.recent.end() && it->first < vaddr + size; ++it) {
+		if (it->second.first <= vaddr) continue;
+		if (now - it->second.second < window) return true;
+	}
+	return false;
+}
+
+// ---- (ram17) The disk store: space in 4 KiB units (the file is unbuffered: offsets, sizes and buffers aligned) ----
+constexpr uint64_t FileUnit  = 4096;
+constexpr uint64_t FileChunk = uint64_t {1} << 20u; // (a read or write of the file, and a window of guest memory)
+#if defined(_WIN32)
+struct FileStore {
+	std::mutex                   mutex;
+	HANDLE                       handle = INVALID_HANDLE_VALUE;
+	bool                         opened = false;
+	uint64_t                     end = 0, cap = 0, used = 0;
+	std::map<uint64_t, uint64_t> holes; // offset -> bytes (free space below end)
+};
+inline FileStore& Files() {
+	static FileStore files;
+	return files;
+}
+
+// (files.mutex held) The file, opened at the first use (once: a failure leaves the store off).
+inline bool FileOpenLocked(FileStore& files) {
+	if (files.opened) return files.handle != INVALID_HANDLE_VALUE;
+	files.opened = true;
+	wchar_t     dir[MAX_PATH] {};
+	const char* asked = std::getenv("KYTY_RAM17_DIR");
+	if (asked != nullptr && asked[0] != '\0') {
+		if (MultiByteToWideChar(CP_ACP, 0, asked, -1, dir, MAX_PATH) == 0) return false;
+	} else {
+		const DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
+		if (n == 0 || n >= MAX_PATH) return false;
+		if (wchar_t* slash = std::wcsrchr(dir, L'\\'); slash != nullptr) slash[1] = L'\0';
+	}
+	if (const size_t length = std::wcslen(dir); length != 0 && dir[length - 1] != L'\\' && dir[length - 1] != L'/' && length + 1 < MAX_PATH) {
+		dir[length]     = L'\\';
+		dir[length + 1] = L'\0';
+	}
+	const char* mb = std::getenv("KYTY_RAM17_FILE_MB");
+	files.cap      = (mb != nullptr && mb[0] != '\0' ? std::strtoull(mb, nullptr, 10) : uint64_t {8192}) << 20u;
+	ULARGE_INTEGER free_bytes {};
+	constexpr uint64_t Spare = uint64_t {2} << 30u; // (left free on the disk)
+	if (GetDiskFreeSpaceExW(dir, &free_bytes, nullptr, nullptr) != 0)
+		files.cap = std::min<uint64_t>(files.cap, free_bytes.QuadPart > Spare ? free_bytes.QuadPart - Spare : 0);
+	wchar_t path[MAX_PATH + 64] {};
+	std::swprintf(path, sizeof(path) / sizeof(path[0]), L"%lskyty-ram17-%lu.tmp", dir, static_cast<unsigned long>(GetCurrentProcessId()));
+	if (files.cap >= (uint64_t {64} << 20u))
+		files.handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+		                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+		                           nullptr);
+	std::printf("RAM17: disk store %s: %ls (up to %llu MiB; error %lu)\n", files.handle != INVALID_HANDLE_VALUE ? "on" : "OFF", path,
+	            static_cast<unsigned long long>(files.cap >> 20u),
+	            static_cast<unsigned long>(files.handle != INVALID_HANDLE_VALUE ? 0 : GetLastError()));
+	std::fflush(stdout);
+	return files.handle != INVALID_HANDLE_VALUE;
+}
+
+// `bytes` (a multiple of FileUnit) of the file: its offset, or UINT64_MAX (store off or full).
+inline uint64_t FileAlloc(uint64_t bytes) {
+	auto&           files = Files();
+	std::lock_guard lock(files.mutex);
+	if (bytes == 0 || bytes % FileUnit != 0 || !FileOpenLocked(files)) return UINT64_MAX;
+	for (auto it = files.holes.begin(); it != files.holes.end(); ++it) {
+		if (it->second < bytes) continue;
+		const uint64_t offset = it->first, rest = it->second - bytes;
+		files.holes.erase(it);
+		if (rest != 0) files.holes.emplace(offset + bytes, rest);
+		files.used += bytes;
+		return offset;
+	}
+	if (files.end + bytes > files.cap) return UINT64_MAX;
+	const uint64_t offset = files.end;
+	files.end += bytes;
+	files.used += bytes;
+	return offset;
+}
+
+inline void FileFree(uint64_t offset, uint64_t bytes) {
+	if (bytes == 0) return;
+	auto&           files = Files();
+	std::lock_guard lock(files.mutex);
+	files.used -= std::min(files.used, bytes);
+	uint64_t begin = offset, end = offset + bytes;
+	if (auto next = files.holes.find(end); next != files.holes.end()) {
+		end += next->second;
+		files.holes.erase(next);
+	}
+	if (auto prev = files.holes.lower_bound(begin); prev != files.holes.begin()) {
+		--prev;
+		if (prev->first + prev->second == begin) {
+			begin = prev->first;
+			files.holes.erase(prev);
+		}
+	}
+	if (end == files.end) files.end = begin; // (the tail of the file free: reused from there; the file keeps its size)
+	else files.holes.emplace(begin, end - begin);
+}
+
+inline void FileUse(uint64_t* used, uint64_t* size) {
+	auto&           files = Files();
+	std::lock_guard lock(files.mutex);
+	*used = files.used;
+	*size = files.end;
+}
+
+// This thread's buffer for the file's unbuffered reads and writes (page-aligned, FileChunk bytes).
+inline uint8_t* FileStaging() {
+	struct Buffer {
+		uint8_t* data = nullptr;
+		~Buffer() {
+			if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+		}
+	};
+	static thread_local Buffer buffer;
+	if (buffer.data == nullptr)
+		buffer.data = static_cast<uint8_t*>(VirtualAlloc(nullptr, FileChunk, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	return buffer.data;
+}
+
+inline bool FileIo(bool write, uint64_t offset, uint8_t* data, uint64_t bytes) {
+	const HANDLE handle = Files().handle; // (set once, before any offset was given out)
+	if (handle == INVALID_HANDLE_VALUE || bytes == 0 || bytes > FileChunk) return false;
+	OVERLAPPED at {};
+	at.Offset     = static_cast<DWORD>(offset);
+	at.OffsetHigh = static_cast<DWORD>(offset >> 32u);
+	DWORD      done = 0;
+	const BOOL ok   = write ? WriteFile(handle, data, static_cast<DWORD>(bytes), &done, &at)
+	                        : ReadFile(handle, data, static_cast<DWORD>(bytes), &done, &at);
+	return ok != 0 && done == bytes;
+}
+#else
+inline void FileFree(uint64_t /*offset*/, uint64_t /*bytes*/) {}
+inline void FileUse(uint64_t* used, uint64_t* size) {
+	*used = 0;
+	*size = 0;
+}
+#endif
+
 #if defined(_WIN32)
 inline bool Protect(uint64_t address, uint64_t size, DWORD protection) {
+	// (ram15) Never with native memory: the pages are the game's own, protected by the page manager and the gate only.
+	if (Native()) return false;
 	DWORD old = 0;
 	return GuestLazyCommit::Protect(reinterpret_cast<void*>(address), size, protection, &old); // (reserved pages first)
 }
@@ -236,13 +593,16 @@ inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64
 	auto            it = state.guest.upper_bound(vaddr);
 	if (it != state.guest.begin() && std::prev(it)->second.guest_end > vaddr) return 1;
 	if (it != state.guest.end() && it->first < vaddr + size) return 1;
-	return state.touched_serials.count(serial) != 0 ? 2 : 0;
+	return TouchedLocked(state, serial) ? 2 : 0;
 }
 
 #if defined(_WIN32)
 // The worker thread's drop of range `begin`'s pages (discarded in the backing view, then no access there): unless it was
 // touched, restored or dropped since it was taken. Under the state's lock: no touch or restore of it meanwhile.
+inline bool DiscardRangeNative(uint64_t begin);
+inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off, uint64_t* file_len); // (ram17, below)
 inline bool DiscardRange(uint64_t begin) {
+	if (Native()) return DiscardRangeNative(begin);
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
 	const auto      it = state.guest.find(begin);
@@ -250,10 +610,62 @@ inline bool DiscardRange(uint64_t begin) {
 	// A MiB at a time: a discard holds the process's working set lock over its pages, which every page fault and
 	// protection change of the game's threads waits for (whole ranges: frames of 30-60 ms after each scan).
 	constexpr uint64_t Chunk = uint64_t {1} << 20u;
+	// KYTY_OFFLOAD_PAGEOUT=1 (default on): the pages are not dropped but taken out of the working set (VirtualUnlock):
+	// Windows keeps their contents (standby list / page file) and gives them back on any touch by any thread, so no
+	// thread ever sees zeros and nothing waits for a restore. The range is then no longer "discarded".
+	static const bool pageout = [] {
+		const char* v = std::getenv("KYTY_OFFLOAD_PAGEOUT");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (pageout) {
+		for (const auto& piece: it->second.pieces) {
+			for (uint64_t at = 0; at < piece.size; at += Chunk) {
+				// Through the trim runner: no guest map, unmap or protection change while the pages leave (bug check 0x1A
+				// otherwise). A busy address space skips the chunk (it stays in RAM), never stalls.
+				static thread_local uint64_t t_at = 0, t_size = 0;
+				t_at   = piece.backing + at;
+				t_size = std::min(Chunk, piece.size - at);
+				LocalPlatform::RunTrimQuiet([] { (void)VirtualUnlock(reinterpret_cast<void*>(t_at), t_size); });
+				SwitchToThread();
+			}
+		}
+		it->second.discarded = false;
+		state.pageout_bytes += it->second.guest_end - begin;
+		return true;
+	}
 	for (const auto& piece: it->second.pieces) {
 		// (A discard is refused on pages without access.)
 		for (uint64_t at = 0; at < piece.size; at += Chunk) {
-			(void)DiscardVirtualMemory(reinterpret_cast<void*>(piece.backing + at), std::min(Chunk, piece.size - at));
+			// (ram5) Its result was ignored: the backing view is a view of a shared section, where a discard may be refused
+			// [not measured]; then nothing was dropped and the log said "pages dropped". Now counted, and a refused chunk
+			// goes by MEM_RESET (no write to the page file) and out of the working set.
+			auto*          chunk = reinterpret_cast<void*>(piece.backing + at);
+			const uint64_t bytes = std::min(Chunk, piece.size - at);
+			const DWORD    error = DiscardVirtualMemory(chunk, bytes);
+			if (error == ERROR_SUCCESS) {
+				state.discard_ok += bytes;
+			} else {
+				state.discard_refused += bytes;
+				if (state.discard_error == 0) state.discard_error = error;
+				if (VirtualAlloc(chunk, bytes, MEM_RESET, PAGE_READWRITE) != nullptr) {
+					state.reset_ok += bytes;
+					// (Fails "not locked" but takes the pages out of the working set; through the trim runner, as the
+					// page-out above: no guest map, unmap or protection change meanwhile.)
+					static thread_local uint64_t t_chunk = 0, t_bytes = 0;
+					t_chunk = reinterpret_cast<uint64_t>(chunk);
+					t_bytes = bytes;
+					LocalPlatform::RunTrimQuiet([] { (void)VirtualUnlock(reinterpret_cast<void*>(t_chunk), t_bytes); });
+				} else {
+					state.reset_refused += bytes;
+				}
+			}
+			// (A page a MiB: still in the working set right after?)
+			PSAPI_WORKING_SET_EX_INFORMATION page {};
+			page.VirtualAddress = chunk;
+			if (K32QueryWorkingSetEx(GetCurrentProcess(), &page, sizeof(page)) != 0) {
+				state.sampled_after++;
+				if (page.VirtualAttributes.Valid != 0) state.resident_after++;
+			}
 			SwitchToThread();
 		}
 		(void)Protect(piece.backing, piece.size, PAGE_NOACCESS);
@@ -262,14 +674,116 @@ inline bool DiscardRange(uint64_t begin) {
 }
 #endif
 
+#if defined(_WIN32)
+// (ram15, native memory; the offload worker) Range `begin`'s RAM dropped at its guest address (its pages no-access by
+// then: the read watchers went on at the scan). Marked as restoring by the worker meanwhile, out of the state's lock: a
+// touch waits for the drop to end (then downloads the bytes back), a restore skips it until then. Untouched, not
+// restoring and not dropped yet only.
+inline bool DiscardRangeNative(uint64_t begin) {
+	auto&              state = Get();
+	const auto         drop  = state.native_drop.load(std::memory_order_acquire);
+	std::vector<Piece> pieces;
+	{
+		std::lock_guard lock(state.mutex);
+		const auto      it = state.guest.find(begin);
+		if (drop == nullptr || it == state.guest.end() || it->second.touched || it->second.restoring || !it->second.discarded ||
+		    it->second.dropped != 0)
+			return false;
+		it->second.restoring = true;
+		it->second.restorer  = std::thread::id {};
+		state.restoring_ranges.fetch_add(1, std::memory_order_acq_rel);
+		pieces = it->second.pieces;
+	}
+	// (ram17, KYTY_RAM17) Its bytes to the disk store first (still marked as restoring: a touch meanwhile waits).
+	// (At most KYTY_RAM17_MAX_MB, default 32, a range: a touch waits for the write, ~1 ms a MiB; larger ones as before.)
+	static const uint64_t file_max = [] {
+		const char* value = std::getenv("KYTY_RAM17_MAX_MB");
+		return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {32}) << 20u;
+	}();
+	uint64_t range_bytes = 0;
+	for (const auto& piece: pieces) range_bytes += piece.size;
+	uint64_t file_off = 0, file_len = 0;
+	if (Ram17On() && range_bytes <= file_max) {
+		const auto file_start = std::chrono::steady_clock::now();
+		const bool written    = FileWriteRange(pieces, &file_off, &file_len);
+		const auto file_us    = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - file_start).count());
+		std::lock_guard lock(state.mutex);
+		if (written) {
+			state.file_writes++;
+			state.file_write_bytes += file_len;
+			state.file_write_us += file_us;
+		} else {
+			state.file_write_failed++;
+		}
+	}
+	const auto start   = std::chrono::steady_clock::now();
+	uint64_t   dropped = 0, refused = 0;
+	for (const auto& piece: pieces) {
+		uint64_t not_done = 0;
+		dropped += drop(piece.backing, piece.size, &not_done);
+		refused += not_done;
+	}
+	// (A page a MiB: still in the working set right after?)
+	uint64_t sampled = 0, resident = 0;
+	for (const auto& piece: pieces) {
+		for (uint64_t at = 0; at < piece.size; at += uint64_t {1} << 20u) {
+			PSAPI_WORKING_SET_EX_INFORMATION page {};
+			page.VirtualAddress = reinterpret_cast<void*>(piece.backing + at);
+			if (K32QueryWorkingSetEx(GetCurrentProcess(), &page, sizeof(page)) == 0) continue;
+			sampled++;
+			if (page.VirtualAttributes.Valid != 0) resident++;
+		}
+	}
+	const auto      us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	std::lock_guard lock(state.mutex);
+	state.native_drops++;
+	state.native_drop_us += us;
+	state.native_drop_us_max = std::max(state.native_drop_us_max, us);
+	state.native_refused += refused;
+	state.sampled_after += sampled;
+	state.resident_after += resident;
+	const auto it = state.guest.find(begin);
+	if (it == state.guest.end()) {
+		FileFree(file_off, file_len); // (ram17: gone meanwhile)
+		return true;
+	}
+	if (it->second.restoring && it->second.restorer == std::thread::id {}) {
+		it->second.restoring = false;
+		state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	it->second.dropped = dropped;
+	// (ram17) The copy on disk kept only for bytes really out of RAM, of a range untouched since (a touch waited).
+	if (file_len != 0) {
+		if (dropped != 0 && !it->second.touched && it->second.file_len == 0 && file_len == it->second.guest_end - begin) {
+			it->second.file_off = file_off;
+			it->second.file_len = file_len;
+		} else {
+			FileFree(file_off, file_len);
+		}
+	}
+	state.native_now += dropped;
+	state.native_peak = std::max(state.native_peak, state.native_now);
+	state.native_total += dropped;
+	return true;
+}
+#endif
+
 // Not to be taken: a range of it is taken, or the image was touched once.
 [[nodiscard]] inline bool Taken(uint64_t vaddr, uint64_t size, uint64_t serial) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
-	if (state.touched_serials.count(serial) != 0) return true;
+	if (TouchedLocked(state, serial)) return true;
 	auto it = state.guest.upper_bound(vaddr);
 	if (it != state.guest.begin() && std::prev(it)->second.guest_end > vaddr) return true;
-	return it != state.guest.end() && it->first < vaddr + size;
+	if (it != state.guest.end() && it->first < vaddr + size) return true;
+	// (ram17) Read back from the disk store a moment ago: held in RAM for KYTY_RAM17_HOLD_S (scans asked, not images).
+	if (HeldLocked(state, vaddr, size)) {
+		state.held++;
+		return true;
+	}
+	return false;
 }
 
 // (state.mutex held) The first range over [vaddr, ...), or end.
@@ -337,8 +851,12 @@ inline void CountLocked(State& state, std::map<uint64_t, Range>::iterator it, To
 	if (rip != 0) state.rips[rip]++;
 	if (caller != 0) state.callers[caller]++;
 	state.touched_serials.insert(range.serial);
+	if (Ram16RetakeSeconds() != 0) state.touched_at[range.serial] = std::chrono::steady_clock::now(); // (ram16)
 	state.now -= std::min(state.now, size);
 	if (range.gpu) state.gpu_now -= std::min(state.gpu_now, size);
+	// (ram15, native: its RAM comes back, by a download or a drop with the memory.)
+	state.native_now -= std::min(state.native_now, range.dropped);
+	range.dropped = 0;
 }
 
 // (state.mutex held) The touch of range `it`: counted, its views given a protection that lets accesses through (the
@@ -369,6 +887,7 @@ inline std::vector<std::pair<uint64_t, uint64_t>> TakePendingLocked(State& state
 		}
 		ranges.emplace_back(begin, range->second.guest_end - begin);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
+		DropFileLocked(range->second); // (ram17)
 		state.guest.erase(range);
 	}
 	state.pending.swap(kept);
@@ -395,6 +914,7 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 	for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
 		auto& range = it->second;
 		if (!range.discarded || range.restoring || (range.touched && !(late && range.missed))) continue;
+		if (range.file_len != 0) continue; // (ram17: read back from the disk store, FileRestore; an orphan stays)
 		if (!range.touched && touch != Touch::Count) CountLocked(state, it, touch);
 		range.touched   = true;
 		range.restoring = true;
@@ -403,6 +923,14 @@ inline std::vector<Restoring> BeginRestore(uint64_t vaddr, uint64_t size, Touch 
 		ranges.push_back({it->first, range.guest_end, range.serial, range.image, range.pieces});
 	}
 	return ranges;
+}
+
+// (ram15) A restore's downloads counted by why (Touch::Count: after a miss).
+inline void NoteRestoreKind(Touch touch, uint64_t bytes) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	state.restores_by[static_cast<int>(touch)]++;
+	state.restore_bytes_by[static_cast<int>(touch)] += bytes;
 }
 
 // The restored ranges out of the maps (their bytes back and read watchers removed: other touches go on).
@@ -420,6 +948,7 @@ inline void EndRestore(const std::vector<Restoring>& ranges, uint64_t bytes, uin
 		}
 		if (range->second.restoring) state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
 		for (const auto& piece: range->second.pieces) state.backing.erase(piece.backing);
+		DropFileLocked(range->second); // (ram17)
 		state.guest.erase(range);
 	}
 	std::erase_if(state.pending, [&](uint64_t begin) { return state.guest.find(begin) == state.guest.end(); });
@@ -445,6 +974,14 @@ inline int GpuOnlySetting() {
 	return setting;
 }
 
+// (ram15) A texture taken by its format's proof, without its own check.
+inline void NoteTrusted(uint64_t bytes) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	state.trusted++;
+	state.trusted_bytes += bytes;
+}
+
 inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
 	auto&           state = Get();
 	std::lock_guard lock(state.mutex);
@@ -454,8 +991,389 @@ inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
 }
 
 #if defined(_WIN32)
+// (ram15) Native memory: this thread's write of restored bytes (its own window must not ask for them again).
+inline thread_local bool t_native_writing = false;
+
+// (ram15, native) Restored bytes written over guest [vaddr, vaddr + size) through a write window (memory.cpp
+// NativeOffloadWrite); without native memory, a plain copy as before.
+inline void WriteBack(uint64_t vaddr, const void* data, uint64_t size) {
+	auto& state = Get();
+	if (!Native()) {
+		std::memcpy(reinterpret_cast<void*>(vaddr), data, size);
+		return;
+	}
+	const auto write = state.native_write.load(std::memory_order_acquire);
+	t_native_writing = true;
+	const bool ok    = write != nullptr && write(vaddr, data, size);
+	t_native_writing = false;
+	if (!ok) {
+		std::lock_guard lock(state.mutex);
+		state.native_write_failed++;
+	}
+}
+
+// (ram17; the offload worker, its range marked as restoring) The range's guest bytes, piece after piece, to a place of
+// the disk store of their size: read through a window (memory.cpp NativeGuardedRead: the pages are no-access by then;
+// this thread's window does not ask the offload for them, t_native_writing), a MiB at a time. False: nothing kept.
+inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off, uint64_t* file_len) {
+	*file_off = 0;
+	*file_len = 0;
+	auto&      state = Get();
+	const auto read  = state.native_read.load(std::memory_order_acquire);
+	uint64_t   bytes = 0;
+	for (const auto& piece: pieces) {
+		if (piece.size % FileUnit != 0 || piece.backing % FileUnit != 0) return false;
+		bytes += piece.size;
+	}
+	uint8_t* staging = FileStaging();
+	if (read == nullptr || bytes == 0 || staging == nullptr) return false;
+	const uint64_t offset = FileAlloc(bytes);
+	if (offset == UINT64_MAX) return false;
+	uint64_t at = 0;
+	bool     ok = true;
+	for (const auto& piece: pieces) {
+		for (uint64_t done = 0; ok && done < piece.size;) {
+			const uint64_t n = std::min(FileChunk, piece.size - done);
+			t_native_writing = true;
+			ok               = read(staging, reinterpret_cast<const void*>(piece.backing + done), n);
+			t_native_writing = false;
+			ok               = ok && FileIo(true, offset + at, staging, n);
+			done += n;
+			at += n;
+		}
+		if (!ok) break;
+	}
+	if (!ok) {
+		FileFree(offset, bytes);
+		return false;
+	}
+	*file_off = offset;
+	*file_len = bytes;
+	return true;
+}
+
+// (ram17; any thread) The discarded ranges over [vaddr, vaddr + size) with a copy on disk, not touched and not being
+// restored: counted as touched by `touch`, read back from the file and written over their guest pages (NativeOffloadWrite)
+// by this thread, then queued for their read watchers to go - removed here when `remove_now` (a game thread's fault, the
+// render thread, a host write: no lock of the emulator's held), else by the render thread (Drain) or a later fault.
+// Ranges over it another thread restores are waited for. A read of the file that fails: the range is a miss (restored
+// from its image by the render thread later, as before). Returned: the ranges read back.
+inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool remove_now, bool* waited);
+inline size_t FileRestore(uint64_t vaddr, uint64_t size, Touch touch, bool remove_now) {
+	// (A range the offload worker was writing and dropping meanwhile has its copy on disk once that is over: looked at
+	// again after the wait, so that a thread that cannot wait for the render thread finds it there.)
+	bool         waited = false;
+	const size_t first  = FileRestoreOnce(vaddr, size, touch, remove_now, &waited);
+	return waited ? first + FileRestoreOnce(vaddr, size, touch, remove_now, &waited) : first;
+}
+inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool remove_now, bool* waited) {
+	*waited    = false;
+	auto& state = Get();
+	if (!Ram17On() || size == 0 || vaddr + size <= state.guest_lo.load(std::memory_order_relaxed) ||
+	    vaddr >= state.guest_hi.load(std::memory_order_relaxed))
+		return 0;
+	struct Job {
+		uint64_t                              begin = 0, end = 0, file_off = 0;
+		std::vector<Piece>                    pieces;
+		std::chrono::steady_clock::time_point since;
+	};
+	std::vector<Job> jobs;
+	bool             wait = false;
+	{
+		std::lock_guard lock(state.mutex);
+		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
+			auto& range = it->second;
+			if (range.file_len == 0) continue;
+			if (range.restoring) {
+				wait = wait || range.restorer != std::this_thread::get_id();
+				continue;
+			}
+			if (range.touched || !range.discarded) continue;
+			CountLocked(state, it, touch == Touch::Count ? Touch::EmulatorGuestRead : touch);
+			range.touched   = true;
+			range.restoring = true;
+			range.restorer  = std::this_thread::get_id();
+			state.restoring_ranges.fetch_add(1, std::memory_order_acq_rel);
+			jobs.push_back({it->first, range.guest_end, range.file_off, range.pieces, range.since});
+		}
+	}
+	const auto write  = state.native_write.load(std::memory_order_acquire);
+	const auto forget = state.native_forget.load(std::memory_order_acquire);
+	for (const auto& job: jobs) {
+		const auto start   = std::chrono::steady_clock::now();
+		uint8_t*   staging = FileStaging();
+		bool       ok      = staging != nullptr && write != nullptr;
+		uint64_t   at      = 0;
+		for (const auto& piece: job.pieces) {
+			for (uint64_t done = 0; ok && done < piece.size;) {
+				const uint64_t n = std::min(FileChunk, piece.size - done);
+				ok               = FileIo(false, job.file_off + at, staging, n);
+				if (ok) {
+					t_native_writing = true;
+					ok               = write(piece.backing + done, staging, n);
+					t_native_writing = false;
+					if (ok && forget != nullptr) forget(piece.backing + done, n);
+				}
+				done += n;
+				at += n;
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const auto us  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+		std::lock_guard lock(state.mutex);
+		auto            it = state.guest.find(job.begin);
+		if (it != state.guest.end()) {
+			auto& range = it->second;
+			if (range.restoring && range.restorer == std::this_thread::get_id()) {
+				range.restoring = false;
+				state.restoring_ranges.fetch_sub(1, std::memory_order_acq_rel);
+			}
+			DropFileLocked(range);
+			if (!ok) {
+				range.missed = true;
+				state.missed++;
+				state.missed_bytes += job.end - job.begin;
+				std::printf("Texture offload: MISSED disk read back of 0x%llx..0x%llx (restored from its image later)\n",
+				            static_cast<unsigned long long>(job.begin), static_cast<unsigned long long>(job.end));
+			}
+			state.pending.push_back(job.begin);
+		}
+		if (ok) {
+			state.file_reads++;
+			state.file_read_bytes += job.end - job.begin;
+			state.file_read_us += us;
+			state.file_read_us_max = std::max(state.file_read_us_max, us);
+			if (now - job.since < std::chrono::seconds(30)) state.file_quick++;
+			if (Ram17HoldSeconds() != 0) state.recent[job.begin] = {job.end, now};
+		} else {
+			state.file_read_failed++;
+		}
+	}
+	if (remove_now && !jobs.empty()) {
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		{
+			std::lock_guard lock(state.mutex);
+			ranges = TakePendingLocked(state);
+		}
+		RemoveAll(state, ranges);
+	}
+	if (wait) {
+		WaitRestores(vaddr, size);
+		*waited = true;
+	}
+	return jobs.size();
+}
+
+// (ram17; render thread, an image going: UnregisterImage) Its ranges with a copy on disk are left as they are - out of
+// RAM, watched - with no download: orphans, read back from the file at their first touch. Returned: bytes left so.
+inline uint64_t OrphanFileBacked(uint64_t vaddr, uint64_t size) {
+	if (!Ram17On() || size == 0) return 0;
+	auto&           state = Get();
+	uint64_t        bytes = 0;
+	std::lock_guard lock(state.mutex);
+	for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
+		auto& range = it->second;
+		if (range.file_len == 0 || range.touched || range.restoring || !range.discarded) continue;
+		if (!range.orphan) {
+			range.orphan = true;
+			state.orphaned++;
+			state.orphaned_bytes += range.guest_end - it->first;
+		}
+		range.image = 0;
+		bytes += range.guest_end - it->first;
+	}
+	return bytes;
+}
+
+// (ram15, native; render thread, first thing of a restore) The taken ranges over [vaddr, vaddr + size) whose bytes are
+// still in RAM (not dropped yet: no download needed) touched by `touch`, and every range waiting for its read watchers
+// to go: out of the maps. Returned: their guest ranges, whose read watchers the caller removes.
+inline std::vector<std::pair<uint64_t, uint64_t>> ReleaseIntactNative(uint64_t vaddr, uint64_t size, Touch touch) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
+		auto& range = it->second;
+		if (range.restoring || range.touched || range.dropped != 0 || range.file_len != 0) continue;
+		TouchLocked(state, it, touch == Touch::Count ? Touch::EmulatorGuestRead : touch);
+	}
+	return TakePendingLocked(state);
+}
+
+// (ram15) The probe handler with native memory (OnFault's first step): a game thread's or the emulator's own fault on a
+// taken range's guest pages (no-access by its read watchers).
+inline bool OnFaultNative(uint64_t address, uint64_t rip, const void* native_context, bool write) {
+	auto& state = Get();
+	if (address < state.guest_lo.load(std::memory_order_relaxed) || address >= state.guest_hi.load(std::memory_order_relaxed))
+		return false;
+	enum class Act { Wait, Download, Remove, Open, File } act = Act::Wait;
+	std::vector<std::pair<uint64_t, uint64_t>> now;
+	uint64_t                                   begin = 0, size = 0;
+	Touch                                      touch = Touch::GameRead;
+	bool                                       host_code = false;
+	{
+		std::unique_lock lock(state.mutex);
+		auto             found = state.guest.upper_bound(address);
+		if (found == state.guest.begin()) return false;
+		--found;
+		auto& range = found->second;
+		if (address >= range.guest_end) return false;
+		begin = found->first;
+		size  = range.guest_end - begin;
+		const bool host = IsHostCode(rip);
+		host_code       = host;
+		touch           = host ? (write ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead) : (write ? Touch::GameWrite : Touch::GameRead);
+		const auto can_wait = state.can_wait.load(std::memory_order_acquire);
+		const bool can = state.restore.load(std::memory_order_acquire) != nullptr && can_wait != nullptr && can_wait();
+		if (range.restoring) {
+			if (range.restorer == std::this_thread::get_id()) return false; // (not ours: this thread restores it)
+			act = can ? Act::Download : Act::Wait; // (a restore waits for the other one first, its GPU work submitted)
+		} else if (range.touched) {
+			// Its read watchers not gone yet (Drain), or missed and not restored yet.
+			if (range.missed) act = can ? Act::Download : Act::Open;
+			else if (!host) act = Act::Remove, now = TakePendingLocked(state);
+			else act = can ? Act::Download : Act::Open;
+			if (range.missed) touch = Touch::Count; // (a late restore)
+		} else if (range.file_len != 0) {
+			act = Act::File; // (ram17: read back from the disk store by this thread, whatever it is)
+		} else if (range.dropped == 0) {
+			// Its bytes still there (the worker has not dropped them): no download.
+			if (!host) {
+				TouchLocked(state, found, touch);
+				now = TakePendingLocked(state);
+				act = Act::Remove;
+			} else if (can) {
+				act = Act::Download;
+			} else {
+				TouchLocked(state, found, touch, rip, CallerOf(native_context));
+				act = Act::Open;
+			}
+		} else if (can) {
+			act = Act::Download;
+		} else {
+			range.missed = true;
+			state.missed++;
+			state.missed_bytes += size;
+			std::printf("Texture offload: MISSED %s of 0x%llx..0x%llx (native: its dropped bytes read as they are until restored) "
+			            "at rip 0x%llx\n",
+			            TouchName(touch), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(begin + size),
+			            static_cast<unsigned long long>(rip));
+			TouchLocked(state, found, touch, host ? rip : 0, host ? CallerOf(native_context) : 0);
+			act = Act::Open;
+		}
+	}
+	switch (act) {
+		case Act::Wait: WaitRestores(begin, size); break;
+		case Act::Download: state.restore.load(std::memory_order_acquire)(begin, size, touch); break;
+		case Act::Remove: RemoveAll(state, now); break; // (a game thread: no lock of the emulator's held)
+		case Act::File: {
+			// (ram17) A game thread removes the read watchers itself (no lock of the emulator's held); the emulator's own
+			// code gets the pages opened for its access, the watchers going on the render thread (Drain), as a miss's.
+			if (FileRestore(begin, size, touch, !host_code) != 0 && host_code) {
+				const auto open = state.native_open.load(std::memory_order_acquire);
+				if (open != nullptr && open(begin, size, write)) {
+					std::lock_guard lock(state.mutex);
+					state.native_opened++;
+				}
+			}
+			break;
+		}
+		case Act::Open: {
+			const auto open = state.native_open.load(std::memory_order_acquire);
+			if (open != nullptr && open(begin, size, write)) {
+				std::lock_guard lock(state.mutex);
+				state.native_opened++;
+			}
+			break;
+		}
+	}
+	return true;
+}
+
+// (ram17, diagnostics of a miss) This thread's name (SetThreadDescription), whether it held the gate, and its first
+// callers as offsets in the exe (0x... outside it).
+inline void ThreadWho(char* out, size_t size, bool gate_held) {
+	char     name[64] = "?";
+	wchar_t* wide     = nullptr;
+	if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &wide)) && wide != nullptr) {
+		if (wide[0] != L'\0') (void)WideCharToMultiByte(CP_UTF8, 0, wide, -1, name, sizeof(name), nullptr, nullptr);
+		LocalFree(wide);
+	}
+	void*          frames[6] {};
+	const USHORT   count = RtlCaptureStackBackTrace(2, 6, frames, nullptr);
+	const auto     exe   = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	int            used  = std::snprintf(out, size, "hilo %s (id %lu), puerta %s, llamadas", name,
+	                                     static_cast<unsigned long>(GetCurrentThreadId()), gate_held ? "tomada" : "libre");
+	for (USHORT i = 0; i < count && used > 0 && static_cast<size_t>(used) < size; i++) {
+		const auto at = reinterpret_cast<uint64_t>(frames[i]);
+		used += std::snprintf(out + used, size - static_cast<size_t>(used), " %s0x%llx", at >= exe && at - exe < (uint64_t {256} << 20u) ? "exe+" : "",
+		                      static_cast<unsigned long long>(at >= exe && at - exe < (uint64_t {256} << 20u) ? at - exe : at));
+	}
+}
+
+// (ram15, native) The hook of every window of the emulator's over guest memory (NativeGuardedAccess, memory.cpp): its
+// copies do not fault, so the dropped bytes they would read (or partly write over) come back first, the window's thread
+// waiting for the render thread. One that cannot wait (the upload worker, deferred GPU work, a recorder, a window inside
+// a window) is a miss: counted; the window copies what is there, the range restored after (Drain).
+inline void NativeBeforeWindow(uint64_t vaddr, uint64_t bytes, bool writes, bool gate_held) {
+	auto& state = Get();
+	state.window_calls.fetch_add(1, std::memory_order_relaxed);
+	if (t_native_writing || bytes == 0 || vaddr + bytes <= state.guest_lo.load(std::memory_order_relaxed) ||
+	    vaddr >= state.guest_hi.load(std::memory_order_relaxed))
+		return;
+	const auto start = std::chrono::steady_clock::now();
+	state.window_lookups.fetch_add(1, std::memory_order_relaxed);
+	bool any = false;
+	{
+		std::lock_guard lock(state.mutex);
+		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + bytes && !any; ++it)
+			any = !(it->second.restoring && it->second.restorer == std::this_thread::get_id()) &&
+			      !(it->second.touched && !it->second.missed && it->second.dropped == 0);
+	}
+	state.window_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
+	                          std::memory_order_relaxed);
+	if (!any) return;
+	state.window_hits.fetch_add(1, std::memory_order_relaxed);
+	const Touch touch    = writes ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead;
+	// (ram17) The ranges with a copy on disk read back by this thread first, whatever it is (never a miss); then only
+	// what is left asks the render thread.
+	if (Ram17On()) {
+		(void)FileRestore(vaddr, bytes, touch, false);
+		any = false;
+		std::lock_guard lock(state.mutex);
+		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + bytes && !any; ++it)
+			any = !(it->second.restoring && it->second.restorer == std::this_thread::get_id()) &&
+			      !(it->second.touched && !it->second.missed && it->second.dropped == 0);
+		if (!any) return;
+	}
+	const auto  restore  = state.restore.load(std::memory_order_acquire);
+	const auto  can_wait = state.can_wait.load(std::memory_order_acquire);
+	if (!gate_held && restore != nullptr && can_wait != nullptr && can_wait()) {
+		restore(vaddr, bytes, touch);
+		return;
+	}
+	state.window_missed.fetch_add(1, std::memory_order_relaxed);
+	std::lock_guard lock(state.mutex);
+	for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + bytes; ++it) {
+		auto& range = it->second;
+		if (range.restoring || range.touched) continue;
+		if (range.dropped != 0) {
+			range.missed = true;
+			state.missed++;
+			state.missed_bytes += range.guest_end - it->first;
+			// (ram17) Who: the thread's name, whether it held the gate, and its callers (as exe offsets).
+			char who[192];
+			ThreadWho(who, sizeof(who), gate_held);
+			std::printf("Texture offload: MISSED %s window over 0x%llx..0x%llx (native: copied as it is until restored; %s)\n",
+			            writes ? "write" : "read", static_cast<unsigned long long>(it->first),
+			            static_cast<unsigned long long>(range.guest_end), who);
+		}
+		TouchLocked(state, it, touch);
+	}
+}
+
 // The exception filter's probe handler (any thread): a touch of a taken range, either view.
 inline bool OnFault(uint64_t address, uint64_t rip, const void* native_context, bool write) {
+	if (Native()) return OnFaultNative(address, rip, native_context, write);
 	auto&      state      = Get();
 	const bool in_guest   = address >= state.guest_lo.load(std::memory_order_relaxed) && address < state.guest_hi.load(std::memory_order_relaxed);
 	const bool in_backing = address >= state.backing_lo.load(std::memory_order_relaxed) && address < state.backing_hi.load(std::memory_order_relaxed);
@@ -551,7 +1469,109 @@ inline bool OnFault(uint64_t address, uint64_t rip, const void* native_context, 
 	RemoveAll(state, now); // (a game thread: no lock of the emulator's held)
 	return true;
 }
+#else
+inline size_t FileRestore(uint64_t /*vaddr*/, uint64_t /*size*/, Touch /*touch*/, bool /*remove_now*/) {
+	return 0;
+}
+inline uint64_t OrphanFileBacked(uint64_t /*vaddr*/, uint64_t /*size*/) {
+	return 0;
+}
 #endif
+
+// (ram3) KYTY_OFFLOAD_UNMAP_SPLIT=1 (off by default; only matters with KYTY_OFFLOAD_PAGEOUT=0, where a taken range's
+// pages are really dropped): an unmap over PART of a discarded range no longer drops the whole range. Before, the part
+// still mapped lost its protection with its bytes gone (zeros, never restored): Demon's Souls unmaps a streamed
+// texture's largest mips (decommit, eboot+0x9014f4) while the smaller ones stay mapped, and the image the unmap
+// deletes was not asked for them back (UnregisterImage finds no range left). Now only the unmapped part is dropped;
+// the rest stays taken (same image, serial and pieces, cut at the unmap's bounds), so the dying image gives it back
+// (its ImageGone restore) or it stays offloaded under a surviving one.
+inline bool UnmapSplit() {
+	static const bool on = [] {
+		const char* v       = std::getenv("KYTY_OFFLOAD_UNMAP_SPLIT");
+		const char* pageout = std::getenv("KYTY_OFFLOAD_PAGEOUT");
+		// (ram15) Native memory drops the pages always: on unless KYTY_OFFLOAD_UNMAP_SPLIT=0 (the part still mapped would
+		// keep no bytes and no restore).
+		if (Native()) return !(v != nullptr && v[0] == '0');
+		// (Only where pages are dropped: paged out, a range keeps its bytes and the old path is right.)
+		return v != nullptr && v[0] == '1' && pageout != nullptr && pageout[0] == '0';
+	}();
+	return on;
+}
+
+// (state.mutex held; ram3, UnmapSplit) Range `begin`, discarded and not touched, loses [vaddr, vaddr + size): what is
+// left of it before and after stays as ranges of their own. Returns the guest part dropped (its read watchers go).
+inline std::pair<uint64_t, uint64_t> SplitLocked(State& state, uint64_t begin, uint64_t vaddr, uint64_t size) {
+	const auto found = state.guest.find(begin);
+	if (found == state.guest.end()) return {0, 0};
+	Range          whole = std::move(found->second);
+	const uint64_t end   = whole.guest_end;
+	const uint64_t whole_size = end > begin ? end - begin : 1;
+	for (const auto& piece: whole.pieces) state.backing.erase(piece.backing);
+	state.guest.erase(found);
+	const uint64_t cut_begin = std::max(begin, vaddr), cut_end = std::min(end, vaddr + size);
+	Range          head, tail;
+	for (Range* part: {&head, &tail}) {
+		part->serial    = whole.serial;
+		part->image     = whole.image;
+		part->since     = whole.since;
+		part->discarded = whole.discarded;
+		part->gpu       = whole.gpu;
+		part->orphan    = whole.orphan;
+	}
+	uint64_t at = begin;
+	for (const auto& piece: whole.pieces) {
+		const uint64_t piece_begin = at, piece_end = at + piece.size;
+		if (piece_begin < cut_begin) head.pieces.push_back({piece.backing, std::min(piece_end, cut_begin) - piece_begin});
+#if defined(_WIN32)
+		const uint64_t gone_begin = std::max(piece_begin, cut_begin), gone_end = std::min(piece_end, cut_end);
+		if (gone_begin < gone_end) (void)Protect(piece.backing + (gone_begin - piece_begin), gone_end - gone_begin, PAGE_READWRITE);
+#endif
+		if (piece_end > cut_end) {
+			const uint64_t from = std::max(piece_begin, cut_end);
+			tail.pieces.push_back({piece.backing + (from - piece_begin), piece_end - from});
+		}
+		at = piece_end;
+	}
+	const bool keep_head = cut_begin > begin && !head.pieces.empty(), keep_tail = end > cut_end && !tail.pieces.empty();
+	// (ram15, native: the dropped bytes shared out by size; the unmapped part's leave the count.)
+	const auto share = [&](uint64_t bytes) {
+		return whole.dropped / whole_size * bytes + whole.dropped % whole_size * bytes / whole_size;
+	};
+	if (keep_head) head.dropped = share(cut_begin - begin);
+	if (keep_tail) tail.dropped = share(end - cut_end);
+	// (ram17) Its copy on disk shared out the same way (guest byte begin + i at file_off + i); the unmapped part's freed.
+	if (whole.file_len == end - begin && end > begin) {
+		const uint64_t head_bytes = cut_begin - begin, gone_bytes = cut_end > cut_begin ? cut_end - cut_begin : 0;
+		const uint64_t tail_bytes = end - std::max(cut_end, cut_begin);
+		if (keep_head) head.file_off = whole.file_off, head.file_len = head_bytes;
+		else FileFree(whole.file_off, head_bytes);
+		FileFree(whole.file_off + head_bytes, gone_bytes);
+		if (keep_tail) tail.file_off = whole.file_off + (end - begin - tail_bytes), tail.file_len = tail_bytes;
+		else FileFree(whole.file_off + (end - begin - tail_bytes), tail_bytes);
+	} else {
+		FileFree(whole.file_off, whole.file_len);
+	}
+	state.native_now -= std::min(state.native_now, whole.dropped - std::min(whole.dropped, head.dropped + tail.dropped));
+	if (keep_head) {
+		head.guest_end = cut_begin;
+		for (const auto& piece: head.pieces) state.backing[piece.backing] = begin;
+		state.guest.emplace(begin, std::move(head));
+	}
+	if (keep_tail) {
+		tail.guest_end = end;
+		for (const auto& piece: tail.pieces) state.backing[piece.backing] = cut_end;
+		state.guest.emplace(cut_end, std::move(tail));
+	}
+	const uint64_t gone = cut_end > cut_begin ? cut_end - cut_begin : 0;
+	state.touches[static_cast<int>(Touch::Unmap)]++;
+	state.touch_bytes[static_cast<int>(Touch::Unmap)] += gone;
+	const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - whole.since).count();
+	state.ages[seconds < 1 ? 0 : seconds < 10 ? 1 : seconds < 60 ? 2 : 3]++;
+	state.now -= std::min(state.now, gone);
+	if (whole.gpu) state.gpu_now -= std::min(state.gpu_now, gone);
+	state.unmap_splits++;
+	return {cut_begin, gone};
+}
 
 // A host write (InvalidateMemory: file reads, network; `over_all`: it writes all of [vaddr, vaddr + size)) or an unmap
 // over [vaddr, vaddr + size): the taken ranges there touched. A discarded one a write covers part of comes back first
@@ -564,6 +1584,7 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 	std::vector<std::pair<uint64_t, uint64_t>> ranges, restore;
 	{
 		std::lock_guard lock(state.mutex);
+		std::vector<uint64_t> cut; // (ram3, UnmapSplit: discarded ranges the unmap covers a part of)
 		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
 			if (it->second.restoring) continue; // (this thread's own restore)
 			const bool covered = over_all && it->first >= vaddr && it->second.guest_end <= vaddr + size;
@@ -575,6 +1596,10 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 				}
 				continue;
 			}
+			if (unmap && it->second.discarded && UnmapSplit() && !(it->first >= vaddr && it->second.guest_end <= vaddr + size)) {
+				cut.push_back(it->first);
+				continue;
+			}
 			if (!unmap && !covered && it->second.discarded) {
 				restore.emplace_back(it->first, it->second.guest_end - it->first);
 				continue;
@@ -582,11 +1607,16 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 			TouchLocked(state, it, unmap ? Touch::Unmap : covered ? Touch::HostOverwrite : Touch::HostWrite);
 		}
 		ranges = TakePendingLocked(state);
+		for (const auto begin: cut) {
+			const auto gone = SplitLocked(state, begin, vaddr, size);
+			if (gone.second != 0) ranges.push_back(gone);
+		}
 	}
 	RemoveAll(state, ranges);
 	const auto restore_fn = state.restore.load(std::memory_order_acquire);
 	const auto can_wait   = state.can_wait.load(std::memory_order_acquire);
 	for (const auto& [begin, bytes]: restore) {
+		(void)FileRestore(begin, bytes, Touch::HostWrite, true); // (ram17: any thread, from the disk store; normal context)
 		if (restore_fn != nullptr && can_wait != nullptr && can_wait()) {
 			restore_fn(begin, bytes, Touch::HostWrite);
 			continue;
@@ -655,6 +1685,20 @@ inline void Report(bool force) {
 		            state.restore_bytes / MiB, state.restore_us / 1000.0, state.restore_us_max / 1000.0,
 		            static_cast<unsigned long long>(state.lost), static_cast<unsigned long long>(state.missed), state.missed_bytes / MiB,
 		            static_cast<unsigned long long>(state.read_waits.load()), state.read_wait_bytes.load() / MiB);
+		// (ram3) Which of the two it is: paged out (the bytes go on living in the page file or Windows' compression
+		// store) or really dropped; and the partial unmaps split.
+		if (state.pageout_bytes != 0)
+			std::printf("Texture offload: paged out, not dropped (KYTY_OFFLOAD_PAGEOUT=1): %.0f MiB sent to the page file / "
+			            "memory compression so far (KYTY_OFFLOAD_PAGEOUT=0 drops them)\n",
+			            state.pageout_bytes / MiB);
+		else
+			std::printf("Texture offload: pages dropped (KYTY_OFFLOAD_PAGEOUT=0); unmaps over part of a range split %llu "
+			            "(KYTY_OFFLOAD_UNMAP_SPLIT=%d); discard took %.0f MiB, refused %.0f MiB (error %lu; of those MEM_RESET "
+			            "took %.0f, refused %.0f); still in RAM right after: %llu of %llu sampled pages\n",
+			            static_cast<unsigned long long>(state.unmap_splits), UnmapSplit() ? 1 : 0, state.discard_ok / MiB,
+			            state.discard_refused / MiB, static_cast<unsigned long>(state.discard_error), state.reset_ok / MiB,
+			            state.reset_refused / MiB, static_cast<unsigned long long>(state.resident_after),
+			            static_cast<unsigned long long>(state.sampled_after));
 		if (state.gpu_ranges_total != 0) {
 			std::printf("GPU-only offload: %.0f MiB of GPU-written images out of RAM now (peak %.0f, %llu ranges / %.0f MiB ever); "
 			            "restored on a touch %llu ranges (%.0f MiB, %.1f ms, at most %.1f ms)\n",
@@ -662,6 +1706,39 @@ inline void Report(bool force) {
 			            state.gpu_total / MiB, static_cast<unsigned long long>(state.gpu_restores), state.gpu_restore_bytes / MiB,
 			            state.gpu_restore_us / 1000.0, state.gpu_restore_us_max / 1000.0);
 		}
+	}
+	if (Native()) {
+		constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+		std::string      why;
+		for (int i = 0; i <= static_cast<int>(Touch::Count); i++) {
+			if (state.restores_by[i] == 0) continue;
+			char part[128];
+			std::snprintf(part, sizeof(part), "%s%s %llu (%.0f MiB)", why.empty() ? "" : ", ",
+			              i == static_cast<int>(Touch::Count) ? "tras un fallo perdido" : TouchName(static_cast<Touch>(i)),
+			              static_cast<unsigned long long>(state.restores_by[i]), state.restore_bytes_by[i] / MiB);
+			why += part;
+		}
+		const uint64_t lookups = state.window_lookups.load();
+		std::printf("Native texture offload (30 s, KYTY_NATIVE_TEXTURE_OFFLOAD=1): RAM ahorrada ahora %.2f GB (pico %.2f; dejado "
+		            "en total %.2f GB, rechazado %.0f MiB; tras dejar seguian en RAM %llu de %llu paginas muestreadas); "
+		            "re-descargas %llu (%.0f MiB, %.1f ms, la mayor %.1f ms) por: %s; perdidas %llu (%.0f MiB), escrituras de "
+		            "vuelta fallidas %llu, abiertas sin esperar %llu; ventanas del emulador %llu (miradas %llu, %.2f us cada una; "
+		            "con rango tomado %llu, sin poder esperar %llu); hilo de descarte %llu pasadas, %.1f ms (la mayor %.1f ms); "
+		            "expulsiones de imagenes con bytes fuera de RAM %llu (puestas al final %llu); comprobadas %llu (%.0f MiB, "
+		            "distintas %llu), tomadas por su formato sin comprobar %llu (%.0f MiB)\n",
+		            state.native_now / GiB, state.native_peak / GiB, state.native_total / GiB, state.native_refused / MiB,
+		            static_cast<unsigned long long>(state.resident_after), static_cast<unsigned long long>(state.sampled_after),
+		            static_cast<unsigned long long>(state.restores), state.restore_bytes / MiB, state.restore_us / 1000.0,
+		            state.restore_us_max / 1000.0, why.empty() ? "nada" : why.c_str(), static_cast<unsigned long long>(state.missed),
+		            state.missed_bytes / MiB, static_cast<unsigned long long>(state.native_write_failed),
+		            static_cast<unsigned long long>(state.native_opened), static_cast<unsigned long long>(state.window_calls.load()),
+		            static_cast<unsigned long long>(lookups), lookups != 0 ? state.window_ns.load() / 1000.0 / static_cast<double>(lookups) : 0.0,
+		            static_cast<unsigned long long>(state.window_hits.load()), static_cast<unsigned long long>(state.window_missed.load()),
+		            static_cast<unsigned long long>(state.native_drops), state.native_drop_us / 1000.0, state.native_drop_us_max / 1000.0,
+		            static_cast<unsigned long long>(state.evict_offloaded), static_cast<unsigned long long>(state.evict_deferred),
+		            static_cast<unsigned long long>(state.checked), state.checked_bytes / MiB,
+		            static_cast<unsigned long long>(state.check_failed), static_cast<unsigned long long>(state.trusted),
+		            state.trusted_bytes / MiB);
 	}
 #if defined(_WIN32)
 	const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));

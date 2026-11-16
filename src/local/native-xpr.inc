@@ -103,6 +103,80 @@ extern "C" {
 // 1, each shortcut checked against the full lookups (TARGETS-SHORTCUT MISMATCH lines, counter shortcut_mismatches).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_targets_shortcut {1};
 }
+// (render5) KYTY_DRAW_FLAGS (local/render5.h). A table draw asks the frame generation and RT code at every draw whether
+// its hooks want it (SsrWanted, ContactShadowsWanted, RtSunWanted, RtParticlesDebug, Capturing: three times); each is
+// another translation unit's function made of a dozen more, most of them a function-local static (a call and a
+// thread-safe-static check each). Those are environment levels read once (KYTY_SSR, KYTY_RT_SUN, ...): their answers
+// never change, and are read once here. Capturing() is half constant (the FSR / XeSS upscaler and KBM warp choices,
+// read once) and half not (frame generation ready, the FSR 3 swapchain, DLSS, the TAA replacement: asked at every
+// call, as Capturing does). 2: the cached answer is checked against the function at every call (mismatches counted in
+// [render5], the first ones printed) and the function's is used.
+// These live in Libs::Graphics::Fsr3 / ::Xess / ::KbmWarp (fsr3-fg.cpp, xess-sr.cpp, kbm-warp.cpp), not in FrameGen.
+namespace Fsr3 {
+[[nodiscard]] bool Active();        // (fsr3-fg.h)
+[[nodiscard]] bool UpscaleWanted(); // (fsr3-fg.h)
+} // namespace Fsr3
+namespace Xess {
+[[nodiscard]] bool Wanted(); // (xess-sr.h)
+} // namespace Xess
+namespace KbmWarp {
+[[nodiscard]] bool HudlessWanted(); // (kbm-warp.h)
+} // namespace KbmWarp
+namespace FrameGen {
+[[nodiscard]] bool DlssUpscaleWanted(); // (frame-gen.cpp)
+} // namespace FrameGen
+namespace Render5Flags {
+enum Flag : uint32_t { Ssr, Contact, RtSun, ParticlesDebug, CaptureConstant, Flags };
+inline constexpr const char* FlagNames[Flags + 1] = {"SsrWanted", "ContactShadowsWanted", "RtSunWanted", "RtParticlesDebug",
+                                                     "Capturing (constant half)", "Capturing"};
+inline std::atomic<int8_t> g_cached[Flags] {-1, -1, -1, -1, -1};
+[[nodiscard]] inline bool Read(Flag flag) {
+	switch (flag) {
+		case Ssr: return FrameGen::SsrWanted();
+		case Contact: return FrameGen::ContactShadowsWanted();
+		case RtSun: return FrameGen::RtSunWanted();
+		case ParticlesDebug: return FrameGen::RtParticlesDebug();
+		default: return Fsr3::UpscaleWanted() || Xess::Wanted() || KbmWarp::HudlessWanted();
+	}
+}
+[[nodiscard]] inline bool Cached(Flag flag) {
+	int8_t value = g_cached[flag].load(std::memory_order_relaxed);
+	if (value < 0) {
+		value = Read(flag) ? 1 : 0;
+		g_cached[flag].store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+// (2) The cached answer against the function's, which is returned.
+[[nodiscard]] inline bool Check(uint32_t which, bool cached, bool live) {
+	Render5::g_flags[Render5::FlagChecks].fetch_add(1, std::memory_order_relaxed);
+	if (cached != live) {
+		const auto n = Render5::g_flags[Render5::FlagMismatches].fetch_add(1, std::memory_order_relaxed);
+		if (n < 8) {
+			std::printf("render5: KYTY_DRAW_FLAGS mismatch: %s cached %d, now %d\n", FlagNames[which], cached ? 1 : 0, live ? 1 : 0);
+			std::fflush(stdout);
+		}
+	}
+	return live;
+}
+// FrameGen::<flag>() as a draw asks it.
+[[nodiscard]] inline bool Wanted(Flag flag) {
+	const auto mode = Render5::Mode(Render5::DrawFlags);
+	if (mode == 0) return Read(flag);
+	if (mode == 2) return Check(flag, Cached(flag), Read(flag));
+	return Cached(flag);
+}
+// FrameGen::Capturing() as a draw asks it (the same terms; their order does not matter: none has an effect).
+[[nodiscard]] inline bool Capturing() {
+	const auto mode = Render5::Mode(Render5::DrawFlags);
+	if (mode == 0) return FrameGen::Capturing();
+	const bool fast = Cached(CaptureConstant) || FrameGen::Enabled() || Fsr3::Active() ||
+	                  FrameGen::DlssUpscaleWanted() || FrameGen::TaaReplaceWanted();
+	if (mode == 2) return Check(Flags, fast, FrameGen::Capturing());
+	return fast;
+}
+} // namespace Render5Flags
+
 // Keys that are XXH3 hashes already: their own bucket index (std::hash<uint64_t> is FNV-1a over the bytes on MSVC).
 struct HashedKey {
 	[[nodiscard]] size_t operator()(uint64_t key) const noexcept { return static_cast<size_t>(key); }
@@ -3129,7 +3203,7 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 // normal path captures the state again.
 bool RenderExecutor::NativeXprTargetsCurrent(const NativeXprDrawState& draw_state) {
 	// Frame generation: the game's final composite into the flip image is drawn on the normal path (its HUD-less image).
-	if (FrameGen::Capturing())
+	if (Render5Flags::Capturing()) // (render5: KYTY_DRAW_FLAGS)
 		for (const auto& target: draw_state.targets)
 			if (FrameGen::IsFlipImage(target.id)) return false;
 	auto&      textures = m_context.GetTextureCache();
@@ -3323,9 +3397,10 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
-	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+	// (render5: KYTY_DRAW_FLAGS, Render5Flags)
+	if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 2);
-	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
+	if (Render5Flags::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
 	emit.state       = &draw_state;
@@ -3339,17 +3414,18 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	// capped by KYTY_FLIP_RATE).
 	// (Capturing, not Enabled: with DLSS/FSR/XeSS upscaling but no frame generation the G-buffer draws that come
 	// from records never gave the camera, so the RT shadows stayed off: "no camera matrix captured yet".)
-	if (FrameGen::Capturing() && record.stage_count > 0 && record.stages[0].program != nullptr) {
+	if (Render5Flags::Capturing() && record.stage_count > 0 && record.stages[0].program != nullptr) {
 		FrameGen::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, 'r');
 	}
 	if (HwScene::Active() && record.stage_count > 0 && record.stages[0].program != nullptr) // (KYTY_HWRT: the camera)
 		HwScene::NoteCamera(record.stages[0].program->shader_hash, record.stages[0].flattened);
-	if (FrameGen::SsrWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
+	if (Render5Flags::Wanted(Render5Flags::Ssr) && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnSsrDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
-	if (FrameGen::ContactShadowsWanted() && record.stage_count > 0 && record.stages[0].program != nullptr)
+	if (Render5Flags::Wanted(Render5Flags::Contact) && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnShadowDraw(record.stages[0].program->shader_hash, record.stages[0].flattened, false);
 	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image)
-	if (FrameGen::RtSunWanted() && record.stage_count > 0 && record.stages[0].program != nullptr && draw_state.targets.size() == 1) {
+	if (Render5Flags::Wanted(Render5Flags::RtSun) && record.stage_count > 0 && record.stages[0].program != nullptr &&
+	    draw_state.targets.size() == 1) {
 		const auto& t = draw_state.targets[0];
 		const auto& r = t.requested;
 		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
@@ -3419,6 +3495,10 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	if (buffer.IsInvalid() || (direct == nullptr ? commands.empty() : !commands.empty()) || commands.size() > 64 ||
 	    (indexed && (index_base == 0 || index_bytes == 0)))
 		return false;
+	// (thread1, KYTY_RENDER_STATS: what comes before the table try - pending operations, the lock, the sets retired,
+	// the draw state's key.)
+	std::optional<LiveCensus::StatScope> stat_before;
+	stat_before.emplace(0, 14);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	// (The GPU thread's: a speculation's thread does not take it.)
 	std::optional<RenderLockGuard> lock;
@@ -3429,6 +3509,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		cache.state_key       = NativeXprStateKey(buffer);
 		cache.state_key_valid = true;
 	}
+	stat_before.reset();
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) != 0) {
 		const auto table = TableTry(buffer, commands, index_base, index_bytes, index_type, direct);
 		if (table == TableResult::Drawn) return true;

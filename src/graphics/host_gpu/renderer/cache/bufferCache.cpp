@@ -11,6 +11,10 @@
 #include "live-trace.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "raiz.h" // (raiz2: KYTY_RAIZ)
+#include "parpadeo7.h" // (parpadeo7: KYTY_PARPADEO7)
+#include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "raiz-wb-guard.h" // (crash-ba2b1f: KYTY_RAIZ_WB_GUARD)
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "sync-stats.h"
@@ -67,7 +71,10 @@ extern volatile std::atomic_uint32_t kyty_local_frame_pipeline_mode;
 #include <array>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
+#include <thread>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -439,9 +446,11 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	// not behind the graphics work queued on the other one).
 	const int lane_before = m_scheduler.Lane();
 	// (Measured 12-10: on the compute lane the copy took longer, ~6 ms; KYTY_ACQ_READBACK_LANE=1 turns it on.)
+	// (serie1) KYTY_SERIE1=1 too, unless KYTY_ACQ_READBACK_LANE=0: the culling alone is on lane 1 there, and its bits'
+	// copy behind the graphics lane would wait for what the culling no longer waits for (local/serie1.h).
 	static const bool by_writer = [] {
 		const char* value = std::getenv("KYTY_ACQ_READBACK_LANE");
-		return value != nullptr && *value == '1';
+		return (value != nullptr && *value == '1') || ((value == nullptr || *value != '0') && Serie1::WantsLanes());
 	}();
 	const int lane = by_writer && CommandScheduler::ThreadRecorder() == nullptr ? LaneSync::WriterLane(begin, end - begin) : lane_before;
 	if (lane != lane_before) m_scheduler.SetLane(lane);
@@ -720,7 +729,22 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 				               request->producer_tick);
 		}
 		const auto* source = (request->verify != nullptr ? request->verify : request->download)->Mapped().data();
-		for (const auto& part: request->parts) WriteBackGpuOwned(part.address, source + part.offset, part.size, "readback");
+		// (raiz2, KYTY_RAIZ: parts that follow each other in guest memory and in the download, one write-back - one
+		// window over their no-access pages instead of one a part -.)
+		const auto& parts = request->parts;
+		for (size_t i = 0; i < parts.size();) {
+			uint64_t size = parts[i].size;
+			size_t   next = i + 1;
+			if (Raiz::On())
+				for (; next < parts.size() && parts[next].address == parts[i].address + size &&
+				       parts[next].offset == parts[i].offset + size;
+				     ++next) {
+					size += parts[next].size;
+					Raiz::g_counters.merged_writebacks.fetch_add(1, std::memory_order_relaxed);
+				}
+			WriteBackGpuOwned(parts[i].address, source + parts[i].offset, size, "readback");
+			i = next;
+		}
 	}
 	request->copied.store(true, std::memory_order_release);
 	request->copied.notify_all();
@@ -855,6 +879,152 @@ void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
 	feedback.index.erase(it, last);
 }
 
+// KYTY_NATIVE_MEMORY=1 (off by default): no read watcher protects a page (PageManager applies none), so a game read of
+// GPU-written memory faults nowhere. GPU writes are written back to guest memory as their work completes instead:
+// copy-feedback snapshots always (as KYTY_EAGER_FEEDBACK), shader-written buffer ranges by NoteNativeWrite /
+// WriteBackNativeWrites, bounded below.
+// (nativemem1) Not with KYTY_WRITE_WATCH=1 (LibKernel::Memory::NativeReadFaultsEnabled): GPU-written pages are no-access
+// again there and a read of them faults, so none of these eager write-backs is needed.
+static bool NativeMemoryOn() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_MEMORY");
+		return v != nullptr && v[0] == '1' && !Libs::LibKernel::Memory::NativeReadFaultsEnabled();
+	}();
+	return on;
+}
+
+// (nativemem1) KYTY_NATIVE_MEMORY=1 with or without KYTY_WRITE_WATCH: CPU writes are seen by the write watch only, so a
+// write of the emulator's own straight to guest memory invalidates what it must itself (CopyGuestMemory).
+static bool NativeWriteWatchOn() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_MEMORY");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+// (raiz2) The upload worker (KYTY_ASYNC_UPLOAD) with native memory: not with KYTY_WRITE_WATCH=1 (ww2: the worker read
+// guest memory itself, faulted on a page GPU work had made no-access meanwhile and asked the GPU thread - maybe waiting
+// for it - for the readback: a hang), except with KYTY_RAIZ=1, where its copies go through Common::GuardedCopy and a
+// window over the no-access pages (AsyncUpload's CopyFrom, Memory::NativeGuardedRead): no guest fault, the bytes the
+// backing view gave. 11-16 (raiz1, Boletaria): all uploads on the GPU thread, buffer_sync 8.6-10.5 ms a frame against
+// 0.2-0.5 with the worker.
+static bool UploadWorkerAllowed() noexcept {
+	return !PageManager::NativeReadFaults() || Raiz::On();
+}
+// (raiz2) The worker's source pointer: TryGetUploadSourcePointer with KYTY_RAIZ (over protected pages too: its copies
+// are guarded), TryGetBackingPointer otherwise.
+static const uint8_t* UploadSourcePointer(uint64_t vaddr, uint64_t size) {
+	return Raiz::On() ? Libs::LibKernel::Memory::TryGetUploadSourcePointer(vaddr, size)
+	                  : Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size);
+}
+
+static uint64_t NativeEnvKiB(const char* name, uint64_t fallback_kib) noexcept {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == 0) return fallback_kib * 1024;
+	return std::strtoull(v, nullptr, 10) * 1024;
+}
+
+// GPU thread, beside each shader write of a guest buffer (GetBuffer, is_written). Writes of one recording share a tick:
+// the same range noted again only moves its tick.
+void BufferCache::NoteNativeWrite(uint64_t vaddr, uint64_t size) {
+	if (!NativeMemoryOn() || Spec::Current() != nullptr || size == 0) return;
+	const auto tick = m_scheduler.CurrentTick();
+	for (size_t i = m_native_writes.size(), last = i > 8 ? i - 8 : 0; i > last; --i) {
+		auto& w = m_native_writes[i - 1];
+		if (w.address == vaddr && w.size == size) {
+			if (i == m_native_writes.size()) {
+				w.tick = std::max(w.tick, tick);
+				return;
+			}
+			break; // (an older entry: a new one keeps the queue ordered by tick)
+		}
+	}
+	constexpr size_t Limit = size_t {1} << 16;
+	if (m_native_writes.size() >= Limit) {
+		// No point between packets for very long: the oldest is written back by the next CPU-side sync, if ever read
+		// by the emulator; a game read of it may see stale bytes.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("BufferCache: native write-back queue full, dropping 0x%016" PRIx64 "\n", m_native_writes.front().address);
+			std::fflush(stdout);
+		}
+		m_native_writes.pop_front();
+	}
+	m_native_writes.push_back({vaddr, size, tick});
+}
+
+// GPU thread, between guest packets (WriteBackCompletedFeedback). Completed writes still GPU-owned are downloaded
+// (ReadMemoryOnGpu: a snapshot if one holds them, else one download; the pages then CPU-owned). Bounded:
+//   KYTY_NATIVE_EAGER_SMALL_KB (64): larger ranges only over a 64 KiB granule some CPU-side read pulled back before;
+//   KYTY_NATIVE_EAGER_BUDGET_KB (4096): bytes per call; the rest waits for the next call.
+void BufferCache::WriteBackNativeWrites() {
+	if (m_native_writes.empty()) return;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	if (m_native_writes.front().tick > master.KnownGpuTick()) return;
+	static const uint64_t small_limit  = NativeEnvKiB("KYTY_NATIVE_EAGER_SMALL_KB", 64);
+	static const uint64_t budget = NativeEnvKiB("KYTY_NATIVE_EAGER_BUDGET_KB", 4096);
+	const auto completed = master.KnownGpuTick();
+	uint64_t   spent     = 0;
+	while (!m_native_writes.empty() && m_native_writes.front().tick <= completed && spent < budget) {
+		const auto w = m_native_writes.front();
+		m_native_writes.pop_front();
+		if (!IsRegionRegistered(w.address, w.size) || !m_memory_tracker.IsRegionGpuModified(w.address, w.size)) {
+			LiveCounters::Add(LiveCounters::EagerClean);
+			continue;
+		}
+		if (w.size > small_limit) {
+			bool read_before = false;
+			{
+				const std::scoped_lock lock(m_native_read_mutex);
+				for (auto g = w.address >> 16u; g <= (w.address + w.size - 1) >> 16u && !read_before; ++g)
+					read_before = m_native_read_granules.count(g) != 0;
+			}
+			if (!read_before) {
+				LiveCounters::Add(LiveCounters::EagerRefused);
+				continue;
+			}
+		}
+		ReadMemoryOnGpu(w.address, w.size, false);
+		LiveCounters::Add(LiveCounters::EagerWritten);
+		spent += w.size;
+	}
+}
+
+// KYTY_NATIVE_MEMORY=1, GPU thread, right before the game can see a label, an end-of-pipe event or a flip
+// (GpuResourceManager::NativeFlushGpuWrites): every GPU-written range of a registered buffer goes to guest memory now,
+// with no size bound or budget (WriteBackNativeWrites' bounds left games reading stale bytes). ReadMemoryOnGpu downloads
+// what its own buffer holds of the range (one buffer each: a range is cut at the buffers' ends) and waits for the GPU
+// work before the copy; the pages are GPU-clean after it, so a later call downloads only what the GPU wrote since.
+uint64_t BufferCache::NativeWriteBackAll(uint64_t* bytes) {
+	if (!NativeMemoryOn() || m_gpu_modified_ranges.Empty()) return 0;
+	// (A copy of the ranges: ReadMemoryOnGpu takes the downloaded ones out of the set.)
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.reserve(m_gpu_modified_ranges.Count());
+	m_gpu_modified_ranges.ForEach([&](uint64_t begin, uint64_t end) { ranges.emplace_back(begin, end); });
+	uint64_t pieces = 0;
+	for (const auto& [begin, end]: ranges) {
+		for (uint64_t at = begin; at < end;) {
+			const auto* owner_id = m_page_table.Find(at >> PageTable::kPageBits);
+			auto*       owner    = owner_id != nullptr && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
+			if (owner == nullptr || owner->is_deleted || !owner->IsInBounds(at, 1)) {
+				// (No buffer holds this caching page: nothing of it to download.)
+				at = ((at >> PageTable::kPageBits) + 1) << PageTable::kPageBits;
+				continue;
+			}
+			const uint64_t stop = std::min<uint64_t>(end, owner->CpuAddress() + owner->Size());
+			if (stop <= at) break; // (cannot happen: IsInBounds)
+			if (IsRegionRegistered(at, stop - at) && m_memory_tracker.IsRegionGpuModified(at, stop - at)) {
+				ReadMemoryOnGpu(at, stop - at, false);
+				++pieces;
+				if (bytes != nullptr) *bytes += stop - at;
+			}
+			at = stop;
+		}
+	}
+	return pieces;
+}
+
 void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	if (kyty_local_copy_feedback_mode.load(std::memory_order_relaxed) == 0) return;
 	if (auto* spec = Spec::Current()) return void(spec->feedbacks.push_back({vaddr, vaddr + size})); // (at its commit)
@@ -926,7 +1096,7 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 	MoveWrittenObtainEpoch();
 	feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
 	if (static auto& eager = LiveSwitch::Find("eager_feedback", 0);
-	    eager.load(std::memory_order_relaxed) != 0) {
+	    eager.load(std::memory_order_relaxed) != 0 || NativeMemoryOn()) {
 		if (m_eager_feedback.size() >= CopyFeedback::SlotCount) m_eager_feedback.pop_front();
 		m_eager_feedback.push_back({selected, vaddr, size, slot.tick});
 	}
@@ -936,11 +1106,12 @@ void BufferCache::ScheduleCopyFeedback(uint64_t vaddr, uint64_t size) {
 // later GPU write over the range invalidates the slot (InvalidateCopyFeedback), so no later write is in flight.
 // TryGuestReadFromFeedback publishes only GPU-modified, CPU-clean bytes and unprotects as a fault's read would.
 void BufferCache::WriteBackCompletedFeedback(bool may_wait) {
+	if (NativeMemoryOn()) WriteBackNativeWrites();
 	// (Called between guest packets: nothing to do until the oldest snapshot's tick completes.)
 	if (m_eager_feedback.empty() || m_eager_feedback.front().tick > m_scheduler.GetMasterSemaphore().KnownGpuTick()) return;
 	static auto& eager  = LiveSwitch::Find("eager_feedback", 0);
 	static auto& verify = LiveSwitch::Find("eager_feedback_verify", 0);
-	if (eager.load(std::memory_order_relaxed) == 0 || !m_copy_feedback) {
+	if ((eager.load(std::memory_order_relaxed) == 0 && !NativeMemoryOn()) || !m_copy_feedback) {
 		m_eager_feedback.clear();
 		return;
 	}
@@ -1296,24 +1467,65 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 // the CPU only after writing them, so a CPU-owned page here holds what the CPU wrote since the copy was
 // taken (or nothing the GPU ever wrote): the stale GPU bytes would overwrite newer game data, which shows
 // up much later as a broken game structure (a null pointer in a job worker while streaming). Logged.
+// (crash-ba2b1f, KYTY_RAIZ=1 + KYTY_RAIZ_WB_GUARD, local/raiz-wb-guard.h) And not on a GPU-owned page the game wrote since
+// the GPU took it (its write watch, reset then; or a game write found during a put-in): that write reached no fault and
+// no upload, so the GPU's copy of the page lacks it and writing the copy back would undo it (20261116-043751: a job
+// worker's shared_ptr control blocks replaced by the page's old bytes, eboot+0xba2b1f). =1: the page is left alone
+// (the game's bytes win; it is queued as CPU-written, so the GPU's copy is uploaded again); =2: counted only.
 void BufferCache::WriteBackGpuOwned(uint64_t address, const uint8_t* data, uint64_t size, const char* source) {
-	if (m_memory_tracker.IsRegionFullyGpuModified(address, size)) {
+	std::vector<uint64_t> game_pages; // (sorted; empty - no allocation - unless the guard found some)
+	const int             guard = LibKernel::Memory::RaizWbGuardMode();
+	if (guard != 0) {
+		LibKernel::Memory::RaizWbGameWritten(address, size, &game_pages);
+		if (guard != 1) {
+			for (const auto page: game_pages)
+				if (m_memory_tracker.IsRegionFullyGpuModified(page, TRACKER_PAGE_SIZE))
+					LibKernel::Memory::RaizWbNoteSkipped(page, address, size, source, false);
+			game_pages.clear();
+		}
+	}
+	const auto game_wrote = [&game_pages](uint64_t at) {
+		return !game_pages.empty() && std::binary_search(game_pages.begin(), game_pages.end(), at & ~(TRACKER_PAGE_SIZE - 1));
+	};
+	if (game_pages.empty() && m_memory_tracker.IsRegionFullyGpuModified(address, size)) {
 		LibKernel::Memory::WriteBacking(address, data, size, source);
 		return;
 	}
 	uint64_t skipped = 0;
+	// (raiz2, KYTY_RAIZ: the GPU-owned pages in a row written back together - one window -, not a page at a time.)
+	const bool join      = Raiz::On();
+	uint64_t   run_begin = 0, run_end = 0;
+	const auto flush     = [&] {
+		if (run_end > run_begin) LibKernel::Memory::WriteBacking(run_begin, data + (run_begin - address), run_end - run_begin, source);
+		run_begin = run_end = 0;
+	};
 	for (uint64_t at = address, end = address + size; at < end;) {
 		const auto next = std::min((at & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE, end);
-		if (m_memory_tracker.IsRegionFullyGpuModified(at, next - at)) {
-			LibKernel::Memory::WriteBacking(at, data + (at - address), next - at, source);
+		const bool owned = m_memory_tracker.IsRegionFullyGpuModified(at, next - at);
+		if (owned && game_wrote(at)) {
+			// (crash-ba2b1f) Left alone: the game's bytes win (counted, logged and queued as CPU-written there).
+			flush();
+			LibKernel::Memory::RaizWbNoteSkipped(at & ~(TRACKER_PAGE_SIZE - 1), address, size, source, true);
+		} else if (owned) {
+			if (join && run_end == at && run_end > run_begin) {
+				run_end = next;
+				Raiz::g_counters.merged_writebacks.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				flush();
+				run_begin = at;
+				run_end   = next;
+				if (!join) flush();
+			}
 		} else {
+			flush();
 			skipped += next - at;
 		}
 		at = next;
 	}
+	flush();
 	LiveCounters::Add(LiveCounters::WriteBackSkips, skipped);
 	static std::atomic<uint32_t> logged {0};
-	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+	if (skipped != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 64) { // (crash-ba2b1f: 0 when only the guard skipped)
 		std::printf("BufferCache: %s write-back skipped 0x%" PRIx64 " of 0x%" PRIx64 " bytes at 0x%016" PRIx64
 		            ": CPU-owned pages\n",
 		            source, skipped, size, address);
@@ -1672,6 +1884,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_scheduler.SetEpilogueHook([this](CommandBuffer& command) { FlushFeedbackBatch(command); });
 	m_gpu_modified_ranges.AllowFastPath();
 	g_sync_cache = this;
+	// (crash-ba2b1f) Crash reports: the trackers' state of a page (MemoryTracker::PeekPageUnlocked).
+	LibKernel::Memory::RaizWbSetPagePeek(
+	    [](void* user, uint64_t page, uint32_t* bits) {
+		    return static_cast<const BufferCache*>(user)->m_memory_tracker.PeekPageUnlocked(page, bits);
+	    },
+	    this);
 	LiveCounters::g_sync_report = [] {
 		if (g_sync_cache != nullptr) g_sync_cache->PrintSyncState();
 	};
@@ -1711,6 +1929,8 @@ void BufferCache::UpdateGcThresholds() {
 }
 
 BufferCache::~BufferCache() {
+	StopPrefetchHelper(); // (parpadeo7: its copies made before the pending readbacks are drained below)
+	LibKernel::Memory::RaizWbSetPagePeek(nullptr, nullptr); // (crash-ba2b1f)
 	LiveCounters::g_buffer_report = nullptr;
 	LiveCounters::g_sync_report = nullptr;
 	g_sync_cache                = nullptr;
@@ -1993,6 +2213,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	const bool async_write = is_write && kyty_local_async_write_readback_mode.load(std::memory_order_relaxed) != 0;
 	const bool guest       = !GuestGpu::IsGpuThread();
 	if (guest) LiveTrace::Event(LiveTrace::GuestReadback, 1, vaddr);
+	if (NativeMemoryOn() && size != 0) {
+		// (WriteBackNativeWrites' bound: ranges a CPU-side read pulled back once are written back eagerly from then on.)
+		const std::scoped_lock lock(m_native_read_mutex);
+		for (auto g = vaddr >> 16u; g <= (vaddr + size - 1) >> 16u; ++g) m_native_read_granules.insert(g);
+	}
 	struct TraceEnd {
 		bool     on;
 		uint64_t vaddr;
@@ -2024,13 +2249,144 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
 				if (is_write) FinishWriteReadback(vaddr, size);
 			});
+			// (raiz8, KYTY_RAIZ_ASYNC_RELEASE: the read releases the GPU thread left of this readback's pages applied
+			// here, by the thread that waited for them - the GPU thread goes on meanwhile -.)
+			for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
 		}
+		PageManager::ApplyDeferredReleases(vaddr, size); // (raiz8: the bytes this read is for, whatever path released them)
 		return;
 	}
 	LiveCounters::Add(GuestGpu::IsGpuThread() ? LiveCounters::SyncReadsRender : LiveCounters::SyncReadsGuest);
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		ReadMemoryOnGpu(vaddr, size, is_write);
 	});
+	if (!GuestGpu::IsGpuThread()) PageManager::ApplyDeferredReleases(vaddr, size); // (raiz8: as above)
+}
+
+// ---- (parpadeo7) KYTY_PARPADEO7: readbacks begun at the XPR label (local/parpadeo7.h) ---------------------------------
+struct BufferCache::PrefetchHelper {
+	struct Item {
+		std::shared_ptr<GuestReadback> request;
+		int64_t                        label_ns = 0;
+		uint64_t                       recent   = 0; // Parpadeo7::NotePrefetched's index
+		bool                           apply    = false; // retired: its pages' deferred releases are left
+	};
+	std::mutex              mutex;
+	std::condition_variable available;
+	std::deque<Item>        items;
+	bool                    stop = false;
+	std::thread             thread;
+};
+
+uint32_t BufferCache::PrefetchGuestRead(uint64_t vaddr, uint64_t size, int64_t label_ns) {
+	if (!GuestGpu::IsGpuThread() || Spec::Current() != nullptr || CommandScheduler::ThreadRecorder() != nullptr ||
+	    !GuestReadbacksEnabled() || size == 0 || UINT64_MAX - vaddr < size)
+		return Parpadeo7::PrefetchOff;
+	const uint64_t end = vaddr + size;
+	// A pending readback over a part of it: in flight already (BeginGuestReadback would share it, or wait for its copy
+	// to retire it first). A free slot (else it would retire the oldest, waiting for that copy).
+	const size_t slots = kyty_local_readback_slots_mode.load(std::memory_order_relaxed) != 0 ? GuestReadbackSlots : 8;
+	size_t       free  = 0;
+	for (size_t slot = 0; slot < GuestReadbackSlots; ++slot) {
+		const auto& pending = m_guest_readbacks[slot];
+		if (!pending || pending->copied.load(std::memory_order_acquire)) {
+			if (slot < slots) ++free;
+			continue;
+		}
+		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) { return page.address < end && vaddr < page.End(); }))
+			return Parpadeo7::PrefetchInflight;
+	}
+	if (free == 0) return Parpadeo7::PrefetchNoSlot;
+	{
+		std::lock_guard lock(m_prefetch_helper_mutex);
+		if (!m_prefetch_helper) {
+			m_prefetch_helper         = std::make_unique<PrefetchHelper>();
+			m_prefetch_helper->thread = std::thread([this] { PrefetchHelperRun(); });
+		} else if (m_prefetch_helper->stop) {
+			return Parpadeo7::PrefetchOff;
+		}
+	}
+	if (NativeMemoryOn()) { // (as ReadMemory: ranges a CPU-side read pulled back are written back eagerly from then on)
+		const std::scoped_lock lock(m_native_read_mutex);
+		for (auto g = vaddr >> 16u; g <= (end - 1) >> 16u; ++g) m_native_read_granules.insert(g);
+	}
+	bool completed = false;
+	auto request   = BeginGuestReadback(vaddr, size, &completed);
+	if (!request) return completed ? Parpadeo7::PrefetchNothing : Parpadeo7::PrefetchRefused;
+	if (request->copying.load(std::memory_order_acquire)) return Parpadeo7::PrefetchInflight;
+	auto& helper = *m_prefetch_helper;
+	{
+		std::lock_guard lock(helper.mutex);
+		if (!helper.stop) {
+			helper.items.push_back({request, label_ns,
+			                        Parpadeo7::NotePrefetched(request->begin, request->begin + request->size, label_ns), false});
+			helper.available.notify_one();
+			return Parpadeo7::PrefetchBegun;
+		}
+	}
+	// (Stopping: nobody will copy it. Detached - its pages stay GPU-owned, a reader faults and reads them back -.)
+	if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot, true);
+	return Parpadeo7::PrefetchOff;
+}
+
+// The GPU thread, the request retired.
+void BufferCache::QueuePrefetchApply(const std::shared_ptr<GuestReadback>& request) {
+	if (!m_prefetch_helper) return;
+	auto&           helper = *m_prefetch_helper;
+	std::lock_guard lock(helper.mutex);
+	if (helper.stop) return;
+	helper.items.push_back({request, 0, 0, true});
+	helper.available.notify_one();
+}
+
+// The helper. It waits for the GPU (and the copy engine) as a reader's CopyGuestReadback does, never for the GPU
+// thread: the retirement is a command posted to it. The GPU thread may wait for a copy claimed here (it retires the
+// request's slot, FinishGuestReadback), as for a reader's; this thread claims each copy as soon as it is queued.
+void BufferCache::PrefetchHelperRun() {
+	LocalPlatform::SetThreadName("Kyty.P7Readback");
+	auto& helper = *m_prefetch_helper;
+	for (;;) {
+		PrefetchHelper::Item item;
+		bool                 stopping = false;
+		{
+			std::unique_lock lock(helper.mutex);
+			helper.available.wait(lock, [&] { return helper.stop || !helper.items.empty(); });
+			if (helper.items.empty()) return;
+			item = std::move(helper.items.front());
+			helper.items.pop_front();
+			stopping = helper.stop;
+		}
+		if (item.apply) {
+			// (raiz8: the put-in of kept bytes here, not by the game thread that reads them)
+			for (const auto& page: item.request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
+			Parpadeo7::g_c.applied.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		CopyGuestReadback(item.request);
+		Parpadeo7::NoteCopied(item.recent, item.label_ns,
+		                      item.request->state.load(std::memory_order_acquire) == GuestReadback::Copying);
+		if (stopping) continue; // (the GPU thread is stopping: the destructor's drain retires it)
+		auto request = std::move(item.request);
+		(void)m_scheduler.Context().GetGpu().PostCommand([this, request] {
+			if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
+			QueuePrefetchApply(request);
+		});
+	}
+}
+
+void BufferCache::StopPrefetchHelper() {
+	std::thread thread;
+	{
+		std::lock_guard lock(m_prefetch_helper_mutex);
+		if (!m_prefetch_helper) return;
+		{
+			std::lock_guard helper_lock(m_prefetch_helper->mutex);
+			m_prefetch_helper->stop = true;
+			m_prefetch_helper->available.notify_all();
+		}
+		thread = std::move(m_prefetch_helper->thread);
+	}
+	if (thread.joinable()) thread.join();
 }
 
 // GPU thread, after an asynchronous readback for a guest write: the tail of
@@ -2337,6 +2693,18 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		}
 		return mapping_end;
 	};
+	// (ww2, KYTY_WRITE_WATCH_MODE=poll; nothing otherwise) GPU work is about to write this range: its pages become
+	// GPU-written (no-access) below. What the game wrote there since the write watch was last read is read now, and
+	// those pages are made CPU-dirty at once (the tracker's part of InvalidateMemory; a page the GPU wrote already is
+	// left as it is): the upload below copies them before the GPU's write, the order a write fault gave. Before, the
+	// next sweep found the page no-access and dropped the write: the buffer kept the bytes from before it (the
+	// "written pages dropped" of the log, 180 000 in 40 s). The images over those pages are invalidated at the next
+	// sweep (PageManager keeps the pages for it).
+	if (is_written && PageManager::WatchPolled()) {
+		thread_local std::vector<uint64_t> written_pages;
+		PageManager::TakeWritesBeforeGpuWrite(vaddr, size, &written_pages);
+		for (const auto page: written_pages) m_memory_tracker.InvalidateRegion(page, TRACKER_PAGE_SIZE, [] {});
+	}
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -2483,7 +2851,23 @@ static void PushUploadCopy(uint8_t* target, const uint8_t* source, uint64_t size
 	AsyncUpload::Get().Push(target, source, size, vaddr);
 }
 
+// (anuncio2) KYTY_RAIZ_ANNOUNCE's audits around each upload copy (AsyncUpload::g_copy_hook; the copies made here too).
+static void UploadAuditHook(uint64_t guest, const uint8_t* destination, uint64_t size, bool done) {
+	if (done) ::Loader::DemonsSoulsWriteAudit::NoteUploadCopied(guest, destination, size);
+	else ::Loader::DemonsSoulsWriteAudit::NoteUploadCopyBegin(guest, size);
+}
+
+static void ReadUploadSourceBytes(uint8_t* destination, uint64_t address, uint64_t size);
 static void ReadUploadSource(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (::Loader::DemonsSoulsWriteAudit::UploadCopyHookOn()) { // (anuncio2)
+		UploadAuditHook(address, destination, size, false);
+		ReadUploadSourceBytes(destination, address, size);
+		UploadAuditHook(address, destination, size, true);
+		return;
+	}
+	ReadUploadSourceBytes(destination, address, size);
+}
+static void ReadUploadSourceBytes(uint8_t* destination, uint64_t address, uint64_t size) {
 	if (Libs::LibKernel::Memory::TryReadBackingToHost(address, destination, size)) return;
 #if defined(_WIN32)
 	if (const auto missed = Common::GuardedCopy(destination, reinterpret_cast<const void*>(address), size); missed != 0) {
@@ -2537,9 +2921,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	// protection deferred. It precedes every copy: queued ahead of them when all go to the
 	// worker, applied here otherwise.
 	if (auto deferred = MemoryTracker::TakeDeferredProtects(); !deferred.empty()) {
-		bool queued = mapped != nullptr && AsyncUpload::Enabled() && staging_ring.IsCoherent();
+		// (ww2, KYTY_NATIVE_MEMORY=1 with KYTY_WRITE_WATCH=1: nothing is handed to the upload worker, see below.)
+		bool queued = mapped != nullptr && AsyncUpload::Enabled() && staging_ring.IsCoherent() && UploadWorkerAllowed();
 		for (const auto& copy: copies)
-			queued = queued && LibKernel::Memory::TryGetBackingPointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
+			queued = queued && UploadSourcePointer(buffer.CpuAddress() + copy.dstOffset, copy.size);
 		for (const auto& item: deferred) {
 			if (queued) {
 				AsyncUpload::Get().PushProtection(
@@ -2552,13 +2937,22 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			}
 		}
 	}
+	// (anuncio2) The audits' hook on the upload worker's copies, while one is on (KYTY_RAIZ_ANNOUNCE).
+	if (::Loader::DemonsSoulsWriteAudit::UploadCopyHookOn()) {
+		if (AsyncUpload::g_copy_hook.load(std::memory_order_relaxed) == nullptr) AsyncUpload::g_copy_hook.store(UploadAuditHook, std::memory_order_release);
+	} else if (AsyncUpload::g_copy_hook.load(std::memory_order_relaxed) != nullptr) {
+		AsyncUpload::g_copy_hook.store(nullptr, std::memory_order_release);
+	}
 	if (mapped != nullptr) {
 		// KYTY_ASYNC_UPLOAD: the worker fills coherent staging memory from the backing view
 		// before the submission that carries these copies; ranges without one copy here.
-		const bool async = AsyncUpload::Enabled() && staging_ring.IsCoherent();
+		// (ww2, KYTY_NATIVE_MEMORY=1 with KYTY_WRITE_WATCH=1: copied here, never by the upload worker. Its "backing"
+		// pointer is guest memory itself, read later: a page GPU work made no-access meanwhile faulted on the worker,
+		// which then asked this thread - maybe waiting for the worker - for the read-back: a hang. ram4's notes, risk A.)
+		const bool async = AsyncUpload::Enabled() && staging_ring.IsCoherent() && UploadWorkerAllowed(); // (raiz2)
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			const auto* source = async ? LibKernel::Memory::TryGetBackingPointer(address, copy.size) : nullptr;
+			const auto* source = async ? UploadSourcePointer(address, copy.size) : nullptr;
 			if (source != nullptr) {
 				PushUploadCopy(mapped + copy.srcOffset, source, copy.size, address);
 			} else {
@@ -2609,6 +3003,7 @@ void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 			if (IsGpuMapped(begin, bytes) && LibKernel::Memory::IsFullyMapped(begin, bytes)) {
 				auto& buffer    = m_slot_buffers[FindBuffer(begin, bytes)];
 				buffer.bda_read = true;
+				PolicyBdaRead(buffer.CpuAddress(), buffer.Size()); // (policy4)
 				TouchBuffer(buffer);
 				(void)SynchronizeBuffer(buffer, begin, bytes, false, false);
 			}
@@ -2617,7 +3012,119 @@ void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
 	}
 }
 
+// (policy1) See PolicyBeforeUse. Any thread that asks the cache (the GPU thread, a speculative translation's).
+// (policy6, KYTY_DS_WRITE_FRAME=2) GPU work is about to use [vaddr, vaddr + size): each sampled page with a hash taken
+// when it last became clean is looked at again; still no-watch and clean, with other bytes now, it is one the GPU would
+// use stale (DemonsSoulsWriteAudit::CheckNoWatchUse counts and lists it). At most 16384 pages a call.
+void BufferCache::PolicyCheckStale(uint64_t vaddr, uint64_t size, bool wide) const {
+	auto&          tracker = const_cast<MemoryTracker&>(m_memory_tracker);
+	const uint64_t end     = vaddr + size;
+	uint64_t       pages   = 0;
+	for (uint64_t page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < end && pages < 16384; page += TRACKER_PAGE_SIZE, ++pages) {
+		if (!::Loader::DemonsSoulsWriteAudit::SampledPage(page) || !::Loader::DemonsSoulsWriteAudit::HasCleanHash(page)) continue;
+		const bool clean = tracker.AnyNoWatch(page, TRACKER_PAGE_SIZE) && !tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE);
+		::Loader::DemonsSoulsWriteAudit::CheckNoWatchUse(page, clean, vaddr, end, wide || size > (uint64_t {1} << 20u));
+	}
+}
+
+void BufferCache::PolicyBeforeUseSlow(uint64_t vaddr, uint64_t size, bool is_written) const {
+	auto& tracker = const_cast<MemoryTracker&>(m_memory_tracker);
+	if (!GuestRange {vaddr, size}.Valid() || !tracker.AnyNoWatch(vaddr, size)) return;
+	if (::Loader::DemonsSoulsWriteAudit::CheckStaleOn()) PolicyCheckStale(vaddr, size, false); // (policy6)
+	if (!is_written && ::Loader::DemonsSoulsWriteAudit::ReadCovered(vaddr, size)) {
+		// (anuncio1) The no-watch pages are trusted here: KYTY_RAIZ_ANNOUNCE + KYTY_RAIZ_VERIFY audits them.
+		if (::Loader::DemonsSoulsWriteAudit::AnnounceVerifyOn()) PolicyCheckAnnounced(vaddr, size, size > (uint64_t {1} << 20u));
+		return;
+	}
+	// (anuncio2) KYTY_RAIZ_ANNOUNCE: a GPU write over frame memory leaves its pages no-watch (PolicyGpuWrite).
+	if (is_written && ::Loader::DemonsSoulsWriteAudit::AnnounceOn()) {
+		PolicyGpuWrite(vaddr, size);
+		return;
+	}
+	const uint64_t pages = tracker.ClearNoWatch(vaddr, size, true);
+	::Loader::DemonsSoulsWriteAudit::NoteReverted(vaddr, pages, is_written ? 1 : 0);
+	if (::Loader::DemonsSoulsWriteAudit::AnnounceOn()) ::Loader::DemonsSoulsWriteAudit::NoteVetoOther(vaddr, size, pages, 0); // (anuncio2)
+}
+
+// (anuncio2) KYTY_RAIZ_ANNOUNCE=1. GPU work is about to write [vaddr, vaddr + size). Measured (035513): ~16,000 pages/s
+// of frame memory went back to their write watcher here, refused for good ("la GPU escribe ahi", 78,891 pages in 5 s),
+// and each cost one write fault more (~20,000/s, up from ~1,000/s) when a frame allocator handed it out again
+// (anuncio1's lift), plus the protection changes both ways. Frame-policy pages (DemonsSoulsWriteAudit::FramePolicyPage:
+// handed out by a frame allocator lately, not a ring) stay no-watch now; they are only made CPU-dirty, so the upload
+// that precedes the write (ForEachUploadRange) copies the guest's bytes into the buffer first - what ClearNoWatch's
+// CPU-dirty did. Why that is enough:
+//  - while GPU-dirty the page has its read watcher (no access: RegionManager::UpdateGpuProtection, independent of
+//    no-watch); a CPU access faults and takes the normal path (SetNoWatch refuses a GPU-dirty page: why 1), as today;
+//  - given back (written back, the read watcher gone) it is writable with no write watcher - no fault when the next
+//    owner writes it -, and the CPU's writes there are announced by R1-R3 like those of any no-watch frame page
+//    (ReadCovered trusts exactly these pages already); MarkNoWatchDirty and SetNoWatch never touch GPU-dirty pages;
+//  - the other pages of the range: as before (watched again and refused).
+void BufferCache::PolicyGpuWrite(uint64_t vaddr, uint64_t size) const {
+	namespace Audit = ::Loader::DemonsSoulsWriteAudit;
+	auto&          tracker = const_cast<MemoryTracker&>(m_memory_tracker);
+	const uint64_t end     = vaddr + size;
+	uint64_t       kept = 0, reverted = 0;
+	// Runs of pages of one kind: frame-policy pages (kept) or not.
+	for (uint64_t at = vaddr; at < end;) {
+		const bool ours = Audit::FramePolicyPage(at);
+		uint64_t   next = (std::min)((at | (TRACKER_PAGE_SIZE - 1)) + 1, end);
+		while (next < end && Audit::FramePolicyPage(next) == ours) next = (std::min)(next + TRACKER_PAGE_SIZE, end);
+		if (ours) {
+			(void)tracker.MarkNoWatchDirty(at, next - at);
+			kept += ((next - 1) / TRACKER_PAGE_SIZE) - (at / TRACKER_PAGE_SIZE) + 1;
+		} else {
+			const uint64_t pages = tracker.ClearNoWatch(at, next - at, true);
+			Audit::NoteReverted(at, pages, 1);
+			Audit::NoteVetoOther(at, next - at, pages, 1);
+			reverted += pages;
+		}
+		at = next;
+	}
+	Audit::NoteGpuWriteUse(kept, reverted);
+}
+
+// (anuncio1) KYTY_RAIZ_ANNOUNCE=1 + KYTY_RAIZ_VERIFY=1. GPU work is about to use [vaddr, vaddr + size), whose no-watch
+// pages the policy trusts (ReadCovered). Each no-watch page the write watch says was written since it last became clean
+// (RegionManager: reset then, before the upload's copy) and that no announcement made CPU-dirty since is one the GPU
+// would use stale: counted and listed (DemonsSoulsWriteAudit::NoteUnannounced), and made CPU-dirty at once, so the use
+// that follows uploads it - the audit repairs what it finds. A page written in bytes this use does not read counts the
+// same (the write watch is per page): an upper bound. At most 512 written pages a call are looked at (more: counted).
+void BufferCache::PolicyCheckAnnounced(uint64_t vaddr, uint64_t size, bool wide) const {
+	auto&              tracker = const_cast<MemoryTracker&>(m_memory_tracker);
+	constexpr uint64_t Max     = 512;
+	uint64_t           written[Max];
+	const uint64_t     found = Libs::LibKernel::Memory::NativeAnnounceWritten(vaddr, size, written, Max);
+	uint64_t           dirty = 0, stale = 0;
+	for (uint64_t i = 0; i < found && i < Max; ++i) {
+		const uint64_t page = written[i];
+		if (!tracker.AnyNoWatch(page, TRACKER_PAGE_SIZE)) continue; // (watched: its writes faulted)
+		if (tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE)) {
+			++dirty; // (announced, or never clean since it became no-watch)
+			continue;
+		}
+		const bool repaired = tracker.MarkNoWatchDirty(page, TRACKER_PAGE_SIZE) != 0;
+		::Loader::DemonsSoulsWriteAudit::NoteUnannounced(page, vaddr, size, wide, repaired);
+		++stale;
+	}
+	::Loader::DemonsSoulsWriteAudit::NoteAnnounceCheck(found, dirty, stale, found > Max);
+}
+
+// (policy4) See PolicyBdaRead.
+void BufferCache::PolicyBdaReadSlow(uint64_t vaddr, uint64_t size) const {
+	auto& tracker = const_cast<MemoryTracker&>(m_memory_tracker);
+	if (!GuestRange {vaddr, size}.Valid() || !tracker.AnyNoWatch(vaddr, size)) return;
+	if (::Loader::DemonsSoulsWriteAudit::CheckStaleOn()) PolicyCheckStale(vaddr, size, true); // (policy6: a BDA read)
+	if (::Loader::DemonsSoulsWriteAudit::ReadCovered(vaddr, size)) {
+		if (::Loader::DemonsSoulsWriteAudit::AnnounceVerifyOn()) PolicyCheckAnnounced(vaddr, size, true); // (anuncio1)
+		return;
+	}
+	const uint64_t pages = tracker.ClearNoWatch(vaddr, size, true);
+	::Loader::DemonsSoulsWriteAudit::NoteReverted(vaddr, pages, 2);
+	if (::Loader::DemonsSoulsWriteAudit::AnnounceOn()) ::Loader::DemonsSoulsWriteAudit::NoteVetoOther(vaddr, size, pages, 2); // (anuncio2)
+}
+
 void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
+	PolicyBeforeUse(vaddr, size, false); // (policy1)
 	if (auto* spec = Spec::Current()) {
 		// Made current when the speculative translation is committed (an earlier segment's guest memory writes
 		// before it, the open segment's after its work).
@@ -2646,6 +3153,7 @@ StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	PolicyBeforeUse(vaddr, size, is_written); // (policy1)
 	if (auto* spec = Spec::Current()) {
 		// As below: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
 		// it (speculation-state.h) and with no guest memory write of the speculation pending over it.
@@ -2714,6 +3222,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			Spec::NoteGpuWrite(vaddr, size);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 			LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+			NoteNativeWrite(vaddr, size);
 			return {buffer, buffer->Offset(vaddr)};
 		}
 	}
@@ -2738,12 +3247,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		Spec::NoteGpuWrite(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+		NoteNativeWrite(vaddr, size);
 		memo = {vaddr, size, RegistrationEpoch(), m_gpu_coverage_epoch, id, is_texel_buffer};
 	}
 	return {buffer, buffer->Offset(vaddr)};
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size, bool* refillable) {
+	PolicyBeforeUse(vaddr, size, false); // (policy1)
 	using Clock = std::chrono::steady_clock;
 	Clock::time_point marks[4] {Clock::now()};
 	const char*       path = "staging";
@@ -2794,8 +3305,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	marks[3] = Clock::now();
 	// KYTY_ASYNC_UPLOAD=2: the upload worker fills the staging copy too (the image upload only
 	// records GPU work on it, and every submission waits for the copies pushed before it).
+	// (ww2: not with KYTY_NATIVE_MEMORY=1 and KYTY_WRITE_WATCH=1, as UploadCopies: the worker would read guest memory
+	// itself later, and fault on a page GPU work made no-access meanwhile.)
 	if (staging != nullptr && kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
-	    m_staging_buffer.IsCoherent()) {
+	    UploadWorkerAllowed() && m_staging_buffer.IsCoherent()) { // (raiz2)
 		if (!PushImageStagingCopies(staging, vaddr, size)) path = "sparse";
 		AsyncUpload::Get().Kick();
 		LiveCounters::Add(LiveCounters::AsyncImageBytes, size);
@@ -2847,7 +3360,7 @@ void BufferCache::QueueImageProtects(std::span<const StagingPiece> copied, bool 
 bool BufferCache::PushImageStagingCopies(uint8_t* staging, uint64_t vaddr, uint64_t size) {
 	const StagingPiece whole {vaddr, size, 0};
 	QueueImageProtects({&whole, 1}, true);
-	if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
+	if (const auto* source = UploadSourcePointer(vaddr, size)) { // (raiz2)
 		PushUploadCopy(staging, source, size, vaddr);
 		return true;
 	}
@@ -2880,7 +3393,7 @@ bool BufferCache::RefillImageStaging(const Buffer& ring, uint64_t offset, uint64
 	// ObtainBufferForImage's staging path, in its order: not over a cached buffer holding the range or GPU-written pages.
 	if (&ring != &m_staging_buffer || !GuestRange {vaddr, size}.Valid() || offset > ring.Size() ||
 	    size > ring.Size() - offset || kyty_local_async_upload_mode.load(std::memory_order_relaxed) < 2 ||
-	    !ring.IsCoherent())
+	    !UploadWorkerAllowed() || !ring.IsCoherent()) // (ww2: see ObtainBufferForImage; raiz2: UploadWorkerAllowed)
 		return false;
 	DrainGuestReadback(vaddr, size);
 	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
@@ -2924,7 +3437,7 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 		return refuse("map", 0, total, nullptr);
 	}
 	const bool async = kyty_local_async_upload_mode.load(std::memory_order_relaxed) >= 2 &&
-	                   m_staging_buffer.IsCoherent();
+	                   UploadWorkerAllowed() && m_staging_buffer.IsCoherent(); // (ww2: see ObtainBufferForImage; raiz2)
 	// (Parts of the image: a deferred protection goes ahead of the worker's copies only of pages one of them reads whole.)
 	if (async) {
 		QueueImageProtects(pieces, false);
@@ -2935,7 +3448,7 @@ std::pair<Buffer*, uint64_t> BufferCache::StageImagePieces(const std::vector<Sta
 	for (const auto& piece: pieces) {
 		auto* target = staging + piece.offset;
 		if (async) {
-			if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(piece.vaddr, piece.size)) {
+			if (const auto* source = UploadSourcePointer(piece.vaddr, piece.size)) { // (raiz2)
 				PushUploadCopy(target, source, piece.size, piece.vaddr);
 				queued = true;
 				continue;
@@ -3091,7 +3604,9 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 			// (As the write faults would: the images over the pages first.)
 			m_texture_cache.InvalidateMemory(address, bytes);
 			// (The pages are not GPU-modified, CopyBuffer checked: no GPU result is written back there.)
-			if (m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
+			// (raiz3, KYTY_RAIZ: not kept read-only - no alias view: writing through it took a window, 2 VirtualProtect
+			// and the gate alone, 6,600-9,300 a second at Boletaria -; unprotected below, as a write fault would.)
+			if (!Raiz::On() && m_memory_tracker.MarkRegionAsCpuDirtyKeepProtection(address, bytes) &&
 			    (Libs::LibKernel::Memory::TryWriteCpuBacking(address, from, bytes) ||
 			     Libs::LibKernel::Memory::TryWriteBacking(address, from, bytes))) {
 				Spec::NoteHostWrite(address, bytes);
@@ -3103,7 +3618,15 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		// (Pages CPU-dirty already change no state: their epoch moves, a copy of their bytes taken meanwhile is
 		// stale. A linear copy is a dispatch, no point the observation epoch moves at.)
 		m_memory_tracker.NoteHostWrite(address, bytes);
-		std::memcpy(reinterpret_cast<void*>(address), from, bytes);
+		if (NativeWriteWatchOn()) {
+			// (KYTY_NATIVE_MEMORY: the write fault of this memcpy on a page an image watches invalidated the image before
+			// the bytes landed; here no fault comes, and NativeForgetWrites below hides the write from the sweeps: the
+			// images over it go now. Pages CPU-dirty for the buffers skipped that above. And the game's own writes there
+			// since the last sweep are kept for it first: the forgetting would lose them.)
+			m_texture_cache.InvalidateMemory(address, bytes);
+			PageManager::CaptureCpuWrites(address, bytes);
+		}
+		std::memcpy(reinterpret_cast<void*>(address), from, bytes); Libs::LibKernel::Memory::NativeForgetWrites(address, bytes);
 		Spec::NoteHostWrite(address, bytes);
 	};
 	// Which destination pages differ: compared on helper threads too when the copy is large (the 4 MiB copy the culling
@@ -3190,6 +3713,7 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+	PolicyBeforeUse(vaddr, size, false); // (policy1)
 	// (Not a range a speculative translation's commit makes current.)
 	const auto* spec = Spec::Current();
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size) && (spec == nullptr || !spec->current_set.Contains(vaddr, size));
@@ -3731,6 +4255,9 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 		const auto start  = std::max(it->start, vaddr);
 		const auto finish = std::min(it->end, end);
 		if (start < finish) {
+			// (policy4) A buffer shaders read by address: no page of it stays without its watcher unless hooks
+			// announce all of its bytes (before the stamp: the pages given back are CPU-dirty and move the epoch).
+			if (it->buffer->bda_read) PolicyBdaRead(start, finish - start);
 			SyncStamp* stamp = nullptr;
 			uint64_t epoch = 0;
 			{

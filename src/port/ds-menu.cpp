@@ -2328,7 +2328,7 @@ void Draw(float width, float height) {
 						if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
 					if (fixed)
 						ImGui::TextColored(kWarn, "%s", s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
-						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (35 reales, 70 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
 					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
 					ChoiceRow("Frame generation", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
@@ -3631,6 +3631,9 @@ void LauncherPerformance(Settings& s) {
 		LCheck(y, "Todos los núcleos", s.all_ccds, "Solo para Ryzen con dos bloques de núcleos (CCD), como un 7950X3D o un 5900X; en otros procesadores no cambia nada. Apagado: el juego usa solo el bloque con más caché (memoria rápida dentro del procesador), que suele dar más FPS y menos tirones. Encendido: usa todos los núcleos. Déjalo apagado salvo que notes que encendido te va mejor.", 216);
 		RowEnd(y);
 	}
+	// (11-14) Pruebas: la gráfica limitada a 8 GB de memoria de vídeo (KYTY_SIMULATE_VRAM_MB=8192).
+	LCheckRow("Simular gráfica de 8 GB (pruebas)", s.simulate_vram8,
+	          "Solo para pruebas: el juego usa como mucho 8 GB de memoria de vídeo, como en una gráfica de 8 GB, aunque la tuya tenga más. Se aplica al iniciar el juego.");
 	{
 		// (perfopts-1107) Opciones de rendimiento: upstream KytyPS5's opt-in switches, off = as before.
 		const float y = RowY() + U(4);
@@ -3769,7 +3772,7 @@ void LauncherSoulsModes(Settings& s) {
 	    {"extremo", "Modo Souls extremo",
 	     "Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"ligero-plus", "Modo Souls ligero +",
-	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 35 FPS estables y frame generation de AMD x2 (70 en pantalla): mas fluido y algo menos de latencia."},
+	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 40 FPS estables y frame generation de AMD x2 (80 en pantalla): mas fluido y algo menos de latencia."},
 	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
 	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."}};
 	const auto pick = [&](float y, const Mode& m, float x) {
@@ -3794,7 +3797,7 @@ void LauncherSoulsModes(Settings& s) {
 	if (FixedFg(s)) {
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
-		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : s.souls_mode == "ligero-plus" ? "Frame generation fija: AMD x2 (35 reales, 70 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
+		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : s.souls_mode == "ligero-plus" ? "Frame generation fija: AMD x2 (40 reales, 80 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
 		RowEnd(y, 28);
 	}
 	BoxEnd();

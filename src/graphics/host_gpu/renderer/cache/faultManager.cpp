@@ -156,7 +156,9 @@ void FaultManager::ProcessFaultBuffer() {
 			// Unmapped since the GPU recorded the access (GpuResourceManager::UnmapMemory no
 			// longer waits for this processing): no buffer over memory that is gone.
 			if (!m_buffer_cache.IsGpuMapped(start, end - start)) return;
-			m_buffer_cache.GetBuffer(m_buffer_cache.FindBuffer(start, end - start)).bda_read = true;
+			auto& read = m_buffer_cache.GetBuffer(m_buffer_cache.FindBuffer(start, end - start));
+			read.bda_read = true;
+			m_buffer_cache.PolicyBdaRead(read.CpuAddress(), read.Size()); // (policy4: see BufferCache::PolicyBdaRead)
 		});
 		m_fault_areas[area] = 0;
 	});

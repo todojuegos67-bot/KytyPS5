@@ -22,6 +22,7 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/trim.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
@@ -218,6 +219,7 @@ void Run(const RunOptions& options) {
 	Libs::InitAll(rt->Symbols());
 
 	Libs::Trophy::Preload();
+	Libs::Trim::Start(); // (recorte1: KYTY_TRIM=1 only)
 
 	LoadElf(options.elf);
 

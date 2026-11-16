@@ -232,6 +232,12 @@ public:
 	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
 	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
 	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
+	// (render4, KYTY_DS_LINEAR_COPY_HOOK; local/ds-linear-copy-hook.h) The game's linear copy as its function announced
+	// it in the command buffer (`commands`, `commands_bytes`: the announcement and the game's own packets after it),
+	// made as DispatchDirect makes the copy shader's dispatch from its registers. False: not made (the game's packets
+	// run). The GPU thread's executor only.
+	[[nodiscard]] bool DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t src, uint32_t count, uint32_t period,
+	                                uint64_t commands, uint64_t commands_bytes);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -456,6 +462,7 @@ private:
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
 	uint32_t              m_linear_copy_uses = 0;
+	uint32_t              m_linear_copy_hook_uses = 0; // (render4: DsLinearCopy's; every 64th is left to the game's packets)
 	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)

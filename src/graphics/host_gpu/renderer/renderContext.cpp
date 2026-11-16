@@ -6,6 +6,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 #include "local-platform.h"
+#include "local/serie1.h" // (serie1: KYTY_SERIE1)
 
 #include <algorithm>
 #include <cstdlib>
@@ -16,19 +17,24 @@ namespace Libs::Graphics {
 void RenderMutex::BecomeOwner() {
 	EXIT_IF(t_owner);
 	m_mutex.Lock(); // (no requester inside: a later one finds the owner)
-	m_owner_exists = true;
-	m_asymmetric   = LocalPlatform::FlushProcessWriteBuffers();
-	m_owner_depth  = 0;
-	m_owner_locked = false;
-	t_owner        = true;
+	// (par1) A second owner (KYTY_PAR_QUEUES=1: the ACB thread) joins the first: the fields are the first one's.
+	EXIT_IF(m_owner_count != 0 && !ParQueues::On());
+	if (m_owner_count++ == 0) {
+		m_owner_exists = true;
+		m_asymmetric   = LocalPlatform::FlushProcessWriteBuffers();
+		m_owner_depth  = 0;
+		m_owner_locked = false;
+	}
+	t_owner = true;
 	m_mutex.Unlock();
 }
 
 void RenderMutex::ResignOwner() {
 	EXIT_IF(!t_owner || m_owner_depth != 0);
 	m_mutex.Lock();
-	t_owner        = false;
-	m_owner_exists = false;
+	t_owner = false;
+	EXIT_IF(m_owner_count == 0);
+	if (--m_owner_count == 0) m_owner_exists = false;
 	m_mutex.Unlock();
 }
 
@@ -68,7 +74,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE"); async != nullptr && (*async == '1' || *async == '2'))
+	// (serie1) KYTY_SERIE1=1: the lanes for the XPR culling's command buffer (local/serie1.h).
+	if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE");
+	    (async != nullptr && (*async == '1' || *async == '2')) || Serie1::WantsLanes())
 		m_command_scheduler.EnableLanes();
 }
 

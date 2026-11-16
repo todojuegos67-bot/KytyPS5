@@ -54,6 +54,7 @@
 #include <intrin.h>
 
 #include "mem-guard.h"
+#include "cold-store.h" // (ram11)
 
 #include <atomic>
 #include <cstdint>
@@ -431,6 +432,9 @@ inline bool LockedAttempt(State& state, uint32_t* error, F&& attempt) {
 // Commits the reserved pages of [address, address + size), each with the protection it would have had committed from
 // the start (before a kernel-mode access, a stack, a readability check).
 inline bool Prefault(const void* address, uint64_t size) {
+	// (ram11, KYTY_COLD_STORE) A kernel-mode access - file reads and writes, sockets - does not fault: what the cold
+	// store holds there comes back first. Nothing when it holds nothing.
+	ColdStore::Ensure(reinterpret_cast<uint64_t>(address), size);
 	auto& state = Get();
 	if (!state.enabled || address == nullptr || size == 0) return true;
 	uint64_t begin = 0, end = 0;

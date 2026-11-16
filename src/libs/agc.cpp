@@ -23,6 +23,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/demonsSoulsWriteAudit.h"
+#include "loader/demonsSoulsMemMap.h"
 
 #include <algorithm>
 #include <array>
@@ -4202,6 +4204,11 @@ static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
+	// (Measurement: the range goes to the [faults] report's "dcb" tag; KYTY_MEMMAP=0 turns it off.)
+	Loader::DemonsSoulsMemMap::NoteSubmit(dcb, uint64_t {size_in_dwords} * 4u);
+	// (policy6, KYTY_DS_WRITE_FRAME / KYTY_DS_FRAME_AUDIT; one relaxed load when off) Before the GPU thread is given it:
+	// the command buffer, its reservation and its context block are taken as written (what the HLE and the game wrote).
+	if (Loader::DemonsSoulsWriteAudit::On()) Loader::DemonsSoulsWriteAudit::NoteSubmitted(dcb, uint64_t {size_in_dwords} * 4u);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
@@ -4260,6 +4267,8 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	}
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+	Loader::DemonsSoulsMemMap::NoteSubmit(acb, uint64_t {size_in_dwords} * 4u);
+	if (Loader::DemonsSoulsWriteAudit::On()) Loader::DemonsSoulsWriteAudit::NoteSubmitted(acb, uint64_t {size_in_dwords} * 4u); // (policy6)
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});

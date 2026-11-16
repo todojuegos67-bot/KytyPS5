@@ -14,6 +14,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -32,6 +33,10 @@ public:
 	[[nodiscard]] bool          HasReadWatchers(uint64_t vaddr, uint64_t size) const noexcept {
         return m_page_manager.HasReadWatchers(vaddr, size);
 	}
+	// (ww2, KYTY_WRITE_WATCH_MODE=protect; false otherwise: PageManager::HasWriteProtection.)
+	[[nodiscard]] bool HasWriteProtection(uint64_t vaddr, uint64_t size) const noexcept {
+		return m_page_manager.HasWriteProtection(vaddr, size);
+	}
 	[[nodiscard]] const std::atomic<uint64_t>* ReadGranules() const noexcept { return m_page_manager.ReadGranules(); }
 	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 	// After a guest protection change: tracked pages get the tracker's protection back.
@@ -47,6 +52,35 @@ public:
 	}
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// (policy2, KYTY_DS_READBACK_HOOK) HandleFault's read branch for a whole range (a guest thread about to read all
+	// of it): one readback instead of one per faulting page. False: the range is not all mapped (nothing done).
+	[[nodiscard]] bool ReadbackRange(uint64_t vaddr, uint64_t size) noexcept;
+	// (parpadeo7, KYTY_PARPADEO7=1; GPU thread, a command queued at an XPR label) Each range ({address, bytes}, sorted)
+	// that holds GPU-written pages begun as an asynchronous guest readback (BufferCache::PrefetchGuestRead), never
+	// waited for here. `label_ns`: the label's time (local/parpadeo7.h, for its line).
+	void PrefetchGuestReads(const std::vector<std::pair<uint64_t, uint64_t>>& ranges, int64_t label_ns) noexcept;
+	// KYTY_NATIVE_MEMORY=1 only (nothing otherwise). GPU thread, at the points where guest writes become visible to
+	// the GPU work after them - the start of each submission (GuestGpu::Process) and each satisfied WAIT_REG_MEM, the
+	// points BdaDirtyRegions::Publish marks -, with no cache lock held: every page the game wrote since the last sweep
+	// that a watcher holds (PageManager::SweepCpuWrites) is invalidated as its write fault did (HandleFault: the
+	// buffers, a GPU-written page read back first, then the images), before any resource is used.
+	// (ww2, KYTY_WRITE_WATCH_MODE=poll; any other mode sweeps whatever the reason, as before) Why the caller is at a
+	// hand-over: Handover sweeps; CoveredSubmission (a submission queued before the last sweep began,
+	// PageManager::SweptSince) and ProcessorWait (a WAIT_REG_MEM satisfied by the value a command processor wrote
+	// itself) carry no write that sweep did not read, and only count.
+	enum class SweepReason { Handover, CoveredSubmission, ProcessorWait };
+	void SweepCpuWrites(SweepReason reason = SweepReason::Handover);
+	// (ww2) A flip, for the "Write watch+" line's per-frame figures (GPU thread; nothing without KYTY_WRITE_WATCH).
+	void NoteFlipForWatchStats();
+	// KYTY_PROTECT_PAUSE: the pages whose write protection a pause skipped, invalidated as written (and protected
+	// again when it ends). GPU thread; called from SweepCpuWrites.
+	void SyncProtectPause();
+	// KYTY_NATIVE_MEMORY=1 only (nothing otherwise). GPU thread, right before the game can see that GPU work it submitted
+	// is done - an end-of-pipe label or event (WRITE_EOP / RELEASE_MEM), an end-of-pipe interrupt, a flip -: everything
+	// the GPU wrote to guest memory is written there first, with the GPU waited for (no read fault serves the game's
+	// reads): every GPU-written range of the buffers (BufferCache::NativeWriteBackAll) and every image GPU work wrote
+	// since the last call (TextureCache::NativeDownloadWritten; KYTY_NATIVE_IMAGE_DOWNLOAD=0 leaves them out). Slow.
+	void NativeFlushGpuWrites();
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// Before a host write of the whole range: GPU-written bytes it replaces are dropped (BufferCache::InvalidateMemoryForWrite).
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
@@ -85,6 +119,8 @@ public:
 
 private:
 	void                      RunCollectors();
+	// SweepCpuWrites: one run of written pages, all mapped.
+	void                      InvalidateCpuWrittenPages(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault);
 	// One window of the fault's mapped range: [window_begin, window_begin + window_size) within it.
 	[[nodiscard]] bool        TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t window_begin, uint64_t window_size);
@@ -129,6 +165,17 @@ private:
 	std::vector<GuestRange> m_bda_spans;
 	bool                    m_bda_rebuild = true;
 	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_fresh_bda_region_requests;
+	// (render3) KYTY_BDA_MEMO=1: the tracker regions (inclusive runs) whose dirty bits PrepareBdaReadRanges consumed
+	// while no bit was set (BdaDirtyRegions::Generation), no buffer was (un)registered and no mapping changed since
+	// `generation`, `registration` and `mapping` were read: a preparation whose ranges lie in them has nothing to do.
+	// GPU thread.
+	struct BdaMemo {
+		static constexpr size_t                           Capacity = 8;
+		uint64_t                                          generation = 0, registration = 0, mapping = 0;
+		size_t                                            count = 0;
+		std::array<std::pair<uint64_t, uint64_t>, Capacity> regions {};
+	};
+	BdaMemo m_bda_memo;
 	GuestGpu*                 m_gpu = nullptr;
 	std::atomic<uint64_t> m_preparation_alias_epoch {uint64_t{1} << 32};
 	bool                      m_fault_process_pending = false;

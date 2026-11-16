@@ -7,6 +7,7 @@
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
+#include "loader/demonsSoulsWriteAudit.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -21,8 +22,10 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -71,6 +74,21 @@ public:
 	void                   CollectResidencyRanges(std::vector<GpuResidency::Range>& out, uint64_t& count);
 	[[nodiscard]] bool TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// (parpadeo7, KYTY_PARPADEO7=1; the GPU thread, between packets: GpuResourceManager::PrefetchGuestReads) The
+	// asynchronous guest readback a read fault of [vaddr, vaddr + size) would begin, begun now; a helper thread copies it
+	// into guest memory as soon as the GPU is done and this thread retires it then (a command). Never waits: nothing when
+	// a pending readback overlaps the range (it is in flight already), when no slot is free (retiring one waits for its
+	// copy) or when the readback refuses it. Returns a Parpadeo7::PrefetchResult (local/parpadeo7.h).
+	[[nodiscard]] uint32_t PrefetchGuestRead(uint64_t vaddr, uint64_t size, int64_t label_ns);
+	// (parpadeo7) The helper stopped (its queued copies made first); later prefetches begin nothing. Before the GPU thread
+	// stops (GuestGpu::Shutdown); again at destruction. Any thread but the GPU thread and the helper.
+	void StopPrefetchHelper();
+	// KYTY_NATIVE_MEMORY=1 (GPU thread; GpuResourceManager::NativeFlushGpuWrites): whether some range holds bytes GPU work
+	// wrote that guest memory does not have yet (the GPU-modified ranges), and every such range of a registered buffer
+	// downloaded to guest memory now, whatever its size (ReadMemoryOnGpu, as a game read's fault did; the pages then
+	// GPU-clean). Returns the ranges downloaded and adds their bytes to `bytes`.
+	[[nodiscard]] bool     NativeHasGpuWrites() const noexcept { return !m_gpu_modified_ranges.Empty(); }
+	uint64_t               NativeWriteBackAll(uint64_t* bytes);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] Buffer* GetBufferIfLive(BufferId id) {
 		auto* buffer = m_slot_buffers.try_get(id);
@@ -181,7 +199,33 @@ public:
 	}
 	// The tracker's answer whatever a speculative translation will upload (what a cache may keep).
 	[[nodiscard]] bool IsRegionCpuDirty(uint64_t vaddr, uint64_t size) {
+		PolicyBeforeUse(vaddr, size, false);
 		return m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	}
+	// ---- (policy1) KYTY_DS_NEIGHBOR_SPLIT (loader/demonsSoulsWriteAudit.h). One relaxed load each when off. --------
+	// The fault handler: the page of a CPU write fault stops being write-protected (MemoryTracker::SetNoWatchPage).
+	// (anuncio1) `why`: why not (MemoryTracker::SetNoWatchPage).
+	[[nodiscard]] bool PolicySetNoWatch(uint64_t vaddr, int* why = nullptr) { return m_memory_tracker.SetNoWatchPage(vaddr, why); }
+	// (anuncio1, KYTY_RAIZ_ANNOUNCE) A refused frame page handed out again since its refusal: refused no more, no-watch now.
+	[[nodiscard]] bool PolicyUnblockSetNoWatch(uint64_t vaddr) { return m_memory_tracker.UnblockSetNoWatchPage(vaddr); }
+	// GpuResourceManager::SweepCpuWrites (the GPU thread, before a submission's work reads guest memory): a hook of the
+	// game announced a write to the range / a range no hook covers appeared there.
+	uint64_t PolicyMarkDirty(uint64_t vaddr, uint64_t size) { return m_memory_tracker.MarkNoWatchDirty(vaddr, size); }
+	uint64_t PolicyRevert(uint64_t vaddr, uint64_t size) { return m_memory_tracker.ClearNoWatch(vaddr, size, true); }
+	uint64_t PolicyMarkAllDirty() { return m_memory_tracker.MarkAllNoWatchDirty(); }
+	uint64_t PolicyRevertAll() { return m_memory_tracker.ClearAllNoWatch(); } // (policy4)
+	// (policy4) A shader reads [vaddr, vaddr + size) through the BDA page table (a buffer marked bda_read): it may read
+	// any byte of it, so its no-watch pages are trusted only when every byte of the range lies in ranges the hooks
+	// announce; else they are watched again for good. One relaxed load when the policy is off.
+	void PolicyBdaRead(uint64_t vaddr, uint64_t size) const {
+		if (::Loader::DemonsSoulsWriteAudit::SplitOn()) PolicyBdaReadSlow(vaddr, size);
+	}
+	// Before anything trusts the tracker about [vaddr, vaddr + size) (a buffer obtained for a draw, a proof by the CPU
+	// epoch or the dirty bits): no-watch pages there are trusted only when every byte asked for lies in ranges whose
+	// writes the game's hooks announce; else they are watched again, CPU-dirty, at once (so the answer that follows is
+	// "modified"). `is_written`: GPU work will write the range (never left no-watch).
+	void PolicyBeforeUse(uint64_t vaddr, uint64_t size, bool is_written) const {
+		if (::Loader::DemonsSoulsWriteAudit::SplitOn()) PolicyBeforeUseSlow(vaddr, size, is_written);
 	}
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
@@ -228,6 +272,7 @@ public:
 	}
 	[[nodiscard]] uint64_t CpuModificationEpoch(uint64_t vaddr, uint64_t size) const {
 		if (!GuestRange {vaddr, size}.Valid()) return 0;
+		PolicyBeforeUse(vaddr, size, false); // (policy1)
 		constexpr uint64_t MaxRegions = 64;
 		const uint64_t     first      = vaddr / TRACKER_REGION_SIZE;
 		const uint64_t     last       = (vaddr + size - 1) / TRACKER_REGION_SIZE;
@@ -279,6 +324,11 @@ public:
 	[[nodiscard]] uint64_t SpilledRoom() const noexcept { return m_spilled_room; }
 
 private:
+	void PolicyBeforeUseSlow(uint64_t vaddr, uint64_t size, bool is_written) const; // (policy1)
+	void PolicyBdaReadSlow(uint64_t vaddr, uint64_t size) const;                    // (policy4)
+	void PolicyCheckAnnounced(uint64_t vaddr, uint64_t size, bool wide) const;      // (anuncio1)
+	void PolicyGpuWrite(uint64_t vaddr, uint64_t size) const;                       // (anuncio2)
+	void PolicyCheckStale(uint64_t vaddr, uint64_t size, bool wide) const;          // (policy6; policy7: wide)
 	friend struct BufferCacheTestAccess;
 
 	// A game buffer in use made in system memory (Buffer::IsInSystemMemory: video memory over budget then) goes back to
@@ -372,6 +422,17 @@ private:
 		uint64_t address, size, tick;
 	};
 	std::deque<EagerFeedback> m_eager_feedback;
+	// KYTY_NATIVE_MEMORY: GPU buffer writes queued for write-back to guest memory once their tick completes (no read
+	// watcher catches the game's read). NoteNativeWrite / WriteBackNativeWrites.
+	struct NativeWrite {
+		uint64_t address, size, tick;
+	};
+	std::deque<NativeWrite> m_native_writes;
+	// 64 KiB granules some CPU-side read has ever pulled back (ReadMemory): the bound on large eager write-backs.
+	std::unordered_set<uint64_t> m_native_read_granules;
+	std::mutex                   m_native_read_mutex;
+	void                         NoteNativeWrite(uint64_t vaddr, uint64_t size);
+	void                         WriteBackNativeWrites();
 	uint64_t                  m_eager_verify_count = 0;
 	[[nodiscard]] bool        VerifyEagerFeedback(const EagerFeedback& entry);
 	// KYTY_FEEDBACK_BATCH: the open buffer's copy-feedback snapshots, recorded together as it closes (FlushFeedbackBatch).
@@ -544,6 +605,14 @@ private:
 	std::array<std::unique_ptr<Buffer>, GuestReadbackSlots> m_verify_downloads {};
 	void VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
 	                    const char* path, uint64_t waited);
+
+	// (parpadeo7) The helper thread of PrefetchGuestRead: copies the prefetched readbacks in, asks the GPU thread to retire
+	// them and applies their pages' deferred releases. Created at the first prefetch.
+	struct PrefetchHelper;
+	std::unique_ptr<PrefetchHelper> m_prefetch_helper;
+	std::mutex                      m_prefetch_helper_mutex; // (its creation and stop)
+	void                            PrefetchHelperRun();
+	void                            QueuePrefetchApply(const std::shared_ptr<GuestReadback>& request);
 
 	// Last member: destroyed (queue idle) before the buffers its copies use.
 	std::unique_ptr<ReadbackQueue::Queue> m_readback_queue;

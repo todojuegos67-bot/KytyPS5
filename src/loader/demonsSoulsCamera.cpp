@@ -272,11 +272,458 @@ bool InstallDirect(Program* program, uint64_t tilt, uint64_t linear, const char*
 	return true;
 }
 
+// ---- (mouse1) Native mouse camera (KYTY_DS_MOUSE_NATIVE=1 with KYTY_KBM=1; off by default) ----
+// What Ghidra shows of 01.007.000 (ghidra/*.c beside the notes; cd = the camera data, ctx = the frame's context):
+//   eboot+0x191d70 builds ctx (0x188640: dt at ctx+0x44, flags at ctx+0x74) and runs the follow camera's steps
+//   (0x196d40). ctx+0x74 bit 0x200 = the free camera (no lock-on cd+0x260, no reset cd+0x12c, no recentre cd+0x262/3).
+//   0x18bd60 reads the right stick: cd+0x2dc == 1 ? (chr input)+0x50 {pitch, yaw} / +0x58 : a zero vector. A stick
+//   other than zero with bit 0x200 is "camera input": cd+0x14c = 1, ctx+0x118 = 1; ctx+0x120 = pitch, +0x124 = yaw,
+//   +0x130 = its length.
+//   0x18cf00 (bit 0x200 only): with ctx+0x118 the angles are re-read from the camera's position, then the linear branch
+//   pitch(cd+0x130) += dt * cd+0x1ec * ctx+0x120 (wrapped, clamped to cd+0x1d8..cd+0x1d4), yaw(cd+0x134) += dt *
+//   cd+0x1f0 * ctx+0x124 (wrapped): no clamp of the stick itself; a stick longer than 0.998 and mostly horizontal
+//   takes the ramp branch instead (yaw at a rate that ignores the stick's size). With ctx+0x118 it ends with cd+0x140 =
+//   pitch and the follow timers cd+0x120/0x124 re-armed.
+//   0x18d3e0 pulls the pitch back to cd+0x140: why a pitch written at ctx+0x120 alone (11-10b, the stick itself centred,
+//   ctx+0x118 = 0) "did not look up or down", and why the yaw needed the held stick (11-10c).
+//   The aim camera (bow, 0x178300 -> 0x176630): aim+0x180 == 1 ? the same (chr input)+0x50 : zero; pitch(aim+0x124) +=
+//   dt([args+0x10]) * pow(|stick|, *[eboot+0x27a81f0]) * stick.pitch / |stick| * (aim+0x50 / aim+0x114) * aim+0xdc, the
+//   yaw(aim+0x128) alike with aim+0xe0.
+// So the mouse goes in where the game reads the stick, as a stick whose value is the angle it must turn this frame:
+//   follow: {pitch, yaw} = sign * counts * rad per count / (|rate| * dt)   -> the linear branch turns exactly that angle
+//           (a detour on the 0.998 test sends this frame to the linear branch; a pad frame keeps the game's test);
+//   aim:    the vector whose pow(length, exponent) * direction is that angle / (dt * rate) (the zoom factor is the
+//           game's: KYTY_DS_MOUSE_AIM_ZOOM=0 divides it out).
+// Every other consequence of "the stick moved" (cd+0x14c, ctx+0x118, cd+0x140, the follow timers) is the game's own, as
+// with a pad. Nothing is clamped or dropped on our side, the angle does not depend on dt (60 or 120 fps alike), and a
+// frame without counts leaves the game's stick alone (the pad works as before). For KYTY_DS_MOUSE_HOLD_MS (100) after
+// the last counts a frame without them reads a 1e-6 stick, so a slow hand (fewer counts than frames) does not flip the
+// game between "stick moved" and "stick released" (cd+0x144: the pivot's follow factor ctx+0x90 changes with it).
+// Not the free camera (lock-on, recentre, input off) or no camera hook in 100 ms (menus): the mouse drives the emulated
+// stick as before (the lock-on's target switch).
+constexpr const char* FollowStick =
+    "80 b8 dc 02 00 00 01 75 13 48 8b 7b 08 e8 ?? ?? ?? ?? 48 8d 48 50 48 83 c0 58 eb 0b 48 8d 0d ?? ?? ?? ?? 48 8d 41 08 "
+    "48 8b 11 48 8b 00 8b 7b 74 48 8b 33 48 89 d1 41 89 d0 48 c1 e9 20 41 09 c8 41 f7 c0 ff ff ff 7f";
+constexpr uint64_t FollowSiteOffset = 39; // mov rdx, [rcx]; mov rax, [rax] (6 bytes)
+constexpr uint64_t FollowZeroDisp   = 31; // the disp32 of lea rcx, [rip + zero vector]
+// lea rcx, [rip + zero]; lea rax, [rcx + 8]; mov rcx, [rcx]; mov rax, [rax]; vmovd xmm0, ecx; shr rcx, 32; vpinsrd x3.
+constexpr const char* AimStick = "48 8d 0d ?? ?? ?? ?? 48 8d 41 08 48 8b 09 48 8b 00 c5 f9 6e c1 48 c1 e9 20 c4 e3 79 22 c1 01 "
+                                 "c4 e3 79 22 c0 02 48 c1 e8 20 c4 e3 79 22 d0 03";
+constexpr uint64_t AimSiteOffset = 11;   // mov rcx, [rcx]; mov rax, [rax] (6 bytes)
+constexpr uint64_t AimHeadBack   = 0x66; // cmp byte [rbx + 0x180], 1; jne <zero>; mov rdi, [r14]; call; lea; add; jmp <site>
+constexpr uint64_t AimExpoOffset = 0xa1; // mov rcx, [rip + exponent's address]; ... vmovss xmm1, [rcx] at +0xbe
+constexpr uint8_t  AimHead1[] {0x80, 0xbb, 0x80, 0x01, 0x00, 0x00, 0x01, 0x75, 0x5d, 0x49, 0x8b, 0x3e, 0xe8};
+constexpr uint8_t  AimHead2[] {0x48, 0x8d, 0x48, 0x50, 0x48, 0x83, 0xc0, 0x58, 0xeb, 0x56};
+constexpr double   RadPerDeg = 3.14159265358979323846 / 180.0;
+
+struct NativeState {
+	std::atomic<bool>     installed {false};
+	std::atomic<bool>     aim {false};
+	std::atomic<int64_t>  nx {0}, ny {0};           // counts pending (the window's thread adds, the hooks take)
+	std::atomic<int64_t>  free_ns {0};              // the last frame of a camera that takes the mouse (0: none)
+	std::atomic<int64_t>  mouse_ns {0};             // the last frame turned by the mouse
+	std::atomic<int64_t>  rx {0}, ry {0};           // stats: counts received (absolute)
+	std::atomic<int64_t>  routed {0};               // stats: counts that went to the emulated stick
+	std::atomic<uint8_t>* linear_flag   = nullptr;  // in the cave: this frame's stick is the mouse's (linear branch)
+	uint64_t              aim_expo_slot = 0;        // where the eboot keeps the address of the aim curve's exponent
+	double                pitch_scale   = 1.0;      // KYTY_DS_MOUSE_PITCH_SCALE, negative with KYTY_DS_MOUSE_INVERT_Y=1
+	int64_t               hold_ns       = 100000000;
+	bool                  aim_zoom      = true;     // KYTY_DS_MOUSE_AIM_ZOOM
+	bool                  stats         = false;    // KYTY_DS_MOUSE_STATS=1
+	// The camera's thread only.
+	int     kept_frames = 0;
+	int64_t log_ns = 0;
+	int64_t applied = 0, lost_not_free = 0, lost_aim = 0, lost_stale = 0, kept = 0, most = 0;
+	int     frames = 0, frames_free = 0, frames_aim = 0, frames_mouse = 0, frames_held = 0;
+	double  deg_yaw = 0.0, deg_yaw_net = 0.0, deg_pitch = 0.0, deg_pitch_net = 0.0, deg_pitch_clipped = 0.0;
+	float   last_dt = 0.0f, last_ry = 0.0f, last_rp = 0.0f, last_zoom = 0.0f, last_expo = 0.0f;
+	uint32_t last_yaw_off = 0;
+};
+NativeState g_native;
+
+double EnvDouble(const char* name, double def, double lo, double hi) {
+	const char* v = std::getenv(name);
+	if (v == nullptr || *v == '\0') return def;
+	const double d = std::atof(v);
+	return std::isfinite(d) && d >= lo && d <= hi ? d : def;
+}
+
+// The stick lanes' signs, from the game's own stick while the mouse still drives the emulated one (as the direct camera).
+void NativeLearnSigns(float game_pitch, float game_yaw) {
+	if (g_yaw_sign.load(std::memory_order_relaxed) == 0) {
+		const int sx = g_stick_x.load(std::memory_order_relaxed) - 128;
+		if (std::abs(sx) >= 40 && std::fabs(game_yaw) > 0.15f) {
+			g_yaw_sign = (game_yaw > 0) == (sx > 0) ? 1 : -1;
+			std::printf("Demon's Souls native mouse camera: yaw sign learned %d (stick x %d, game yaw %.2f)\n", g_yaw_sign.load(),
+			            sx, game_yaw);
+			std::fflush(stdout);
+		}
+	}
+	if (g_pitch_sign.load(std::memory_order_relaxed) == 0) {
+		const int sy = g_stick_y.load(std::memory_order_relaxed) - 128;
+		if (std::abs(sy) >= 40 && std::fabs(game_pitch) > 0.15f) {
+			g_pitch_sign = (game_pitch > 0) == (sy > 0) ? 1 : -1;
+			std::printf("Demon's Souls native mouse camera: pitch sign learned %d (stick y %d, game pitch %.2f)\n",
+			            g_pitch_sign.load(), sy, game_pitch);
+			std::fflush(stdout);
+		}
+	}
+}
+
+// KYTY_DS_MOUSE_STATS=1: every 5 s, the counts' account (received = applied + lost + still pending) and the angle.
+void NativeStats(int64_t now) {
+	auto& n = g_native;
+	if (!n.stats) return;
+	if (n.log_ns == 0) n.log_ns = now;
+	if (now - n.log_ns < 5000000000LL) return;
+	const int64_t rx = n.rx.exchange(0, std::memory_order_relaxed), ry = n.ry.exchange(0, std::memory_order_relaxed);
+	const int64_t pending = std::llabs(n.nx.load(std::memory_order_relaxed)) + std::llabs(n.ny.load(std::memory_order_relaxed));
+	const int64_t lost    = n.lost_not_free + n.lost_aim + n.lost_stale;
+	std::printf("Demon's Souls native mouse stats (%.1f s): counts received %lld (x %lld, y %lld), applied %lld, lost %lld "
+	            "(camera not free %lld, aim %lld, stale %lld), kept for a later frame %lld, still pending %lld, routed to the "
+	            "emulated stick %lld; angle applied: yaw %.1f deg (net %+.1f), pitch %.1f deg (net %+.1f; about %.1f deg asked "
+	            "beyond the camera's pitch limit); camera frames %d (free %d, aim %d), turned by the mouse %d, held %d; most "
+	            "counts in one frame %lld; %.4f deg per count; follow: dt %.4f, yaw rate %.3f rad/s (cd+0x%x), pitch rate "
+	            "%.3f rad/s; aim: zoom factor %.3f, curve exponent %.3f; signs yaw %d pitch %d\n",
+	            static_cast<double>(now - n.log_ns) * 1e-9, static_cast<long long>(rx + ry), static_cast<long long>(rx),
+	            static_cast<long long>(ry), static_cast<long long>(n.applied), static_cast<long long>(lost),
+	            static_cast<long long>(n.lost_not_free), static_cast<long long>(n.lost_aim), static_cast<long long>(n.lost_stale),
+	            static_cast<long long>(n.kept), static_cast<long long>(pending),
+	            static_cast<long long>(n.routed.exchange(0, std::memory_order_relaxed)), n.deg_yaw, n.deg_yaw_net, n.deg_pitch,
+	            n.deg_pitch_net, n.deg_pitch_clipped, n.frames, n.frames_free, n.frames_aim, n.frames_mouse, n.frames_held,
+	            static_cast<long long>(n.most), static_cast<double>(g_dpc.load(std::memory_order_relaxed)),
+	            static_cast<double>(n.last_dt), static_cast<double>(n.last_ry), n.last_yaw_off, static_cast<double>(n.last_rp),
+	            static_cast<double>(n.last_zoom), static_cast<double>(n.last_expo), g_yaw_sign.load(), g_pitch_sign.load());
+	std::fflush(stdout);
+	n.log_ns  = now;
+	n.applied = n.lost_not_free = n.lost_aim = n.lost_stale = n.kept = n.most = 0;
+	n.frames = n.frames_free = n.frames_aim = n.frames_mouse = n.frames_held = 0;
+	n.deg_yaw = n.deg_yaw_net = n.deg_pitch = n.deg_pitch_net = n.deg_pitch_clipped = 0.0;
+}
+
+// The counts pending, taken; false if there are none.
+bool NativeTake(int64_t* dx, int64_t* dy) {
+	*dx = g_native.nx.exchange(0, std::memory_order_acq_rel);
+	*dy = g_native.ny.exchange(0, std::memory_order_acq_rel);
+	return *dx != 0 || *dy != 0;
+}
+
+// The follow camera's stick read (eboot+0x18bd93): ctx = the frame's context, xy = the stick it just read {pitch, yaw}.
+void KYTY_SYSV_ABI NativeFollowHook(uint8_t* ctx, uint64_t* xy) {
+	auto&         n   = g_native;
+	const int64_t now = NowNs();
+	if (n.linear_flag != nullptr) n.linear_flag->store(0, std::memory_order_relaxed);
+	uint8_t* cd = nullptr;
+	std::memcpy(&cd, ctx, sizeof(cd));
+	if (cd == nullptr) return;
+	uint32_t flags = 0;
+	std::memcpy(&flags, ctx + 0x74, sizeof(flags));
+	const bool input_on = cd[0x2dc] == 1;
+	float      game[2] {0.0f, 0.0f};
+	std::memcpy(game, xy, sizeof(game));
+	if (input_on) NativeLearnSigns(game[0], game[1]);
+	n.frames++;
+	int64_t dx = 0, dy = 0;
+	if (!input_on || (flags & 0x200) == 0) {
+		// Lock-on, recentre, reset, input off: the game does not turn this camera by the stick. The mouse goes back to
+		// the emulated stick at once; what arrived since the last frame has no camera to turn.
+		n.free_ns.store(0, std::memory_order_relaxed);
+		if (NativeTake(&dx, &dy)) n.lost_not_free += std::llabs(dx) + std::llabs(dy);
+		NativeStats(now);
+		return;
+	}
+	n.frames_free++;
+	n.free_ns.store(now, std::memory_order_relaxed);
+	if (!NativeTake(&dx, &dy)) {
+		// No counts this frame. A pad's stick is left as read; an idle stick shortly after the mouse stays "moved".
+		if ((*xy & 0x7fffffff7fffffffULL) == 0 && n.hold_ns > 0 && now - n.mouse_ns.load(std::memory_order_relaxed) < n.hold_ns) {
+			const float held[2] {0.0f, 1e-6f};
+			std::memcpy(xy, held, sizeof(held));
+			n.frames_held++;
+		}
+		NativeStats(now);
+		return;
+	}
+	uint32_t yaw_off = BaseYawRate;
+	std::memcpy(&yaw_off, reinterpret_cast<const void*>(g_linear + YawRateOffset), sizeof(yaw_off));
+	const float dt = F(ctx, 0x44), rp = std::fabs(F(cd, 0x1ec)), ry = std::fabs(F(cd, yaw_off));
+	const int   ys = g_yaw_sign.load(std::memory_order_relaxed), ps = g_pitch_sign.load(std::memory_order_relaxed);
+	if (ys == 0 || ps == 0 || !std::isfinite(dt) || !std::isfinite(rp) || !std::isfinite(ry) || !(dt > 1e-4f) || !(rp > 1e-4f) ||
+	    !(ry > 1e-4f)) {
+		// Not convertible this frame (no dt, no rate yet): kept for the next one, a few frames at most (no late burst).
+		if (++n.kept_frames <= 8) {
+			n.nx.fetch_add(dx, std::memory_order_acq_rel);
+			n.ny.fetch_add(dy, std::memory_order_acq_rel);
+			n.kept += std::llabs(dx) + std::llabs(dy);
+		} else {
+			n.lost_stale += std::llabs(dx) + std::llabs(dy);
+		}
+		NativeStats(now);
+		return;
+	}
+	n.kept_frames = 0;
+	const double dpc   = static_cast<double>(g_dpc.load(std::memory_order_relaxed));
+	const double deg_y = static_cast<double>(dx) * dpc, deg_p = static_cast<double>(dy) * dpc * n.pitch_scale;
+	const float  stick[2] {static_cast<float>(ps * deg_p * RadPerDeg / (static_cast<double>(rp) * dt)),
+	                       static_cast<float>(ys * deg_y * RadPerDeg / (static_cast<double>(ry) * dt))};
+	std::memcpy(xy, stick, sizeof(stick));
+	if (n.linear_flag != nullptr) n.linear_flag->store(1, std::memory_order_relaxed);
+	n.mouse_ns.store(now, std::memory_order_relaxed);
+	if (n.stats) {
+		const int64_t c = std::llabs(dx) + std::llabs(dy);
+		n.applied += c;
+		if (c > n.most) n.most = c;
+		n.frames_mouse++;
+		n.deg_yaw += std::fabs(deg_y), n.deg_yaw_net += deg_y, n.deg_pitch += std::fabs(deg_p), n.deg_pitch_net += deg_p;
+		// The game clamps the pitch to cd+0x1d8..cd+0x1d4 (looking straight up or down): what was asked beyond it.
+		const double p1 = static_cast<double>(F(cd, 0x130)) + static_cast<double>(dt) * F(cd, 0x1ec) * stick[0];
+		const double lo = F(cd, 0x1d8), hi = F(cd, 0x1d4);
+		if (std::isfinite(p1) && std::isfinite(lo) && std::isfinite(hi) && lo < hi) {
+			if (p1 > hi) n.deg_pitch_clipped += (p1 - hi) / RadPerDeg;
+			if (p1 < lo) n.deg_pitch_clipped += (lo - p1) / RadPerDeg;
+		}
+		n.last_dt = dt, n.last_ry = ry, n.last_rp = rp, n.last_yaw_off = yaw_off;
+	}
+	NativeStats(now);
+}
+
+// The aim camera's stick read (eboot+0x1766f7): aim = the camera, args = its frame arguments (dt at +0x10), xy / zw =
+// the stick it just read ({pitch, yaw} and the two lanes that only count in its length).
+void KYTY_SYSV_ABI NativeAimHook(const uint8_t* aim, const uint8_t* args, uint64_t* xy, uint64_t* zw) {
+	auto&         n   = g_native;
+	const int64_t now = NowNs();
+	const bool    input_on = aim[0x180] == 1;
+	float         game[2] {0.0f, 0.0f};
+	std::memcpy(game, xy, sizeof(game));
+	if (input_on) NativeLearnSigns(game[0], game[1]);
+	n.frames++;
+	const float* expo_at = nullptr;
+	std::memcpy(&expo_at, reinterpret_cast<const void*>(n.aim_expo_slot), sizeof(expo_at));
+	float expo = 0.0f;
+	if (expo_at != nullptr) std::memcpy(&expo, expo_at, sizeof(expo));
+	const float dt = F(args, 0x10), zoom = F(aim, 0x50) / F(aim, 0x114), rp = std::fabs(F(aim, 0xdc)), ry = std::fabs(F(aim, 0xe0));
+	const int   ys = g_yaw_sign.load(std::memory_order_relaxed), ps = g_pitch_sign.load(std::memory_order_relaxed);
+	const bool  ok = input_on && ys != 0 && ps != 0 && std::isfinite(expo) && expo > 0.05f && expo < 20.0f && std::isfinite(dt) &&
+	                 dt > 1e-4f && std::isfinite(rp) && rp > 1e-4f && std::isfinite(ry) && ry > 1e-4f && std::isfinite(zoom) &&
+	                 zoom > 1e-3f;
+	int64_t dx = 0, dy = 0;
+	if (!ok) {
+		// Input off, or values this hook does not understand: the mouse drives the emulated stick, as before.
+		n.free_ns.store(0, std::memory_order_relaxed);
+		if (NativeTake(&dx, &dy)) n.lost_aim += std::llabs(dx) + std::llabs(dy);
+		NativeStats(now);
+		return;
+	}
+	n.frames_aim++;
+	n.free_ns.store(now, std::memory_order_relaxed);
+	if (!NativeTake(&dx, &dy)) {
+		NativeStats(now);
+		return;
+	}
+	const double dpc   = static_cast<double>(g_dpc.load(std::memory_order_relaxed));
+	const double deg_y = static_cast<double>(dx) * dpc, deg_p = static_cast<double>(dy) * dpc * n.pitch_scale;
+	const double unzoom = n.aim_zoom ? 1.0 : 1.0 / static_cast<double>(zoom);
+	const double a = ps * deg_p * RadPerDeg * unzoom / (static_cast<double>(dt) * rp);
+	const double b = ys * deg_y * RadPerDeg * unzoom / (static_cast<double>(dt) * ry);
+	const double m = std::hypot(a, b);
+	if (!(m > 0.0) || !std::isfinite(m)) {
+		n.lost_aim += std::llabs(dx) + std::llabs(dy);
+		NativeStats(now);
+		return;
+	}
+	// The game turns by pow(length, exponent) along the stick's direction: the length whose power is m.
+	const double len = std::pow(m, 1.0 / static_cast<double>(expo));
+	const float  stick[2] {static_cast<float>(a / m * len), static_cast<float>(b / m * len)};
+	std::memcpy(xy, stick, sizeof(stick));
+	*zw = 0;
+	n.mouse_ns.store(now, std::memory_order_relaxed);
+	if (n.stats) {
+		const int64_t c = std::llabs(dx) + std::llabs(dy);
+		n.applied += c;
+		if (c > n.most) n.most = c;
+		n.frames_mouse++;
+		const double z = n.aim_zoom ? static_cast<double>(zoom) : 1.0;
+		n.deg_yaw += std::fabs(deg_y) * z, n.deg_yaw_net += deg_y * z, n.deg_pitch += std::fabs(deg_p) * z, n.deg_pitch_net += deg_p * z;
+		n.last_zoom = zoom, n.last_expo = expo;
+	}
+	NativeStats(now);
+}
+
+// The three detours (one cave, the direct camera's address: the two are never installed together). False, nothing
+// patched, if the bytes differ or the cave cannot be made. *aim_at: the aim camera's site, 0 if only the follow camera.
+bool InstallNative(Program* program, uint64_t tilt, uint64_t linear, uint64_t* follow_at, uint64_t* aim_at, const char** why) {
+	auto& n     = g_native;
+	*follow_at = *aim_at = 0;
+	const auto follow = GuestCode::FindUnique(*program, GuestCode::Pattern(FollowStick));
+	if (!follow.has_value()) {
+		*why = "the follow camera's stick read of 01.007.000 (eboot+0x18bd6c) not found / bytes differ";
+		return false;
+	}
+	{
+		// The other source of that read is the eboot's zero vector.
+		int32_t disp = 0;
+		std::memcpy(&disp, reinterpret_cast<const void*>(*follow + FollowZeroDisp), sizeof(disp));
+		const uint64_t zero = *follow + FollowZeroDisp + 4 + static_cast<int64_t>(disp);
+		uint64_t       v[2] {0, 0};
+		if (zero >= program->base_vaddr && zero + sizeof(v) <= program->base_vaddr + program->base_size)
+			std::memcpy(v, reinterpret_cast<const void*>(zero), sizeof(v));
+		if (v[0] != 0 || v[1] != 0) {
+			*why = "the follow camera's stick read: its zero vector is not zero (another build?)";
+			return false;
+		}
+	}
+	const uint64_t site_f = *follow + FollowSiteOffset;
+	uint64_t       site_a = 0;
+	if (const auto aim = GuestCode::FindUnique(*program, GuestCode::Pattern(AimStick)); aim.has_value()) {
+		// The block before it: "input on" (aim+0x180) -> (chr input)+0x50, else the zero vector; and the curve's exponent.
+		const uint8_t* head = reinterpret_cast<const uint8_t*>(*aim - AimHeadBack);
+		const uint8_t* expo = reinterpret_cast<const uint8_t*>(*aim + AimExpoOffset);
+		if (std::memcmp(head, AimHead1, sizeof(AimHead1)) == 0 && std::memcmp(head + 17, AimHead2, sizeof(AimHead2)) == 0 &&
+		    expo[0] == 0x48 && expo[1] == 0x8b && expo[2] == 0x0d && expo[0x1d] == 0xc5 && expo[0x1e] == 0xfa && expo[0x1f] == 0x10 &&
+		    expo[0x20] == 0x09) {
+			int32_t disp = 0;
+			std::memcpy(&disp, expo + 3, sizeof(disp));
+			n.aim_expo_slot = *aim + AimExpoOffset + 7 + static_cast<int64_t>(disp);
+			site_a          = *aim + AimSiteOffset;
+		}
+	}
+	const uint64_t requested = program->base_vaddr + CaveOffset;
+	const uint64_t cave      = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+        requested, CavePage, Common::VirtualMemory::Mode::ExecuteReadWrite, "demons_souls_kbm_camera", true);
+	const auto in_reach = [&](uint64_t a) {
+		const int64_t d = static_cast<int64_t>(a) - static_cast<int64_t>(cave);
+		return d > -0x70000000LL && d < 0x70000000LL;
+	};
+	if (cave == 0 || !in_reach(tilt) || !in_reach(linear) || !in_reach(site_f) || (site_a != 0 && !in_reach(site_a))) {
+		if (cave != 0) Libs::LibKernel::Memory::FreeGuestMemory(cave, CavePage);
+		*why = "no executable memory near the eboot";
+		return false;
+	}
+	using namespace Xbyak::util;
+	Xbyak::ClearError();
+	Xbyak::CodeGenerator c(CavePage, reinterpret_cast<void*>(cave));
+	Xbyak::Label         flag;
+	constexpr uint8_t    save_fp[] {0x48, 0x0f, 0xae, 0x04, 0x24}; // FXSAVE64 [rsp]
+	// Registers, flags and FP state kept, below the red zone, on a realigned stack. After the pushes: [rsp] rbx, +8 r11,
+	// +16 r10, +24 r9, +32 r8, +40 rdi, +48 rsi, +56 rdx, +64 rcx, +72 rax.
+	const auto save = [&] {
+		c.lea(rsp, ptr[rsp - 128]);
+		c.pushfq();
+		for (const auto& reg: {rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, rbx})
+			c.push(reg);
+	};
+	const auto call_and_restore = [&](uint64_t host) {
+		c.mov(rbx, rsp);
+		c.and_(rsp, -16);
+		c.sub(rsp, 512);
+		c.db(save_fp, sizeof(save_fp));
+		c.mov(rax, host);
+		c.call(rax);
+		c.fxrstor64(ptr[rsp]);
+		c.mov(rsp, rbx);
+		for (const auto& reg: {rbx, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax})
+			c.pop(reg);
+		c.popfq();
+		c.lea(rsp, ptr[rsp + 128]);
+	};
+	// The 0.998 full-tilt test: the original vmovss xmm0, [rbx+0x130]; a mouse frame -> the linear branch, else the test.
+	const uint8_t* stub_t = c.getCurr();
+	c.db(reinterpret_cast<const uint8_t*>(tilt), 8);
+	c.cmp(byte[rip + flag], 0); // (flags are dead: the test sets them, the linear branch reads none)
+	c.jne(reinterpret_cast<const void*>(linear));
+	c.jmp(reinterpret_cast<const void*>(tilt + 8), Xbyak::CodeGenerator::T_NEAR);
+	// The follow camera's stick read: the original two loads (rdx = {pitch, yaw}), then the hook may replace rdx.
+	c.align(16);
+	const uint8_t* stub_f = c.getCurr();
+	c.db(reinterpret_cast<const uint8_t*>(site_f), 6);
+	save();
+	c.mov(rdi, rbx);           // ctx
+	c.lea(rsi, ptr[rsp + 56]); // the saved rdx
+	call_and_restore(reinterpret_cast<uint64_t>(&NativeFollowHook));
+	c.jmp(reinterpret_cast<const void*>(site_f + 6), Xbyak::CodeGenerator::T_NEAR);
+	// The aim camera's: the original two loads (rcx = {pitch, yaw}, rax = the other two lanes).
+	c.align(16);
+	const uint8_t* stub_a = c.getCurr();
+	if (site_a != 0) {
+		c.db(reinterpret_cast<const uint8_t*>(site_a), 6);
+		save();
+		c.mov(rdi, rbx);           // the aim camera
+		c.mov(rsi, r14);           // its frame arguments
+		c.lea(rdx, ptr[rsp + 64]); // the saved rcx
+		c.lea(rcx, ptr[rsp + 72]); // the saved rax
+		call_and_restore(reinterpret_cast<uint64_t>(&NativeAimHook));
+		c.jmp(reinterpret_cast<const void*>(site_a + 6), Xbyak::CodeGenerator::T_NEAR);
+	}
+	c.align(16);
+	c.L(flag);
+	const uint8_t* flag_at = c.getCurr();
+	c.dd(0);
+	c.ready();
+	if (Xbyak::GetError() || !Common::VirtualMemory::FlushInstructionCache(cave, c.getSize())) {
+		Libs::LibKernel::Memory::FreeGuestMemory(cave, CavePage);
+		*why = "the hook code could not be generated";
+		return false;
+	}
+	n.linear_flag = reinterpret_cast<std::atomic<uint8_t>*>(const_cast<uint8_t*>(flag_at)); // (the page is RWX)
+	n.linear_flag->store(0);
+	g_linear      = linear;
+	n.pitch_scale = EnvDouble("KYTY_DS_MOUSE_PITCH_SCALE", 1.0, 0.1, 4.0) * (Is1("KYTY_DS_MOUSE_INVERT_Y") ? -1.0 : 1.0);
+	n.hold_ns     = static_cast<int64_t>(EnvDouble("KYTY_DS_MOUSE_HOLD_MS", 100.0, 0.0, 1000.0) * 1e6);
+	if (const char* z = std::getenv("KYTY_DS_MOUSE_AIM_ZOOM"); z != nullptr && z[0] == '0') n.aim_zoom = false;
+	n.stats      = Is1("KYTY_DS_MOUSE_STATS");
+	g_yaw_sign   = EnvSign("KYTY_KBM_YAW_SIGN");
+	g_pitch_sign = EnvSign("KYTY_KBM_PITCH_SIGN");
+	const auto jmp = [](uint64_t at, const uint8_t* to, size_t size) {
+		uint8_t       j[8] {0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+		const int32_t rel = static_cast<int32_t>(reinterpret_cast<int64_t>(to) - static_cast<int64_t>(at + 5));
+		std::memcpy(j + 1, &rel, sizeof(rel));
+		std::memcpy(reinterpret_cast<void*>(at), j, size);
+		Common::VirtualMemory::FlushInstructionCache(at, size);
+	};
+	jmp(site_f, stub_f, 6);
+	if (site_a != 0) jmp(site_a, stub_a, 6);
+	jmp(tilt, stub_t, 8);
+	n.aim.store(site_a != 0);
+	n.installed.store(true);
+	*follow_at = site_f;
+	*aim_at    = site_a;
+	return true;
+}
+
 } // namespace
+
+// (mouse1) Read at each call (the port sets its environment before the emulator starts; nothing is cached here).
+bool NativeWanted() {
+	return Is1("KYTY_DS_MOUSE_NATIVE") && Is1("KYTY_KBM") && !Is1("KYTY_KBM_CALIBRATE");
+}
+
+bool NativeInstalled() {
+	return g_native.installed.load(std::memory_order_relaxed);
+}
+
+bool NativeTakesMouse() {
+	if (!g_native.installed.load(std::memory_order_relaxed) || g_yaw_sign.load(std::memory_order_relaxed) == 0 ||
+	    g_pitch_sign.load(std::memory_order_relaxed) == 0)
+		return false;
+	const int64_t seen = g_native.free_ns.load(std::memory_order_relaxed);
+	return seen != 0 && NowNs() - seen < 100000000;
+}
+
+void NativeAddMouse(int dx, int dy) {
+	g_native.nx.fetch_add(dx, std::memory_order_acq_rel);
+	g_native.ny.fetch_add(dy, std::memory_order_acq_rel);
+	g_native.rx.fetch_add(dx < 0 ? -static_cast<int64_t>(dx) : dx, std::memory_order_relaxed);
+	g_native.ry.fetch_add(dy < 0 ? -static_cast<int64_t>(dy) : dy, std::memory_order_relaxed);
+}
+
+void NativeNoteStickRouted(int64_t counts) {
+	if (g_native.installed.load(std::memory_order_relaxed)) g_native.routed.fetch_add(counts, std::memory_order_relaxed);
+}
 
 bool DirectWanted() {
 	static const bool wanted = [] {
 		if (!Is1("KYTY_KBM") || Is1("KYTY_KBM_CALIBRATE")) return false;
+		if (NativeWanted()) return false; // (mouse1) the native mouse camera replaces it
 		const char* v = std::getenv("KYTY_KBM_DIRECT");
 		return v == nullptr || v[0] != '0';
 	}();
@@ -364,14 +811,24 @@ void InstallNoRamp(Program* program) {
 	if (program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() || program->file_name.filename() != "eboot.bin")
 		return;
 	const int  mode   = NoRampMode();
+	const bool native = NativeWanted(); // (mouse1) KYTY_DS_MOUSE_NATIVE=1
 	const bool direct = DirectWanted();
-	if (Is1("KYTY_KBM") && !direct)
+	if (Is1("KYTY_DS_MOUSE_NATIVE") && !native)
+		std::printf("Demon's Souls native mouse camera: KYTY_DS_MOUSE_NATIVE=1 ignored (%s)\n",
+		            Is1("KYTY_KBM") ? "KYTY_KBM_CALIBRATE=1" : "keyboard and mouse is off: teclado_raton / KYTY_KBM=1");
+	if (Is1("KYTY_KBM") && !direct && !native)
 		std::printf("Demon's Souls direct mouse camera: off (%s); the mouse drives the right stick\n",
 		            Is1("KYTY_KBM_CALIBRATE") ? "KYTY_KBM_CALIBRATE=1" : "KYTY_KBM_DIRECT=0");
-	if (mode == 0 && !direct) {
+	// (mouse1) One line at start: the mouse mode in effect.
+	const auto mode_line = [](const char* text) {
+		std::printf("Demon's Souls mouse mode: %s\n", text);
+		std::fflush(stdout);
+	};
+	if (mode == 0 && !direct && !native) {
 		if (Is1("KYTY_KBM") || Is1("KYTY_KBM_CALIBRATE"))
 			std::printf("Demon's Souls camera: the game's full-tilt turn ramp kept (KYTY_KBM_NO_RAMP=0)\n");
-		std::fflush(stdout);
+		mode_line(Is1("KYTY_KBM") || Is1("KYTY_KBM_CALIBRATE") ? "emulated right stick, both axes (no hook; KYTY_DS_MOUSE_NATIVE off)"
+		                                                          : "keyboard and mouse off (pad only)");
 		return;
 	}
 	const auto tilt   = GuestCode::FindUnique(*program, GuestCode::Pattern(FullTilt));
@@ -395,8 +852,36 @@ void InstallNoRamp(Program* program) {
 		if (direct)
 			std::printf("Demon's Souls direct mouse camera: NOT applied (the free camera code of 01.007.000 not found / bytes "
 			            "differ); the mouse drives the right stick\n");
-		std::fflush(stdout);
+		mode_line(native ? "NATIVE asked (KYTY_DS_MOUSE_NATIVE=1) but NOT applied: hook bytes DIFFER (the free camera's full-tilt "
+		                   "test of 01.007.000 not found); emulated right stick, both axes"
+		                 : "emulated right stick (hook bytes differ; KYTY_DS_MOUSE_NATIVE off)");
 		return;
+	}
+	if (native) {
+		const char* why    = "";
+		uint64_t    follow = 0, aim = 0;
+		if (InstallNative(program, *tilt, *linear, &follow, &aim, &why)) {
+			char text[1024];
+			std::snprintf(text, sizeof(text),
+			              "NATIVE (KYTY_DS_MOUSE_NATIVE=1): hook bytes MATCH; follow camera stick read eboot+0x%llx, full-tilt "
+			              "test eboot+0x%llx, aim camera %s%llx; counts -> angle at %.4f deg per count (x raton_sensibilidad, "
+			              "live), no stick, no dead zone, no top rate; pitch scale %.2f%s, hold %lld ms, stats %s; signs yaw %d "
+			              "pitch %d (0 = learned on the first mouse motion)",
+			              static_cast<unsigned long long>(follow - program->base_vaddr),
+			              static_cast<unsigned long long>(*tilt - program->base_vaddr),
+			              aim != 0 ? "eboot+0x" : "NOT hooked (bytes differ: the bow keeps the stick) 0x",
+			              static_cast<unsigned long long>(aim != 0 ? aim - program->base_vaddr : 0),
+			              static_cast<double>(g_dpc.load()), std::fabs(g_native.pitch_scale),
+			              g_native.pitch_scale < 0.0 ? " inverted (KYTY_DS_MOUSE_INVERT_Y=1)" : "",
+			              static_cast<long long>(g_native.hold_ns / 1000000), g_native.stats ? "on (every 5 s)" : "off (KYTY_DS_MOUSE_STATS=1)",
+			              g_yaw_sign.load(), g_pitch_sign.load());
+			mode_line(text);
+		} else {
+			char text[384];
+			std::snprintf(text, sizeof(text),
+			              "NATIVE asked (KYTY_DS_MOUSE_NATIVE=1) but NOT applied (%s); emulated right stick, both axes", why);
+			mode_line(text);
+		}
 	}
 	if (direct) {
 		const char* why = "";
@@ -409,6 +894,10 @@ void InstallNoRamp(Program* program) {
 		else
 			std::printf("Demon's Souls direct mouse camera: NOT applied (%s); the mouse drives the right stick\n", why);
 		std::fflush(stdout);
+		mode_line(DirectInstalled() ? "direct yaw hook (hook bytes match) + emulated right stick for the pitch (KYTY_DS_MOUSE_NATIVE off)"
+		                            : "emulated right stick, both axes (direct hook not applied; KYTY_DS_MOUSE_NATIVE off)");
+	} else if (!native) {
+		mode_line("emulated right stick, both axes (turn ramp patch only; KYTY_DS_MOUSE_NATIVE off)");
 	}
 	if (mode == 0) return;
 	// jmp <ramp = 0>; nop (the 6-byte jbe).

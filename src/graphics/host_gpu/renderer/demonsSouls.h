@@ -47,5 +47,20 @@ bool TryLinearCopy(const ShaderComputeInputInfo& input, BufferCache& cache, uint
 // The same from the registers: for a shader the program-level checks passed for (its code unchanged since).
 bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
                    uint32_t mode);
+// (render4, KYTY_DS_LINEAR_COPY_HOOK; local/ds-linear-copy-hook.h) A linear copy known by its ranges - `count`
+// dwords from `src` to `dst`, the shader's period `period` dwords - as the game's function announced it in the
+// command buffer: LinearCopyOf's checks of the ranges (not those of the registers and descriptors, which the hook
+// made of the game's packets when it sealed the announcement), `commands` and `commands_bytes` the announcement and
+// the game's packets after it in place of the shader's parameter block.
+std::optional<LinearCopy> LinearCopyOfRanges(uint64_t dst, uint64_t src, uint32_t count, uint32_t period, uint64_t commands,
+                                             uint64_t commands_bytes, const char** reason = nullptr,
+                                             bool* aliased = nullptr);
+// ... copied on the CPU, as TryLinearCopy copies a dispatch's. False: not copied (the game's packets run).
+bool TryLinearCopyRanges(BufferCache& cache, uint64_t dst, uint64_t src, uint32_t count, uint32_t period, uint64_t commands,
+                         uint64_t commands_bytes);
+// (KYTY_DS_LINEAR_COPY_HOOK=2, verify) The copy an announcement makes, for the dispatch that follows it: TryLinearCopy
+// compares what it copies with it (DsLinearCopyHook's Verify counters; lines for the first differences). Render thread.
+void ExpectLinearCopy(uint64_t dst, uint64_t src, uint32_t count, uint32_t period, uint64_t commands,
+                      uint64_t commands_bytes);
 } // namespace DemonsSouls
 } // namespace Libs::Graphics

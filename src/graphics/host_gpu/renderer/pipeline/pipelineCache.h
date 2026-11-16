@@ -278,6 +278,19 @@ public:
 	// (native bindings, for table mode programs).
 	[[nodiscard]] Pipeline* TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                                 const ShaderProgram&          compute_program);
+	// (render2, KYTY_ASYNC_COMPUTE_PIPELINES) The normal path's compute pipeline, as CreateComputePipeline makes it
+	// (the same build, driver cache, remake, optimized build and recording), compiled on a compile worker ahead of the
+	// workers' other jobs. GPU thread. Find: the pipeline when it is made (one a worker finished is taken in), null
+	// otherwise, nothing started; Queue: as Find, and a pipeline neither made nor compiling goes to a worker (null:
+	// PipelineWaiting is its completion); Block: waits for the worker (nothing compiling: CreateComputePipeline), null
+	// only while the cache shuts down. `compiling`: whether a worker has it.
+	enum class AsyncCompute { Find, Queue, Block };
+	[[nodiscard]] Pipeline* TryCreateComputePipelineAsync(const ShaderComputeInputInfo& input_info,
+	                                                      const ShaderProgram& compute_program, AsyncCompute how,
+	                                                      bool* compiling = nullptr);
+	// Its workers' compiles so far: how many, and their time (microseconds). Any thread.
+	[[nodiscard]] uint64_t AsyncComputeCompiled() const { return m_async_compute_done.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t AsyncComputeCompileUs() const { return m_async_compute_us.load(std::memory_order_relaxed); }
 	// The optimized builds finished since replace their unoptimized pipelines (at each flip: the draws of native
 	// XPR records hold their pipelines and look nothing up). GPU thread.
 	// Each flip (from the CPU or the GPU's commands): optimized builds in place, shader plans unused for a while out of
@@ -413,6 +426,11 @@ private:
 	                                m_pending_graphics_pipelines;
 	struct PendingComputePipeline;
 	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_compute_pipelines;
+	// (render2) TryCreateComputePipelineAsync: the normal path's compute pipelines a worker is still compiling, by
+	// program (a map of their own: the table dispatches' above are other pipelines, with native bindings).
+	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_normal_compute_pipelines;
+	std::atomic<uint64_t>                                                 m_async_compute_done {0};
+	std::atomic<uint64_t>                                                 m_async_compute_us {0};
 	std::unique_ptr<CompileWorkers> m_compile_workers;
 	std::shared_ptr<const std::atomic<bool>> m_pipeline_waiting; // (PipelineWaiting)
 	// Table mode programs and pipelines (src/local/table-xpr.inc): a new area brings hundreds, which ahead of the

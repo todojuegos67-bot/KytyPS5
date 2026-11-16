@@ -7,6 +7,8 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "writeback-verify.h"
+#include "raiz-wb-guard.h" // (crash-ba2b1f: KYTY_RAIZ_WB_GUARD)
+#include "loader/demonsSoulsWriteAudit.h"
 
 #include <atomic>
 #include <immintrin.h>
@@ -123,6 +125,9 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 // the value of its last such change: the CPU-dirty pages of a region whose clock is not above a value read earlier were
 // dirty all the time since (nothing made them clean: see CommandScheduler::UploadPrologue).
 inline std::atomic<uint64_t> g_cpu_dirty_clock {1};
+// (policy1, KYTY_DS_NEIGHBOR_SPLIT) Clean pages an upload left without their write watcher because they are no-watch
+// (RegionManager::SetNoWatch): the protection changes the policy saved, for its line.
+inline std::atomic<uint64_t> g_nowatch_kept_pages {0};
 [[nodiscard]] inline uint64_t NextCpuDirtyClock() noexcept {
 	return g_cpu_dirty_clock.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
@@ -142,6 +147,16 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// (crash-ba2b1f) Crash reports: the bits of the page of `vaddr` (inside this region), read WITHOUT the lock (a hint:
+	// the crashing thread may hold it). Libs::LibKernel::Memory::RaizPeek* bits.
+	[[nodiscard]] uint32_t PeekPageUnlocked(uint64_t vaddr) const noexcept {
+		if (vaddr < m_cpu_addr || vaddr - m_cpu_addr >= TRACKER_REGION_SIZE) return 0;
+		const auto page = static_cast<size_t>((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+		namespace M     = ::Libs::LibKernel::Memory;
+		return M::RaizPeekRegion | (m_cpu_dirty.Get(page) ? M::RaizPeekCpuDirty : 0u) | (m_gpu_dirty.Get(page) ? M::RaizPeekGpuDirty : 0u) |
+		       (m_writable.Get(page) ? M::RaizPeekWritable : 0u) | (m_readable.Get(page) ? M::RaizPeekReadable : 0u) |
+		       (m_nowatch.Get(page) ? M::RaizPeekNoWatch : 0u) | (m_nosplit.Get(page) ? M::RaizPeekNoSplit : 0u);
+	}
 	// See g_cpu_dirty_clock.
 	[[nodiscard]] uint64_t LastDirtyClock() const noexcept { return m_last_dirty.load(std::memory_order_acquire); }
 	[[nodiscard]] uint64_t CpuModificationEpoch() const {
@@ -200,7 +215,10 @@ public:
 			UpdateCpuProtection<!enable>(start, end);
 		} else {
 			// (GPU-written pages given back to the CPU hold the GPU's bytes now: the epoch moves, NoteHostWrite.)
-			if constexpr (!enable) m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			if constexpr (!enable) {
+				m_cpu_epoch.fetch_add(1, std::memory_order_release);
+				NoteVolatileClean(); // (the pages given back are clean now)
+			}
 			UpdateGpuProtection<enable>();
 		}
 	}
@@ -240,9 +258,138 @@ public:
 		}
 		if constexpr (source == DirtySource::Gpu && clear) {
 			m_cpu_epoch.fetch_add(1, std::memory_order_release); // (as ChangeState's)
+			NoteVolatileClean();
 			UpdateGpuProtection<false>();
 		}
 		ForEachRange(mask, std::forward<Func>(func));
+	}
+
+	// KYTY_VOLATILE=1 (MemoryTracker): memory the game rewrites every frame (its frame rings, KYTY_VOLATILE_RANGES). Its
+	// pages are never write-protected for the CPU: an upload leaves them clean but writable (no syscall, no later
+	// fault), and MemoryTracker::VolatileRedirty makes the pages the game may have written since CPU-dirty again, so
+	// what the next draws read is uploaded again. GPU-dirty pages keep the usual rules.
+	// Set under the region lock (at creation, or later for the game's rings); read under it.
+	[[nodiscard]] bool IsVolatile() const noexcept { return m_volatile.load(std::memory_order_relaxed); }
+	// (Region lock held.) Returns the pages that became dirty.
+	size_t SetVolatile() {
+		m_volatile.store(true, std::memory_order_relaxed);
+		const size_t pages = MarkVolatileDirty();
+		UpdateCpuProtection<false>(0, TRACKER_REGION_PAGES); // (a page still write-protected loses it, once)
+		return pages;
+	}
+	// (Region lock held.) The pages of [start, end) neither GPU-dirty nor CPU-dirty become CPU-dirty (bits only).
+	// Nothing changed (all dirty already): nothing is done, no epoch, no clock, no protection call. A page that
+	// changed and is still write-protected (one the GPU gave back) is unprotected: the only syscall it can make.
+	// Returns the pages that became dirty.
+	size_t MarkVolatileDirty(size_t start = 0, size_t end = TRACKER_REGION_PAGES) {
+		RegionBits clean = ~m_gpu_dirty;
+		clean &= ~m_cpu_dirty;
+		const RegionBits add(clean, start, end);
+		if (add.None()) return 0;
+		const size_t pages = add.Count();
+		m_cpu_dirty ^= add; // (disjoint: an OR)
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		UpdateCpuProtection<false>(start, end);
+		return pages;
+	}
+	// KYTY_VOLATILE: some page of this volatile region became clean (an upload, the GPU giving pages back) since the
+	// last TakeVolatileClean. MemoryTracker re-dirties the allocator/ctx regions only when it is set, so an idle region
+	// costs one load per call. Hint: readable without the lock; Take under it.
+	[[nodiscard]] bool VolatileCleanHint() const noexcept { return m_volatile_clean.load(std::memory_order_acquire); }
+	bool               TakeVolatileClean() noexcept { return m_volatile_clean.exchange(false, std::memory_order_acq_rel); }
+
+	// (policy1) KYTY_DS_NEIGHBOR_SPLIT (loader/demonsSoulsWriteAudit.h; nothing below is ever set without it): a
+	// "no-watch" page is never write-protected for the CPU. An upload leaves it clean and writable, so the game's
+	// writes to it are not seen; it becomes CPU-dirty again only when a hook of the game announces a write
+	// (MarkNoWatchDirty) or when it stops being no-watch (ClearNoWatch: a consumer asked for bytes of it no hook
+	// covers). GPU-dirty pages keep the usual rules. All of it under the region lock; HasNoWatch is a hint.
+	[[nodiscard]] bool HasNoWatch() const noexcept { return m_has_nowatch.load(std::memory_order_relaxed); }
+	// (Region lock held, or TrackingSpinLock::ReadShared.) Some page of the range is no-watch.
+	[[nodiscard]] bool AnyNoWatch(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return m_nowatch.AnyInRange(start, end);
+	}
+	// (Region lock held.) The page of `vaddr` becomes no-watch: CPU-dirty now (the write that faulted lands after
+	// this returns and is in the page's next upload) and its write watcher released. False, nothing changed: the GPU
+	// wrote the page, it is no-watch already, or a consumer refused it before (ClearNoWatch with `block`).
+	// (anuncio1) `why` (may be null), when false: 1 GPU-dirty, 2 no-watch already (another watcher keeps the page
+	// protected: an image, fresh memory), 3 refused before (ClearNoWatch with `block`). The no-watch policy's counters.
+	[[nodiscard]] bool SetNoWatch(uint64_t vaddr, int* why = nullptr) {
+		const auto [start, end] = GetPageRange(vaddr, 1);
+		if (m_gpu_dirty.Get(start) || m_nowatch.Get(start) || m_nosplit.Get(start)) {
+			if (why != nullptr) *why = m_gpu_dirty.Get(start) ? 1 : m_nowatch.Get(start) ? 2 : 3;
+			return false;
+		}
+		m_nowatch.Set(start);
+		m_has_nowatch.store(true, std::memory_order_relaxed);
+		if (!m_cpu_dirty.Get(start)) {
+			m_cpu_dirty.Set(start);
+			m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+			BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		}
+		UpdateCpuProtection<false>(start, end);
+		return true;
+	}
+	// (Region lock held.) The no-watch pages of the range neither GPU-dirty nor CPU-dirty become CPU-dirty (bits
+	// only: they are writable already). Returns how many.
+	size_t MarkNoWatchDirty(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		RegionBits clean        = m_nowatch & ~m_gpu_dirty;
+		clean &= ~m_cpu_dirty;
+		const RegionBits add(clean, start, end);
+		if (add.None()) return 0;
+		m_cpu_dirty ^= add; // (disjoint: an OR)
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		return add.Count();
+	}
+	// (Region lock held.) The no-watch pages of the range are watched again: CPU-dirty now (their bytes may have
+	// changed unseen; the next upload makes them clean and write-protected as any page), a GPU-dirty one given the
+	// write watcher it never got. `block`: they are not made no-watch again. Returns how many.
+	size_t ClearNoWatch(uint64_t offset, uint64_t size, bool block) {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const RegionBits mask(m_nowatch, start, end);
+		if (mask.None()) return 0;
+		m_nowatch ^= mask;
+		if (block) {
+			for (const auto [first, last]: mask) {
+				m_nosplit.SetRange(first, last);
+				// (anuncio1, KYTY_RAIZ_ANNOUNCE) When it was refused: a frame page handed out again after it may be
+				// made no-watch again (DemonsSoulsWriteAudit::UnblockWanted). One relaxed load when off.
+				if (::Loader::DemonsSoulsWriteAudit::AnnounceOn())
+					::Loader::DemonsSoulsWriteAudit::NoteBlockedRun(m_cpu_addr + first * TRACKER_PAGE_SIZE, m_cpu_addr + last * TRACKER_PAGE_SIZE);
+			}
+		}
+		RegionBits add = mask & ~m_gpu_dirty;
+		add &= ~m_cpu_dirty;
+		if (!add.None()) {
+			m_cpu_dirty ^= add;
+			m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+			BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		}
+		UpdateCpuProtection<true>(start, end);
+		return mask.Count();
+	}
+	// (anuncio1, KYTY_RAIZ_ANNOUNCE; region lock held) The page of `vaddr` is no longer refused (its refusal belonged to a
+	// reservation of a frame allocator that has been handed out again since): SetNoWatch may take it. True: it was.
+	bool UnblockNoWatch(uint64_t vaddr) {
+		const auto [start, end] = GetPageRange(vaddr, 1);
+		if (!m_nosplit.Get(start)) return false;
+		m_nosplit.Unset(start);
+		return true;
+	}
+	// (Region lock held.) The range is no tracked memory any more (MemoryTracker::UntrackMemory made it CPU-dirty and
+	// unwatched): its pages forget the policy's state.
+	void ForgetNoWatch(uint64_t offset, uint64_t size) {
+		if (!HasNoWatch()) return;
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		m_nowatch.UnsetRange(start, end);
+		m_nosplit.UnsetRange(start, end);
 	}
 
 	// Own cache line: guest fault handling updates the epoch and bitmaps below.
@@ -254,7 +401,38 @@ private:
 	// MarkCpuDirtyKeepProtection, are left alone by a change that only made other pages clean or dirty.)
 	template <bool track>
 	void UpdateCpuProtection(size_t start, size_t end) {
-		const auto changed = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+		// (Volatile: clean pages stay writable, see SetVolatile.)
+		if constexpr (track) {
+			if (m_volatile.load(std::memory_order_relaxed)) {
+				m_volatile_clean.store(true, std::memory_order_release); // (pages were made clean: an upload)
+				return;
+			}
+		}
+		auto changed = track ? m_writable & ~m_cpu_dirty : m_cpu_dirty & ~m_writable;
+		// (policy1: a no-watch page stays writable when it becomes clean. One load unless the region has some.)
+		if (track && m_has_nowatch.load(std::memory_order_relaxed)) {
+			const RegionBits kept(changed & m_nowatch, start, end);
+			if (!kept.None()) {
+				g_nowatch_kept_pages.fetch_add(kept.Count(), std::memory_order_relaxed);
+				// (anuncio1, KYTY_RAIZ_ANNOUNCE + KYTY_RAIZ_VERIFY) Clean now, before the upload copies them
+				// (MemoryTracker::ForEachUploadRange): their write watch starts over. A write found there when GPU work
+				// is about to use them, with no announcement in between, is one the GPU would miss.
+				if (::Loader::DemonsSoulsWriteAudit::AnnounceVerifyOn()) {
+					for (const auto [first, last]: kept)
+						::Loader::DemonsSoulsWriteAudit::NoteNoWatchCleanRun(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				}
+				// (policy6, KYTY_DS_WRITE_FRAME=2) The sampled ones are hashed: their upload copies them now.
+				if (::Loader::DemonsSoulsWriteAudit::CheckStaleOn()) {
+					for (const auto [first, last]: kept) {
+						for (size_t page = first; page < last; ++page) {
+							const uint64_t address = m_cpu_addr + page * TRACKER_PAGE_SIZE;
+							if (::Loader::DemonsSoulsWriteAudit::SampledPage(address)) ::Loader::DemonsSoulsWriteAudit::NoteNoWatchClean(address);
+						}
+					}
+				}
+			}
+			changed &= ~m_nowatch;
+		}
 		RegionBits mask(changed, start, end);
 		if (mask.None()) {
 			return;
@@ -289,6 +467,13 @@ private:
 			}
 		}
 		if constexpr (track) {
+			// (crash-ba2b1f, KYTY_RAIZ_WB_GUARD) The pages the GPU takes: their write watch starts over before they lose
+			// access, so a game write that reaches no fault from here on is seen at their write-back (BufferCache::
+			// WriteBackGpuOwned). One relaxed load when off.
+			if (::Libs::LibKernel::Memory::RaizWbGuardOn()) {
+				for (const auto [start, end]: mask)
+					::Libs::LibKernel::Memory::RaizWbGpuOwned(m_cpu_addr + start * TRACKER_PAGE_SIZE, (end - start) * TRACKER_PAGE_SIZE);
+			}
 			m_page_manager.UpdatePageWatchersForRegion<true, true>(m_cpu_addr, mask);
 		} else {
 			m_page_manager.UpdatePageWatchersForRegion<false, true>(m_cpu_addr, mask);
@@ -339,6 +524,15 @@ private:
 	RegionBits            m_gpu_dirty;
 	RegionBits            m_writable;
 	RegionBits            m_readable;
+	std::atomic<bool>     m_volatile {false}; // (SetVolatile)
+	std::atomic<bool>     m_has_nowatch {false}; // (policy1: some bit of m_nowatch was set at some time)
+	RegionBits            m_nowatch;             // (policy1: SetNoWatch; all clear without the policy)
+	RegionBits            m_nosplit;             // (policy1: ClearNoWatch with `block`)
+	std::atomic<bool>     m_volatile_clean {false}; // (VolatileCleanHint)
+
+	void NoteVolatileClean() noexcept {
+		if (m_volatile.load(std::memory_order_relaxed)) m_volatile_clean.store(true, std::memory_order_release);
+	}
 };
 
 } // namespace Libs::Graphics

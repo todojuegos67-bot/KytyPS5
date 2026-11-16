@@ -9,6 +9,11 @@
 // into the guest's fault handler, and unmapping a range waits for the jobs on it before the range can be reused.
 
 #include "common/guardedCopy.h"
+#include "raiz.h" // (raiz2: KYTY_RAIZ, CopyFrom)
+
+namespace Libs::LibKernel::Memory {
+bool NativeGuardedRead(void* destination, const void* guest, uint64_t size); // (raiz2, kernel/memory.h)
+} // namespace Libs::LibKernel::Memory
 #include "live-census.h"
 #include "live-counters.h"
 #include "local-platform.h"
@@ -55,6 +60,33 @@ inline volatile std::atomic<uint32_t> kyty_local_upload_help {[] {
 
 namespace AsyncUpload {
 
+// (raiz10) Now OFF by default (=1 turns it on): 20261116-044058 (KYTY_RAIZ=1) measured it - the worker waited for the
+// protection side's lock 102.6 ms/s out of the protection thread's 128.6 ms/s (the two serialized through it, no overlap),
+// the GPU thread's upload wait as before (upw 2.93 against raiz8's 2.89), and a protection queued after a copy may run
+// during that copy (the flicker the user saw rising with the frame rate is suspected of it: not proven).
+// (raiz9) KYTY_UPLOAD_PROT_THREAD (default on; =0: as before): the upload jobs' write protections run on a thread of their
+// own (Kyty.UploadProt), in queue order, ahead of the worker, which copies every run whose protections are done while the
+// next ones are being protected. Before, the worker did a whole backlog's protections, then its copies: its time was their
+// sum, and the GPU thread's wait at each submission (Drain) waited for both. 20261116-034739 (KYTY_RAIZ=1), at 4-6.5 k table
+// draws: the worker busy 4.6-6.1 ms/frame, 2.3-3.2 of it protections (upload_call_us), the GPU thread waiting for it 2.0-3.6
+// ms/frame (upload); the old memory (203605, 215649): busy 2.7-4.2, protections 1.0-1.3, waits 1.0-1.7. A copy still comes
+// after every protection pushed before it (the order the write faults need: a write after the copy faults), and a call
+// that is not a protection still runs on the worker, in order, with every protection before it done and none after it
+// begun. The worker protects too when it has nothing protected to copy (never slower than before), and copies a run only
+// once it holds 1 MiB or the protections caught up with it (the copies' helper threads start at 1 MiB: CopyRun).
+[[nodiscard]] inline bool ProtThreadOn() {
+	static const bool on = [] {
+		const char* v   = std::getenv("KYTY_UPLOAD_PROT_THREAD");
+		const bool  set = v != nullptr && v[0] == '1'; // (raiz10: off unless =1)
+		std::printf("Upload worker: protection thread %s (KYTY_UPLOAD_PROT_THREAD%s): the uploads' write protections run ahead "
+		            "of their copies on a thread of their own\n",
+		            set ? "ON" : "off", set ? "=0 turns it off" : "=1 turns it on");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+
 // True on the worker's thread (a fault there cannot wait for the render thread, which may wait for the worker).
 inline thread_local bool t_worker = false;
 
@@ -65,6 +97,12 @@ inline thread_local bool t_worker = false;
 // them, true when some ran.
 inline bool (*g_serve_hook)(bool serve) = nullptr;
 
+// (anuncio2, KYTY_RAIZ_ANNOUNCE with KYTY_RAIZ_VERIFY or KYTY_DS_WRITE_FRAME=2: the audits of the no-watch pages) Told
+// on the copying thread just before (`done` false) and just after (`done` true, `destination` holding the bytes read)
+// each copy of guest [guest, guest + size) into staging memory. Null (the default): one relaxed load per copy.
+// Set by BufferCache (bufferCache.cpp) when an audit is on.
+inline std::atomic<void (*)(uint64_t guest, const uint8_t* destination, uint64_t size, bool done)> g_copy_hook {nullptr};
+
 class Worker {
 public:
 	static constexpr uint64_t Capacity = 1u << 16;
@@ -72,12 +110,16 @@ public:
 	// whose locks protections take (bufferCache.cpp asserts it is TRACKER_REGION_SIZE).
 	static constexpr uint64_t LaneRegion = uint64_t {4} << 20u;
 
-	Worker(): m_jobs(std::make_unique<Job[]>(Capacity)), m_thread([this] { Run(); }) {}
+	Worker(): m_jobs(std::make_unique<Job[]>(Capacity)), m_pipeline(ProtThreadOn()), m_thread([this] { Run(); }) {
+		if (m_pipeline) m_prot_thread = std::thread([this] { ProtRun(); }); // (raiz9)
+	}
 	~Worker() {
 		m_stop.store(true, std::memory_order_seq_cst);
 		m_head.fetch_add(0, std::memory_order_seq_cst);
 		m_head.notify_all();
+		m_done.notify_all(); // (raiz9: the protection thread may wait for the worker's progress)
 		m_thread.join();
+		if (m_prot_thread.joinable()) m_prot_thread.join();
 		m_lane_posted.fetch_add(1, std::memory_order_seq_cst);
 		m_lane_posted.notify_all();
 		if (m_lane_thread.joinable()) m_lane_thread.join();
@@ -104,7 +146,8 @@ public:
 	}
 	// Render thread only: wakes the worker after a batch of pushes.
 	void Kick() {
-		if (m_sleeping.load(std::memory_order_seq_cst)) m_head.notify_one();
+		// (raiz9: two threads may sleep on m_head - the worker, the protection thread -: both woken.)
+		if (m_sleeping.load(std::memory_order_seq_cst) || m_prot_sleeping.load(std::memory_order_seq_cst)) m_head.notify_all();
 	}
 	// Render thread only: the sequence number of the last pushed copy.
 	[[nodiscard]] uint64_t Pushed() const { return m_head.load(std::memory_order_relaxed); }
@@ -154,6 +197,12 @@ public:
 	// mapping, which may fault into a readback) is left to the worker, and waited for.
 	void Help(uint64_t sequence) {
 		if (m_done.load(std::memory_order_acquire) >= sequence) return;
+		// (raiz9: with the protection thread the jobs' order is kept by the worker and that thread alone: waited for.)
+		if (m_pipeline) {
+			Kick();
+			Wait(sequence);
+			return;
+		}
 		const auto start = std::chrono::steady_clock::now();
 		// The jobs at the worker's priority, not the render thread's above the game's threads: held to four CPUs, the game's
 		// threads starved behind them, frames of 100-500 ms with the render thread idle (1-1, 1% lows 25-45 -> 7-13 fps;
@@ -197,7 +246,8 @@ private:
 
 	uint64_t Add(const Job& job) {
 		const uint64_t head = m_head.load(std::memory_order_relaxed);
-		while (head - m_done.load(std::memory_order_acquire) >= Capacity) {
+		// (raiz9: a slot is free once the worker and the protection thread are both past it.)
+		while (head - OldestInUse() >= Capacity) {
 			Kick();
 			_mm_pause();
 		}
@@ -208,7 +258,8 @@ private:
 
 	void Run() {
 		LocalPlatform::SetThreadName("Kyty.Upload");
-		t_worker = true;
+		t_worker               = true;
+		Raiz::t_upload_thread  = true; // (raiz9: the "[raiz]" line's PROTECT COST, upload threads)
 		// Created by the render thread: do not inherit its dedicated CPU.
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		// Pause iterations the worker polls for new copies before it sleeps (while its CPUs idle: spin-gate.h).
@@ -244,6 +295,7 @@ private:
 	// Jobs [done, head) in queue order (the caller holds m_process), m_done published as they finish; `helper`: stops at a
 	// call other than a write protection. Returns the jobs' new end.
 	uint64_t Process(uint64_t done, uint64_t head, bool helper) {
+		if (m_pipeline && !helper) return ProcessPipelined(done, head); // (raiz9)
 		const auto start = std::chrono::steady_clock::now();
 		const auto since = [](std::chrono::steady_clock::time_point from) {
 			return static_cast<uint64_t>((std::chrono::steady_clock::now() - from).count()) / 1000u;
@@ -285,6 +337,156 @@ private:
 	}
 
 	static void CallJob(const Job& job) { job.call(job.context, reinterpret_cast<uint64_t>(job.destination), job.size); }
+
+	// ---- (raiz9) KYTY_UPLOAD_PROT_THREAD ---------------------------------------------------------------------------
+	// m_prot_next: every protection job before it is done, and no protection job from it on has begun. Changed under
+	// m_prot_mutex by whichever thread protects (the protection thread, or the worker when it has nothing to copy).
+	static constexpr uint64_t PipelineMinBytes = uint64_t {1} << 20u; // (CopyRun's helper threads start there)
+	static constexpr uint32_t ProtBatch        = 8;                   // protections per lock hold
+	static uint64_t           UsSince(std::chrono::steady_clock::time_point from) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - from).count());
+	}
+
+	[[nodiscard]] uint64_t OldestInUse() const {
+		const uint64_t done = m_done.load(std::memory_order_acquire);
+		if (!m_pipeline) return done;
+		return std::min(done, m_prot_next.load(std::memory_order_acquire));
+	}
+
+	void PublishDone(uint64_t done) {
+		m_done.store(done, std::memory_order_seq_cst);
+		if (m_waiters.load(std::memory_order_seq_cst) != 0) m_done.notify_all();
+	}
+
+	// The protection jobs from m_prot_next up to `limit` (at most ProtBatch of them), in queue order. A call that is not a
+	// protection stops it until the worker ran it (m_done past it). `worker`: the worker's own (timed apart). Returns the
+	// new m_prot_next.
+	uint64_t AdvanceProtections(uint64_t limit, bool worker) {
+		std::unique_lock lock(m_prot_mutex, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			if (!worker) return m_prot_next.load(std::memory_order_acquire); // (the worker protects: the thread lets it)
+			const auto waiting = std::chrono::steady_clock::now();
+			lock.lock();
+			Raiz::g_up_prot_lock_us.fetch_add(UsSince(waiting), std::memory_order_relaxed);
+		}
+		uint64_t       next  = m_prot_next.load(std::memory_order_relaxed);
+		const uint64_t head  = m_head.load(std::memory_order_acquire);
+		const uint64_t until = std::min(limit, head);
+		const auto     start = std::chrono::steady_clock::now();
+		uint32_t       ran   = 0;
+		while (next < until && ran < ProtBatch) {
+			const Job& job = m_jobs[next % Capacity];
+			if (job.call != nullptr) {
+				if (job.protection) {
+					if (m_last_call == job.call && m_last_context == job.context && m_last_end == job.guest)
+						Raiz::g_up_adjacent.fetch_add(1, std::memory_order_relaxed);
+					m_last_call    = job.call;
+					m_last_context = job.context;
+					m_last_end     = job.guest + job.guest_size;
+					CallJob(job);
+					++ran;
+				} else if (m_done.load(std::memory_order_acquire) <= next) {
+					break; // (another call: the worker's, in order; protections after it wait for it)
+				}
+			}
+			++next;
+		}
+		m_prot_next.store(next, std::memory_order_release);
+		if (ran != 0) {
+			const uint64_t us = UsSince(start);
+			Raiz::g_up_prot_jobs.fetch_add(ran, std::memory_order_relaxed);
+			(worker ? Raiz::g_up_prot_us_worker : Raiz::g_up_prot_us_thread).fetch_add(us, std::memory_order_relaxed);
+			LiveCounters::Add(LiveCounters::UploadCallUs, us);
+		}
+		return next;
+	}
+
+	// The worker's jobs [done, head) with the protection thread: calls in order (every protection before each done), the
+	// copies of each run as soon as their protections are (1 MiB at least, or the run's rest). Publishes m_done as it goes.
+	uint64_t ProcessPipelined(uint64_t done, uint64_t head) {
+		const auto start = std::chrono::steady_clock::now();
+		while (done < head) {
+			if (const Job& job = m_jobs[done % Capacity]; job.call != nullptr && !job.protection) {
+				while (m_prot_next.load(std::memory_order_acquire) < done) (void)AdvanceProtections(done, true);
+				const auto called = std::chrono::steady_clock::now();
+				CallJob(job);
+				LiveCounters::Add(LiveCounters::UploadCallUs, UsSince(called));
+				PublishDone(++done);
+				continue;
+			}
+			uint64_t end = done;
+			for (; end < head; ++end) {
+				const Job& next = m_jobs[end % Capacity];
+				if (next.call != nullptr && !next.protection) break;
+			}
+			while (done < end) {
+				const uint64_t ready = std::min(m_prot_next.load(std::memory_order_acquire), end);
+				if (ready <= done) {
+					(void)AdvanceProtections(end, true); // (nothing protected ahead: the worker protects)
+					continue;
+				}
+				uint64_t bytes = 0;
+				for (uint64_t i = done; i < ready; ++i)
+					if (const Job& next = m_jobs[i % Capacity]; next.call == nullptr) bytes += next.size;
+				if (ready < end && bytes < PipelineMinBytes) {
+					(void)AdvanceProtections(end, true); // (too little to copy as a run yet: protect meanwhile)
+					continue;
+				}
+				const auto copying = std::chrono::steady_clock::now();
+				CopyRun(done, ready, bytes);
+				if (bytes != 0) {
+					Raiz::g_up_copy_us.fetch_add(UsSince(copying), std::memory_order_relaxed);
+					Raiz::g_up_copy_runs.fetch_add(1, std::memory_order_relaxed);
+					Raiz::g_up_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+				}
+				done = ready;
+				PublishDone(done);
+			}
+		}
+		LiveCounters::Add(LiveCounters::UploadBusyUs, UsSince(start));
+		return done;
+	}
+
+	// The protection thread: the protection jobs as they are pushed, ahead of the worker; between them it spins a little,
+	// then sleeps on m_head (Kick wakes it). Stopped at another call, it waits for the worker to run it.
+	void ProtRun() {
+		LocalPlatform::SetThreadName("Kyty.UploadProt");
+		t_worker              = true;
+		Raiz::t_upload_thread = true;
+		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
+		for (;;) {
+			if (m_stop.load(std::memory_order_seq_cst)) return;
+			const uint64_t head = m_head.load(std::memory_order_acquire);
+			const uint64_t next = m_prot_next.load(std::memory_order_acquire);
+			if (next < head) {
+				if (AdvanceProtections(head, false) != next) continue;
+				const Job& job = m_jobs[next % Capacity];
+				if (job.call != nullptr && !job.protection) {
+					// (Stopped at another call: until the worker ran it.)
+					m_waiters.fetch_add(1, std::memory_order_seq_cst);
+					for (uint64_t d; (d = m_done.load(std::memory_order_seq_cst)) <= next && !m_stop.load(std::memory_order_seq_cst);)
+						m_done.wait(d, std::memory_order_seq_cst);
+					m_waiters.fetch_sub(1, std::memory_order_relaxed);
+				} else {
+					_mm_pause(); // (the worker holds the protection lock)
+				}
+				continue;
+			}
+			// (A short spin, where the spin gate lets the hand-off workers spin: spin-gate.h.)
+			bool      more  = false;
+			const int spins = SpinGate::Open(false) ? 2000 : 0;
+			for (int spin = 0; spin < spins && !more; ++spin) {
+				_mm_pause();
+				more = m_head.load(std::memory_order_acquire) != head;
+			}
+			if (more) continue;
+			m_prot_sleeping.store(true, std::memory_order_seq_cst);
+			if (m_head.load(std::memory_order_seq_cst) == head && !m_stop.load(std::memory_order_seq_cst))
+				m_head.wait(head, std::memory_order_seq_cst);
+			m_prot_sleeping.store(false, std::memory_order_relaxed);
+		}
+	}
 
 	// KYTY_UPLOAD_LANES: the jobs each lane needs at least for a run to be split: the second thread's wake-up (~3-4 us, protwait)
 	// plus the waker's FUTEX_WAKE (~2-3 us) against ~3 us a protection; lane 1 runs late by the wake-up, so it needs more.
@@ -352,7 +554,8 @@ private:
 	// thread in the process makes every protection's TLB flush reach one more CPU, ~0.27 us each).
 	void LaneRun() {
 		LocalPlatform::SetThreadName("Kyty.Upload2");
-		t_worker = true;
+		t_worker              = true;
+		Raiz::t_upload_thread = true; // (raiz9)
 		LocalPlatform::PinThreadToCpuList(std::getenv("KYTY_RECORDING_CPUS"));
 		uint32_t seen = 0;
 		for (;;) {
@@ -452,6 +655,16 @@ private:
 	// mapping cannot read (GPU-written, read-protected) ends that part (GuardedCopy); the rest comes from the backing
 	// view, the same bytes (unmapping a range waits for its jobs: the guest mapping is the backing's).
 	static void CopyFrom(uint8_t* destination, const uint8_t* backing, uint64_t guest, uint64_t size) {
+		// (anuncio2) The audits' hook, around the copy.
+		if (auto* const hook = g_copy_hook.load(std::memory_order_relaxed); hook != nullptr) {
+			hook(guest, destination, size, false);
+			CopyFromGuest(destination, backing, guest, size);
+			hook(guest, destination, size, true);
+			return;
+		}
+		CopyFromGuest(destination, backing, guest, size);
+	}
+	static void CopyFromGuest(uint8_t* destination, const uint8_t* backing, uint64_t guest, uint64_t size) {
 		// (des-launcherfog-1108) A null source zero-fills (an unmapped part of a streamed texture pool): restored, the
 		// KYTY_UPLOAD_LANES merge (0c88c496) had dropped it, and a shared run read from null + offset ~15 s into play.
 		if (backing == nullptr) {
@@ -462,6 +675,12 @@ private:
 		if (const auto left = Common::GuardedCopy(destination, reinterpret_cast<const void*>(guest), size); left != 0) {
 			LiveCounters::Add(LiveCounters::UploadGuardStops);
 			const auto done = size - left;
+			// (raiz2, KYTY_RAIZ: no backing view - `backing` is guest memory itself -: the rest through a window over
+			// the no-access pages, no guest fault on this thread. Memory::NativeGuardedRead.)
+			if (Raiz::On()) {
+				(void)Libs::LibKernel::Memory::NativeGuardedRead(destination + done, reinterpret_cast<const void*>(guest + done), left);
+				return;
+			}
 			std::memcpy(destination + done, backing + done, left);
 		}
 #else
@@ -492,6 +711,16 @@ private:
 	std::atomic<uint32_t>              m_waiters {0};
 	std::atomic<bool>                  m_stop {false};
 	std::mutex                         m_process; // held by whichever thread runs jobs (the worker, or Help)
+	// (raiz9) KYTY_UPLOAD_PROT_THREAD: whether on, the protection side's progress and lock, its thread and its sleep; the
+	// last protection run (under m_prot_mutex: the adjacency count).
+	const bool                         m_pipeline;
+	alignas(64) std::atomic<uint64_t>  m_prot_next {0};
+	std::mutex                         m_prot_mutex;
+	alignas(64) std::atomic<bool>      m_prot_sleeping {false};
+	std::thread                        m_prot_thread;
+	void (*m_last_call)(void*, uint64_t, uint64_t) = nullptr;
+	void*                              m_last_context = nullptr;
+	uint64_t                           m_last_end     = 0;
 	std::thread                        m_thread;
 };
 
@@ -522,13 +751,48 @@ inline void Wait(uint64_t sequence) {
 // Render thread: every recorded copy reaches staging memory before this returns; the jobs the worker is not at made
 // here where kyty_local_upload_help says (above). `serve`: the guest commands queued for the GPU thread run meanwhile
 // (KYTY_SERVE_IN_WAITS); only from a drain that no command and no submit is inside.
+// (raiz9) The "[upload]" line, every 5 s (render thread, from Drain): the protection jobs and who ran them, the worker's
+// copies, the render thread's drains that had to wait. Per second (the "[render]" line's fps turns them into per frame).
+inline void Report() {
+	using Clock = std::chrono::steady_clock;
+	static Clock::time_point last  = Clock::now();
+	static uint64_t          prev[10] = {};
+	const auto               now   = Clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	const double   secs   = std::chrono::duration<double>(now - last).count();
+	const uint64_t cur[10] = {Raiz::g_up_prot_jobs.load(),   Raiz::g_up_prot_us_thread.load(), Raiz::g_up_prot_us_worker.load(),
+	                          Raiz::g_up_prot_lock_us.load(), Raiz::g_up_adjacent.load(),       Raiz::g_up_copy_runs.load(),
+	                          Raiz::g_up_copy_bytes.load(),   Raiz::g_up_copy_us.load(),        Raiz::g_up_waits.load(),
+	                          Raiz::g_up_wait_us.load()};
+	double d[10];
+	for (int i = 0; i < 10; ++i) d[i] = static_cast<double>(cur[i] - prev[i]) / secs;
+	std::printf("[upload] (raiz9, %.1f s) protection thread %s: protection jobs %.0f/s (%.0f%% starting where the one before "
+	            "ended), run by the protection thread %.1f ms/s + the worker %.1f ms/s (its waits for the protection lock %.1f "
+	            "ms/s); worker copies %.0f runs/s %.0f MB/s %.1f ms/s; render thread drains that waited %.0f/s, %.1f ms/s\n",
+	            secs, ProtThreadOn() ? "ON" : "off", d[0], d[0] > 0.0 ? 100.0 * d[4] / d[0] : 0.0, d[1] / 1000.0, d[2] / 1000.0,
+	            d[3] / 1000.0, d[5], d[6] / 1e6, d[7] / 1000.0, d[8], d[9] / 1000.0);
+	std::fflush(stdout);
+	for (int i = 0; i < 10; ++i) prev[i] = cur[i];
+	last = now;
+}
+
 inline void Drain(bool serve = false) {
 	if (const auto sequence = SubmitSequence(); sequence != 0) {
-		const auto help = kyty_local_upload_help.load(std::memory_order_relaxed);
+		const bool waits = Get().Done() < sequence; // (raiz9: the "[upload]" line's waited drains)
+		const auto start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		const auto help  = kyty_local_upload_help.load(std::memory_order_relaxed);
 		if (help == 1 || (help == 2 && !SpinGate::g_open.load(std::memory_order_relaxed)))
 			Get().Help(sequence);
 		else
 			Get().Wait(sequence, serve);
+		if (waits) {
+			Raiz::g_up_waits.fetch_add(1, std::memory_order_relaxed);
+			Raiz::g_up_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                                       std::chrono::steady_clock::now() - start)
+			                                                       .count()),
+			                             std::memory_order_relaxed);
+		}
+		Report();
 	}
 }
 

@@ -32,5 +32,17 @@ int  DirectHoldStickX();
 void DirectNoteStickRouted(int64_t counts); // mouse counts that went to the emulated stick path (log)
 void DirectSetStick(int x, int y);    // the emulated right stick last sent (0..255), to learn the signs
 void DirectSetDegPerCount(float deg); // degrees per mouse count (deg per count * sensitivity)
+// (mouse1) Native mouse camera (KYTY_DS_MOUSE_NATIVE=1 with KYTY_KBM=1; off by default: nothing below runs and the code
+// above is unchanged). The mouse's counts become the camera's own stick input, in angle units, where the game reads it
+// (ChrExFollowCam eboot+0x18bd93 and the aim camera eboot+0x1766f7): both axes turn by exactly counts x degrees per
+// count, no stick, no dead zone, no top rate, nothing dropped (demonsSoulsCamera.cpp). Wanted: asked for; Installed: the
+// hooks are in (the bytes matched); TakesMouse: a camera that reads the hook ran in the last 100 ms with its input on
+// and the stick signs known, so the counts go to NativeAddMouse instead of the emulated stick (lock-on, menus: the
+// stick, as before). The degrees per count are DirectSetDegPerCount's.
+bool NativeWanted();
+bool NativeInstalled();
+bool NativeTakesMouse();
+void NativeAddMouse(int dx, int dy);
+void NativeNoteStickRouted(int64_t counts); // counts that went to the emulated stick while the hooks exist (stats)
 } // namespace DemonsSoulsCamera
 } // namespace Loader

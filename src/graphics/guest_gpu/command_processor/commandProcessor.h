@@ -108,6 +108,8 @@ public:
 	bool DrawIndex(DrawIndexArgs args);
 	// An indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
 	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed);
+	// (parpadeo2, KYTY_PARPADEO; local/parpadeo.h) An indexed indirect draw run about to be drawn. `path`: Parpadeo::Path.
+	void ParpadeoNoteDraws(std::span<const uint64_t> args, uint64_t index_bytes, uint32_t path);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	bool DrawIndexAuto(DrawAutoArgs args);
 	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.

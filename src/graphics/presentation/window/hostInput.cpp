@@ -3,6 +3,7 @@
 #include "SDL_error.h"
 #include "SDL_events.h"
 #include "SDL_filesystem.h"
+#include "SDL_hints.h"
 #include "SDL_keyboard.h"
 #include "SDL_keycode.h"
 #include "SDL_mouse.h"
@@ -1194,7 +1195,13 @@ void KbmInit() {
 	const char*  src = g_kbm.curve.valid ? "kbm_curve.txt" : "linear mapping, until measured";
 	// (DirectWanted, not DirectInstalled: the window can be set up before the eboot is patched; the camera's own line
 	// says whether the direct camera was applied.)
-	if (!Loader::DemonsSoulsCamera::DirectWanted())
+	if (Loader::DemonsSoulsCamera::NativeWanted())
+		// (mouse1) (Wanted, not Installed: the eboot may not be patched yet; "Demon's Souls mouse mode:" says if it was.)
+		LOGF("KYTY_DS_MOUSE_NATIVE=1: native mouse camera asked: %.4f deg per count (KYTY_KBM_DEG_PER_COUNT %.3f x sens %.2f) on "
+		     "both axes, no top rate; the emulated stick (max %.0f deg/s, %s) only with lock-on, in menus, or if the hook is "
+		     "not applied\n",
+		     g_kbm.dpc * g_kbm.sens, g_kbm.dpc, g_kbm.sens, top, src);
+	else if (!Loader::DemonsSoulsCamera::DirectWanted())
 		LOGF("KYTY_KBM_EQUAL_AXES=%d: direct camera off, both axes on the emulated stick: max horizontal %.0f deg/s, "
 		     "max vertical %.0f deg/s (%s)\n",
 		     g_kbm.equal_axes ? 1 : 0, top, top, src);
@@ -1212,6 +1219,12 @@ void KbmCapture(bool on) {
 	if ((!g_kbm.enabled && !g_kbm.mouse_only) || g_kbm.captured == on) return;
 	SDL_Window* window = SDL_GetKeyboardFocus();
 	if (on && window == nullptr) return;
+	// (mouse1) KYTY_DS_MOUSE_NATIVE=1: SDL's relative mode said in full (these are SDL2's defaults): Windows Raw Input
+	// (WM_INPUT), not the warped cursor; the counts as the device gives them, no system ballistics.
+	if (on && Loader::DemonsSoulsCamera::NativeWanted()) {
+		SDL_SetHint("SDL_MOUSE_RELATIVE_MODE_WARP", "0");
+		SDL_SetHint("SDL_MOUSE_RELATIVE_SYSTEM_SCALE", "0");
+	}
 	if (SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE) != 0) {
 		LOGF("KYTY_KBM: relative mouse mode failed: %s\n", SDL_GetError());
 		return;
@@ -1365,6 +1378,16 @@ bool HostInputMouseMotion(int dx, int dy) {
 	if (g_kbm.enabled && !g_kbm.captured && !s_first_capture_done && SDL_GetKeyboardFocus() != nullptr) {
 		s_first_capture_done = true;
 		KbmCapture(true);
+	}
+	// (mouse1) KYTY_DS_MOUSE_NATIVE=1: while a camera that reads the native hook runs (the free follow camera, the bow's
+	// aim), every count goes to it as an angle, both axes: no stick, nothing metered, capped or dropped here. Otherwise
+	// (lock-on, menus, signs not learned yet) the counts drive the emulated stick below, as before.
+	if (g_kbm.captured && g_kbm.enabled && Loader::DemonsSoulsCamera::NativeInstalled()) {
+		if (Loader::DemonsSoulsCamera::NativeTakesMouse()) {
+			Loader::DemonsSoulsCamera::NativeAddMouse(dx, dy);
+			return true;
+		}
+		Loader::DemonsSoulsCamera::NativeNoteStickRouted(std::llabs(dx) + std::llabs(dy));
 	}
 	// (11-10) Direct mouse camera: while the free camera runs, the counts turn it by their angle (no stick, no cap).
 	if (g_kbm.captured && g_kbm.enabled && Loader::DemonsSoulsCamera::DirectTakesMouse()) {

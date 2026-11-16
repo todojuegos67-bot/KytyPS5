@@ -258,7 +258,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
-	s->simulate_vram8 = false; // (11-12) option removed: always off, whatever the file says
+	// (11-14) Option back in the launcher (Simular gráfica de 8 GB, pruebas): the file's value counts.
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
 	str("precompilar_hilos", s->precompile_threads);
@@ -453,7 +453,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Con la frame generation de NVIDIA: reflex (recomendado), normal o ultra (el nuestro, con Reflex apagado)\n"
 	  << "antilag_dlssg=" << s.antilag_dlssg << "\n\n"
 	  << "[Graficos]\n"
-	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, ligero + 35 reales x2 AMD, para monitores de mas de 60 Hz, FSR Calidad, texturas y sombras medio);\n"
+	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, ligero + 40 reales x2 AMD, para monitores de mas de 60 Hz, FSR Calidad, texturas y sombras medio);\n"
 	  << "; equilibrado (45 reales x2 AMD, texturas, distancia y sombras alto); ultra (RTX 5060-5070 Ti, RX 9070);\n"
 	  << "; extremo (RTX 5080 / 5090: todo al maximo). Los FPS dependen de tu GPU y tu CPU.\n"
 	  << "; Ligero, equilibrado y low mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
@@ -621,6 +621,8 @@ const GameSetting kGameSettings[] = {
 	 "Adaptacion de la vista: la exposicion cambia poco a poco al pasar de zonas oscuras a claras. No: exposicion fija. No cuesta FPS. Manda sobre la casilla Eye Adaptation."},
 	{"gs_aasharp", "Postprocesado", false, "Nitidez del antialiasing", {"r_aaSharpenStrengthStatic=1.2;r_aaSharpenStrengthMotion=1.2;r_aaHistorySharpeningStrength=0.5", "r_aaSharpenStrengthStatic=2.0;r_aaSharpenStrengthMotion=2.0;r_aaHistorySharpeningStrength=0.7", "r_aaSharpenStrengthStatic=2.5;r_aaSharpenStrengthMotion=2.5;r_aaHistorySharpeningStrength=0.8", "r_aaSharpenStrengthStatic=3.5;r_aaSharpenStrengthMotion=3.5;r_aaHistorySharpeningStrength=0.9", "r_aaSharpenStrengthStatic=5.0;r_aaSharpenStrengthMotion=5.0;r_aaHistorySharpeningStrength=1.0"},
 	 "Nitidez del antialiasing temporal del juego: Bajo 1,2, Medio 2,0, Alto 2,5 (de fabrica), Ultra 3,5, Extremo 5,0 (la del historial de 0,5 a 1,0). No cuesta FPS; mucha puede marcar bordes y brillos. Manda sobre AA Sharpness."},
+	{"gs_texcache", "Memoria", true, "Guardar texturas que no se usan", {"cacheUnusedTextures=false", "cacheUnusedTextures=true", nullptr, nullptr, nullptr},
+	 "El juego guarda en la RAM las texturas de zonas por las que ya pasaste, por si vuelves, hasta 8 GB (texturePoolSizeMiBs). Si (de fabrica): vuelve antes a esas zonas. No: las suelta y la RAM sube mucho menos; misma calidad de texturas, alguna puede tardar un poco en cargar al volver. Recomendado No en PCs de 16 GB."},
 };
 
 const GameSetting* GameSettings(size_t* count) {
@@ -743,7 +745,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Souls ligero / equilibrado / PC low profile: AMD x2 whatever frame_generation says, the game flipped at 30 / 45 / 30.
 	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
-	std::string fg_id    = fixed_fg ? std::string("amd-x2") : s.framegen; // (11-12) ligero + is 35x2 now
+	std::string fg_id    = fixed_fg ? std::string("amd-x2") : s.framegen; // (11-14) ligero + is 40x2 now
 	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
 		fg_id = "sin-fg";
 		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
@@ -804,7 +806,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-11) Souls ligero +: the pad read 4 ms later than ligero's (39 ms before its 30 fps flip slot, the game's ~7 ms
 	// of CPU plus margin): about 4 ms less input latency.
 	if (fixed_fg)
-		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "37" : "43"); // (11-12) ligero 30x2 (43), ligero + 35x2 (37) // (10-25) Anti-Lag+
+		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "33" : "43"); // (11-12) ligero 30x2 (43); (11-14) ligero + 40x2 (33) // (10-25) Anti-Lag+
 	// (des-particles-fg) Souls ligero (30x2) and ligero + (30x3) only: the particle layer's motion vectors for AMD frame
 	// generation (particle-mv.cpp): fire, sparks, rain, mist and spells interpolated instead of shown at the real 30.
 	// (11-11) Off by default until verified in game (the first build lost the device): KYTY_FG_PARTICLE_MV=1 by hand.
@@ -891,7 +893,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (s.souls_mode == "low") sharp = "1";
 	else if (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus") sharp = "0.75";
 	if (!sharp.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", sharp);
-	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : s.souls_mode == "ligero-plus" ? "35" : "30"); // (11-12) ligero 30x2, ligero + 35x2
+	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : s.souls_mode == "ligero-plus" ? "40" : "30"); // (11-12) ligero 30x2; (11-14) ligero + 40x2
 	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
 	if (s.af16) sets.emplace_back("KYTY_FORCE_AF", "16");
 	if (s.texture_sharpness == "2") {
@@ -1191,7 +1193,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) No fast memory moves: the user saw the PC reboot when memory was freed/moved quickly (working-set trims,
 	// release passes). The RAM budget and the RAM guard's release passes are off; memory stays where the game put it.
 	env.Default("KYTY_RAM_BUDGET_MB", "0");
-	env.Default("KYTY_RAM_GUARD", "0");
+	// (11-14) RAM guard back on, caches only: under pressure (zone changes) it frees what holds nothing in use (heap free
+	// blocks, idle scratch, images unused for 600 flips, idle pipelines). Never the working set nor guest memory
+	// (KYTY_RAM_FLUSH_TRIM stays off): no paging, so not the 0x1A of 11-14.
+	env.Default("KYTY_RAM_GUARD", "1");
+	// (11-14, rama ds-native-1) Memoria nativa: memoria del juego privada con MEM_WRITE_WATCH, sin vista duplicada ni
+	// cambios de permisos de página (causa del bug check 0x1A). En [Avanzado] extra, KYTY_NATIVE_MEMORY=0 la apaga.
+	env.Default("KYTY_NATIVE_MEMORY", "0"); // (11-14) off: step 3 ~2.5 fps, image still wrong
 	// (11-13) The low-RAM profile turns itself on with 20 GiB or less and would enable runtime releases (soft release,
 	// RAM diet): off, nothing is freed or moved while playing.
 	env.Default("KYTY_SOFT_RELEASE", "0");
@@ -1233,6 +1241,21 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
+	// (11-16 release) The configuration validated with JUGAR.cmd (native memory, parpadeo6, rend1, ram16/ram17), on by
+	// default; [Avanzado] extra (below) can still change any of them (KEY=0).
+	{
+		std::stringstream list(
+		    "KYTY_FG_PARTICLE_MV=1;KYTY_TEXTURE_OFFLOAD=1;KYTY_GPU_ONLY_OFFLOAD=1;KYTY_OFFLOAD_PAGEOUT=1;KYTY_BIG_WINDOW=1;"
+		    "KYTY_VOLATILE_EXTRA_ALLOCATORS=HeapAllocator,PageAllocator,Bucket;KYTY_FAULT_STATS=0;KYTY_TEXTURE_PROBE=0;"
+		    "KYTY_BUFFER_PROBE=0;KYTY_RESIDENCY_LOG=0;KYTY_RAM_GUARD=0;KYTY_RAM_LINE=1;KYTY_RENDER_STATS=0;KYTY_RAIZ=1;"
+		    "KYTY_DS_FREED_RELEASE=1;KYTY_PM_LOCK_HOLDERS=1;KYTY_REG_LANE=1;KYTY_DRAW_FLAGS=1;KYTY_CENSUS_LIGHT=1;"
+		    "KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1");
+		std::string pair;
+		while (std::getline(list, pair, ';')) {
+			const auto eq = pair.find('=');
+			env.Set(pair.substr(0, eq), pair.substr(eq + 1));
+		}
+	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
 	{
 		std::stringstream list(s.extra);
@@ -1243,6 +1266,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			if (eq == std::string::npos || eq == 0) continue;
 			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
 		}
+	}
+	// (texpool1) KYTY_DS_TEXTURE_POOL_MB=N in [Avanzado] extra: the game's own texture streaming budget
+	// (convar texturePoolSizeMiBs, 8192 by default; eboot+0xac9ea0 only loads a mip that fits and lowers mips when over).
+	// extra= splits at ';', so a convar list cannot be given there: this adds the one convar. Off unless set.
+	if (demons) {
+		if (const std::string pool_mb = env.Get("KYTY_DS_TEXTURE_POOL_MB"); !pool_mb.empty() && pool_mb != "0")
+			env.AppendConvars("texturePoolSizeMiBs=" + pool_mb);
 	}
 	// (11-13) The fire and particle blending as before: with KYTY_FG_PARTICLE_MV=1 the native particle vectors always on
 	// (a run came up with KYTY_FG_PARTICLE_NATIVE=0 from outside the settings and ghosting around fire); only an explicit

@@ -10,6 +10,7 @@
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
+#include "loader/demonsSoulsTextureProbe.h"
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
@@ -648,6 +649,8 @@ void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 }
 
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
+	// KYTY_TEXTURE_PROBE: counts only the streamed texture chunks' copy (measurement, demonsSoulsTextureProbe.h).
+	::Loader::DemonsSoulsTextureProbe::OnCopy(reinterpret_cast<uint64_t>(__builtin_return_address(0)), dest, n);
 	return ::memcpy(dest, src, n);
 }
 

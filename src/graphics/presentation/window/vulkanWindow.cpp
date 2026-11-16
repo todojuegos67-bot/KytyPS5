@@ -46,6 +46,7 @@
 #include "local/dlss-nr.h"
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
+#include "local/serie1.h" // (serie1: KYTY_SERIE1)
 #include "local/hwrt-scene.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -696,12 +697,15 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			graphics.present_queue_created   = true;
 		}
 		// KYTY_ASYNC_COMPUTE: a third graphics-family queue for the game's compute queues (lane-sync.h).
-		if (const char* async = std::getenv("KYTY_ASYNC_COMPUTE");
-		    async != nullptr && (*async == '1' || *async == '2') && graphics.present_queue_created && families[queue_family].queueCount >= 3) {
+		// (serie1) KYTY_SERIE1=1: the same queue, for the XPR culling's command buffer (local/serie1.h).
+		const char* async      = std::getenv("KYTY_ASYNC_COMPUTE");
+		const bool  wants_lane = (async != nullptr && (*async == '1' || *async == '2')) || Serie1::WantsLanes();
+		if (wants_lane && graphics.present_queue_created && families[queue_family].queueCount >= 3) {
 			queue_create_infos[0].queueCount = 3;
 			graphics.compute_queue_created   = true;
-		} else if (async != nullptr && (*async == '1' || *async == '2')) {
-			std::printf("Async compute: the graphics queue family has fewer than 3 queues: off\n");
+		} else if (wants_lane) {
+			std::printf("Async compute: the graphics queue family has fewer than 3 queues: off%s\n",
+			            Serie1::WantsLanes() ? " ([serie1] KYTY_SERIE1=1 solo mide: no hay segunda cola)" : "");
 		}
 	}
 #endif

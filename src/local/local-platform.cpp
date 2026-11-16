@@ -1979,6 +1979,124 @@ static void PrintMemoryTagSummary(unsigned long seconds) {
 	std::fflush(stdout);
 }
 
+// (ram4) The process heaps as the last "Private breakdown" walk saw them: [0] bytes committed in heap segments, [1]
+// segments, [2] the largest segment's committed bytes, [3] GetTickCount64 at that walk (all 0 before the first).
+static std::atomic<uint64_t> g_heap_commit {0}, g_heap_segments {0}, g_heap_largest {0}, g_heap_tick {0};
+void RamLineHeap(uint64_t* out, size_t count);
+void RamLineHeap(uint64_t* out, size_t count) {
+	const uint64_t v[4] = {g_heap_commit.load(std::memory_order_relaxed), g_heap_segments.load(std::memory_order_relaxed),
+	                       g_heap_largest.load(std::memory_order_relaxed), g_heap_tick.load(std::memory_order_relaxed)};
+	for (size_t i = 0; i < count && i < 4; i++) out[i] = v[i];
+}
+
+// (ram5, with KYTY_RAM_LINE=1, from the breakdown thread after its "Heaps:" line) Two answers to "what fills the C++ heap":
+// - "Heaps by heap": the commit of each heap (its segments joined by their header's Heap field). The process heap is
+//   malloc/new of the emulator and of every DLL built with the UCRT (the driver's user-mode DLLs too); a heap of its own
+//   (HeapCreate) is a DLL's or a library's. Costs nothing beyond the walk already made.
+// - KYTY_HEAP_HISTOGRAM_SECONDS=<n> (off by default; at least 120): every n seconds the heaps' busy blocks walked
+//   (at least 60; the first walk n seconds after the start; WriteHeapHistogram, the live "heapstats": <log>-heap-<k>.tsv, .sig.tsv, .vm.tsv beside the run's log) and the line
+//   "Heap blocks": bytes by what a block starts with (an address in a module = a C++ object's vtable: module+offset, found
+//   in the .map; SPIR-V; zero; other data) and the largest groups by size. Every heap is locked while it is walked: a
+//   stall of the game of up to a few seconds each time (millions of blocks), and up to 384 MiB of commit for the walk's
+//   table, given back after. For a measuring session only.
+static void RamFiveHeapHistogram();
+static void RamFiveHeapLines(const std::set<uint64_t>& heaps, const std::map<uint64_t, uint64_t>& segment_owner,
+                             const std::map<uint64_t, std::pair<uint64_t, DWORD>>& bases) {
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> by_heap; // heap -> committed, segments
+	for (const auto base: heaps) {
+		const auto found = bases.find(base);
+		if (found == bases.end()) continue;
+		const auto owner = segment_owner.find(base);
+		auto&      use   = by_heap[owner != segment_owner.end() && owner->second != 0 ? owner->second : base];
+		use.first += found->second.first;
+		use.second++;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> order; // committed, heap
+	for (const auto& [handle, use]: by_heap) order.emplace_back(use.first, handle);
+	std::sort(order.begin(), order.end(), std::greater<>());
+	const auto process_heap = reinterpret_cast<uint64_t>(GetProcessHeap());
+	char       line[1024];
+	int        len = std::snprintf(line, sizeof(line), "Heaps by heap (KYTY_RAM_LINE=1): %zu heaps;", order.size());
+	for (size_t i = 0; i < order.size() && i < 8 && len > 0 && len < static_cast<int>(sizeof(line)) - 128; i++) {
+		const auto handle = order[i].second;
+		len += std::snprintf(line + len, sizeof(line) - len, " 0x%llx=%lluMiB/%llu%s", static_cast<unsigned long long>(handle),
+		                     static_cast<unsigned long long>(order[i].first >> 20u),
+		                     static_cast<unsigned long long>(by_heap[handle].second),
+		                     handle == process_heap ? "(process heap: malloc/new)" : "");
+	}
+	std::printf("%s (MiB committed/segments)\n", line);
+	RamFiveHeapHistogram();
+}
+
+static void RamFiveHeapHistogram() {
+	static const uint64_t period = [] {
+		const char* v = std::getenv("KYTY_HEAP_HISTOGRAM_SECONDS");
+		const auto  s = v != nullptr ? std::strtoull(v, nullptr, 10) : 0ull;
+		return s == 0 ? uint64_t {0} : std::max<uint64_t>(s, 60) * 1000u; // (ram7: at least 60, was 120)
+	}();
+	if (period == 0) return;
+	// (ram7) Counted from the breakdown thread's start (its first line comes 60 s after it), not from its first line: the
+	// 21:43 session (2.5 min of play with 300) never got to a walk.
+	static uint64_t last = GetTickCount64() - 60000u, walks = 0;
+	if (GetTickCount64() - last < period) return;
+	last = GetTickCount64();
+	std::string prefix;
+	if (const char* log = std::getenv("KYTY_RUN_LOG"); log != nullptr && *log != '\0') {
+		prefix = log;
+		if (const auto dot = prefix.find(".out.log"); dot != std::string::npos) prefix.resize(dot);
+		prefix += "-";
+	}
+	const std::string path  = prefix + "heap-" + std::to_string(++walks) + ".tsv";
+	const auto        begin = std::chrono::steady_clock::now();
+	// (Every thread allocating waits for the heap lock this thread holds: not at the lowest priority meanwhile.)
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	const bool ok = WriteHeapHistogram(path.c_str());
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	const auto        ms    = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+	FILE*             file  = ok ? std::fopen((path + ".sig.tsv").c_str(), "r") : nullptr;
+	if (file == nullptr) {
+		std::printf("Heap blocks: the walk failed (%s)\n", path.c_str());
+		return;
+	}
+	std::map<std::string, std::pair<uint64_t, uint64_t>> by_kind; // first word -> blocks, bytes
+	std::vector<std::tuple<uint64_t, uint64_t, uint64_t, std::string>> groups; // bytes, size, blocks, kind
+	uint64_t total = 0, blocks_total = 0;
+	char     text[512];
+	(void)std::fgets(text, sizeof(text), file); // (header)
+	while (std::fgets(text, sizeof(text), file) != nullptr) {
+		long               heap = 0;
+		unsigned long long size = 0, count = 0, bytes = 0;
+		char               kind[320] {};
+		if (std::sscanf(text, "%ld\t%llu\t%319[^\t]\t%llu\t%llu", &heap, &size, kind, &count, &bytes) != 5) continue;
+		auto& use = by_kind[kind];
+		use.first += count;
+		use.second += bytes;
+		total += bytes;
+		blocks_total += count;
+		groups.emplace_back(bytes, size, count, kind);
+	}
+	std::fclose(file);
+	std::vector<std::pair<uint64_t, std::string>> kinds;
+	for (const auto& [kind, use]: by_kind) kinds.emplace_back(use.second, kind);
+	std::sort(kinds.begin(), kinds.end(), std::greater<>());
+	std::sort(groups.begin(), groups.end(), std::greater<>());
+	char line[2048];
+	int  len = std::snprintf(line, sizeof(line), "Heap blocks (%s, walk %lld ms): %llu MiB busy in %llu blocks; by first word:",
+	                         path.c_str(), static_cast<long long>(ms), static_cast<unsigned long long>(total >> 20u),
+	                         static_cast<unsigned long long>(blocks_total));
+	for (size_t i = 0; i < kinds.size() && i < 12 && len > 0 && len < static_cast<int>(sizeof(line)) - 160; i++)
+		len += std::snprintf(line + len, sizeof(line) - len, " %s=%lluMiB/%llu", kinds[i].second.c_str(),
+		                     static_cast<unsigned long long>(kinds[i].first >> 20u),
+		                     static_cast<unsigned long long>(by_kind[kinds[i].second].first));
+	if (len > 0 && len < static_cast<int>(sizeof(line)) - 32) len += std::snprintf(line + len, sizeof(line) - len, "; largest groups:");
+	for (size_t i = 0; i < groups.size() && i < 10 && len > 0 && len < static_cast<int>(sizeof(line)) - 160; i++) {
+		const auto& [bytes, size, count, kind] = groups[i];
+		len += std::snprintf(line + len, sizeof(line) - len, " %llux%llu %s=%lluMiB", static_cast<unsigned long long>(count),
+		                     static_cast<unsigned long long>(size), kind.c_str(), static_cast<unsigned long long>(bytes >> 20u));
+	}
+	std::printf("%s\n", line);
+}
+
 // KYTY_MEMORY_BREAKDOWN_SECONDS (default 60, 0 off): where the process's private commit is, from a walk of its
 // address space on a low-priority thread (a few ms per walk, off the game's threads): private committed by kind
 // (process heaps, executable, read-write), mapped (sections: the guest store), and the largest allocations.
@@ -2006,6 +2124,26 @@ void StartMemoryBreakdown() {
 				}
 				std::map<uint64_t, std::pair<uint64_t, DWORD>> bases; // allocation base -> committed private, its protection
 				uint64_t heap = 0, exec = 0, rw = 0, other = 0, mapped = 0, image = 0, regions = 0;
+				uint64_t heap_segments_found = 0; // (ram4: heap segments told by their header, beyond GetProcessHeaps' bases)
+				// (ram5) The heap each segment belongs to (its header's Heap field, +0x28 on x64; a heap's first segment is
+				// the heap itself): the "Heaps by heap" line.
+				std::map<uint64_t, uint64_t> segment_owner;
+				static const bool heap_walk = [] {
+					const char* v = std::getenv("KYTY_RAM_LINE");
+					return v != nullptr && v[0] == '1';
+				}();
+				// (ram3) KYTY_PRIVATE_RESIDENCY=1 (off by default): which private allocations are in RAM. The working set
+				// is sampled once per MiB of every committed private region of 64 KiB or more (K32QueryWorkingSetEx, 2048
+				// samples a call, yielding between calls; ~20-30 thousand samples per pass of this lowest-priority
+				// thread) and summed per allocation: "Private residency" below.
+				static const bool residency = [] {
+					const char* v = std::getenv("KYTY_PRIVATE_RESIDENCY");
+					return v != nullptr && v[0] == '1';
+				}();
+				struct ResidentSample {
+					uint64_t address = 0, base = 0, weight = 0;
+				};
+				std::vector<ResidentSample> resident_samples;
 				MEMORY_BASIC_INFORMATION info {};
 				for (uint64_t at = 0x10000; VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
 					const uint64_t size = info.RegionSize;
@@ -2013,9 +2151,39 @@ void StartMemoryBreakdown() {
 					if (info.State == MEM_COMMIT) {
 						if (info.Type == MEM_PRIVATE) {
 							const auto base = reinterpret_cast<uint64_t>(info.AllocationBase);
+							// (ram4) A heap's further segments: GetProcessHeaps names only each heap's first allocation, so a
+							// heap grown past it counted as "read-write" ("heaps 1 MiB" with gigabytes of C++ heap: logs
+							// 11-15, allocations of 1020 MiB - the NT heap's largest segment - and one growing 220 -> 601 MiB).
+							// An NT heap segment starts with its header: signature 0xFFEEFFEE at +0x10. Read with
+							// ReadProcessMemory (48 bytes of an allocation's first page: no fault whatever is there).
+							// Only with KYTY_RAM_LINE=1 (heap_walk): without it the walk and its line are as before.
+							if (heap_walk && reinterpret_cast<uint64_t>(info.BaseAddress) == base && heaps.count(base) == 0 && size >= 0x1000 &&
+							    info.Protect == PAGE_READWRITE) {
+								uint8_t head[0x30] {};
+								SIZE_T  got = 0;
+								if (ReadProcessMemory(GetCurrentProcess(), info.BaseAddress, head, sizeof(head), &got) != 0 &&
+								    got == sizeof(head)) {
+									uint32_t signature = 0;
+									std::memcpy(&signature, head + 0x10, sizeof(signature));
+									if (signature == 0xFFEEFFEEu) {
+										heaps.insert(base);
+										heap_segments_found++;
+										uint64_t owner = 0;
+										std::memcpy(&owner, head + 0x28, sizeof(owner));
+										segment_owner[base] = owner;
+									}
+								}
+							}
 							auto&      entry = bases[base];
 							entry.first += size;
 							entry.second = info.AllocationProtect;
+							if (residency && size >= 0x10000 && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+							    resident_samples.size() < (size_t {1} << 17u)) {
+								constexpr uint64_t Stride = uint64_t {1} << 20u;
+								const uint64_t     first  = reinterpret_cast<uint64_t>(info.BaseAddress);
+								for (uint64_t sample = first; sample < first + size; sample += Stride)
+									resident_samples.push_back({sample, base, std::min(Stride, first + size - sample)});
+							}
 							if (heaps.count(base) != 0) heap += size;
 							else if ((info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) exec += size;
 							else if ((info.Protect & PAGE_READWRITE) != 0) rw += size;
@@ -2033,6 +2201,29 @@ void StartMemoryBreakdown() {
 				std::vector<std::pair<uint64_t, uint64_t>> top; // committed, base
 				top.reserve(bases.size());
 				for (const auto& [base, entry]: bases) top.emplace_back(entry.first, base);
+				// (ram4) The heaps' commit by segment, for the "[ram+]" line (RamLineHeap) and a line of its own.
+				if (heap_walk) {
+					uint64_t heap_count = 0, heap_largest = 0;
+					for (const auto base: heaps) {
+						const auto found = bases.find(base);
+						if (found == bases.end()) continue;
+						heap_count++;
+						heap_largest = std::max(heap_largest, found->second.first);
+					}
+					g_heap_commit.store(heap, std::memory_order_relaxed);
+					g_heap_segments.store(heap_count, std::memory_order_relaxed);
+					g_heap_largest.store(heap_largest, std::memory_order_relaxed);
+					g_heap_tick.store(GetTickCount64(), std::memory_order_relaxed);
+					static uint64_t last_heap = 0;
+					std::printf("Heaps: %llu MiB committed in %llu segments (%llu told by their header; the largest %llu MiB), "
+					            "%+lld MiB since the last line: the emulator's C++ heap (malloc/new under ~508 KiB a block; "
+					            "larger blocks are allocations of their own, in \"read-write\")\n",
+					            static_cast<unsigned long long>(heap >> 20u), static_cast<unsigned long long>(heap_count),
+					            static_cast<unsigned long long>(heap_segments_found), static_cast<unsigned long long>(heap_largest >> 20u),
+					            (static_cast<long long>(heap) - static_cast<long long>(last_heap)) / (1 << 20));
+					last_heap = heap;
+					RamFiveHeapLines(heaps, segment_owner, bases);
+				}
 				std::sort(top.begin(), top.end(), std::greater<>());
 				char line[1024];
 				int  len = std::snprintf(line, sizeof(line),
@@ -2069,6 +2260,59 @@ void StartMemoryBreakdown() {
 				            static_cast<unsigned long long>(large_b >> 20u), tags,
 				            annotations.empty() ? "" : "; largest that are new:", annotations.c_str());
 				std::fflush(stdout);
+				if (residency && !resident_samples.empty()) { // (ram3)
+					const auto                             t0 = std::chrono::steady_clock::now();
+					std::unordered_map<uint64_t, uint64_t> in_ram; // allocation base -> sampled bytes in the working set
+					std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(2048);
+					bool                                   ok = true;
+					for (size_t at = 0; at < resident_samples.size() && ok; at += entries.size()) {
+						const size_t n = std::min(entries.size(), resident_samples.size() - at);
+						for (size_t i = 0; i < n; i++) {
+							entries[i]                = {};
+							entries[i].VirtualAddress = reinterpret_cast<PVOID>(resident_samples[at + i].address);
+						}
+						ok = K32QueryWorkingSetEx(GetCurrentProcess(), entries.data(), static_cast<DWORD>(n * sizeof(entries[0]))) != 0;
+						for (size_t i = 0; i < n && ok; i++)
+							if ((entries[i].VirtualAttributes.Flags & 1u) != 0) in_ram[resident_samples[at + i].base] += resident_samples[at + i].weight;
+						SwitchToThread();
+					}
+					if (ok) {
+						uint64_t all = 0, by_size[3] {}, by_commit[3] {}, in_heaps = 0;
+						std::vector<std::pair<uint64_t, uint64_t>> most; // in RAM, base
+						for (const auto& [base, entry]: bases) {
+							const auto     found = in_ram.find(base);
+							const uint64_t ram   = found != in_ram.end() ? std::min(found->second, entry.first) : 0;
+							const int      slot  = entry.first < (1u << 20u) ? 0 : entry.first < (64u << 20u) ? 1 : 2;
+							by_size[slot] += ram;
+							by_commit[slot] += entry.first;
+							all += ram;
+							if (heaps.count(base) != 0) in_heaps += ram;
+							if (ram != 0) most.emplace_back(ram, base);
+						}
+						std::sort(most.begin(), most.end(), std::greater<>());
+						char text[1024];
+						int  used = std::snprintf(
+                            text, sizeof(text),
+                            "Private residency (KYTY_PRIVATE_RESIDENCY=1; a sample per MiB, %zu samples, %.1f ms): about %llu MiB of "
+                            "the private memory is in RAM (allocations of 64 KiB or more; heaps %llu); by allocation size, in RAM "
+                            "/ committed: <1 MiB %llu/%llu, 1-64 MiB %llu/%llu, >=64 MiB %llu/%llu; most in RAM:",
+                            resident_samples.size(),
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                            static_cast<unsigned long long>(all >> 20u), static_cast<unsigned long long>(in_heaps >> 20u),
+                            static_cast<unsigned long long>(by_size[0] >> 20u), static_cast<unsigned long long>(by_commit[0] >> 20u),
+                            static_cast<unsigned long long>(by_size[1] >> 20u), static_cast<unsigned long long>(by_commit[1] >> 20u),
+                            static_cast<unsigned long long>(by_size[2] >> 20u), static_cast<unsigned long long>(by_commit[2] >> 20u));
+						for (size_t i = 0; i < most.size() && i < 12 && used > 0 && used < static_cast<int>(sizeof(text)) - 64; i++)
+							used += std::snprintf(text + used, sizeof(text) - used, " 0x%llx=%llu/%lluMiB",
+							                      static_cast<unsigned long long>(most[i].second),
+							                      static_cast<unsigned long long>(most[i].first >> 20u),
+							                      static_cast<unsigned long long>(bases[most[i].second].first >> 20u));
+						std::printf("%s\n", text);
+					} else {
+						std::printf("Private residency: K32QueryWorkingSetEx failed (0x%08x)\n", static_cast<unsigned>(GetLastError()));
+					}
+					std::fflush(stdout);
+				}
 				if (MemoryTagsEnabled()) PrintMemoryTagSummary(seconds);
 			}
 		}).detach();
@@ -2126,6 +2370,11 @@ bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
 }
 void SetTrimRunner(void (*runner)(void (*call)())) {
 	g_trim_runner.store(runner, std::memory_order_release);
+}
+
+void RunTrimQuiet(void (*call)()) {
+	if (auto* runner = g_trim_runner.load(std::memory_order_acquire); runner != nullptr) runner(call);
+	else call();
 }
 
 void StartWorkingSetTrim() {
@@ -2664,6 +2913,9 @@ uint64_t SimulationBallast() { return 0; }
 bool MemoryTagsEnabled() { return false; }
 void MemoryTagAdd(int, int64_t, int64_t) {}
 void SetTrimRunner(void (*)(void (*)())) {}
+void RunTrimQuiet(void (*call)()) {
+	call();
+}
 
 uint64_t PhysicalMemory() {
 	if (const char* simulate = std::getenv("KYTY_SIMULATE_RAM_MB"); simulate != nullptr && *simulate != '\0')
@@ -2734,8 +2986,25 @@ void* LargeNewAllocate(size_t size, void* caller);
 bool  LargeNewFree(void* memory);
 } // namespace LocalPlatform
 
+// (ram4) KYTY_MEMORY_TAGS_MIN_KB=<n> (with KYTY_MEMORY_TAGS=1; default 1024, at least 16): the smallest C++ new recorded
+// by caller. The C++ heap is the emulator's largest private memory (the "Heaps:" line) and blocks of 1 MiB or more are a
+// small part of it; 64 names the callers of most of it (the table holds 32768 live blocks; the lines still say
+// "new>=1MiB").
+static size_t KytyNewTagBytes() {
+	static const size_t bytes = [] {
+		size_t      kib  = 1024;
+		const char* text = std::getenv("KYTY_MEMORY_TAGS_MIN_KB");
+		if (text != nullptr && text[0] != '\0') {
+			const unsigned long long asked = std::strtoull(text, nullptr, 10);
+			if (asked >= 16 && asked <= 1024) kib = static_cast<size_t>(asked);
+		}
+		return kib << 10u;
+	}();
+	return bytes;
+}
+
 static void* KytyNew(size_t size, void* caller, bool nothrow) {
-	if (size >= (size_t {1} << 20u) && LocalPlatform::MemoryTagsEnabled()) {
+	if (size >= (size_t {16} << 10u) && LocalPlatform::MemoryTagsEnabled() && size >= KytyNewTagBytes()) {
 		if (void* memory = LocalPlatform::LargeNewAllocate(size, caller); memory != nullptr) return memory;
 	}
 	for (;;) {
