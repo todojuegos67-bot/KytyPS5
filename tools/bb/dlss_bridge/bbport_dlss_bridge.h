@@ -82,7 +82,18 @@ typedef struct BbDlssgEvaluate {
     float view_to_clip[4][4];
     float clip_to_prev_clip[4][4];
     float prev_clip_to_clip[4][4];
+    // bb-dlssg-inputs (appended: an older bridge ignores them; a newer bridge reads them only
+    // when camera_magic is BBPORT_DLSSG_CAMERA_MAGIC). World-space camera position and unit
+    // up / right / forward vectors (NGX's cameraPos / Up / Right / Fwd; the bridge sent the
+    // placeholders 0 / +y / +x / +z before).
+    uint32_t camera_magic;
+    float camera_pos[3];
+    float camera_up[3];
+    float camera_right[3];
+    float camera_fwd[3];
 } BbDlssgEvaluate;
+
+#define BBPORT_DLSSG_CAMERA_MAGIC 0x314D4143u /* "CAM1" */
 
 typedef struct BbDlssApi {
     uint32_t abi;

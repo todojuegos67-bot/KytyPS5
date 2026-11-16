@@ -430,9 +430,24 @@ int32_t FrameGenEvaluate(VkCommandBuffer command, const BbDlssgEvaluate* evaluat
         Log(0, "Frame Generation mvecScale %.6f %.6f (%s)", options.mvecScale[0],
             options.mvecScale[1], raw_scale ? "BB_DLSSG_MVEC_SCALE=1" : "1 / render size");
     }
-    options.cameraUp[1] = 1.0f;
-    options.cameraRight[0] = 1.0f;
-    options.cameraFwd[2] = 1.0f;
+    const bool camera_basis = evaluate->camera_magic == BBPORT_DLSSG_CAMERA_MAGIC;
+    if (camera_basis) {
+        // bb-dlssg-inputs: the game camera's world-space position and axes.
+        std::memcpy(options.cameraPos, evaluate->camera_pos, sizeof(options.cameraPos));
+        std::memcpy(options.cameraUp, evaluate->camera_up, sizeof(options.cameraUp));
+        std::memcpy(options.cameraRight, evaluate->camera_right, sizeof(options.cameraRight));
+        std::memcpy(options.cameraFwd, evaluate->camera_fwd, sizeof(options.cameraFwd));
+    } else {
+        options.cameraUp[1] = 1.0f;
+        options.cameraRight[0] = 1.0f;
+        options.cameraFwd[2] = 1.0f;
+    }
+    static bool said_basis = false;
+    if (!said_basis) {
+        said_basis = true;
+        Log(0, "Frame Generation camera position / axes: %s",
+            camera_basis ? "the game camera's (bb-dlssg-inputs)" : "placeholders (0, +y, +x, +z)");
+    }
     options.cameraNear = evaluate->camera_near;
     options.cameraFar = evaluate->camera_far;
     options.cameraFOV = evaluate->camera_fov;
