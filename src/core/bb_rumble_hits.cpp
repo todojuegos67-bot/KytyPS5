@@ -73,6 +73,8 @@ std::atomic<u32> g_count[NumCallers + 1]{};
 std::atomic<u32> g_diag[NumCallers + 1][2]{};
 std::atomic<u32> g_diag_total{0};
 std::atomic<s64> g_diag_last_ms{0};
+std::atomic<u32> g_diag_lines{0}; // periodic summaries logged (capped)
+constexpr u32 MaxDiagLines = 60;  // one per 5 s of hit-fx activity: ~5 min of combat
 
 s64 NowMs() {
     using namespace std::chrono;
@@ -92,15 +94,18 @@ const char* CallerName(u32 k) {
 
 void LogDiag(s64 now) {
     s64 last = g_diag_last_ms.load();
-    if (now - last < 5000 || !g_diag_last_ms.compare_exchange_strong(last, now)) {
+    if (g_diag_lines.load() >= MaxDiagLines || now - last < 5000 ||
+        !g_diag_last_ms.compare_exchange_strong(last, now)) {
         return;
     }
+    const u32 n = g_diag_lines.fetch_add(1) + 1;
     std::string line;
     for (u32 k = 0; k <= NumCallers; ++k) {
         line += fmt::format(" {}[other {} player {}]", CallerName(k), g_diag[k][0].load(),
                             g_diag[k][1].load());
     }
-    LOG_INFO(Core, "[rumble-hits] diag hit-fx calls{}", line);
+    LOG_INFO(Core, "[rumble-hits] diag hit-fx calls{}{}", line,
+             n == MaxDiagLines ? " (last diag line)" : "");
 }
 
 // regs: rbx, r11, r10, r9, r8, rdi, rsi, rdx, rcx, rax, then the return address
