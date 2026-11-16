@@ -32,6 +32,9 @@ public:
         return opened;
     }
     void FinishPreload();
+    [[nodiscard]] const std::filesystem::path& GetCachePath() const {
+        return cache_path;
+    }
     // bb-perf-2: close, move the current cache aside (<name>.stale) and open an empty one.
     void Reset();
 

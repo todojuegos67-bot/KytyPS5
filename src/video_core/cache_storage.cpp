@@ -7,6 +7,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 
+#include "video_core/bb/bb_precompile.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -135,6 +136,10 @@ void DataBase::Close() {
 
     opened = false;
     LOG_INFO(Render, "Cache dumped");
+    // bb-precompile: (re)write the shipped bb-shadercache.bin when asked or when it is outdated.
+    if (!EmulatorSettings.IsPipelineCacheArchived()) {
+        BBPrecompile::OnCacheClosed();
+    }
 }
 
 template <typename T>
