@@ -68,6 +68,14 @@ void TestPhysicsStep() {
 	g_phys = 0.3f / 60.0f;
 	Check(Near(Frame(hook, 0.0075f), 0.0075f), "deep slow motion at 40 fps: not the scaled step (the old fixed step)");
 
+	// Time stopped by the manager (scale 0): it stores 0 and the scaled step is 0, so nothing moves.
+	g_phys = 0.0f;
+	Check(Frame(hook, 0.0f) == 0.0f && g_phys == 0.0f, "scale 0: physics advances");
+	// A pause at scale 1 (the "L1 Parry" prompt in 73-trask-fight: step 0, pause flag set): the manager's 1/60 as before
+	// this change; the game doesn't step Havok while the pause flag is set.
+	g_phys = 1.0f / 60.0f;
+	Check(Near(Frame(hook, 0.0f), 1.0f / 60.0f), "pause at scale 1: not the manager's 1/60");
+
 	// A mode change stores phys = ref (1/30 in Fidelity).
 	g_phys = 1.0f / 30.0f;
 	Check(Near(Frame(hook, 0.05f), 0.05f), "1/30 mode at 20 fps: not 0.05");
