@@ -307,7 +307,7 @@ std::string BbSsrDesc(const Pipeline& pipeline, const R& regs, std::string kind,
     return d;
 }
 
-// bb-rt-reflect (BB_RT_REFLECT=1, default off): find the game's SSR draw (PS hash 0x5a619b89)
+// bb-rt-reflect (BB_RT_REFLECT=1, default off): find the game's SSR draw (PS hash 0x6c2323c2)
 // and log, at most once per 5 s, the Vulkan images it renders to and reads, for the ray-query
 // pass of the next step. Diagnostic only: nothing is changed.
 bool BbRtReflectRequested() {
@@ -317,7 +317,7 @@ bool BbRtReflectRequested() {
     }();
     return on;
 }
-constexpr u64 BbSsrPsHash = 0x5a619b89;
+constexpr u64 BbSsrPsHash = 0x6c2323c2; // fragment shader of the SSR draw (stage 0 in the probe log; 0x5a619b89 is its vertex shader)
 } // namespace
 
 void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
