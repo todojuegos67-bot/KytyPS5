@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -433,6 +434,43 @@ void TestNativeNestedSrtRefresh() {
   // (Not walked: the high word lies past the two-word table, so the pointer would be garbage.)
   Check(Extract(program).srt_code != nullptr,
         "the walker did not compile nonadjacent nested pointer words");
+}
+
+// Reads over 64 words go through a buffer the checks keep per thread: a later, shorter read must not compare the longer
+// one's words, and a changed word in either must fail the check.
+void TestReadLogLargeReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  std::vector<uint32_t> memory(512);
+  for (uint32_t i = 0; i < memory.size(); i++) memory[i] = i * 7u + 1u;
+  const SrtRuntime source{
+      .read_memory = [](void *userdata, uint64_t address, std::span<uint32_t> values) {
+        const auto &words = *static_cast<const std::vector<uint32_t> *>(userdata);
+        if (address / 4u + values.size() > words.size()) return false;
+        std::copy_n(words.begin() + static_cast<ptrdiff_t>(address / 4u), values.size(), values.begin());
+        return true;
+      },
+      .userdata = &memory};
+  const ResourcePlan plan;
+  SrtReadLog big, small;
+  const auto record = [](SrtReadLog &log, const SrtRuntime &runtime, uint64_t address, uint32_t count) {
+    std::vector<uint32_t> values(count);
+    const auto via = log.Recording(runtime);
+    Check(via.read_memory(via.userdata, address, values), "a logged read failed");
+  };
+  record(big, source, 0u, 200u);
+  record(small, source, 1024u, 100u);
+  Check(big.Repeats(source, plan) && small.Repeats(source, plan) && big.Repeats(source, plan),
+        "unchanged large reads did not repeat");
+  memory[199] ^= 1u;
+  Check(!big.Repeats(source, plan) && small.Repeats(source, plan), "a change past 64 words was missed");
+  memory[199] ^= 1u;
+  memory[256 + 99] ^= 1u;
+  Check(big.Repeats(source, plan) && !small.Repeats(source, plan), "a shorter read after a longer one was missed");
+  memory[256 + 99] ^= 1u;
+  Check(big.StillReads(source.read_memory, &memory) && small.StillReads(source.read_memory, &memory),
+        "unchanged large reads were not still read");
+  memory[256 + 70] ^= 1u;
+  Check(!small.StillReads(source.read_memory, &memory), "StillReads missed a change past 64 words");
 }
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
@@ -2293,6 +2331,7 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestReadLogLargeReads();
   TestSrtAliasesRetainReadPolicy();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();

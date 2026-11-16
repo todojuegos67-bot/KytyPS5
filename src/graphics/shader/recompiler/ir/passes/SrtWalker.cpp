@@ -195,13 +195,15 @@ void SrtReadLog::RecordWalk(const ResourcePlan& plan, std::span<const uint32_t> 
 namespace {
 
 // A log's reads are a few words each, thousands of times a frame: no allocation per call. Not cleared: a read that
-// succeeds fills what it's given, and one that fails isn't compared.
+// succeeds fills what it's given, and one that fails isn't compared. Callers keep one per thread: a read over 64 words
+// (Marvel's Wolverine's smoke trail at place 103) otherwise allocated and freed a vector on every check, 3.7 % of the
+// GPU thread there.
 class ReadWords {
 public:
 	[[nodiscard]] std::span<uint32_t> Get(uint32_t count) {
 		if (count <= m_small.size()) return {m_small.data(), count};
-		m_large.resize(count);
-		return m_large;
+		if (m_large.size() < count) m_large.resize(count);
+		return {m_large.data(), count};
 	}
 
 private:
@@ -239,7 +241,8 @@ bool SrtReadLog::Repeats(const SrtRuntime& runtime, const ResourcePlan& plan,
 		    !std::equal(captures, captures + plan.srt_loads, m_walk.data() + outputs + reach))
 			return false;
 	}
-	ReadWords buffer;
+	// Not reentrant: a read callback never checks a log.
+	thread_local ReadWords buffer;
 	for (const auto& read: m_reads) {
 		const auto words = buffer.Get(read.count);
 		if (Read(runtime, read.strict, read.address, words) != read.ok ||
@@ -265,7 +268,7 @@ bool SrtReadLog::StillReads(SrtMemoryReader read, void* userdata, SrtMemoryPeek 
 		}
 		return true;
 	}
-	ReadWords buffer;
+	thread_local ReadWords buffer;
 	for (const auto& entry: m_reads) {
 		const auto words = buffer.Get(entry.count);
 		if (!entry.ok || !read(userdata, entry.address, words) ||
