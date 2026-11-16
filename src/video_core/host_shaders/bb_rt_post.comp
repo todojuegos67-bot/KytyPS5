@@ -9,6 +9,10 @@
 //   mode 2  same with step 2, then blended into the game's SSR target: colour replaced by the
 //           filtered RT colour (misses already carry the game's colour), alpha raised smoothly by
 //           the filtered hit fraction instead of a hard 0/1 replace (faint puddles fade).
+//           With BB_RT_REFLECT_FULLRES=1 (trace scale 2) the result goes to our own full-res
+//           image (binding 5) instead, every pixel written (no depth: the game's SSR value).
+//   mode 3  (full-res only) 2x2 box downsample of the full-res result into the game's SSR target
+//           (dispatched at the SSR size), so the game's blur pyramid sees the RT result as before.
 #version 460
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src_tex;    // this frame's input (texelFetch)
@@ -16,7 +20,8 @@ layout(binding = 1) uniform sampler2D hist_tex;   // previous accumulated result
 layout(binding = 2) uniform sampler2D guide_tex;  // (view normal, view distance)
 layout(binding = 3) uniform sampler2D pguide_tex; // previous frame's guide
 layout(binding = 4, rgba16f) uniform writeonly image2D dst;
-layout(binding = 5, rgba16f) uniform image2D ssr_out;
+layout(binding = 5, rgba16f) uniform image2D ssr_out;      // output: SSR target, or own full-res image
+layout(binding = 10, rgba16f) uniform readonly image2D game_ssr; // the game's SSR target (input)
 layout(binding = 6) uniform sampler2D shine_tex;
 layout(std140, binding = 7) uniform Params {
     mat4 proj;
@@ -35,9 +40,12 @@ layout(push_constant) uniform Push { uint mode; } pc;
 
 shared uint s_ok;
 
+int Scale() { return max(int(p.misc3.w + 0.5), 1); }
+ivec2 TraceSize() { return ivec2(p.size.xy) * Scale(); }
+
 vec3 Unproject(ivec2 px) {
-    float d = texelFetch(depth_tex, px, 0).r;
-    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    float d = texelFetch(depth_tex, px / Scale(), 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(TraceSize());
     vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc.y > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
     vec4 v = p.inv_proj * ndc;
     return v.xyz / v.w;
@@ -48,7 +56,7 @@ float Rough(ivec2 c) {
         return p.misc3.y;
     }
     ivec2 ssz = textureSize(shine_tex, 0);
-    ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(p.size.xy)), ivec2(0), ssz - 1);
+    ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(TraceSize())), ivec2(0), ssz - 1);
     return clamp(1.0 - texelFetch(shine_tex, sc, 0).r, 0.0, 1.0);
 }
 
@@ -58,7 +66,20 @@ void main() {
     }
     barrier();
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = ivec2(p.size.xy);
+    if (pc.mode == 3u) {
+        if (all(lessThan(c, ivec2(p.size.xy)))) {
+            ivec2 b = c * 2;
+            vec4 o = 0.25 * (texelFetch(src_tex, b, 0) + texelFetch(src_tex, b + ivec2(1, 0), 0) +
+                             texelFetch(src_tex, b + ivec2(0, 1), 0) +
+                             texelFetch(src_tex, b + ivec2(1, 1), 0));
+            if (!any(isnan(o)) && !any(isinf(o))) {
+                imageStore(ssr_out, c, o);
+            }
+        }
+        return;
+    }
+    ivec2 sz = TraceSize();
+    const bool full = Scale() > 1;
     bool inside = all(lessThan(c, sz));
     uint ok_hist = 0u;
     if (inside) {
@@ -136,7 +157,7 @@ void main() {
             if (pc.mode == 1u) {
                 imageStore(dst, c, res);
             } else if (g.w > 0.0) {
-                vec4 game = imageLoad(ssr_out, c);
+                vec4 game = imageLoad(game_ssr, c / Scale());
                 float a = clamp(res.a, 0.0, 1.0);
                 if ((uint(p.misc2.w) & 2u) != 0u) {
                     a = sqrt(a); // BB_RT_REFLECT_MORE: faint hits count more
@@ -147,7 +168,11 @@ void main() {
                 }
                 if (!any(isnan(o)) && !any(isinf(o))) {
                     imageStore(ssr_out, c, o);
+                } else if (full) {
+                    imageStore(ssr_out, c, game);
                 }
+            } else if (full) {
+                imageStore(ssr_out, c, imageLoad(game_ssr, c / Scale()));
             }
         }
     }

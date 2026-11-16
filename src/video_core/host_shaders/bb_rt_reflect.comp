@@ -28,13 +28,32 @@ layout(std140, binding = 6) uniform Params {
     uvec4 size;      // depth w, h, grid w, grid h
     vec4 misc;       // far distance, y sign, cell size, debug tint (1)
     vec4 misc2;      // history valid, frame index, rays per pixel, flags (1 shine, 2 more)
-    vec4 misc3;      // temporal blend, default roughness, filter strength, 0
+    vec4 misc3;      // temporal blend, default roughness, filter strength, trace scale (1 or 2)
 } p;
 layout(binding = 7) uniform sampler2D shine_tex;   // G-buffer RT1 (R: shininess) or RT0 when absent
 layout(binding = 8, rgba16f) uniform writeonly image2D raw_out;
 layout(binding = 9, rgba16f) uniform writeonly image2D guide_out;
 
 shared uint s_cnt[5];
+
+// Trace resolution = depth / SSR size (p.size.xy) * scale (BB_RT_REFLECT_FULLRES=1: 2).
+int Scale() { return max(int(p.misc3.w + 0.5), 1); }
+ivec2 TraceSize() { return ivec2(p.size.xy) * Scale(); }
+
+// View-space position of trace pixel px (depth fetched from the depth texel under it).
+vec3 UnprojectT(ivec2 px, out bool ok) {
+    ivec2 ts = TraceSize();
+    px = clamp(px, ivec2(0), ts - 1);
+    float d = texelFetch(depth_tex, px / Scale(), 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(ts);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc.y > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    ok = abs(v.w) > 1e-8;
+    vec3 r = v.xyz / (ok ? v.w : 1.0);
+    float l = length(r);
+    ok = ok && !(isnan(l) || isinf(l)) && l < p.misc.x * 0.95 && l > 1e-4;
+    return r;
+}
 
 vec3 Unproject(ivec2 px, out bool ok) {
     px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
@@ -66,19 +85,22 @@ void main() {
     }
     barrier();
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
+    const ivec2 ts = TraceSize();
+    const int sc_ = Scale();
+    bool inside = c.x < ts.x && c.y < ts.y;
     uint valid = 0u, hit = 0u, used_g = 0u, used_d = 0u;
     if (inside) {
-        vec4 game = imageLoad(ssr_out, c);
+        vec4 game = imageLoad(ssr_out, c / sc_);
         vec4 raw = vec4(game.rgb, 0.0);
         vec4 guide = vec4(0.0);
         bool ok;
-        vec3 P = Unproject(c, ok);
+        vec3 P = UnprojectT(c, ok);
         bool okx1, okx0, oky1, oky0;
-        vec3 px1 = Unproject(c + ivec2(1, 0), okx1);
-        vec3 px0 = Unproject(c - ivec2(1, 0), okx0);
-        vec3 py1 = Unproject(c + ivec2(0, 1), oky1);
-        vec3 py0 = Unproject(c - ivec2(0, 1), oky0);
+        // Neighbours one depth texel away (sc_ trace pixels), else the derivative is 0.
+        vec3 px1 = UnprojectT(c + ivec2(sc_, 0), okx1);
+        vec3 px0 = UnprojectT(c - ivec2(sc_, 0), okx0);
+        vec3 py1 = UnprojectT(c + ivec2(0, sc_), oky1);
+        vec3 py0 = UnprojectT(c - ivec2(0, sc_), oky0);
         if (ok) {
             valid = 1u;
             vec3 dx = (okx1 && (!okx0 || abs(px1.z - P.z) < abs(P.z - px0.z))) ? px1 - P : P - px0;
@@ -88,7 +110,7 @@ void main() {
                 Nd = -Nd;
             }
             ivec2 nsz = textureSize(normal_tex, 0);
-            ivec2 nc = clamp(ivec2((vec2(c) + 0.5) * vec2(nsz) / vec2(p.size.xy)), ivec2(0), nsz - 1);
+            ivec2 nc = clamp(ivec2((vec2(c) + 0.5) * vec2(nsz) / vec2(ts)), ivec2(0), nsz - 1);
             vec3 nw = texelFetch(normal_tex, nc, 0).rgb * 2.0 - 1.0;
             float nl = length(nw);
             vec3 N = Nd;
@@ -108,7 +130,7 @@ void main() {
             float shine = 0.0;
             if ((flags & 1u) != 0u) {
                 ivec2 ssz = textureSize(shine_tex, 0);
-                ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(p.size.xy)), ivec2(0), ssz - 1);
+                ivec2 sc = clamp(ivec2((vec2(c) + 0.5) * vec2(ssz) / vec2(ts)), ivec2(0), ssz - 1);
                 shine = texelFetch(shine_tex, sc, 0).r;
                 rough = clamp(1.0 - shine, 0.0, 1.0);
             }

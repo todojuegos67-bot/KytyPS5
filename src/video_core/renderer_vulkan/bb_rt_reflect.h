@@ -49,6 +49,13 @@ public:
     // Returns false when it did nothing (not supported, no camera, an allocation failed).
     bool Run(vk::CommandBuffer cmd, const Input& in);
 
+    // BB_RT_REFLECT_FULLRES=1: the full-res (2x SSR size) RGBA16F result of the last Run, in
+    // GENERAL layout, same alpha semantics as the game's SSR target. Null when off / failed.
+    bool FullRes() const { return scale > 1; }
+    vk::ImageView FullView() const { return full.view; }
+    u32 FullWidth() const { return w * scale; }
+    u32 FullHeight() const { return h * scale; }
+
 private:
     struct Buf {
         vk::Buffer buffer{};
@@ -84,7 +91,8 @@ private:
     float temporal_blend = 0.1f, filter_strength = 1.0f;
     bool more = false, use_shine = true;
     // Own images (RGBA16F, SSR size): raw trace, guide (normal, distance) x2, history x2, temp.
-    Img raw, tmp;
+    Img raw, tmp, full;
+    u32 scale = 1; // trace scale vs. the SSR size (2 with BB_RT_REFLECT_FULLRES=1)
     std::array<Img, 2> guide, hist;
     bool images_fresh = false;
     // Previous camera (row-major 4x4, column vectors) for the temporal reprojection.

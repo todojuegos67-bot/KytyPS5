@@ -13,7 +13,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 14u; // bb-mv-candles: blended objmv fragment (class)
-static constexpr u32 ShaderMetaVersion = 6u;
+static constexpr u32 ShaderMetaVersion = 7u; // bb-rt-fullres: ImageResource::is_loaded/is_queried
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 

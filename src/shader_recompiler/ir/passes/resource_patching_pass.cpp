@@ -121,6 +121,8 @@ public:
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
         image.is_written |= desc.is_written;
+        image.is_loaded |= desc.is_loaded;
+        image.is_queried |= desc.is_queried;
         return index;
     }
 
@@ -246,6 +248,8 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
         .is_r128 = bool(inst_info.is_r128),
+        .is_loaded = inst.GetOpcode() == IR::Opcode::ImageRead,
+        .is_queried = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions,
         .post_op = resource.sharps[0].post_op,
     };
 

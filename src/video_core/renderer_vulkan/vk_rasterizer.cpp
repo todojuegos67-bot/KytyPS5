@@ -319,22 +319,31 @@ bool BbRtReflectRequested() {
     return on;
 }
 constexpr u64 BbSsrPsHash = 0x6c2323c2; // fragment shader of the SSR draw (stage 0 in the probe log; 0x5a619b89 is its vertex shader)
-bool BbRtFullresRequested() {
+bool BbRtFullresRequested() { // BB_RT_REFLECT_FULLRES=1: full-res trace + composite substitution
     static const bool on = [] {
         const char* e = std::getenv("BB_RT_REFLECT_FULLRES");
         return BbRtReflectRequested() && e && e[0] == '1';
     }();
     return on;
 }
+bool BbRtFullresLogRequested() { // BB_RT_REFLECT_FULLRES=log: the draw-chain diagnostic only
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_REFLECT_FULLRES");
+        return BbRtReflectRequested() && e && std::string_view{e} == "log";
+    }();
+    return on;
+}
+// The lighting / composite draw that samples the SSR target directly (VS 0x8747a367).
+constexpr u64 BbCompositePsHash = 0x3fe9e964;
 } // namespace
 
-// bb-rt-fullres (BB_RT_REFLECT=1 + BB_RT_REFLECT_FULLRES=1, default off): step 1 of full-res
+// bb-rt-fullres (BB_RT_REFLECT=1 + BB_RT_REFLECT_FULLRES=log, default off): step 1 of full-res
 // reflections. Logs, for the first 2 frames that have an SSR draw, every later draw (up to 400)
 // that samples the SSR target or a target written from it (the downsample chain), with its
 // shaders, targets, blend state and reads, so the game's composite draw can be identified by
 // hash. Diagnostic only: nothing is changed.
 void Rasterizer::BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr) {
-    if (!BbRtFullresRequested()) {
+    if (!BbRtFullresLogRequested()) {
         return;
     }
     static std::vector<VAddr> chain;
@@ -597,7 +606,9 @@ void Rasterizer::BbRtReflectRun() {
         .height = target->info.size.height,
     };
     scheduler.EndRendering();
-    bb_rt_reflect->Run(scheduler.CommandBuffer(), in);
+    const bool ran = bb_rt_reflect->Run(scheduler.CommandBuffer(), in);
+    bb_rt_full_pending = ran && bb_rt_reflect->FullRes() && bb_rt_reflect->FullView();
+    bb_rt_ssr_addr = target->info.guest_address;
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
@@ -1370,7 +1381,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     u32 num_images{};
+    // bb-rt-fullres: per binding, 1 = sampled only (substitutable), 2 = IMAGE_LOAD, 3 = size query.
+    boost::container::small_vector<u8, 16> bb_access;
+    const bool bb_full = bb_rt_full_pending && stage.pgm_hash == BbCompositePsHash;
     for (const auto& image_desc : stage.images) {
+        if (bb_full) {
+            bb_access.resize(num_images + image_desc.NumBindings(stage),
+                             image_desc.is_loaded ? 2 : image_desc.is_queried ? 3 : 1);
+        }
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
@@ -1488,6 +1506,37 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             } else if (BB::UiCut::Active() && !is_storage) {
                 // bb-hud-layer: the HUD composite pass reads a transparent layer (AfterDraw).
                 bb_cut.SubstituteLayer(image_id, bb_view, bb_layout);
+            }
+            if (bb_full && !is_storage && image.info.guest_address == bb_rt_ssr_addr) {
+                // bb-rt-fullres: the composite samples our full-res RT result instead.
+                const u8 acc = i < bb_access.size() ? bb_access[i] : 0;
+                const bool fmt_ok = image_view.info.format == vk::Format::eR16G16B16A16Sfloat;
+                static bool logged_sub = false, logged_refuse = false;
+                if (acc == 1 && fmt_ok) {
+                    bb_view = bb_rt_reflect->FullView();
+                    bb_layout = vk::ImageLayout::eGeneral;
+                    bb_rt_full_pending = false;
+                    ++bb_rt_full_subs;
+                    if (!logged_sub) {
+                        logged_sub = true;
+                        LOG_INFO(Render_Vulkan,
+                                 "[rt-fullres] PS {:#x}: binding {} (SSR target {:#x} {}x{}) -> "
+                                 "own RT image {}x{} RGBA16F (sampled with a sampler)",
+                                 BbCompositePsHash, i, bb_rt_ssr_addr, image.info.size.width,
+                                 image.info.size.height, bb_rt_reflect->FullWidth(),
+                                 bb_rt_reflect->FullHeight());
+                    }
+                } else if (!logged_refuse) {
+                    logged_refuse = true;
+                    LOG_WARNING(Render_Vulkan,
+                                "[rt-fullres] PS {:#x}: SSR target binding {} NOT substituted: {}",
+                                BbCompositePsHash, i,
+                                !fmt_ok ? fmt::format("view format {}",
+                                                      vk::to_string(image_view.info.format))
+                                : acc == 2 ? std::string("read with IMAGE_LOAD (texel coords)")
+                                : acc == 3 ? std::string("its size is queried (RESINFO)")
+                                           : std::string("unknown access"));
+                }
             }
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }

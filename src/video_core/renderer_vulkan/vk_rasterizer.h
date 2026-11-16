@@ -233,6 +233,11 @@ private:
 
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt-reflect (BB_RT_REFLECT=1)
     bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
+    // bb-rt-fullres (BB_RT_REFLECT_FULLRES=1): set when the last RT pass produced the full-res
+    // image; the next draw with the composite PS samples it instead of the SSR target.
+    bool bb_rt_full_pending = false;
+    VAddr bb_rt_ssr_addr = 0;
+    u64 bb_rt_full_subs = 0;
 };
 
 } // namespace Vulkan

@@ -133,6 +133,8 @@ struct ImageResource {
     bool is_array{};
     bool is_written{};
     bool is_r128{};
+    bool is_loaded{};  // bb-rt-fullres: read with IMAGE_LOAD (texel coordinates, no sampler)
+    bool is_queried{}; // bb-rt-fullres: size queried (IMAGE_GET_RESINFO)
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};

@@ -191,6 +191,7 @@ void RtReflect::FreeSized() {
     const auto device = instance.GetDevice();
     FreeImage(raw);
     FreeImage(tmp);
+    FreeImage(full);
     for (auto& i : guide) FreeImage(i);
     for (auto& i : hist) FreeImage(i);
     have_prev = false;
@@ -213,6 +214,7 @@ bool RtReflect::Init() {
         return false;
     }
     debug = EnvOn("BB_RT_REFLECT_DEBUG");
+    scale = EnvOn("BB_RT_REFLECT_FULLRES") ? 2u : 1u;
     more = EnvOn("BB_RT_REFLECT_MORE");
     if (const char* q = std::getenv("BB_RT_REFLECT_QUALITY"); q && q[0] >= '1' && q[0] <= '3') {
         quality = u32(q[0] - '0');
@@ -278,7 +280,7 @@ bool RtReflect::Init() {
         return false;
     }
     {
-        const std::array<vk::DescriptorSetLayoutBinding, 10> pb{{
+        const std::array<vk::DescriptorSetLayoutBinding, 11> pb{{
             {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {1, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {2, vk::DescriptorType::eCombinedImageSampler, 1, C},
@@ -289,6 +291,7 @@ bool RtReflect::Init() {
             {7, vk::DescriptorType::eUniformBuffer, 1, C},
             {8, vk::DescriptorType::eCombinedImageSampler, 1, C},
             {9, vk::DescriptorType::eStorageBuffer, 1, C},
+            {10, vk::DescriptorType::eStorageImage, 1, C},
         }};
         auto [lr, l] = device.createDescriptorSetLayout({
             .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
@@ -345,9 +348,11 @@ bool RtReflect::Init() {
     LOG_INFO(Render_Vulkan,
              "[rt-reflect] ray-traced reflections ON: quality {} (depth mesh {}x{} px cells, {} "
              "rays/px, temporal blend {:.2f}, 2-pass bilateral x{:.1f}), more {}, shininess {}, "
-             "debug tint {}",
+             "debug tint {}, trace {}",
              quality, Cell, Cell, rays, temporal_blend, filter_strength, more ? "on" : "off",
-             use_shine ? "if bound" : "off", debug ? "on" : "off");
+             use_shine ? "if bound" : "off", debug ? "on" : "off",
+             scale > 1 ? "full-res (BB_RT_REFLECT_FULLRES=1, own image fed to PS 0x3fe9e964)"
+                       : "SSR size");
     return true;
 }
 
@@ -366,8 +371,10 @@ bool RtReflect::EnsureSize(u32 width, u32 height) {
     using U = vk::BufferUsageFlagBits;
     if (!MakeBuffer(verts, vk::DeviceSize(tris) * 3 * 3 * sizeof(float),
                     U::eStorageBuffer | U::eAccelerationStructureBuildInputReadOnlyKHR, false) ||
-        !MakeImage(raw, w, h) || !MakeImage(tmp, w, h) || !MakeImage(guide[0], w, h) ||
-        !MakeImage(guide[1], w, h) || !MakeImage(hist[0], w, h) || !MakeImage(hist[1], w, h)) {
+        !MakeImage(raw, w * scale, h * scale) || !MakeImage(tmp, w * scale, h * scale) ||
+        !MakeImage(guide[0], w * scale, h * scale) || !MakeImage(guide[1], w * scale, h * scale) ||
+        !MakeImage(hist[0], w * scale, h * scale) || !MakeImage(hist[1], w * scale, h * scale) ||
+        (scale > 1 && !MakeImage(full, w * scale, h * scale))) {
         FreeSized();
         return false;
     }
@@ -524,6 +531,7 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     prm.misc3[0] = temporal_blend;
     prm.misc3[1] = 0.12f; // default roughness without RT1
     prm.misc3[2] = filter_strength;
+    prm.misc3[3] = float(scale);
     std::memcpy(prev_view, vd, sizeof(prev_view));
     std::memcpy(prev_proj, pd, sizeof(prev_proj));
     have_prev = true;
@@ -607,10 +615,12 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     }
     if (images_fresh) {
         // Own images: UNDEFINED -> GENERAL once (they stay GENERAL).
-        std::array<vk::ImageMemoryBarrier2, 6> b{};
-        const std::array<vk::Image, 6> imgs{raw.image, tmp.image, guide[0].image,
-                                            guide[1].image, hist[0].image, hist[1].image};
-        for (u32 i = 0; i < 6; ++i) {
+        std::array<vk::ImageMemoryBarrier2, 7> b{};
+        const std::array<vk::Image, 7> imgs{raw.image,      tmp.image,      guide[0].image,
+                                            guide[1].image, hist[0].image,  hist[1].image,
+                                            full.image};
+        const u32 nimg = full.image ? 7u : 6u;
+        for (u32 i = 0; i < nimg; ++i) {
             b[i] = vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -622,7 +632,7 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
                 .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
             };
         }
-        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 6,
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = nimg,
                                                 .pImageMemoryBarriers = b.data()});
         images_fresh = false;
     }
@@ -784,7 +794,8 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
         }};
         cmd.bindPipeline(vk::PipelineBindPoint::eCompute, ray_pipe);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, ray_layout, 0, wr);
-        cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        const u32 tw = w * scale, th = h * scale;
+        cmd.dispatch((tw + 7) / 8, (th + 7) / 8, 1);
 
         // 4. Temporal accumulation, then two bilateral passes (the second blends into the target).
         const vk::MemoryBarrier2 cc{
@@ -793,7 +804,11 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
             .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
         };
+        const vk::DescriptorImageInfo full_info{{}, full.view, vk::ImageLayout::eGeneral};
         const auto post = [&](u32 mode, const Img& src, const Img& dst) {
+            // Mode 2 output: the SSR target, or (full-res) our own image; mode 3: the target.
+            const vk::DescriptorImageInfo& out_i =
+                (mode == 2 && scale > 1) ? full_info : target_info;
             cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
                                                     .pMemoryBarriers = &cc});
             const vk::DescriptorImageInfo src_i{nearest, src.view, vk::ImageLayout::eGeneral};
@@ -801,7 +816,7 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
             const vk::DescriptorImageInfo g_i{nearest, guide[cur].view, vk::ImageLayout::eGeneral};
             const vk::DescriptorImageInfo pg_i{nearest, guide[prv].view, vk::ImageLayout::eGeneral};
             const vk::DescriptorImageInfo dst_i{{}, dst.view, vk::ImageLayout::eGeneral};
-            const std::array<vk::WriteDescriptorSet, 10> pw{{
+            const std::array<vk::WriteDescriptorSet, 11> pw{{
                 {.dstBinding = 0, .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &src_i},
                 {.dstBinding = 1, .descriptorCount = 1,
@@ -813,7 +828,7 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
                 {.dstBinding = 4, .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst_i},
                 {.dstBinding = 5, .descriptorCount = 1,
-                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &target_info},
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &out_i},
                 {.dstBinding = 6, .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eCombinedImageSampler,
                  .pImageInfo = &shine_info},
@@ -825,22 +840,29 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
                 {.dstBinding = 9, .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageBuffer,
                  .pBufferInfo = &counters_info},
+                {.dstBinding = 10, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &target_info},
             }};
             cmd.bindPipeline(vk::PipelineBindPoint::eCompute, post_pipe);
             cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, post_layout, 0, pw);
             cmd.pushConstants(post_layout, vk::ShaderStageFlagBits::eCompute, 0, 4, &mode);
-            cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+            const u32 dw = mode == 3 ? w : tw, dh = mode == 3 ? h : th;
+            cmd.dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
         };
         post(0, raw, hist[cur]);  // raw + history -> hist[cur] (next frame's history)
         post(1, hist[cur], tmp);  // bilateral step 1
-        post(2, tmp, raw);        // bilateral step 2 -> blended into the SSR target
+        post(2, tmp, raw);        // bilateral step 2 -> blended into the SSR target (or `full`)
+        if (scale > 1) {
+            post(3, full, tmp);   // full-res result 2x2-averaged into the SSR target (pyramid)
+        }
     }
     if (queries) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, queries, slot * 2 + 1);
     }
     // Back to the layouts the texture cache tracks; the writes visible to whatever comes next.
     layouts(false);
-    if (ntr == 0) {
+    if (ntr == 0 || scale > 1) {
+        // (full-res: our image's writes -> the composite draw's fragment-shader reads)
         cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
                                                 .pMemoryBarriers = &all_before});
     }
@@ -866,10 +888,10 @@ void RtReflect::Log() {
     LOG_INFO(Render_Vulkan,
              "[rt-reflect] 5 s: {} dispatches, {} px, {:.1f}% with depth, hit {:.1f}% of those, "
              "normal: G-buffer RT0 {:.1f}% / depth derivatives {:.1f}%, history reused {:.1f}%, "
-             "quality {} ({} rays, {}px cells), GPU {:.3f} ms per pass{}",
+             "quality {} ({} rays, {}px cells), trace {}x{}, GPU {:.3f} ms per pass{}",
              dispatches - last_dispatches, d[0], 100.0 * d[1] / std::max<double>(d[0], 1.0),
              100.0 * d[2] / valid, 100.0 * d[3] / valid, 100.0 * d[4] / valid,
-             100.0 * d[5] / valid, quality, rays, Cell,
+             100.0 * d[5] / valid, quality, rays, Cell, w * scale, h * scale,
              gpu_ms_n ? gpu_ms_sum / gpu_ms_n : 0.0, debug ? " (debug tint)" : "");
     last_dispatches = dispatches;
     gpu_ms_sum = 0.0;
