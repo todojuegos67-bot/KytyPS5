@@ -396,6 +396,10 @@ public:
     }
     u32 bb_prof_next_label = 0;
 
+    /// bb-reflex: this scheduler's submits carry the game frame's Reflex id
+    /// (VkLatencySubmissionPresentIdNV); off for the present thread's own.
+    bool bb_reflex_tag = true;
+
     /// Starts a new session.
     void BeginSession();
 

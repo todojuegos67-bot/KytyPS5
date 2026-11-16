@@ -22,4 +22,11 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size);
 void OnGuestFlip(int flip_mode);
 // Present thread, after a guest frame was presented.
 void OnPresent();
+// bb-reflex: the period of the frame cap BB_GAME_FPS_CAP gave the game's limiter (>= 10 fps,
+// limiter installed), 0 when there is none (unlimited, or BB_VARIABLE_DT off).
+float CapPeriod();
+// bb-reflex: NVIDIA Reflex paces the frames with that cap (its sleep's minimum interval), so the
+// limiter's period becomes 1 ms; false gives the cap back to the limiter. On the thread running
+// the limiter (from its own gettimeofday), so the period it reads next is already the new one.
+void SetLimiterExternal(bool external);
 } // namespace BB::VarDt

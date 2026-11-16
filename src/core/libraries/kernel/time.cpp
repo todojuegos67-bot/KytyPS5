@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_reflex.h"
 
 #ifdef _WIN64
 #include <windows.h>
@@ -403,6 +404,8 @@ s32 PS4_SYSV_ABI sceKernelClockGetres(const u32 clock_id, OrbisKernelTimespec* r
 }
 
 s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
+    // bb-reflex: the game's frame limiter reads its frame start here; Reflex sleeps first.
+    BB::Reflex::OnGuestClock(__builtin_return_address(0));
 #ifdef _WIN64
     if (tp) {
         FILETIME filetime;

@@ -40,7 +40,8 @@ public:
         return present_mode == vk::PresentModeKHR::eFifo ||
                present_mode == vk::PresentModeKHR::eFifoRelaxed;
     }
-    bool Present();
+    // bb-reflex: present_id != 0 adds VkPresentIdKHR (the game frame's Reflex frame id).
+    bool Present(u64 present_id = 0);
     [[nodiscard]] vk::PresentModeKHR GetPresentMode() const {
         return present_mode;
     }

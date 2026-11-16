@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <string>
 #include "video_core/bb/bb_fg.h"
+#include "video_core/bb/bb_reflex_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -91,7 +92,26 @@ void Swapchain::Create(u32 width_, u32 height_) {
     if (BB::FG::CreateSwapchain(swapchain_info, &fg_chain)) {
         swapchain = fg_chain;
     } else {
-        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
+        // bb-reflex: latency mode on (VK_NV_low_latency2) when Reflex is set up; made again
+        // without it if the driver refuses, and Reflex stays off.
+        vk::SwapchainCreateInfoKHR info = swapchain_info;
+        const void* latency_next = BB::Reflex::SwapchainCreateNext(info.pNext);
+        const bool latency = latency_next != nullptr;
+        if (latency) {
+            info.pNext = latency_next;
+        }
+        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(info);
+        if (latency && swapchain_result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Swapchain with latency mode refused ({}): made without",
+                        vk::to_string(swapchain_result));
+            auto [retry_result, retry_chain] =
+                instance.GetDevice().createSwapchainKHR(swapchain_info);
+            swapchain_result = retry_result;
+            chain = retry_chain;
+            BB::Reflex::OnSwapchainCreated({}, false);
+        } else if (latency) {
+            BB::Reflex::OnSwapchainCreated(chain, true);
+        }
         ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                    vk::to_string(swapchain_result));
         swapchain = chain;
@@ -188,12 +208,18 @@ bool Swapchain::AcquireNextImage(u64 timeout_ns, bool& timed_out) {
     return !needs_recreation;
 }
 
-bool Swapchain::Present() {
+bool Swapchain::Present(u64 present_id) {
     if (!swapchain) {
         needs_recreation = true;
         return false;
     }
+    // bb-reflex: the game frame's Reflex frame id (VK_KHR_present_id), 0: none.
+    const vk::PresentIdKHR id_info{
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
     const vk::PresentInfoKHR present_info = {
+        .pNext = present_id != 0 ? &id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -372,6 +398,7 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
+        BB::Reflex::OnSwapchainDestroy();
         if (BB::FG::Fsr3Active()) {
             BB::FG::DestroySwapchain(swapchain);
         } else {

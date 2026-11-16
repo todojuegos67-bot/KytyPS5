@@ -7,6 +7,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_perf2.h"
+#include "video_core/bb/bb_reflex.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -263,8 +264,15 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pSignalSemaphoreValues = info.signal_ticks.data(),
     };
 
-    const vk::SubmitInfo submit_info = {
+    // bb-reflex: the game frame this GPU work belongs to (NVIDIA Reflex's GPU timings).
+    const vk::LatencySubmissionPresentIdNV latency_si = {
         .pNext = &timeline_si,
+        .presentID = bb_reflex_tag ? BB::Reflex::SubmitPresentId() : 0,
+    };
+
+    const vk::SubmitInfo submit_info = {
+        .pNext = latency_si.presentID != 0 ? static_cast<const void*>(&latency_si)
+                                           : static_cast<const void*>(&timeline_si),
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
