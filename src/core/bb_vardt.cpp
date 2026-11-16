@@ -127,6 +127,19 @@ constexpr u64 EbootBase = 0x400000; // Ghidra / XML address = vaddr + EbootBase
 constexpr u32 LiveDtVa = 0x56D3FC4;   // float, written by the dt hook every frame (bss slack)
 constexpr u32 HavokAccVa = 0x56D3FC0; // float, Havok step accumulator (bss slack)
 constexpr u32 PitchRateVa = 0x56D3FC8; // float, camera DirectPitchRate for this frame (ours)
+// BB_RAGDOLL_FIX (default off): the Havok cave keeps stepping while acc >= 1/360 s (vcomiss at
+// 0x17F9CB2), so the last substep of a frame has a variable size h in [1/360, 1/60) that changes
+// with the fps (e.g. 40 fps: 1/60 + 1/120 every frame; uncapped: random). The original game
+// always stepped a fixed 1/30 s. Variable h makes the Havok solver re-solve resting contacts with
+// a different dt each step, which shows up as resting ragdolls (corpses) trembling. The fix only
+// re-points that vcomiss at a 0.0165 s threshold (bss slack 0x56D3FCC): every substep is then
+// h = min(acc, 1/60) with acc >= 0.0165, i.e. a near-fixed 1/60 step; the remainder stays in acc.
+constexpr u32 RagdollThrVa = 0x56D3FCC;  // float threshold read by the patched vcomiss (ours)
+constexpr u32 HavokCmpVa = 0x17F9CB2;    // vcomiss xmm0, [rip+disp] in the Havok cave
+const u8 HavokCmpOrig[8] = {0xC5, 0xF8, 0x2F, 0x05, 0x16, 0xF7, 0x08, 0x03}; // -> 1/360 @0x48893D0
+bool g_ragdoll_fix = false;
+u32 g_ragdoll_frames = 0, g_ragdoll_zero_steps = 0;
+double g_ragdoll_last_log = 0;
 constexpr u32 FramePtrVa = 0x55404F8;  // the frame limiter object pointer
 constexpr u32 OffPeriod = 0x18, OffMeasured = 0x264;
 
@@ -480,6 +493,21 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
         Apply(kHavok, true);
     }
     if (st_pad == St::Orig) Apply(kPad, true);
+    {
+        const char* rf = std::getenv("BB_RAGDOLL_FIX");
+        const bool want = rf != nullptr && rf[0] == '1';
+        if (want && InsideV(RagdollThrVa, 4) && InsideV(HavokCmpVa, 8) &&
+            std::memcmp(AtV(HavokCmpVa), HavokCmpOrig, 8) == 0) {
+            Write32(RagdollThrVa, Bits(0.0165f));
+            Write32(HavokCmpVa + 4, static_cast<u32>(RagdollThrVa - (HavokCmpVa + 8)));
+            g_ragdoll_fix = true;
+            LOG_INFO(Lib_VideoOut, "[ragdoll] BB_RAGDOLL_FIX on: Havok substeps fixed ~1/60 s "
+                                   "(step while acc >= 16.5 ms, remainder carried)");
+        } else if (want) {
+            LOG_WARNING(Lib_VideoOut, "[ragdoll] BB_RAGDOLL_FIX=1 but the Havok cave bytes at "
+                                      "0x17F9CB2 are not the expected ones: off");
+        }
+    }
 
     // 3) Max dt (upper clamp) and the frame cap (the limiter's own period, this+0x18).
     g_max_dt = EnvFloat("BB_VARIABLE_DT_MAX_MS", 50.0f, 17.0f, 100.0f) / 1000.0f;
@@ -633,6 +661,20 @@ void OnGuestFlip(int flip_mode) {
     }
     if (frame) g_frame_period = period;
     if (std::isfinite(havok_acc)) g_havok_acc.Add(havok_acc);
+    if (g_ragdoll_fix) {
+        ++g_ragdoll_frames;
+        if (good && havok_acc >= dt - 0.0001f) ++g_ragdoll_zero_steps; // no substep this frame
+        if (g_ragdoll_last_log == 0) g_ragdoll_last_log = now;
+        if (now - g_ragdoll_last_log >= 5.0) {
+            LOG_INFO(Lib_VideoOut,
+                     "[ragdoll] {:.1f}s: {} frames, {} without a Havok substep; fixed h ~1/60 s, "
+                     "acc now {:.2f} ms",
+                     now - g_ragdoll_last_log, g_ragdoll_frames, g_ragdoll_zero_steps,
+                     havok_acc * 1e3);
+            g_ragdoll_frames = g_ragdoll_zero_steps = 0;
+            g_ragdoll_last_log = now;
+        }
+    }
     if (g_last_flip > 0) g_flip_iv.Add(now - g_last_flip);
     g_last_flip = now;
     (flip_mode == 1 ? g_mode_vsync : flip_mode == 2 ? g_mode_imm : g_mode_other)++;
