@@ -239,13 +239,30 @@ void NoteDlssPanel(float real, float shown) {
 }
 
 const char* PanelName() {
-    return Cfg().kind == Kind::Dlss ? "DLSS-G" : "FSR 3 x2";
+    if (Cfg().kind == Kind::Dlss) return DlssSl::Requested() ? "DLSS-G (Streamline)" : "DLSS-G";
+    return "FSR 3 x2";
 }
 
 bool PanelInfo(float& real, float& shown, const char*& state) {
     real = shown = 0;
     state = "off";
     if (!On()) return false;
+    if (Cfg().kind == Kind::Dlss && DlssSl::Requested()) {
+        // bb-sl-metrics: DLSS-G through Streamline (the NGX bridge is not used then).
+        DlssSl::SecondStats st{};
+        if (!DlssSl::Ready()) {
+            state = "DLSS-G (Streamline) unavailable";
+            return true;
+        }
+        if (!DlssSl::Stats(st)) {
+            state = "starting";
+            return true;
+        }
+        real = st.real_fps;
+        shown = st.shown_fps;
+        state = st.on ? "on" : "idle";
+        return true;
+    }
     if (Cfg().kind == Kind::Dlss) {
         if (!Dlss::Ready()) {
             state = "DLSS-G unavailable";

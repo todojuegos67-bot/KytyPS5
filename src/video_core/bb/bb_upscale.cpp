@@ -1199,6 +1199,21 @@ void DrawOverlay() {
         const char* st = "off";
         if (FG::PanelInfo(fr, fs, st)) {
             const bool gen = std::strcmp(st, "on") == 0;
+            FG::DlssSl::SecondStats sl{};
+            if (FG::DlssSl::Stats(sl)) {
+                // bb-sl-metrics: DLSS-G through Streamline: its own per-second numbers.
+                rows.push_back(
+                    {"FG",
+                     gen ? fmt::format("{} \xC2\xB7 on x{} \xC2\xB7 {:.0f} {} {:.0f} fps "
+                                       "({:.0f} gen/s)",
+                                       FG::PanelName(), sl.presented_per_frame, fr,
+                                       "\xE2\x86\x92", fs, sl.generated_fps)
+                         : fmt::format("{} \xC2\xB7 {} (x{} pedido)", FG::PanelName(), st,
+                                       sl.multiplier),
+                     gen ? kGreen : kOrange});
+                rows.push_back({"Reflex", sl.reflex ? "on (Streamline)" : "off",
+                                sl.reflex ? kGreen : kOrange});
+            } else
             rows.push_back({"FG", gen ? fmt::format("{} \xC2\xB7 on \xC2\xB7 {:.0f} {} {:.0f} fps",
                                                     FG::PanelName(), fr, "\xE2\x86\x92", fs)
                                       : fmt::format("{} \xC2\xB7 {}", FG::PanelName(), st),
@@ -1257,7 +1272,13 @@ void DrawOverlay() {
                             std::strcmp(fg_state, "on") == 0 && fg_shown > fg_real * 1.2f;
         const std::string fps =
             fg_gen ? fmt::format("FPS real {:.0f} / mostrados {:.0f} (FG x{:.0f})", fg_real, fg_shown,
-                                 std::round(fg_shown / std::max(fg_real, 1.0f)))
+                                 [&] {
+                                     // bb-sl-metrics: Streamline's real presented-per-frame.
+                                     FG::DlssSl::SecondStats sl{};
+                                     return FG::DlssSl::Stats(sl) && sl.presented_per_frame > 1
+                                                ? float(sl.presented_per_frame)
+                                                : std::round(fg_shown / std::max(fg_real, 1.0f));
+                                 }())
                    : fmt::format("FPS {:.0f}", s.fps);
         dl->AddText(f, fps_px, {x0 + pad, y}, kWhite, fps.c_str());
         y += fps_h;

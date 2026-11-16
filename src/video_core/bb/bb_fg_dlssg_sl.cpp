@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
@@ -109,6 +110,10 @@ std::atomic<uint32_t> g_last_used{0};
 std::atomic<uint32_t> g_sec_tagged{0}, g_sec_off{0}, g_sec_own_constants{0}, g_sec_errors{0},
     g_sec_presents{0};
 std::atomic<uint32_t> g_max_gen{0};
+bool g_reflex_on = false;
+std::mutex g_stats_mutex;
+SecondStats g_stats{};
+bool g_stats_set = false;
 
 template <typename F>
 bool Feature(sl::Feature feature, const char* name, F*& out) {
@@ -338,6 +343,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         o.mode = sl::ReflexMode::eLowLatency;
         o.useMarkersToOptimize = false;
         const auto r = g.reflex_set_options(o);
+        g_reflex_on = r == sl::Result::eOk;
         BBLogf("DLSS-G (Streamline): slReflexSetOptions(low latency) returned %d",
                static_cast<int>(r));
     } else {
@@ -501,18 +507,44 @@ void AfterPresent(uint32_t frame, bool presented) {
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(1)) return;
+    const double secs = std::chrono::duration<double>(now - last).count();
     last = now;
     sl::DLSSGState s{};
     const auto r = g.dlssg_get_state(kViewport, s, nullptr);
     if (r == sl::Result::eOk) g_max_gen.store(s.numFramesToGenerateMax, std::memory_order_relaxed);
+    const uint32_t sec_presents = g_sec_presents.exchange(0);
+    {
+        // bb-sl-metrics: the second's numbers for the panel / [bbport] (read-only for them).
+        SecondStats st{};
+        const uint32_t ppf = r == sl::Result::eOk ? s.numFramesActuallyPresented : 0;
+        st.presented_per_frame = ppf;
+        st.multiplier = g_options.on ? g_options.frames + 1 : 1;
+        st.status = static_cast<uint32_t>(s.status);
+        st.reflex = g_reflex_on;
+        st.real_fps = static_cast<float>(sec_presents / secs);
+        st.shown_fps = st.real_fps * static_cast<float>(std::max(ppf, 1u));
+        st.generated_fps = st.shown_fps - st.real_fps;
+        st.on = g_options.on && ppf > 1;
+        std::lock_guard lock{g_stats_mutex};
+        g_stats = st;
+        g_stats_set = true;
+    }
     BBLogf("[dlssg-sl] state %d status 0x%x presented/frame %u max-gen %u min-size %u vram %.0f MB "
            "| last s: game frames %u tagged %u off %u own-constants %u errors %u | options %s x%u",
            static_cast<int>(r), static_cast<uint32_t>(s.status), s.numFramesActuallyPresented,
            s.numFramesToGenerateMax, s.minWidthOrHeight,
            static_cast<double>(s.estimatedVRAMUsageInBytes) / (1024.0 * 1024.0),
-           g_sec_presents.exchange(0), g_sec_tagged.exchange(0), g_sec_off.exchange(0),
+           sec_presents, g_sec_tagged.exchange(0), g_sec_off.exchange(0),
            g_sec_own_constants.exchange(0), g_sec_errors.exchange(0),
            g_options.on ? "on" : "off", g_options.frames + 1);
+}
+
+bool Stats(SecondStats& out) {
+    if (!g_ready) return false;
+    std::lock_guard lock{g_stats_mutex};
+    if (!g_stats_set) return false;
+    out = g_stats;
+    return true;
 }
 
 #else // no Streamline SDK in this build
@@ -551,6 +583,9 @@ uint32_t TagFrame(vk::CommandBuffer, const Inputs*, vk::Extent2D, vk::Format) {
 }
 void BeforePresent(uint32_t) {}
 void AfterPresent(uint32_t, bool) {}
+bool Stats(SecondStats&) {
+    return false;
+}
 
 #endif
 

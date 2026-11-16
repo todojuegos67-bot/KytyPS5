@@ -2253,8 +2253,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 "shown {:.1f} fps",
                 frames_cut ? "yes" : "no", frames_cut, game, cut.cuts, cut.ui_only, cut.displays,
                 cut.layer_cuts, cut.layer_composites, cut.layer_failed, hudless ? "yes" : "no", cut.hudless, hudless, hudless_failed,
-                BB::FG::Dlss::Ready() ? (shown ? "on" : "idle") : "off", made, shown,
+                BB::FG::Dlss::Ready()      ? (shown ? "on" : "idle")
+                : BB::FG::DlssSl::Ready() ? "on via Streamline"
+                                          : "off",
+                made, shown,
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
+            // bb-sl-metrics: DLSS-G through Streamline (generated inside its present proxy, so
+            // the counters above stay 0): its own last second.
+            if (BB::FG::DlssSl::SecondStats sl{}; BB::FG::DlssSl::Stats(sl)) {
+                BB::Upscale::Checkpoint(fmt::format(
+                    "[bbport] DLSS-G {} via Streamline (x{} presented/frame, options x{}, "
+                    "{:.1f} generated/s, real {:.1f} fps, shown {:.1f} fps, status 0x{:x}, "
+                    "Reflex {})",
+                    sl.on ? "on" : "idle", sl.presented_per_frame, sl.multiplier,
+                    sl.generated_fps, sl.real_fps, sl.shown_fps, sl.status,
+                    sl.reflex ? "on" : "off"));
+            }
             if (BB::FG::Dlss::Ready()) {
                 BB::FG::NoteDlssPanel(float(game / sec), float((presents + shown) / sec));
             }

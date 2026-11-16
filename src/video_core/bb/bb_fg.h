@@ -153,6 +153,20 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
 // Present thread, around the game frame's present (frame: TagFrame's index, 0: none).
 void BeforePresent(uint32_t frame);
 void AfterPresent(uint32_t frame, bool presented);
+// bb-sl-metrics: the last second's numbers (from AfterPresent's once-a-second slDLSSGGetState and
+// [dlssg-sl] counters), for the F8 "Metricas" panel and the [bbport] line. Read only: calling it
+// changes nothing in Streamline's path. False until Ready() and the first second has passed.
+struct SecondStats {
+    bool on = false;          // options mode on and Streamline presents generated frames
+    float real_fps = 0;       // game frames presented through the proxy per second
+    float shown_fps = 0;      // real_fps x presented per frame
+    float generated_fps = 0;  // shown_fps - real_fps
+    uint32_t presented_per_frame = 0; // DLSSGState::numFramesActuallyPresented (0: unknown)
+    uint32_t multiplier = 1;  // options: numFramesToGenerate + 1 (1 while off)
+    uint32_t status = 0;      // DLSSGState::status
+    bool reflex = false;      // slReflexSetOptions(low latency) returned eOk
+};
+bool Stats(SecondStats& out);
 } // namespace DlssSl
 
 bool PanelInfo(float& real, float& shown, const char*& state);
