@@ -272,14 +272,14 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
-    // bb-clean-021-fg: FSR 3 FG paces its own presents (real + generated). Under FIFO the
-    // present of the real frame waited a whole refresh (real fps halved, no gain over FG off):
-    // with FG on, mailbox (else immediate) unless BB_FG_PRESENT=fifo.
-    // bb-clean-021-bbport: DLSS-G presents its generated frames itself (Supermedo's loop): the
-    // same choice.
-    if ((BB::FG::Fsr3Requested() || BB::FG::Dlss::Requested()) &&
-        (present_mode == vk::PresentModeKHR::eFifo ||
-         present_mode == vk::PresentModeKHR::eFifoRelaxed)) {
+    // bb-clean-021-fg / bb-clean-021-bbport: frame generation (FSR 3 and DLSS-G) present mode.
+    // bb-dlssg-pace: FIFO (V-Sync; with G-SYNC / FreeSync it is the VRR mode) by default, as the
+    // user asked: "auto" used to switch to Mailbox, which may replace a queued image by the next
+    // one and gave DLSS-G uneven frame times (log-dlssg: "present mode Mailbox (configured Fifo;
+    // BB_FG_PRESENT=auto)"). Mailbox / Immediate only when asked: BB_FG_PRESENT=mailbox |
+    // immediate (the configured mode stays when the asked one is missing). BB_FG_PRESENT=fifo
+    // forces FIFO even when the settings ask for Mailbox / Immediate.
+    if (BB::FG::Fsr3Requested() || BB::FG::Dlss::Requested()) {
         const char* v = std::getenv("BB_FG_PRESENT");
         const std::string want = v != nullptr ? v : "";
         const auto has = [&](vk::PresentModeKHR m) {
@@ -288,12 +288,16 @@ void Swapchain::FindPresentMode() {
         vk::PresentModeKHR chosen = present_mode;
         if (want == "immediate" && has(vk::PresentModeKHR::eImmediate)) {
             chosen = vk::PresentModeKHR::eImmediate;
-        } else if (want != "fifo") {
-            chosen = has(vk::PresentModeKHR::eMailbox)     ? vk::PresentModeKHR::eMailbox
-                     : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
-                                                           : present_mode;
+        } else if (want == "mailbox" && has(vk::PresentModeKHR::eMailbox)) {
+            chosen = vk::PresentModeKHR::eMailbox;
+        } else if (want == "configured") {
+            chosen = present_mode;
+        } else if (want != "immediate" && want != "mailbox") {
+            chosen = vk::PresentModeKHR::eFifo;
         }
-        LOG_INFO(Render_Vulkan, "Frame generation: present mode {} (configured {}; BB_FG_PRESENT={})",
+        LOG_INFO(Render_Vulkan,
+                 "Frame generation: present mode {} (configured {}; BB_FG_PRESENT={}; FIFO = "
+                 "V-Sync / VRR by default, mailbox / immediate / configured only when set)",
                  vk::to_string(chosen), vk::to_string(present_mode), want.empty() ? "auto" : want);
         present_mode = chosen;
     }

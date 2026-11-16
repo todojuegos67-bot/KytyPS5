@@ -38,6 +38,9 @@ public:
                present_mode == vk::PresentModeKHR::eFifoRelaxed;
     }
     bool Present();
+    [[nodiscard]] vk::PresentModeKHR GetPresentMode() const {
+        return present_mode;
+    }
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

@@ -969,9 +969,132 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
     if (!swapchain.Present()) {
         return false;
     }
+    BbDlssgNotePresent(false);
     return true;
 }
 
+// bb-dlssg-pace (BB_DLSSG_PACE, default 1; 0: each game frame's generated frame goes out the
+// moment the game frame arrives, its own one game-frame-average / 2 later, as before).
+// log-dlssg (40 FPS cap, x2, 240 Hz): 41 generated / 41 presented each second, but the frames were
+// shown when each game frame happened to arrive, so any jitter in the arrivals (the game's own
+// limiter sleeps with sceKernelUsleep, then the GPU work) reached the screen unchanged, and the
+// generated / real spacing used a 10-frame average instead of the actual interval. Here the
+// arrivals feed a grid: the step is the mean of the last 32 game frame intervals, each slot moves
+// 1/8 of the way towards the arrival it belongs to (a re-phase when an arrival is more than 0.4
+// steps off: pauses, loading), and the presents wait for slot + margin
+// (BB_DLSSG_PACE_MARGIN_MS, default 2, at most a quarter step) so an arrival a little late still
+// lands on the grid. Never waits when the game is waiting for a free frame.
+std::chrono::steady_clock::time_point Presenter::BbDlssgPaceOrigin(
+    std::chrono::steady_clock::time_point now, bool generating, bool may_wait, double& step_ms) {
+    static const bool pace_on = [] {
+        const char* v = std::getenv("BB_DLSSG_PACE");
+        const bool on = v == nullptr || v[0] != '0';
+        BB::Upscale::Checkpoint(fmt::format(
+            "[fg-pacing] DLSS-G present grid {} (BB_DLSSG_PACE; 0: frames go out as they arrive)",
+            on ? "on" : "off"));
+        return on;
+    }();
+    static const double margin_cfg_s = [] {
+        const char* v = std::getenv("BB_DLSSG_PACE_MARGIN_MS");
+        const double ms = v != nullptr && *v != '\0' ? std::strtod(v, nullptr) : 2.0;
+        return std::clamp(ms, 0.0, 20.0) / 1e3;
+    }();
+    auto& p = bb_dlssg_pace;
+    const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
+    if (p.last_arrive > 0.0) {
+        const double dt = now_s - p.last_arrive;
+        if (dt > 0.0 && dt < 0.1) {
+            p.arrive_ms.push_back(dt * 1e3);
+            p.ring[p.next] = dt;
+            p.next = (p.next + 1) % int(p.ring.size());
+            p.count = std::min(p.count + 1, int(p.ring.size()));
+        } else {
+            p.count = 0;
+            p.next = 0;
+            p.last_slot = 0.0;
+        }
+    }
+    p.last_arrive = now_s;
+    if (!pace_on)
+        return now;
+    p.step = 0.0;
+    if (p.count >= 8) {
+        double sum = 0.0;
+        for (int i = 0; i < p.count; ++i)
+            sum += p.ring[i];
+        p.step = sum / p.count;
+    }
+    if (!(p.step > 0.001 && p.step < 0.1)) {
+        p.last_slot = 0.0;
+        return now;
+    }
+    step_ms = p.step * 1e3;
+    const double expected = p.last_slot + p.step;
+    double slot = now_s;
+    if (p.last_slot > 0.0 && std::fabs(now_s - expected) <= 0.4 * p.step) {
+        slot = expected + (now_s - expected) * 0.125;
+    } else {
+        ++p.rephase;
+    }
+    p.last_slot = slot;
+    if (!generating)
+        return now;
+    const double target = slot + std::min(margin_cfg_s, 0.25 * p.step);
+    if (target <= now_s) {
+        ++p.late;
+        return now;
+    }
+    if (!may_wait) {
+        ++p.skipped_behind;
+        return now;
+    }
+    ++p.waits;
+    p.wait_ms += (target - now_s) * 1e3;
+    return now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                     std::chrono::duration<double>(target - now_s));
+}
+
+void Presenter::BbDlssgNotePresent(bool real) {
+    if (!BB::FG::Dlss::Ready())
+        return;
+    auto& p = bb_dlssg_pace;
+    const auto now = std::chrono::steady_clock::now();
+    const auto note = [&](std::chrono::steady_clock::time_point& last, std::vector<double>& out) {
+        if (last.time_since_epoch().count() != 0) {
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            if (ms > 0.0 && ms < 100.0)
+                out.push_back(ms);
+        }
+        last = now;
+    };
+    note(p.last_present, p.all_ms);
+    if (real)
+        note(p.last_real_present, p.real_ms);
+}
+
+void Presenter::BbDlssgPaceLogSecond(double sec) {
+    auto& p = bb_dlssg_pace;
+    const auto mode = swapchain.GetPresentMode();
+    const char* mode_name = mode == vk::PresentModeKHR::eFifo          ? "FIFO"
+                            : mode == vk::PresentModeKHR::eFifoRelaxed ? "FIFO relaxed"
+                            : mode == vk::PresentModeKHR::eMailbox     ? "Mailbox"
+                            : mode == vk::PresentModeKHR::eImmediate   ? "Immediate"
+                                                                       : "other";
+    BB::Upscale::Checkpoint(fmt::format(
+        "[fg-pacing] DLSS-G {:.2f} s: real frames (arrivals) {} | real presents {} | all presents "
+        "{} | grid step {:.2f} ms: waited {} (avg {:.2f} ms), late {}, re-phased {}, not held "
+        "(game waiting) {} | reflex markers sent 0 (bbport_dlss ABI 2 has no Reflex / PCL calls, "
+        "VK_NV_low_latency2 not enabled) | present mode {}",
+        sec, BB::FG::IntervalStats(std::move(p.arrive_ms)),
+        BB::FG::IntervalStats(std::move(p.real_ms)), BB::FG::IntervalStats(std::move(p.all_ms)),
+        p.step * 1e3, p.waits, p.waits ? p.wait_ms / p.waits : 0.0, p.late, p.rephase,
+        p.skipped_behind, mode_name));
+    p.arrive_ms.clear();
+    p.real_ms.clear();
+    p.all_ms.clear();
+    p.waits = p.late = p.rephase = p.skipped_behind = 0;
+    p.wait_ms = 0.0;
+}
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
@@ -1693,8 +1816,6 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         bb_last_game_present = bb_start;
         ++bb_sec_game;
     }
-    const auto bb_step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double, std::milli>(bb_game_frame_ms / (bb_generated + 1)));
     // The game must never wait for generated frames: when every frame is in use they are
     // dropped and the game's frame goes out at once.
     const auto bb_behind = [this] {
@@ -1715,16 +1836,31 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             std::this_thread::yield();
         }
     };
+    // bb-dlssg-pace: the generated frame and the game's go out on a grid locked to the game's
+    // frame rate (as FSR 3's slots), not at the moment each game frame happens to arrive.
+    double bb_frame_ms = bb_game_frame_ms;
+    auto bb_origin = bb_start;
+    if (!is_reusing_frame && is_game_frame && BB::FG::Dlss::Ready()) {
+        const auto origin =
+            BbDlssgPaceOrigin(bb_start, bb_generated > 0, !bb_behind(), bb_frame_ms);
+        if (bb_generated) {
+            bb_origin = origin;
+            if (bb_origin > bb_start)
+                bb_wait_until(bb_origin);
+        }
+    }
+    const auto bb_step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double, std::milli>(bb_frame_ms / (bb_generated + 1)));
     u32 bb_shown = 0;
     for (; bb_shown < bb_generated; ++bb_shown) {
         if (bb_shown > 0) {
             if (bb_behind()) break;
-            bb_wait_until(bb_start + bb_step * bb_shown);
+            bb_wait_until(bb_origin + bb_step * bb_shown);
         }
         if (!BbPresentGenerated(frame, bb_shown, bb_shown == 0)) break;
     }
     if (bb_shown && !bb_behind()) {
-        bb_wait_until(bb_start + bb_step * bb_shown);
+        bb_wait_until(bb_origin + bb_step * bb_shown);
     }
     bb_sec_generated_shown += bb_shown;
 
@@ -2012,6 +2148,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        } else {
+            BbDlssgNotePresent(!is_reusing_frame && is_game_frame);
         }
     }
 
@@ -2047,6 +2185,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 bb_frame_gen_limit.load(), game / sec, (presents + shown) / sec));
             if (BB::FG::Dlss::Ready()) {
                 BB::FG::NoteDlssPanel(float(game / sec), float((presents + shown) / sec));
+                BbDlssgPaceLogSecond(sec);
             }
             bb_hud_fg->LogSecond(sec);
             bb_hud_fg->LogHudlessSecond(sec);

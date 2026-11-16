@@ -185,6 +185,8 @@ struct FrameTimes {
     std::vector<double> shown; // ms between the presents planned on the slots (all frames)
     uint32_t rephase = 0, own_slots = 0;
 } g_ft;
+std::string g_dll_presents_line = "n/a"; // bb-dlssg-pace: the DLL's present intervals, last second
+const char* g_present_mode_name = "?";
 
 double SteadyNow() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
@@ -523,6 +525,13 @@ void LogPresentIntervals(double window) {
     const double var_ms2 =
         n > 0.0 ? static_cast<double>(pace[3]) / n / 1e12 - mean_ms * mean_ms : 0.0;
     NotePacing(-1.0, std::sqrt(std::max(var_ms2, 0.0))); // 1.54: all presents
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "mean %.2f sd %.2f min %.2f max %.2f ms (%lld)", mean_ms,
+                      std::sqrt(std::max(var_ms2, 0.0)), static_cast<double>(pace[4]) / 1e6,
+                      static_cast<double>(pace[5]) / 1e6, static_cast<long long>(pace[1]));
+        g_dll_presents_line = n > 1.0 ? buf : "n/a";
+    }
     Printf("[midpoint] real %.1f fps, shown %.1f fps (%lld presents); interval over all presents: "
            "mean %.2f ms, sd %.2f ms (min %.2f, max %.2f, %lld intervals); placed %u of %u real "
            "flips; late %lld (max %.2f ms)",
@@ -873,8 +882,14 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
         g_requested = false;
         return false;
     }
-    Printf("FSR3 FG: frame generation swapchain %ux%u (present mode %d)", info.imageExtent.width,
-           info.imageExtent.height, static_cast<int>(info.presentMode));
+    g_present_mode_name = info.presentMode == vk::PresentModeKHR::eFifo          ? "FIFO"
+                          : info.presentMode == vk::PresentModeKHR::eFifoRelaxed ? "FIFO relaxed"
+                          : info.presentMode == vk::PresentModeKHR::eMailbox     ? "Mailbox"
+                          : info.presentMode == vk::PresentModeKHR::eImmediate   ? "Immediate"
+                                                                                 : "other";
+    Printf("FSR3 FG: frame generation swapchain %ux%u (present mode %d, %s)",
+           info.imageExtent.width, info.imageExtent.height, static_cast<int>(info.presentMode),
+           g_present_mode_name);
     *out = swapchain;
     return true;
 }
@@ -1149,9 +1164,16 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
                    CapInterval() * 1e3, "present");
         }
+        g_dll_presents_line = "n/a (the DLL has no pace counters)";
         if (g_take_pace_stats != nullptr) {
             LogPresentIntervals(window);
         }
+        // bb-dlssg-pace: the same per-second pacing line as DLSS-G's (log only).
+        Printf("[fg-pacing] FSR 3 1 s: real frames (into the FG swapchain) %s | presented (DLL, "
+               "all presents) %s | planned slots %s | reflex markers sent 0 (FSR 3 path: the "
+               "DLL's own pacing thread, no Reflex / Anti-Lag) | present mode %s",
+               IntervalStats(g_ft.real).c_str(), g_dll_presents_line.c_str(),
+               IntervalStats(g_ft.shown).c_str(), g_present_mode_name);
         {
             // 0.92: real / planned-shown frame times (ms) of the last second.
             std::string line = "[fsr3-ft] ";

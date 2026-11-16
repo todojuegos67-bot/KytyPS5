@@ -24,6 +24,8 @@ namespace BB::FG {
 const char* Env(const char* kyty_name);
 void Printf(const char* format, ...);
 void NotePacing(double real_sd_ms, double shown_sd_ms);
+// bb-dlssg-pace: "mean M sd S p99 P max X ms (n)" of a list of intervals in ms ("n/a" under 2).
+std::string IntervalStats(std::vector<double> ms);
 
 enum class Kind : uint32_t { Off, Amd, Dlss };
 struct Config {

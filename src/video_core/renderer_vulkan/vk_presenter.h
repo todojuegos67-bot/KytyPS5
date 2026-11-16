@@ -6,8 +6,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include "video_core/renderer_vulkan/bb_present_sr.h"
+#include <vector>
 #include "video_core/renderer_vulkan/bb_hud_fg.h"
+#include "video_core/renderer_vulkan/bb_present_sr.h"
 
 #include <condition_variable>
 
@@ -173,6 +174,21 @@ private:
     bool BbPresentGenerated(Frame* frame, u32 index, bool first);
     std::atomic<double> bb_game_frame_ms{16.6};
     std::chrono::steady_clock::time_point bb_last_game_present{};
+    // bb-dlssg-pace: the DLSS-G present grid (BB_DLSSG_PACE) and the per-second [fg-pacing] line.
+    struct BbDlssgPace {
+        double last_slot = 0.0, last_arrive = 0.0, step = 0.0; // s
+        std::array<double, 32> ring{};
+        int count = 0, next = 0;
+        u32 waits = 0, late = 0, rephase = 0, skipped_behind = 0;
+        double wait_ms = 0.0;
+        std::vector<double> arrive_ms, real_ms, all_ms;
+        std::chrono::steady_clock::time_point last_present{}, last_real_present{};
+    };
+    BbDlssgPace bb_dlssg_pace{};
+    std::chrono::steady_clock::time_point BbDlssgPaceOrigin(
+        std::chrono::steady_clock::time_point now, bool generating, bool may_wait, double& step_ms);
+    void BbDlssgNotePresent(bool real);
+    void BbDlssgPaceLogSecond(double sec);
     bool bb_imgui_ui_shown = false; // bb-dlssg-ui
     // bb-menu-ui: the texture of the game image ImGui drew in the last Present (the draw data
     // BbPresentGenerated draws again belongs to that Present, not to the frame being presented).
