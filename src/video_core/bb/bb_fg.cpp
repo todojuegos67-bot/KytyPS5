@@ -265,7 +265,7 @@ bool PanelInfo(float& real, float& shown, const char*& state) {
 }
 
 bool WantInputs() {
-    return Fsr3Active() || Dlss::Ready();
+    return Fsr3Active() || Dlss::Ready() || DlssSl::Ready();
 }
 
 bool WantsUiLayer() {

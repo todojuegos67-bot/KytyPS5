@@ -227,6 +227,19 @@ struct OptionsKey {
 OptionsKey g_options{};
 bool g_options_set = false;
 
+// One log line when the reason for staying off (or for being on) changes.
+void Reason(uint32_t reason) {
+    static std::atomic<uint32_t> last{~0u};
+    if (last.exchange(reason, std::memory_order_relaxed) == reason) return;
+    static constexpr const char* kText[] = {
+        "on (frames tagged)",
+        "off: no 3D frame captured for this game frame (2D, HDR or inputs not ready)",
+        "off: own constants failed",
+        "off: slSetTagForFrame failed",
+    };
+    BBLogf("[dlssg-sl] %s", kText[reason]);
+}
+
 void SetOptions(const OptionsKey& key) {
     if (g_options_set && key == g_options) return;
     sl::DLSSGOptions o{};
@@ -421,11 +434,13 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
         SetOptions(OptionsKey{false, g_options.frames, g_options.mw, g_options.mh, g_options.cw,
                               g_options.ch});
         g_sec_off.fetch_add(1, std::memory_order_relaxed);
+        Reason(1);
         return frame;
     }
     if (own) {
         if (!SetOwnConstants(*inputs, *token)) {
             g_sec_errors.fetch_add(1, std::memory_order_relaxed);
+            Reason(2);
             return frame;
         }
         g_sec_own_constants.fetch_add(1, std::memory_order_relaxed);
@@ -451,11 +466,13 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
         static uint32_t said = 0;
         if (said++ < 8) BBLogf("DLSS-G (Streamline): slSetTagForFrame returned %d", static_cast<int>(r));
         g_sec_errors.fetch_add(1, std::memory_order_relaxed);
+        Reason(3);
         return frame;
     }
     SetOptions(OptionsKey{true, WantedFrames(), inputs->render.width, inputs->render.height,
                           backbuffer.width, backbuffer.height});
     g_sec_tagged.fetch_add(1, std::memory_order_relaxed);
+    Reason(0);
     static bool said = false;
     if (!said) {
         said = true;
