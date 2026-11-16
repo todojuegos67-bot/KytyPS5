@@ -48,9 +48,9 @@ struct Memory {
 		Put(address + 8u, count);
 	}
 	// A material's place, its slot and the image in the slot.
-	void PutMaterial(uint32_t material, uint32_t place, uint32_t slot, uint64_t image) {
+	void PutMaterial(uint32_t material, uint32_t place, uint32_t slot, uint64_t image, uint32_t slot_field = 0x94u) {
 		Put(RegistryBase + material * 96ull + 28u, place);
-		Put(ManagerBase + place * 16ull + 0x94u, slot);
+		Put(ManagerBase + place * 16ull + slot_field, slot);
 		Put(HeapBase + slot * 32ull, static_cast<uint32_t>(image >> 8u));
 		Put(HeapBase + slot * 32ull + 4u, static_cast<uint32_t>(image >> 40u));
 	}
@@ -87,8 +87,8 @@ std::vector<uint32_t> VertexUser(Memory& memory, uint32_t records, uint32_t stri
 	return user;
 }
 
-std::vector<uint32_t> PixelUser(uint32_t records, uint32_t stride = 16u) {
-	std::vector<uint32_t> user(32u);
+std::vector<uint32_t> PixelUser(uint32_t records, uint32_t stride = 16u, uint32_t table = 28u) {
+	std::vector<uint32_t> user(table + 4u);
 	const auto            put = [&](uint32_t reg, uint64_t base, uint32_t buffer_stride, uint32_t count) {
         user[reg]      = static_cast<uint32_t>(base);
         user[reg + 1u] = static_cast<uint32_t>(base >> 32u) | (buffer_stride << 16u);
@@ -96,7 +96,7 @@ std::vector<uint32_t> PixelUser(uint32_t records, uint32_t stride = 16u) {
 	};
 	put(0u, ListBase, stride, records);
 	put(4u, HeapBase, 0u, 0x100000u);
-	put(28u, TableBase, 0u, 0x10000u);
+	put(table, TableBase, 0u, 0x10000u);
 	return user;
 }
 
@@ -214,11 +214,35 @@ void TestNarrow() {
 	Check(narrowed.empty() && kept.empty(), "no values");
 }
 
+// Place 103's smoke-trail pixel programs: their table in register 20; A's slot at +0x84, B's at +0x94.
+void TestTrailReach() {
+	auto memory = MakeMemory();
+	// Material 591's place 9 holds another slot at +0x84, so A and B reach different images.
+	memory.PutMaterial(591u, 9u, 18600u, 0xa00000000ull, 0x84u);
+	memory.PutMaterial(0u, 7u, 71u, 0x710000000ull, 0x84u);
+	Reach reach;
+	const auto user = PixelUser(1u, 16u, 20u);
+	Check(Find(TrailPixelB, user, 0u, memory, reach) && reach.count == 2u && reach.Holds(0x900000000ull) &&
+	          reach.Holds(0x700000000ull),
+	      "trail B reads its slot at +0x94 through the table in register 20");
+	Check(Find(TrailPixelA, user, 0u, memory, reach) && reach.count == 2u && reach.Holds(0xa00000000ull) &&
+	          reach.Holds(0x710000000ull),
+	      "trail A reads its slot at +0x84");
+	Check(!Find(TrailPixelA, std::vector<uint32_t>(23u), 0u, memory, reach), "too little trail user data");
+	Check(!Find(PixelProgram, user, 0u, memory, reach), "the particle program needs user data up to its table in register 28");
+	Check(!Find(0x3de16049649d9ad6ull, user, 0u, memory, reach), "no chain for another program");
+	// The particle program still reads register 28 and +0x94.
+	Check(Find(PixelProgram, PixelUser(1u), 0u, memory, reach) && reach.Holds(0x900000000ull), "the particle chain is unchanged");
+}
+
 } // namespace
 
 int main() {
-	Check(IsStoreProgram(VertexProgram) && IsStoreProgram(PixelProgram) && !IsStoreProgram(0x3de16049649d9ad6ull), "the store programs");
+	Check(IsStoreProgram(VertexProgram) && IsStoreProgram(PixelProgram) && IsStoreProgram(TrailPixelA) &&
+	          IsStoreProgram(TrailPixelB) && !IsStoreProgram(0x3de16049649d9ad6ull),
+	      "the store programs");
 	TestReach();
+	TestTrailReach();
 	TestNarrow();
 	std::puts("WolverineStoresTests: all passed");
 	return 0;
