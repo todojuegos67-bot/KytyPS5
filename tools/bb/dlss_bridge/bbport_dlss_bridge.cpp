@@ -431,6 +431,10 @@ int32_t FrameGenEvaluate(VkCommandBuffer command, const BbDlssgEvaluate* evaluat
             options.mvecScale[1], raw_scale ? "BB_DLSSG_MVEC_SCALE=1" : "1 / render size");
     }
     const bool camera_basis = evaluate->camera_magic == BBPORT_DLSSG_CAMERA_MAGIC;
+    static_assert(sizeof(options.cameraPos) == sizeof(evaluate->camera_pos) &&
+                  sizeof(options.cameraUp) == sizeof(evaluate->camera_up) &&
+                  sizeof(options.cameraRight) == sizeof(evaluate->camera_right) &&
+                  sizeof(options.cameraFwd) == sizeof(evaluate->camera_fwd));
     if (camera_basis) {
         // bb-dlssg-inputs: the game camera's world-space position and axes.
         std::memcpy(options.cameraPos, evaluate->camera_pos, sizeof(options.cameraPos));

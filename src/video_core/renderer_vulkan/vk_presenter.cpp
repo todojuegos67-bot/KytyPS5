@@ -742,8 +742,8 @@ static bool BbEnsureHudless(const Vulkan::Instance& instance, Frame& frame, vk::
 // (bb_hudless_fix.comp: the finished frame's own pixels outside the HUD) since bb-mv-only;
 // DLSS-G got the raw copy, so it saw nearly the whole picture as UI (pixels not interpolated:
 // generated frames close to the real one, motion less fluid with no artifact).
-// BB_DLSSG_HUDLESS=fix (default: the same corrected image FSR 3 gets; none when the correction
-// could not run) | raw (the uncorrected copy, as before) | off (no HUD-less image).
+// BB_DLSSG_HUDLESS=fix (default: the same corrected image FSR 3 gets; the raw copy, as before,
+// when the correction could not run) | raw (the uncorrected copy, as before) | off (no HUD-less image).
 enum class BbDlssgHudless { Fix, Raw, Off };
 static BbDlssgHudless BbDlssgHudlessMode() {
     static const BbDlssgHudless mode = [] {
@@ -755,7 +755,7 @@ static BbDlssgHudless BbDlssgHudlessMode() {
         BB::Upscale::Checkpoint(fmt::format(
             "[dlssg-in] HUD-less image for DLSS-G: {} (BB_DLSSG_HUDLESS=fix|raw|off)",
             m == BbDlssgHudless::Fix   ? "fix: equal to the finished frame outside the HUD "
-                                         "(bb_hudless_fix.comp, as FSR 3), none if that fails"
+                                         "(bb_hudless_fix.comp, as FSR 3), the raw copy if that fails"
             : m == BbDlssgHudless::Raw ? "raw: the post-processed copy at the cut (as before)"
                                        : "off: none"));
         return m;
@@ -2094,11 +2094,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             BB::FG::Inputs dlssg_in = frame->fg;
             if (dlssg_in.has_hudless) {
                 const auto mode = BbDlssgHudlessMode();
-                if (mode == BbDlssgHudless::Off ||
-                    (mode == BbDlssgHudless::Fix && !bb_hudless_fixed)) {
+                if (mode == BbDlssgHudless::Off) {
                     dlssg_in.has_hudless = false;
                     ++bb_sec_dlssg_hl_none;
-                } else if (mode == BbDlssgHudless::Fix) {
+                } else if (mode == BbDlssgHudless::Fix && bb_hudless_fixed) {
                     ++bb_sec_dlssg_hl_fixed;
                 } else {
                     ++bb_sec_dlssg_hl_raw;
