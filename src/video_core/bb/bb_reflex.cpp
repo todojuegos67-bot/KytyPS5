@@ -38,6 +38,27 @@ constexpr uint64_t kUsleepCallVa = 0x2034BCA; // vcvttss2si edi,xmm0; test edi,e
 constexpr uint8_t kUsleepCallBytes[] = {0xC5, 0xFA, 0x2C, 0xF8, 0x85, 0xFF, 0x7E,
                                         0x0E, 0xE8, 0x91, 0xB2, 0xB8, 0x00};
 constexpr uint64_t kUsleepReturnVa = kUsleepCallVa + sizeof(kUsleepCallBytes); // 0x2034BD7
+// The limiter has two waits, chosen by r8b = the result of 0xFE3980 (call at 0x20347C5): r8b != 0
+// (taken in the 1.09 runs: the 0x2034BD2 usleep never fired, measured dt exactly the period) is a
+// pure gettimeofday spin (0x2034AF0..0x2034B6F, no sleep at all); r8b == 0 is the usleep loop
+// (0x2034B90): usleep(left - 5 ms) only if left > 1 ms and > 5 ms, then gettimeofday. With Reflex
+// armed the limiter is sent to the usleep loop always (je -> jmp at 0x2034ADA) and its usleep is
+// called on every pass (the three skips at 0x2034BA6 / 0x2034BB0 / 0x2034BD0 become nops), so the
+// first pass of each frame is the Reflex sleep; later passes with nothing left over 5 ms (usec <=
+// 0) return at once (the loop then polls gettimeofday until the game's deadline, as the original
+// usleep loop does in its last 5 ms), others are the game's own usleep as before.
+struct CodePatch {
+    uint64_t va;
+    uint8_t len;
+    uint8_t orig[6];
+    uint8_t neu[6];
+};
+constexpr CodePatch kWaitPatches[] = {
+    {0x2034ADA, 6, {0x0F, 0x84, 0x9A, 0x00, 0x00, 0x00}, {0xE9, 0x9B, 0x00, 0x00, 0x00, 0x90}},
+    {0x2034BA6, 2, {0x76, 0x38}, {0x90, 0x90}},
+    {0x2034BB0, 2, {0x76, 0x2E}, {0x90, 0x90}},
+    {0x2034BD0, 2, {0x7E, 0x0E}, {0x90, 0x90}},
+};
 constexpr uint64_t kLimiterPtrVa = 0x55404F8;
 constexpr uint64_t kLimiterPrologueVa = 0x2034770;
 constexpr uint8_t kLimiterPrologue[] = {0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56};
@@ -131,6 +152,7 @@ uint64_t g_eboot_size = 0; // image size (OnEbootLoaded), for the diagnostics' a
 std::atomic<uint32_t> g_usleep_all{0};     // every guest call that reaches the native usleep
 std::atomic<uint32_t> g_usleep_limiter{0}; // return address == the limiter's call site (0x2034BD7)
 std::atomic<uint32_t> g_usleep_other{0};   // any other return address (the game's own wait)
+std::atomic<uint32_t> g_usleep_nothing{0}; // limiter site, usec <= 0 and no Reflex sleep: no wait
 std::atomic<uint32_t> g_limiter_silent{0}; // GuestWait left before its sleep (no limiter / period)
 std::atomic<uintptr_t> g_last_other_ra{0};
 std::atomic<uint32_t> g_other_logged{0}, g_hit_logged{0};
@@ -625,13 +647,28 @@ void OnEbootLoaded(uintptr_t eboot_base, uint64_t image_size) {
                                 "the game's own wait");
         return;
     }
+    bool wait_ok = true;
+    for (const CodePatch& p : kWaitPatches)
+        wait_ok = wait_ok &&
+                  std::memcmp(reinterpret_cast<const void*>(eboot_base + p.va), p.orig, p.len) == 0;
+    if (!wait_ok) {
+        BB::Upscale::Checkpoint("[reflex-native] the frame limiter's wait branches (0x2034ADA, "
+                                "0x2034BA6, 0x2034BB0, 0x2034BD0) are not the 1.09 bytes: no "
+                                "Reflex sleep, the game's own wait");
+        return;
+    }
+    // After the byte check of kUsleepCallBytes (it covers the jle at 0x2034BD0).
+    for (const CodePatch& p : kWaitPatches)
+        std::memcpy(reinterpret_cast<void*>(eboot_base + p.va), p.neu, p.len);
     g_eboot_base = eboot_base;
     g_eboot_size = image_size;
     g_usleep_return = eboot_base + kUsleepReturnVa;
     BB::Upscale::Checkpoint(
         "[reflex-native] hook armed: the frame limiter's (0x2034770) sceKernelUsleep at 0x2034BD2 "
         "becomes vkLatencySleepNV (minimum interval = the limiter's period this+0x18) on "
-        "shadPS4:ReflexSleep; the game's gettimeofday after it is unchanged");
+        "shadPS4:ReflexSleep; the limiter's gettimeofday spin path is redirected to its usleep "
+        "loop (0x2034ADA) and the usleep is called on every pass (0x2034BA6/BB0/BD0), so it is "
+        "the frame's one wait; the game's gettimeofday / dt after it is unchanged");
 }
 
 bool NativeEnv() {
@@ -687,11 +724,20 @@ bool OnGuestUsleep(const void* return_address, uint32_t usec) {
             "native path from {} (Reflex {})",
             usec, DescribeGuestAddress(ra), Active() ? "active" : "not active: the game's wait"));
     }
+    // The patched loop calls with usec <= 0 (vcvttss2si, signed) when less than 5 ms is left:
+    // never hand that to the game's usleep (as u32 it would be huge); no wait, as the original jle.
+    const bool nothing_left = static_cast<int32_t>(usec) <= 0;
+    bool waited = false;
     if (!Active()) {
         g_fallbacks.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    } else {
+        waited = GuestWait(usec);
     }
-    return GuestWait(usec);
+    if (!waited && nothing_left) {
+        g_usleep_nothing.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return waited;
 }
 
 void OnGuestSubmit() {
@@ -816,6 +862,7 @@ void OnGameFramePresented() {
         const float period = lim != nullptr ? ReadAt<float>(lim, kOffPeriod) : 0.0f;
         const uint32_t usleep_all = g_usleep_all.exchange(0);
         const uint32_t usleep_limiter = g_usleep_limiter.exchange(0);
+        const uint32_t usleep_nothing = g_usleep_nothing.exchange(0);
         const uint32_t usleep_other = g_usleep_other.exchange(0);
         const uint32_t limiter_silent = g_limiter_silent.exchange(0);
         const uintptr_t last_other = g_last_other_ra.load(std::memory_order_relaxed);
@@ -827,14 +874,15 @@ void OnGameFramePresented() {
                             : fmt::format("0x{:x}", last_other);
         line = fmt::format(
             "[reflex-native] {:.2f} s: sleeps {} (avg {:.2f} ms, {} failed), timeouts {} ({} "
-            "total), game top-ups {}, fallbacks {} | usleep calls {} (limiter site {}, other {}, "
+            "total), game top-ups {}, fallbacks {} | usleep calls {} (limiter site {} [<=0 us, no "
+            "wait: {}], other {}, "
             "last other return {}), limiter exits before sleep {} | state {} | period {:.2f} ms | "
             "game dt (this+0x264) {:.2f} ms sd {:.2f} (n {}) vs present interval {:.2f} ms sd "
             "{:.2f} (n {}) | markers {}",
             sec, sleeps, sleeps ? us / 1e3 / sleeps : 0.0, g_sleep_failed.exchange(0),
             g_timeouts.exchange(0), g_timeouts_total.load(), g_topups.exchange(0),
-            g_fallbacks.exchange(0), usleep_all, usleep_limiter, usleep_other, last_other_text,
-            limiter_silent,
+            g_fallbacks.exchange(0), usleep_all, usleep_limiter, usleep_nothing, usleep_other,
+            last_other_text, limiter_silent,
             Active()     ? std::string("reflex")
             : g_disabled ? std::string("fallback (disabled)")
             : !g_ready   ? "fallback (" +
