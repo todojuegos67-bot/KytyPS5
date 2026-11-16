@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <unordered_set>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/string_util.h"
 #include "core/file_sys/backends/host_fs.h"
 #include "core/file_sys/backends/zarchive_fs.h"
@@ -55,6 +57,52 @@ std::filesystem::path OverlayPath(const std::filesystem::path& base, std::string
     }
     result += std::string{suffix};
     return result;
+}
+
+// BB_MODS_DIR: optional override for the /app0 mods overlay (the launcher points it at
+// "<port>\\mods"). Read once; empty when unset, blank or not an existing directory, in which
+// case the classic "<game>-mods" sibling is used exactly as before.
+static const std::filesystem::path& ModsDirOverride() {
+    static const std::filesystem::path override_dir = [] {
+        std::filesystem::path p;
+#ifdef _WIN32
+        const wchar_t* env = _wgetenv(L"BB_MODS_DIR");
+        if (env == nullptr) {
+            return p;
+        }
+        std::wstring v{env};
+        constexpr const wchar_t* kTrim = L" \t\r\n\"";
+#else
+        const char* env = std::getenv("BB_MODS_DIR");
+        if (env == nullptr) {
+            return p;
+        }
+        std::string v{env};
+        constexpr const char* kTrim = " \t\r\n\"";
+#endif
+        const auto first = v.find_first_not_of(kTrim);
+        if (first == decltype(v)::npos) {
+            return p;
+        }
+        const auto last = v.find_last_not_of(kTrim);
+        p = std::filesystem::path{v.substr(first, last - first + 1)};
+        std::error_code ec;
+        if (!std::filesystem::is_directory(p, ec)) {
+            LOG_WARNING(Kernel_Fs, "BB_MODS_DIR='{}' is not an existing directory; using default",
+                        Common::FS::PathToUTF8String(p));
+            p.clear();
+        }
+        return p;
+    }();
+    return override_dir;
+}
+
+// Mods overlay location for a game mount: BB_MODS_DIR if valid, else "<game>-mods".
+static std::filesystem::path ModsOverlayPath(const std::filesystem::path& base) {
+    if (const auto& o = ModsDirOverride(); !o.empty()) {
+        return o;
+    }
+    return OverlayPath(base, "-mods");
 }
 
 std::optional<std::filesystem::path> BaseGameFromOverlay(const std::filesystem::path& path) {
@@ -138,8 +186,15 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
     };
     // check for mods , updates,patch
     if (eligible_for_overlays) {
-        if (auto mods = probe_overlay(host_folder, "-mods")) {
+        const std::filesystem::path mods_dir = ModsOverlayPath(host_folder);
+        if (auto mods = CreateBackend(mods_dir, /*ro=*/true)) {
             stack.push_back(std::move(mods));
+            static std::once_flag mods_log_once;
+            std::call_once(mods_log_once, [&] {
+                LOG_INFO(Kernel_Fs, "Mods overlay for {}: '{}' ({})", guest_folder_sanitized,
+                         Common::FS::PathToUTF8String(mods_dir),
+                         ModsDirOverride().empty() ? "default <game>-mods" : "BB_MODS_DIR");
+            });
         }
         if (!ignore_game_patches) {
             auto patch = probe_overlay(host_folder, "-UPDATE");
@@ -233,8 +288,10 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
         patch_path = OverlayPath(mount->host_path, "-patch");
     }
 
-    // Mods folder can only be at mount + "-mods"
-    std::filesystem::path mods_path = OverlayPath(mount->host_path, "-mods");
+    // Mods folder is mount + "-mods", or BB_MODS_DIR (if set) for the game mounts.
+    std::filesystem::path mods_path = (mount->mount == "/app0" || mount->mount == "/hostapp")
+                                          ? ModsOverlayPath(mount->host_path)
+                                          : OverlayPath(mount->host_path, "-mods");
 
     // If we're just retrieving the mount, return the correct mount path.
     if (corrected_path_sanitized == mount->mount) {
