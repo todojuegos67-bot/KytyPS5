@@ -3917,6 +3917,14 @@ bool OnSdlEvent(SDL_Event& event) {
         } else {
             g_pad_buttons &= ~bit;
         }
+        // Start + R3 on the pad toggles the menu like F1 (on the press that completes the combo)
+        constexpr u32 kCombo = (1u << SDL_GAMEPAD_BUTTON_START) |
+                               (1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+        if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && (bit & kCombo) != 0 &&
+            (g_pad_buttons & kCombo) == kCombo) {
+            SetOpen(!g_open);
+            return true;
+        }
     } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
         if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
             g_trig_l = event.gaxis.value;
