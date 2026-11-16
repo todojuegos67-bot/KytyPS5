@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <fmt/format.h>
+#include "common/thread.h"
 #include "core/bb_vardt.h"
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_sr.h"
@@ -134,6 +137,26 @@ std::atomic<bool> g_cap_owned{false};
 std::atomic<uint32_t> g_markers{0}, g_sleeps{0}, g_sleep_failed{0}, g_frames_started{0};
 std::atomic<uint64_t> g_sleep_us{0};
 
+// bb-reflex-crash: every VK_NV_low_latency2 call runs on this host thread (or the host present
+// thread), never on a guest thread. Guest threads run host code on their guest stacks with the
+// TEB's stack limits disabled (stack_asm.cpp: no __chkstk probing) and a single 16 KiB guard page
+// between neighbouring guest stacks (stack.cpp), so a deep driver call there (the sleep, the
+// semaphore wait, the markers) could step over the guard into another thread's stack. The guest
+// threads only queue markers here and wait for the frame-start sleep.
+// Two threads, so a marker never waits behind a sleep: shadPS4:ReflexMarks sends the render
+// thread's markers, shadPS4:ReflexSleep the frame start (SIMULATION_END, sleep, SIMULATION_START).
+struct Job {
+    uint64_t id = 0;
+    VkLatencyMarkerNV marker = VK_LATENCY_MARKER_SIMULATION_START_NV;
+};
+std::mutex g_jobs_mutex;
+std::condition_variable g_jobs_cv;
+std::deque<Job> g_jobs;
+std::mutex g_start_mutex;
+std::condition_variable g_start_cv, g_done_cv;
+uint64_t g_ticket = 0, g_taken_ticket = 0, g_done_ticket = 0, g_start_end_id = 0;
+bool g_done_slept = false;
+
 uint32_t WantedIntervalUs() {
     if (!Cfg().cap) return 0;
     const float period = BB::VarDt::CapPeriod();
@@ -229,6 +252,68 @@ bool LatencySleep() {
     return true;
 }
 
+// shadPS4:ReflexSleep: SIMULATION_END of the previous frame, the sleep, SIMULATION_START of the new one.
+bool WorkerFrameStart(uint64_t end_id) {
+    Marker(end_id, VK_LATENCY_MARKER_SIMULATION_END_NV);
+    const bool slept = LatencySleep();
+    uint64_t id = 0;
+    {
+        std::scoped_lock lock{g_frames_mutex};
+        id = ++g_next_id;
+        PushBounded(g_sim, id, 4);
+        g_last_sim = id;
+    }
+    g_frames_started.fetch_add(1, std::memory_order_relaxed);
+    Marker(id, VK_LATENCY_MARKER_SIMULATION_START_NV);
+    return slept;
+}
+
+void MarkerLoop() {
+    Common::SetCurrentThreadName("shadPS4:ReflexMarks");
+    for (;;) {
+        Job job;
+        {
+            std::unique_lock lock{g_jobs_mutex};
+            g_jobs_cv.wait(lock, [] { return !g_jobs.empty(); });
+            job = g_jobs.front();
+            g_jobs.pop_front();
+        }
+        Marker(job.id, job.marker);
+    }
+}
+
+void SleepLoop() {
+    Common::SetCurrentThreadName("shadPS4:ReflexSleep");
+    for (;;) {
+        uint64_t ticket = 0, end_id = 0;
+        {
+            std::unique_lock lock{g_start_mutex};
+            g_start_cv.wait(lock, [] { return g_ticket > g_taken_ticket; });
+            ticket = g_taken_ticket = g_ticket;
+            end_id = g_start_end_id;
+        }
+        const bool slept = WorkerFrameStart(end_id);
+        {
+            std::scoped_lock lock{g_start_mutex};
+            g_done_ticket = ticket;
+            g_done_slept = slept;
+        }
+        g_done_cv.notify_all();
+    }
+}
+
+// Guest threads: a marker for the worker to send.
+void PostMarker(uint64_t id, VkLatencyMarkerNV marker) {
+    if (id == 0) return;
+    {
+        std::scoped_lock lock{g_jobs_mutex};
+        if (g_jobs.size() >= 256) return; // the worker is stuck: markers are not worth a wait
+        g_jobs.push_back(Job{.id = id, .marker = marker});
+    }
+    g_jobs_cv.notify_one();
+}
+
+// Game main thread, inside the limiter's gettimeofday: waits for the worker's sleep.
 void FrameStart() {
     std::scoped_lock sleep_lock{g_sleep_mutex};
     if (!Active()) {
@@ -246,8 +331,20 @@ void FrameStart() {
             g_sim_end_upto = g_last_sim;
         }
     }
-    Marker(end_id, VK_LATENCY_MARKER_SIMULATION_END_NV);
-    const bool slept = LatencySleep();
+    bool slept = false;
+    {
+        std::unique_lock lock{g_start_mutex};
+        const uint64_t ticket = ++g_ticket;
+        g_start_end_id = end_id;
+        g_start_cv.notify_one();
+        // The sleep itself times out at 200 ms; past 250 the frame goes on without it.
+        if (g_done_cv.wait_for(lock, std::chrono::milliseconds(250),
+                               [ticket] { return g_done_ticket >= ticket; })) {
+            slept = g_done_ticket == ticket && g_done_slept;
+        } else {
+            g_sleep_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // The cap goes to Reflex only while its sleep runs with that minimum interval; otherwise
     // (minimized: no swapchain, errors) the game's limiter has it.
     const uint32_t interval = g_applied_interval_us.load();
@@ -258,15 +355,6 @@ void FrameStart() {
         BB::VarDt::SetLimiterExternal(own);
     }
     g_cap_owned = own;
-    uint64_t id = 0;
-    {
-        std::scoped_lock lock{g_frames_mutex};
-        id = ++g_next_id;
-        PushBounded(g_sim, id, 4);
-        g_last_sim = id;
-    }
-    g_frames_started.fetch_add(1, std::memory_order_relaxed);
-    Marker(id, VK_LATENCY_MARKER_SIMULATION_START_NV);
 }
 
 // Under g_frames_mutex: the frame the render thread is submitting (made when there is none).
@@ -376,9 +464,12 @@ void OnDevice(vk::Device device) {
     }
     g_device = device;
     g_sleep_semaphore = semaphore;
+    std::thread{MarkerLoop}.detach();
+    std::thread{SleepLoop}.detach();
     g_ready.store(true, std::memory_order_release);
     BB::Upscale::Checkpoint("[reflex] VK_NV_low_latency2 ready on the device (the swapchain "
-                            "is made with latency mode on)");
+                            "is made with latency mode on; sleep and markers on the host threads "
+                            "shadPS4:ReflexSleep / ReflexMarks, none on the game's threads)");
 }
 
 const void* SwapchainCreateNext(const void* next) {
@@ -464,8 +555,8 @@ void OnGuestSubmit() {
         if (g_render_id != 0) return;
         id = OpenRenderFrame(sim_end);
     }
-    Marker(sim_end, VK_LATENCY_MARKER_SIMULATION_END_NV);
-    Marker(id, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+    PostMarker(sim_end, VK_LATENCY_MARKER_SIMULATION_END_NV);
+    PostMarker(id, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
 }
 
 void OnGuestFlip() {
@@ -481,9 +572,9 @@ void OnGuestFlip() {
         g_render_open.store(false, std::memory_order_relaxed);
         PushBounded(g_gpu, id, 8);
     }
-    Marker(sim_end, VK_LATENCY_MARKER_SIMULATION_END_NV);
-    if (opened) Marker(id, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
-    Marker(id, VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+    PostMarker(sim_end, VK_LATENCY_MARKER_SIMULATION_END_NV);
+    if (opened) PostMarker(id, VK_LATENCY_MARKER_RENDERSUBMIT_START_NV);
+    PostMarker(id, VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
 }
 
 void OnGuestFlipDropped() {
