@@ -218,6 +218,14 @@ void Buffer::Back(uint64_t offset, uint64_t size) {
 		vk::DeviceMemory memory;
 		uint64_t         memory_offset = 0;
 		m_pages[page] = m_graphics->AllocateSparse(m_page_requirements, m_page_size, memory, memory_offset);
+		if (m_pages[page] == nullptr && m_scheduler->Active() && !CommandScheduler::InDeferredOperation()) {
+			// Out of video memory (a 12 GB card in Telambang, 2026-11-16). A sparse buffer allows only device-local memory on
+			// NVIDIA, so there is no system-memory fallback; but buffers and images freed earlier are released only once the
+			// GPU is done with them. Wait for it, release them, and try once more.
+			LOGF("Video memory full: a sparse buffer page waits for the GPU to release freed memory\n");
+			m_scheduler->Finish();
+			m_pages[page] = m_graphics->AllocateSparse(m_page_requirements, m_page_size, memory, memory_offset);
+		}
 		EXIT_NOT_IMPLEMENTED(m_pages[page] == nullptr);
 		m_backed_pages++;
 		m_scheduler->BindSparseBuffer(m_buffer, {begin, bytes, memory, memory_offset});
