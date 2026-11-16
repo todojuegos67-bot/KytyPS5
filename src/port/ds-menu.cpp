@@ -2395,7 +2395,7 @@ void Draw(float width, float height) {
 					ImGui::BeginDisabled(s.pure_game);
 					if (ChoiceRow("Reflejos RT", changed_not_live(l.rt_ss_refl != s.rt_ss_refl, 1),
 					              kRtReflLevels, kRtReflLevelCount, s.rt_ss_refl,
-					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta. Apagarlo es inmediato."))
+					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta. Apagarlo es inmediato."))
 						live_changed = true;
 					// (refl-sharp-1031)
 					ChoiceRow("Nitidez de reflejos RT", s.rt_refl_sharp != l.rt_refl_sharp, kRtReflSharp, kRtReflSharpCount, s.rt_refl_sharp,
@@ -2413,8 +2413,7 @@ void Draw(float width, float height) {
 					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.");
 					// (ds-pc-port9) No Sombras RT in the port.
 					ImGui::EndDisabled();
-					CheckRow("RT por hardware (experimental)", s.rt_hw_exp != l.rt_hw_exp, s.rt_hw_exp,
-					         "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
+					// (11-16 release) "RT por hardware" removed (s.rt_hw_exp always off).
 					if (s.rt_hw_exp) {
 						ImGui::BeginDisabled(s.pure_game);
 						{
@@ -2809,9 +2808,9 @@ std::string    g_steam_text;
 std::mutex     g_steam_mutex;
 std::atomic<bool> g_steam_busy {false};
 
-const ImVec4 kInkL {0.97f, 0.96f, 0.93f, 1.0f};
+const ImVec4 kInkL {0.93f, 0.90f, 0.83f, 1.0f}; // (launcher1) old parchment (was near white)
 const ImVec4 kDimL {0.86f, 0.84f, 0.80f, 1.0f}; // (ds-pc-port9) secondary text, still high contrast
-const ImVec4 kGoldL {0.87f, 0.77f, 0.55f, 1.0f};
+const ImVec4 kGoldL {0.80f, 0.69f, 0.48f, 1.0f}; // (launcher1) tarnished gold (was brighter)
 
 struct LBox {
 	ImVec2 at {};
@@ -3055,8 +3054,18 @@ void BoxBegin(const char* title, float w = 420, bool card = false) {
 	g_lbox.card = card;
 	ImGui::BeginGroup();
 	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), g_lbox.at.y + U(card ? 12 : 6)});
-	ImGui::PushFont(g_font_display, U(card ? 25 : 20));
+	ImGui::PushFont(g_font_display, std::round(U(card ? 25 : 20))); // (launcher1) whole-pixel sizes: crisp
 	ImGui::TextColored(kGoldL, "%s", I18n::T(title));
+	{
+		// (launcher1) A fine rule under the title, fading out to the right, with a small lozenge at its start.
+		const ImVec2 tmin = ImGui::GetItemRectMin(), tmax = ImGui::GetItemRectMax();
+		const float  ly   = std::floor(tmax.y + U(3)) + 0.5f, lx = std::floor(tmin.x);
+		const float  lw   = g_lbox.w - U(24);
+		const float  r    = std::round(U(2.5f));
+		dl->AddQuadFilled({lx, ly - r}, {lx + r, ly}, {lx, ly + r}, {lx - r, ly}, IM_COL32(204, 176, 122, 200));
+		dl->AddRectFilledMultiColor({lx + r + U(3), ly - 0.5f}, {lx + lw, ly + 0.5f}, IM_COL32(204, 176, 122, 150), IM_COL32(204, 176, 122, 0),
+		                            IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 150));
+	}
 	ImGui::PopFont();
 	ImGui::SetCursorScreenPos({g_lbox.at.x, g_lbox.at.y + U(card ? 46 : 32)});
 	ImGui::Dummy({g_lbox.w, 0});
@@ -3182,40 +3191,124 @@ bool LSlider(float y, const char* label, float& v, float lo, float hi, const cha
 }
 
 // The launcher's buttons: the primary one gold with dark text, the others dark with a grey border.
+// (launcher1) JUGAR in Demon's Souls' manner: a dark stone slab in a fine double frame of tarnished gold with notched
+// corners and small lozenges, thin flourishes running out from the inscription, the inscription itself in Cinzel, the
+// colour of old parchment, on whole pixels. Hover / focus: a soft warm halo breathes around the slab and the letters
+// brighten (eased, ~110 ms, real time); pressed: the slab darkens and the inscription sinks one pixel. Only the drawing
+// changed: the click, the focus and the tooltip are the same ImGui::Button as before.
+void DrawSoulsButton(ImDrawList* dl, ImVec2 a, ImVec2 b, ImFont* font, float font_size, const char* t, float hot, bool held) {
+	const float  u     = g_unit;
+	const float  al    = ImGui::GetStyle().Alpha;
+	const auto   C     = [al](int r, int g, int bl, float alpha) {
+        return IM_COL32(r, g, bl, static_cast<int>(std::clamp(alpha, 0.0f, 1.0f) * 255.0f * al));
+	};
+	const float  px    = std::max(1.0f, std::round(u)); // a hairline, whole pixels
+	a                  = {std::floor(a.x) + 0.5f, std::floor(a.y) + 0.5f};
+	b                  = {std::floor(b.x) - 0.5f, std::floor(b.y) - 0.5f};
+	// (a, b: the item on whole pixels, the hairlines centred on them)
+	const float  cut   = std::round(7.0f * u); // the notched corners
+	const ImVec2 mid   = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
+	// The halo: wide, faint, warm; grows with the hover (eased) and a slow breath while it lasts.
+	if (hot > 0.0f) {
+		const float breath = 0.85f + 0.15f * std::sin(static_cast<float>(Anim::Now()) * 2.4f);
+		for (int k = 6; k >= 1; k--) {
+			const float g = k * 3.0f * u * hot;
+			dl->AddRectFilled({a.x - g, a.y - g}, {b.x + g, b.y + g}, C(214, 170, 92, 0.035f * hot * breath), cut + g);
+		}
+	}
+	// The slab: a cold stone gradient, darker at the bottom; pressed: darker still.
+	const float k_press = held ? 0.72f : 1.0f;
+	const auto  stone   = [&](float v, float alpha) {
+        const int c = static_cast<int>(v * k_press);
+        return C(c + 4, c + 2, c, alpha);
+	};
+	ImVec2 poly[8] = {{a.x + cut, a.y}, {b.x - cut, a.y}, {b.x, a.y + cut}, {b.x, b.y - cut},
+	                  {b.x - cut, b.y}, {a.x + cut, b.y}, {a.x, b.y - cut}, {a.x, a.y + cut}};
+	dl->AddConvexPolyFilled(poly, 8, stone(18, 0.93f));
+	dl->AddRectFilledMultiColor({a.x + cut * 0.5f, a.y + px}, {b.x - cut * 0.5f, mid.y}, stone(46 + 18 * hot, 0.55f), stone(46 + 18 * hot, 0.55f),
+	                            stone(22, 0.0f), stone(22, 0.0f));
+	// A warm wash rising from the bottom edge while hot (the light of a bonfire on the stone).
+	if (hot > 0.0f)
+		dl->AddRectFilledMultiColor({a.x + cut * 0.5f, mid.y}, {b.x - cut * 0.5f, b.y - px}, C(200, 150, 70, 0.0f), C(200, 150, 70, 0.0f),
+		                            C(200, 150, 70, 0.16f * hot), C(200, 150, 70, 0.16f * hot));
+	// The double frame: outer tarnished gold, inner fainter, both hairlines.
+	const ImU32 gold_o = C(176 + static_cast<int>(40 * hot), 148 + static_cast<int>(36 * hot), 96 + static_cast<int>(22 * hot), 0.92f);
+	const ImU32 gold_i = C(150, 126, 84, 0.45f + 0.25f * hot);
+	dl->AddPolyline(poly, 8, gold_o, ImDrawFlags_Closed, px);
+	const float in = std::round(4.0f * u);
+	ImVec2      ip[8] = {{a.x + cut + in * 0.4f, a.y + in}, {b.x - cut - in * 0.4f, a.y + in}, {b.x - in, a.y + cut + in * 0.4f},
+	                     {b.x - in, b.y - cut - in * 0.4f}, {b.x - cut - in * 0.4f, b.y - in}, {a.x + cut + in * 0.4f, b.y - in},
+	                     {a.x + in, b.y - cut - in * 0.4f}, {a.x + in, a.y + cut + in * 0.4f}};
+	dl->AddPolyline(ip, 8, gold_i, ImDrawFlags_Closed, px);
+	// Lozenges at the middle of the long sides and at both ends.
+	const auto lozenge = [&](ImVec2 c, float r, ImU32 col) {
+		dl->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, col);
+	};
+	const float lr = std::round(3.5f * u);
+	lozenge({mid.x, a.y}, lr, gold_o);
+	lozenge({mid.x, b.y}, lr, gold_o);
+	lozenge({a.x, mid.y}, lr, gold_o);
+	lozenge({b.x, mid.y}, lr, gold_o);
+	// The inscription: measured on whole pixels, flourishes out from it to the inner frame.
+	const ImVec2 ts  = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, t);
+	const float  sink = held ? px : 0.0f;
+	const ImVec2 p   = {std::floor(mid.x - ts.x * 0.5f), std::floor(mid.y - ts.y * 0.5f) + sink};
+	const float  gap = std::round(14.0f * u);
+	const float  fy  = std::floor(mid.y) + 0.5f + sink;
+	const float  run = std::max(0.0f, (p.x - gap) - (a.x + in + std::round(14.0f * u)));
+	if (run > 4.0f * u) {
+		const float l0 = p.x - gap - run, r0 = p.x + ts.x + gap;
+		// Fading out towards the frame (two segments, the outer fainter) and a small lozenge at the inner end.
+		dl->AddLine({l0, fy}, {l0 + run * 0.5f, fy}, C(170, 142, 92, 0.30f + 0.2f * hot), px);
+		dl->AddLine({l0 + run * 0.5f, fy}, {p.x - gap, fy}, C(190, 160, 104, 0.65f + 0.3f * hot), px);
+		dl->AddLine({r0 + run * 0.5f, fy}, {r0 + run, fy}, C(170, 142, 92, 0.30f + 0.2f * hot), px);
+		dl->AddLine({r0, fy}, {r0 + run * 0.5f, fy}, C(190, 160, 104, 0.65f + 0.3f * hot), px);
+		lozenge({p.x - gap + lr * 0.5f, fy}, lr * 0.8f, gold_o);
+		lozenge({r0 - lr * 0.5f, fy}, lr * 0.8f, gold_o);
+	}
+	// A dark bed under the letters (legible over the stone), then the parchment letters; hot: warmer and a faint glow.
+	dl->AddText(font, font_size, {p.x, p.y + px}, C(0, 0, 0, 0.85f), t);
+	if (hot > 0.0f) {
+		const float o = std::round(1.0f * u);
+		for (int dx = -1; dx <= 1; dx++)
+			for (int dy = -1; dy <= 1; dy++)
+				if (dx != 0 || dy != 0) dl->AddText(font, font_size, {p.x + dx * o, p.y + dy * o}, C(230, 180, 96, 0.10f * hot), t);
+	}
+	dl->AddText(font, font_size, p, C(218 + static_cast<int>(26 * hot), 206 + static_cast<int>(22 * hot), 178 + static_cast<int>(10 * hot), 1.0f), t);
+}
+
 bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* font, float font_size, const char* tip = nullptr) {
 	ImGui::SetCursorScreenPos(at);
-	if (primary) {
+	// (launcher1) The primary button in the display face is drawn by DrawSoulsButton: ImGui's own frame transparent.
+	const bool souls = primary && font == g_font_display && font != nullptr;
+	if (souls) {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0, 0, 0, 0});
+	} else if (primary) {
 		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.69f, 0.55f, 0.27f, 0.92f});
 		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.81f, 0.67f, 0.38f, 0.96f});
 		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.60f, 0.47f, 0.22f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0.08f, 0.06f, 0.04f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Border, kGoldL);
 	} else {
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.82f});
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.90f});
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.24f, 0.27f, 0.33f, 1.0f});
+		// (launcher1) Stone grey and tarnished gold (was blue-grey).
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.075f, 0.072f, 0.068f, 0.84f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.15f, 0.135f, 0.115f, 0.90f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.21f, 0.19f, 0.15f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
-		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.50f, 0.44f, 0.33f, 0.85f});
 	}
 	ImGui::PushFont(font, font_size);
-	// (ds-pc-port12) The primary button in the display face: the label drawn engraved into the gold (dark letters, a
-	// light edge under them and a soft dark one above), on whole pixels so it stays crisp.
-	const bool engraved = primary && font == g_font_display;
-	if (engraved) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
 	const bool clicked = ImGui::Button(I18n::T(text), size);
-	Anim::Highlight(g_unit); // (step5) eased hover / focus glow, border and accent bar (real time)
-	if (engraved) {
-		ImGui::PopStyleColor();
-		auto*        dl  = ImGui::GetWindowDrawList();
-		const char*  t   = I18n::T(text);
-		const ImVec2 ts  = ImGui::CalcTextSize(t);
-		const ImVec2 mn  = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-		const ImVec2 p   = {std::floor(mn.x + (mx.x - mn.x - ts.x) * 0.5f), std::floor(mn.y + (mx.y - mn.y - ts.y) * 0.5f)};
-		const float  off = std::max(1.0f, std::round(font_size / 28.0f));
-		dl->AddText(font, font_size, {p.x, p.y + off}, IM_COL32(255, 238, 196, 150), t);   // the light lower edge
-		dl->AddText(font, font_size, {p.x, p.y - off}, IM_COL32(40, 26, 8, 90), t);        // the shade above
-		dl->AddText(font, font_size, p, IM_COL32(22, 14, 5, 255), t);                      // the letters
-		dl->AddText(font, font_size, {p.x + 0.5f * off, p.y}, IM_COL32(22, 14, 5, 160), t); // a touch more weight
+	if (souls) {
+		const bool on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
+		DrawSoulsButton(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), font, font_size, I18n::T(text),
+		                Anim::Hot(ImGui::GetItemID(), on), ImGui::IsItemActive());
+	} else {
+		Anim::Highlight(g_unit); // (step5) eased hover / focus glow, border and accent bar (real time)
 	}
 	ImGui::PopFont();
 	ImGui::PopStyleColor(5);
@@ -3473,7 +3566,7 @@ void LauncherRayTracing(Settings& s) {
 	ImGui::BeginDisabled(s.pure_game);
 	const float fx = 154, fw = 252;
 	LRow("Reflejos RT", kRtReflLevelCount, kRtReflLevels, s.rt_ss_refl, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta.",
+	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta.",
 	     fx, fw);
 	// (refl-sharp-1031)
 	LRow("Nitidez reflejos RT", kRtReflSharpCount, kRtReflSharp, s.rt_refl_sharp, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
@@ -3491,8 +3584,7 @@ void LauncherRayTracing(Settings& s) {
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.",
 	     fx, fw);
 	ImGui::EndDisabled();
-	LCheckRow("RT por hardware (experimental)", s.rt_hw_exp,
-	          "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
+	// (11-16 release) "RT por hardware" removed (s.rt_hw_exp always off).
 	if (s.rt_hw_exp) {
 		ImGui::BeginDisabled(s.pure_game);
 		{
@@ -3632,8 +3724,7 @@ void LauncherPerformance(Settings& s) {
 		RowEnd(y);
 	}
 	// (11-14) Pruebas: la gráfica limitada a 8 GB de memoria de vídeo (KYTY_SIMULATE_VRAM_MB=8192).
-	LCheckRow("Simular gráfica de 8 GB (pruebas)", s.simulate_vram8,
-	          "Solo para pruebas: el juego usa como mucho 8 GB de memoria de vídeo, como en una gráfica de 8 GB, aunque la tuya tenga más. Se aplica al iniciar el juego.");
+	// (11-16 release) "Simular gráfica de 8 GB" removed from the public build (simulate_vram8 always off).
 	{
 		// (perfopts-1107) Opciones de rendimiento: upstream KytyPS5's opt-in switches, off = as before.
 		const float y = RowY() + U(4);
@@ -4361,7 +4452,7 @@ void DrawLauncher(float width, float height) {
 	{
 		const float y = RowY();
 		g_focus_once  = false;
-		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_display, U(35),
+		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_display, std::round(U(32)),
 		            pv.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
 		                       : "Guarda los ajustes en settings.ini y empieza el juego.")) {
 			// (No game folder: the picker at once; a valid one chosen, saved and played.)
@@ -6291,6 +6382,13 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	g_edit         = *settings;
 	g_start_mode   = true;
 	g_start_result = 0;
+	// (launcher1) Pixel-exact launcher on scaled desktops (125 / 150 / 200 %): the same hints the game's window sets
+	// (window.cpp), now before the launcher's SDL video init. Without them the process was DPI-unaware while the launcher
+	// ran: SDL got the desktop in scaled-down units, ImGui drew into that smaller surface and Windows stretched the whole
+	// window back to the screen (bitmap scaling: every letter blurred). The awareness is per process: the game's window,
+	// created afterwards, asks for the same one.
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
 		std::printf("[port] start menu: SDL failed (%s): straight to the game\n", SDL_GetError());
 		g_start_mode = false;
@@ -6351,12 +6449,15 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 				std::error_code ec;
 				const auto      ttf = fonts / name;
 				if (std::filesystem::exists(ttf, ec)) {
-					// (11-12) Sharper text: oversampled, sub-pixel placed, a touch heavier.
+					// (launcher1) Crisp text: ImGui 1.92 rasterizes every glyph at the exact size it is drawn at, so the
+					// glyphs go 1:1 on whole pixels (PixelSnapH, no oversampling). Before: OversampleH 3 / V 2 with
+					// sub-pixel placement, drawn through the atlas' linear filter - every letter resampled (soft edges,
+					// the vertical 2x halved by the filter). A touch heavier for the dark, busy art behind.
 					ImFontConfig cfg;
-					cfg.OversampleH       = 3;
-					cfg.OversampleV       = 2;
-					cfg.PixelSnapH        = false;
-					cfg.RasterizerMultiply = 1.12f;
+					cfg.OversampleH        = 1;
+					cfg.OversampleV        = 1;
+					cfg.PixelSnapH         = true;
+					cfg.RasterizerMultiply = 1.15f;
 					return io.Fonts->AddFontFromFileTTF(ttf.string().c_str(), 0.0f, &cfg);
 				}
 			}
@@ -6376,9 +6477,11 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 				if (data != nullptr && size > 0) {
 					ImFontConfig cfg;
 					cfg.FontDataOwnedByAtlas = false; // (the resource stays mapped for the process' life)
-					cfg.OversampleH          = 3;
-					cfg.OversampleV          = 2;
-					cfg.GlyphExtraAdvanceX   = 1.5f;
+					cfg.OversampleH          = 1; // (launcher1) 1:1 on whole pixels, as the text faces
+					cfg.OversampleV          = 1;
+					cfg.PixelSnapH           = true;
+					cfg.RasterizerMultiply   = 1.08f;
+					cfg.GlyphExtraAdvanceX   = 2.0f; // (whole pixels: the inscription's letter spacing)
 					g_font_display           = io.Fonts->AddFontFromMemoryTTF(data, static_cast<int>(size), 0.0f, &cfg);
 				}
 			}
@@ -6398,6 +6501,21 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	}
 	SDL_ShowCursor(SDL_ENABLE);
 	CloseSplash();
+	// (launcher1) Even frame pacing: VSync presents at the screen's rate; the launcher draws every n-th refresh, n the
+	// whole divisor that keeps it at 60 fps or just above (60 Hz: 60, 120 Hz: 60, 144 Hz: 72, 165 Hz: 82.5), so every
+	// frame lasts the same number of refreshes (no judder) and the CPU / GPU are not spent on 144-240 identical frames.
+	// The wait is a high-resolution waitable timer (no busy loop); it also caps a launcher whose VSync is not honoured
+	// (minimized, covered, a driver forcing it off) instead of letting it spin at thousands of frames a second.
+	int refresh_hz = 60;
+	if (SDL_DisplayMode mode {}; SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.refresh_rate >= 50) refresh_hz = mode.refresh_rate;
+	const int    every_n   = std::max(1, static_cast<int>(std::floor(refresh_hz / 60.0 + 0.1)));
+	const double frame_s   = static_cast<double>(every_n) / refresh_hz - 0.0015; // (a little early: VSync does the last bit)
+	HANDLE       pace_wait = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+	if (pace_wait == nullptr) pace_wait = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+	const Uint64 pace_freq = SDL_GetPerformanceFrequency();
+	Uint64       pace_last = SDL_GetPerformanceCounter();
+	const Uint64 fade_t0   = pace_last;
+	std::printf("[port] launcher: %d Hz, drawn every %d refresh(es) (%.1f fps)\n", refresh_hz, every_n, static_cast<double>(refresh_hz) / every_n);
 	while (g_start_result == 0) {
 		SDL_Event e;
 		while (SDL_PollEvent(&e) == 1) {
@@ -6465,12 +6583,29 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		ImGui::NewFrame();
 		if (g_config_mode) Draw(io.DisplaySize.x, io.DisplaySize.y);
 		else DrawLauncher(io.DisplaySize.x, io.DisplaySize.y);
+		if (!g_config_mode) {
+			// (launcher1) The launcher rises out of black (0.6 s, ease-out cubic): the art, the fog and the column together.
+			const float t = static_cast<float>(static_cast<double>(SDL_GetPerformanceCounter() - fade_t0) / pace_freq / 0.6);
+			if (t < 1.0f)
+				ImGui::GetForegroundDrawList()->AddRectFilled({0, 0}, io.DisplaySize,
+				                                              IM_COL32(0, 0, 0, static_cast<int>(255.0f * (1.0f - Anim::EaseOut(t)))));
+		}
 		ImGui::Render();
 		SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 		SDL_RenderClear(renderer);
 		ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 		SDL_RenderPresent(renderer);
+		{
+			// (launcher1) The pacing above: wait out the rest of this frame's slot, then let VSync align it.
+			const double spent = static_cast<double>(SDL_GetPerformanceCounter() - pace_last) / pace_freq;
+			if (const double rest = frame_s - spent; rest > 0.0005 && pace_wait != nullptr) {
+				LARGE_INTEGER due {};
+				due.QuadPart = -static_cast<LONGLONG>(rest * 1e7); // (relative, 100 ns units)
+				if (SetWaitableTimer(pace_wait, &due, 0, nullptr, nullptr, FALSE) != 0) WaitForSingleObject(pace_wait, 100);
+			}
+			pace_last = SDL_GetPerformanceCounter();
+		}
 		// (des-fix-1110) The launcher's black-frame flicker, diagnosed: the illustration's texture not uploaded after the draw
 		// (the frame showed only the clear colour). At most once a second.
 		if (g_background != nullptr && g_background->Status != ImTextureStatus_OK) {
@@ -6482,6 +6617,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 			}
 		}
 	}
+	if (pace_wait != nullptr) CloseHandle(pace_wait);
 	if (g_start_result > 0) *settings = g_edit;
 	// (ds-pc-port8) As Launcher-souls.ps1 (each change written at once): Salir / Esc keep the changes too.
 	if (g_start_result < 0 && !g_config_mode) Save();

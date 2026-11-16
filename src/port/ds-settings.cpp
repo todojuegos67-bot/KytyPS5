@@ -88,7 +88,7 @@ const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-
 const int    kAntiLagDlssgCount = 3;
 const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
                               {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
-const int    kRtReflLevelCount = 7;
+const int    kRtReflLevelCount = 6; // (11-16 release) Hibrido (hardware RT) no longer offered
 const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
 const int    kRtReflSharpCount = 3;
 const Choice kMotesLevels[] = {{"0", "No"}, {"1", "Sutil"}, {"2", "Media"}, {"3", "Densa"}}; // (motes-1031)
@@ -258,6 +258,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
+	s->simulate_vram8 = false; // (11-16 release) test option, not in the public build
 	// (11-14) Option back in the launcher (Simular gráfica de 8 GB, pruebas): the file's value counts.
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
@@ -325,6 +326,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rend_feedback_agrupado", s->perf_feedback_batch);
 	boo("rend_shaders_lane_local", s->perf_lane_wide);
 	str("reflejos_rt", s->rt_ss_refl);
+	if (s->rt_ss_refl == "6") s->rt_ss_refl = "3"; // (11-16 release) Hibrido gone: its screen-space part, Alto
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
 	str("luz_rt_pantalla", s->rt_ssgi);
@@ -334,6 +336,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("luz_antorchas", s->torch);
 	boo("destellos_lente", s->lens_flare);
 	boo("rt_experimental", s->rt_hw_exp);
+	s->rt_hw_exp = false; // (11-16 release) hardware RT removed from the port (the owner: of no use)
 	// (Out of range: No.)
 	const auto clamp_level = [](std::string& v, int max) {
 		const int n = std::atoi(v.c_str());
