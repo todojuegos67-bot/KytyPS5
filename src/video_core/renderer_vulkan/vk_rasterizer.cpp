@@ -16,6 +16,7 @@
 #include "common/debug.h"
 #include "core/bb_hud_native_hook.h"
 #include "core/bb_ssr_probe.h"
+#include "video_core/renderer_vulkan/bb_rt_reflect.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -328,6 +329,7 @@ void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
             is_ssr = true;
         }
     }
+    bb_rt_ssr_draw = is_ssr;
     if (!is_ssr) {
         return;
     }
@@ -408,6 +410,91 @@ void Rasterizer::BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indir
              BbSsrDesc(*pipeline, regs, indirect ? "DrawIndirect" : "Draw", true));
 }
 
+// bb-rt-reflect: right after the SSR draw, outside the render pass: the ray-query pass writes the
+// hit pixels of the SSR target (bb_rt_reflect.h). The images are the ones the draw bound: the
+// target (RGBA16F colour target), the depth (sampled, depth format), the G-buffer RT0 (RGBA8,
+// twice the target's size) and the lit scene (RGBA16F, twice the target's size). The tracked
+// layouts are left as they were.
+void Rasterizer::BbRtReflectRun() {
+    bb_rt_ssr_draw = false;
+    if (!instance.IsRtReflectEnabled()) {
+        return;
+    }
+    VideoCore::Image* target = nullptr;
+    VideoCore::Image* depth = nullptr;
+    VideoCore::Image* normal = nullptr;
+    VideoCore::Image* color = nullptr;
+    for (const auto& image_id : bound_images) {
+        auto& img = texture_cache.GetImage(image_id);
+        const auto f = img.info.pixel_format;
+        const auto area = [](const VideoCore::Image* i) {
+            return i ? u64(i->info.size.width) * i->info.size.height : 0ull;
+        };
+        // The largest sampled RGBA8 / RGBA16F (the full-size G-buffer RT0 and lit scene).
+        if (img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat && !target) {
+            target = &img;
+        } else if (img.info.props.is_depth && !depth) {
+            depth = &img;
+        } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm &&
+                   area(&img) > area(normal)) {
+            normal = &img;
+        } else if (!img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat &&
+                   area(&img) > area(color)) {
+            color = &img;
+        }
+    }
+    static bool warned = false;
+    if (!target || !depth || !normal || !color ||
+        depth->info.size.width != target->info.size.width ||
+        depth->info.size.height != target->info.size.height ||
+        target->info.num_samples > 1 || depth->info.num_samples > 1) {
+        if (!warned) {
+            warned = true;
+            LOG_WARNING(Render_Vulkan,
+                        "[rt-reflect] SSR draw without the expected images (target {}, depth {}, "
+                        "normal {}, colour {}): skipped",
+                        target != nullptr, depth != nullptr, normal != nullptr, color != nullptr);
+        }
+        return;
+    }
+    if (!bb_rt_reflect) {
+        bb_rt_reflect = std::make_unique<BB::RtReflect>(instance);
+    }
+    const auto layout_of = [](const VideoCore::Image& img) {
+        return img.backing->subresource_states.empty()
+                   ? img.backing->state.layout
+                   : img.backing->subresource_states[0].layout;
+    };
+    VideoCore::ImageViewInfo tv{};
+    tv.format = vk::Format::eR16G16B16A16Sfloat;
+    tv.is_storage = true;
+    VideoCore::ImageViewInfo dv{};
+    dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
+    VideoCore::ImageViewInfo nv{};
+    nv.format = vk::Format::eR8G8B8A8Unorm;
+    VideoCore::ImageViewInfo cv{};
+    cv.format = vk::Format::eR16G16B16A16Sfloat;
+    const BB::RtReflect::Input in{
+        .target = target->GetImage(),
+        .target_view = *target->FindView(tv, false).image_view,
+        .target_layout = layout_of(*target),
+        .depth = depth->GetImage(),
+        .depth_view = *depth->FindView(dv, false).image_view,
+        .depth_layout = layout_of(*depth),
+        .depth_has_stencil = bool(depth->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .normal = normal->GetImage(),
+        .normal_view = *normal->FindView(nv, false).image_view,
+        .normal_layout = layout_of(*normal),
+        .color = color->GetImage(),
+        .color_view = *color->FindView(cv, false).image_view,
+        .color_layout = layout_of(*color),
+        .width = target->info.size.width,
+        .height = target->info.size.height,
+    };
+    scheduler.EndRendering();
+    bb_rt_reflect->Run(scheduler.CommandBuffer(), in);
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -480,6 +567,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    if (bb_rt_ssr_draw) {
+        BbRtReflectRun();
+    }
 
     if (BB::UiCut::Active()) {
         bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
@@ -579,6 +669,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+    }
+    if (bb_rt_ssr_draw) {
+        BbRtReflectRun();
     }
 
     if (BB::UiCut::Active()) {
@@ -1067,7 +1160,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                if (BB::Upscale::Capture()) {
+                if (BB::Upscale::Capture() || BbRtReflectRequested()) {
                     BB::Upscale::OnConstants(stage.flattened_ud_buf.data(),
                                              stage.flattened_ud_buf.size());
                 }
@@ -1119,7 +1212,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
                     !desc.is_written && size >= 864 &&
-                    size <= 16384 && BB::Upscale::Capture() &&
+                    size <= 16384 && (BB::Upscale::Capture() || BbRtReflectRequested()) &&
                     memory->IsValidMapping(vsharp.base_address, 272)) {
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));

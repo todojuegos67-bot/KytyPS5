@@ -56,6 +56,8 @@ add_host_shader(bb_dlss5.comp bb_dlss5_comp)
 add_host_shader(bb_taa.comp bb_taa_comp)
 add_host_shader(bb_taa_sharpen.comp bb_taa_sharpen_comp)
 add_host_shader(bb_fsr4_prep.comp bb_fsr4_prep_comp)
+add_host_shader(bb_rt_mesh.comp bb_rt_mesh_comp)
+add_host_shader(bb_rt_reflect.comp bb_rt_reflect_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)

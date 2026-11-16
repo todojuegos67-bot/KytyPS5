@@ -298,6 +298,12 @@ struct BlockCam {
 std::mutex g_cam_mutex;
 BlockCam g_cam_cur, g_cam_prev;
 bool g_frame_has_camera = false;
+struct RtCam {
+    float proj[16]{};
+    float view[12]{};
+    float far_dist = 3000.0f;
+    bool valid = false;
+} g_rt_cam;
 
 u32 g_frame_no = 0;
 float g_jitter[2]{};
@@ -659,6 +665,16 @@ bool RunBackend(const SR::Desc& desc) {
 
 // Bloodborne's scene constant block (864 bytes): [0] far plane 3000, [1] 1 / far, [4] [5] the
 // render size, floats 8-19 the view, 52-67 the projection, 180-191 the inverse view.
+bool RtCamera(float proj[16], float view[12], float& far_dist) {
+    std::scoped_lock lk{g_cam_mutex};
+    if (!g_rt_cam.valid) {
+        return false;
+    }
+    std::memcpy(proj, g_rt_cam.proj, sizeof(g_rt_cam.proj));
+    std::memcpy(view, g_rt_cam.view, sizeof(g_rt_cam.view));
+    far_dist = g_rt_cam.far_dist;
+    return true;
+}
 void OnConstants(const u32* data, size_t count) {
     if (count < 216) {
         return;
@@ -669,6 +685,11 @@ void OnConstants(const u32* data, size_t count) {
         return;
     }
     std::scoped_lock lk{g_cam_mutex};
+    // bb-rt-reflect: the latest block (the SSR draw binds the scene block itself).
+    std::memcpy(g_rt_cam.proj, d + 52, sizeof(g_rt_cam.proj));
+    std::memcpy(g_rt_cam.view, d + 8, sizeof(g_rt_cam.view));
+    g_rt_cam.far_dist = d[0];
+    g_rt_cam.valid = d[52] != 0.0f && d[57] != 0.0f;
     if (g_frame_has_camera) {
         return; // the first one of a frame is the main camera
     }

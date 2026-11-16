@@ -1,0 +1,133 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-reflect (BB_RT_REFLECT=1): ray-traced reflections over the game's SSR output. Runs right
+// after the SSR draw on its 854x480 RGBA16F target. Per pixel: view-space position from depth,
+// normal from G-buffer RT0 (world normal, rgb * 2 - 1, accepted only when unit length and in
+// agreement with the depth normal) or else from depth derivatives, the reflected view ray traced
+// (ray query) against the depth mesh (bb_rt_mesh.comp), the hit projected back to the screen and
+// the lit scene colour sampled there. A miss keeps the game's SSR value.
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;   // 854x480 (nearest)
+layout(binding = 1) uniform sampler2D normal_tex;  // 1708x960 RGBA8 (nearest)
+layout(binding = 2) uniform sampler2D color_tex;   // 1708x960 RGBA16F lit scene (linear)
+layout(binding = 3, rgba16f) uniform image2D ssr_out;
+layout(binding = 4) uniform accelerationStructureEXT tlas;
+layout(std430, binding = 5) buffer Counters { uint n[8]; } cnt; // pixels, valid, hits, g-normal, d-normal
+layout(std140, binding = 6) uniform Params {
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 view;
+    uvec4 size;  // depth w, h, grid w, grid h
+    vec4 misc;   // far distance, y sign, cell size, debug tint (1)
+} p;
+
+shared uint s_cnt[5];
+
+vec3 Unproject(ivec2 px, out bool ok) {
+    px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
+    float d = texelFetch(depth_tex, px, 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc.y > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    ok = abs(v.w) > 1e-8;
+    vec3 r = v.xyz / (ok ? v.w : 1.0);
+    float l = length(r);
+    ok = ok && !(isnan(l) || isinf(l)) && l < p.misc.x * 0.95 && l > 1e-4;
+    return r;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < 5u) {
+        s_cnt[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = c.x < int(p.size.x) && c.y < int(p.size.y);
+    uint valid = 0u, hit = 0u, used_g = 0u, used_d = 0u;
+    if (inside) {
+        bool ok;
+        vec3 P = Unproject(c, ok);
+        bool okx1, okx0, oky1, oky0;
+        vec3 px1 = Unproject(c + ivec2(1, 0), okx1);
+        vec3 px0 = Unproject(c - ivec2(1, 0), okx0);
+        vec3 py1 = Unproject(c + ivec2(0, 1), oky1);
+        vec3 py0 = Unproject(c - ivec2(0, 1), oky0);
+        if (ok) {
+            valid = 1u;
+            // Depth normal: the smaller of the two one-sided differences on each axis.
+            vec3 dx = (okx1 && (!okx0 || abs(px1.z - P.z) < abs(P.z - px0.z))) ? px1 - P : P - px0;
+            vec3 dy = (oky1 && (!oky0 || abs(py1.z - P.z) < abs(P.z - py0.z))) ? py1 - P : P - py0;
+            vec3 Nd = normalize(cross(dx, dy));
+            if (dot(Nd, P) > 0.0) {
+                Nd = -Nd;
+            }
+            // G-buffer normal (RT0 RGB: world-space normal, unorm).
+            ivec2 nsz = textureSize(normal_tex, 0);
+            ivec2 nc = clamp(ivec2((vec2(c) + 0.5) * vec2(nsz) / vec2(p.size.xy)), ivec2(0), nsz - 1);
+            vec3 nw = texelFetch(normal_tex, nc, 0).rgb * 2.0 - 1.0;
+            float nl = length(nw);
+            vec3 N = Nd;
+            if (abs(nl - 1.0) < 0.15) {
+                vec3 Ng = normalize((p.view * vec4(nw / nl, 0.0)).xyz);
+                if (dot(Ng, Nd) > 0.7) {
+                    N = Ng;
+                    used_g = 1u;
+                }
+            }
+            used_d = 1u - used_g;
+            if (any(isnan(N))) {
+                N = vec3(0.0);
+            }
+            vec3 V = normalize(P);
+            vec3 R = reflect(V, N);
+            float dist = length(P);
+            if (dot(R, N) > 0.01 && dot(N, N) > 0.5) {
+                vec3 O = P + N * (0.02 * dist);
+                rayQueryEXT rq;
+                rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, O, 0.03 * dist, R,
+                                      p.misc.x);
+                while (rayQueryProceedEXT(rq)) {
+                }
+                if (rayQueryGetIntersectionTypeEXT(rq, true) ==
+                    gl_RayQueryCommittedIntersectionTriangleEXT) {
+                    float t = rayQueryGetIntersectionTEXT(rq, true);
+                    vec3 H = O + R * t;
+                    vec4 clip = p.proj * vec4(H, 1.0);
+                    if (clip.w > 1e-6) {
+                        vec2 ndc = clip.xy / clip.w;
+                        vec2 uv = vec2(ndc.x * 0.5 + 0.5,
+                                       p.misc.y > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+                        if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+                            vec3 col = textureLod(color_tex, uv, 0.0).rgb;
+                            if (!any(isnan(col)) && !any(isinf(col))) {
+                                hit = 1u;
+                                // Fade towards the screen edges (as an SSR would).
+                                vec2 e = min(uv, 1.0 - uv);
+                                float w = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0);
+                                vec4 game = imageLoad(ssr_out, c);
+                                if (p.misc.w > 0.5) {
+                                    col = mix(col, vec3(1.0, 0.0, 1.0), 0.5);
+                                    w = 1.0;
+                                }
+                                imageStore(ssr_out, c, mix(game, vec4(col, 1.0), w));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (inside) {
+        atomicAdd(s_cnt[0], 1u);
+    }
+    if (valid != 0u) atomicAdd(s_cnt[1], 1u);
+    if (hit != 0u) atomicAdd(s_cnt[2], 1u);
+    if (used_g != 0u) atomicAdd(s_cnt[3], 1u);
+    if (used_d != 0u) atomicAdd(s_cnt[4], 1u);
+    barrier();
+    if (gl_LocalInvocationIndex < 5u) {
+        atomicAdd(cnt.n[gl_LocalInvocationIndex], s_cnt[gl_LocalInvocationIndex]);
+    }
+}

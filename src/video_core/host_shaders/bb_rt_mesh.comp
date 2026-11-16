@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-reflect (BB_RT_REFLECT=1): the "depth mesh" of the SSR pass. One cell per CELL x CELL
+// pixels of the SSR depth (854x480), two triangles per cell, non-indexed (3 vertices each), in
+// view space (depth unprojected with the inverse of the game's projection). A triangle over a
+// depth discontinuity or the sky gets NaN positions, which makes it inactive in the BLAS.
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(std430, binding = 1) writeonly buffer Verts { float verts[]; };
+layout(std140, binding = 2) uniform Params {
+    mat4 proj;      // view -> clip (column vectors)
+    mat4 inv_proj;  // clip -> view
+    mat4 view;      // world -> view rotation in the upper 3x3 (column vectors)
+    uvec4 size;     // depth w, h, grid w (cells), grid h
+    vec4 misc;      // far distance, y sign (+1: ndc.y = 1 - 2 v), cell size, debug
+} p;
+
+vec3 Unproject(ivec2 px, out bool ok) {
+    px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
+    float d = texelFetch(depth_tex, px, 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc.y > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    ok = abs(v.w) > 1e-8;
+    vec3 r = v.xyz / (ok ? v.w : 1.0);
+    float l = length(r);
+    ok = ok && !(isnan(l) || isinf(l)) && l < p.misc.x * 0.95 && l > 1e-4;
+    return r;
+}
+
+void main() {
+    uvec2 c = gl_GlobalInvocationID.xy;
+    if (c.x >= p.size.z || c.y >= p.size.w) {
+        return;
+    }
+    int cs = int(p.misc.z);
+    ivec2 b = ivec2(c) * cs;
+    bool o0, o1, o2, o3;
+    vec3 a0 = Unproject(b, o0);
+    vec3 a1 = Unproject(b + ivec2(cs, 0), o1);
+    vec3 a2 = Unproject(b + ivec2(0, cs), o2);
+    vec3 a3 = Unproject(b + ivec2(cs, cs), o3);
+    float l0 = length(a0), l1 = length(a1), l2 = length(a2), l3 = length(a3);
+    const float nan = uintBitsToFloat(0x7fc00000u);
+    // Triangle 0: a0 a1 a2; triangle 1: a1 a3 a2.
+    float mn0 = min(l0, min(l1, l2)), mx0 = max(l0, max(l1, l2));
+    float mn1 = min(l1, min(l3, l2)), mx1 = max(l1, max(l3, l2));
+    bool t0 = o0 && o1 && o2 && (mx0 - mn0) < 0.08 * mn0 + 0.05;
+    bool t1 = o1 && o3 && o2 && (mx1 - mn1) < 0.08 * mn1 + 0.05;
+    uint base = (c.y * p.size.z + c.x) * 18u; // 2 triangles * 3 vertices * 3 floats
+    vec3 t[6] = vec3[6](a0, a1, a2, a1, a3, a2);
+    for (int i = 0; i < 6; ++i) {
+        bool on = i < 3 ? t0 : t1;
+        vec3 q = on ? t[i] : vec3(nan);
+        verts[base + uint(i) * 3u + 0u] = q.x;
+        verts[base + uint(i) * 3u + 1u] = q.y;
+        verts[base + uint(i) * 3u + 2u] = q.z;
+    }
+}

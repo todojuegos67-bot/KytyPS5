@@ -56,6 +56,10 @@ bool RunBackend(const SR::Desc& desc);
 extern u32 g_scene_w, g_scene_h;
 // Flattened user data of a stage (Bloodborne's 864-byte scene constant block carries the camera).
 void OnConstants(const u32* data, size_t count);
+// bb-rt-reflect: the latest valid scene constant block seen (not only the first of a frame):
+// the projection (floats 52-67, row-major, column vectors) and the view (floats 8-19, 3x4 rows)
+// and the far distance (float 0). False until one was seen.
+bool RtCamera(float proj[16], float view[12], float& far_dist);
 // This frame's jitter in render pixels (zero when off).
 void Jitter(float& x, float& y);
 // bb-hudjitter: a depth-target bind of a draw (rasterizer): jittered (scene), skipped (after the
