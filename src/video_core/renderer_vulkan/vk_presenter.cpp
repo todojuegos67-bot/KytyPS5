@@ -88,6 +88,8 @@ s64 BbStallLimitNs() {
 }
 
 void BbStallWatchdog() {
+    // Bounded log: at most 64 stall reports (and their "resumed" lines) per run.
+    u32 reports_left = 64;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         const s64 now = BbNowNs();
@@ -97,7 +99,17 @@ void BbStallWatchdog() {
             if (what == nullptr || since == 0 || now - since < BbStallLimitNs()) {
                 continue;
             }
+            if (reports_left == 0 || st->reported.load()) {
+                continue;
+            }
             if (!st->reported.exchange(true)) {
+                if (st->since_ns.load() != since || st->what.load() != what) {
+                    // The call returned between the loads and the flag: nothing to report, and
+                    // no "resumed" line for the next call.
+                    st->reported.store(false);
+                    continue;
+                }
+                --reports_left;
                 const char* other_what =
                     (st == &bb_stall_present ? bb_stall_render : bb_stall_present).what.load();
                 BB::Upscale::Checkpoint(fmt::format(
@@ -105,6 +117,10 @@ void BbStallWatchdog() {
                     (now - since) / 1e6, what,
                     st == &bb_stall_present ? bb_stall_render.thread : bb_stall_present.thread,
                     other_what != nullptr ? other_what : "running"));
+                if (reports_left == 0) {
+                    BB::Upscale::Checkpoint("[fg-stall] report limit reached (64): no more "
+                                            "[fg-stall] lines this run");
+                }
             }
         }
     }
