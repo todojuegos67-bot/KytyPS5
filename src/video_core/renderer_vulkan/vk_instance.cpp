@@ -485,14 +485,15 @@ bool Instance::CreateDevice() {
     }
     bb_rt_reflect = bb_rt_on;
 
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    // bb-dlssg-sl: up to 4 in the graphics family (Streamline's DLSS-G queues after ours).
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
     // bb-clean-021-fg: FSR 3 frame generation (BB_FG=amd-x2) adds a second graphics queue for its
     // presents and two async compute queues; with BB_FG off one graphics queue as before.
     const BB::FG::QueuePlan fg_queues = BB::FG::PlanQueues(physical_device, queue_family_index);
     const std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{
         vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = queue_family_index,
-            .queueCount = std::min<u32>(fg_queues.graphics_count, 2),
+            .queueCount = std::min<u32>(fg_queues.graphics_count, 4),
             .pQueuePriorities = queue_priorities.data(),
         },
         vk::DeviceQueueCreateInfo{
@@ -803,6 +804,7 @@ bool Instance::CreateDevice() {
     BB::FG::OnDevice(physical_device, *device, queue_family_index, graphics_queue, fg_queues,
                      &Scheduler::submit_mutex);
     BB::FG::Dlss::OnDevice(*instance, physical_device, *device);
+    BB::FG::DlssSl::OnDevice(*instance, physical_device, *device); // after slSetVulkanInfo
     BB::Reflex::OnDevice(*device);
     return true;
 }

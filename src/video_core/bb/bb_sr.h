@@ -93,6 +93,11 @@ const std::vector<std::string>& RequiredDeviceExtensions();   // slGetFeatureReq
 const std::vector<std::string>& RequiredInstanceExtensions();
 const std::vector<std::string>& RequiredFeatures12();
 const std::vector<std::string>& RequiredFeatures13();
+// bb-dlssg-sl: the graphics + compute queues Streamline's features asked (slGetFeatureRequirements)
+void RequiredQueues(uint32_t* graphics, uint32_t* compute);
+// bb-dlssg-sl: the device has `count` queues in `family` (ours at 0, Streamline's after it):
+// slSetVulkanInfo then points Streamline at them. Before OnDevice.
+void SetQueues(uint32_t family, uint32_t count);
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
 bool Ready();
 bool Evaluate(const Desc& desc);

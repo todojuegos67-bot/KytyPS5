@@ -30,6 +30,9 @@ struct Config {
     Kind kind = Kind::Off;
     int multiplier = 2;
     bool dynamic = false; // dlss-dyn, amd-dyn
+    // bb-dlssg-sl: DLSS-G through Streamline (sl.dlss_g + Reflex / PCL) instead of the NGX
+    // bridge: BB_FG=dlss-sl[-x2|-x3|-x4|-dyn], or BB_FG=dlss-* with BB_DLSSG_SL=1. Opt-in.
+    bool streamline = false;
 };
 const Config& Cfg();
 const char* Name(); // "off", "amd-x2", "dlss-x3", "dlss-dyn"
@@ -120,6 +123,38 @@ uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& 
 } // namespace Dlss
 
 // F8 panel: FSR 3 FG's last per-second real / shown fps and its state ("on", or why off).
+// bb-dlssg-sl: DLSS Frame Generation through Streamline (bb_fg_dlssg_sl.cpp). Streamline's
+// DLSS-G plugin generates and presents the frames inside its vkQueuePresentKHR proxy: the
+// swapchain functions go through sl.interposer.dll's proxies (manual hooking), the frame's
+// inputs are tagged on DLSS super resolution's frame token, and PCL markers + Reflex options
+// tell the driver about the frame. Needs BB_UPSCALER=dlss (Streamline loaded). No pacing of ours.
+namespace DlssSl {
+bool Requested(); // BB_FG=dlss-sl* / BB_DLSSG_SL=1 (the NGX bridge is then not used)
+void Queues(uint32_t* graphics, uint32_t* compute); // extra queues Streamline's features want
+void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
+bool Hooked(); // the swapchain goes through Streamline's proxies
+bool Ready();  // DLSS-G feature functions and proxies all present
+void* SurfaceProc(vk::Instance instance); // vkCreateWin32SurfaceKHR proxy, or null
+vk::Result CreateSwapchain(vk::Device device, const vk::SwapchainCreateInfoKHR& info,
+                           vk::SwapchainKHR* out);
+void DestroySwapchain(vk::Device device, vk::SwapchainKHR swapchain);
+vk::Result GetSwapchainImages(vk::Device device, vk::SwapchainKHR swapchain, uint32_t* count,
+                              vk::Image* images);
+vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint64_t timeout,
+                            vk::Semaphore semaphore, uint32_t* index);
+vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info);
+vk::Result DeviceWaitIdle(vk::Device device);
+void DestroySurface(vk::Instance instance, vk::SurfaceKHR surface);
+// GPU thread, the game frame's command buffer: PCL simulation / render-submit-start markers,
+// the DLSS-G tags (depth, motion vectors, HUD-less: copied now, eOnlyValidNow) and options.
+// inputs null or !valid: DLSS-G off for this frame. Returns the Streamline frame index (0: none).
+uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D backbuffer,
+                  vk::Format format);
+// Present thread, around the game frame's present (frame: TagFrame's index, 0: none).
+void BeforePresent(uint32_t frame);
+void AfterPresent(uint32_t frame, bool presented);
+} // namespace DlssSl
+
 bool PanelInfo(float& real, float& shown, const char*& state);
 // bb-menu-ui: the presenter's measured game / shown frame rates with DLSS-G (once a second), for
 // the F8 panel (it showed "FSR 3 x2 · DLSS-G (NGX)" and no shown rate, as if FG were off).

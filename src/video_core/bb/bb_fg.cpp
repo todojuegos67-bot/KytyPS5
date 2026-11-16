@@ -15,6 +15,7 @@
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_fg_internal.h"
 #include "video_core/bb/bb_kyty_compat.h"
+#include "video_core/bb/bb_sr.h"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -114,10 +115,31 @@ Config ParseConfig() {
         c.kind = Kind::Dlss;
         c.multiplier = 4;
         c.dynamic = true;
+    } else if (s == "dlss-sl" || s == "dlss-sl-x2" || s == "dlssg-sl") {
+        c.kind = Kind::Dlss;
+        c.multiplier = 2;
+        c.streamline = true;
+    } else if (s == "dlss-sl-x3") {
+        c.kind = Kind::Dlss;
+        c.multiplier = 3;
+        c.streamline = true;
+    } else if (s == "dlss-sl-x4") {
+        c.kind = Kind::Dlss;
+        c.multiplier = 4;
+        c.streamline = true;
+    } else if (s == "dlss-sl-dyn") {
+        c.kind = Kind::Dlss;
+        c.multiplier = 4;
+        c.dynamic = true;
+        c.streamline = true;
     } else if (s != "off" && s != "0" && !s.empty()) {
         BBLogf("Frame generation: BB_FG=%s is not available in this build (amd-x2, dlss-x2..x4, "
                "dlss-dyn): off",
                s.c_str());
+    }
+    if (c.kind == Kind::Dlss && !c.streamline) {
+        const char* sl = std::getenv("BB_DLSSG_SL");
+        c.streamline = sl != nullptr && sl[0] == '1';
     }
     if (c.kind == Kind::Amd) {
         SetProcessEnv("KYTY_FSR3_FG", "1");
@@ -168,7 +190,8 @@ const Config& Cfg() {
             else BBLogf("Frame generation: BB_FG=%s (AMD FSR 3, fixed x%d)", std::getenv("BB_FG"),
                         c.multiplier);
         } else if (c.kind == Kind::Dlss) {
-            BBLogf("Frame generation: BB_FG=%s (DLSS-G via NGX, %s)", std::getenv("BB_FG"),
+            BBLogf("Frame generation: BB_FG=%s (DLSS-G via %s, %s)", std::getenv("BB_FG"),
+                   c.streamline ? "Streamline sl.dlss_g" : "NGX",
                    c.dynamic ? "dynamic up to x4" : (c.multiplier == 2   ? "x2"
                                                      : c.multiplier == 3 ? "x3"
                                                                          : "x4"));
@@ -277,6 +300,22 @@ void AddDeviceExtensions(const std::vector<std::string>& available,
 }
 
 QueuePlan PlanQueues(vk::PhysicalDevice physical, uint32_t graphics_family) {
+    if (DlssSl::Requested()) {
+        // bb-dlssg-sl: Streamline's extra graphics + compute queues, all in the graphics family
+        // after ours (index 0); vk_instance.cpp creates up to 4 there.
+        uint32_t g = 0, c = 0;
+        DlssSl::Queues(&g, &c);
+        QueuePlan plan{};
+        uint32_t family_max = 1;
+        const auto families = physical.getQueueFamilyProperties();
+        if (graphics_family < families.size()) family_max = families[graphics_family].queueCount;
+        plan.graphics_count = std::min<uint32_t>({1u + g + c, 4u, family_max});
+        SR::Dlss::SetQueues(graphics_family, plan.graphics_count);
+        BBLogf("DLSS-G (Streamline): %u graphics queue(s) in family %u (Streamline wants %u "
+               "graphics + %u compute)",
+               plan.graphics_count, graphics_family, g, c);
+        return plan;
+    }
     if (Cfg().kind != Kind::Amd) return {};
     return Amd::PlanQueues(physical, graphics_family);
 }

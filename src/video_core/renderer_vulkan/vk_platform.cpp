@@ -74,7 +74,21 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
             .hwnd = static_cast<HWND>(window_info.render_surface),
         };
 
-        if (instance.createWin32SurfaceKHR(&win32_ci, nullptr, &surface) != vk::Result::eSuccess) {
+        // bb-dlssg-sl: through Streamline's proxy (it maps the surface to its window for DLSS-G).
+        bool made = false;
+        if (void* proxy = BB::FG::DlssSl::SurfaceProc(instance)) {
+            const VkWin32SurfaceCreateInfoKHR& ci = win32_ci;
+            VkSurfaceKHR raw = VK_NULL_HANDLE;
+            made = reinterpret_cast<PFN_vkCreateWin32SurfaceKHR>(proxy)(
+                       static_cast<VkInstance>(instance), &ci, nullptr, &raw) == VK_SUCCESS;
+            surface = raw;
+            if (!made) {
+                LOG_CRITICAL(Render_Vulkan, "Failed to initialize Win32 surface (Streamline)");
+                UNREACHABLE();
+            }
+        }
+        if (!made &&
+            instance.createWin32SurfaceKHR(&win32_ci, nullptr, &surface) != vk::Result::eSuccess) {
             LOG_CRITICAL(Render_Vulkan, "Failed to initialize Win32 surface");
             UNREACHABLE();
         }

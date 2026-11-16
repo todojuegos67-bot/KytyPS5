@@ -7,6 +7,7 @@
 // through it and it adds what DLSS needs. The DLSS-G, Reflex and PCL plugins load too (DLSS-G stays
 // off): the Demon's Souls fork found the device creation failing with the DLSS plugin alone, and
 // phase 2 (frame generation) needs them.
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -68,6 +69,8 @@ struct Api {
 // device afterwards (slSetVulkanInfo, manual hooking); DLSS super resolution only.
 bool g_manual = false;
 std::vector<sl::Feature> g_features;
+uint32_t g_req_graphics_queues = 0, g_req_compute_queues = 0; // bb-dlssg-sl
+uint32_t g_queue_family = 0, g_queue_count = 1;
 std::vector<std::string> g_req_device_ext, g_req_instance_ext, g_req_f12, g_req_f13;
 Api g_api;
 bool g_loaded = false;
@@ -311,7 +314,9 @@ bool Preload() {
             // and DLSS only by default; BB_SL_NO_INTERPOSER_LOADER=0 for the interposer loader.
             g_manual = (m == nullptr || m[0] != '0') && g_api.set_vulkan_info != nullptr;
             // BB_SL_FEATURES=dlss,dlssg,reflex,pcl (default all four; manual mode: dlss).
+            // bb-dlssg-sl: BB_FG=dlss-sl*: all four (DLSS-G needs Reflex / PCL).
             std::string list = std::getenv("BB_SL_FEATURES") ? std::getenv("BB_SL_FEATURES")
+                               : BB::FG::DlssSl::Requested() ? "dlss,dlssg,reflex,pcl"
                                : g_manual                    ? "dlss"
                                                              : "dlss,dlssg,reflex,pcl";
             const auto has = [&](const char* name) {
@@ -396,6 +401,8 @@ bool Preload() {
                     g_req_instance_ext.emplace_back(req.vkInstanceExtensions[i]);
                     inst += std::string(" ") + req.vkInstanceExtensions[i];
                 }
+                g_req_graphics_queues += req.vkNumGraphicsQueuesRequired;
+                g_req_compute_queues += req.vkNumComputeQueuesRequired;
                 BBLogf("DLSS: feature %u needs: device ext:%s; instance ext:%s; %u compute + %u "
                        "graphics + %u optical-flow queues; %u vk12 + %u vk13 features",
                        static_cast<uint32_t>(f), dev.c_str(), inst.c_str(),
@@ -470,6 +477,16 @@ const std::vector<std::string>& RequiredFeatures13() {
     return g_req_f13;
 }
 
+void RequiredQueues(uint32_t* graphics, uint32_t* compute) {
+    if (graphics) *graphics = g_loaded ? g_req_graphics_queues : 0;
+    if (compute) *compute = g_loaded ? g_req_compute_queues : 0;
+}
+
+void SetQueues(uint32_t family, uint32_t count) {
+    g_queue_family = family;
+    g_queue_count = count;
+}
+
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
     if (!g_loaded) {
         return;
@@ -483,6 +500,18 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         info.graphicsQueueIndex = 0;
         info.computeQueueFamily = 0;
         info.computeQueueIndex = 0;
+        if (g_queue_count > 1) {
+            // bb-dlssg-sl: Streamline's queues start after ours (index 0) in the graphics family.
+            info.graphicsQueueFamily = g_queue_family;
+            info.graphicsQueueIndex = 1;
+            info.computeQueueFamily = g_queue_family;
+            info.computeQueueIndex =
+                std::min<uint32_t>(1 + g_req_graphics_queues, g_queue_count - 1);
+            BBLogf("DLSS: slSetVulkanInfo queues: family %u, graphics from %u, compute from %u "
+                   "(%u created)",
+                   g_queue_family, info.graphicsQueueIndex, info.computeQueueIndex,
+                   g_queue_count);
+        }
         const auto r = g_api.set_vulkan_info(info);
         BBLogf("DLSS: slSetVulkanInfo(device %p, instance %p, physical %p) returned %d",
                static_cast<void*>(info.device), static_cast<void*>(info.instance),
@@ -793,6 +822,11 @@ const std::vector<std::string>& RequiredFeatures13() {
     static const std::vector<std::string> none;
     return none;
 }
+void RequiredQueues(uint32_t* graphics, uint32_t* compute) {
+    if (graphics) *graphics = 0;
+    if (compute) *compute = 0;
+}
+void SetQueues(uint32_t, uint32_t) {}
 void OnDevice(vk::Instance, vk::PhysicalDevice, vk::Device) {}
 bool Ready() {
     return false;

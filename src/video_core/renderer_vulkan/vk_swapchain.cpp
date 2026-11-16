@@ -33,7 +33,11 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
 
 Swapchain::~Swapchain() {
     Destroy();
-    instance.GetInstance().destroySurfaceKHR(surface);
+    if (BB::FG::DlssSl::Hooked()) {
+        BB::FG::DlssSl::DestroySurface(instance.GetInstance(), surface); // bb-dlssg-sl
+    } else {
+        instance.GetInstance().destroySurfaceKHR(surface);
+    }
 }
 
 void Swapchain::Create(u32 width_, u32 height_) {
@@ -91,6 +95,15 @@ void Swapchain::Create(u32 width_, u32 height_) {
     vk::SwapchainKHR fg_chain{};
     if (BB::FG::CreateSwapchain(swapchain_info, &fg_chain)) {
         swapchain = fg_chain;
+    } else if (BB::FG::DlssSl::Hooked()) {
+        // bb-dlssg-sl: through Streamline's proxy (sl.dlss_g attaches to it); no Reflex latency
+        // swapchain of ours (Streamline's Reflex).
+        vk::SwapchainKHR chain{};
+        const vk::Result r =
+            BB::FG::DlssSl::CreateSwapchain(instance.GetDevice(), swapchain_info, &chain);
+        ASSERT_MSG(r == vk::Result::eSuccess, "Failed to create swapchain (Streamline): {}",
+                   vk::to_string(r));
+        swapchain = chain;
     } else {
         // bb-reflex: latency mode on (VK_NV_low_latency2) when Reflex is set up; made again
         // without it if the driver refuses, and Reflex stays off.
@@ -151,7 +164,9 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
+    auto result = BB::FG::DlssSl::Hooked()
+                      ? BB::FG::DlssSl::DeviceWaitIdle(instance.GetDevice())
+                      : instance.GetDevice().waitIdle();
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
                     vk::to_string(result));
@@ -172,6 +187,9 @@ bool Swapchain::AcquireNextImage() {
     vk::Result result =
         BB::FG::Fsr3Active()
             ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
+        : BB::FG::DlssSl::Hooked()
+            ? BB::FG::DlssSl::AcquireNextImage(device, swapchain, std::numeric_limits<u64>::max(),
+                                               image_acquired[frame_index], &image_index)
             : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                          image_acquired[frame_index], VK_NULL_HANDLE,
                                          &image_index);
@@ -216,6 +234,8 @@ bool Swapchain::Present(u64 present_id) {
 
     auto result = BB::FG::Fsr3Active()
                       ? BB::FG::QueuePresent(instance.GetPresentQueue(), present_info)
+                  : BB::FG::DlssSl::Hooked()
+                      ? BB::FG::DlssSl::QueuePresent(instance.GetPresentQueue(), present_info)
                       : instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
@@ -365,7 +385,8 @@ void Swapchain::SetSurfaceProperties() {
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
+    const auto wait_result = BB::FG::DlssSl::Hooked() ? BB::FG::DlssSl::DeviceWaitIdle(device)
+                                                      : device.waitIdle();
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));
@@ -380,6 +401,8 @@ void Swapchain::Destroy() {
         BB::Reflex::OnSwapchainDestroy();
         if (BB::FG::Fsr3Active()) {
             BB::FG::DestroySwapchain(swapchain);
+        } else if (BB::FG::DlssSl::Hooked()) {
+            BB::FG::DlssSl::DestroySwapchain(device, swapchain);
         } else {
             device.destroySwapchainKHR(swapchain);
         }
@@ -433,6 +456,17 @@ void Swapchain::SetupImages() {
         }
         ASSERT_MSG(result == vk::Result::eSuccess, "Failed to get the FSR 3 swapchain images: {}",
                    vk::to_string(result));
+        imgs.resize(count);
+        images = std::move(imgs);
+    } else if (BB::FG::DlssSl::Hooked()) {
+        u32 count = 0;
+        auto result = BB::FG::DlssSl::GetSwapchainImages(device, swapchain, &count, nullptr);
+        std::vector<vk::Image> imgs(count);
+        if (result == vk::Result::eSuccess || result == vk::Result::eIncomplete) {
+            result = BB::FG::DlssSl::GetSwapchainImages(device, swapchain, &count, imgs.data());
+        }
+        ASSERT_MSG(result == vk::Result::eSuccess,
+                   "Failed to get the swapchain images (Streamline): {}", vk::to_string(result));
         imgs.resize(count);
         images = std::move(imgs);
     } else {

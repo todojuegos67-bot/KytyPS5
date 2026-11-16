@@ -1572,7 +1572,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                  m == 0 ? "fix (as FSR 3)" : m == 1 ? "raw (as before)" : "off");
         return m;
     }();
-    const bool bb_dlssg_on = BB::FG::Dlss::Ready() && frame->fg.valid;
+    const bool bb_dlssg_on =
+        (BB::FG::Dlss::Ready() || BB::FG::DlssSl::Ready()) && frame->fg.valid; // bb-dlssg-sl
     if (frame->fg.has_hudless && !frame->is_hdr &&
         (BB::FG::Fsr3Active() || (bb_dlssg_on && bb_dlssg_hudless == 0))) {
         const vk::Format fmt = swapchain.GetSurfaceFormat().format;
@@ -1709,6 +1710,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     } else if (!BB::FG::Dlss::Ready() && frame->generated[0].image) {
         BbDestroyGenerated(frame);
+    }
+    // bb-dlssg-sl: Streamline's DLSS-G: this frame's inputs tagged (copied in this command
+    // buffer) and its PCL markers; the frames are generated and presented in Streamline's
+    // vkQueuePresentKHR proxy. HDR / 2D frames: DLSS-G off for them.
+    frame->bb_sl_frame = 0;
+    if (BB::FG::DlssSl::Ready()) {
+        const bool sl_in = !frame->is_hdr && frame->fg.valid;
+        frame->bb_sl_frame = BB::FG::DlssSl::TagFrame(
+            draw_scheduler.CommandBuffer(), sl_in ? &frame->fg : nullptr,
+            {frame->width, frame->height}, swapchain.GetSurfaceFormat().format);
+        draw_scheduler.GetDynamicState().Invalidate(); // Streamline's copies may bind pipelines
     }
     bb_sr->FrameEnd(draw_scheduler.CommandBuffer());
     // bb-velocity: the guest frame ended, after its compose pass (bb_sr->Run) was recorded.
@@ -2198,7 +2210,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         const u64 reflex_id = !is_reusing_frame && is_game_frame
                                   ? BB::Reflex::BeginPresent(std::exchange(frame->bb_reflex_id, 0))
                                   : 0;
+        // bb-dlssg-sl: PCL render-submit-end / present markers of the game frame.
+        const u32 sl_frame =
+            !is_reusing_frame && is_game_frame ? std::exchange(frame->bb_sl_frame, 0u) : 0u;
+        BB::FG::DlssSl::BeforePresent(sl_frame);
         presented = swapchain.Present(reflex_id);
+        BB::FG::DlssSl::AfterPresent(sl_frame, presented);
         BB::Reflex::EndPresent(reflex_id, presented);
         if (!is_reusing_frame && is_game_frame) {
             BB::Reflex::OnGameFramePresented(); // bb-reflex-native: [reflex-native] line

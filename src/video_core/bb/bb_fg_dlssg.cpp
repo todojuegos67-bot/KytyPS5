@@ -101,7 +101,8 @@ bool Load() {
 } // namespace
 
 bool Requested() {
-    return Cfg().kind == Kind::Dlss;
+    // bb-dlssg-sl: not with BB_FG=dlss-sl* / BB_DLSSG_SL=1 (Streamline's DLSS-G instead).
+    return Cfg().kind == Kind::Dlss && !Cfg().streamline;
 }
 
 void AddInstanceExtensions(const std::vector<std::string>& available,
