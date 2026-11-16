@@ -34,10 +34,10 @@
 #include <array>
 #include <atomic>
 #include <cctype>
-#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -45,16 +45,106 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
-#include <thread>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <vector>
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+namespace {
+
+// bb-fg-hang (log-cuelgue-fg: the game froze shortly after DLSS-G switched on under FIFO, and the
+// log just stopped): a watchdog that names the blocking call. Each thread marks the call it is
+// in (acquire, present with the submit lock held, waiting for the lock, a pacing wait, waiting
+// for a free frame or its fence); a background thread logs "[fg-stall]" when one lasts over
+// BB_FG_STALL_MS (default 1000), and again when it returns. Only while frame generation is on.
+struct BbStall {
+    const char* thread;
+    std::atomic<const char*> what{nullptr};
+    std::atomic<s64> since_ns{0};
+    std::atomic<bool> reported{false};
+};
+BbStall bb_stall_present{"present thread"}, bb_stall_render{"GPU thread (next frame)"};
+
+s64 BbNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+s64 BbStallLimitNs() {
+    static const s64 limit = [] {
+        const char* v = std::getenv("BB_FG_STALL_MS");
+        const double ms = v != nullptr && *v != '\0' ? std::strtod(v, nullptr) : 1000.0;
+        return static_cast<s64>((std::isfinite(ms) ? std::clamp(ms, 50.0, 60000.0) : 1000.0) * 1e6);
+    }();
+    return limit;
+}
+
+void BbStallWatchdog() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const s64 now = BbNowNs();
+        for (BbStall* st : {&bb_stall_present, &bb_stall_render}) {
+            const char* what = st->what.load();
+            const s64 since = st->since_ns.load();
+            if (what == nullptr || since == 0 || now - since < BbStallLimitNs()) {
+                continue;
+            }
+            if (!st->reported.exchange(true)) {
+                const char* other_what =
+                    (st == &bb_stall_present ? bb_stall_render : bb_stall_present).what.load();
+                BB::Upscale::Checkpoint(fmt::format(
+                    "[fg-stall] {} blocked {:.0f} ms in: {} | {} meanwhile: {}", st->thread,
+                    (now - since) / 1e6, what,
+                    st == &bb_stall_present ? bb_stall_render.thread : bb_stall_present.thread,
+                    other_what != nullptr ? other_what : "running"));
+            }
+        }
+    }
+}
+
+class BbStallScope {
+public:
+    BbStallScope(BbStall& st, const char* what) : st_{BB::FG::On() ? &st : nullptr} {
+        if (st_ == nullptr) {
+            return;
+        }
+        static std::once_flag started;
+        std::call_once(started, [] { std::thread(BbStallWatchdog).detach(); });
+        prev_ = st_->what.load();
+        prev_since_ = st_->since_ns.load();
+        st_->since_ns.store(BbNowNs());
+        st_->what.store(what);
+    }
+    ~BbStallScope() {
+        if (st_ == nullptr) {
+            return;
+        }
+        if (st_->reported.exchange(false)) {
+            BB::Upscale::Checkpoint(
+                fmt::format("[fg-stall] {} resumed after {:.0f} ms: {}", st_->thread,
+                            (BbNowNs() - st_->since_ns.load()) / 1e6, st_->what.load()));
+        }
+        st_->what.store(prev_);
+        st_->since_ns.store(prev_ != nullptr ? prev_since_ : 0);
+    }
+    BbStallScope(const BbStallScope&) = delete;
+    BbStallScope& operator=(const BbStallScope&) = delete;
+
+private:
+    BbStall* st_;
+    const char* prev_ = nullptr;
+    s64 prev_since_ = 0;
+};
+
+} // namespace
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -807,8 +897,31 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
 // Supermedo's PresentImage for a generated frame: acquire, blit into the swapchain image (the
 // frame's place in the window), submit after the frame's own work, present.
 bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
-    if (!swapchain.AcquireNextImage()) {
-        return false;
+    // bb-fg-hang: under FIFO a generated frame never waits for a swapchain image: when none is
+    // free within BB_DLSSG_ACQUIRE_MS (default 4; 0 = wait as before) it is dropped and the
+    // game's frame goes out. (A generated present blocked in FIFO while holding the submit lock
+    // is the leading suspect for the freeze in log-cuelgue-fg.)
+    static const u64 fifo_timeout_ns = [] {
+        const char* v = std::getenv("BB_DLSSG_ACQUIRE_MS");
+        const double ms = v != nullptr && *v != '\0' ? std::strtod(v, nullptr) : 4.0;
+        return std::isfinite(ms) && ms > 0.0 ? static_cast<u64>(std::min(ms, 1000.0) * 1e6)
+                                             : std::numeric_limits<u64>::max();
+    }();
+    bool timed_out = false;
+    {
+        BbStallScope stall{bb_stall_present, "generated frame: vkAcquireNextImageKHR"};
+        if (!swapchain.AcquireNextImage(swapchain.IsFifo() ? fifo_timeout_ns
+                                                           : std::numeric_limits<u64>::max(),
+                                        timed_out)) {
+            if (timed_out) {
+                ++bb_dlssg_pace.acquire_dropped;
+            } else {
+                // Out of date / suboptimal: the image (if any) and its acquire semaphore must not
+                // be reused by the game frame's acquire: the swapchain is made again first.
+                bb_generated_acquire_failed = true;
+            }
+            return false;
+        }
     }
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -964,10 +1077,21 @@ bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     if (first) info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
-    scheduler.Flush(info);
-    std::scoped_lock submit_lock{Scheduler::submit_mutex};
-    if (!swapchain.Present()) {
-        return false;
+    {
+        BbStallScope stall{bb_stall_present, "generated frame: submit (blit)"};
+        scheduler.Flush(info);
+    }
+    std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+    {
+        BbStallScope stall{bb_stall_present, "generated frame: waiting for the submit lock"};
+        submit_lock.lock();
+    }
+    {
+        BbStallScope stall{bb_stall_present,
+                           "generated frame: vkQueuePresentKHR (submit lock held)"};
+        if (!swapchain.Present()) {
+            return false;
+        }
     }
     BbDlssgNotePresent(false);
     return true;
@@ -1083,16 +1207,17 @@ void Presenter::BbDlssgPaceLogSecond(double sec) {
     BB::Upscale::Checkpoint(fmt::format(
         "[fg-pacing] DLSS-G {:.2f} s: real frames (arrivals) {} | real presents {} | all presents "
         "{} | grid step {:.2f} ms: waited {} (avg {:.2f} ms), late {}, re-phased {}, not held "
-        "(game waiting) {} | reflex markers sent 0 (bbport_dlss ABI 2 has no Reflex / PCL calls, "
+        "(game waiting) {} | generated frames dropped (no free image under FIFO) {} | reflex "
+        "markers sent 0 (bbport_dlss ABI 2 has no Reflex / PCL calls, "
         "VK_NV_low_latency2 not enabled) | present mode {}",
         sec, BB::FG::IntervalStats(std::move(p.arrive_ms)),
         BB::FG::IntervalStats(std::move(p.real_ms)), BB::FG::IntervalStats(std::move(p.all_ms)),
         p.step * 1e3, p.waits, p.waits ? p.wait_ms / p.waits : 0.0, p.late, p.rephase,
-        p.skipped_behind, mode_name));
+        p.skipped_behind, p.acquire_dropped, mode_name));
     p.arrive_ms.clear();
     p.real_ms.clear();
     p.all_ms.clear();
-    p.waits = p.late = p.rephase = p.skipped_behind = 0;
+    p.waits = p.late = p.rephase = p.skipped_behind = p.acquire_dropped = 0;
     p.wait_ms = 0.0;
 }
 
@@ -1845,8 +1970,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             BbDlssgPaceOrigin(bb_start, bb_generated > 0, !bb_behind(), bb_frame_ms);
         if (bb_generated) {
             bb_origin = origin;
-            if (bb_origin > bb_start)
+            if (bb_origin > bb_start) {
+                BbStallScope stall{bb_stall_present,
+                                   "DLSS-G grid wait (before the generated frame)"};
                 bb_wait_until(bb_origin);
+            }
         }
     }
     const auto bb_step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -1855,16 +1983,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     for (; bb_shown < bb_generated; ++bb_shown) {
         if (bb_shown > 0) {
             if (bb_behind()) break;
+            BbStallScope stall{bb_stall_present, "DLSS-G spacing wait (between generated frames)"};
             bb_wait_until(bb_origin + bb_step * bb_shown);
         }
         if (!BbPresentGenerated(frame, bb_shown, bb_shown == 0)) break;
     }
     if (bb_shown && !bb_behind()) {
+        BbStallScope stall{bb_stall_present, "DLSS-G spacing wait (before the game's frame)"};
         bb_wait_until(bb_origin + bb_step * bb_shown);
     }
     bb_sec_generated_shown += bb_shown;
 
-    if (!swapchain.AcquireNextImage()) {
+    if (bb_generated_acquire_failed) {
+        bb_generated_acquire_failed = false;
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    bool bb_acquired = false;
+    {
+        BbStallScope stall{bb_stall_present, "game frame: vkAcquireNextImageKHR"};
+        bb_acquired = swapchain.AcquireNextImage();
+    }
+    if (!bb_acquired) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -2144,9 +2283,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         // lock: not held here then.)
         std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
         if (!BB::FG::Fsr3Active()) {
+            BbStallScope stall{bb_stall_present, "game frame: waiting for the submit lock"};
             submit_lock.lock();
         }
-        if (!swapchain.Present()) {
+        bool presented = false;
+        {
+            BbStallScope stall{bb_stall_present,
+                               "game frame: vkQueuePresentKHR (submit lock held unless FSR 3)"};
+            presented = swapchain.Present();
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         } else {
             BbDlssgNotePresent(!is_reusing_frame && is_game_frame);
@@ -2278,6 +2424,8 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        BbStallScope stall{bb_stall_render, "waiting for a free frame (the present thread has "
+                                            "them all)"};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
@@ -2305,12 +2453,15 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+    {
+        BbStallScope stall{bb_stall_render, "waiting for the free frame's present fence (GPU)"};
+        while (wait() != vk::Result::eSuccess) {
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                       "Device lost during waiting for a frame");
+            // Retry if the waiting times out
+            if (result == vk::Result::eTimeout) {
+                continue;
+            }
         }
     }
 

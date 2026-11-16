@@ -144,6 +144,12 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    bool timed_out = false;
+    return AcquireNextImage(std::numeric_limits<u64>::max(), timed_out);
+}
+
+bool Swapchain::AcquireNextImage(u64 timeout_ns, bool& timed_out) {
+    timed_out = false;
     if (!swapchain) {
         needs_recreation = true;
         return false;
@@ -152,12 +158,19 @@ bool Swapchain::AcquireNextImage() {
     vk::Result result =
         BB::FG::Fsr3Active()
             ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
-            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
-                                         image_acquired[frame_index], VK_NULL_HANDLE,
-                                         &image_index);
+            : device.acquireNextImageKHR(swapchain, timeout_ns, image_acquired[frame_index],
+                                         VK_NULL_HANDLE, &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
+        break;
+    case vk::Result::eTimeout:
+    case vk::Result::eNotReady:
+        if (timeout_ns != std::numeric_limits<u64>::max()) {
+            timed_out = true;
+            return false;
+        }
+        needs_recreation = true;
         break;
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:

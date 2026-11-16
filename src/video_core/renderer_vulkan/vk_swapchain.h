@@ -30,6 +30,9 @@ public:
 
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
+    // bb-fg-hang: a bounded acquire (no image within timeout_ns: false, nothing acquired, the
+    // swapchain stays usable; timed_out tells it apart from a swapchain to recreate).
+    bool AcquireNextImage(u64 timeout_ns, bool& timed_out);
 
     /// Presents the current image and move to the next one
     // bb-clean-021-bbport: FIFO / FIFO relaxed (each present waits for the display).
