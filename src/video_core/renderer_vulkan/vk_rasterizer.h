@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/bb_present_sr.h"
 #include "video_core/renderer_vulkan/bb_ui_cut.h"
 
+#include <memory>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -16,6 +17,10 @@
 
 namespace AmdGpu {
 struct Liverpool;
+}
+
+namespace BB {
+class RtReflect; // bb-rt-reflect
 }
 
 namespace Core {
@@ -128,6 +133,7 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     void BbRtReflectProbe(const GraphicsPipeline& pipeline); // bb-rt-reflect
     void BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect); // bb-rt-reflect
+    void BbRtReflectRun(); // bb-rt-reflect: the ray-query pass after the SSR draw
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -223,6 +229,9 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt-reflect (BB_RT_REFLECT=1)
+    bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
 };
 
 } // namespace Vulkan
