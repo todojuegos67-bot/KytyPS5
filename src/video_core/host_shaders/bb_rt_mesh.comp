@@ -12,6 +12,8 @@ layout(std140, binding = 2) uniform Params {
     mat4 proj;      // view -> clip (column vectors)
     mat4 inv_proj;  // clip -> view
     mat4 view;      // world -> view rotation in the upper 3x3 (column vectors)
+    mat4 reproj;    // (unused here) must match bb_rt_reflect.comp / bb_rt_post.comp layout
+    mat4 prev_proj; // (unused here)
     uvec4 size;     // depth w, h, grid w (cells), grid h
     vec4 misc;      // far distance, y sign (+1: ndc.y = 1 - 2 v), cell size, debug
 } p;
