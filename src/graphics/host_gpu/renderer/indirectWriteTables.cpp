@@ -179,8 +179,8 @@ void IndirectWriteTables::PrepareRoot(uint64_t address) {
 	// The window ends on a RootEndGranule boundary. A stream's roots step a few KiB at a time: an end that moved with each
 	// root made the buffer cache rebuild a buffer of hundreds of MiB per root, all of them held until the GPU was done
 	// (Marvel's Wolverine, Pro mode, the load into Trask: 21 GB in one frame, session 60). The roots of one granule share
-	// one buffer now; the window still covers MaxRootBytes or more after the root.
-	const auto end = m_context.MappedEnd(begin, Common::AlignUp(begin + MaxRootBytes, RootEndGranule) - begin);
+	// one buffer now; the window still covers m_root_bytes or more after the root.
+	const auto end = m_context.MappedEnd(begin, Common::AlignUp(begin + m_root_bytes, RootEndGranule) - begin);
 	if (end <= begin || !GuestRange {begin, end - begin}.Valid()) {
 		return;
 	}
@@ -197,6 +197,17 @@ void IndirectWriteTables::NoteDroppedStores(std::span<const uint64_t> pages) {
 	for (const auto page: pages) {
 		LOGF("Compute: runtime V# stores lost on uncached page 0x%016" PRIx64 " (%" PRIu64 " such pages so far)\n",
 		     page, m_dropped_pages);
+		// A store past the window of the root below it: later windows cover twice that reach.
+		auto root = m_roots.upper_bound(page);
+		if (root == m_roots.begin()) {
+			continue;
+		}
+		const uint64_t reach = page + BufferCache::CACHING_PAGESIZE - *--root;
+		if (reach <= MaxRootReach && 2 * reach > m_root_bytes) {
+			m_root_bytes = std::min(Common::AlignUp(2 * reach, MinRootBytes), MaxRootReach);
+			LOGF("Compute: runtime V# stores reach %" PRIu64 " KiB past their root: windows now %" PRIu64 " KiB\n",
+			     reach / 1024u, m_root_bytes / 1024u);
+		}
 	}
 }
 
