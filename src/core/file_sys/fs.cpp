@@ -289,10 +289,9 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
     }
 
     // Mods folder is mount + "-mods", or BB_MODS_DIR (if set) for the game mounts.
-    std::filesystem::path mods_path =
-        (mount->mount == "/app0" || mount->mount == "/hostapp")
-            ? ModsOverlayPath(mount->host_path)
-            : OverlayPath(mount->host_path, "-mods");
+    std::filesystem::path mods_path = (mount->mount == "/app0" || mount->mount == "/hostapp")
+                                          ? ModsOverlayPath(mount->host_path)
+                                          : OverlayPath(mount->host_path, "-mods");
 
     // If we're just retrieving the mount, return the correct mount path.
     if (corrected_path_sanitized == mount->mount) {
