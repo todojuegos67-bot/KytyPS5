@@ -1,5 +1,8 @@
 #include "wolverineLauncher.h"
 
+#include "common/archive.h"
+#include "gameContent.h"
+
 #include <QApplication>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -348,6 +351,10 @@ QWidget* WolverineLauncher::BuildPlayPage() {
 	connect(folder, &QPushButton::clicked, this, &WolverineLauncher::ChooseFolder);
 	auto* folder_row = new QHBoxLayout;
 	folder_row->addWidget(folder);
+	auto* archive = new QPushButton(tr("Game .zar…"));
+	archive->setObjectName(QStringLiteral("folderButton"));
+	connect(archive, &QPushButton::clicked, this, &WolverineLauncher::ChooseArchive);
+	folder_row->addWidget(archive);
 	folder_row->addStretch(1);
 	games_layout->addLayout(folder_row);
 	games_layout->addSpacing(18);
@@ -789,7 +796,9 @@ bool WolverineLauncher::FrameGeneration(QString* why) const {
 QStringList WolverineLauncher::GameArguments() const {
 	QStringList args;
 	const auto  size = m_settings.value("resolution", "1920x1080").toString().split(QLatin1Char('x'));
-	args << QStringLiteral("--game") << QDir::toNativeSeparators(QDir(m_game.dir).filePath(QStringLiteral("eboot.bin")));
+	// The emulator takes a ZArchive as it is (main.cpp checks eboot.bin inside), a folder by its eboot.bin.
+	args << QStringLiteral("--game")
+	     << QDir::toNativeSeparators(GameContent::IsArchive(m_game.dir) ? m_game.dir : QDir(m_game.dir).filePath(QStringLiteral("eboot.bin")));
 	args << QStringLiteral("--readback-linear-images") << QStringLiteral("--tessellation") << QStringLiteral("--redzone");
 	args << QStringLiteral("--screen-width") << size.value(0, QStringLiteral("1920")) << QStringLiteral("--screen-height")
 	     << size.value(1, QStringLiteral("1080"));
@@ -829,20 +838,23 @@ QStringList WolverineLauncher::GameArguments() const {
 void WolverineLauncher::LoadGame() {
 	m_game     = {};
 	m_game.dir = m_settings.value("game_dir").toString();
-	QFile param(QDir(m_game.dir).filePath(QStringLiteral("sce_sys/param.json")));
-	if (!m_game.dir.isEmpty() && QFileInfo::exists(QDir(m_game.dir).filePath(QStringLiteral("eboot.bin"))) &&
-	    param.open(QIODevice::ReadOnly)) {
-		const auto json      = QJsonDocument::fromJson(param.readAll()).object();
+	// A folder or a .zar: GameContent reads both. The reader keeps the archive's index open through all the reads below.
+	const auto reader = GameContent::IsArchive(m_game.dir) ? Common::OpenArchive(GameContent::ToPath(m_game.dir)) : nullptr;
+	const auto param  = m_game.dir.isEmpty() ? QByteArray {}
+	                                         : GameContent::ReadFile(m_game.dir, QStringLiteral("sce_sys/param.json"), GameContent::MaxMetadataSize);
+	if (!param.isEmpty() && GameContent::FileExists(m_game.dir, QStringLiteral("eboot.bin"))) {
+		const auto json      = QJsonDocument::fromJson(param).object();
 		m_game.found         = true;
 		m_game.title_id      = json.value(QStringLiteral("titleId")).toString();
 		m_game.version       = json.value(QStringLiteral("contentVersion")).toString();
 		const auto localized = json.value(QStringLiteral("localizedParameters")).toObject();
 		m_game.name = localized.value(localized.value(QStringLiteral("defaultLanguage")).toString()).toObject().value(QStringLiteral("titleName")).toString();
 		// The art comes from the user's own game files.
-		m_game.icon.load(QDir(m_game.dir).filePath(QStringLiteral("sce_sys/icon0.png")));
-		if (!m_game.background.load(QDir(m_game.dir).filePath(QStringLiteral("sce_sys/pic2.png")))) {
-			m_game.background.load(QDir(m_game.dir).filePath(QStringLiteral("sce_sys/pic0.png")));
-		}
+		const auto art = [this](QPixmap* picture, const char* file) {
+			return picture->loadFromData(GameContent::ReadFile(m_game.dir, QString::fromLatin1(file), GameContent::MaxImageSize));
+		};
+		art(&m_game.icon, "sce_sys/icon0.png");
+		if (!art(&m_game.background, "sce_sys/pic2.png")) art(&m_game.background, "sce_sys/pic0.png");
 	}
 	if (!m_game.icon.isNull()) {
 		setWindowIcon(QIcon(m_game.icon));
@@ -852,7 +864,7 @@ void WolverineLauncher::LoadGame() {
 		m_card_art->setStyleSheet(QStringLiteral("color: #c3bbae;"));
 	}
 	for (int i = 0; i < m_pages->count(); i++) static_cast<Backdrop*>(m_pages->widget(i))->SetPicture(m_game.background);
-	m_card_name->setText(m_game.found ? m_game.name : tr("Choose the game folder"));
+	m_card_name->setText(m_game.found ? m_game.name : tr("Choose the game folder or .zar"));
 	m_card_id->setText(m_game.found ? QStringLiteral("%1 · %2").arg(m_game.title_id, m_game.version) : QString());
 	UpdateChecks();
 	UpdateSummary();
@@ -865,6 +877,15 @@ void WolverineLauncher::ChooseFolder() {
 	                                                   m_settings.value("game_dir").toString());
 	if (dir.isEmpty()) return;
 	m_settings.setValue("game_dir", dir);
+	LoadGame();
+}
+
+// A ZArchive of the game folder (upstream's launcher makes one with "Compress to ZAR"). Same setting as the folder.
+void WolverineLauncher::ChooseArchive() {
+	const auto file = QFileDialog::getOpenFileName(this, tr("The game archive (.zar)"), m_settings.value("game_dir").toString(),
+	                                               tr("ZArchive (*.zar)"));
+	if (file.isEmpty()) return;
+	m_settings.setValue("game_dir", file);
 	LoadGame();
 }
 
@@ -898,11 +919,12 @@ void WolverineLauncher::UpdateChecks() {
 	};
 	const bool right_game = m_game.found && m_game.title_id == QString::fromLatin1(TitleId);
 	if (!m_game.found) {
-		add('b', tr("No game folder"), tr("Choose the folder of your Marvel's Wolverine dump: eboot.bin and sce_sys."));
+		add('b', tr("No game folder"), tr("Choose the folder of your Marvel's Wolverine dump (eboot.bin and sce_sys) or its .zar."));
 	} else if (!right_game) {
 		add('b', tr("Not Marvel's Wolverine"), tr("%1 is %2: this build plays %3 only.").arg(m_game.dir, m_game.title_id, QString::fromLatin1(TitleId)));
 	} else {
-		add('g', tr("Game folder found"), QStringLiteral("%1 · eboot.bin, sce_sys").arg(QDir::toNativeSeparators(m_game.dir)));
+		add('g', GameContent::IsArchive(m_game.dir) ? tr("Game archive found") : tr("Game folder found"),
+		    QStringLiteral("%1 · eboot.bin, sce_sys").arg(QDir::toNativeSeparators(m_game.dir)));
 		if (m_game.version == QString::fromLatin1(TestedVersion)) {
 			add('g', tr("Game version %1 · tested").arg(m_game.version), {});
 		} else {

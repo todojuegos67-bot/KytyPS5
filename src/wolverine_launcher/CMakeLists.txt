@@ -6,9 +6,12 @@ add_executable(wolverine_launcher WIN32
 	main.cpp
 	wolverineLauncher.cpp
 	wolverineLauncher.h
+	# The official launcher's game-file reads: a game folder or a ZArchive (.zar), through common.
+	"${KYTY_SOURCE_DIR}/launcher/src/gameContent.cpp"
 )
 set_target_properties(wolverine_launcher PROPERTIES AUTOMOC ON)
-target_link_libraries(wolverine_launcher Qt6::Widgets)
+target_include_directories(wolverine_launcher PRIVATE "${KYTY_SOURCE_DIR}/launcher/include")
+target_link_libraries(wolverine_launcher Qt6::Widgets common)
 if(WIN32)
 	target_link_libraries(wolverine_launcher dxgi)
 endif()

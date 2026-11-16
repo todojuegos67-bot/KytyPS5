@@ -79,6 +79,7 @@ private:
 	void        UpdateBusy();
 	void        UpdateCache();
 	void        ChooseFolder();
+	void        ChooseArchive();
 	void        Play();
 	void        StartGame();
 	void        Precompile(const QStringList& extra);
