@@ -306,7 +306,52 @@ std::string BbSsrDesc(const Pipeline& pipeline, const R& regs, std::string kind,
     d += reads.empty() ? " none" : reads;
     return d;
 }
+
+// bb-rt-reflect (BB_RT_REFLECT=1, default off): find the game's SSR draw (PS hash 0x5a619b89)
+// and log, at most once per 5 s, the Vulkan images it renders to and reads, for the ray-query
+// pass of the next step. Diagnostic only: nothing is changed.
+bool BbRtReflectRequested() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_REFLECT");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+constexpr u64 BbSsrPsHash = 0x5a619b89;
 } // namespace
+
+void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
+    bool is_ssr = false;
+    for (const auto* stage : pipeline.GetStages()) {
+        if (stage && stage->sw_stage == Shader::SwStage::Fragment &&
+            stage->pgm_hash == BbSsrPsHash) {
+            is_ssr = true;
+        }
+    }
+    if (!is_ssr) {
+        return;
+    }
+    static u64 hits = 0;
+    static auto last = std::chrono::steady_clock::time_point{};
+    ++hits;
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+    std::string d;
+    for (const auto& image_id : bound_images) {
+        const auto& img = texture_cache.GetImage(image_id);
+        d += fmt::format(" [{} guest={:#x} {}x{} {} vk={:#x}]",
+                         img.binding.is_target ? "target" : "tex", img.info.guest_address,
+                         img.info.size.width, img.info.size.height,
+                         vk::to_string(img.info.pixel_format),
+                         reinterpret_cast<u64>(static_cast<VkImage>(img.GetImage())));
+    }
+    LOG_INFO(Render_Vulkan, "[rt-reflect] SSR draw (PS {:#x}) seen {} times, rtq={}; images:{}",
+             BbSsrPsHash, hits, instance.IsRtReflectEnabled() ? "on" : "off",
+             d.empty() ? " none" : d);
+}
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
@@ -334,6 +379,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                        fmt::format("draw{} n{}", is_indexed ? "-idx" : "",
                                                    regs.num_indices),
                                        true));
+    }
+    if (BbRtReflectRequested()) {
+        BbRtReflectProbe(*pipeline);
     }
 
     BindVertexBuffers(pipeline);
