@@ -88,6 +88,17 @@ void SetProcessEnv(const char* name, const char* value) {
 }
 #endif
 
+// Generated frames per real one this present (KYTY_FSR3_FG_ACTIVE): x(N+1).
+std::atomic<int> g_amd_active{1};
+
+void WriteAmdEnv(int frames, int active) {
+    char f[8], a[8];
+    std::snprintf(f, sizeof(f), "%d", frames);
+    std::snprintf(a, sizeof(a), "%d", active);
+    SetProcessEnv("KYTY_FSR3_FG_FRAMES", f); // read by the DLL when it makes the swapchain
+    SetProcessEnv("KYTY_FSR3_FG_ACTIVE", a); // read on every present
+}
+
 Config ParseConfig() {
     Config c{};
     const char* v = std::getenv("BB_FG");
@@ -129,18 +140,33 @@ Config ParseConfig() {
     }
     if (c.kind == Kind::Amd) {
         SetProcessEnv("KYTY_FSR3_FG", "1");
-        char frames[8], active[8];
-        std::snprintf(frames, sizeof(frames), "%d", c.multiplier - 1);
-        std::snprintf(active, sizeof(active), "%d", c.dynamic ? 1 : c.multiplier - 1);
-        SetProcessEnv("KYTY_FSR3_FG_FRAMES", frames); // read by the DLL when it makes the swapchain
-        SetProcessEnv("KYTY_FSR3_FG_ACTIVE", active); // read on every present
+        g_amd_active.store(c.dynamic ? 1 : c.multiplier - 1, std::memory_order_relaxed);
+        WriteAmdEnv(c.multiplier - 1, g_amd_active.load(std::memory_order_relaxed));
     }
     return c;
 }
 
 } // namespace
 
+// bb-fsr3-mfg-mult: the generated frames per real one the DLL is told (KYTY_FSR3_FG_FRAMES at
+// swapchain creation, KYTY_FSR3_FG_ACTIVE on every present). Kept here so the FG swapchain's
+// creation (bb_fg_fsr3.cpp, which clears both first) can give them back with the right values.
+int AmdFrames() {
+    const auto& c = Cfg();
+    return c.kind == Kind::Amd ? std::clamp(c.multiplier, 2, 4) - 1 : 1;
+}
+
+int AmdActiveFrames() {
+    return std::clamp(g_amd_active.load(std::memory_order_relaxed), 1, AmdFrames());
+}
+
+void ApplyAmdEnv() {
+    if (Cfg().kind != Kind::Amd) return;
+    WriteAmdEnv(AmdFrames(), AmdActiveFrames());
+}
+
 void SetAmdActive(int multiplier) {
+    g_amd_active.store(std::clamp(multiplier, 2, 4) - 1, std::memory_order_relaxed);
     char active[8];
     std::snprintf(active, sizeof(active), "%d", std::clamp(multiplier, 2, 4) - 1);
     SetProcessEnv("KYTY_FSR3_FG_ACTIVE", active);

@@ -72,6 +72,7 @@ ffxContext g_swapchain_context = nullptr;
 ffxQueryDescSwapchainReplacementFunctionsVK g_functions{};
 // Patched DLL: the grid slot of the next present; the presents' intervals (read and cleared).
 void (*g_set_pace_slot)(int64_t, int64_t) = nullptr;
+bool g_dll_patched = false; // bb-fsr3-mfg-mult: the bb-windows DLL (x3 / x4 / dynamic); AMD's: x2 only
 void (*g_take_pace_stats)(int64_t*) = nullptr;
 // 1.58 (bb-fgpace-158, ffx-sdk-v1.1.4-pace.patch): intervals by the kind of present they end at,
 // the DLL's adaptive readiness offset (raised / lowered), late presents, min slack.
@@ -605,6 +606,7 @@ bool LoadApi() {
             return false;
         }
         const bool patched = GetProcAddress(g_dll, "kytyFfxGetRealSwapchainVK") != nullptr;
+        g_dll_patched = patched;
         g_set_pace_slot = reinterpret_cast<void (*)(int64_t, int64_t)>(
             GetProcAddress(g_dll, "kytyFfxSetPaceSlot"));
         g_take_pace_stats =
@@ -613,8 +615,15 @@ bool LoadApi() {
             GetProcAddress(g_dll, "kytyFfxTakePaceStats2"));
         g_take_display_ids = reinterpret_cast<uint32_t (*)(uint64_t*, uint32_t)>(
             GetProcAddress(g_dll, "kytyFfxTakeDisplayIds"));
-        Printf("FSR3 FG: amd_fidelityfx_vk.dll loaded (%s)",
-               patched ? "patched (bb-windows build), x2" : "AMD's signed DLL, x2");
+        // bb-fsr3-mfg-mult: the multiplier asked (was always printed as "x2"); AMD's signed DLL
+        // ignores KYTY_FSR3_FG_FRAMES and stays at x2.
+        Printf("FSR3 FG: amd_fidelityfx_vk.dll loaded (%s, BB_FG=%s: %s)",
+               patched ? "patched (bb-windows build)" : "AMD's signed DLL", Name(),
+               patched ? (Cfg().dynamic ? "dynamic x2..x4"
+                          : Cfg().multiplier == 4 ? "x4"
+                          : Cfg().multiplier == 3 ? "x3"
+                                                  : "x2")
+                       : (Cfg().multiplier > 2 ? "x2 only, x3 / x4 need the patched DLL" : "x2"));
         return true;
     }();
     return loaded;
@@ -628,7 +637,10 @@ double CapInterval() {
         if (std::string(text) == "auto") {
             cap = RefreshTarget();
         }
-        const int generated = 1;
+        // bb-fsr3-mfg-mult: real frames under cap / (1 + generated) for a fixed x3 / x4 (was
+        // always 1: x2). Dynamic keeps 1 (the loosest real limit): its own rule already keeps
+        // real x N under the refresh target, and a tighter cap would hold it at x3 / x4.
+        const int generated = g_dll_patched && !Cfg().dynamic ? AmdFrames() : 1;
         if (cap <= 0.0) return 0.0;
         Printf("FSR3 FG: shown frames held under %.0f fps (real at most %.1f)", cap,
                cap / (1 + generated));
@@ -786,9 +798,10 @@ int Generated() {
     if (!Active() || !g_generating) return 0;
     // bb-smooth: x3 / x4 / dynamic generate 2-3 frames per real one (was always 1: the planned
     // grid stats assumed x2). The DLL reads the same variable on every present.
-    const char* v = std::getenv("KYTY_FSR3_FG_ACTIVE");
-    const int n = v != nullptr ? std::atoi(v) : 1;
-    return std::clamp(n, 1, 3);
+    // bb-fsr3-mfg-mult: the value given to the DLL (bb_fg.cpp), not the CRT copy of the variable
+    // (getenv kept "2" / "3" after CreateSwapchain cleared the Win32 one the DLL reads); AMD's
+    // signed DLL only makes one.
+    return g_dll_patched ? AmdActiveFrames() : 1;
 }
 
 // 1.51 (bb-fgmv-151): present watchdog. r149_0459: presents stopped completing ("source=none
@@ -833,8 +846,27 @@ bool CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::SwapchainKHR* o
     UpdateDisplayHz(); // 1.58: the mode may have changed (fullscreen, another display)
     g_display_ids = false;
     SetEnvironmentVariableA("KYTY_FSR3_DISPLAY_IDS", nullptr);
+    // (bb-clean-021-fg cleared these for the x2-only build so no stale value reached the DLL.)
+    // bb-fsr3-mfg-mult: then given back from BB_FG: the DLL reads KYTY_FSR3_FG_FRAMES in
+    // FrameInterpolationSwapChainVK::init (the generated frame images it makes: 1..3, unset = 1)
+    // and KYTY_FSR3_FG_ACTIVE on every present (unset = FRAMES). With both left cleared, x3 / x4
+    // / dynamic ran at x2 ("x3" in the log, one generated frame on screen).
     SetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", nullptr);
     SetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", nullptr);
+    ApplyAmdEnv();
+    {
+        char frames[16] = {}, active[16] = {};
+        const DWORD fn = GetEnvironmentVariableA("KYTY_FSR3_FG_FRAMES", frames, sizeof(frames));
+        const DWORD an = GetEnvironmentVariableA("KYTY_FSR3_FG_ACTIVE", active, sizeof(active));
+        const int f = fn > 0 && fn < sizeof(frames) ? std::atoi(frames) : 1;
+        const int dll_frames = !g_dll_patched ? 1 : f >= 3 ? 3 : f == 2 ? 2 : 1;
+        Printf("[fg-amd] multiplier given to the DLL: BB_FG=%s, KYTY_FSR3_FG_FRAMES=%s "
+               "KYTY_FSR3_FG_ACTIVE=%s (Win32 environment, as the DLL reads it) -> swapchain x%d, "
+               "this present x%d%s",
+               Name(), fn > 0 ? frames : "(unset)", an > 0 ? active : "(unset)", dll_frames + 1,
+               std::clamp(an > 0 ? std::atoi(active) : dll_frames, 1, dll_frames) + 1,
+               g_dll_patched ? "" : " (AMD's signed DLL: x2 only)");
+    }
     {
         // Pacing floor (the patched DLL; AMD's ignores it): no present of the frame interpolation
         // swapchain closer than the display's refresh period x KYTY_FSR3_PACING_FLOOR (default 1.0,

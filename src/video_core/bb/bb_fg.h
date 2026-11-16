@@ -36,6 +36,12 @@ struct Config {
 const Config& Cfg();
 const char* Name(); // "off", "amd-x2", "dlss-x3", "dlss-dyn"
 void SetAmdActive(int multiplier); // (amd-dyn) generated frames per real one + 1, on every present
+// bb-fsr3-mfg-mult: AMD generated frames per real frame: AmdFrames() = the swapchain's (x3: 2,
+// x4 / dynamic: 3), AmdActiveFrames() = this present's (1..AmdFrames()); ApplyAmdEnv() writes
+// both to KYTY_FSR3_FG_FRAMES / _ACTIVE (the patched DLL reads them with GetEnvironmentVariableA).
+int AmdFrames();
+int AmdActiveFrames();
+void ApplyAmdEnv();
 bool On();          // BB_FG asked (inputs captured even without an upscaler)
 
 bool FgBlocked(const char** why);
