@@ -12,7 +12,6 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
-#include "video_core/bb/bb_reflex.h"
 
 #ifdef _WIN64
 #include <windows.h>
@@ -404,8 +403,6 @@ s32 PS4_SYSV_ABI sceKernelClockGetres(const u32 clock_id, OrbisKernelTimespec* r
 }
 
 s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
-    // bb-reflex: the game's frame limiter reads its frame start here; Reflex sleeps first.
-    BB::Reflex::OnGuestClock(__builtin_return_address(0));
 #ifdef _WIN64
     if (tp) {
         FILETIME filetime;
@@ -592,14 +589,8 @@ void RegisterTime(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("lLMT9vJAck0", "libScePosix", 1, "libkernel", posix_clock_gettime);
     LIB_FUNCTION("smIj7eqzZE8", "libkernel", 1, "libkernel", posix_clock_getres);
     LIB_FUNCTION("smIj7eqzZE8", "libScePosix", 1, "libkernel", posix_clock_getres);
-    // bb-reflex: linked without HOST_CALL's forwarder (it only forwards), so the guest calls
-    // posix_gettimeofday itself and its __builtin_return_address(0) is the guest's return address
-    // at any optimization level (through the forwarder that held only when it was inlined or
-    // tail-called).
-    LinkSymbolImpl(sym, "n88vx3C5nW8", "libkernel", 1, "libkernel",
-                   reinterpret_cast<u64>(&posix_gettimeofday), Core::Loader::SymbolType::Function);
-    LinkSymbolImpl(sym, "n88vx3C5nW8", "libScePosix", 1, "libkernel",
-                   reinterpret_cast<u64>(&posix_gettimeofday), Core::Loader::SymbolType::Function);
+    LIB_FUNCTION("n88vx3C5nW8", "libkernel", 1, "libkernel", posix_gettimeofday);
+    LIB_FUNCTION("n88vx3C5nW8", "libScePosix", 1, "libkernel", posix_gettimeofday);
     LIB_FUNCTION("ChCOChPU-YM", "libkernel", 1, "libkernel", sceKernelSettimeofday);
     LIB_FUNCTION("VdXIDAbJ3tQ", "libScePosix", 1, "libkernel", posix_settimeofday);
     LIB_FUNCTION("d7nUj1LOdDU", "libScePosix", 1, "libkernel", posix_clock_settime);

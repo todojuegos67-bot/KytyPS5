@@ -14,7 +14,6 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
-#include "video_core/bb/bb_reflex.h"
 #include "video_core/bb/bb_smooth.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -326,11 +325,6 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
-    }
-    // bb-reflex: the frame's GPU work is submitted; its Reflex id goes with it to the present.
-    const u64 reflex_id = BB::Reflex::OnGpuFlip();
-    if (frame != nullptr) {
-        frame->bb_reflex_id = reflex_id;
     }
 
     std::scoped_lock lock{mutex};

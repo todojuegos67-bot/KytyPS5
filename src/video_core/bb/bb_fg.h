@@ -24,8 +24,6 @@ namespace BB::FG {
 const char* Env(const char* kyty_name);
 void Printf(const char* format, ...);
 void NotePacing(double real_sd_ms, double shown_sd_ms);
-// bb-dlssg-pace: "mean M sd S p99 P max X ms (n)" of a list of intervals in ms ("n/a" under 2).
-std::string IntervalStats(std::vector<double> ms);
 
 enum class Kind : uint32_t { Off, Amd, Dlss };
 struct Config {
@@ -94,9 +92,6 @@ struct Inputs {
     bool camera_valid = false;
     float view_to_clip[16]{};
     float clip_to_prev_clip[16]{};
-    // bb-dlssg-inputs: world-space camera (Upscale::Camera basis), for DLSS-G.
-    bool basis_valid = false;
-    float cam_pos[3]{}, cam_up[3]{}, cam_right[3]{}, cam_fwd[3]{};
     uint64_t color_frame = ~0ull, depth_frame = ~0ull, mv_frame = ~0ull, obj_frame = ~0ull,
              hudless_frame = ~0ull;
 };
@@ -118,9 +113,6 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
 bool Ready();          // NGX up with Frame Generation
 uint32_t MaxCount();   // NGX's MultiFrameCountMax (1..3), 0 when unavailable
 uint32_t WantedCount(); // frames per game frame asked (dlss-x2: 1 .. dlss-x4: 3, dyn: max)
-// bb-dlssg-inputs: a game frame was prepared without an evaluation (no scene, no generated frame
-// this time): the next evaluation resets instead of pairing with an older frame.
-void NoteSkipped();
 // `backbuffer`: the finished frame (UI included, GENERAL); `outputs`: `count` storage images of
 // its size and format (GENERAL). Records multiFrameIndex 1..count; returns how many were made.
 uint32_t Generate(vk::CommandBuffer cmd, const Image& backbuffer, const Inputs& inputs,

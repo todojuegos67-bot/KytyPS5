@@ -411,11 +411,6 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         fg->obj_frame = obj_composed ? scene_no : 0;
         std::memcpy(fg->view_to_clip, cam.view_to_clip, sizeof(fg->view_to_clip));
         std::memcpy(fg->clip_to_prev_clip, cam.clip_to_prev_clip, sizeof(fg->clip_to_prev_clip));
-        fg->basis_valid = cam.basis_valid;
-        std::memcpy(fg->cam_pos, cam.cam_pos, sizeof(fg->cam_pos));
-        std::memcpy(fg->cam_up, cam.cam_up, sizeof(fg->cam_up));
-        std::memcpy(fg->cam_right, cam.cam_right, sizeof(fg->cam_right));
-        std::memcpy(fg->cam_fwd, cam.cam_fwd, sizeof(fg->cam_fwd));
         // A 3D frame is one with the scene depth (movies and 2D flips have none); without the
         // camera the vectors are zero and FSR 3 uses its default near / far / fov.
         fg->valid = true;

@@ -254,7 +254,6 @@ uintptr_t g_base = 0;
 u64 g_size = 0;
 bool g_site_live[NumSites] = {}; // re-evaluated every flip
 float g_max_dt = 0.05f, g_period = 0.001f;
-bool g_cap_real = false, g_limiter_external = false;
 bool g_cam = false;
 const char* g_mode = "off";
 
@@ -489,7 +488,6 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     const bool write_period = cap_set || st_lim == St::Orig;
     if (write_period) {
         g_period = cap >= 10.0f ? 1.0f / cap : 0.001f; // 0 / unset = unlimited (1 ms)
-        g_cap_real = cap >= 10.0f;
         for (const u32 p : PeriodImmVa) Write32(p + 5, Bits(g_period));
     } else {
         g_period = Float(Read32(PeriodImmVa[1] + 5));
@@ -661,37 +659,6 @@ void OnGuestFlip(int flip_mode) {
     g_havok_acc.Reset();
     g_mode_vsync = g_mode_imm = g_mode_other = g_bad_dt = g_clamp_hi = g_clamp_lo = 0;
     g_last_log = now;
-}
-
-float CapPeriod() {
-    return g_installed && g_cap_real ? g_period : 0.0f;
-}
-
-void SetLimiterExternal(bool external) {
-    if (!g_installed || !g_cap_real) {
-        return;
-    }
-    // Data only, no code patch: the limiter (0x2034770) stores its period into this+0x18 from
-    // the immediate at 0x203485A every frame (jump table entry 0 after the kLimiter patch), then
-    // calls gettimeofday (0x2034977, where this runs) and reads this+0x18 at 0x2034991. A write
-    // here therefore holds for this frame and must be repeated every frame; when it stops, the
-    // next frame's immediate (g_period, never rewritten) gives the cap back by itself. Same
-    // thread as the limiter, between its store and its read: nothing to synchronize, no page
-    // protection to change, and immune to the static patcher relocating that code.
-    const float period = external ? 0.001f : g_period;
-    u64 frame = 0;
-    std::memcpy(&frame, AtV(FramePtrVa), 8);
-    if (frame >= 0x10000 && (frame & 3) == 0) {
-        std::memcpy(reinterpret_cast<void*>(frame + OffPeriod), &period, 4);
-    }
-    if (external == g_limiter_external) {
-        return;
-    }
-    g_limiter_external = external;
-    LOG_INFO(Lib_VideoOut,
-             "[vardt] frame cap {:.0f} fps: {} (game limiter period {:.3f} ms)", 1.0f / g_period,
-             external ? "paced by NVIDIA Reflex's sleep" : "back in the game's limiter",
-             period * 1000.0f);
 }
 
 void OnPresent() {

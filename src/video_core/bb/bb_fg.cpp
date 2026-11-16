@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -56,24 +55,6 @@ void Printf(const char* format, ...) {
 }
 
 void NotePacing(double, double) {}
-
-std::string IntervalStats(std::vector<double> ms) {
-    if (ms.size() < 2)
-        return "n/a";
-    double sum = 0.0, sq = 0.0;
-    for (const double x : ms) {
-        sum += x;
-        sq += x * x;
-    }
-    const double n = static_cast<double>(ms.size());
-    const double mean = sum / n;
-    std::sort(ms.begin(), ms.end());
-    const size_t i99 = std::min(ms.size() - 1, static_cast<size_t>(std::ceil(0.99 * n)) - 1);
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "mean %.2f sd %.2f p99 %.2f max %.2f ms (%zu)", mean,
-                  std::sqrt(std::max(sq / n - mean * mean, 0.0)), ms[i99], ms.back(), ms.size());
-    return buf;
-}
 
 namespace {
 

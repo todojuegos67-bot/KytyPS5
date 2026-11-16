@@ -416,7 +416,7 @@ bool HudFg::FixHudless(vk::CommandBuffer cmd, vk::ImageView frame_view, vk::Imag
     };
     // (11-13) BB_FSR3_PLAYER_REAL=1: the player (moving opaque pixels of attachment 7 in the
     // screen's centre) given to FSR 3 as UI: taken from the real frame, no ghost (moves at the
-    // real rate). FSR 3 reads this image, and DLSS-G since bb-dlssg-inputs (BB_DLSSG_HUDLESS=fix).
+    // real rate). Only FSR 3 reads this image.
     static const bool player_real = [] {
         const char* v = std::getenv("BB_FSR3_PLAYER_REAL");
         return v != nullptr && v[0] == '1';

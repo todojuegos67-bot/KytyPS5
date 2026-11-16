@@ -15,7 +15,6 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "core/address_space.h"
 #include "video_core/bb/bb_fg.h"
-#include "video_core/bb/bb_reflex_vk.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -421,17 +420,6 @@ bool Instance::CreateDevice() {
         }
     }
 
-    if (BB::Reflex::Requested()) {
-        // bb-reflex: VK_NV_low_latency2 (and the present ids it needs) for NVIDIA Reflex.
-        std::vector<const char*> reflex_extensions(enabled_extensions.begin(),
-                                                   enabled_extensions.end());
-        BB::Reflex::AddDeviceExtensions(physical_device, available_extensions, reflex_extensions);
-        for (std::size_t i = enabled_extensions.size(); i < reflex_extensions.size(); ++i) {
-            LOG_INFO(Render_Vulkan, "Enabling extension: {} (Reflex)", reflex_extensions[i]);
-            enabled_extensions.push_back(reflex_extensions[i]);
-        }
-    }
-
     static constexpr std::array queue_priorities = {1.0f, 1.0f};
     // bb-clean-021-fg: FSR 3 frame generation (BB_FG=amd-x2) adds a second graphics queue for its
     // presents and two async compute queues; with BB_FG off one graphics queue as before.
@@ -668,13 +656,6 @@ bool Instance::CreateDevice() {
         bb_ci.ppEnabledExtensionNames = enabled_extensions.data();
         Core::ReleaseDlssAddressHole();
     }
-    if (BB::Reflex::Requested()) {
-        // bb-reflex: not requested, the device create info is left exactly as before.
-        auto& reflex_ci = device_chain.get<vk::DeviceCreateInfo>();
-        reflex_ci.pNext = BB::Reflex::ChainDeviceFeatures(const_cast<void*>(reflex_ci.pNext));
-        reflex_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
-        reflex_ci.ppEnabledExtensionNames = enabled_extensions.data();
-    }
     if (BB::Upscale::Capture()) {
         std::string names;
         for (const char* e : enabled_extensions) names += std::string(e) + " ";
@@ -736,7 +717,6 @@ bool Instance::CreateDevice() {
     BB::FG::OnDevice(physical_device, *device, queue_family_index, graphics_queue, fg_queues,
                      &Scheduler::submit_mutex);
     BB::FG::Dlss::OnDevice(*instance, physical_device, *device);
-    BB::Reflex::OnDevice(*device);
     return true;
 }
 

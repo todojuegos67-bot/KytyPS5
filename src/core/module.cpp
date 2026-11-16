@@ -23,7 +23,6 @@
 #include "core/memory.h"
 #include "core/module.h"
 #include "core/tls.h"
-#include "video_core/bb/bb_reflex.h"
 
 namespace Core {
 
@@ -387,7 +386,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             BB::ResPatch::OnEbootLoaded(base_virtual_addr, base_size);
             BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
             BB::VarDt::OnEbootLoaded(base_virtual_addr, base_size); // BB_VARIABLE_DT=1
-            BB::Reflex::OnEbootLoaded(base_virtual_addr, base_size); // after VarDt: its cap
         }
     }
 

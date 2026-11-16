@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/bb/bb_native_mv.h"
-#include "video_core/bb/bb_reflex.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -181,10 +180,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
 
-    // bb-reflex: RENDERSUBMIT_END, before the GPU thread can reach the flip.
-    BB::Reflex::OnGuestFlip();
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
-        BB::Reflex::OnGuestFlipDropped();
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
     }

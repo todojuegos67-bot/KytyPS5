@@ -6,9 +6,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <vector>
-#include "video_core/renderer_vulkan/bb_hud_fg.h"
 #include "video_core/renderer_vulkan/bb_present_sr.h"
+#include "video_core/renderer_vulkan/bb_hud_fg.h"
 
 #include <condition_variable>
 
@@ -43,7 +42,6 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
-    u64 bb_reflex_id = 0; // bb-reflex: the game frame's Reflex frame id (0: none)
     BB::FG::Inputs fg{}; // bb-clean-021-fg: this frame's frame generation inputs (valid: 3D frame)
     // bb-hudless: the upscaled scene without the HUD, through the same post-process pass as the
     // frame (its size and format): FSR 3 FG's HUD-less colour (DLSS-G: kBufferTypeHUDLessColor).
@@ -175,22 +173,6 @@ private:
     bool BbPresentGenerated(Frame* frame, u32 index, bool first);
     std::atomic<double> bb_game_frame_ms{16.6};
     std::chrono::steady_clock::time_point bb_last_game_present{};
-    // bb-dlssg-pace: the DLSS-G present grid (BB_DLSSG_PACE) and the per-second [fg-pacing] line.
-    struct BbDlssgPace {
-        double last_slot = 0.0, last_arrive = 0.0, step = 0.0; // s
-        std::array<double, 32> ring{};
-        int count = 0, next = 0;
-        u32 waits = 0, late = 0, rephase = 0, skipped_behind = 0, acquire_dropped = 0;
-        double wait_ms = 0.0;
-        std::vector<double> arrive_ms, real_ms, all_ms;
-        std::chrono::steady_clock::time_point last_present{}, last_real_present{};
-    };
-    BbDlssgPace bb_dlssg_pace{};
-    bool bb_generated_acquire_failed = false; // bb-fg-hang
-    std::chrono::steady_clock::time_point BbDlssgPaceOrigin(
-        std::chrono::steady_clock::time_point now, bool generating, bool may_wait, double& step_ms);
-    void BbDlssgNotePresent(bool real);
-    void BbDlssgPaceLogSecond(double sec);
     bool bb_imgui_ui_shown = false; // bb-dlssg-ui
     // bb-menu-ui: the texture of the game image ImGui drew in the last Present (the draw data
     // BbPresentGenerated draws again belongs to that Present, not to the frame being presented).

@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <string>
 #include "video_core/bb/bb_fg.h"
-#include "video_core/bb/bb_reflex_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -92,26 +91,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     if (BB::FG::CreateSwapchain(swapchain_info, &fg_chain)) {
         swapchain = fg_chain;
     } else {
-        // bb-reflex: latency mode on (VK_NV_low_latency2) when Reflex is set up; made again
-        // without it if the driver refuses, and Reflex stays off.
-        vk::SwapchainCreateInfoKHR info = swapchain_info;
-        const void* latency_next = BB::Reflex::SwapchainCreateNext(info.pNext);
-        const bool latency = latency_next != nullptr;
-        if (latency) {
-            info.pNext = latency_next;
-        }
-        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(info);
-        if (latency && swapchain_result != vk::Result::eSuccess) {
-            LOG_WARNING(Render_Vulkan, "Swapchain with latency mode refused ({}): made without",
-                        vk::to_string(swapchain_result));
-            auto [retry_result, retry_chain] =
-                instance.GetDevice().createSwapchainKHR(swapchain_info);
-            swapchain_result = retry_result;
-            chain = retry_chain;
-            BB::Reflex::OnSwapchainCreated({}, false);
-        } else if (latency) {
-            BB::Reflex::OnSwapchainCreated(chain, true);
-        }
+        auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
         ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                    vk::to_string(swapchain_result));
         swapchain = chain;
@@ -164,12 +144,6 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
-    bool timed_out = false;
-    return AcquireNextImage(std::numeric_limits<u64>::max(), timed_out);
-}
-
-bool Swapchain::AcquireNextImage(u64 timeout_ns, bool& timed_out) {
-    timed_out = false;
     if (!swapchain) {
         needs_recreation = true;
         return false;
@@ -178,19 +152,12 @@ bool Swapchain::AcquireNextImage(u64 timeout_ns, bool& timed_out) {
     vk::Result result =
         BB::FG::Fsr3Active()
             ? BB::FG::AcquireNextImage(swapchain, image_acquired[frame_index], &image_index)
-            : device.acquireNextImageKHR(swapchain, timeout_ns, image_acquired[frame_index],
-                                         VK_NULL_HANDLE, &image_index);
+            : device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                         image_acquired[frame_index], VK_NULL_HANDLE,
+                                         &image_index);
 
     switch (result) {
     case vk::Result::eSuccess:
-        break;
-    case vk::Result::eTimeout:
-    case vk::Result::eNotReady:
-        if (timeout_ns != std::numeric_limits<u64>::max()) {
-            timed_out = true;
-            return false;
-        }
-        needs_recreation = true;
         break;
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:
@@ -208,18 +175,12 @@ bool Swapchain::AcquireNextImage(u64 timeout_ns, bool& timed_out) {
     return !needs_recreation;
 }
 
-bool Swapchain::Present(u64 present_id) {
+bool Swapchain::Present() {
     if (!swapchain) {
         needs_recreation = true;
         return false;
     }
-    // bb-reflex: the game frame's Reflex frame id (VK_KHR_present_id), 0: none.
-    const vk::PresentIdKHR id_info{
-        .swapchainCount = 1,
-        .pPresentIds = &present_id,
-    };
     const vk::PresentInfoKHR present_info = {
-        .pNext = present_id != 0 ? &id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -311,12 +272,14 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
-    // bb-clean-021-fg / bb-clean-021-bbport: frame generation (FSR 3 and DLSS-G) present mode.
-    // BB_FG_PRESENT unset / auto: as before bb-dlssg-pace (a FIFO setting becomes Mailbox, else
-    // Immediate; other settings stay). bb-fg-revert: FIFO by default froze the game when DLSS-G
-    // switched on at a high refresh rate (log-cuelgue-fg), so FIFO is only used when asked:
-    // BB_FG_PRESENT=fifo (V-Sync / VRR) | mailbox | immediate | configured.
-    if (BB::FG::Fsr3Requested() || BB::FG::Dlss::Requested()) {
+    // bb-clean-021-fg: FSR 3 FG paces its own presents (real + generated). Under FIFO the
+    // present of the real frame waited a whole refresh (real fps halved, no gain over FG off):
+    // with FG on, mailbox (else immediate) unless BB_FG_PRESENT=fifo.
+    // bb-clean-021-bbport: DLSS-G presents its generated frames itself (Supermedo's loop): the
+    // same choice.
+    if ((BB::FG::Fsr3Requested() || BB::FG::Dlss::Requested()) &&
+        (present_mode == vk::PresentModeKHR::eFifo ||
+         present_mode == vk::PresentModeKHR::eFifoRelaxed)) {
         const char* v = std::getenv("BB_FG_PRESENT");
         const std::string want = v != nullptr ? v : "";
         const auto has = [&](vk::PresentModeKHR m) {
@@ -325,22 +288,12 @@ void Swapchain::FindPresentMode() {
         vk::PresentModeKHR chosen = present_mode;
         if (want == "immediate" && has(vk::PresentModeKHR::eImmediate)) {
             chosen = vk::PresentModeKHR::eImmediate;
-        } else if (want == "mailbox" && has(vk::PresentModeKHR::eMailbox)) {
-            chosen = vk::PresentModeKHR::eMailbox;
-        } else if (want == "configured") {
-            chosen = present_mode;
-        } else if (want == "fifo") {
-            chosen = vk::PresentModeKHR::eFifo;
-        } else if (want != "immediate" && want != "mailbox" &&
-                   (present_mode == vk::PresentModeKHR::eFifo ||
-                    present_mode == vk::PresentModeKHR::eFifoRelaxed)) {
+        } else if (want != "fifo") {
             chosen = has(vk::PresentModeKHR::eMailbox)     ? vk::PresentModeKHR::eMailbox
                      : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
                                                            : present_mode;
         }
-        LOG_INFO(Render_Vulkan,
-                 "Frame generation: present mode {} (configured {}; BB_FG_PRESENT={}; FIFO = "
-                 "V-Sync / VRR only with BB_FG_PRESENT=fifo)",
+        LOG_INFO(Render_Vulkan, "Frame generation: present mode {} (configured {}; BB_FG_PRESENT={})",
                  vk::to_string(chosen), vk::to_string(present_mode), want.empty() ? "auto" : want);
         present_mode = chosen;
     }
@@ -398,7 +351,6 @@ void Swapchain::Destroy() {
     images_view.clear();
 
     if (swapchain) {
-        BB::Reflex::OnSwapchainDestroy();
         if (BB::FG::Fsr3Active()) {
             BB::FG::DestroySwapchain(swapchain);
         } else {
