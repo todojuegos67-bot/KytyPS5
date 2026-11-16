@@ -1147,6 +1147,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			// A candidate out of the store's reach can't be written: it resolves as a null, which holds until it is in reach.
 			group.narrowed_now = store_reach_known && resource.written;
 			if (group.narrowed_now) WolverineStores::Narrow(std::span(all_values), store_reach, group.narrowed, group.narrowed_kept);
+			// No candidate over a reached image means the chain and the group disagree: bind every candidate, never all nulls.
+			if (group.narrowed_now && group.narrowed_kept.empty()) group.narrowed_now = false;
 			const auto& values = group.narrowed_now ? group.narrowed : all_values;
 			// Marvel's Wolverine's Trask outpost repeats about 54,000 lookups a frame in its effect passes, about 25 draws
 			// of 11-22 groups each, nearly all of them what the group's last draw found. A repeat reads the texture cache's

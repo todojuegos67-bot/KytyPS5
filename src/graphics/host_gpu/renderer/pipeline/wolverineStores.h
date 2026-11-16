@@ -75,8 +75,8 @@ struct Reach {
 	return (uint64_t {dword0} | (uint64_t {dword1 & 0xffu} << 32u)) << 8u;
 }
 
-// False when it can't be known: a read failed (`read(address, data, bytes)` returns false), the list is longer than
-// MaxRecords or it has no stride. The caller then binds every candidate. `read` must hand back the bytes as the GPU left
+// False when it can't be known: a read failed (`read(address, data, bytes)` returns false), a link in the chain is null,
+// the list is longer than MaxRecords or has no stride, or no image is reached. The caller then binds every candidate. `read` must hand back the bytes as the GPU left
 // them, not what guest memory holds of bytes the GPU may have written.
 template <typename Read>
 [[nodiscard]] bool FindReach(uint64_t program, std::span<const uint32_t> user_data, uint32_t user_data_base, Read&& read, Reach& reach) {
@@ -94,9 +94,12 @@ template <typename Read>
 		std::copy_n(reg(chain->table), 4, global);
 	}
 	uint32_t registry[4] {}, manager[4] {};
+	if (BufferBase(global) == 0u) return false;
 	if (!read(BufferBase(global) + 1600u, registry, sizeof(registry)) || !read(BufferBase(global) + 1376u, manager, sizeof(manager))) return false;
 	const uint32_t* list = reg(vertex ? 8u : 0u);
 	const uint32_t* heap = reg(vertex ? 12u : 4u);
+	// A null link isn't the layout the disassembly shows: not known, so every candidate is bound.
+	if (BufferBase(registry) == 0u || BufferBase(manager) == 0u || BufferBase(list) == 0u || BufferBase(heap) == 0u) return false;
 	const auto      add  = [&](uint32_t material) {
         uint32_t place = 0, slot = 0, image[2] {};
         if (material < registry[2] && !read(BufferBase(registry) + material * 96ull + 28u, &place, sizeof(place))) return false;
@@ -114,7 +117,8 @@ template <typename Read>
 		uint32_t material = 0;
 		if (!read(BufferBase(list) + uint64_t {record} * stride + 8u, &material, sizeof(material)) || !add(material >> 18u)) return false;
 	}
-	return add(0u);
+	// Reaching no image at all would null every candidate: take it as not known instead.
+	return add(0u) && reach.count != 0u;
 }
 
 // `narrowed` becomes `values` with every candidate over another image a null descriptor. `kept` lists the ranks that aren't

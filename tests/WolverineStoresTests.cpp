@@ -160,6 +160,22 @@ void TestReach() {
 	check_written(ManagerBase + 9u * 16ull + 0x94u, "the slot");
 	check_written(HeapBase + 18596u * 32ull, "the T#");
 	check_written(RegistryBase + 28u, "material 0's place");
+
+	// A null link, or no image reached at all, isn't known either: the draw then binds every candidate, never all nulls.
+	auto no_table = PixelUser(1u);
+	no_table[28] = no_table[29] = 0u;
+	Check(!Find(PixelProgram, no_table, 0u, memory, reach), "a null table");
+	auto no_heap = PixelUser(1u);
+	no_heap[4] = no_heap[5] = 0u;
+	Check(!Find(PixelProgram, no_heap, 0u, memory, reach), "a null heap");
+	auto null_registry = MakeMemory();
+	null_registry.PutBuffer(TableBase + 1600u, 0u, 96u, 1000u);
+	Check(!Find(PixelProgram, PixelUser(1u), 0u, null_registry, reach), "a null registry");
+	auto no_image = MakeMemory();
+	no_image.PutMaterial(0u, 7u, 70u, 0u);
+	no_image.PutMaterial(591u, 9u, 18596u, 0u);
+	Check(!Find(PixelProgram, PixelUser(1u), 0u, no_image, reach), "no image reached");
+	Check(!Find(TrailPixelA, PixelUser(1u, 16u, 20u), 0u, no_image, reach), "no image reached by a trail program");
 }
 
 struct Value {
