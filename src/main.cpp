@@ -9,6 +9,16 @@
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -113,12 +123,33 @@ int main(int argc, char* argv[]) {
 
     // ---- No-args behavior ----
     if (argc == 1) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
-                                 "This is a CLI application. Please use the '-b' flag for Big "
-                                 "Picture mode, or QTLauncher for a standalone GUI:\n"
-                                 "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
+#ifdef _WIN32
+        // Bloodborne port: double-clicking Bloodborne.exe opens the launcher next to it.
+        {
+            wchar_t exe_path[MAX_PATH * 4] = {};
+            const DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 4);
+            if (n > 0 && n < MAX_PATH * 4) {
+                const std::filesystem::path dir = std::filesystem::path(exe_path).parent_path();
+                const std::filesystem::path ps1 = dir / L"Launcher-bloodborne.ps1";
+                std::error_code ec;
+                if (std::filesystem::exists(ps1, ec)) {
+                    const std::wstring params =
+                        L"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+                        ps1.wstring() + L"\"";
+                    const auto r = reinterpret_cast<INT_PTR>(
+                        ShellExecuteW(nullptr, L"open", L"powershell.exe", params.c_str(),
+                                      dir.wstring().c_str(), SW_HIDE));
+                    if (r > 32) {
+                        return 0;
+                    }
+                }
+            }
+        }
+#endif
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Bloodborne",
+                                 "Abre Launcher-bloodborne.cmd para jugar.\n"
+                                 "Open Launcher-bloodborne.cmd to play.",
                                  nullptr);
-        std::cout << app.help();
         return -1;
     }
 
