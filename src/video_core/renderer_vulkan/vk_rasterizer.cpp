@@ -333,6 +333,13 @@ bool BbRtFullresLogRequested() { // BB_RT_REFLECT_FULLRES=log: the draw-chain di
     }();
     return on;
 }
+bool BbRtVolRequested() { // BB_RT_VOLUMETRIC=1 (with BB_RT_REFLECT=1)
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_VOLUMETRIC");
+        return BbRtReflectRequested() && e && e[0] == '1';
+    }();
+    return on;
+}
 // The lighting / composite draw that samples the SSR target directly (VS 0x8747a367).
 constexpr u64 BbCompositePsHash = 0x3fe9e964;
 } // namespace
@@ -1339,6 +1346,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     memory->IsValidMapping(vsharp.base_address, 272)) {
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));
+                }
+                // bb-rt-vol: the game's light-set (slot 5) and fog (slot 6) constant buffers,
+                // layouts from Ghidra (FUN_026deeb0, FUN_02651f10); see bb_upscale.h.
+                if ((stage.sw_stage == Shader::SwStage::Vertex ||
+                     stage.sw_stage == Shader::SwStage::Fragment) &&
+                    !desc.is_written && size >= 84 && size <= 320 && BbRtVolRequested() &&
+                    memory->IsValidMapping(vsharp.base_address, size)) {
+                    BB::Upscale::OnLightingConstants(
+                        reinterpret_cast<const u32*>(vsharp.base_address),
+                        static_cast<size_t>(size), stage.pgm_hash);
                 }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",

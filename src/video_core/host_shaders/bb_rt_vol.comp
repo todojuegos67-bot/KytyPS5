@@ -23,6 +23,7 @@ layout(std140, binding = 2) uniform Params {
     vec4 color;      // light colour, strength
     vec4 misc;       // density, max march distance, steps, frame
     vec4 misc2;      // history valid, temporal blend, far distance, y sign
+    vec4 fog;        // view-space world up, height falloff 1/H (game fog CB, 0: uniform)
 } p;
 layout(binding = 3) uniform sampler2D src_tex;  // mode 1: raw, mode 2: accumulated (nearest)
 layout(binding = 4) uniform sampler2D hist_tex; // previous accumulated (linear)
@@ -75,10 +76,14 @@ void main() {
         float ign = fract(52.9829189 * fract(0.06711056 * float(c.x) + 0.00583715 * float(c.y)));
         float j = fract(ign + float(Hash(uint(p.misc.w)) & 0xffffu) / 65536.0);
         float dens = p.misc.x;
-        float acc = 0.0;
+        float acc = 0.0, od = 0.0; // in-scatter, optical depth so far
+        float vy = dot(V, p.fog.xyz);  // world height gained per unit of march
         for (int i = 0; i < steps; ++i) {
             float t = (float(i) + j) * dt;
             vec3 S = V * t;
+            // Height fog (game fog CB): density at the camera height * exp(-dy / H).
+            float ds = dens * exp(clamp(-vy * t * p.fog.w, -20.0, 20.0));
+            od += ds * dt;
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, tlas,
                                   gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
@@ -90,7 +95,7 @@ void main() {
             ++ns;
             if (lit) {
                 ++nl;
-                acc += exp(-dens * t) * dens * dt;
+                acc += exp(-od) * ds * dt;
             }
         }
         const float g = 0.55;

@@ -62,6 +62,18 @@ void OnConstants(const u32* data, size_t count);
 bool RtCamera(float proj[16], float view[12], float& far_dist);
 // bb-rt-vol: the same block's first 216 floats (light direction search).
 bool RtSceneBlock(float out[216]);
+// bb-rt-vol (Ghidra, eboot 1.09): the game's per-frame light-set and fog constant buffers.
+//  Light CB (288 bytes, CB slot 5, written by FUN_026deeb0 / FUN_026dfe80 from the LIGHT SET
+//  MANAGER's light set): floats 0-15 four directional-light directions (world space, xyz; w =
+//  set+0x80/+0xe0/+0x140/+0x1a0), 16-31 their diffuse colours (rgb^2 * intensity), 32-47 their
+//  specular colours, 48-63 hemisphere ambient, 64-67 (set+0x90, +0xf0, +0x150, +0x1b0).
+//  Fog CB (>= 84 bytes, CB slot 6, written by FUN_02651f10 from the FOG MANAGER's fog param):
+//  v0 (a*k, 1/dist, 1/dist*exp(-camY/H), 1/H), v1 (fog rgb^2, p30), v2 (a*k, p54, 1/dist, 1/H),
+//  v3 (a2*k, base height, 1/(H*p50), camY), v4 (colour2 rgb^2, p30), v5.x = 1 (int).
+// Fed by the rasterizer with the read-only buffers of a draw (hash: the shader's pgm hash).
+void OnLightingConstants(const u32* data, size_t bytes, u64 hash);
+bool RtLightBlock(float out[72], u64& age_frames);
+bool RtFogBlock(float out[24], u64& age_frames);
 // This frame's jitter in render pixels (zero when off).
 void Jitter(float& x, float& y);
 // bb-hudjitter: a depth-target bind of a draw (rasterizer): jittered (scene), skipped (after the

@@ -684,6 +684,69 @@ bool RtSceneBlock(float out[216]) {
     std::memcpy(out, g_rt_cam.block, sizeof(g_rt_cam.block));
     return true;
 }
+namespace {
+struct RtLighting {
+    float light[72]{};
+    float fog[24]{};
+    u32 light_frame = 0, fog_frame = 0;
+    bool light_valid = false, fog_valid = false;
+} g_rt_lighting;
+bool Finite(const float* f, int n) {
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(f[i])) return false;
+    }
+    return true;
+}
+} // namespace
+
+void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
+    const float* f = reinterpret_cast<const float*>(data);
+    // Fog CB (FUN_02651f10): v2.x == v0.x, v2.z == v0.y (1/dist), v2.w == v0.w (1/H),
+    // v1.w == v4.w (p30), v5.x == int 1, colours (squares) >= 0.
+    if (bytes >= 84 && bytes <= 256 && data[20] == 1u && Finite(f, 20) && f[10] == f[1] &&
+        f[11] == f[3] && f[8] == f[0] && f[7] == f[19] && f[1] >= 0.0f &&
+        f[4] >= 0.0f && f[5] >= 0.0f && f[6] >= 0.0f && f[16] >= 0.0f && f[17] >= 0.0f &&
+        f[18] >= 0.0f && (f[1] > 0.0f || f[3] != 0.0f)) {
+        std::scoped_lock lk{g_cam_mutex};
+        std::memcpy(g_rt_lighting.fog, f, 21 * sizeof(float));
+        g_rt_lighting.fog_frame = g_frame_no;
+        g_rt_lighting.fog_valid = true;
+        return;
+    }
+    // Light CB (FUN_026deeb0): only from the deferred lighting / composite / SSR draws.
+    if ((hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2) && bytes >= 288 &&
+        bytes <= 320 && Finite(f, 72)) {
+        const auto len = [&](int i) {
+            return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
+        };
+        bool colours_ok = true;
+        for (int i = 16; i < 48; ++i) {
+            if ((i & 3) != 3 && f[i] < 0.0f) colours_ok = false;
+        }
+        if (!colours_ok || std::abs(len(0) - 1.0f) > 0.05f) {
+            return;
+        }
+        std::scoped_lock lk{g_cam_mutex};
+        std::memcpy(g_rt_lighting.light, f, 72 * sizeof(float));
+        g_rt_lighting.light_frame = g_frame_no;
+        g_rt_lighting.light_valid = true;
+    }
+}
+bool RtLightBlock(float out[72], u64& age_frames) {
+    std::scoped_lock lk{g_cam_mutex};
+    if (!g_rt_lighting.light_valid) return false;
+    std::memcpy(out, g_rt_lighting.light, sizeof(g_rt_lighting.light));
+    age_frames = g_frame_no - g_rt_lighting.light_frame;
+    return true;
+}
+bool RtFogBlock(float out[24], u64& age_frames) {
+    std::scoped_lock lk{g_cam_mutex};
+    if (!g_rt_lighting.fog_valid) return false;
+    std::memcpy(out, g_rt_lighting.fog, sizeof(g_rt_lighting.fog));
+    age_frames = g_frame_no - g_rt_lighting.fog_frame;
+    return true;
+}
+
 void OnConstants(const u32* data, size_t count) {
     if (count < 216) {
         return;

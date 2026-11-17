@@ -93,6 +93,7 @@ struct alignas(16) VolParams {
     float color[4];
     float misc[4];  // density, max march distance, steps, frame
     float misc2[4]; // history valid, temporal blend, far distance, y sign
+    float fog[4];   // view-space world up (xyz), height falloff 1/H (density *= exp(-dy / H))
 };
 static_assert(sizeof(VolParams) <= 512);
 
@@ -967,6 +968,7 @@ bool RtReflect::InitVolumetric() {
     const auto device = instance.GetDevice();
     vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", 1.0f, 0.0f, 10.0f);
     vol_density = EnvFloat("BB_RT_VOLUMETRIC_DENSITY", 0.02f, 0.0001f, 1.0f);
+    if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DENSITY"); e && e[0]) density_env = true;
     vol_dist = EnvFloat("BB_RT_VOLUMETRIC_DIST", 60.0f, 2.0f, 1000.0f);
     vol_steps = u32(EnvFloat("BB_RT_VOLUMETRIC_STEPS", 12.0f, 2.0f, 64.0f));
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DIR"); e && e[0]) {
@@ -986,6 +988,7 @@ bool RtReflect::InitVolumetric() {
         float v[3]{};
         if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
             for (int i = 0; i < 3; ++i) vol_color[i] = std::clamp(v[i], 0.0f, 100.0f);
+            color_env = true;
         }
     }
     constexpr auto C = vk::ShaderStageFlagBits::eCompute;
@@ -1043,7 +1046,15 @@ bool RtReflect::InitVolumetric() {
              vol_color[2],
              light_env ? "BB_RT_VOLUMETRIC_DIR"
              : light_forced_ofs >= 0 ? "BB_RT_VOLUMETRIC_LIGHT_OFS"
-                                     : "searched in the scene constant block, else fixed fallback");
+                                     : "game light-set CB, else scene-block search, else fixed");
+    LOG_INFO(Render_Vulkan,
+             "[rt-vol] game data offsets (Ghidra, eboot 1.09): light-set CB slot 5 (288 B, "
+             "FUN_026deeb0 / FUN_026dfe80, bound to PS 0x3fe9e964 / VS 0x8747a367 / PS 0x6c2323c2): "
+             "dir[i] floats 4i..4i+2 (world), diffuse[i] floats 16+4i..18+4i (rgb^2 x intensity), "
+             "i = 0..3; fog CB slot 6 (FUN_02651f10): floats 1 = 1/dist, 2 = density at camera "
+             "height, 3 = 1/H height falloff, 4-6 = fog rgb^2; env overrides: DIR {}, COLOR {}, "
+             "DENSITY {}",
+             light_env ? "set" : "-", color_env ? "set" : "-", density_env ? "set" : "-");
     return true;
 }
 
@@ -1051,6 +1062,80 @@ bool RtReflect::InitVolumetric() {
 // for a unit vec3 at a vec4 boundary that is not a camera matrix row (rows come in orthogonal
 // groups and match the view's axes). This is a heuristic: which float the game really uses for
 // the sun / moon is unverified. Fallback: a fixed high moonlight direction.
+// The game's directional lights: CB slot 5 (FUN_026deeb0 packs the LIGHT SET MANAGER's set:
+// set+0x40/+0xa0/+0x100/+0x160 directions, +0x50/+0xb0/+0x110/+0x170 diffuse rgba -> rgb^2*a).
+// The light with the brightest diffuse colour and a non-zero direction is the sun / moon.
+bool RtReflect::GameLight() {
+    float b[72];
+    u64 age = 0;
+    if (!BB::Upscale::RtLightBlock(b, age) || age > 120) return false;
+    int best = -1;
+    float best_l = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        const float* d = b + 4 * i;
+        const float* c = b + 16 + 4 * i;
+        const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        const float lum = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+        if (dl > 0.5f && lum > best_l) {
+            best_l = lum;
+            best = i;
+        }
+    }
+    if (best < 0) return false;
+    const float* d = b + 4 * best;
+    const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    for (int i = 0; i < 3; ++i) game_dir[i] = d[i] / dl;
+    if (!color_env) {
+        for (int i = 0; i < 3; ++i) game_color[i] = b[16 + 4 * best + i];
+        color_src = "ghidra:light-set CB diffuse (FUN_026deeb0)";
+    }
+    if (!logged_game_light || best != game_light_idx) {
+        logged_game_light = true;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-vol] game light-set CB: light {} of 4 chosen (brightest diffuse): dir "
+                 "floats {}-{} = ({:.3f}, {:.3f}, {:.3f}), diffuse floats {}-{} = ({:.3f}, {:.3f}, "
+                 "{:.3f}); all diffuse lum: {:.3f} {:.3f} {:.3f} {:.3f}",
+                 best, 4 * best, 4 * best + 2, d[0], d[1], d[2], 16 + 4 * best, 18 + 4 * best,
+                 b[16 + 4 * best], b[17 + 4 * best], b[18 + 4 * best],
+                 0.2126f * b[16] + 0.7152f * b[17] + 0.0722f * b[18],
+                 0.2126f * b[20] + 0.7152f * b[21] + 0.0722f * b[22],
+                 0.2126f * b[24] + 0.7152f * b[25] + 0.0722f * b[26],
+                 0.2126f * b[28] + 0.7152f * b[29] + 0.0722f * b[30]);
+    }
+    game_light_idx = best;
+    std::snprintf(game_light_src, sizeof(game_light_src),
+                  "ghidra:light-set CB slot 5 dir %d (floats %d-%d, FUN_026deeb0)", best, 4 * best,
+                  4 * best + 2);
+    return true;
+}
+
+// The game's fog: CB slot 6 (FUN_02651f10 packs the FOG MANAGER's param).
+void RtReflect::GameFog() {
+    float f[24];
+    u64 age = 0;
+    if (!BB::Upscale::RtFogBlock(f, age) || age > 120 || !(f[1] > 0.0f)) {
+        fog_height = 0.0f;
+        for (float& t : fog_tint) t = 1.0f;
+        fog_density = vol_density;
+        fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY" : "fallback (default density, no fog CB seen)";
+        return;
+    }
+    fog_density = density_env ? vol_density : std::clamp(f[2], 0.0f, 1.0f);
+    fog_height = std::clamp(f[3], -10.0f, 10.0f);
+    const float m = std::max({f[4], f[5], f[6]});
+    for (int i = 0; i < 3; ++i) fog_tint[i] = m > 1e-6f ? f[4 + i] / m : 1.0f;
+    fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY + ghidra:fog CB slot 6 height/colour"
+                          : "ghidra:fog CB slot 6 (FUN_02651f10) floats 2,3,4-6";
+    if (!logged_game_fog) {
+        logged_game_fog = true;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-vol] game fog CB: v0 ({:.4f}, {:.5f}, {:.5f}, {:.5f}) v1 ({:.3f}, {:.3f}, "
+                 "{:.3f}, {:.3f}) v3 ({:.3f}, {:.3f}, {:.5f}, {:.3f}) v4 ({:.3f}, {:.3f}, {:.3f})",
+                 f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[12], f[13], f[14], f[15], f[16],
+                 f[17], f[18]);
+    }
+}
+
 bool RtReflect::LightDir(const double* view, float out_view[3]) {
     double lw[3] = {-0.3, 0.8, 0.5};
     const char* src = "fallback (fixed world dir -0.3,0.8,0.5; no unit vector in the scene block)";
@@ -1093,6 +1178,9 @@ bool RtReflect::LightDir(const double* view, float out_view[3]) {
     if (light_env) {
         for (int i = 0; i < 3; ++i) lw[i] = light_env_dir[i];
         src = "BB_RT_VOLUMETRIC_DIR";
+    } else if (GameLight()) {
+        for (int i = 0; i < 3; ++i) lw[i] = game_dir[i];
+        src = game_light_src;
     } else if (have_block) {
         int ofs = -1;
         if (light_forced_ofs >= 0) {
@@ -1119,10 +1207,12 @@ bool RtReflect::LightDir(const double* view, float out_view[3]) {
             src = src_buf;
         }
     }
-    // Toward the light, assumed above the horizon (world y up).
+    // Toward the light, assumed above the horizon (world y up). The sign the game's shader applies
+    // to the CB direction is not decoded (the shader binary is not in the eboot).
     if (lw[1] < 0.0) {
         for (double& v : lw) v = -v;
     }
+    for (int i = 0; i < 3; ++i) used_dir[i] = static_cast<float>(lw[i]);
     double lv[3];
     for (int r = 0; r < 3; ++r) {
         lv[r] = view[r * 4] * lw[0] + view[r * 4 + 1] * lw[1] + view[r * 4 + 2] * lw[2];
@@ -1174,11 +1264,19 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* 
     vp.light[0] = lv[0];
     vp.light[1] = lv[1];
     vp.light[2] = lv[2];
-    vp.color[0] = vol_color[0];
-    vp.color[1] = vol_color[1];
-    vp.color[2] = vol_color[2];
+    GameFog();
+    const float* col = (light_src == game_light_src && !color_env) ? game_color : vol_color;
+    if (col == vol_color && !color_env) color_src = "fallback (fixed 0.55,0.62,0.80)";
+    for (int i = 0; i < 3; ++i) used_color[i] = col[i] * fog_tint[i];
+    vp.color[0] = used_color[0];
+    vp.color[1] = used_color[1];
+    vp.color[2] = used_color[2];
     vp.color[3] = vol_strength;
-    vp.misc[0] = vol_density;
+    vp.misc[0] = fog_density;
+    vp.fog[0] = static_cast<float>(view[1]); // world +y in view space (column 1 of the 3x4 view)
+    vp.fog[1] = static_cast<float>(view[5]);
+    vp.fog[2] = static_cast<float>(view[9]);
+    vp.fog[3] = fog_height;
     vp.misc[1] = vol_dist;
     vp.misc[2] = float(vol_steps);
     vp.misc[3] = float(vol_dispatches & 0xffff);
@@ -1296,10 +1394,14 @@ void RtReflect::LogVolumetric() {
     vol_last_counts[1] = c[1];
     LOG_INFO(Render_Vulkan,
              "[rt-vol] 5 s: {} dispatches, {}x{} trace, {} light rays, {:.1f}% unshadowed, GPU "
-             "{:.3f} ms per pass, strength {:.2f}, light dir source: {}",
+             "{:.3f} ms per pass, strength {:.2f}; light dir world ({:.3f}, {:.3f}, {:.3f}) from "
+             "{}; colour ({:.3f}, {:.3f}, {:.3f}) from {} x fog tint ({:.2f}, {:.2f}, {:.2f}); "
+             "density {:.5f}, height falloff {:.5f} from {}",
              vol_dispatches - vol_last_dispatches, vol_w, vol_h, samples,
              samples ? 100.0 * lit / samples : 0.0, vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0,
-             vol_strength, light_src);
+             vol_strength, used_dir[0], used_dir[1], used_dir[2], light_src, used_color[0],
+             used_color[1], used_color[2], color_src, fog_tint[0], fog_tint[1], fog_tint[2],
+             fog_density, fog_height, fog_src);
     vol_last_dispatches = vol_dispatches;
     vol_ms_sum = 0.0;
     vol_ms_n = 0;

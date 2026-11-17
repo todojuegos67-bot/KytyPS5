@@ -88,6 +88,8 @@ private:
                     bool reproj_ok,
                     const vk::DescriptorImageInfo& depth_info);
     bool LightDir(const double* view, float out_view[3]);
+    bool GameLight();
+    void GameFog();
     void LogVolumetric();
 
     const Vulkan::Instance& instance;
@@ -156,6 +158,20 @@ private:
     float light_env_dir[3]{};
     const char* light_src = "none";
     bool logged_block = false;
+    // Game data (Ghidra, see bb_upscale.h): light-set CB slot 5, fog CB slot 6.
+    bool density_env = false, color_env = false;
+    bool logged_game_light = false, logged_game_fog = false;
+    float game_color[3]{};        // diffuse colour of the chosen directional light (or vol_color)
+    float game_dir[3]{};          // its world direction as used (toward the light)
+    int game_light_idx = -1;
+    float fog_density = 0.0f;     // density at the camera height (1/m)
+    float fog_height = 0.0f;      // height falloff 1/H (signed), 0: none
+    float fog_tint[3]{1.0f, 1.0f, 1.0f};
+    const char* color_src = "fallback (fixed 0.55,0.62,0.80)";
+    char game_light_src[96]{};
+    float used_dir[3]{};
+    float used_color[3]{};
+    const char* fog_src = "fallback (BB_RT_VOLUMETRIC_DENSITY default, no height fog)";
     std::chrono::steady_clock::time_point vol_last_log{};
     std::chrono::steady_clock::time_point last_log{};
 };
