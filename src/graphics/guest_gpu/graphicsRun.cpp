@@ -860,6 +860,9 @@ struct State {
 	std::vector<std::vector<uint32_t>>           prev_pieces, cur_pieces;
 	std::vector<uint64_t>                        prev_shapes, cur_shapes;
 	std::unordered_map<uint32_t, uint64_t>       field_changes;
+	// Exact pieces of the last 4 submissions: GT7's per-frame rings may repeat every 2-4 frames.
+	std::array<std::unordered_set<uint64_t>, 4> hist;
+	std::array<uint64_t, 4>                     hist_hits {};
 	uint64_t compared = 0, only_sh_user_data = 0, unchanged = 0;
 	uint64_t pieces = 0, exact_hits = 0, shape_hits = 0, dwords = 0, exact_hit_dw = 0, frames = 0;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
@@ -880,6 +883,10 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		s.cur_exact.clear();
 		s.prev_shape.swap(s.cur_shape);
 		s.cur_shape.clear();
+		for (size_t i = s.hist.size() - 1; i > 0; i--) {
+			s.hist[i].swap(s.hist[i - 1]);
+		}
+		s.hist[0] = s.prev_exact;
 		s.prev_pieces.swap(s.cur_pieces);
 		s.cur_pieces.clear();
 		s.prev_shapes.swap(s.cur_shapes);
@@ -903,6 +910,11 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 	}
 	if (s.prev_shape.count(s.shape_h) != 0) {
 		s.shape_hits++;
+	}
+	for (size_t i = 0; i < s.hist.size(); i++) {
+		if (s.hist[i].count(s.exact_h) != 0) {
+			s.hist_hits[i]++;
+		}
 	}
 	s.cur_exact.insert(s.exact_h);
 	s.cur_shape.insert(s.shape_h);
@@ -983,6 +995,12 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		             100.0 * static_cast<double>(s.compared - s.unchanged - s.only_sh_user_data) /
 		                 static_cast<double>(std::max<uint64_t>(s.compared, 1)),
 		             fields.c_str());
+		LOGF_UNMUTED("Replay history (10 s): exact repeat of submission N-1 %.1f%%, N-2 %.1f%%, N-3 %.1f%%, N-4 %.1f%%\n",
+		             100.0 * static_cast<double>(s.hist_hits[0]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)),
+		             100.0 * static_cast<double>(s.hist_hits[1]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)),
+		             100.0 * static_cast<double>(s.hist_hits[2]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)),
+		             100.0 * static_cast<double>(s.hist_hits[3]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)));
+		s.hist_hits = {};
 		s.field_changes.clear();
 		s.compared = s.only_sh_user_data = s.unchanged = 0;
 		s.pieces = s.exact_hits = s.shape_hits = s.dwords = s.exact_hit_dw = s.frames = 0;
