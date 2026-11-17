@@ -156,6 +156,10 @@ struct GraphicContext {
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	void               LogFallback(VmaAllocation allocation, const char* what) const;
+	// `types` without the device-local ones when the resource may also live elsewhere and video memory is within
+	// RoomBytes of its budget: that room stays for sparse buffer pages, which may live nowhere else on NVIDIA.
+	[[nodiscard]] uint32_t RoomTypes(uint32_t types, uint64_t size) const;
+	static constexpr uint64_t RoomBytes = 512ull * 1024ull * 1024ull;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

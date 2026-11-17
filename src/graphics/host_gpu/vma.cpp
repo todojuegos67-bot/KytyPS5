@@ -155,10 +155,20 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT; // see AllocateSparse
 
+	// Near a full card the image goes to system memory, keeping the room for sparse buffer pages (RoomTypes); an image
+	// that may live in video memory only is created there as before.
+	alloc_info.memoryTypeBits = RoomTypes(UINT32_MAX, 0);
+
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
+	auto              result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	if (result != vk::Result::eSuccess && alloc_info.memoryTypeBits != UINT32_MAX) {
+		alloc_info.memoryTypeBits = 0;
+		result = static_cast<vk::Result>(vmaCreateImage(allocator,
+		                                                static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                                                &alloc_info, &native_image, &image.allocation, nullptr));
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
@@ -198,6 +208,31 @@ bool GraphicContext::CreateSparseImage(const vk::ImageCreateInfo& image_info, Vu
 	return true;
 }
 
+uint32_t GraphicContext::RoomTypes(uint32_t types, uint64_t size) const {
+	const auto& memory = physical_device_memory_properties;
+	uint32_t    local  = 0;
+	for (uint32_t i = 0; i < memory.memoryTypeCount; i++) {
+		if (memory.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) local |= 1u << i;
+	}
+	if ((types & ~local) == 0 || !CanReportMemoryUsage()) return types; // nowhere else to go (or a unified memory GPU)
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		if ((memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+		    budgets[heap].usage + size + RoomBytes > budgets[heap].budget) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true)) {
+				LOGF("Video memory near full: images go to system memory, the last %" PRIu64
+				     " MiB stay for sparse buffer pages (logged for the first one only)\n",
+				     RoomBytes >> 20u);
+				LogMemoryBudget();
+			}
+			return types & ~local;
+		}
+	}
+	return types;
+}
+
 // The first allocation that went to system memory because video memory is full.
 void GraphicContext::LogFallback(VmaAllocation allocation, const char* what) const {
 	VkMemoryPropertyFlags flags = 0;
@@ -211,7 +246,7 @@ void GraphicContext::LogFallback(VmaAllocation allocation, const char* what) con
 
 VmaAllocation GraphicContext::AllocateSparse(const vk::MemoryRequirements& image, uint64_t size,
                                              vk::DeviceMemory& memory, uint64_t& offset) {
-	const VkMemoryRequirements need {size, image.alignment, image.memoryTypeBits};
+	const VkMemoryRequirements need {size, image.alignment, RoomTypes(image.memoryTypeBits, size)};
 	VmaAllocationCreateInfo    create {};
 	// Preferred, not required: when video memory runs out (a 12 GB card in Telambang, 2026-11-16), VMA goes on to the
 	// other memory types the resource allows, i.e. system memory over PCIe: slower, but drawn, where required exits.
