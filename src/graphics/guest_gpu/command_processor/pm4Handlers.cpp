@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -2001,6 +2002,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
+	if ((control & (1u << 20u)) != 0) {
+		// gt7-mt-1117 stage A (record only): a chained buffer starts a chunk.
+		MtGpu::ChunkBegin(reinterpret_cast<uint64_t>(indirect_buffer),
+		                  uint64_t {indirect_num_dw} * sizeof(uint32_t));
+	}
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
 	return 3;

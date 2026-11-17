@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -379,6 +380,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		const auto page = Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE);
 		LibKernel::Memory::JournalWrite(page, TRACKER_PAGE_SIZE,
 		                                LibKernel::Memory::WriteSource::CpuWriteFault);
+		MtGpu::NoteWrite(MtGpu::WriteKind::Host, fault_vaddr, fault_size);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (!texture_done) {
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
@@ -523,6 +525,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	MtGpu::NoteWrite(MtGpu::WriteKind::Host, vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_bindless_table.OnCpuWrite(vaddr, size);

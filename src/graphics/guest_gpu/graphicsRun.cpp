@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1151,6 +1152,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(*this, execution);
 
 	ProcessPm4(execution);
+	if (execution.m_buffer_stack.empty()) {
+		MtGpu::StreamEnd();
+	}
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -1227,6 +1231,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (DrawPrep::CountsAsDrawOrDispatch(opcode)) {
+			MtGpu::NoteDraw();
+		}
 		// Draw prep: number the draw and dispatch packets as the scanner does (predicated ones too;
 		// a packet suspended and run again keeps its number).
 		if (draw_prep && DrawPrep::CountsAsDrawOrDispatch(opcode)) {

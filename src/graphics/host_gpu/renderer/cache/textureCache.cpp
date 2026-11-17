@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1204,6 +1205,8 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
+	MtGpu::NoteWrite(MtGpu::WriteKind::ImageRetired, image->info.data.address,
+	                 image->info.data.size);
 	if (image->depth_id) {
 		if (auto* depth = m_slot_images.try_get(image->depth_id); depth != nullptr) {
 			std::erase(depth->stencil_ids, id);
@@ -3861,6 +3864,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	MtGpu::NoteRead(desc.info.data.address, desc.info.data.size);
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
@@ -4301,6 +4305,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	if (!image.registered || image.depth_id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
+	MtGpu::NoteWrite(MtGpu::WriteKind::Gpu, image.info.data.address, image.info.data.size);
 	TrackImage(id);
 	CommitGpuWrite(image);
 	if (image.info.HasStencil()) {
@@ -6653,6 +6658,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
+	MtGpu::NoteWrite(MtGpu::WriteKind::Gpu, address, size);
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];

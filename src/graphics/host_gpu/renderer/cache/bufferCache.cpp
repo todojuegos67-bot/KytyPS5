@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -2602,6 +2603,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (!is_written) {
+		MtGpu::NoteRead(vaddr, size);
+	}
 
 	if (auto& stream = ActiveStream(); !is_written && size <= CACHING_PAGESIZE &&
 	                                   (!needs_device_address || stream.HasDeviceAddress()) &&
@@ -3152,6 +3156,7 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	MtGpu::NoteWrite(MtGpu::WriteKind::Gpu, vaddr, size);
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);

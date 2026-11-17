@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -686,6 +687,7 @@ void DrawPrepScanner::Scan(const Item& item) {
 						return;
 					}
 					if (chained) {
+						MtGpu::NotePrepared(reinterpret_cast<uint64_t>(sub));
 						stack.back() = next;
 					} else {
 						stack.push_back(next);
