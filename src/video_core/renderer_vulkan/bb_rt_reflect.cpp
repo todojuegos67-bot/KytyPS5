@@ -1800,6 +1800,9 @@ constexpr std::array<std::array<float, 2>, 6> ProbeAt{{
 void RtReflect::ProbeDepth(vk::CommandBuffer cmd, vk::Image r32f, vk::ImageLayout r32f_layout,
                            vk::Image d32, vk::ImageLayout d32_layout, bool d32_stencil, u32 rw,
                            u32 rh, u32 dw, u32 dh) {
+    if (probe_state == 2 && depth_enc < 0 && d32 && !probe_has_d32) {
+        probe_state = 0; // retries spent without a D32: one more, verified against it
+    }
     if (probe_state != 0) return;
     if (const char* e = std::getenv("BB_RT_LIGHT_DEPTH_ENC"); e && e[0] >= '0' && e[0] <= '2') {
         depth_enc = e[0] - '0';

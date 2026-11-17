@@ -728,21 +728,84 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             normal = &img;
         }
     }
-    // The scene depth (D32): the largest depth target written since the previous composite draw
-    // (BeginRendering, command-stream order). Consumed here: a second composite draw without a
-    // depth write in between is the same frame drawn again.
+    // The scene depth (D32): the largest single-sample depth target written since the previous
+    // composite draw (BeginRendering, command-stream order) with the scene image's aspect ratio
+    // (shadow maps are larger but square; a half-resolution scene depth is sampled with scaled
+    // UVs). Consumed here: a second composite draw without a depth write in between is the same
+    // frame drawn again. Without a match the last selected D32 is reused while it lives.
     const bool depth_fresh = bb_rt_depth_fresh;
     bb_rt_depth_fresh = false;
+    const auto seen = std::move(bb_rt_depth_seen);
+    bb_rt_depth_seen.clear();
+    const auto same_aspect = [&](u32 w, u32 h) {
+        return scene && u64(w) * scene->info.size.height == u64(h) * scene->info.size.width;
+    };
     VideoCore::Image* d32 = nullptr;
+    bool d32_reused = false;
     if (depth_fresh) {
-        d32 = texture_cache.TryGetImage(bb_rt_depth_id, bb_rt_depth_uid);
-        if (d32 && scene &&
-            u64(d32->info.size.width) * scene->info.size.height !=
-                u64(d32->info.size.height) * scene->info.size.width) {
-            d32 = nullptr; // a different aspect ratio: not the scene depth
+        u64 best_area = 0;
+        for (const auto& c : seen) {
+            const u64 ar = u64(c.w) * c.h;
+            if (!c.depth_write || c.samples != 1 || !same_aspect(c.w, c.h) || ar < best_area) {
+                continue;
+            }
+            if (auto* img = texture_cache.TryGetImage(c.id, c.uid)) {
+                d32 = img; // later entries (more recently bound) win ties
+                best_area = ar;
+                bb_rt_depth_last_id = c.id;
+                bb_rt_depth_last_uid = c.uid;
+                bb_rt_depth_last_addr = c.addr;
+            }
+        }
+        if (!d32 && bb_rt_depth_last_uid != 0) {
+            d32 = texture_cache.TryGetImage(bb_rt_depth_last_id, bb_rt_depth_last_uid);
+            if (!d32 && bb_rt_depth_last_addr != 0) {
+                texture_cache.ForEachImageInRegion(
+                    bb_rt_depth_last_addr, 1, [&](VideoCore::ImageId id, VideoCore::Image& img) {
+                        if (!d32 && img.info.props.is_depth && img.info.num_samples == 1 &&
+                            img.info.guest_address == bb_rt_depth_last_addr &&
+                            same_aspect(img.info.size.width, img.info.size.height)) {
+                            d32 = &img;
+                            bb_rt_depth_last_id = id;
+                            bb_rt_depth_last_uid = img.image_uid;
+                        }
+                    });
+            }
+            if (d32 && !same_aspect(d32->info.size.width, d32->info.size.height)) {
+                d32 = nullptr;
+            }
+            d32_reused = d32 != nullptr;
         }
     } else {
         ++n_d32_stale;
+    }
+    {
+        // The depth targets seen between two composites, logged for the first few composites
+        // and whenever none of them qualified as the scene depth (once).
+        static int seen_logged = 0;
+        static bool miss_logged = false;
+        const bool miss = depth_fresh && (!d32 || d32_reused);
+        if (seen_logged < 2 || (miss && !miss_logged)) {
+            ++seen_logged;
+            miss_logged |= miss;
+            std::string list;
+            for (const auto& c : seen) {
+                list += fmt::format(" [{:#x} {}x{} {} x{} test {} write {}{}]", c.addr, c.w, c.h,
+                                    vk::to_string(c.format), c.samples, c.depth_test ? "on" : "off",
+                                    c.depth_write ? "on" : "off",
+                                    same_aspect(c.w, c.h) ? "" : ", other aspect");
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[rt-light] depth targets since the previous composite (scene {}):{} -> "
+                     "scene D32 {}{}",
+                     scene ? fmt::format("{}x{}", scene->info.size.width, scene->info.size.height)
+                           : std::string("none"),
+                     list.empty() ? " none" : list,
+                     d32 ? fmt::format("{:#x} {}x{}", d32->info.guest_address,
+                                       d32->info.size.width, d32->info.size.height)
+                         : std::string("none"),
+                     d32_reused ? " (reused from an earlier frame)" : "");
+        }
     }
     // Once per scene image between two scene renders: the composite is drawn twice per frame;
     // a second draw on the same scene image would darken / add twice.
@@ -2181,15 +2244,24 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
-        if (bb_rt_reflect && regs.depth_control.depth_enable &&
-            regs.depth_control.depth_write_enable && image.info.num_samples == 1) {
-            const u64 ar = u64(image.info.size.width) * image.info.size.height;
-            if (!bb_rt_depth_fresh || ar >= bb_rt_depth_area) {
-                bb_rt_depth_fresh = true;
-                bb_rt_depth_area = ar;
-                bb_rt_depth_id = image_id;
-                bb_rt_depth_uid = image.image_uid;
+        if (bb_rt_reflect) {
+            const bool writes =
+                regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+            bool merged = false;
+            for (auto& c : bb_rt_depth_seen) {
+                if (c.id == image_id && c.uid == image.image_uid) {
+                    c.depth_test |= bool(regs.depth_control.depth_enable);
+                    c.depth_write |= writes;
+                    merged = true;
+                }
             }
+            if (!merged && bb_rt_depth_seen.size() < 32) {
+                bb_rt_depth_seen.push_back({image_id, image.image_uid, image.info.guest_address,
+                                            image.info.size.width, image.info.size.height,
+                                            image.info.num_samples, image.info.pixel_format,
+                                            bool(regs.depth_control.depth_enable), writes});
+            }
+            bb_rt_depth_fresh |= writes && image.info.num_samples == 1;
         }
         if (BB::Upscale::Capture()) {
             // bb-clean-021: the scene depth (the presented image's size, depth test on): the

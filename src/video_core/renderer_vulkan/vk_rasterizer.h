@@ -243,10 +243,22 @@ private:
     // last composite draw, in command-stream order (no frame counter: the flip counter is bumped
     // on the presenter thread and drifts against the GPU command stream). The composite samples
     // only an R32F copy of the scene depth, so the lighting takes the D32 from here.
-    VideoCore::ImageId bb_rt_depth_id{};
-    u64 bb_rt_depth_uid = 0;
-    u64 bb_rt_depth_area = 0;
+    // Every depth target bound since the last composite (for the selection and its log); the
+    // composite picks the largest written single-sample one with the scene's aspect ratio.
+    struct BbRtDepthSeen {
+        VideoCore::ImageId id{};
+        u64 uid = 0;
+        VAddr addr = 0;
+        u32 w = 0, h = 0, samples = 1;
+        vk::Format format{};
+        bool depth_test = false, depth_write = false;
+    };
+    std::vector<BbRtDepthSeen> bb_rt_depth_seen;
     bool bb_rt_depth_fresh = false;  // a depth target was written since the last composite
+    // The last selected scene D32 (kept across frames: fallback when no candidate matches).
+    VideoCore::ImageId bb_rt_depth_last_id{};
+    u64 bb_rt_depth_last_uid = 0;
+    VAddr bb_rt_depth_last_addr = 0;
     bool bb_rt_light_gap = true;     // the last composite (not a duplicate) did not run the pass
 };
 
