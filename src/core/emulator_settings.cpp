@@ -8,6 +8,15 @@
 #include <common/path_util.h>
 #include <common/scm_rev.h>
 #include <toml.hpp>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include "common/assert.h"
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
@@ -176,8 +185,46 @@ const std::vector<bool> EmulatorSettingsImpl::GetGameInstallDirsEnabled() {
     return enabled_dirs;
 }
 
+// Bloodborne port: when port-version.txt sits next to the exe, saves and trophies live in
+// "<port folder>\Partidas guardadas" so they are easy to find and separate per port copy.
+// The first time, any saves in the shared emulator home are copied there (nothing deleted).
+static std::filesystem::path BbPortHomeDir() {
+    static const std::filesystem::path dir = [] {
+        std::filesystem::path out;
+#ifdef _WIN32
+        wchar_t buf[32768];
+        const DWORD n = GetModuleFileNameW(nullptr, buf, 32768);
+        if (n == 0 || n >= 32768) {
+            return out;
+        }
+        const std::filesystem::path exe_dir = std::filesystem::path(buf).parent_path();
+        std::error_code ec;
+        if (!std::filesystem::exists(exe_dir / "port-version.txt", ec)) {
+            return out;
+        }
+        out = exe_dir / L"Partidas guardadas";
+        const auto old_home = Common::FS::GetUserPath(Common::FS::PathType::HomeDir);
+        if (!std::filesystem::exists(out, ec)) {
+            std::filesystem::create_directories(out, ec);
+            if (std::filesystem::exists(old_home, ec) && old_home != out) {
+                std::filesystem::copy(old_home, out,
+                                      std::filesystem::copy_options::recursive |
+                                          std::filesystem::copy_options::skip_existing,
+                                      ec);
+            }
+        }
+#endif
+        return out;
+    }();
+    return dir;
+}
+
 std::filesystem::path EmulatorSettingsImpl::GetHomeDir() {
     if (m_general.home_dir.value.empty()) {
+        const auto port_home = BbPortHomeDir();
+        if (!port_home.empty()) {
+            return port_home;
+        }
         return Common::FS::GetUserPath(Common::FS::PathType::HomeDir);
     }
     return m_general.home_dir.value;
