@@ -1,4 +1,6 @@
 #include "common/hostException.h"
+#include <string>
+#include <vector>
 
 #include "common/lastWords.h"
 
@@ -82,6 +84,87 @@ bool InitializeThreadSignalStack() {
 
 #endif
 
+
+namespace {
+// Fixed open-addressing table, written from fault handlers on any thread: lock-free.
+constexpr size_t kFaultSlots = 4096;
+struct FaultSlot {
+	std::atomic<uint64_t> rip {0};
+	std::atomic<uint64_t> writes {0};
+	std::atomic<uint64_t> reads {0};
+	std::atomic<uint64_t> last_vaddr {0};
+};
+FaultSlot             g_fault_slots[kFaultSlots];
+std::atomic<uint64_t> g_fault_dropped {0};
+
+void FaultProfileRecord(uint64_t rip, uint64_t vaddr, bool write) {
+	size_t i = static_cast<size_t>((rip * 0x9E3779B97F4A7C15ull) >> 52u) & (kFaultSlots - 1);
+	for (size_t n = 0; n < 32; n++, i = (i + 1) & (kFaultSlots - 1)) {
+		uint64_t cur = g_fault_slots[i].rip.load(std::memory_order_relaxed);
+		if (cur == 0) {
+			uint64_t expected = 0;
+			if (!g_fault_slots[i].rip.compare_exchange_strong(expected, rip, std::memory_order_relaxed) &&
+			    expected != rip) {
+				continue;
+			}
+			cur = rip;
+		}
+		if (cur == rip) {
+			(write ? g_fault_slots[i].writes : g_fault_slots[i].reads).fetch_add(1, std::memory_order_relaxed);
+			g_fault_slots[i].last_vaddr.store(vaddr, std::memory_order_relaxed);
+			return;
+		}
+	}
+	g_fault_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+bool FaultProfileEnabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_FAULT_PROFILE");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+std::string FaultProfileLine() {
+	if (!FaultProfileEnabled()) {
+		return {};
+	}
+	struct Row {
+		uint64_t total, writes, rip, vaddr;
+	};
+	std::vector<Row> rows;
+	uint64_t         all = 0;
+	for (auto& slot: g_fault_slots) {
+		const uint64_t rip = slot.rip.load(std::memory_order_relaxed);
+		if (rip == 0) {
+			continue;
+		}
+		const uint64_t w = slot.writes.exchange(0, std::memory_order_relaxed);
+		const uint64_t r = slot.reads.exchange(0, std::memory_order_relaxed);
+		if (w + r == 0) {
+			continue;
+		}
+		all += w + r;
+		rows.push_back({w + r, w, rip, slot.last_vaddr.load(std::memory_order_relaxed)});
+	}
+	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.total > b.total; });
+	char        buf[160];
+	std::string line;
+	(void)std::snprintf(buf, sizeof(buf), "Fault profile: %llu faults, %zu instructions, dropped %llu |",
+	                    static_cast<unsigned long long>(all), rows.size(),
+	                    static_cast<unsigned long long>(g_fault_dropped.exchange(0)));
+	line += buf;
+	for (size_t i = 0; i < rows.size() && i < 20; i++) {
+		(void)std::snprintf(buf, sizeof(buf), " rip %016llx %llu (%llu w) last %016llx;",
+		                    static_cast<unsigned long long>(rows[i].rip), static_cast<unsigned long long>(rows[i].total),
+		                    static_cast<unsigned long long>(rows[i].writes), static_cast<unsigned long long>(rows[i].vaddr));
+		line += buf;
+	}
+	return line;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
@@ -111,6 +194,10 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 			default: info.access_violation_type = AccessViolationType::Unknown; break;
 		}
 		info.access_violation_vaddr = exception_record->ExceptionInformation[1];
+		if (FaultProfileEnabled()) {
+			FaultProfileRecord(info.exception_address, info.access_violation_vaddr,
+			                   info.access_violation_type == AccessViolationType::Write);
+		}
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {

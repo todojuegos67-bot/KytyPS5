@@ -3,6 +3,8 @@
 
 #include "common/common.h"
 
+#include <string>
+
 namespace Common::HostException {
 
 enum class ExceptionType { Unknown, AccessViolation, IllegalInstruction };
@@ -38,6 +40,11 @@ struct ExceptionInfo {
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+
+// KYTY_FAULT_PROFILE=1: counts access-violation faults by faulting instruction (RIP) and type.
+// FaultProfileLine() returns the top entries since the last call (empty when off).
+[[nodiscard]] bool        FaultProfileEnabled();
+[[nodiscard]] std::string FaultProfileLine();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();

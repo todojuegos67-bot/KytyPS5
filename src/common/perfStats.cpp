@@ -1,4 +1,5 @@
 #include "common/perfStats.h"
+#include "common/hostException.h"
 
 #include "common/common.h"
 #include "common/cpuAffinity.h"
@@ -457,6 +458,9 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		}
 	}
 	Log::WriteUnmuted(line + "\n");
+	if (auto faults = Common::HostException::FaultProfileLine(); !faults.empty()) {
+		Log::WriteUnmuted(faults + "\n");
+	}
 }
 
 void Run() {

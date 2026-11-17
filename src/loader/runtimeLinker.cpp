@@ -2028,6 +2028,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
+	if (Common::HostException::FaultProfileEnabled()) {
+		Log::WriteUnmuted(fmt::format("Fault profile: module {} at {:016x}, size {:x}\n",
+		                              Common::PathToString(program->file_name.filename()), program->base_vaddr,
+		                              program->mapped_size));
+	}
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
