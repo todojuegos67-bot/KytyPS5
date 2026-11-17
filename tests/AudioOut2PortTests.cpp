@@ -635,6 +635,46 @@ void TestPushConsumesPcm() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void SetSilentGrain(bool on) {
+#ifdef _WIN32
+	_putenv(on ? "KYTY_AUDIOOUT2_SILENT_GRAIN=1" : "KYTY_AUDIOOUT2_SILENT_GRAIN=");
+#else
+	on ? setenv("KYTY_AUDIOOUT2_SILENT_GRAIN", "1", 1) : unsetenv("KYTY_AUDIOOUT2_SILENT_GRAIN");
+#endif
+}
+
+// With the switch on, a push without PCM gives the device a silent grain of the last grain's size, so the device
+// queue keeps pacing the game's mixer; a port that never had PCM gets nothing.
+void TestDevicePushWithoutPcmQueuesSilence() {
+	SetSilentGrain(true);
+	const auto context = CreateContext();
+	const auto port    = CreatePort(context, MakeParam());
+	ResetOutputCalls();
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push before any PCM failed");
+	Check(OutputCalls().empty(), "a port that never had PCM got a silent grain");
+
+	std::vector<uint32_t> pcm(512, 0x01020304u);
+	const auto            pcm_bytes = pcm.size() * sizeof(uint32_t);
+	SetPcm(port, pcm.data());
+	CaptureOutputPcm(pcm_bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push with PCM failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push without PCM failed");
+	auto output = OutputPcm();
+	Check(output.size() == 2 && std::memcmp(output[0].data(), pcm.data(), pcm_bytes) == 0,
+	      "the PCM push did not reach the device");
+	Check(std::all_of(output[1].begin(), output[1].end(), [](uint8_t b) { return b == 0; }),
+	      "a push without PCM did not give the device a silent grain");
+
+	SetSilentGrain(false);
+	CaptureOutputPcm(pcm_bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push without PCM, switch off, failed");
+	Check(OutputPcm().empty(), "switch off: a push without PCM still reached the device");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestQueueDrainsAtExactGrainRate() {
 	// Three 512-sample grains play in exactly 32000 us.
 	const auto context = CreateContext();
@@ -968,6 +1008,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPushConsumesPcm();
+	TestDevicePushWithoutPcmQueuesSilence();
 	TestQueueDrainsAtExactGrainRate();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();

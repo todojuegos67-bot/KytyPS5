@@ -204,6 +204,8 @@ struct AudioOut2ContextState {
 	int                    object_audio_handle = 0;
 	// The device handle the last push gave a grain to (audioout2_context_device_handle_locked).
 	int                    last_device_handle  = 0;
+	// Bytes of the grain the last push gave last_device_handle: the size of a silent grain.
+	size_t                 last_device_bytes   = 0;
 	uint32_t               max_ports           = 0;
 	// Channel slots precede object slots; each partition has its own creation limit.
 	std::vector<AudioOut2PortStateEntry> ports;
@@ -230,6 +232,7 @@ struct AudioOut2Submission {
 	std::array<std::vector<uint8_t>, AudioInternal::OUT_PORTS_MAX>  pcm;
 	std::array<std::array<float, 16>, AudioInternal::OUT_PORTS_MAX> gains;
 	std::vector<float>                                              object_mix;
+	std::vector<uint8_t>                                            silence;
 };
 
 static Common::Mutex                              g_audioout2_state_mutex;
@@ -429,6 +432,16 @@ static const bool g_audioout2_device_queue = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
+// A push that hands the device no PCM gives it a grain of silence, as a PS5 port the game does not feed plays
+// silence for that grain. Without it the device queue drains, the level reads 0, every push returns at once and
+// the game's mixer renders unpaced: Wolverine silences all but its inaudible cinematic clock voice during loads,
+// which then ran at ~550x and could stop at a loop end, leaving cinematics in slow motion (session 80).
+// KYTY_AUDIOOUT2_SILENT_GRAIN=1 turns it on; read per push so tests can switch it.
+static bool audioout2_silent_grain() {
+	const char* value = std::getenv("KYTY_AUDIOOUT2_SILENT_GRAIN");
+	return value != nullptr && value[0] == '1';
+}
+
 // SDL may hold this much beyond the queue depth before it counts: the depth alone (4 grains, 21 ms
 // with 256-sample grains) does not cover Windows scheduling, and the device ran dry.
 static constexpr uint64_t AUDIOOUT2_DEVICE_CUSHION_US = 20000;
@@ -525,6 +538,21 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 	}
 	if (!out.object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
 		params.push_back({context->object_audio_handle, out.object_mix.data()});
+	}
+	if (g_audioout2_device_queue && audioout2_silent_grain()) {
+		const int device = context->last_device_handle;
+		for (size_t i = 0; i < params.size(); i++) {
+			if (params[i].handle == device) {
+				context->last_device_bytes = params[i].data == out.object_mix.data()
+				                                 ? out.object_mix.size() * sizeof(float)
+				                                 : out.pcm[i].size();
+			}
+		}
+		if (params.empty() && device > 0 && context->last_device_bytes != 0 &&
+		    AudioInternal::AudioOutHasDevice(device)) {
+			out.silence.assign(context->last_device_bytes, 0);
+			params.push_back({device, out.silence.data()});
+		}
 	}
 	g_audioout2_state_mutex.Unlock();
 	if (!params.empty()) {
