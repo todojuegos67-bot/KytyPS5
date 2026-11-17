@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
+#include "local/tiron1.h" // (tiron1: also where renderDraw.cpp's table-xpr.inc and native-xpr.inc find it)
 
 #include <array>
 #include <atomic>
@@ -495,6 +496,12 @@ private:
 	std::unordered_set<uint32_t> m_scenes_warmed;
 	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);
 	void                         SceneLoop(uint64_t compute_video);
+	// (tiron1, KYTY_TIRON1=1) A PC under 30 GB of RAM (no pipeline warmup): once the shader prefetch is done, the
+	// recording's compute recipes (newest first, at most KYTY_TIRON1_COMPUTE_MAX) made beside the game on
+	// m_warmup_thread, their programs translated first (local/tiron1.h). m_tiron1_quiet: GetPrefetchProgress leaves
+	// that warmup's phase out (no "Preparing" line on screen while playing).
+	void              Tiron1WarmCompute(uint64_t compute_video);
+	std::atomic<bool> m_tiron1_quiet {false};
 	// Pipelines made where first needed (CreateGraphicsPipeline, CreateComputePipeline), and the time it took.
 	uint64_t m_render_pipelines   = 0;
 	double   m_render_pipeline_ms = 0.0;
