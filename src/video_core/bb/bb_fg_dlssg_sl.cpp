@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
 #include "video_core/bb/bb_sr.h"
@@ -68,6 +69,7 @@ SL_STRUCT_END()
 } // namespace sl
 using PFun_slPCLSetMarker = sl::Result(sl::PCLMarker marker, const sl::FrameToken& frame);
 using PFun_slReflexSetOptions = sl::Result(const sl::ReflexOptions& options);
+using BbPFun_slShutdown = sl::Result();
 #endif
 
 namespace BB::FG::DlssSl {
@@ -103,7 +105,12 @@ struct Api {
     PFN_vkDestroySurfaceKHR destroy_surface = nullptr;
 };
 Api g{};
-bool g_hooked = false, g_ready = false;
+bool g_hooked = false;
+std::atomic<bool> g_ready{false};
+std::atomic<bool> g_shutting_down{false};
+std::atomic<uint32_t> g_in_present{0};
+// slDLSSGSetOptions from the GPU thread (TagFrame) and the present thread (untagged presents).
+std::recursive_mutex g_options_mutex;
 const sl::ViewportHandle kViewport{1}; // DLSS super resolution's viewport
 
 std::atomic<uint32_t> g_last_used{0};
@@ -246,6 +253,8 @@ void Reason(uint32_t reason) {
 }
 
 void SetOptions(const OptionsKey& key) {
+    std::scoped_lock lock{g_options_mutex};
+    if (g_shutting_down.load(std::memory_order_relaxed) && key.on) return;
     if (g_options_set && key == g_options) return;
     sl::DLSSGOptions o{};
     o.mode = key.on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
@@ -376,6 +385,7 @@ vk::Result CreateSwapchain(vk::Device device, const vk::SwapchainCreateInfoKHR& 
     *out = chain;
     BBLogf("DLSS-G (Streamline): swapchain %ux%u through Streamline: %d", info.imageExtent.width,
            info.imageExtent.height, static_cast<int>(r));
+    std::scoped_lock lock{g_options_mutex};
     g_options_set = false; // set again for the new swapchain
     return r;
 }
@@ -415,7 +425,7 @@ void DestroySurface(vk::Instance instance, vk::SurfaceKHR surface) {
 
 uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D backbuffer,
                   vk::Format format) {
-    if (!g_ready) return 0;
+    if (!g_ready || g_shutting_down.load(std::memory_order_relaxed)) return 0;
     // DLSS super resolution's token when it evaluated this frame (its constants are set),
     // else the next index of the same stream and our own constants.
     uint32_t frame = SR::Dlss::LastFrameIndex();
@@ -492,18 +502,97 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
     return frame;
 }
 
-void BeforePresent(uint32_t frame) {
-    if (!g_ready || frame == 0) return;
+// Untagged presents (repeats of the last frame while the game does not flip, 2D / empty
+// frames): before, they went through Streamline's present with no PCL markers while DLSS-G was
+// still on from the last tagged frame, so sl.dlss_g reported eFailReflexNotDetectedAtRuntime and
+// generated nothing for them. Now each gets a fresh frame index with the full marker set (Reflex
+// sees every present) and DLSS-G is off for it (nothing tagged to interpolate); the next tagged
+// frame turns it on again.
+void NoteUntagged(bool untagged) {
+    static std::atomic<bool> last{false};
+    if (last.exchange(untagged, std::memory_order_relaxed) == untagged) return;
+    BBLogf("[dlssg-sl] %s", untagged ? "untagged presents: full PCL markers on a fresh frame, "
+                                       "DLSS-G off for them"
+                                     : "tagged game frames again: DLSS-G per the options");
+}
+
+uint32_t BeforePresent(uint32_t frame) {
+    if (!g_ready) return 0;
+    g_in_present.fetch_add(1, std::memory_order_acq_rel);
+    if (g_shutting_down.load(std::memory_order_acquire)) {
+        g_in_present.fetch_sub(1, std::memory_order_acq_rel);
+        return 0;
+    }
+    if (frame == 0) {
+        frame = SR::Dlss::NextFrameIndex();
+        {
+            std::scoped_lock lock{g_options_mutex};
+            if (g_options_set && g_options.on) {
+                SetOptions(OptionsKey{false, g_options.frames, g_options.mw, g_options.mh,
+                                      g_options.cw, g_options.ch});
+            }
+        }
+        NoteUntagged(true);
+        Marker(sl::PCLMarker::eSimulationStart, frame);
+        Marker(sl::PCLMarker::eSimulationEnd, frame);
+        Marker(sl::PCLMarker::eRenderSubmitStart, frame);
+    } else {
+        NoteUntagged(false);
+    }
     Marker(sl::PCLMarker::eRenderSubmitEnd, frame);
     Marker(sl::PCLMarker::ePresentStart, frame);
+    return frame;
+}
+
+bool PresentAllowed() {
+    return !g_shutting_down.load(std::memory_order_acquire);
+}
+
+void Shutdown() {
+    if (!g_hooked || g_shutting_down.exchange(true, std::memory_order_acq_rel)) return;
+    BBLogf("[dlssg-sl] shutdown: DLSS-G off, Reflex off, slShutdown");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (g_in_present.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const bool idle = g_in_present.load(std::memory_order_acquire) == 0;
+    if (g_ready && g.dlssg_set_options != nullptr) {
+        std::scoped_lock lock{g_options_mutex};
+        sl::DLSSGOptions o{};
+        o.mode = sl::DLSSGMode::eOff;
+        o.numFramesToGenerate = 1;
+        BBLogf("[dlssg-sl] shutdown: slDLSSGSetOptions(off) returned %d",
+               static_cast<int>(g.dlssg_set_options(kViewport, o)));
+        g_options.on = false;
+    }
+    if (g_reflex_on && g.reflex_set_options != nullptr) {
+        sl::ReflexOptions o{};
+        o.mode = sl::ReflexMode::eOff;
+        BBLogf("[dlssg-sl] shutdown: slReflexSetOptions(off) returned %d",
+               static_cast<int>(g.reflex_set_options(o)));
+        g_reflex_on = false;
+    }
+    g_ready.store(false, std::memory_order_release);
+    if (!idle) {
+        // A present is stuck inside Streamline: slShutdown would race it. The process watchdog
+        // ends the process.
+        BBLogf("[dlssg-sl] shutdown: a present is still in Streamline after 500 ms: no slShutdown");
+        return;
+    }
+    if (auto* shutdown = reinterpret_cast<BbPFun_slShutdown*>(SR::Dlss::Proc("slShutdown"))) {
+        BBLogf("[dlssg-sl] shutdown: slShutdown returned %d", static_cast<int>(shutdown()));
+    }
 }
 
 void AfterPresent(uint32_t frame, bool presented) {
+    if (frame == 0) return; // BeforePresent did not run (not ready)
+    struct Leave {
+        ~Leave() { g_in_present.fetch_sub(1, std::memory_order_acq_rel); }
+    } leave;
     if (!g_ready) return;
-    if (frame != 0) {
-        Marker(sl::PCLMarker::ePresentEnd, frame);
-        if (presented) g_sec_presents.fetch_add(1, std::memory_order_relaxed);
-    }
+    Marker(sl::PCLMarker::ePresentEnd, frame);
+    if (presented) g_sec_presents.fetch_add(1, std::memory_order_relaxed);
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(1)) return;
@@ -581,8 +670,14 @@ void DestroySurface(vk::Instance, vk::SurfaceKHR) {}
 uint32_t TagFrame(vk::CommandBuffer, const Inputs*, vk::Extent2D, vk::Format) {
     return 0;
 }
-void BeforePresent(uint32_t) {}
+uint32_t BeforePresent(uint32_t) {
+    return 0;
+}
 void AfterPresent(uint32_t, bool) {}
+bool PresentAllowed() {
+    return true;
+}
+void Shutdown() {}
 bool Stats(SecondStats&) {
     return false;
 }

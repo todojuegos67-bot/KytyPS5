@@ -1218,7 +1218,10 @@ void Presenter::PresentLastFrame() {
         const char* v = std::getenv("BB_MENU_REPEAT_ALWAYS");
         return v != nullptr && v[0] == '1';
     }();
-    if (!repeat_always && (BB::FG::Dlss::Ready() || BB::FG::Fsr3Active()) &&
+    // bb-exit-dlssg: Streamline's DLSS-G too: a repeat between its game frames is an untagged
+    // present, which turns DLSS-G off for it (and on again on the next game frame).
+    if (!repeat_always &&
+        (BB::FG::Dlss::Ready() || BB::FG::DlssSl::Ready() || BB::FG::Fsr3Active()) &&
         std::chrono::steady_clock::now() - bb_last_game_present < std::chrono::milliseconds(100)) {
         ++bb_menu_sec.repeats_skipped;
         return;
@@ -2213,9 +2216,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         // bb-dlssg-sl: PCL render-submit-end / present markers of the game frame.
         const u32 sl_frame =
             !is_reusing_frame && is_game_frame ? std::exchange(frame->bb_sl_frame, 0u) : 0u;
-        BB::FG::DlssSl::BeforePresent(sl_frame);
-        presented = swapchain.Present(reflex_id);
-        BB::FG::DlssSl::AfterPresent(sl_frame, presented);
+        if (BB::FG::DlssSl::PresentAllowed()) {
+            const u32 sl_used = BB::FG::DlssSl::BeforePresent(sl_frame);
+            presented = swapchain.Present(reflex_id);
+            BB::FG::DlssSl::AfterPresent(sl_used, presented);
+        } else {
+            presented = true; // bb-exit-dlssg: shutting down, nothing more through Streamline
+        }
         BB::Reflex::EndPresent(reflex_id, presented);
         if (!is_reusing_frame && is_game_frame) {
             BB::Reflex::OnGameFramePresented(); // bb-reflex-native: [reflex-native] line

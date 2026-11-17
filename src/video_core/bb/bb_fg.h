@@ -150,9 +150,16 @@ void DestroySurface(vk::Instance instance, vk::SurfaceKHR surface);
 // inputs null or !valid: DLSS-G off for this frame. Returns the Streamline frame index (0: none).
 uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D backbuffer,
                   vk::Format format);
-// Present thread, around the game frame's present (frame: TagFrame's index, 0: none).
-void BeforePresent(uint32_t frame);
+// Present thread, around every present through Streamline (frame: TagFrame's index, 0: an
+// untagged present, which gets a fresh index and the full PCL marker set so Reflex never goes
+// missing, with DLSS-G off). Returns the index to pass to AfterPresent. false from
+// PresentAllowed: shutting down, skip the present.
+uint32_t BeforePresent(uint32_t frame);
 void AfterPresent(uint32_t frame, bool presented);
+bool PresentAllowed();
+// Exit: DLSS-G off, Reflex off, wait for an in-flight present (bounded), slShutdown. Any thread,
+// once; bounded waits only.
+void Shutdown();
 // bb-sl-metrics: the last second's numbers (from AfterPresent's once-a-second slDLSSGGetState and
 // [dlssg-sl] counters), for the F8 "Metricas" panel and the [bbport] line. Read only: calling it
 // changes nothing in Streamline's path. False until Ready() and the first second has passed.

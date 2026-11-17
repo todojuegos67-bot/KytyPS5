@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -47,6 +48,7 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
@@ -83,7 +85,34 @@ Emulator::Emulator() {
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
-    std::at_quick_exit([]() { Common::Singleton<Core::Emulator>::Instance()->Shutdown(); });
+    std::at_quick_exit([]() {
+        StartExitWatchdog();
+        BB::FG::DlssSl::Shutdown();
+        Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+        Common::Log::Flush();
+#ifdef _WIN32
+        // bb-exit-dlssg: everything of ours is saved; skip ExitProcess's DLL_PROCESS_DETACH
+        // (Streamline's plugins and the driver join threads it already killed: the exit hang).
+        TerminateProcess(GetCurrentProcess(), 0);
+#endif
+    });
+}
+
+void Emulator::StartExitWatchdog() {
+    static std::atomic_flag started{};
+    if (started.test_and_set()) {
+        return;
+    }
+    LOG_INFO(Common, "Exit: shutdown started (watchdog ends the process in 5 s)");
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        LOG_CRITICAL(Common, "Exit: shutdown did not finish in 5 s, ending the process");
+        Common::Log::Flush();
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 0);
+#endif
+        std::_Exit(0);
+    }).detach();
 }
 
 Emulator::~Emulator() {}
