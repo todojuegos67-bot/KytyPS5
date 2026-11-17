@@ -531,7 +531,7 @@ uint64_t Origin() {
 		// KYTY_UPSTREAM_PATHS and KYTY_LEAN_PATHS (common/upstreamPaths.h) pick between upstream's and lean's code,
 		// some of it in the recompiler.
 		for (const char* name: {"KYTY_GPL", "KYTY_IMAGE_HEAP", "KYTY_IMAGE_FORMS", "KYTY_NULL_IMAGE_DIMS",
-		                         "KYTY_UPSTREAM_PATHS", "KYTY_LEAN_PATHS"}) {
+		                         "KYTY_UPSTREAM_PATHS", "KYTY_LEAN_PATHS", "KYTY76_LDS_SYNC"}) {
 			const char* value = std::getenv(name);
 			text += fmt::format("|{}={}", name, value != nullptr ? value : "");
 		}

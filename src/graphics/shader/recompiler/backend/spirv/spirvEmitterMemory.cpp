@@ -4,14 +4,40 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include "common/logging/log.h"
+
 #include <functional>
 #include <optional>
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// 76 (torn meshes on RTX 30/40, Ziva on): a guest wave64 run as halves passes values between lanes through LDS
+// with no barrier (CS_ZivaRBFInterpolate & co. reduce 32/16/8/4/2/1; lockstep on GCN). Between host invocations
+// that is a data race under the Vulkan memory model, which some NVIDIA compilers act on. A subgroup barrier
+// with workgroup-memory acquire/release before every LDS access orders it, like CUDA's __syncwarp. Halves keep
+// control flow subgroup-uniform (branches are votes), so every invocation reaches it. KYTY76_LDS_SYNC=0: off.
+void EmitLdsLaneSync(EmitterState& state, const IR::MemoryInfo& mem) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY76_LDS_SYNC");
+		const bool  on    = value == nullptr || std::strcmp(value, "0") != 0;
+		Log::WriteToConsoleAndLog(on ? "76 LDS lane sync: on (wave64 halves)\n" : "76 LDS lane sync: off\n");
+		return on;
+	}();
+	// A BVH stack keeps each lane to its own LDS slots and must stay barrier-free (ray tracing is skipped anyway).
+	if (!enabled || mem.kind != IR::ResourceKind::Lds || state.lane_count != 2 ||
+	    state.lds_storage_class != spv::StorageClassWorkgroup || state.program.info.bvh_stack) {
+		return;
+	}
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup), ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+}
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
@@ -1917,6 +1943,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	EmitLdsLaneSync(ctx.state, mem);
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
@@ -1950,6 +1977,7 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	EmitLdsLaneSync(ctx.state, mem);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
 	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
