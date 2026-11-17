@@ -1,0 +1,42 @@
+DEMON'S SOULS REMAKE PC - LEEME PRIMERO
+=======================================
+
+QUE HAY QUE TENER (no se incluye)
+---------------------------------
+1. El juego de PS5 volcado de tu consola: Demon's Souls PPSA01341, version 01.007.000.
+   Es una carpeta con eboot.bin, sce_sys y los datos del juego.
+2. (Opcional) DLSS 5: el archivo nvngx_dlssnr.dll.
+   Ponlo en la carpeta del port, junto a kyty_emulator.exe.
+   Sin el archivo el juego funciona igual; solo no aparece DLSS 5.
+
+Todo lo demas ya viene en el zip: DLSS y frame generation de NVIDIA (carpeta streamline),
+XeSS, FSR 3 y FSR 4, y las DLL de Visual C++.
+
+
+PASOS
+-----
+1. Descomprime el zip en una carpeta propia (por ejemplo C:\Demon's Souls PC).
+   Mejor en un SSD y con al menos 10 GB libres.
+2. Abre "Demon's Souls.exe".
+3. En el lanzador, indica la carpeta del juego volcado (punto 1 de arriba).
+4. La primera vez se preparan los shaders. Tarda unos minutos y solo se hace una vez.
+5. Pulsa JUGAR.
+
+
+ANADIR A STEAM (opcional)
+-------------------------
+1. Cierra Steam.
+2. Abre "Anadir-a-Steam.cmd" (en la carpeta del port).
+3. Vuelve a abrir Steam: el juego aparece en la biblioteca con su banner, portada y fondo.
+
+El banner, la portada y el fondo de Steam salen de "fondo-steam.jpg".
+Para usar otra imagen, sustituye "fondo-steam.jpg" por la tuya con ese mismo nombre
+(mejor apaisada, por ejemplo 2210x712 o mas grande) y vuelve a abrir "Anadir-a-Steam.cmd".
+
+
+RECOMENDADO
+-----------
+- 16 GB de RAM como minimo (mejor 32 GB).
+- Grafica de 8 GB de VRAM o mas.
+- Teclado y raton: activalo en el lanzador. La sensibilidad se cambia en el menu del juego
+  (Controles) o en settings.ini, seccion [Mandos], y se aplica al momento.
