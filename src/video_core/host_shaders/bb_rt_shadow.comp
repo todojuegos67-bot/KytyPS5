@@ -161,12 +161,16 @@ void main() {
                     float qd = length(Q);
                     if (!any(isnan(h)) && abs(h.a - qd) < 0.05 * qd + 0.1) {
                         // Loose clamp: the 3x3 range widened a little so the noise can settle.
-                        float hv = clamp(h.r, m0 - 0.25, m1 + 0.25);
+                        float hv = clamp(h.r, max(m0 - 0.25, 0.0), min(m1 + 0.25, 1.0));
                         outv.r = mix(hv, cur.r, p.misc2.x);
                     }
                 }
             }
         }
+        if (isnan(outv.r) || isinf(outv.r)) {
+            outv.r = 1.0;
+        }
+        outv.r = clamp(outv.r, 0.0, 1.0);
         imageStore(dst, c, outv);
     } else if (pc.mode == 2u && all(lessThan(c, ivec2(p.size.zw)))) {
         vec2 hp = (vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw);
@@ -191,8 +195,9 @@ void main() {
             }
             float vis = ws > 1e-5 ? sum / ws : ref.r;
             float facing = ws > 1e-5 ? fsum / ws : ref.g;
-            float k = clamp(p.misc.x * (1.0 - vis) * facing, 0.0, 1.0);
-            if (k > 0.0 && !isnan(k)) {
+            float k = p.misc.x * (1.0 - clamp(vis, 0.0, 1.0)) * clamp(facing, 0.0, 1.0);
+            k = (isnan(k) || isinf(k)) ? 0.0 : clamp(k, 0.0, p.misc.x);
+            if (k > 0.0) {
                 vec4 sc = imageLoad(scene, c);
                 imageStore(scene, c, vec4(sc.rgb * (1.0 - k), sc.a));
             }

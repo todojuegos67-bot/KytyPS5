@@ -11,6 +11,7 @@
 
 #include <array>
 #include <chrono>
+#include <string>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -62,7 +63,22 @@ public:
         vk::ImageLayout scene_layout;
         u32 depth_width, depth_height;
         u32 scene_width, scene_height;
+        // The previous scene render ran this pass too (no skipped frame): temporal history usable.
+        bool history_ok;
     };
+    // Why RunLighting returned false (per-5 s counters in the rasterizer).
+    enum class LightSkip : u8 {
+        None,
+        NoCamera,      // no 864 B scene block (camera) captured yet
+        BadProjection, // projection not invertible
+        DepthEncoding, // R32F copy only and its encoding not known yet
+        NoLight,       // no validated game light (light-set CB) recently: not run with a guess
+        Allocation,    // images / converter / mesh
+        Count,
+    };
+    LightSkip LastSkip() const { return l_skip; }
+    bool HistoryRestarted() const { return l_hist_restarted; }
+    std::string LightSourceText() const;
 
     explicit RtReflect(const Vulkan::Instance& instance);
     ~RtReflect();
@@ -173,6 +189,13 @@ private:
     u32 lw_ = 0, lh_ = 0;
     double l_prev_view[16]{}, l_prev_proj[16]{};
     bool l_have_prev = false;
+    LightSkip l_skip = LightSkip::None;
+    bool l_hist_restarted = false;
+    float l_prev_light[3]{};
+    bool l_have_light = false;
+    const char* l_reset_why = "";
+    // Restart the temporal accumulation (vol / shadow history) and clear its images.
+    void ResetLightHistory(const char* why);
     u32 l_ring = 0;
     Buf verts, blas_buf, tlas_buf, scratch, instances, params, counters;
     vk::AccelerationStructureKHR blas{}, tlas{};
@@ -213,6 +236,7 @@ private:
     bool light_env = false;       // BB_RT_VOLUMETRIC_DIR given
     float light_env_dir[3]{};
     const char* light_src = "none";
+    bool light_heuristic = false; // BB_RT_LIGHT_HEURISTIC=1: scene-block search allowed
     bool logged_block = false;
     // Game data (Ghidra, see bb_upscale.h): light-set CB slot 5, fog CB slot 6.
     bool density_env = false, color_env = false;
@@ -269,6 +293,7 @@ private:
     Buf probe;
     int probe_state = 0;      // 0 not taken, 1 recorded (waiting), 2 read
     u32 probe_wait = 0;
+    u32 probe_retries = 0;
     bool probe_has_d32 = false;
     u32 probe_rw = 0, probe_rh = 0;
 };

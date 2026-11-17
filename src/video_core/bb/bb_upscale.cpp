@@ -706,7 +706,7 @@ void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
     const float* f = reinterpret_cast<const float*>(data);
     const bool light_hash = hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2;
     // Diagnostic: the read-only buffers the lighting draws bind, once per (hash, size).
-    if (light_hash && bytes >= 64) {
+    if ((light_hash && bytes >= 64) || (bytes >= 288 && bytes <= 320)) {
         static std::vector<std::pair<u64, size_t>> seen;
         std::scoped_lock lk{g_cam_mutex};
         if (seen.size() < 32 &&
@@ -734,26 +734,47 @@ void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
         g_rt_lighting.fog_valid = true;
         return;
     }
-    // Light CB (FUN_026deeb0, 288 B; the V# may cover more): from the deferred lighting /
-    // composite / SSR draws. Light 0's direction is set+0x40 (not renormalised by the packer), so
-    // any of the 4 directions with a non-trivial length and a non-negative diffuse is accepted.
-    if (light_hash && bytes >= 288 && Finite(f, 72)) {
+    // Light-set CB (Ghidra, eboot 1.09): FUN_02651f10 (per-material constant setup, called from
+    // the object draw paths FUN_02650690 / FUN_02650f70 / FUN_02654a10 for pass types 0 and 4)
+    // gets the material's CB slot 5 ((*ctx->vtbl[3])(ctx, 5)) and FUN_026deeb0 / FUN_026dfe80
+    // pack the LIGHT SET into it: a 288-byte block (stack 0x158..0x38) uploaded with
+    // FUN_02568a20(gfx, gfx + 0xb730, cb, 0, 0, data), stored in the context's CB table
+    // (+0x990 = slot 5 of the table at +0x968, dirty range 5..6, dirty bit 0x200000 at +0x1978).
+    // Layout: floats 0-15 = 4 directions (light 0 = set+0x40 raw world; 1-3 world or, when the
+    // light's flag is set, transformed by the matrix at owner+0x3f8), 16-31 diffuse rgb^2*a,
+    // 32-47 specular rgb^2*a, 48-59 ambient terms, 60-63 set+0x230 rgb^2*a, u32 65 = flag
+    // (set+0x24e, 0 or 1), 68-71 = set+0x90/+0xf0/+0x150/+0x1b0.
+    // It is consumed by the forward-lit object draws, NOT by the composite (PS 0x3fe9e964, its
+    // 208 B buffer) or the SSR draw (PS 0x6c2323c2, its 320 B buffer): those two are rejected.
+    const bool rejected = hash == 0x3fe9e964 || hash == 0x6c2323c2 || hash == 0x8747a367;
+    if (!rejected && bytes >= 288 && bytes <= 320 && Finite(f, 72)) {
         const auto len = [&](int i) {
             return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
         };
-        bool any_dir = false;
-        for (int i = 0; i < 4; ++i) {
+        bool ok = data[65] <= 1u;                        // bool flag
+        ok = ok && std::abs(len(0) - 1.0f) < 0.02f;      // light 0: unit world direction
+        for (int i = 1; i < 4 && ok; ++i) {
             const float l = len(4 * i);
-            const float* c = f + 16 + 4 * i;
-            if (l > 0.5f && l < 2.0f && c[0] >= 0.0f && c[1] >= 0.0f && c[2] >= 0.0f &&
-                c[0] + c[1] + c[2] > 1e-5f) {
-                any_dir = true;
-            }
+            ok = l < 1e-4f || std::abs(l - 1.0f) < 0.05f; // unused (0) or unit
         }
-        if (!any_dir) {
+        for (int i = 16; i < 48 && ok; ++i) {
+            ok = f[i] >= 0.0f && f[i] < 1e4f; // squared colours x intensity
+        }
+        for (int i = 60; i < 63 && ok; ++i) {
+            ok = f[i] >= 0.0f && f[i] < 1e4f;
+        }
+        ok = ok && f[16] + f[17] + f[18] > 1e-5f; // light 0 lit
+        if (!ok) {
             return;
         }
         std::scoped_lock lk{g_cam_mutex};
+        if (g_rt_lighting.light_hash != hash || g_rt_lighting.light_bytes != bytes) {
+            LOG_INFO(Render_Vulkan,
+                     "[rt-light] light-set CB source: shader {:#x}, {} B V# (strict layout "
+                     "check passed): dir0 ({:.3f} {:.3f} {:.3f}) diffuse0 ({:.3f} {:.3f} {:.3f}) "
+                     "flag {}",
+                     hash, bytes, f[0], f[1], f[2], f[16], f[17], f[18], data[65]);
+        }
         std::memcpy(g_rt_lighting.light, f, 72 * sizeof(float));
         g_rt_lighting.light_frame = g_rt_frame;
         g_rt_lighting.light_valid = true;

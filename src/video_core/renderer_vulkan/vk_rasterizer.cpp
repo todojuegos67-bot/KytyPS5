@@ -669,8 +669,10 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         return;
     }
     // Per 5 s status (also when nothing ran, with the reason).
+    using Skip = BB::RtReflect::LightSkip;
     static u64 n_seen = 0, n_ran = 0, n_dup = 0, n_nodepth = 0, n_noscene = 0, n_r32f = 0,
-               n_d32 = 0, n_fail = 0;
+               n_d32 = 0, n_d32_stale = 0, n_hist_reset = 0;
+    static std::array<u64, size_t(Skip::Count)> n_skip{};
     static auto last_status = std::chrono::steady_clock::time_point{};
     ++n_seen;
     const auto status = [&] {
@@ -682,10 +684,17 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         last_status = now;
         LOG_INFO(Render_Vulkan,
                  "[rt-light] 5 s: composite draws {}, lighting ran {} (depth: scene D32 {}, R32F "
-                 "copy {}), skipped: same scene twice in a frame {}, no depth {}, no scene {}, not run "
-                 "(no camera / R32F encoding not known yet / allocation) {}",
-                 n_seen, n_ran, n_d32, n_r32f, n_dup, n_nodepth, n_noscene, n_fail);
-        n_seen = n_ran = n_dup = n_nodepth = n_noscene = n_r32f = n_d32 = n_fail = 0;
+                 "copy {}; no depth target written since the previous composite {}), history "
+                 "restarts {}; skipped: same scene again without new depth {}, no depth {}, no "
+                 "scene {}, no camera {}, bad projection {}, R32F encoding unknown {}, no valid "
+                 "game light {}, allocation {}; light: {}",
+                 n_seen, n_ran, n_d32, n_r32f, n_d32_stale, n_hist_reset, n_dup, n_nodepth,
+                 n_noscene, n_skip[size_t(Skip::NoCamera)], n_skip[size_t(Skip::BadProjection)],
+                 n_skip[size_t(Skip::DepthEncoding)], n_skip[size_t(Skip::NoLight)],
+                 n_skip[size_t(Skip::Allocation)], bb_rt_reflect->LightSourceText());
+        n_seen = n_ran = n_dup = n_nodepth = n_noscene = n_r32f = n_d32 = n_d32_stale =
+            n_hist_reset = 0;
+        n_skip.fill(0);
     };
     VideoCore::Image* depth = nullptr;  // depth-format image sampled by the draw (none so far)
     VideoCore::Image* zcopy = nullptr;  // R32F colour copy of the depth sampled by the draw
@@ -719,36 +728,43 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             normal = &img;
         }
     }
-    // The frame's scene depth (D32) from BeginRendering, if still the same image.
+    // The scene depth (D32): the largest depth target written since the previous composite draw
+    // (BeginRendering, command-stream order). Consumed here: a second composite draw without a
+    // depth write in between is the same frame drawn again.
+    const bool depth_fresh = bb_rt_depth_fresh;
+    bb_rt_depth_fresh = false;
     VideoCore::Image* d32 = nullptr;
-    const u32 frame = DebugState.GetFrameNum();
-    if (bb_rt_depth_frame == frame || bb_rt_depth_frame + 1 == frame) {
+    if (depth_fresh) {
         d32 = texture_cache.TryGetImage(bb_rt_depth_id, bb_rt_depth_uid);
         if (d32 && scene &&
             u64(d32->info.size.width) * scene->info.size.height !=
                 u64(d32->info.size.height) * scene->info.size.width) {
             d32 = nullptr; // a different aspect ratio: not the scene depth
         }
+    } else {
+        ++n_d32_stale;
     }
-    // Once per game frame and scene image: the composite is drawn twice per frame; a second
-    // draw on the same scene image would darken / add twice. A draw on another scene image runs.
-    static u32 last_frame = ~0u;
+    // Once per scene image between two scene renders: the composite is drawn twice per frame;
+    // a second draw on the same scene image would darken / add twice.
     static VAddr last_scene = 0;
     static int dup_logged = 0;
     const VAddr scene_addr = scene ? scene->info.guest_address : 0;
-    if (frame == last_frame && scene_addr == last_scene) {
+    if (!depth_fresh && scene_addr == last_scene) {
         ++n_dup;
         if (dup_logged < 1) {
             ++dup_logged;
             LOG_INFO(Render_Vulkan,
-                     "[rt-light] composite PS {:#x} drawn again in the same frame on the same "
-                     "scene image {:#x} (images:{}): the RT lighting runs once per frame and "
-                     "scene image",
+                     "[rt-light] composite PS {:#x} drawn again on the scene image {:#x} with no "
+                     "depth target written in between (images:{}): the RT lighting runs once per "
+                     "scene render",
                      BbCompositePsHash, scene_addr, desc);
         }
         status();
         return;
     }
+    // From here on every exit without a run breaks the temporal history.
+    const bool history_ok = !bb_rt_light_gap;
+    bb_rt_light_gap = true;
     static bool logged = false;
     if (!logged) {
         logged = true;
@@ -832,14 +848,16 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         .depth_height = dimg->info.size.height,
         .scene_width = scene->info.size.width,
         .scene_height = scene->info.size.height,
+        .history_ok = history_ok,
     };
     if (bb_rt_reflect->RunLighting(cmd, in)) {
-        last_frame = frame;
         last_scene = scene_addr;
+        bb_rt_light_gap = false;
         ++n_ran;
         ++(use_copy ? n_r32f : n_d32);
+        n_hist_reset += bb_rt_reflect->HistoryRestarted() ? 1 : 0;
     } else {
-        ++n_fail;
+        ++n_skip[size_t(bb_rt_reflect->LastSkip())];
     }
     status();
 }
@@ -1572,21 +1590,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));
                 }
-                // bb-rt-vol: the game's light-set (slot 5) and fog (slot 6) constant buffers,
-                // layouts from Ghidra (FUN_026deeb0, FUN_02651f10); see bb_upscale.h.
-                // The V# can cover more than the 288-byte light CB: for the lighting shaders
-                // any size is looked at (the first 1 KiB at most).
+                // bb-rt-vol: the game's light-set (material CB slot 5, 288 B) and fog (slot 6)
+                // constant buffers, layouts from Ghidra (FUN_026deeb0, FUN_02651f10); bound to
+                // the forward-lit object draws (any VS / PS), see OnLightingConstants.
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
-                    !desc.is_written && size >= 84 && BbRtLightRequested() &&
-                    (size <= 320 || stage.pgm_hash == BbCompositePsHash ||
-                     stage.pgm_hash == 0x8747a367 || stage.pgm_hash == BbSsrPsHash)) {
-                    const u64 look = std::min<u64>(size, 1024);
-                    if (memory->IsValidMapping(vsharp.base_address, look)) {
-                        BB::Upscale::OnLightingConstants(
-                            reinterpret_cast<const u32*>(vsharp.base_address),
-                            static_cast<size_t>(look), stage.pgm_hash);
-                    }
+                    !desc.is_written && size >= 84 && size <= 320 && BbRtLightRequested() &&
+                    memory->IsValidMapping(vsharp.base_address, size)) {
+                    BB::Upscale::OnLightingConstants(
+                        reinterpret_cast<const u32*>(vsharp.base_address),
+                        static_cast<size_t>(size), stage.pgm_hash);
                 }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
@@ -2170,10 +2183,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
         if (bb_rt_reflect && regs.depth_control.depth_enable &&
             regs.depth_control.depth_write_enable && image.info.num_samples == 1) {
-            const u32 fr = DebugState.GetFrameNum();
             const u64 ar = u64(image.info.size.width) * image.info.size.height;
-            if (fr != bb_rt_depth_frame || ar >= bb_rt_depth_area) {
-                bb_rt_depth_frame = fr;
+            if (!bb_rt_depth_fresh || ar >= bb_rt_depth_area) {
+                bb_rt_depth_fresh = true;
                 bb_rt_depth_area = ar;
                 bb_rt_depth_id = image_id;
                 bb_rt_depth_uid = image.image_uid;

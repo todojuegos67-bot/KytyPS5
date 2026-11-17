@@ -239,12 +239,15 @@ private:
     bool bb_rt_full_pending = false;
     VAddr bb_rt_ssr_addr = 0;
     u64 bb_rt_full_subs = 0;
-    // bb-rt-light: the largest single-sample depth target written this frame (the scene depth,
-    // D32): the composite samples only an R32F copy of it, so the lighting takes it from here.
+    // bb-rt-light: the largest single-sample depth target written (depth write on) since the
+    // last composite draw, in command-stream order (no frame counter: the flip counter is bumped
+    // on the presenter thread and drifts against the GPU command stream). The composite samples
+    // only an R32F copy of the scene depth, so the lighting takes the D32 from here.
     VideoCore::ImageId bb_rt_depth_id{};
     u64 bb_rt_depth_uid = 0;
-    u32 bb_rt_depth_frame = ~0u;
     u64 bb_rt_depth_area = 0;
+    bool bb_rt_depth_fresh = false;  // a depth target was written since the last composite
+    bool bb_rt_light_gap = true;     // the last composite (not a duplicate) did not run the pass
 };
 
 } // namespace Vulkan

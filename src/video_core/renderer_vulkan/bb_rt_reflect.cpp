@@ -221,7 +221,8 @@ bool RtReflect::MakeImage(Img& i, u32 width, u32 height, vk::Format format) {
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                 vk::ImageUsageFlagBits::eTransferDst,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
     VmaAllocationCreateInfo aci{};
@@ -1048,6 +1049,10 @@ bool RtReflect::InitVolumetric() {
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_LIGHT_OFS"); e && e[0]) {
         light_forced_ofs = std::clamp(std::atoi(e), 0, 213);
     }
+    // The scene-block unit-vector search is unverified game data: off unless asked for.
+    if (const char* e = std::getenv("BB_RT_LIGHT_HEURISTIC"); e && e[0] == '1') {
+        light_heuristic = true;
+    }
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_COLOR"); e && e[0]) {
         float v[3]{};
         if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
@@ -1110,10 +1115,13 @@ bool RtReflect::InitVolumetric() {
              vol_color[2],
              light_env ? "BB_RT_VOLUMETRIC_DIR"
              : light_forced_ofs >= 0 ? "BB_RT_VOLUMETRIC_LIGHT_OFS"
-                                     : "game light-set CB, else scene-block search, else fixed");
+                                     : light_heuristic
+                                         ? "game light-set CB, else scene-block search (BB_RT_LIGHT_HEURISTIC=1)"
+                                         : "game light-set CB light 0 only (no valid CB: lighting not run)");
     LOG_INFO(Render_Vulkan,
-             "[rt-vol] game data offsets (Ghidra, eboot 1.09): light-set CB slot 5 (288 B, "
-             "FUN_026deeb0 / FUN_026dfe80, bound to PS 0x3fe9e964 / VS 0x8747a367 / PS 0x6c2323c2): "
+             "[rt-vol] game data offsets (Ghidra, eboot 1.09): light-set CB = material CB slot 5 "
+             "(288 B, FUN_02651f10 -> FUN_026deeb0 / FUN_026dfe80, upload FUN_02568a20; bound to "
+             "the forward-lit object draws, not the composite / SSR draws): "
              "dir[i] floats 4i..4i+2 (world), diffuse[i] floats 16+4i..18+4i (rgb^2 x intensity), "
              "i = 0..3; fog CB slot 6 (FUN_02651f10): floats 1 = 1/dist, 2 = density at camera "
              "height, 3 = 1/H height falloff, 4-6 = fog rgb^2; env overrides: DIR {}, COLOR {}, "
@@ -1133,44 +1141,53 @@ bool RtReflect::GameLight() {
     float b[72];
     u64 age = 0;
     if (!BB::Upscale::RtLightBlock(b, age) || age > 120) return false;
-    int best = -1;
-    float best_l = 0.0f;
-    for (int i = 0; i < 4; ++i) {
-        const float* d = b + 4 * i;
-        const float* c = b + 16 + 4 * i;
-        const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        const float lum = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
-        if (dl > 0.5f && lum > best_l) {
-            best_l = lum;
-            best = i;
-        }
-    }
-    if (best < 0) return false;
-    const float* d = b + 4 * best;
+    // Light 0: the only direction FUN_026deeb0 always copies untransformed (set+0x40, world);
+    // lights 1-3 may be transformed by the owner's matrix (flags set+0x24c..0x24e).
+    const float* d = b;
+    const float* c = b + 16;
     const float dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (!(dl > 0.5f) || !(c[0] + c[1] + c[2] > 1e-5f)) return false;
     for (int i = 0; i < 3; ++i) game_dir[i] = d[i] / dl;
     if (!color_env) {
-        for (int i = 0; i < 3; ++i) game_color[i] = b[16 + 4 * best + i];
-        color_src = "ghidra:light-set CB diffuse (FUN_026deeb0)";
+        // rgb^2 x intensity; capped so an extreme value cannot blow the scene out.
+        const float m = std::max({c[0], c[1], c[2]});
+        const float k = m > 4.0f ? 4.0f / m : 1.0f;
+        for (int i = 0; i < 3; ++i) game_color[i] = c[i] * k;
+        color_src = "ghidra:light-set CB light 0 diffuse (FUN_026deeb0 set+0x50)";
     }
-    if (!logged_game_light || best != game_light_idx) {
+    u64 hash = 0;
+    size_t bytes = 0;
+    BB::Upscale::RtLightSource(hash, bytes);
+    if (!logged_game_light) {
         logged_game_light = true;
         LOG_INFO(Render_Vulkan,
-                 "[rt-vol] game light-set CB: light {} of 4 chosen (brightest diffuse): dir "
-                 "floats {}-{} = ({:.3f}, {:.3f}, {:.3f}), diffuse floats {}-{} = ({:.3f}, {:.3f}, "
-                 "{:.3f}); all diffuse lum: {:.3f} {:.3f} {:.3f} {:.3f}",
-                 best, 4 * best, 4 * best + 2, d[0], d[1], d[2], 16 + 4 * best, 18 + 4 * best,
-                 b[16 + 4 * best], b[17 + 4 * best], b[18 + 4 * best],
-                 0.2126f * b[16] + 0.7152f * b[17] + 0.0722f * b[18],
+                 "[rt-vol] game light-set CB (shader {:#x}, {} B): light 0 dir ({:.3f}, {:.3f}, "
+                 "{:.3f}), diffuse ({:.3f}, {:.3f}, {:.3f}); lights 1-3 diffuse lum {:.3f} {:.3f} "
+                 "{:.3f} (not used: may be in a transformed space)",
+                 hash, bytes, d[0], d[1], d[2], c[0], c[1], c[2],
                  0.2126f * b[20] + 0.7152f * b[21] + 0.0722f * b[22],
                  0.2126f * b[24] + 0.7152f * b[25] + 0.0722f * b[26],
                  0.2126f * b[28] + 0.7152f * b[29] + 0.0722f * b[30]);
     }
-    game_light_idx = best;
+    game_light_idx = 0;
     std::snprintf(game_light_src, sizeof(game_light_src),
-                  "ghidra:light-set CB slot 5 dir %d (floats %d-%d, FUN_026deeb0)", best, 4 * best,
-                  4 * best + 2);
+                  "ghidra:light-set CB light 0 (shader %#llx, %zu B, FUN_026deeb0)",
+                  static_cast<unsigned long long>(hash), bytes);
     return true;
+}
+
+std::string RtReflect::LightSourceText() const {
+    if (!l_have_light) return "none yet (no validated light-set CB: lighting not run)";
+    return fmt::format("{} dir ({:.3f}, {:.3f}, {:.3f})", light_src, used_dir[0], used_dir[1],
+                       used_dir[2]);
+}
+
+void RtReflect::ResetLightHistory(const char* why) {
+    vol_fresh = true; // re-created state: cleared and no history on the next dispatch
+    sh_fresh = true;
+    l_have_prev = false;
+    l_hist_restarted = true;
+    l_reset_why = why;
 }
 
 // The game's fog: CB slot 6 (FUN_02651f10 packs the FOG MANAGER's param).
@@ -1245,7 +1262,7 @@ bool RtReflect::LightDir(const double* view, float out_view[3]) {
     } else if (GameLight()) {
         for (int i = 0; i < 3; ++i) lw[i] = game_dir[i];
         src = game_light_src;
-    } else if (have_block) {
+    } else if (have_block && (light_heuristic || light_forced_ofs >= 0)) {
         int ofs = -1;
         if (light_forced_ofs >= 0) {
             ofs = unit(light_forced_ofs) ? light_forced_ofs : -1;
@@ -1270,6 +1287,9 @@ bool RtReflect::LightDir(const double* view, float out_view[3]) {
                           light_forced_ofs >= 0 ? " (forced)" : " (heuristic)");
             src = src_buf;
         }
+    }
+    if (src == nullptr || std::strncmp(src, "fallback", 8) == 0) {
+        return false; // no validated light: never run with a guess
     }
     // Toward the light, assumed above the horizon (world y up). The sign the game's shader applies
     // to the CB direction is not decoded (the shader binary is not in the eboot).
@@ -1367,8 +1387,8 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
         for (u32 i = 0; i < 3; ++i) {
             b[i] = vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eClear,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
                 .newLayout = vk::ImageLayout::eGeneral,
                 .image = imgs[i],
@@ -1377,6 +1397,20 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
         }
         cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 3,
                                                 .pImageMemoryBarriers = b.data()});
+        // Cleared, never left undefined: the first temporal / upsample passes read them.
+        const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        for (const auto& im : imgs) {
+            cmd.clearColorImage(im, vk::ImageLayout::eGeneral, zero, range);
+        }
+        const vk::MemoryBarrier2 cleared{
+            .srcStageMask = vk::PipelineStageFlagBits2::eClear,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                .pMemoryBarriers = &cleared});
         vol_fresh = false;
     }
     const vk::MemoryBarrier2 cc{
@@ -1475,14 +1509,18 @@ void RtReflect::ReadTimer(vk::QueryPool pool, std::array<bool, Ring>& used, u32 
 }
 
 bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
+    l_skip = LightSkip::None;
+    l_hist_restarted = false;
     if (!LightingOn()) return false;
     float proj[16], view[12], far_dist = 3000.0f;
     if (!BB::Upscale::RtCamera(proj, view, far_dist)) {
+        l_skip = LightSkip::NoCamera;
         return false;
     }
     if (!(far_dist > 1.0f)) far_dist = 3000.0f;
     double inv[16];
     if (!Invert4(proj, inv)) {
+        l_skip = LightSkip::BadProjection;
         return false;
     }
     double pd[16], vd[16]{};
@@ -1492,15 +1530,59 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     vd[15] = 1.0;
     ReadProbe(proj, far_dist);
     if (in.depth_is_copy && (depth_enc < 0 || !InitDepthCvt())) {
-        return false; // R32F encoding not known yet (probe pending) or no converter
+        l_skip = LightSkip::DepthEncoding; // probe pending / inconclusive, or no converter
+        return false;
+    }
+    // A validated game light, or nothing (never a guessed direction).
+    float lv_check[3];
+    if (!LightDir(vd, lv_check)) {
+        l_skip = LightSkip::NoLight;
+        return false;
     }
     // Trace (and depth-mesh) size: the depth, halved when it is the full render size.
     const u32 ds = in.depth_width > 1100 ? 2u : 1u;
-    lw_ = std::max(1u, in.depth_width / ds);
-    lh_ = std::max(1u, in.depth_height / ds);
+    const u32 new_lw = std::max(1u, in.depth_width / ds);
+    const u32 new_lh = std::max(1u, in.depth_height / ds);
+    // Temporal history: restarted (images cleared, no reprojection) when the previous scene
+    // render skipped this pass, on a camera cut, a size change or an abrupt light change.
+    if (!in.history_ok) {
+        ResetLightHistory("previous frame not run");
+    } else if (new_lw != lw_ || new_lh != lh_) {
+        ResetLightHistory("size change");
+    } else if (l_have_prev) {
+        // Camera position: eye = -R^T t (3x4 row-major view).
+        const auto eye = [](const double* m, int k) {
+            return -(m[k] * m[3] + m[4 + k] * m[7] + m[8 + k] * m[11]);
+        };
+        double dt = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            const double e = eye(vd, k) - eye(l_prev_view, k);
+            dt += e * e;
+        }
+        dt = std::sqrt(dt);
+        const double fwd = vd[8] * l_prev_view[8] + vd[9] * l_prev_view[9] +
+                           vd[10] * l_prev_view[10];
+        if (!(dt < 8.0) || !(fwd > 0.94)) ResetLightHistory("camera cut");
+    }
+    if (l_have_light && !l_hist_restarted) {
+        const float d = used_dir[0] * l_prev_light[0] + used_dir[1] * l_prev_light[1] +
+                        used_dir[2] * l_prev_light[2];
+        if (!(d > 0.995f)) ResetLightHistory("light changed");
+    }
+    for (int i = 0; i < 3; ++i) l_prev_light[i] = used_dir[i];
+    l_have_light = true;
+    if (l_hist_restarted) {
+        static u64 n_logged = 0;
+        if (n_logged++ < 8) {
+            LOG_INFO(Render_Vulkan, "[rt-light] temporal history restarted: {}", l_reset_why);
+        }
+    }
+    lw_ = new_lw;
+    lh_ = new_lh;
     const bool own_mesh = !mesh_from_reflect;
     mesh_from_reflect = false;
     if (own_mesh && !EnsureMesh(lw_, lh_, 4)) {
+        l_skip = LightSkip::Allocation;
         return false;
     }
 
@@ -1575,6 +1657,7 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
             FreeImage(dcvt);
             if (!MakeImage(dcvt, in.depth_width, in.depth_height, vk::Format::eR32Sfloat)) {
                 layouts(false);
+                l_skip = LightSkip::Allocation;
                 return false;
             }
             dcvt_w = in.depth_width;
@@ -1857,6 +1940,11 @@ void RtReflect::ReadProbe(const float* proj, float far_dist) {
             depth_enc_src = "readback, values > 1 (assumed view distance, no D32 to compare)";
         } else {
             depth_enc_src = "readback inconclusive (R32F copy unused; set BB_RT_LIGHT_DEPTH_ENC)";
+            // Taken again later (a scene D32 may be there to compare with by then).
+            if (probe_retries++ < 16) {
+                probe_state = 0;
+                probe_wait = 0;
+            }
         }
     }
     LOG_INFO(Render_Vulkan,
@@ -2001,8 +2089,8 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
         for (u32 i = 0; i < 3; ++i) {
             b[i] = vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eClear,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
                 .newLayout = vk::ImageLayout::eGeneral,
                 .image = imgs[i],
@@ -2011,6 +2099,20 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
         }
         cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 3,
                                                 .pImageMemoryBarriers = b.data()});
+        // Cleared, never left undefined: the first temporal / upsample passes read them.
+        const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        for (const auto& im : imgs) {
+            cmd.clearColorImage(im, vk::ImageLayout::eGeneral, zero, range);
+        }
+        const vk::MemoryBarrier2 cleared{
+            .srcStageMask = vk::PipelineStageFlagBits2::eClear,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                .pMemoryBarriers = &cleared});
         sh_fresh = false;
     }
     const vk::MemoryBarrier2 cc{
