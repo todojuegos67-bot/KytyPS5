@@ -436,10 +436,10 @@ static const bool g_audioout2_device_queue = [] {
 // silence for that grain. Without it the device queue drains, the level reads 0, every push returns at once and
 // the game's mixer renders unpaced: Wolverine silences all but its inaudible cinematic clock voice during loads,
 // which then ran at ~550x and could stop at a loop end, leaving cinematics in slow motion (session 80).
-// KYTY_AUDIOOUT2_SILENT_GRAIN=1 turns it on; read per push so tests can switch it.
+// KYTY_AUDIOOUT2_SILENT_GRAIN=0 turns it off; read per push so tests can switch it.
 static bool audioout2_silent_grain() {
 	const char* value = std::getenv("KYTY_AUDIOOUT2_SILENT_GRAIN");
-	return value != nullptr && value[0] == '1';
+	return value == nullptr || value[0] != '0';
 }
 
 // SDL may hold this much beyond the queue depth before it counts: the depth alone (4 grains, 21 ms

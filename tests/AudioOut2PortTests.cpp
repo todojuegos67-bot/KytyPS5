@@ -635,16 +635,17 @@ void TestPushConsumesPcm() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+// On: the switch unset (its default). Off: KYTY_AUDIOOUT2_SILENT_GRAIN=0.
 void SetSilentGrain(bool on) {
 #ifdef _WIN32
-	_putenv(on ? "KYTY_AUDIOOUT2_SILENT_GRAIN=1" : "KYTY_AUDIOOUT2_SILENT_GRAIN=");
+	_putenv(on ? "KYTY_AUDIOOUT2_SILENT_GRAIN=" : "KYTY_AUDIOOUT2_SILENT_GRAIN=0");
 #else
-	on ? setenv("KYTY_AUDIOOUT2_SILENT_GRAIN", "1", 1) : unsetenv("KYTY_AUDIOOUT2_SILENT_GRAIN");
+	on ? unsetenv("KYTY_AUDIOOUT2_SILENT_GRAIN") : setenv("KYTY_AUDIOOUT2_SILENT_GRAIN", "0", 1);
 #endif
 }
 
-// With the switch on, a push without PCM gives the device a silent grain of the last grain's size, so the device
-// queue keeps pacing the game's mixer; a port that never had PCM gets nothing.
+// With the switch on (its default), a push without PCM gives the device a silent grain of the last grain's size,
+// so the device queue keeps pacing the game's mixer; a port that never had PCM gets nothing.
 void TestDevicePushWithoutPcmQueuesSilence() {
 	SetSilentGrain(true);
 	const auto context = CreateContext();
@@ -994,6 +995,8 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 } // namespace Libs::LibKernel
 
 int main() {
+	// The other cases check pushes without the silent grain; TestDevicePushWithoutPcmQueuesSilence covers it.
+	SetSilentGrain(false);
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
 	TestUserSupportedAttributes();
 	TestSlotReuse();
