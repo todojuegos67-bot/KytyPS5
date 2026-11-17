@@ -5,6 +5,8 @@
 // a depth mesh (bb_rt_mesh.comp) -> BLAS + one-instance TLAS (rebuilt each SSR draw) -> one ray
 // query per SSR pixel (bb_rt_reflect.comp) writing into the SSR target. BB_RT_REFLECT_DEBUG=1
 // tints the pixels a ray hit. Needs Instance::IsRtReflectEnabled() and the game's camera.
+// BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1 (each independent of BB_RT_REFLECT) run in RunLighting,
+// before the composite draw, on their own depth mesh unless the reflections built one this frame.
 #pragma once
 
 #include <array>
@@ -44,8 +46,31 @@ public:
         u32 color_width, color_height; // lit scene size
     };
 
+    // bb-rt-light: volumetric light / RT shadows, run before the game's composite draw
+    // (PS 0x3fe9e964, which runs with or without the game's SSR) on the lit scene it samples.
+    struct LightInput {
+        vk::Image depth;
+        vk::ImageView depth_view;
+        vk::ImageLayout depth_layout;
+        bool depth_has_stencil;
+        vk::Image normal; // G-buffer RT0, null when not bound
+        vk::ImageView normal_view;
+        vk::ImageLayout normal_layout;
+        vk::Image scene;  // lit scene, RGBA16F
+        vk::ImageView scene_storage_view;
+        vk::ImageLayout scene_layout;
+        u32 depth_width, depth_height;
+        u32 scene_width, scene_height;
+    };
+
     explicit RtReflect(const Vulkan::Instance& instance);
     ~RtReflect();
+
+    // Pipelines, buffers and query pools for the features requested by the environment
+    // (BB_RT_REFLECT / BB_RT_VOLUMETRIC / BB_RT_SHADOWS). Called once at renderer start.
+    bool Init();
+    bool LightingOn() const { return ok && ((vol_on && vol_ok) || (sh_on && sh_ok)); }
+    bool RunLighting(vk::CommandBuffer cmd, const LightInput& in);
 
     // Records the pass into `cmd` (outside a render pass). Image layouts are restored.
     // Returns false when it did nothing (not supported, no camera, an allocation failed).
@@ -66,8 +91,12 @@ private:
         vk::DeviceAddress address = 0;
         vk::DeviceSize size = 0;
     };
-    bool Init();
     bool EnsureSize(u32 w, u32 h);
+    bool EnsureMesh(u32 mw, u32 mh, u32 cell);
+    // Depth mesh -> BLAS -> TLAS for the given (sampleable) depth; params slot already written.
+    void BuildMesh(vk::CommandBuffer cmd, const vk::DescriptorImageInfo& depth_info,
+                   const vk::DescriptorBufferInfo& params_info);
+    void ReadTimer(vk::QueryPool pool, std::array<bool, 8>& used, u32 slot, double& sum, u32& n);
     bool MakeBuffer(Buf& b, vk::DeviceSize size, vk::BufferUsageFlags usage, bool host,
                     vk::DeviceSize alignment = 0);
     void FreeBuffer(Buf& b);
@@ -83,10 +112,17 @@ private:
     // bb-rt-vol (BB_RT_VOLUMETRIC=1): volumetric light pass, recorded inside Run after the
     // reflections (same TLAS). The lit scene is in GENERAL.
     bool InitVolumetric();
-    void Volumetric(vk::CommandBuffer cmd, const Input& in, const float* proj, const double* inv,
-                    const double* view, const double* reproj, const double* prev_proj_,
-                    bool reproj_ok,
+    bool InitShadows();
+    void Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 scene_w, u32 scene_h,
+                    const float* proj, const double* inv, const double* view,
+                    const double* reproj, const double* prev_proj_, bool reproj_ok,
                     const vk::DescriptorImageInfo& depth_info);
+    void Shadows(vk::CommandBuffer cmd, const LightInput& in, const float* proj,
+                 const double* inv, const double* view, const double* reproj,
+                 const double* prev_proj_, bool reproj_ok,
+                 const vk::DescriptorImageInfo& depth_info,
+                 const vk::DescriptorImageInfo& normal_info);
+    void LogShadows();
     bool LightDir(const double* view, float out_view[3]);
     bool GameLight();
     void GameFog();
@@ -94,6 +130,8 @@ private:
 
     const Vulkan::Instance& instance;
     bool tried = false, ok = false;
+    bool refl_on = false; // BB_RT_REFLECT=1: reflection pipelines / images
+    double ts_period = 1.0;
     bool debug = false;
     vk::Sampler nearest{}, linear{};
     vk::DescriptorSetLayout mesh_set{}, ray_set{}, post_set{};
@@ -117,7 +155,15 @@ private:
     u32 Cell = 4;
     static constexpr u32 Ring = 8;
     static constexpr vk::DeviceSize ParamSize = 512;
-    u32 w = 0, h = 0, gw = 0, gh = 0, tris = 0;
+    u32 w = 0, h = 0;                      // reflection (SSR) size
+    u32 mesh_w = 0, mesh_h = 0, mesh_cell = 0; // depth-mesh grid source size and cell
+    u32 gw = 0, gh = 0, tris = 0;
+    bool mesh_from_reflect = false; // the reflection pass built this frame's TLAS
+    // Lighting pass (composite hook) trace size and camera history.
+    u32 lw_ = 0, lh_ = 0;
+    double l_prev_view[16]{}, l_prev_proj[16]{};
+    bool l_have_prev = false;
+    u32 l_ring = 0;
     Buf verts, blas_buf, tlas_buf, scratch, instances, params, counters;
     vk::AccelerationStructureKHR blas{}, tlas{};
     vk::DeviceSize blas_scratch = 0, tlas_scratch = 0;
@@ -173,6 +219,31 @@ private:
     float used_color[3]{};
     const char* fog_src = "fallback (BB_RT_VOLUMETRIC_DENSITY default, no height fog)";
     std::chrono::steady_clock::time_point vol_last_log{};
+
+    // bb-rt-shadow state (BB_RT_SHADOWS=1).
+    bool sh_on = false, sh_ok = false, sh_fresh = true;
+    float sh_strength = 0.6f, sh_cone = 0.02f, sh_dist = 80.0f;
+    vk::DescriptorSetLayout sh_set{};
+    vk::PipelineLayout sh_layout{};
+    vk::Pipeline sh_pipe{};
+    Buf sh_params;
+    Img sraw;
+    std::array<Img, 2> sacc;
+    u32 sh_w = 0, sh_h = 0;
+    vk::QueryPool sh_queries{};
+    std::array<bool, Ring> sh_query_used{};
+    u64 sh_dispatches = 0, sh_last_dispatches = 0;
+    double sh_ms_sum = 0.0;
+    u32 sh_ms_n = 0;
+    u32 sh_last_counts[2]{};
+    bool sh_normal = false;
+    float sh_used_dir[3]{};
+    std::chrono::steady_clock::time_point sh_last_log{};
+    // Lighting pass totals (mesh build included when the composite hook built it).
+    vk::QueryPool l_queries{};
+    std::array<bool, Ring> l_query_used{};
+    double l_ms_sum = 0.0;
+    u32 l_ms_n = 0;
     std::chrono::steady_clock::time_point last_log{};
 };
 

@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-shadow (BB_RT_SHADOWS=1): ray-traced shadows of the main directional light against the
+// screen-space depth-mesh TLAS, applied to the lit scene before the game's composite.
+//   mode 0  trace at the trace size: one ray per pixel from the depth-reconstructed position
+//           toward the light, direction jittered inside a small cone (per pixel and frame).
+//           Output (visibility 0..1, facing = saturate(N.L * 4), -, view distance).
+//   mode 1  temporal: reprojected history (previous camera, distance-checked), else current.
+//   mode 2  joint-bilateral 5x5 denoise + upsample to the scene size; the lit scene is
+//           multiplied by 1 - strength * (1 - visibility) * facing.
+#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1) uniform accelerationStructureEXT tlas;
+layout(std140, binding = 2) uniform Params {
+    mat4 proj;
+    mat4 inv_proj;
+    mat4 reproj;     // current view -> previous view
+    mat4 prev_proj;
+    uvec4 size;      // trace w, h, scene w, h
+    vec4 light;      // view-space direction toward the light, cone half-angle (rad)
+    vec4 misc;       // strength, max ray length, frame, history valid
+    vec4 misc2;      // temporal blend, far distance, y sign, normal source (1: G-buffer)
+    mat4 view;       // world -> view (G-buffer normals)
+} p;
+layout(binding = 3) uniform sampler2D src_tex;
+layout(binding = 4) uniform sampler2D hist_tex;
+layout(binding = 5, rgba16f) uniform writeonly image2D dst;
+layout(binding = 6, rgba16f) uniform image2D scene;
+layout(std430, binding = 7) buffer Counters { uint n[16]; } cnt; // [10] rays, [11] shadowed
+layout(binding = 8) uniform sampler2D normal_tex;
+layout(push_constant) uniform Push { uint mode; } pc;
+
+shared uint s_n[2];
+
+ivec2 DepthPx(ivec2 px) {
+    ivec2 dsz = textureSize(depth_tex, 0);
+    return clamp(ivec2((vec2(px) + 0.5) * vec2(dsz) / vec2(p.size.xy)), ivec2(0), dsz - 1);
+}
+
+vec3 Unproject(ivec2 px, out float dist) {
+    px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
+    float d = texelFetch(depth_tex, DepthPx(px), 0).r;
+    vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc2.z > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    vec3 r = v.xyz / (abs(v.w) > 1e-8 ? v.w : 1.0);
+    dist = length(r);
+    if (isnan(dist) || isinf(dist) || dist > p.misc2.y * 0.95) {
+        dist = -1.0; // sky
+    }
+    return r;
+}
+
+uint Hash(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < 2u) {
+        s_n[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    uint nr = 0u, nsh = 0u;
+    if (pc.mode == 0u && all(lessThan(c, ivec2(p.size.xy)))) {
+        float dist;
+        vec3 P = Unproject(c, dist);
+        vec4 o = vec4(1.0, 0.0, 0.0, -1.0);
+        if (dist > 0.0) {
+            float d1, d2, d3, d4;
+            vec3 px1 = Unproject(c + ivec2(1, 0), d1);
+            vec3 px0 = Unproject(c - ivec2(1, 0), d2);
+            vec3 py1 = Unproject(c + ivec2(0, 1), d3);
+            vec3 py0 = Unproject(c - ivec2(0, 1), d4);
+            vec3 dx = abs(px1.z - P.z) < abs(P.z - px0.z) ? px1 - P : P - px0;
+            vec3 dy = abs(py1.z - P.z) < abs(P.z - py0.z) ? py1 - P : P - py0;
+            vec3 N = normalize(cross(dx, dy));
+            if (dot(N, P) > 0.0) {
+                N = -N;
+            }
+            if (p.misc2.w > 0.5) {
+                ivec2 nsz = textureSize(normal_tex, 0);
+                ivec2 nc = clamp(ivec2((vec2(c) + 0.5) * vec2(nsz) / vec2(p.size.xy)), ivec2(0),
+                                 nsz - 1);
+                vec3 nw = texelFetch(normal_tex, nc, 0).rgb * 2.0 - 1.0;
+                float nl = length(nw);
+                if (abs(nl - 1.0) < 0.15) {
+                    vec3 Ng = normalize((p.view * vec4(nw / nl, 0.0)).xyz);
+                    if (dot(Ng, N) > 0.5) {
+                        N = Ng;
+                    }
+                }
+            }
+            if (any(isnan(N))) {
+                N = -normalize(P);
+            }
+            vec3 L = p.light.xyz;
+            float ndl = dot(N, L);
+            float facing = clamp(ndl * 4.0, 0.0, 1.0);
+            float vis = 1.0;
+            if (facing > 0.0) {
+                // Cone jitter: interleaved gradient noise + per-frame rotation.
+                uint h = Hash(uint(c.x) * 1973u + uint(c.y) * 9277u + uint(p.misc.z) * 26699u);
+                float u1 = float(h & 0xffffu) / 65536.0;
+                float u2 = float(h >> 16) / 65536.0;
+                vec3 t = normalize(abs(L.y) < 0.99 ? cross(L, vec3(0.0, 1.0, 0.0))
+                                                   : cross(L, vec3(1.0, 0.0, 0.0)));
+                vec3 b = cross(L, t);
+                float r = p.light.w * sqrt(u1);
+                float a = 6.2831853 * u2;
+                vec3 D = normalize(L + (t * cos(a) + b * sin(a)) * r);
+                // The mesh is coarse (cells of a few pixels): offset along the normal and
+                // start a distance-proportional bit away to avoid self-shadowing.
+                vec3 O = P + N * (0.03 + 0.004 * dist);
+                rayQueryEXT rq;
+                rayQueryInitializeEXT(rq, tlas,
+                                      gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                      0xFF, O, 0.05 + 0.01 * dist, D, p.misc.y);
+                while (rayQueryProceedEXT(rq)) {
+                }
+                vis = rayQueryGetIntersectionTypeEXT(rq, true) ==
+                              gl_RayQueryCommittedIntersectionNoneEXT
+                          ? 1.0
+                          : 0.0;
+                ++nr;
+                if (vis < 0.5) {
+                    ++nsh;
+                }
+            }
+            o = vec4(vis, facing, 0.0, dist);
+        }
+        imageStore(dst, c, o);
+    } else if (pc.mode == 1u && all(lessThan(c, ivec2(p.size.xy)))) {
+        vec4 cur = texelFetch(src_tex, c, 0);
+        vec4 outv = cur;
+        if (p.misc.w > 0.5 && cur.a > 0.0) {
+            float m0 = 1.0, m1 = 0.0;
+            for (int y = -1; y <= 1; ++y) {
+                for (int x = -1; x <= 1; ++x) {
+                    float s = texelFetch(src_tex, clamp(c + ivec2(x, y), ivec2(0),
+                                                        ivec2(p.size.xy) - 1), 0).r;
+                    m0 = min(m0, s);
+                    m1 = max(m1, s);
+                }
+            }
+            float dist;
+            vec3 P = Unproject(c, dist);
+            vec3 Q = (p.reproj * vec4(P, 1.0)).xyz;
+            vec4 clip = p.prev_proj * vec4(Q, 1.0);
+            if (clip.w > 1e-6) {
+                vec2 ndc = clip.xy / clip.w;
+                vec2 uv = vec2(ndc.x * 0.5 + 0.5,
+                               p.misc2.z > 0.0 ? 0.5 - 0.5 * ndc.y : 0.5 + 0.5 * ndc.y);
+                if (all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)))) {
+                    vec4 h = textureLod(hist_tex, uv, 0.0);
+                    float qd = length(Q);
+                    if (!any(isnan(h)) && abs(h.a - qd) < 0.05 * qd + 0.1) {
+                        // Loose clamp: the 3x3 range widened a little so the noise can settle.
+                        float hv = clamp(h.r, m0 - 0.25, m1 + 0.25);
+                        outv.r = mix(hv, cur.r, p.misc2.x);
+                    }
+                }
+            }
+        }
+        imageStore(dst, c, outv);
+    } else if (pc.mode == 2u && all(lessThan(c, ivec2(p.size.zw)))) {
+        vec2 hp = (vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw);
+        ivec2 hc = clamp(ivec2(hp), ivec2(0), ivec2(p.size.xy) - 1);
+        vec4 ref = texelFetch(src_tex, hc, 0);
+        if (ref.a > 0.0) {
+            float sum = 0.0, ws = 0.0, fsum = 0.0;
+            for (int y = -2; y <= 2; ++y) {
+                for (int x = -2; x <= 2; ++x) {
+                    ivec2 q = clamp(hc + ivec2(x, y), ivec2(0), ivec2(p.size.xy) - 1);
+                    vec4 s = texelFetch(src_tex, q, 0);
+                    if (s.a <= 0.0) {
+                        continue;
+                    }
+                    vec2 dd = vec2(q) + 0.5 - hp;
+                    float w = exp(-dot(dd, dd) * 0.25) *
+                              exp(-abs(s.a - ref.a) / (0.01 * ref.a + 0.03));
+                    sum += s.r * w;
+                    fsum += s.g * w;
+                    ws += w;
+                }
+            }
+            float vis = ws > 1e-5 ? sum / ws : ref.r;
+            float facing = ws > 1e-5 ? fsum / ws : ref.g;
+            float k = clamp(p.misc.x * (1.0 - vis) * facing, 0.0, 1.0);
+            if (k > 0.0 && !isnan(k)) {
+                vec4 sc = imageLoad(scene, c);
+                imageStore(scene, c, vec4(sc.rgb * (1.0 - k), sc.a));
+            }
+        }
+    }
+    if (nr != 0u) {
+        atomicAdd(s_n[0], nr);
+        atomicAdd(s_n[1], nsh);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < 2u && pc.mode == 0u) {
+        atomicAdd(cnt.n[10 + gl_LocalInvocationIndex], s_n[gl_LocalInvocationIndex]);
+    }
+}

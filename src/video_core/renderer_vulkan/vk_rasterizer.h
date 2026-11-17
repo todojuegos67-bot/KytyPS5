@@ -135,6 +135,7 @@ private:
     void BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr); // bb-rt-fullres
     void BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect); // bb-rt-reflect
     void BbRtReflectRun(); // bb-rt-reflect: the ray-query pass after the SSR draw
+    void BbRtLightRun(const GraphicsPipeline& pipeline); // bb-rt-light: before the composite
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -231,7 +232,7 @@ private:
     bool attachment_feedback_loop{};
     bool needs_barrier{};
 
-    std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt-reflect (BB_RT_REFLECT=1)
+    std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
     bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
     // bb-rt-fullres (BB_RT_REFLECT_FULLRES=1): set when the last RT pass produced the full-res
     // image; the next draw with the composite PS samples it instead of the SSR target.

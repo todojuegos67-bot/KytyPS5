@@ -80,7 +80,7 @@ public:
     }
 
     /// Returns true if anisotropic filtering is supported
-    /// bb-rt-reflect: BB_RT_REFLECT=1 and the device got AS + ray query.
+    /// bb-rt: BB_RT_REFLECT, BB_RT_VOLUMETRIC or BB_RT_SHADOWS =1 and the device got AS + ray query.
     bool IsRtReflectEnabled() const {
         return bb_rt_reflect;
     }

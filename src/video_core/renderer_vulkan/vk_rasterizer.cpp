@@ -58,6 +58,10 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+namespace {
+bool BbRtAnyRequested();
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
@@ -73,6 +77,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     memory->SetRasterizer(this);
     BB::ObjMv2::Init(instance);
+    // bb-rt: pipelines / buffers at start, never lazily during play.
+    if (BbRtAnyRequested() && instance.IsRtReflectEnabled()) {
+        bb_rt_reflect = std::make_unique<BB::RtReflect>(instance);
+        if (!bb_rt_reflect->Init()) {
+            LOG_ERROR(Render_Vulkan, "[rt] init failed: RT features off");
+        }
+    }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -333,12 +344,25 @@ bool BbRtFullresLogRequested() { // BB_RT_REFLECT_FULLRES=log: the draw-chain di
     }();
     return on;
 }
-bool BbRtVolRequested() { // BB_RT_VOLUMETRIC=1 (with BB_RT_REFLECT=1)
+bool BbRtVolRequested() { // BB_RT_VOLUMETRIC=1 (independent of BB_RT_REFLECT)
     static const bool on = [] {
         const char* e = std::getenv("BB_RT_VOLUMETRIC");
-        return BbRtReflectRequested() && e && e[0] == '1';
+        return e && e[0] == '1';
     }();
     return on;
+}
+bool BbRtShadowRequested() { // BB_RT_SHADOWS=1 (independent of the others)
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_SHADOWS");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+bool BbRtLightRequested() {
+    return BbRtVolRequested() || BbRtShadowRequested();
+}
+bool BbRtAnyRequested() {
+    return BbRtReflectRequested() || BbRtLightRequested();
 }
 // The lighting / composite draw that samples the SSR target directly (VS 0x8747a367).
 constexpr u64 BbCompositePsHash = 0x3fe9e964;
@@ -570,7 +594,10 @@ void Rasterizer::BbRtReflectRun() {
         return;
     }
     if (!bb_rt_reflect) {
-        bb_rt_reflect = std::make_unique<BB::RtReflect>(instance);
+        return;
+    }
+    if (static bool logged = false; !logged) {
+        logged = true;
         LOG_INFO(Render_Vulkan,
                  "[rt-reflect] inputs: RT0 guest={:#x} {}x{}, RT1 candidate {}",
                  normal->info.guest_address, normal->info.size.width, normal->info.size.height,
@@ -592,10 +619,6 @@ void Rasterizer::BbRtReflectRun() {
     nv.format = vk::Format::eR8G8B8A8Unorm;
     VideoCore::ImageViewInfo cv{};
     cv.format = vk::Format::eR16G16B16A16Sfloat;
-    static const bool bb_vol = [] {
-        const char* e = std::getenv("BB_RT_VOLUMETRIC");
-        return e && e[0] == '1';
-    }();
     const BB::RtReflect::Input in{
         .target = target->GetImage(),
         .target_view = *target->FindView(tv, false).image_view,
@@ -609,7 +632,7 @@ void Rasterizer::BbRtReflectRun() {
         .normal_layout = layout_of(*normal),
         .color = color->GetImage(),
         .color_view = *color->FindView(cv, false).image_view,
-        .color_storage_view = bb_vol ? *color->FindView(tv, false).image_view : vk::ImageView{},
+        .color_storage_view = vk::ImageView{},
         .color_layout = layout_of(*color),
         .shine = shine ? shine->GetImage() : vk::Image{},
         .shine_view = shine ? *shine->FindView(nv, false).image_view : vk::ImageView{},
@@ -623,6 +646,117 @@ void Rasterizer::BbRtReflectRun() {
     const bool ran = bb_rt_reflect->Run(scheduler.CommandBuffer(), in);
     bb_rt_full_pending = ran && bb_rt_reflect->FullRes() && bb_rt_reflect->FullView();
     bb_rt_ssr_addr = target->info.guest_address;
+}
+
+// bb-rt-light (BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1): right before the game's composite draw
+// (PS 0x3fe9e964, which runs whether or not the game's SSR is on), outside the render pass: RT
+// shadows darken and volumetric light is added into the lit scene (the largest RGBA16F image the
+// composite samples). Depth: the depth image it samples; RT0: the largest RGBA8 it samples.
+void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
+    bool is_composite = false;
+    for (const auto* stage : pipeline.GetStages()) {
+        if (stage && stage->sw_stage == Shader::SwStage::Fragment &&
+            stage->pgm_hash == BbCompositePsHash) {
+            is_composite = true;
+        }
+    }
+    if (!is_composite || !bb_rt_reflect->LightingOn()) {
+        return;
+    }
+    // Once per game frame: a second composite draw in the same frame would darken twice.
+    static u32 last_frame = ~0u;
+    static u64 skipped = 0;
+    const u32 frame = DebugState.GetFrameNum();
+    if (frame == last_frame) {
+        if (++skipped == 1) {
+            LOG_INFO(Render_Vulkan, "[rt-light] composite PS {:#x} drawn twice in a frame: the "
+                                    "RT lighting runs on the first only",
+                     BbCompositePsHash);
+        }
+        return;
+    }
+    last_frame = frame;
+    VideoCore::Image* depth = nullptr;
+    VideoCore::Image* normal = nullptr;
+    VideoCore::Image* scene = nullptr;
+    const auto area = [](const VideoCore::Image* i) {
+        return i ? u64(i->info.size.width) * i->info.size.height : 0ull;
+    };
+    std::string desc;
+    static bool logged = false;
+    for (const auto& image_id : bound_images) {
+        auto& img = texture_cache.GetImage(image_id);
+        const auto f = img.info.pixel_format;
+        if (!logged) {
+            desc += fmt::format(" [{} guest={:#x} {}x{} {}]",
+                                img.binding.is_target ? "target" : "tex", img.info.guest_address,
+                                img.info.size.width, img.info.size.height, vk::to_string(f));
+        }
+        if (img.info.num_samples > 1) {
+            continue;
+        }
+        if (img.info.props.is_depth) {
+            if (!depth || (!img.binding.is_target && depth->binding.is_target)) {
+                depth = &img;
+            }
+        } else if (!img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat &&
+                   area(&img) > area(scene)) {
+            scene = &img;
+        } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm &&
+                   area(&img) > area(normal)) {
+            normal = &img;
+        }
+    }
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-light] composite PS {:#x} images:{} -> scene {}, depth {}, RT0 {}",
+                 BbCompositePsHash, desc.empty() ? " none" : desc,
+                 scene ? fmt::format("{:#x} {}x{}", scene->info.guest_address,
+                                     scene->info.size.width, scene->info.size.height)
+                       : std::string("none (skipped)"),
+                 depth ? fmt::format("{:#x} {}x{}", depth->info.guest_address,
+                                     depth->info.size.width, depth->info.size.height)
+                       : std::string("none (skipped)"),
+                 normal ? fmt::format("{:#x}", normal->info.guest_address)
+                        : std::string("none (depth normals)"));
+    }
+    if (normal && area(normal) < area(scene) / 4) {
+        normal = nullptr;
+    }
+    if (!scene || !depth) {
+        return;
+    }
+    const auto layout_of = [](const VideoCore::Image& img) {
+        return img.backing->subresource_states.empty()
+                   ? img.backing->state.layout
+                   : img.backing->subresource_states[0].layout;
+    };
+    VideoCore::ImageViewInfo sv{};
+    sv.format = vk::Format::eR16G16B16A16Sfloat;
+    sv.is_storage = true;
+    VideoCore::ImageViewInfo dv{};
+    dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
+    VideoCore::ImageViewInfo nv{};
+    nv.format = vk::Format::eR8G8B8A8Unorm;
+    const BB::RtReflect::LightInput in{
+        .depth = depth->GetImage(),
+        .depth_view = *depth->FindView(dv, false).image_view,
+        .depth_layout = layout_of(*depth),
+        .depth_has_stencil = bool(depth->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .normal = normal ? normal->GetImage() : vk::Image{},
+        .normal_view = normal ? *normal->FindView(nv, false).image_view : vk::ImageView{},
+        .normal_layout = normal ? layout_of(*normal) : vk::ImageLayout::eUndefined,
+        .scene = scene->GetImage(),
+        .scene_storage_view = *scene->FindView(sv, false).image_view,
+        .scene_layout = layout_of(*scene),
+        .depth_width = depth->info.size.width,
+        .depth_height = depth->info.size.height,
+        .scene_width = scene->info.size.width,
+        .scene_height = scene->info.size.height,
+    };
+    scheduler.EndRendering();
+    bb_rt_reflect->RunLighting(scheduler.CommandBuffer(), in);
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
@@ -666,6 +800,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     if (needs_barrier) {
         runtime.FlushBarriers();
+    }
+    if (bb_rt_reflect && BbRtLightRequested()) {
+        BbRtLightRun(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -762,6 +899,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     if (needs_barrier) {
         runtime.FlushBarriers();
+    }
+    if (bb_rt_reflect && BbRtLightRequested()) {
+        BbRtLightRun(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -1290,7 +1430,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                if (BB::Upscale::Capture() || BbRtReflectRequested()) {
+                if (BB::Upscale::Capture() || BbRtAnyRequested()) {
                     BB::Upscale::OnConstants(stage.flattened_ud_buf.data(),
                                              stage.flattened_ud_buf.size());
                 }
@@ -1342,20 +1482,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
                     !desc.is_written && size >= 864 &&
-                    size <= 16384 && (BB::Upscale::Capture() || BbRtReflectRequested()) &&
+                    size <= 16384 && (BB::Upscale::Capture() || BbRtAnyRequested()) &&
                     memory->IsValidMapping(vsharp.base_address, 272)) {
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));
                 }
                 // bb-rt-vol: the game's light-set (slot 5) and fog (slot 6) constant buffers,
                 // layouts from Ghidra (FUN_026deeb0, FUN_02651f10); see bb_upscale.h.
+                // The V# can cover more than the 288-byte light CB: for the lighting shaders
+                // any size is looked at (the first 1 KiB at most).
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
-                    !desc.is_written && size >= 84 && size <= 320 && BbRtVolRequested() &&
-                    memory->IsValidMapping(vsharp.base_address, size)) {
-                    BB::Upscale::OnLightingConstants(
-                        reinterpret_cast<const u32*>(vsharp.base_address),
-                        static_cast<size_t>(size), stage.pgm_hash);
+                    !desc.is_written && size >= 84 && BbRtLightRequested() &&
+                    (size <= 320 || stage.pgm_hash == BbCompositePsHash ||
+                     stage.pgm_hash == 0x8747a367 || stage.pgm_hash == BbSsrPsHash)) {
+                    const u64 look = std::min<u64>(size, 1024);
+                    if (memory->IsValidMapping(vsharp.base_address, look)) {
+                        BB::Upscale::OnLightingConstants(
+                            reinterpret_cast<const u32*>(vsharp.base_address),
+                            static_cast<size_t>(look), stage.pgm_hash);
+                    }
                 }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",

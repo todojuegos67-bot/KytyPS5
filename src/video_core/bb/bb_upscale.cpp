@@ -307,6 +307,7 @@ struct RtCam {
 } g_rt_cam;
 
 u32 g_frame_no = 0;
+u32 g_rt_frame = 0; // bb-rt: frames, counted whether or not jitter is on
 float g_jitter[2]{};
 
 float Halton(u32 index, u32 base) {
@@ -690,6 +691,8 @@ struct RtLighting {
     float fog[24]{};
     u32 light_frame = 0, fog_frame = 0;
     bool light_valid = false, fog_valid = false;
+    u64 light_hash = 0;
+    size_t light_bytes = 0;
 } g_rt_lighting;
 bool Finite(const float* f, int n) {
     for (int i = 0; i < n; ++i) {
@@ -701,49 +704,80 @@ bool Finite(const float* f, int n) {
 
 void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
     const float* f = reinterpret_cast<const float*>(data);
+    const bool light_hash = hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2;
+    // Diagnostic: the read-only buffers the lighting draws bind, once per (hash, size).
+    if (light_hash && bytes >= 64) {
+        static std::vector<std::pair<u64, size_t>> seen;
+        std::scoped_lock lk{g_cam_mutex};
+        if (seen.size() < 32 &&
+            std::ranges::find(seen, std::pair{hash, bytes}) == seen.end()) {
+            seen.emplace_back(hash, bytes);
+            const auto len = [&](int i) {
+                return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
+            };
+            LOG_INFO(Render_Vulkan,
+                     "[rt-light] CB candidate: shader {:#x} {} B: f0-7 ({:.3f} {:.3f} {:.3f} "
+                     "{:.3f} {:.3f} {:.3f} {:.3f} {:.3f}) |v0..v3| {:.3f} {:.3f} {:.3f} {:.3f} "
+                     "f16-19 ({:.3f} {:.3f} {:.3f} {:.3f}) u20 {:#x}",
+                     hash, bytes, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], len(0), len(4),
+                     len(8), len(12), f[16], f[17], f[18], f[19], data[20]);
+        }
+    }
     // Fog CB (FUN_02651f10): v2.x == v0.x, v2.z == v0.y (1/dist), v2.w == v0.w (1/H),
-    // v1.w == v4.w (p30), v5.x == int 1, colours (squares) >= 0.
-    if (bytes >= 84 && bytes <= 256 && data[20] == 1u && Finite(f, 20) && f[10] == f[1] &&
-        f[11] == f[3] && f[8] == f[0] && f[7] == f[19] && f[1] >= 0.0f &&
-        f[4] >= 0.0f && f[5] >= 0.0f && f[6] >= 0.0f && f[16] >= 0.0f && f[17] >= 0.0f &&
-        f[18] >= 0.0f && (f[1] > 0.0f || f[3] != 0.0f)) {
+    // colours (squares) >= 0.
+    if (bytes >= 84 && bytes <= 512 && Finite(f, 20) && f[10] == f[1] && f[11] == f[3] &&
+        f[8] == f[0] && f[1] >= 0.0f && f[4] >= 0.0f && f[5] >= 0.0f && f[6] >= 0.0f &&
+        f[16] >= 0.0f && f[17] >= 0.0f && f[18] >= 0.0f && (f[1] > 0.0f || f[3] != 0.0f)) {
         std::scoped_lock lk{g_cam_mutex};
         std::memcpy(g_rt_lighting.fog, f, 21 * sizeof(float));
-        g_rt_lighting.fog_frame = g_frame_no;
+        g_rt_lighting.fog_frame = g_rt_frame;
         g_rt_lighting.fog_valid = true;
         return;
     }
-    // Light CB (FUN_026deeb0): only from the deferred lighting / composite / SSR draws.
-    if ((hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2) && bytes >= 288 &&
-        bytes <= 320 && Finite(f, 72)) {
+    // Light CB (FUN_026deeb0, 288 B; the V# may cover more): from the deferred lighting /
+    // composite / SSR draws. Light 0's direction is set+0x40 (not renormalised by the packer), so
+    // any of the 4 directions with a non-trivial length and a non-negative diffuse is accepted.
+    if (light_hash && bytes >= 288 && Finite(f, 72)) {
         const auto len = [&](int i) {
             return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
         };
-        bool colours_ok = true;
-        for (int i = 16; i < 48; ++i) {
-            if ((i & 3) != 3 && f[i] < 0.0f) colours_ok = false;
+        bool any_dir = false;
+        for (int i = 0; i < 4; ++i) {
+            const float l = len(4 * i);
+            const float* c = f + 16 + 4 * i;
+            if (l > 0.5f && l < 2.0f && c[0] >= 0.0f && c[1] >= 0.0f && c[2] >= 0.0f &&
+                c[0] + c[1] + c[2] > 1e-5f) {
+                any_dir = true;
+            }
         }
-        if (!colours_ok || std::abs(len(0) - 1.0f) > 0.05f) {
+        if (!any_dir) {
             return;
         }
         std::scoped_lock lk{g_cam_mutex};
         std::memcpy(g_rt_lighting.light, f, 72 * sizeof(float));
-        g_rt_lighting.light_frame = g_frame_no;
+        g_rt_lighting.light_frame = g_rt_frame;
         g_rt_lighting.light_valid = true;
+        g_rt_lighting.light_hash = hash;
+        g_rt_lighting.light_bytes = bytes;
     }
+}
+void RtLightSource(u64& hash, size_t& bytes) {
+    std::scoped_lock lk{g_cam_mutex};
+    hash = g_rt_lighting.light_hash;
+    bytes = g_rt_lighting.light_bytes;
 }
 bool RtLightBlock(float out[72], u64& age_frames) {
     std::scoped_lock lk{g_cam_mutex};
     if (!g_rt_lighting.light_valid) return false;
     std::memcpy(out, g_rt_lighting.light, sizeof(g_rt_lighting.light));
-    age_frames = g_frame_no - g_rt_lighting.light_frame;
+    age_frames = g_rt_frame - g_rt_lighting.light_frame;
     return true;
 }
 bool RtFogBlock(float out[24], u64& age_frames) {
     std::scoped_lock lk{g_cam_mutex};
     if (!g_rt_lighting.fog_valid) return false;
     std::memcpy(out, g_rt_lighting.fog, sizeof(g_rt_lighting.fog));
-    age_frames = g_frame_no - g_rt_lighting.fog_frame;
+    age_frames = g_rt_frame - g_rt_lighting.fog_frame;
     return true;
 }
 
@@ -853,6 +887,7 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
             cam.mv_valid = true;
         }
     }
+    ++g_rt_frame;
     g_scene_w = flip_w;
     g_scene_h = flip_h;
     // Next frame's jitter: Halton(2,3) - 0.5 over 8 * ratio^2 phases (at least 8).

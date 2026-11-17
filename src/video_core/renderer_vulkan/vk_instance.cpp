@@ -438,7 +438,12 @@ bool Instance::CreateDevice() {
     // bb-rt-reflect (BB_RT_REFLECT=1, default off): ray query + acceleration structures for the
     // ray-traced reflection pass that will replace the game's SSR. Unset: nothing changes.
     bool bb_rt_on = false;
-    if (const char* e = std::getenv("BB_RT_REFLECT"); e && e[0] == '1') {
+    const auto bb_env_on = [](const char* n) {
+        const char* e = std::getenv(n);
+        return e && e[0] == '1';
+    };
+    if (bb_env_on("BB_RT_REFLECT") || bb_env_on("BB_RT_VOLUMETRIC") ||
+        bb_env_on("BB_RT_SHADOWS")) {
         const auto has = [&](std::string_view n) {
             return std::find(available_extensions.begin(), available_extensions.end(), n) !=
                    available_extensions.end();

@@ -14,6 +14,7 @@
 #include "video_core/host_shaders/bb_rt_mesh_comp.h"
 #include "video_core/host_shaders/bb_rt_post_comp.h"
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
+#include "video_core/host_shaders/bb_rt_shadow_comp.h"
 #include "video_core/host_shaders/bb_rt_vol_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -97,6 +98,19 @@ struct alignas(16) VolParams {
 };
 static_assert(sizeof(VolParams) <= 512);
 
+struct alignas(16) ShParams {
+    float proj[16];
+    float inv_proj[16];
+    float reproj[16];
+    float prev_proj[16];
+    u32 size[4];    // trace w, h, scene w, h
+    float light[4]; // view-space direction toward the light, cone half-angle
+    float misc[4];  // strength, max ray length, frame, history valid
+    float misc2[4]; // temporal blend, far distance, y sign, G-buffer normals
+    float view[16];
+};
+static_assert(sizeof(ShParams) <= 512);
+
 float EnvFloat(const char* name, float def, float lo, float hi) {
     const char* e = std::getenv(name);
     if (!e || !e[0]) return def;
@@ -118,6 +132,22 @@ RtReflect::~RtReflect() {
     if (!device) return;
     (void)device.waitIdle();
     FreeSized();
+    FreeImage(vraw);
+    for (auto& i : vacc) FreeImage(i);
+    FreeImage(sraw);
+    for (auto& i : sacc) FreeImage(i);
+    if (blas) device.destroyAccelerationStructureKHR(blas);
+    if (tlas) device.destroyAccelerationStructureKHR(tlas);
+    FreeBuffer(verts);
+    FreeBuffer(blas_buf);
+    FreeBuffer(tlas_buf);
+    FreeBuffer(scratch);
+    FreeBuffer(sh_params);
+    if (sh_pipe) device.destroyPipeline(sh_pipe);
+    if (sh_layout) device.destroyPipelineLayout(sh_layout);
+    if (sh_set) device.destroyDescriptorSetLayout(sh_set);
+    if (sh_queries) device.destroyQueryPool(sh_queries);
+    if (l_queries) device.destroyQueryPool(l_queries);
     FreeBuffer(instances);
     FreeBuffer(params);
     FreeBuffer(counters);
@@ -218,35 +248,25 @@ void RtReflect::FreeImage(Img& i) {
 }
 
 void RtReflect::FreeSized() {
-    const auto device = instance.GetDevice();
     FreeImage(raw);
     FreeImage(tmp);
     FreeImage(full);
     for (auto& i : guide) FreeImage(i);
     for (auto& i : hist) FreeImage(i);
-    FreeImage(vraw);
-    for (auto& i : vacc) FreeImage(i);
-    vol_w = vol_h = 0;
-    vol_fresh = true;
     have_prev = false;
-    if (blas) device.destroyAccelerationStructureKHR(blas);
-    if (tlas) device.destroyAccelerationStructureKHR(tlas);
-    blas = tlas = vk::AccelerationStructureKHR{};
-    FreeBuffer(verts);
-    FreeBuffer(blas_buf);
-    FreeBuffer(tlas_buf);
-    FreeBuffer(scratch);
-    w = h = gw = gh = tris = 0;
+    w = h = 0;
 }
 
 bool RtReflect::Init() {
     if (tried) return ok;
     tried = true;
     if (!instance.IsRtReflectEnabled()) {
-        LOG_WARNING(Render_Vulkan, "[rt-reflect] device has no ray query / acceleration "
-                                   "structures: the game's SSR is kept");
+        LOG_WARNING(Render_Vulkan, "[rt] device has no ray query / acceleration structures: "
+                                   "RT reflections / volumetric light / shadows off");
         return false;
     }
+    refl_on = EnvOn("BB_RT_REFLECT");
+    ts_period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
     debug = EnvOn("BB_RT_REFLECT_DEBUG");
     scale = EnvOn("BB_RT_REFLECT_FULLRES") ? 2u : 1u;
     more = EnvOn("BB_RT_REFLECT_MORE");
@@ -362,8 +382,9 @@ bool RtReflect::Init() {
         return true;
     };
     if (!pipeline(Vulkan::CompileSPV(BB_RT_MESH_COMP, device), mesh_layout, mesh_pipe) ||
-        !pipeline(Vulkan::CompileSPV(BB_RT_REFLECT_COMP, device), ray_layout, ray_pipe) ||
-        !pipeline(Vulkan::CompileSPV(BB_RT_POST_COMP, device), post_layout, post_pipe)) {
+        (refl_on &&
+         (!pipeline(Vulkan::CompileSPV(BB_RT_REFLECT_COMP, device), ray_layout, ray_pipe) ||
+          !pipeline(Vulkan::CompileSPV(BB_RT_POST_COMP, device), post_layout, post_pipe)))) {
         LOG_ERROR(Render_Vulkan, "[rt-reflect] compute pipelines failed");
         return false;
     }
@@ -382,17 +403,36 @@ bool RtReflect::Init() {
     if (qr == vk::Result::eSuccess) {
         queries = qp;
     }
+    auto [lqr, lqp] = device.createQueryPool({
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = Ring * 2,
+    });
+    if (lqr == vk::Result::eSuccess) {
+        l_queries = lqp;
+    }
     ok = true;
-    LOG_INFO(Render_Vulkan,
-             "[rt-reflect] strength {:.2f} (BB_RT_REFLECT_STRENGTH: hit weight x strength, hit "
-             "colour x(1 + (strength-1)/2)), depth-buffer hit refinement {} (BB_RT_REFLECT_REFINE), "
-             "mirrors (roughness < 0.05): 1 exact ray, no spatial blur, 40% temporal weight",
-             strength, refine ? "on" : "off");
     vol_on = EnvOn("BB_RT_VOLUMETRIC");
     if (vol_on && !InitVolumetric()) {
         vol_on = false;
         LOG_ERROR(Render_Vulkan, "[rt-vol] init failed: volumetric light off");
     }
+    sh_on = EnvOn("BB_RT_SHADOWS");
+    if (sh_on && !InitShadows()) {
+        sh_on = false;
+        LOG_ERROR(Render_Vulkan, "[rt-shadow] init failed: RT shadows off");
+    }
+    LOG_INFO(Render_Vulkan,
+             "[rt] features: reflections {} (SSR draw hook), volumetric {} / shadows {} (composite "
+             "PS 0x3fe9e964 hook, independent of the game's SSR); pipelines built at start",
+             refl_on ? "on" : "off", vol_on ? "on" : "off", sh_on ? "on" : "off");
+    if (!refl_on) {
+        return true;
+    }
+    LOG_INFO(Render_Vulkan,
+             "[rt-reflect] strength {:.2f} (BB_RT_REFLECT_STRENGTH: hit weight x strength, hit "
+             "colour x(1 + (strength-1)/2)), depth-buffer hit refinement {} (BB_RT_REFLECT_REFINE), "
+             "mirrors (roughness < 0.05): 1 exact ray, no spatial blur, 40% temporal weight",
+             strength, refine ? "on" : "off");
     LOG_INFO(Render_Vulkan,
              "[rt-reflect] ray-traced reflections ON: quality {} (depth mesh {}x{} px cells, {} "
              "rays/px, temporal blend {:.2f}, 2-pass bilateral x{:.1f}), more {}, shininess {}, "
@@ -405,21 +445,14 @@ bool RtReflect::Init() {
 }
 
 bool RtReflect::EnsureSize(u32 width, u32 height) {
-    if (width == w && height == h && blas) return true;
-    const auto device = instance.GetDevice();
+    if (width == w && height == h && raw.image) return true;
     if (w != 0) {
-        (void)device.waitIdle(); // a resize only
+        (void)instance.GetDevice().waitIdle(); // a resize only
     }
     FreeSized();
     w = width;
     h = height;
-    gw = (w + Cell - 1) / Cell;
-    gh = (h + Cell - 1) / Cell;
-    tris = gw * gh * 2;
-    using U = vk::BufferUsageFlagBits;
-    if (!MakeBuffer(verts, vk::DeviceSize(tris) * 3 * 3 * sizeof(float),
-                    U::eStorageBuffer | U::eAccelerationStructureBuildInputReadOnlyKHR, false) ||
-        !MakeImage(raw, w * scale, h * scale) || !MakeImage(tmp, w * scale, h * scale) ||
+    if (!MakeImage(raw, w * scale, h * scale) || !MakeImage(tmp, w * scale, h * scale) ||
         !MakeImage(guide[0], w * scale, h * scale) || !MakeImage(guide[1], w * scale, h * scale) ||
         !MakeImage(hist[0], w * scale, h * scale) || !MakeImage(hist[1], w * scale, h * scale) ||
         (scale > 1 && !MakeImage(full, w * scale, h * scale))) {
@@ -427,6 +460,44 @@ bool RtReflect::EnsureSize(u32 width, u32 height) {
         return false;
     }
     images_fresh = true;
+    return true;
+}
+
+bool RtReflect::EnsureMesh(u32 mw, u32 mh, u32 cell) {
+    if (mw == mesh_w && mh == mesh_h && cell == mesh_cell && blas) return true;
+    const auto device = instance.GetDevice();
+    if (mesh_w != 0) {
+        (void)device.waitIdle(); // a resize only
+    }
+    if (blas) device.destroyAccelerationStructureKHR(blas);
+    if (tlas) device.destroyAccelerationStructureKHR(tlas);
+    blas = tlas = vk::AccelerationStructureKHR{};
+    FreeBuffer(verts);
+    FreeBuffer(blas_buf);
+    FreeBuffer(tlas_buf);
+    FreeBuffer(scratch);
+    mesh_w = mw;
+    mesh_h = mh;
+    mesh_cell = cell;
+    gw = (mw + cell - 1) / cell;
+    gh = (mh + cell - 1) / cell;
+    tris = gw * gh * 2;
+    const auto fail = [&] {
+        if (blas) device.destroyAccelerationStructureKHR(blas);
+        if (tlas) device.destroyAccelerationStructureKHR(tlas);
+        blas = tlas = vk::AccelerationStructureKHR{};
+        FreeBuffer(verts);
+        FreeBuffer(blas_buf);
+        FreeBuffer(tlas_buf);
+        FreeBuffer(scratch);
+        mesh_w = mesh_h = mesh_cell = gw = gh = tris = 0;
+        return false;
+    };
+    using U = vk::BufferUsageFlagBits;
+    if (!MakeBuffer(verts, vk::DeviceSize(tris) * 3 * 3 * sizeof(float),
+                    U::eStorageBuffer | U::eAccelerationStructureBuildInputReadOnlyKHR, false)) {
+        return fail();
+    }
     // BLAS sizes.
     const vk::AccelerationStructureGeometryKHR geom{
         .geometryType = vk::GeometryTypeKHR::eTriangles,
@@ -478,8 +549,7 @@ bool RtReflect::EnsureSize(u32 width, u32 height) {
                     U::eAccelerationStructureStorageKHR, false) ||
         !MakeBuffer(scratch, tlas_scratch + tsz.buildScratchSize, U::eStorageBuffer, false,
                     align)) {
-        FreeSized();
-        return false;
+        return fail();
     }
     auto [br, b] = device.createAccelerationStructureKHR({
         .buffer = blas_buf.buffer,
@@ -494,8 +564,7 @@ bool RtReflect::EnsureSize(u32 width, u32 height) {
     if (br != vk::Result::eSuccess || tr != vk::Result::eSuccess) {
         if (br == vk::Result::eSuccess) device.destroyAccelerationStructureKHR(b);
         if (tr == vk::Result::eSuccess) device.destroyAccelerationStructureKHR(t);
-        FreeSized();
-        return false;
+        return fail();
     }
     blas = b;
     tlas = t;
@@ -511,219 +580,16 @@ bool RtReflect::EnsureSize(u32 width, u32 height) {
     });
     std::memcpy(instances.mapped, &inst, sizeof(inst));
     LOG_INFO(Render_Vulkan,
-             "[rt-reflect] depth mesh {}x{}: {}x{} cells, {} triangles, BLAS {} KiB, TLAS {} KiB, "
+             "[rt] depth mesh {}x{}: {}x{} cells, {} triangles, BLAS {} KiB, TLAS {} KiB, "
              "scratch {} KiB",
-             w, h, gw, gh, tris, bsz.accelerationStructureSize / 1024,
+             mw, mh, gw, gh, tris, bsz.accelerationStructureSize / 1024,
              tsz.accelerationStructureSize / 1024, scratch.size / 1024);
     return true;
 }
 
-bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
-    if (!Init()) return false;
-    float proj[16], view[12], far_dist = 3000.0f;
-    if (!BB::Upscale::RtCamera(proj, view, far_dist)) {
-        return false;
-    }
-    double inv[16];
-    if (!Invert4(proj, inv)) {
-        return false;
-    }
-    if (!EnsureSize(in.width, in.height)) {
-        return false;
-    }
-    const auto device = instance.GetDevice();
-
-    // Parameters (ring slot).
-    const u32 slot = ring_pos++ % Ring;
-    Params prm{};
-    double pd[16], vd[16]{};
-    for (int i = 0; i < 16; ++i) pd[i] = proj[i];
-    for (int r = 0; r < 3; ++r)
-        for (int c = 0; c < 4; ++c) vd[r * 4 + c] = view[r * 4 + c];
-    vd[15] = 1.0;
-    ToGlsl(pd, prm.proj);
-    ToGlsl(inv, prm.inv_proj);
-    ToGlsl(vd, prm.view);
-    prm.size[0] = w;
-    prm.size[1] = h;
-    prm.size[2] = gw;
-    prm.size[3] = gh;
-    // Assumption (logged once): depth is NDC z in [0, 1] (no remap) and NDC y points up
-    // (row 0 of the image is ndc.y = +1, D3D/GNM convention).
-    prm.misc[0] = far_dist > 1.0f ? far_dist : 3000.0f;
-    prm.misc[1] = 1.0f;
-    prm.misc[2] = float(Cell);
-    prm.misc[3] = debug ? 1.0f : 0.0f;
-    // Temporal reprojection: current view -> world -> previous view.
-    double inv_view[16];
-    double rp[16]{};
-    const bool cam_prev_ok = have_prev && Invert4(vd, inv_view);
-    const bool hist_ok = cam_prev_ok && !images_fresh;
-    if (cam_prev_ok) {
-        Mul4(prev_view, inv_view, rp);
-    }
-    double vol_prev_proj[16];
-    std::memcpy(vol_prev_proj, prev_proj, sizeof(vol_prev_proj));
-    if (hist_ok) {
-        ToGlsl(rp, prm.reproj);
-        ToGlsl(prev_proj, prm.prev_proj);
-    }
-    const bool shine_on = use_shine && in.shine && in.shine_view;
-    if (!logged_shine) {
-        logged_shine = true;
-        LOG_INFO(Render_Vulkan, "[rt-reflect] G-buffer RT1 (shininess): {}",
-                 shine_on ? "bound, used for roughness / blend"
-                          : (use_shine ? "not among the SSR draw's images, default roughness"
-                                       : "disabled (BB_RT_REFLECT_SHINE=0)"));
-    }
-    const u32 cur = u32(frame & 1), prv = cur ^ 1u;
-    prm.misc2[0] = hist_ok ? 1.0f : 0.0f;
-    prm.misc2[1] = float(frame & 0xffff);
-    prm.misc2[2] = float(rays);
-    prm.misc2[3] = float((shine_on ? 1u : 0u) | (more ? 2u : 0u));
-    prm.misc3[0] = temporal_blend;
-    prm.misc3[1] = 0.12f; // default roughness without RT1
-    prm.misc3[2] = filter_strength;
-    prm.misc3[3] = float(scale);
-    prm.misc4[0] = strength;
-    prm.misc4[1] = refine ? 1.0f : 0.0f;
-    std::memcpy(prev_view, vd, sizeof(prev_view));
-    std::memcpy(prev_proj, pd, sizeof(prev_proj));
-    have_prev = true;
-    ++frame;
-    std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
-    if (!logged_camera) {
-        logged_camera = true;
-        // Near / far from the projection: view z where ndc z = 0 and 1 (column vectors).
-        const auto zat = [&](double nz) {
-            // Solve (p2 . v) / (p3 . v) = nz along the view axis v = (0, 0, z, 1).
-            const double a = proj[10] - nz * proj[14];
-            const double b = proj[11] - nz * proj[15];
-            return std::fabs(a) > 1e-12 ? -b / a : 0.0;
-        };
-        LOG_INFO(Render_Vulkan,
-                 "[rt-reflect] camera: proj rows [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} "
-                 "{:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}], "
-                 "fov_y {:.1f} deg, view z at depth 0: {:.3f}, at depth 1: {:.3f}, far {} "
-                 "(assumes depth = ndc z in [0,1], ndc y up)",
-                 proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], proj[6], proj[7], proj[8],
-                 proj[9], proj[10], proj[11], proj[12], proj[13], proj[14], proj[15],
-                 proj[5] != 0.0f ? 2.0 * std::atan(1.0 / std::fabs(proj[5])) * 57.29578 : 0.0,
-                 zat(0.0), zat(1.0), prm.misc[0]);
-    }
-
-    // GPU time of the previous use of this slot.
-    if (queries && query_used[slot]) {
-        std::array<u64, 2> ts{};
-        if (device.getQueryPoolResults(queries, slot * 2, 2, sizeof(ts), ts.data(), sizeof(u64),
-                                       vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
-            const double period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
-            const double ms = double(ts[1] - ts[0]) * period * 1e-6;
-            if (ms > 0.0 && ms < 1000.0) {
-                gpu_ms_sum += ms;
-                ++gpu_ms_n;
-            }
-        }
-    }
-    if (queries) {
-        cmd.resetQueryPool(queries, slot * 2, 2);
-        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, queries, slot * 2);
-        query_used[slot] = true;
-    }
-
-    // Everything before (the SSR draw, the previous pass's AS reads / builds) -> this pass.
-    const vk::MemoryBarrier2 all_before{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-    };
-    // Layout changes: the SSR target to GENERAL (storage); inputs only when not sampleable.
-    const auto sampleable = [](vk::ImageLayout l) {
-        return l == vk::ImageLayout::eGeneral || l == vk::ImageLayout::eShaderReadOnlyOptimal ||
-               l == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
-               l == vk::ImageLayout::eDepthReadOnlyOptimal ||
-               l == vk::ImageLayout::eReadOnlyOptimal;
-    };
-    struct Tr {
-        vk::Image image;
-        vk::ImageLayout from;
-        vk::ImageAspectFlags aspect;
-    };
-    std::array<Tr, 5> trs{};
-    u32 ntr = 0;
-    const auto depth_aspect = in.depth_has_stencil
-                                  ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
-                                  : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
-    if (in.target_layout != vk::ImageLayout::eGeneral) {
-        trs[ntr++] = {in.target, in.target_layout, vk::ImageAspectFlagBits::eColor};
-    }
-    if (!sampleable(in.depth_layout)) trs[ntr++] = {in.depth, in.depth_layout, depth_aspect};
-    if (!sampleable(in.normal_layout)) {
-        trs[ntr++] = {in.normal, in.normal_layout, vk::ImageAspectFlagBits::eColor};
-    }
-    const bool vol_run = vol_on && vol_ok && in.color_storage_view;
-    const bool color_general = vol_run || !sampleable(in.color_layout);
-    if (color_general && in.color_layout != vk::ImageLayout::eGeneral) {
-        trs[ntr++] = {in.color, in.color_layout, vk::ImageAspectFlagBits::eColor};
-    }
-    if (shine_on && in.shine != in.normal && in.shine != in.color && !sampleable(in.shine_layout)) {
-        trs[ntr++] = {in.shine, in.shine_layout, vk::ImageAspectFlagBits::eColor};
-    }
-    if (images_fresh) {
-        // Own images: UNDEFINED -> GENERAL once (they stay GENERAL).
-        std::array<vk::ImageMemoryBarrier2, 7> b{};
-        const std::array<vk::Image, 7> imgs{raw.image,      tmp.image,      guide[0].image,
-                                            guide[1].image, hist[0].image,  hist[1].image,
-                                            full.image};
-        const u32 nimg = full.image ? 7u : 6u;
-        for (u32 i = 0; i < nimg; ++i) {
-            b[i] = vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask =
-                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .image = imgs[i],
-                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-            };
-        }
-        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = nimg,
-                                                .pImageMemoryBarriers = b.data()});
-        images_fresh = false;
-    }
-    const auto layouts = [&](bool to_general) {
-        std::array<vk::ImageMemoryBarrier2, 5> b{};
-        for (u32 i = 0; i < ntr; ++i) {
-            b[i] = vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .dstAccessMask =
-                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                .oldLayout = to_general ? trs[i].from : vk::ImageLayout::eGeneral,
-                .newLayout = to_general ? vk::ImageLayout::eGeneral : trs[i].from,
-                .image = trs[i].image,
-                .subresourceRange{trs[i].aspect, 0, 1, 0, 1},
-            };
-        }
-        cmd.pipelineBarrier2(vk::DependencyInfo{
-            .memoryBarrierCount = to_general ? 1u : 0u,
-            .pMemoryBarriers = &all_before,
-            .imageMemoryBarrierCount = ntr,
-            .pImageMemoryBarriers = b.data(),
-        });
-    };
-    layouts(true);
-    const auto lay = [&](vk::ImageLayout l) {
-        return sampleable(l) ? l : vk::ImageLayout::eGeneral;
-    };
-
-    // 1. Depth mesh.
-    const vk::DescriptorImageInfo depth_info{nearest, in.depth_view, lay(in.depth_layout)};
+void RtReflect::BuildMesh(vk::CommandBuffer cmd, const vk::DescriptorImageInfo& depth_info,
+                          const vk::DescriptorBufferInfo& params_info) {
     const vk::DescriptorBufferInfo verts_info{verts.buffer, 0, verts.size};
-    const vk::DescriptorBufferInfo params_info{params.buffer, slot * ParamSize, ParamSize};
     {
         const std::array<vk::WriteDescriptorSet, 3> wr{{
             {.dstBinding = 0, .descriptorCount = 1,
@@ -807,6 +673,201 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
         .dstAccessMask = vk::AccessFlagBits2::eAccelerationStructureReadKHR,
     };
     cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &tlas_done});
+
+}
+
+bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
+    if (!Init() || !refl_on) return false;
+    float proj[16], view[12], far_dist = 3000.0f;
+    if (!BB::Upscale::RtCamera(proj, view, far_dist)) {
+        return false;
+    }
+    double inv[16];
+    if (!Invert4(proj, inv)) {
+        return false;
+    }
+    if (!EnsureSize(in.width, in.height) || !EnsureMesh(in.width, in.height, Cell)) {
+        return false;
+    }
+
+    // Parameters (ring slot).
+    const u32 slot = ring_pos++ % Ring;
+    Params prm{};
+    double pd[16], vd[16]{};
+    for (int i = 0; i < 16; ++i) pd[i] = proj[i];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) vd[r * 4 + c] = view[r * 4 + c];
+    vd[15] = 1.0;
+    ToGlsl(pd, prm.proj);
+    ToGlsl(inv, prm.inv_proj);
+    ToGlsl(vd, prm.view);
+    prm.size[0] = mesh_w;
+    prm.size[1] = mesh_h;
+    prm.size[2] = gw;
+    prm.size[3] = gh;
+    // Assumption (logged once): depth is NDC z in [0, 1] (no remap) and NDC y points up
+    // (row 0 of the image is ndc.y = +1, D3D/GNM convention).
+    prm.misc[0] = far_dist > 1.0f ? far_dist : 3000.0f;
+    prm.misc[1] = 1.0f;
+    prm.misc[2] = float(Cell);
+    prm.misc[3] = debug ? 1.0f : 0.0f;
+    // Temporal reprojection: current view -> world -> previous view.
+    double inv_view[16];
+    double rp[16]{};
+    const bool cam_prev_ok = have_prev && Invert4(vd, inv_view);
+    const bool hist_ok = cam_prev_ok && !images_fresh;
+    if (cam_prev_ok) {
+        Mul4(prev_view, inv_view, rp);
+    }
+    if (hist_ok) {
+        ToGlsl(rp, prm.reproj);
+        ToGlsl(prev_proj, prm.prev_proj);
+    }
+    const bool shine_on = use_shine && in.shine && in.shine_view;
+    if (!logged_shine) {
+        logged_shine = true;
+        LOG_INFO(Render_Vulkan, "[rt-reflect] G-buffer RT1 (shininess): {}",
+                 shine_on ? "bound, used for roughness / blend"
+                          : (use_shine ? "not among the SSR draw's images, default roughness"
+                                       : "disabled (BB_RT_REFLECT_SHINE=0)"));
+    }
+    const u32 cur = u32(frame & 1), prv = cur ^ 1u;
+    prm.misc2[0] = hist_ok ? 1.0f : 0.0f;
+    prm.misc2[1] = float(frame & 0xffff);
+    prm.misc2[2] = float(rays);
+    prm.misc2[3] = float((shine_on ? 1u : 0u) | (more ? 2u : 0u));
+    prm.misc3[0] = temporal_blend;
+    prm.misc3[1] = 0.12f; // default roughness without RT1
+    prm.misc3[2] = filter_strength;
+    prm.misc3[3] = float(scale);
+    prm.misc4[0] = strength;
+    prm.misc4[1] = refine ? 1.0f : 0.0f;
+    std::memcpy(prev_view, vd, sizeof(prev_view));
+    std::memcpy(prev_proj, pd, sizeof(prev_proj));
+    have_prev = true;
+    ++frame;
+    std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
+    if (!logged_camera) {
+        logged_camera = true;
+        // Near / far from the projection: view z where ndc z = 0 and 1 (column vectors).
+        const auto zat = [&](double nz) {
+            // Solve (p2 . v) / (p3 . v) = nz along the view axis v = (0, 0, z, 1).
+            const double a = proj[10] - nz * proj[14];
+            const double b = proj[11] - nz * proj[15];
+            return std::fabs(a) > 1e-12 ? -b / a : 0.0;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "[rt-reflect] camera: proj rows [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} "
+                 "{:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}], "
+                 "fov_y {:.1f} deg, view z at depth 0: {:.3f}, at depth 1: {:.3f}, far {} "
+                 "(assumes depth = ndc z in [0,1], ndc y up)",
+                 proj[0], proj[1], proj[2], proj[3], proj[4], proj[5], proj[6], proj[7], proj[8],
+                 proj[9], proj[10], proj[11], proj[12], proj[13], proj[14], proj[15],
+                 proj[5] != 0.0f ? 2.0 * std::atan(1.0 / std::fabs(proj[5])) * 57.29578 : 0.0,
+                 zat(0.0), zat(1.0), prm.misc[0]);
+    }
+
+    // GPU time of the previous use of this slot.
+    ReadTimer(queries, query_used, slot, gpu_ms_sum, gpu_ms_n);
+    if (queries) {
+        cmd.resetQueryPool(queries, slot * 2, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, queries, slot * 2);
+        query_used[slot] = true;
+    }
+
+    // Everything before (the SSR draw, the previous pass's AS reads / builds) -> this pass.
+    const vk::MemoryBarrier2 all_before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    // Layout changes: the SSR target to GENERAL (storage); inputs only when not sampleable.
+    const auto sampleable = [](vk::ImageLayout l) {
+        return l == vk::ImageLayout::eGeneral || l == vk::ImageLayout::eShaderReadOnlyOptimal ||
+               l == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+               l == vk::ImageLayout::eDepthReadOnlyOptimal ||
+               l == vk::ImageLayout::eReadOnlyOptimal;
+    };
+    struct Tr {
+        vk::Image image;
+        vk::ImageLayout from;
+        vk::ImageAspectFlags aspect;
+    };
+    std::array<Tr, 5> trs{};
+    u32 ntr = 0;
+    const auto depth_aspect = in.depth_has_stencil
+                                  ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+                                  : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
+    if (in.target_layout != vk::ImageLayout::eGeneral) {
+        trs[ntr++] = {in.target, in.target_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    if (!sampleable(in.depth_layout)) trs[ntr++] = {in.depth, in.depth_layout, depth_aspect};
+    if (!sampleable(in.normal_layout)) {
+        trs[ntr++] = {in.normal, in.normal_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    const bool color_general = !sampleable(in.color_layout);
+    if (color_general && in.color_layout != vk::ImageLayout::eGeneral) {
+        trs[ntr++] = {in.color, in.color_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    if (shine_on && in.shine != in.normal && in.shine != in.color && !sampleable(in.shine_layout)) {
+        trs[ntr++] = {in.shine, in.shine_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    if (images_fresh) {
+        // Own images: UNDEFINED -> GENERAL once (they stay GENERAL).
+        std::array<vk::ImageMemoryBarrier2, 7> b{};
+        const std::array<vk::Image, 7> imgs{raw.image,      tmp.image,      guide[0].image,
+                                            guide[1].image, hist[0].image,  hist[1].image,
+                                            full.image};
+        const u32 nimg = full.image ? 7u : 6u;
+        for (u32 i = 0; i < nimg; ++i) {
+            b[i] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = imgs[i],
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = nimg,
+                                                .pImageMemoryBarriers = b.data()});
+        images_fresh = false;
+    }
+    const auto layouts = [&](bool to_general) {
+        std::array<vk::ImageMemoryBarrier2, 5> b{};
+        for (u32 i = 0; i < ntr; ++i) {
+            b[i] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = to_general ? trs[i].from : vk::ImageLayout::eGeneral,
+                .newLayout = to_general ? vk::ImageLayout::eGeneral : trs[i].from,
+                .image = trs[i].image,
+                .subresourceRange{trs[i].aspect, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = to_general ? 1u : 0u,
+            .pMemoryBarriers = &all_before,
+            .imageMemoryBarrierCount = ntr,
+            .pImageMemoryBarriers = b.data(),
+        });
+    };
+    layouts(true);
+    const auto lay = [&](vk::ImageLayout l) {
+        return sampleable(l) ? l : vk::ImageLayout::eGeneral;
+    };
+
+    // 1. Depth mesh, BLAS, TLAS.
+    const vk::DescriptorImageInfo depth_info{nearest, in.depth_view, lay(in.depth_layout)};
+    const vk::DescriptorBufferInfo params_info{params.buffer, slot * ParamSize, ParamSize};
+    BuildMesh(cmd, depth_info, params_info);
+    mesh_from_reflect = true;
 
     // 3. One ray per SSR pixel.
     {
@@ -917,9 +978,6 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const Input& in) {
     }
     if (queries) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, queries, slot * 2 + 1);
-    }
-    if (vol_run) {
-        Volumetric(cmd, in, proj, inv, vd, rp, vol_prev_proj, cam_prev_ok, depth_info);
     }
     // Back to the layouts the texture cache tracks; the writes visible to whatever comes next.
     layouts(false);
@@ -1224,13 +1282,13 @@ bool RtReflect::LightDir(const double* view, float out_view[3]) {
     return true;
 }
 
-void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* proj,
-                           const double* inv, const double* view, const double* reproj,
-                           const double* prev_proj_, bool reproj_ok,
+void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 scene_w,
+                           u32 scene_h, const float* proj, const double* inv, const double* view,
+                           const double* reproj, const double* prev_proj_, bool reproj_ok,
                            const vk::DescriptorImageInfo& depth_info) {
+    const u32 w = lw_, h = lh_;
     float lv[3];
     if (!LightDir(view, lv)) return;
-    const auto device = instance.GetDevice();
     if (vol_w != w || vol_h != h || !vraw.image) {
         FreeImage(vraw);
         for (auto& i : vacc) FreeImage(i);
@@ -1259,8 +1317,8 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* 
     }
     vp.size[0] = w;
     vp.size[1] = h;
-    vp.size[2] = in.color_width;
-    vp.size[3] = in.color_height;
+    vp.size[2] = scene_w;
+    vp.size[3] = scene_h;
     vp.light[0] = lv[0];
     vp.light[1] = lv[1];
     vp.light[2] = lv[2];
@@ -1291,20 +1349,7 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* 
     vp.misc2[3] = 1.0f;
     std::memcpy(static_cast<u8*>(vol_params.mapped) + slot * ParamSize, &vp, sizeof(vp));
 
-    if (vol_queries && vol_query_used[slot]) {
-        std::array<u64, 2> ts{};
-        if (device.getQueryPoolResults(vol_queries, slot * 2, 2, sizeof(ts), ts.data(),
-                                       sizeof(u64), vk::QueryResultFlagBits::e64) ==
-            vk::Result::eSuccess) {
-            const double period =
-                instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
-            const double ms = double(ts[1] - ts[0]) * period * 1e-6;
-            if (ms > 0.0 && ms < 1000.0) {
-                vol_ms_sum += ms;
-                ++vol_ms_n;
-            }
-        }
-    }
+    ReadTimer(vol_queries, vol_query_used, slot, vol_ms_sum, vol_ms_n);
     if (vol_queries) {
         cmd.resetQueryPool(vol_queries, slot * 2, 2);
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, vol_queries, slot * 2);
@@ -1336,7 +1381,7 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* 
     };
     const vk::DescriptorBufferInfo params_info{vol_params.buffer, slot * ParamSize, ParamSize};
     const vk::DescriptorBufferInfo counters_info{counters.buffer, 0, counters.size};
-    const vk::DescriptorImageInfo scene_info{{}, in.color_storage_view, vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo scene_info{{}, scene_view, vk::ImageLayout::eGeneral};
     const vk::WriteDescriptorSetAccelerationStructureKHR as_info{
         .accelerationStructureCount = 1,
         .pAccelerationStructures = &tlas,
@@ -1372,7 +1417,7 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, const Input& in, const float* 
     };
     pass(0, vacc[prv], vacc[prv], vraw, w, h);                         // trace
     pass(1, vraw, vacc[prv], vacc[cur], w, h);                         // temporal
-    pass(2, vacc[cur], vacc[prv], vraw, in.color_width, in.color_height); // upsample + add
+    pass(2, vacc[cur], vacc[prv], vraw, scene_w, scene_h); // upsample + add
     if (vol_queries) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, vol_queries, slot * 2 + 1);
     }
@@ -1405,6 +1450,399 @@ void RtReflect::LogVolumetric() {
     vol_last_dispatches = vol_dispatches;
     vol_ms_sum = 0.0;
     vol_ms_n = 0;
+}
+
+void RtReflect::ReadTimer(vk::QueryPool pool, std::array<bool, Ring>& used, u32 slot, double& sum,
+                          u32& n) {
+    // Non-blocking: a result not ready yet (no WAIT flag) is skipped, never waited for.
+    if (!pool || !used[slot]) return;
+    std::array<u64, 2> ts{};
+    if (instance.GetDevice().getQueryPoolResults(pool, slot * 2, 2, sizeof(ts), ts.data(),
+                                                 sizeof(u64), vk::QueryResultFlagBits::e64) ==
+        vk::Result::eSuccess) {
+        const double ms = double(ts[1] - ts[0]) * ts_period * 1e-6;
+        if (ms > 0.0 && ms < 1000.0) {
+            sum += ms;
+            ++n;
+        }
+    }
+}
+
+bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
+    if (!LightingOn()) return false;
+    float proj[16], view[12], far_dist = 3000.0f;
+    if (!BB::Upscale::RtCamera(proj, view, far_dist)) {
+        return false;
+    }
+    if (!(far_dist > 1.0f)) far_dist = 3000.0f;
+    double inv[16];
+    if (!Invert4(proj, inv)) {
+        return false;
+    }
+    double pd[16], vd[16]{};
+    for (int i = 0; i < 16; ++i) pd[i] = proj[i];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) vd[r * 4 + c] = view[r * 4 + c];
+    vd[15] = 1.0;
+    // Trace (and depth-mesh) size: the depth, halved when it is the full render size.
+    const u32 ds = in.depth_width > 1100 ? 2u : 1u;
+    lw_ = std::max(1u, in.depth_width / ds);
+    lh_ = std::max(1u, in.depth_height / ds);
+    const bool own_mesh = !mesh_from_reflect;
+    mesh_from_reflect = false;
+    if (own_mesh && !EnsureMesh(lw_, lh_, 4)) {
+        return false;
+    }
+
+    const auto sampleable = [](vk::ImageLayout l) {
+        return l == vk::ImageLayout::eGeneral || l == vk::ImageLayout::eShaderReadOnlyOptimal ||
+               l == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+               l == vk::ImageLayout::eDepthReadOnlyOptimal ||
+               l == vk::ImageLayout::eReadOnlyOptimal;
+    };
+    struct Tr {
+        vk::Image image;
+        vk::ImageLayout from;
+        vk::ImageAspectFlags aspect;
+    };
+    std::array<Tr, 3> trs{};
+    u32 ntr = 0;
+    const auto depth_aspect = in.depth_has_stencil
+                                  ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+                                  : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
+    if (in.scene_layout != vk::ImageLayout::eGeneral) {
+        trs[ntr++] = {in.scene, in.scene_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    if (!sampleable(in.depth_layout)) trs[ntr++] = {in.depth, in.depth_layout, depth_aspect};
+    if (in.normal && in.normal != in.scene && !sampleable(in.normal_layout)) {
+        trs[ntr++] = {in.normal, in.normal_layout, vk::ImageAspectFlagBits::eColor};
+    }
+    const vk::MemoryBarrier2 all_before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    const auto layouts = [&](bool to_general) {
+        std::array<vk::ImageMemoryBarrier2, 3> b{};
+        for (u32 i = 0; i < ntr; ++i) {
+            b[i] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = to_general ? trs[i].from : vk::ImageLayout::eGeneral,
+                .newLayout = to_general ? vk::ImageLayout::eGeneral : trs[i].from,
+                .image = trs[i].image,
+                .subresourceRange{trs[i].aspect, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &all_before,
+            .imageMemoryBarrierCount = ntr,
+            .pImageMemoryBarriers = b.data(),
+        });
+    };
+    const auto lay = [&](vk::ImageLayout l) {
+        return sampleable(l) ? l : vk::ImageLayout::eGeneral;
+    };
+    const u32 tslot = l_ring++ % Ring;
+    ReadTimer(l_queries, l_query_used, tslot, l_ms_sum, l_ms_n);
+    if (l_queries) {
+        cmd.resetQueryPool(l_queries, tslot * 2, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, l_queries, tslot * 2);
+        l_query_used[tslot] = true;
+    }
+    layouts(true);
+    const vk::DescriptorImageInfo depth_info{nearest, in.depth_view, lay(in.depth_layout)};
+    if (own_mesh) {
+        const u32 slot = ring_pos++ % Ring;
+        Params prm{};
+        ToGlsl(pd, prm.proj);
+        ToGlsl(inv, prm.inv_proj);
+        ToGlsl(vd, prm.view);
+        prm.size[0] = mesh_w;
+        prm.size[1] = mesh_h;
+        prm.size[2] = gw;
+        prm.size[3] = gh;
+        prm.misc[0] = far_dist;
+        prm.misc[1] = 1.0f;
+        prm.misc[2] = float(mesh_cell);
+        std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
+        const vk::DescriptorBufferInfo params_info{params.buffer, slot * ParamSize, ParamSize};
+        BuildMesh(cmd, depth_info, params_info);
+    }
+    // Temporal reprojection: current view -> world -> previous view.
+    double inv_view[16], rp[16]{};
+    const bool cam_prev_ok = l_have_prev && Invert4(vd, inv_view);
+    if (cam_prev_ok) {
+        Mul4(l_prev_view, inv_view, rp);
+    }
+    double prev_p[16];
+    std::memcpy(prev_p, l_prev_proj, sizeof(prev_p));
+    std::memcpy(l_prev_view, vd, sizeof(l_prev_view));
+    std::memcpy(l_prev_proj, pd, sizeof(l_prev_proj));
+    l_have_prev = true;
+    const vk::DescriptorImageInfo normal_info{
+        nearest, in.normal ? in.normal_view : in.depth_view,
+        in.normal ? lay(in.normal_layout) : lay(in.depth_layout)};
+    sh_normal = bool(in.normal);
+    if (sh_on && sh_ok) {
+        Shadows(cmd, in, proj, inv, vd, rp, prev_p, cam_prev_ok, depth_info, normal_info);
+    }
+    if (vol_on && vol_ok) {
+        const vk::MemoryBarrier2 cc{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &cc});
+        Volumetric(cmd, in.scene_storage_view, in.scene_width, in.scene_height, proj, inv, vd, rp,
+                   prev_p, cam_prev_ok, depth_info);
+    }
+    if (l_queries) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, l_queries, tslot * 2 + 1);
+    }
+    layouts(false);
+    if (ntr == 0) {
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                                .pMemoryBarriers = &all_before});
+    }
+    return true;
+}
+
+bool RtReflect::InitShadows() {
+    const auto device = instance.GetDevice();
+    sh_strength = EnvFloat("BB_RT_SHADOWS_STRENGTH", 0.6f, 0.0f, 1.0f);
+    sh_cone = EnvFloat("BB_RT_SHADOWS_CONE", 0.02f, 0.0f, 0.2f);
+    sh_dist = EnvFloat("BB_RT_SHADOWS_DIST", 80.0f, 2.0f, 1000.0f);
+    constexpr auto C = vk::ShaderStageFlagBits::eCompute;
+    const std::array<vk::DescriptorSetLayoutBinding, 9> sb{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {1, vk::DescriptorType::eAccelerationStructureKHR, 1, C},
+        {2, vk::DescriptorType::eUniformBuffer, 1, C},
+        {3, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {4, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {5, vk::DescriptorType::eStorageImage, 1, C},
+        {6, vk::DescriptorType::eStorageImage, 1, C},
+        {7, vk::DescriptorType::eStorageBuffer, 1, C},
+        {8, vk::DescriptorType::eCombinedImageSampler, 1, C},
+    }};
+    auto [lr, l] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(sb.size()),
+        .pBindings = sb.data(),
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    sh_set = l;
+    const vk::PushConstantRange range{C, 0, 4};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &sh_set,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess) return false;
+    sh_layout = pl;
+    const auto module = Vulkan::CompileSPV(BB_RT_SHADOW_COMP, device);
+    if (!module) return false;
+    auto [cr, pipe] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{.stage = C, .module = module, .pName = "main"},
+                .layout = sh_layout,
+            });
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess) return false;
+    sh_pipe = pipe;
+    if (!MakeBuffer(sh_params, ParamSize * Ring, vk::BufferUsageFlagBits::eUniformBuffer, true)) {
+        return false;
+    }
+    auto [qr, qp] = device.createQueryPool({
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = Ring * 2,
+    });
+    if (qr == vk::Result::eSuccess) sh_queries = qp;
+    sh_ok = true;
+    LOG_INFO(Render_Vulkan,
+             "[rt-shadow] ray-traced shadows ON: 1 ray/px toward the main directional light at "
+             "half the render size, cone {:.3f} rad, max {:.0f} units, temporal + 5x5 "
+             "depth-bilateral denoise; the lit scene sampled by the composite PS 0x3fe9e964 is "
+             "multiplied by 1 - {:.2f} x occlusion x saturate(4 N.L) (BB_RT_SHADOWS_STRENGTH). "
+             "Occluders: screen-space depth mesh only (off-screen / hidden geometry casts none)",
+             sh_cone, sh_dist, sh_strength);
+    return true;
+}
+
+void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float* proj,
+                        const double* inv, const double* view, const double* reproj,
+                        const double* prev_proj_, bool reproj_ok,
+                        const vk::DescriptorImageInfo& depth_info,
+                        const vk::DescriptorImageInfo& normal_info) {
+    float lv[3];
+    if (!LightDir(view, lv)) return;
+    for (int i = 0; i < 3; ++i) sh_used_dir[i] = used_dir[i];
+    const u32 w = lw_, h = lh_;
+    if (sh_w != w || sh_h != h || !sraw.image) {
+        FreeImage(sraw);
+        for (auto& i : sacc) FreeImage(i);
+        if (!MakeImage(sraw, w, h) || !MakeImage(sacc[0], w, h) || !MakeImage(sacc[1], w, h)) {
+            FreeImage(sraw);
+            for (auto& i : sacc) FreeImage(i);
+            sh_ok = false;
+            LOG_ERROR(Render_Vulkan, "[rt-shadow] images {}x{} failed: RT shadows off", w, h);
+            return;
+        }
+        sh_w = w;
+        sh_h = h;
+        sh_fresh = true;
+    }
+    const u32 slot = u32(sh_dispatches % Ring);
+    const u32 cur = u32(sh_dispatches & 1), prv = cur ^ 1u;
+    ShParams sp{};
+    double pd[16];
+    for (int i = 0; i < 16; ++i) pd[i] = proj[i];
+    ToGlsl(pd, sp.proj);
+    ToGlsl(inv, sp.inv_proj);
+    ToGlsl(view, sp.view);
+    const bool hist = reproj_ok && !sh_fresh;
+    if (hist) {
+        ToGlsl(reproj, sp.reproj);
+        ToGlsl(prev_proj_, sp.prev_proj);
+    }
+    float far_dist = 3000.0f;
+    {
+        float pj[16], vw[12];
+        if (BB::Upscale::RtCamera(pj, vw, far_dist) && !(far_dist > 1.0f)) far_dist = 3000.0f;
+    }
+    sp.size[0] = w;
+    sp.size[1] = h;
+    sp.size[2] = in.scene_width;
+    sp.size[3] = in.scene_height;
+    sp.light[0] = lv[0];
+    sp.light[1] = lv[1];
+    sp.light[2] = lv[2];
+    sp.light[3] = sh_cone;
+    sp.misc[0] = sh_strength;
+    sp.misc[1] = sh_dist;
+    sp.misc[2] = float(sh_dispatches & 0xffff);
+    sp.misc[3] = hist ? 1.0f : 0.0f;
+    sp.misc2[0] = 0.15f;
+    sp.misc2[1] = far_dist;
+    sp.misc2[2] = 1.0f;
+    sp.misc2[3] = sh_normal ? 1.0f : 0.0f;
+    std::memcpy(static_cast<u8*>(sh_params.mapped) + slot * ParamSize, &sp, sizeof(sp));
+    ReadTimer(sh_queries, sh_query_used, slot, sh_ms_sum, sh_ms_n);
+    if (sh_queries) {
+        cmd.resetQueryPool(sh_queries, slot * 2, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, sh_queries, slot * 2);
+        sh_query_used[slot] = true;
+    }
+    if (sh_fresh) {
+        std::array<vk::ImageMemoryBarrier2, 3> b{};
+        const std::array<vk::Image, 3> imgs{sraw.image, sacc[0].image, sacc[1].image};
+        for (u32 i = 0; i < 3; ++i) {
+            b[i] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = imgs[i],
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 3,
+                                                .pImageMemoryBarriers = b.data()});
+        sh_fresh = false;
+    }
+    const vk::MemoryBarrier2 cc{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    const vk::DescriptorBufferInfo params_info{sh_params.buffer, slot * ParamSize, ParamSize};
+    const vk::DescriptorBufferInfo counters_info{counters.buffer, 0, counters.size};
+    const vk::DescriptorImageInfo scene_info{{}, in.scene_storage_view, vk::ImageLayout::eGeneral};
+    const vk::WriteDescriptorSetAccelerationStructureKHR as_info{
+        .accelerationStructureCount = 1,
+        .pAccelerationStructures = &tlas,
+    };
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, sh_pipe);
+    const auto pass = [&](u32 mode, const Img& src, const Img& hst, const Img& dst, u32 dw,
+                          u32 dh) {
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &cc});
+        const vk::DescriptorImageInfo src_i{nearest, src.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo hist_i{linear, hst.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo dst_i{{}, dst.view, vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 9> wr{{
+            {.dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &depth_info},
+            {.pNext = &as_info, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eAccelerationStructureKHR},
+            {.dstBinding = 2, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &params_info},
+            {.dstBinding = 3, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &src_i},
+            {.dstBinding = 4, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &hist_i},
+            {.dstBinding = 5, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst_i},
+            {.dstBinding = 6, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &scene_info},
+            {.dstBinding = 7, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &counters_info},
+            {.dstBinding = 8, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+             .pImageInfo = &normal_info},
+        }};
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, sh_layout, 0, wr);
+        cmd.pushConstants(sh_layout, vk::ShaderStageFlagBits::eCompute, 0, 4, &mode);
+        cmd.dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
+    };
+    pass(0, sacc[prv], sacc[prv], sraw, w, h);                               // trace
+    pass(1, sraw, sacc[prv], sacc[cur], w, h);                               // temporal
+    pass(2, sacc[cur], sacc[prv], sraw, in.scene_width, in.scene_height);    // denoise + apply
+    if (sh_queries) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, sh_queries, slot * 2 + 1);
+    }
+    ++sh_dispatches;
+    LogShadows();
+}
+
+void RtReflect::LogShadows() {
+    const auto now = std::chrono::steady_clock::now();
+    if (sh_last_log != std::chrono::steady_clock::time_point{} &&
+        now - sh_last_log < std::chrono::seconds(5)) {
+        return;
+    }
+    sh_last_log = now;
+    u32 c[2];
+    std::memcpy(c, static_cast<const u32*>(counters.mapped) + 10, sizeof(c));
+    const u32 rays = c[0] - sh_last_counts[0], shadowed = c[1] - sh_last_counts[1];
+    sh_last_counts[0] = c[0];
+    sh_last_counts[1] = c[1];
+    u64 lhash = 0;
+    size_t lbytes = 0;
+    BB::Upscale::RtLightSource(lhash, lbytes);
+    LOG_INFO(Render_Vulkan,
+             "[rt-shadow] 5 s: {} dispatches, {}x{} trace, {} rays, {:.1f}% shadowed, GPU {:.3f} "
+             "ms per pass (whole lighting hook incl. mesh/AS build: {:.3f} ms), strength {:.2f}, "
+             "normals {}; light dir world ({:.3f}, {:.3f}, {:.3f}) from {} (light CB last seen: "
+             "shader {:#x}, {} B)",
+             sh_dispatches - sh_last_dispatches, sh_w, sh_h, rays,
+             rays ? 100.0 * shadowed / rays : 0.0, sh_ms_n ? sh_ms_sum / sh_ms_n : 0.0,
+             l_ms_n ? l_ms_sum / l_ms_n : 0.0, sh_strength,
+             sh_normal ? "G-buffer RT0" : "depth derivatives", sh_used_dir[0], sh_used_dir[1],
+             sh_used_dir[2], light_src, lhash, lbytes);
+    sh_last_dispatches = sh_dispatches;
+    sh_ms_sum = 0.0;
+    sh_ms_n = 0;
+    l_ms_sum = 0.0;
+    l_ms_n = 0;
 }
 
 } // namespace BB

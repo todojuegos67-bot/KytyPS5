@@ -73,6 +73,7 @@ bool RtSceneBlock(float out[216]);
 // Fed by the rasterizer with the read-only buffers of a draw (hash: the shader's pgm hash).
 void OnLightingConstants(const u32* data, size_t bytes, u64 hash);
 bool RtLightBlock(float out[72], u64& age_frames);
+void RtLightSource(u64& hash, size_t& bytes); // shader hash / buffer size of the last light CB
 bool RtFogBlock(float out[24], u64& age_frames);
 // This frame's jitter in render pixels (zero when off).
 void Jitter(float& x, float& y);

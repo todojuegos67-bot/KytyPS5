@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bb-rt-vol (BB_RT_VOLUMETRIC=1): ray-traced volumetric light, run right after the RT reflections
-// (same depth-mesh TLAS) and added into the lit scene the game's composite reads.
+// bb-rt-vol (BB_RT_VOLUMETRIC=1): ray-traced volumetric light, run right before the game's
+// composite draw (depth-mesh TLAS, shared with the RT reflections when those ran this frame) and
+// added into the lit scene the composite reads.
 //   mode 0  trace at the depth size (half the lit scene): march the view ray through depth in
 //           `steps` jittered steps; at each sample one ray query toward the main light
 //           (terminate on first hit) decides visibility; in-scattering with a Henyey-Greenstein
@@ -34,9 +35,14 @@ layout(push_constant) uniform Push { uint mode; } pc;
 
 shared uint s_n[2];
 
+ivec2 DepthPx(ivec2 px) { // the depth may be larger than the grid / trace size
+    ivec2 dsz = textureSize(depth_tex, 0);
+    return clamp(ivec2((vec2(px) + 0.5) * vec2(dsz) / vec2(p.size.xy)), ivec2(0), dsz - 1);
+}
+
 vec3 Unproject(ivec2 px, out float dist) {
     px = clamp(px, ivec2(0), ivec2(p.size.xy) - 1);
-    float d = texelFetch(depth_tex, px, 0).r;
+    float d = texelFetch(depth_tex, DepthPx(px), 0).r;
     vec2 uv = (vec2(px) + 0.5) / vec2(p.size.xy);
     vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc2.w > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
     vec4 v = p.inv_proj * ndc;
