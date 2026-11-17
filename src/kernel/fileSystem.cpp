@@ -727,6 +727,43 @@ static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 	return total;
 }
 
+// (ram20, KYTY_RAM20=1 with native memory) A file write of a guest buffer: WriteFile reads it in kernel mode, where a
+// page RAM20 (or RAM16/17/18) took - no-access, its bytes on disk - makes the write fail short with no fault (a save or a
+// trophy file cut), and a page whose bytes were reset but not yet watched would be written as zeros. So the buffer goes
+// through a host bounce, read by NativeGuardedRead (straight through readable pages; a window - whose hook brings the
+// taken bytes back from the disk store first - over the no-access ones), and the bounce is written. A chunk the guarded
+// read cannot read whole is written from the guest buffer as before. Off: the plain write (one static bool read).
+static bool GuestWriteBounceOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_RAM20");
+		return v != nullptr && v[0] == '1' && v[1] == '\0' && Memory::NativeMemoryEnabled();
+	}();
+	return on;
+}
+
+static void WriteFromGuest(Common::File& f, const void* buf, uint32_t nbytes, uint32_t* written) {
+	if (!GuestWriteBounceOn() || nbytes == 0) {
+		f.Write(buf, nbytes, written);
+		return;
+	}
+	constexpr uint32_t                Chunk = 4u << 20u;
+	thread_local SoftRelease::Scratch bounce_scratch("guest write bounce");
+	const auto                        bounce_hold = bounce_scratch.Use();
+	auto&                             bounce      = bounce_scratch.bytes;
+	uint32_t                          total       = 0;
+	while (total < nbytes) {
+		const uint32_t want = std::min(nbytes - total, Chunk);
+		if (bounce.size() < want) bounce.resize(want);
+		const auto* source = static_cast<const uint8_t*>(buf) + total;
+		uint32_t    got    = 0;
+		if (Memory::NativeGuardedRead(bounce.data(), source, want)) f.Write(bounce.data(), want, &got);
+		else f.Write(source, want, &got);
+		total += got;
+		if (got < want) break;
+	}
+	*written = total;
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
@@ -840,7 +877,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written); // (ram20)
 	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -951,7 +988,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written); // (ram20)
 	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();

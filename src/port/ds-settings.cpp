@@ -306,6 +306,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("teclado_raton", s->kbm);
 	num("raton_sensibilidad", s->kbm_sens);
 	num("raton_antizona", s->kbm_antidz);
+	num("raton_sens_x", s->kbm_sens_x); // (raton2)
+	num("raton_sens_y", s->kbm_sens_y);
 	str("mapa_teclado", s->kbm_map);
 	str("mapa_mando", s->pad_map);
 	str("ajustes_juego", s->game_settings);
@@ -527,6 +529,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "teclado_raton=" << b(s.kbm) << "\n"
 	  << "raton_sensibilidad=" << Num(s.kbm_sens) << "\n"
 	  << "raton_antizona=" << Num(s.kbm_antidz) << "\n"
+	  << "; Camara nativa (KYTY_CAM1): multiplicador horizontal / vertical. Todo lo de raton se aplica en directo al guardar\n"
+	  << "raton_sens_x=" << Num(s.kbm_sens_x) << "\n"
+	  << "raton_sens_y=" << Num(s.kbm_sens_y) << "\n"
 	  << "; Teclas: Cross=F;R1=Mouse:Left;... (vacio = las de serie, estilo Souls)\n"
 	  << "mapa_teclado=" << s.kbm_map << "\n"
 	  << "; Mando remapeado: a=Cross;b=Circle;... (boton fisico de SDL = control de PS5; vacio = normal)\n"
@@ -1252,7 +1257,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		    "KYTY_VOLATILE_EXTRA_ALLOCATORS=HeapAllocator,PageAllocator,Bucket;KYTY_FAULT_STATS=0;KYTY_TEXTURE_PROBE=0;"
 		    "KYTY_BUFFER_PROBE=0;KYTY_RESIDENCY_LOG=0;KYTY_RAM_GUARD=0;KYTY_RAM_LINE=1;KYTY_RENDER_STATS=0;KYTY_RAIZ=1;"
 		    "KYTY_DS_FREED_RELEASE=1;KYTY_PM_LOCK_HOLDERS=1;KYTY_REG_LANE=1;KYTY_DRAW_FLAGS=1;KYTY_CENSUS_LIGHT=1;"
-		    "KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1");
+		    "KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1;KYTY_RAM18=1;KYTY_CAM1=1");
 		std::string pair;
 		while (std::getline(list, pair, ';')) {
 			const auto eq = pair.find('=');
@@ -1308,6 +1313,9 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	const float sens = (s.kbm_sens > 0 ? s.kbm_sens : 1.0f) * (fixed_fg ? 0.92f : 1.0f);
 	env.Set("KYTY_KBM_SENS", s.kbm ? Num(sens) : "");
 	env.Set("KYTY_KBM_ANTIDZ", s.kbm ? Num(s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f) : "");
+	// (raton2) Only when not 1, so a KYTY_CAM1_SENS_X / _Y of the environment still wins at 1.
+	if (s.kbm && s.kbm_sens_x > 0 && s.kbm_sens_x != 1.0f) env.Set("KYTY_CAM1_SENS_X", Num(s.kbm_sens_x));
+	if (s.kbm && s.kbm_sens_y > 0 && s.kbm_sens_y != 1.0f) env.Set("KYTY_CAM1_SENS_Y", Num(s.kbm_sens_y));
 	// (10-28) The launcher's: Camara instantanea, Calibrar camara (once) and the mouse's camera speed (a game convar).
 	env.Set("KYTY_KBM_WARP", s.kbm && s.kbm_warp ? "1" : "");
 	env.Set("KYTY_KBM_CALIBRATE", s.kbm_calibrate ? "1" : "");

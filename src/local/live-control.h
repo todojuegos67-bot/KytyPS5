@@ -24,8 +24,10 @@
 #include "frame-capture.h"
 #include "kernel/memory.h"
 #include "ds-linear-copy-hook.h"
+#include "copia1.h" // (copia1)
 #include "live-census.h"
 #include "live-counters.h"
+#include "tiron1.h" // (tiron1)
 #include "lane-sync.h"
 #include "live-trace.h"
 #include "libs/controller.h"
@@ -452,9 +454,11 @@ inline void Flip() {
 	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
 	RenderStats(flip_ns); // (render2, KYTY_RENDER_STATS)
+	if (LiveCensus::RenderStatsOn()) Otros1::Report(flip_ns, 0.0); // (otros1, KYTY_OTROS1)
 	LiveCensus::Par2::Flipped(); // (trust1: the two-thread what-if's frame ends at this flip)
 	TrustedDepth::OnFlip(flip_ns); // (trust1: the [trust1] line, KYTY_RENDER_STATS / KYTY_DS_TRUSTED_DEPTH)
 	Render5Report(flip_ns); // (render5)
+	Copia1::NoteFrame();    // (copia1: the [copia1] line's frames)
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
@@ -601,6 +605,37 @@ inline void Flip() {
 			                                   std::chrono::system_clock::now().time_since_epoch())
 			                                   .count()));
 			std::fflush(stdout);
+		}
+		// (tiron1, KYTY_TIRON1=1) The frame by cause, from the SLOW Frame line's sources; a [tiron1] line every 5 s.
+		if (Tiron1::On() && last != std::chrono::steady_clock::time_point {}) {
+			Tiron1::FrameCost cost;
+			cost.ms = ms;
+			if (ms > 25.0) {
+				const double per_cycle = tsc > last_tsc ? ms / static_cast<double>(tsc - last_tsc) : 0.0;
+				const auto   kind_ms   = [&](size_t kind) {
+                    return static_cast<double>(LiveCensus::g_kind_cycles[kind] - last_kind_cycles[kind]) * per_cycle;
+				};
+				const auto count = [&](C id) -> uint64_t {
+					for (size_t i = 0; i < counted.size(); ++i)
+						if (counted[i] == id) return LiveCounters::Value(id) - last_counts[i];
+					return 0;
+				};
+				const auto wait_ms = [&](size_t wait) { return static_cast<double>(LiveCensus::g_waits_ns[wait] - last_waits[wait]) / 1e6; };
+				cost.idle           = static_cast<double>(g_render_idle_ns - last_idle) / 1e6;
+				cost.draw           = kind_ms(LiveCensus::Draw);
+				cost.xpr            = kind_ms(LiveCensus::NativeXpr);
+				cost.programs       = kind_ms(LiveCensus::GraphicsPrograms) +
+				                static_cast<double>(LiveCensus::g_dispatch_phase_cycles[0] - last_dispatch_phases[0]) * per_cycle;
+				cost.dispatch_table = static_cast<double>(LiveCensus::g_dispatch_phase_cycles[10] - last_dispatch_phases[10]) * per_cycle;
+				cost.compile        = wait_ms(LiveCensus::WaitCompile);
+				cost.gpu_waits      = wait_ms(LiveCensus::WaitGpu) + wait_ms(LiveCensus::WaitReadback) +
+				                 wait_ms(LiveCensus::WaitDownload) + wait_ms(LiveCensus::WaitRecord);
+				cost.upload_wait    = static_cast<double>(LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed) - last_upload_wait) / 1e6;
+				cost.image_init     = static_cast<double>(count(C::ImageInitUs)) / 1000.0;
+				cost.store_deferred = count(C::TableStoreDeferred);
+				cost.xpr_stores     = count(C::XprStores);
+			}
+			Tiron1::NoteFrame(cost, now);
 		}
 		last      = now;
 		last_tsc  = tsc;

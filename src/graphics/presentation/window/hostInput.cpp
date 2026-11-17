@@ -24,6 +24,11 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>      // (raton2)
+#include <filesystem>  // (raton2)
+#include <fstream>     // (raton2)
+#include <iterator>    // (raton2)
+#include <thread>      // (raton2)
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -899,7 +904,11 @@ void KbmLearnGain(KbmState& k) {
 // The right stick at a guest pad read (Controller's provider). (10-25) One value per game frame: a read with no guest
 // flip since the last one (and within 50 ms) repeats it. The counts are drained over KYTY_KBM_SMOOTH_MS (a sub-frame
 // exponential: the stick follows counts/s, not how many counts happened to arrive before this read).
+void KbmApplyLive(); // (raton2)
+void KbmStartLive();
+
 bool KbmProvide(int* x, int* y) {
+	KbmApplyLive();
 	auto&         k   = g_kbm;
 	const int64_t now = KbmNow();
 
@@ -1185,6 +1194,7 @@ void KbmInit() {
 	     g_kbm.sens, g_kbm.expo, g_kbm.adz, g_kbm.decay_ms, g_kbm.smooth_ms, g_kbm.carry_ms, g_kbm.bindings.size());
 	KbmSetupMouse();
 	Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(g_kbm.dpc * g_kbm.sens));
+	KbmStartLive(); // (raton2)
 	if (Loader::DemonsSoulsCamera::DirectInstalled())
 		LOGF("KYTY_KBM: direct mouse camera on: %.3f deg per count (KYTY_KBM_DEG_PER_COUNT %.3f x sens %.2f), %s\n",
 		     g_kbm.dpc * g_kbm.sens, g_kbm.dpc, g_kbm.sens,
@@ -1351,12 +1361,133 @@ bool HostInputKbmEnabled() {
 
 // (11-10) The F2 menu's mouse sensitivity and anti-dead-zone, live: the sensitivity as a factor of the one the game started
 // with (that one already carries the launch's adjustments, e.g. frame generation's 0.92), the anti-dead-zone as is.
+namespace { // (raton2)
+
+// (raton2) Mouse settings live, without restarting. Everything that changes them (the in-game menu, settings.ini edited
+// while the game runs) only posts the new values here; the input thread applies them at its next frame / mouse move
+// (KbmApplyLive), so g_kbm is written by one thread. A light thread watches settings.ini's write time every 500 ms.
+struct KbmLive {
+	std::atomic<bool>   pending {false};
+	std::atomic<float>  sens {-1.0f};    // the absolute g_kbm.sens wanted (< 0: no change)
+	std::atomic<float>  adz {-1.0f};     // the anti-dead-zone wanted (< 0: no change)
+	std::atomic<double> sx {-1.0}, sy {-1.0}; // KYTY_CAM1_SENS_X / _Y wanted (< 0: no change)
+	float               launch_sens = 1.0f; // g_kbm.sens at the start (KYTY_KBM_SENS, with the launcher's x0.92 in 30x2)
+	std::atomic<bool>   watching {false};
+};
+KbmLive g_kbm_live;
+
+void KbmApplyLive() {
+	auto& l = g_kbm_live;
+	if (!l.pending.exchange(false, std::memory_order_acq_rel)) return;
+	auto&       k      = g_kbm;
+	const float sens   = l.sens.exchange(-1.0f), adz = l.adz.exchange(-1.0f);
+	const double sx    = l.sx.exchange(-1.0), sy = l.sy.exchange(-1.0);
+	bool        change = false;
+	if (std::isfinite(sens) && sens > 0.0f) {
+		const float v = std::clamp(sens, 0.05f, 20.0f);
+		if (std::fabs(v - k.sens) > 1e-4f) {
+			k.sens = v, change = true;
+			Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(k.dpc * k.sens));
+		}
+	}
+	if (std::isfinite(adz) && adz >= 0.0f) {
+		const float v = std::clamp(adz, 0.0f, 0.6f);
+		if (std::fabs(v - k.adz) > 1e-4f) k.adz = v, change = true;
+	}
+	double ox = 1.0, oy = 1.0;
+	Loader::DemonsSoulsCamera::Cam1GetSens(&ox, &oy);
+	if ((sx > 0.0 && std::fabs(sx - ox) > 1e-4) || (sy > 0.0 && std::fabs(sy - oy) > 1e-4)) {
+		Loader::DemonsSoulsCamera::Cam1SetSens(sx > 0.0 ? sx : ox, sy > 0.0 ? sy : oy);
+		change = true;
+	}
+	if (!change) return;
+	double nx = 1.0, ny = 1.0;
+	Loader::DemonsSoulsCamera::Cam1GetSens(&nx, &ny);
+	const double s = k.sens / (l.launch_sens > 0.0f ? l.launch_sens : 1.0f);
+	LOGF("[raton] sensibilidad x %.2f y %.2f aplicada en directo (raton_sensibilidad x%.2f, sens %.2f = %.3f deg por cuenta; "
+	     "cam1 x %.2f y %.2f%s; antizona %.2f)\n",
+	     s * nx, s * ny, s, k.sens, k.dpc * k.sens, nx, ny, Loader::DemonsSoulsCamera::Cam1Active() ? "" : " (KYTY_CAM1 apagado: sin efecto)", k.adz);
+}
+
+// One "key=value" of settings.ini as a number (a comma read as a point); false: absent or not a number.
+bool KbmIniNum(const std::string& text, const char* key, double* out) {
+	const std::string_view want(key);
+	size_t                 at = 0;
+	while (at < text.size()) {
+		size_t end = text.find('\n', at);
+		if (end == std::string::npos) end = text.size();
+		std::string line = text.substr(at, end - at);
+		at               = end + 1;
+		while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+		const size_t eq = line.find('=');
+		if (eq == std::string::npos || line.empty() || line[0] == ';' || line[0] == '#') continue;
+		std::string name = line.substr(0, eq);
+		while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+		if (std::string_view(name) != want) continue;
+		std::string v = line.substr(eq + 1);
+		for (char& c: v) if (c == ',') c = '.';
+		char*        e = nullptr;
+		const double d = std::strtod(v.c_str(), &e);
+		if (e == v.c_str() || !std::isfinite(d)) return false;
+		*out = d;
+		return true;
+	}
+	return false;
+}
+
+void KbmWatchIni() {
+	namespace fs = std::filesystem;
+	const char*      env  = std::getenv("KYTY_DS_INI");
+	const fs::path   path = (env != nullptr && env[0] != 0) ? fs::path(env) : fs::path("settings.ini");
+	std::error_code  ec;
+	auto             last = fs::last_write_time(path, ec);
+	bool             have = !ec;
+	double           base_sens = -1.0; // raton_sensibilidad when the game started (KYTY_KBM_SENS is relative to it)
+	const auto read = [&](std::string* text) {
+		std::ifstream f(path.string(), std::ios::binary);
+		if (!f) return false;
+		text->assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+		return true;
+	};
+	if (std::string t; have && read(&t)) KbmIniNum(t, "raton_sensibilidad", &base_sens);
+	LOGF("[raton] vigilando %s: raton_sensibilidad, raton_antizona, raton_sens_x, raton_sens_y se aplican en directo al guardar\n",
+	     path.string().c_str());
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		const auto now = fs::last_write_time(path, ec);
+		if (ec || (have && now == last)) continue;
+		last = now, have = true;
+		std::this_thread::sleep_for(std::chrono::milliseconds(100)); // let the writer finish
+		std::string t;
+		if (!read(&t)) continue;
+		auto&  l = g_kbm_live;
+		double v = 0.0;
+		if (KbmIniNum(t, "raton_sensibilidad", &v) && v > 0.0) {
+			if (base_sens <= 0.0) base_sens = v;
+			l.sens.store(static_cast<float>(l.launch_sens * v / base_sens));
+		}
+		if (KbmIniNum(t, "raton_antizona", &v) && v >= 0.0) l.adz.store(static_cast<float>(v));
+		if (KbmIniNum(t, "raton_sens_x", &v) && v > 0.0) l.sx.store(v);
+		if (KbmIniNum(t, "raton_sens_y", &v) && v > 0.0) l.sy.store(v);
+		l.pending.store(true, std::memory_order_release);
+	}
+}
+
+void KbmStartLive() {
+	g_kbm_live.launch_sens = g_kbm.sens;
+	if (const char* off = std::getenv("KYTY_KBM_LIVE_INI"); off != nullptr && off[0] == '0') return;
+	if (g_kbm_live.watching.exchange(true)) return;
+	std::thread(KbmWatchIni).detach();
+}
+
+} // namespace (raton2)
+
 void HostInputKbmSetLive(float sens_factor, float antidz) {
 	if (!g_kbm.enabled) return;
-	static const float base = g_kbm.sens;
-	if (std::isfinite(sens_factor) && sens_factor > 0.0f) g_kbm.sens = std::clamp(base * sens_factor, 0.05f, 20.0f);
-	Loader::DemonsSoulsCamera::DirectSetDegPerCount(static_cast<float>(g_kbm.dpc * g_kbm.sens));
-	if (std::isfinite(antidz)) g_kbm.adz = std::clamp(antidz, 0.0f, 0.6f);
+	auto& l = g_kbm_live;
+	if (std::isfinite(sens_factor) && sens_factor > 0.0f) l.sens.store(l.launch_sens * sens_factor);
+	if (std::isfinite(antidz)) l.adz.store(antidz);
+	l.pending.store(true, std::memory_order_release);
 }
 
 void HostInputFocus(bool focused) {
@@ -1370,6 +1501,7 @@ void HostInputFocus(bool focused) {
 }
 
 bool HostInputMouseMotion(int dx, int dy) {
+	if (g_kbm.enabled) KbmApplyLive(); // (raton2)
 	if (!g_kbm.enabled && !g_kbm.mouse_only) return false;
 	// (11-09) Started straight into the game (menu_inicio=0, no launcher before it), the window can get its focus before
 	// keyboard and mouse is set up, so the focus capture never happened and the mouse did not turn the camera. The first

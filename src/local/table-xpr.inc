@@ -256,6 +256,9 @@ struct RenderExecutor::TableXpr {
 	Pair*    store       = nullptr;
 	uint64_t store_state = 0, store_frame = 0;
 	uint32_t store_requests = 0;
+	// (tiron1, KYTY_TIRON1=1) The render thread's time this frame from each granted store request to the end of its
+	// TableStore (its normal-path draw and the store), and the time the last one was granted.
+	int64_t tiron1_store_us = 0, tiron1_grant_ns = 0;
 	// The draw's T#/S# words (the set's key) and pixel stage LOD statistics words; its runs' addresses.
 	TableWords                           words;
 	std::vector<uint32_t>                lod_stats;
@@ -499,6 +502,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	auto& table = OwnTable();
+	Tiron1::t_no_native_store = false; // (tiron1: set below only for a pair waiting for its store)
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
@@ -579,23 +583,49 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
 	// stored native records too, which the table variant replaced a frame or two later: 100-230 a slow frame walking
 	// into new parts of Boletarian Palace 1-3 (each traced and sorted, ~3 ms of the frame).
+	// (tiron1, KYTY_TIRON1=1) A pair waiting for its store: its draw takes the native record it has (a miss draws the
+	// normal way, as Deferred), and stores none (native-xpr.inc NativeXprTry): the table variant replaces it soon.
+	const bool tiron1        = Tiron1::On();
+	const auto tiron1_wait   = [&] {
+		LiveCounters::Add(LiveCounters::TableStoreDeferred);
+		Tiron1::t_no_native_store = true;
+		Tiron1::g_native_kept.fetch_add(1, std::memory_order_relaxed);
+		return TableResult::Native;
+	};
 	const auto request_store = [&] {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
-			if (!pair.waiting->load(std::memory_order_acquire))
+			if (!pair.waiting->load(std::memory_order_acquire)) {
+				if (tiron1) return tiron1_wait();
 				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred; // (programs compiling)
+			}
 			pair.waiting.reset();
 		}
 		if (table.store_frame != frame) {
-			table.store_frame    = frame;
-			table.store_requests = 0;
+			table.store_frame     = frame;
+			table.store_requests  = 0;
+			table.tiron1_store_us = 0;
 		}
-		if (pair.store_frame == frame && pair.store_state == cache.state_key)
+		if (pair.store_frame == frame && pair.store_state == cache.state_key) {
+			if (tiron1) return tiron1_wait();
 			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred;
-		// (Past the budget, the others draw from native records meanwhile.)
+		}
+		// (Past the budget, the others draw from native records meanwhile.) (tiron1: past it, more while the stores
+		// granted this frame took less than KYTY_TIRON1_STORE_MS of the render thread.)
+		bool by_time = false;
 		if (const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
-		    budget != 0 && table.store_requests >= budget)
-			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
+		    budget != 0 && table.store_requests >= budget) {
+			if (!tiron1 || table.tiron1_store_us >= Tiron1::StoreBudgetUs()) {
+				if (tiron1) return tiron1_wait();
+				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
+			}
+			by_time = true;
+		}
+		if (tiron1) {
+			table.tiron1_grant_ns = Tiron1::NowNs();
+			Tiron1::g_stores.fetch_add(1, std::memory_order_relaxed);
+			if (by_time) Tiron1::g_stores_by_time.fetch_add(1, std::memory_order_relaxed);
+		}
 		++table.store_requests;
 		pair.store_frame  = frame;
 		pair.store_state  = cache.state_key;
@@ -2167,6 +2197,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	bool                 trust_pair = false, trust_hit = false, trust_sample = false;
 	uint64_t             trust_key = 0, trust_mapping = 0, trust_start = 0;
 	TrustedDepth::Entry* trust_entry = nullptr;
+	// (reuso1) KYTY_REUSO1: the preparation's cycles (key, proof or evaluation+gather, set, BDA, blocks) of the draws
+	// the registry follows, hit or not: the [reuso1] line's saving per hit is their difference.
+	const uint64_t reuso_start = TrustedDepth::Reuso1Mode() != 0 && trust_depth ? __rdtsc() : 0;
 	// (draw1, KYTY_DRAW1 with KYTY_RENDER_STATS) A render list's direct draw's key, for its repetition (measurement only).
 	if (direct != nullptr && trust_bytes && trust_stats && Role() == 0 && Spec::Current() == nullptr) {
 		const std::array<uint64_t, 3> head {reinterpret_cast<uint64_t>(&pair), variant.state, reinterpret_cast<uint64_t>(&draw_state)};
@@ -2257,6 +2290,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 								now.resize(run.count);
 								reader.Read(run.address, run.count, now.data());
 								if (std::memcmp(now.data(), block.data() + run.first, uint64_t {run.count} * 4u) != 0) {
+									// (reuso1) Which words changed, for the next decision (counted only with KYTY_REUSO1).
+									if (TrustedDepth::Reuso1Mode() != 0)
+										TrustedDepth::NoteWordDiff(now.data(), block.data() + run.first, run.count,
+										                           static_cast<uint32_t>(&run - entry.runs.data()));
 									valid = false;
 									break;
 								}
@@ -2413,6 +2450,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	}
 	if (!blocks_made)
 		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
+	if (reuso_start != 0 && trust_entry != nullptr) TrustedDepth::NotePrep(trust_hit, __rdtsc() - reuso_start);
 	// (trust1) The normal path's result of an XPR depth draw the registry follows (or a sampled one): its reads
 	// classified (KYTY_RENDER_STATS), compared with a confirmed entry (=2) or one to confirm, and stored.
 	if (trust_depth && !trust_hit && (trust_entry != nullptr || trust_sample)) {
@@ -3022,6 +3060,19 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	auto&       table = *m_table_xpr;
 	auto* const pair  = std::exchange(table.store, nullptr);
 	if (!storable || pair == nullptr) return;
+	// (tiron1) The request's time, from its grant (TableTry) to here, whatever the store's way out.
+	struct Tiron1StoreTime {
+		TableXpr& table;
+		~Tiron1StoreTime() {
+			if (table.tiron1_grant_ns == 0) return;
+			const auto us = (Tiron1::NowNs() - std::exchange(table.tiron1_grant_ns, 0)) / 1000;
+			if (us <= 0 || us > 1000000) return;
+			table.tiron1_store_us += us;
+			Tiron1::g_store_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+		}
+	};
+	std::optional<Tiron1StoreTime> tiron1_time;
+	if (Tiron1::On()) tiron1_time.emplace(table);
 	const auto& sh = buffer.GetShaders();
 	// (A request whose packet never reached a prepared draw must not store for another state.)
 	if (sh.GetVs().es_regs.data_addr != pair->vs || sh.GetPs().ps_regs.data_addr != pair->ps ||
@@ -3431,6 +3482,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const auto& pipeline = set->pipeline != nullptr ? *set->pipeline : *pair.pipeline;
 	const auto& program  = set->program != nullptr ? *set->program : *pair.programs[0];
 	const auto& bindings = program.bindings;
+	const Envio1::Scope envio1_record(Envio1::Record); // (envio1, KYTY_ENVIO1=1: to the end of the dispatch)
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
 	if (bindings.UsesPushData()) {
 		ShaderRecompiler::IR::PushData push_data;

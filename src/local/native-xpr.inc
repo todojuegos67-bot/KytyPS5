@@ -3477,6 +3477,12 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 	// in a later frame.
 	const auto request_store = [&] {
 		if ((kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 1u) != 0) return;
+		// (tiron1, KYTY_TIRON1=1) A draw of a pair waiting for its table store (TableTry): no native record, which the
+		// table variant would replace a frame or two later (each ~16 us, traced and sorted, 256 a frame walking in).
+		if (Tiron1::t_no_native_store && Tiron1::On()) {
+			Tiron1::g_native_store_skipped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 		if (const auto budget = kyty_local_native_xpr_store_budget.load(std::memory_order_relaxed); budget != 0) {
 			if (cache.store_frame != m_context.FrameNumber()) {
 				cache.store_frame    = m_context.FrameNumber();
@@ -3510,6 +3516,7 @@ bool RenderExecutor::NativeXprTry(CommandBuffer& buffer, bool clean, std::span<c
 		cache.state_key_valid = true;
 	}
 	stat_before.reset();
+	Tiron1::t_no_native_store = false; // (tiron1: TableTry sets it for a pair waiting for its store)
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) != 0) {
 		const auto table = TableTry(buffer, commands, index_base, index_bytes, index_type, direct);
 		if (table == TableResult::Drawn) return true;

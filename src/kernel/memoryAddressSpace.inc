@@ -1912,6 +1912,17 @@ static void NativeGuardedWrite(uint8_t* host, uint64_t bytes, WriteTo&& write_to
 		NativeGuardedAccess(host, bytes, [&] { write_to(host); }, true);
 		return;
 	}
+	// (ram20, KYTY_RAM20=1) A write-back of GPU results over a range RAM20 dropped (no-access by its read watchers: it would
+	// be kept aside below, with no window to ask for the bytes first) gets the range back from the disk store first, as a
+	// window's write does (the hook; nothing there when no taken range is near). Off: one static bool read.
+	static const bool ram20 = [] {
+		const char* v = std::getenv("KYTY_RAM20");
+		return v != nullptr && v[0] == '1' && v[1] == '\0';
+	}();
+	if (ram20) {
+		if (const auto hook = g_native_window_hook.load(std::memory_order_acquire); hook != nullptr)
+			hook(vaddr, bytes, true, t_native_window_depth != 0 || t_native_protect_depth != 0);
+	}
 	const auto start = std::chrono::steady_clock::now(); // (raiz4: timed, the "[raiz]" line)
 	// (raiz4: the calling thread's buffer, not one allocated each write-back; a nested write - a fault in the copy -
 	// gets its own.)

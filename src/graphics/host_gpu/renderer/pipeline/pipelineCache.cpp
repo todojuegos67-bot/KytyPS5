@@ -2303,8 +2303,9 @@ struct PipelineCache::ProgramCache {
 	class WarmWorkers {
 	public:
 		WarmWorkers(vk::Device device, std::span<const std::span<const uint32_t>> records, uint32_t threads,
-		            bool background)
-		    : device(device), records(records), jobs(records.size()), ready(records.size()), background(background) {
+		            bool background, const std::vector<uint8_t>* only = nullptr)
+		    : device(device), records(records), jobs(records.size()), ready(records.size()), background(background),
+		      only(only) {
 			for (uint32_t t = 0; t < threads; ++t) pool.emplace_back([this] { Run(); });
 		}
 		~WarmWorkers() {
@@ -2342,7 +2343,9 @@ struct PipelineCache::ProgramCache {
 				}
 				if (stop.load(std::memory_order_relaxed)) return;
 				const size_t index = WarmOrder(n, jobs.size(), background);
-				jobs[index]        = PrepareWarmJob(device, records[index]);
+				// (tiron1: the records asked for only; the others are taken as invalid, at once.)
+				if (only == nullptr || (index < only->size() && (*only)[index] != 0))
+					jobs[index] = PrepareWarmJob(device, records[index]);
 				ready[index].store(1, std::memory_order_release);
 				ready[index].notify_one();
 			}
@@ -2352,6 +2355,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<std::unique_ptr<WarmJob>>      jobs;
 		std::vector<std::atomic<uint8_t>>          ready;
 		bool                                       background = false;
+		const std::vector<uint8_t>*                only       = nullptr; // (tiron1) the records to translate (null: all)
 		std::atomic<size_t>                        taken {0};
 		std::atomic<size_t>                        consumed {0};
 		std::atomic<bool>                          stop {false};
@@ -2398,7 +2402,9 @@ struct PipelineCache::ProgramCache {
 		return found != entry->second.permutations.end() ? &*found : nullptr;
 	}
 
-	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
+	// (tiron1) `only`: the records to translate (null: all); the others keep a null permutation.
+	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop,
+	                     const std::vector<uint8_t>* only = nullptr) {
 		const auto begin = std::chrono::steady_clock::now();
 		// 0 means all recorded inputs. A caller can explicitly bound startup time.
 		uint32_t budget_seconds = 0;
@@ -2419,9 +2425,9 @@ struct PipelineCache::ProgramCache {
 			const auto parsed = std::from_chars(value, end, translate_seconds);
 			if (parsed.ec != std::errc {} || parsed.ptr != end || translate_seconds > 3600) translate_seconds = 0;
 		}
-		const char* only               = std::getenv("KYTY_SHADER_WARMUP_ONLY");
+		const char* only_env           = std::getenv("KYTY_SHADER_WARMUP_ONLY");
 		auto        translate_deadline = background ? std::chrono::steady_clock::time_point::max() : warm_deadline;
-		if (!background && translate_seconds != 0 && (only == nullptr || std::string_view(only) != "1"))
+		if (!background && translate_seconds != 0 && (only_env == nullptr || std::string_view(only_env) != "1"))
 			translate_deadline = std::min(translate_deadline, begin + std::chrono::seconds(translate_seconds));
 		const size_t count = warm_records.size();
 		warm_permutations.assign(count, nullptr);
@@ -2432,7 +2438,7 @@ struct PipelineCache::ProgramCache {
 		const uint32_t threads = WarmupThreads(background);
 		PipelineCacheLog("Shader warmup: {} threads of {} CPUs", threads, LocalPlatform::AllCpus()); // (ds-pc-port47)
 		std::optional<WarmWorkers> workers;
-		if (threads > 1 || background) workers.emplace(device, warm_records, threads, background);
+		if (threads > 1 || background) workers.emplace(device, warm_records, threads, background, only);
 		for (size_t n = 0; n < count; ++n) {
 			if (stop.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= translate_deadline) {
 				left = count - n;
@@ -2441,6 +2447,7 @@ struct PipelineCache::ProgramCache {
 			if (!background) StartupProgress::Report("Preparing shaders", n, count);
 			warm_done.store(n, std::memory_order_relaxed);
 			const size_t index = WarmOrder(n, count, background);
+			if (!workers && only != nullptr && (index >= only->size() || (*only)[index] == 0)) continue; // (tiron1)
 			const auto   job   = workers ? workers->Take(index) : PrepareWarmJob(device, warm_records[index]);
 			if (!job) continue;
 			auto&          record = job->record;
@@ -3366,6 +3373,11 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			m_warmup_thread          = std::thread([this, settings] { RunWarmup(settings); });
 		} else {
 			RunWarmup(settings);
+			// (tiron1, KYTY_TIRON1=1) Under 30 GB of RAM no pipeline is made before play: the compute ones, which the
+			// render thread waits for (13-132 ms of a zone's first frames, 0.6-0.75 ms each), beside the game.
+			if (Tiron1::On() && low_ram && std::string_view(warmup) == "1" && !m_warm_cache_only &&
+			    (only == nullptr || std::string_view(only) != "1") && force != "0")
+				m_warmup_thread = std::thread([this, compute_video] { Tiron1WarmCompute(compute_video); });
 		}
 	}
 	if (!prefetch_by_warmup) StartShaderPrefetch({});
@@ -3613,7 +3625,8 @@ void PipelineCache::StartShaderPrefetch(std::vector<std::vector<uint32_t>> recor
 
 PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	const auto& programs = *m_program_cache;
-	if (const auto phase = programs.warm_phase.load(std::memory_order_acquire); phase != 0) {
+	if (const auto phase = programs.warm_phase.load(std::memory_order_acquire);
+	    phase != 0 && !m_tiron1_quiet.load(std::memory_order_acquire)) {
 		const auto total = programs.warm_total.load(std::memory_order_relaxed);
 		return {std::min(programs.warm_done.load(std::memory_order_relaxed), total), total,
 		        phase == 1 ? "Preparing recorded shaders" : "Preparing recorded pipelines"};
@@ -3622,6 +3635,90 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return {};
 	const auto total = prefetch->groups.size();
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
+}
+
+// (tiron1, KYTY_TIRON1=1; pipelineCache.h, local/tiron1.h) On m_warmup_thread, beside the game, as WarmScene with the
+// recording read again: its compute recipes only, newest first up to KYTY_TIRON1_COMPUTE_MAX, their records translated
+// (TranslateWarmup, those records only) and their pipelines made (WarmPipelines, the warmup's video memory cap). What the
+// game made meanwhile stays the game's.
+void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
+	LocalPlatform::SetThreadName("Kyty.Warmup");
+	auto& programs = *m_program_cache;
+	Tiron1::g_warm_state.store(1, std::memory_order_relaxed);
+	// The shader prefetch first (it translates every program of the game on every thread at start-up): at most 180 s.
+	const auto begin = std::chrono::steady_clock::now();
+	while (!m_warmup_stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
+		const auto progress = GetPrefetchProgress();
+		if (progress.label == nullptr && progress.total != 0 && progress.done >= progress.total) break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	}
+	if (m_warmup_stop.load(std::memory_order_relaxed)) return;
+	const auto start = std::chrono::steady_clock::now();
+	std::vector<std::vector<uint32_t>> records, recipes;
+	if (!LocalShaderWarmup::Cache::ReadInputs(m_warmup_path, records, recipes)) {
+		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
+		PipelineCacheLog("Tiron1: compute pipelines before play: the recording could not be read");
+		return;
+	}
+	const auto cap = static_cast<size_t>(Tiron1::EnvNumber("KYTY_TIRON1_COMPUTE_MAX", 1500.0, 0.0, 1000000.0));
+	std::vector<std::vector<uint32_t>> compute;
+	std::vector<uint8_t>               needed(records.size(), 0);
+	std::unordered_set<uint64_t>       only;
+	for (auto recorded = recipes.rbegin(); recorded != recipes.rend() && compute.size() < cap; ++recorded) {
+		LocalShaderWarmup::PipelineRecord recipe;
+		LocalShaderWarmup::Reader         reader {*recorded};
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe) || recipe.compute == LocalShaderWarmup::NoShader ||
+		    recipe.compute >= records.size())
+			continue;
+		if (!only.insert(LocalShaderWarmup::RecipeKey(*recorded)).second) continue;
+		needed[recipe.compute] = 1;
+		compute.push_back(std::move(*recorded));
+	}
+	std::reverse(compute.begin(), compute.end()); // (the recording's order: WarmPipelines takes the newest first)
+	if (compute.empty()) {
+		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
+		PipelineCacheLog("Tiron1: compute pipelines before play: none recorded yet");
+		return;
+	}
+	Tiron1::g_warm_wanted.store(compute.size(), std::memory_order_relaxed);
+	Tiron1::g_warm_state.store(2, std::memory_order_relaxed);
+	m_tiron1_quiet.store(true, std::memory_order_release);
+	size_t pipelines_before = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		programs.warming = true;
+		programs.warm_records.assign(records.begin(), records.end());
+		programs.warm_recipes = std::move(compute);
+		pipelines_before      = m_compute_pipelines.size();
+	}
+	programs.TranslateWarmup(m_mutex, true, m_warmup_stop, &needed);
+	size_t translated = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (size_t i = 0; i < needed.size() && i < programs.warm_permutations.size(); ++i)
+			translated += needed[i] != 0 && programs.warm_permutations[i] != nullptr ? 1 : 0;
+	}
+	Tiron1::g_warm_programs.store(translated, std::memory_order_relaxed);
+	if (!m_warmup_stop.load(std::memory_order_relaxed)) WarmPipelines(compute_video, true, &only);
+	size_t made = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		made = m_compute_pipelines.size() - std::min(m_compute_pipelines.size(), pipelines_before);
+		programs.warming = false;
+		programs.ReleaseRetired();
+		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warm_permutations = {};
+		programs.warm_records      = {};
+		programs.warm_recipes      = {};
+	}
+	m_tiron1_quiet.store(false, std::memory_order_release);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	Tiron1::g_warm_compute.store(made, std::memory_order_relaxed);
+	Tiron1::g_warm_ms.store(static_cast<uint64_t>(ms), std::memory_order_relaxed);
+	Tiron1::g_warm_state.store(3, std::memory_order_relaxed);
+	PipelineCacheLog("Tiron1: compute pipelines before play: {} recipes, {} programs translated, {} pipelines made (the "
+	                 "game's own meanwhile kept) in {} ms",
+	                 Tiron1::g_warm_wanted.load(), translated, made, ms);
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {

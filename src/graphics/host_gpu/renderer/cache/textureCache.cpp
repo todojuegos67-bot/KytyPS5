@@ -1,4 +1,5 @@
 #include <atomic>
+#include "local/envio1.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -646,6 +647,7 @@ static uint32_t TestReclaimRounds() {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
+	const Envio1::Scope envio1_new(Envio1::TexNew); // (envio1)
 	auto id = m_slot_images.insert(m_graphics, m_scheduler, info, may_fail);
 	// An image that must exist (a render target, a depth image, a copy's) the GPU could not make: room is made at once
 	// (the second time all there is, the images the GPU wrote too) and it is made again; then again for a while, as a
@@ -4798,6 +4800,15 @@ void TextureCache::OffloadScan(uint64_t tick) {
 		m_scheduler.Flush();
 	}
 	if (tick % 120 != 0) return;
+	// (ram18, KYTY_RAM18) The cold ranges of the game's memory the RAM18 thread found (no image), taken here where the
+	// textures are (the one thread that adds ranges): their read watchers on now, before the RAM18 thread writes them to
+	// the disk store and drops them (texture-offload.h, Ram18TakeQueued).
+	if (TextureOffload::Ram18On()) {
+		for (const auto& [cold_begin, cold_size]: TextureOffload::Ram18TakeQueued()) {
+			AsyncUpload::DrainRange(cold_begin, cold_size);
+			m_page_manager.UpdateReadWatchers<true>(cold_begin, cold_size);
+		}
+	}
 	// (Diagnostics: where a scan's time goes, printed when it took 10 ms or more.)
 	using Clock          = std::chrono::steady_clock;
 	const auto scan_start = Clock::now();

@@ -1,3 +1,4 @@
+#include "local/envio1.h" // (envio1: table-xpr.inc)
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"
 #include "local/rt-water.h"

@@ -9,9 +9,11 @@
 #include "speculation-state.h"
 
 #include <atomic>
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -46,6 +48,9 @@ class StreamBuffer;
 class Speculation {
 public:
 	explicit Speculation(RenderContext& renderer);
+	// (envio2, KYTY_ENVIO2) The compute queues' (ACB): one translator whose processor serves a compute queue
+	// (`queue_event_id`), and its own thread (Kyty.Acb2) that translates what the GPU thread hands it (Hand).
+	Speculation(RenderContext& renderer, int queue_event_id, std::function<void()> wake);
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
 
@@ -88,6 +93,22 @@ public:
 	[[nodiscard]] Outcome CommitReady(CommandProcessor& cp, const Job& job, uint32_t chunk, Pm4Execution& execution,
 	                                  std::optional<Pm4Execution>& end);
 	void                  Done(uint64_t serial, const CommandProcessor& cp);
+	// (envio2) The ACB thread's: a submission (from `cp`'s state, at `execution`) handed to it (false: it cannot take
+	// one more: Full). Pending: one handed or blocked (what the GPU thread translates meanwhile is logged: Log).
+	// CommitHanded: on the GPU thread, in guest order: waits for its translation (`waited_ns`: how long) and commits it
+	// as TranslateAndCommit does.
+	// (envio3, KYTY_ENVIO3) Several in flight (a FIFO, at most `max_in_flight`, one per serial: a queue's head), each
+	// with its own start state and the effects log's end when it was handed; a commit blocked at a wait is kept by
+	// serial (Blocked / ResumeHanded). ENVIO2 alone: max_in_flight 1, as before.
+	[[nodiscard]] bool    Hand(uint64_t serial, const CommandProcessor& cp, std::span<const uint32_t> commands,
+	                           const Pm4Execution& execution);
+	[[nodiscard]] bool    Full() const noexcept { return m_in_flight.size() >= m_max_in_flight; }
+	[[nodiscard]] bool    Pending() const noexcept { return !m_in_flight.empty() || m_blocked != nullptr; }
+	[[nodiscard]] size_t  InFlight() const noexcept { return m_in_flight.size(); }
+	[[nodiscard]] Outcome CommitHanded(uint64_t serial, CommandProcessor& cp, Pm4Execution& execution, uint64_t& waited_ns);
+	[[nodiscard]] bool    BlockedHanded(uint64_t serial) const noexcept;
+	[[nodiscard]] Outcome ResumeHanded(uint64_t serial, CommandProcessor& cp, Pm4Execution& execution);
+	void                  SetMaxInFlight(size_t count) noexcept { m_max_in_flight = std::max<size_t>(count, 1); }
 	static constexpr uint32_t ChunkWork = 128;
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
@@ -150,7 +171,7 @@ private:
 	// 3), the serial it translates, its latest result (the commits unlink it), when the translation going on began
 	// (m_clock; 0: none: it walks no speculation before it).
 	struct Translator {
-		explicit Translator(RenderContext& renderer, uint32_t number);
+		explicit Translator(RenderContext& renderer, uint32_t number, int queue_event_id = 0);
 		uint32_t                                   index = 0;
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;
@@ -230,6 +251,7 @@ private:
 	// scheduler's open command buffer (after all it submitted); the result kept for reuse.
 	void Finish(std::unique_ptr<Result> result, size_t first);
 	void Report();
+	void DetachedRun(); // (envio2) the ACB thread
 
 	RenderContext&                           m_renderer;
 	std::vector<std::unique_ptr<Translator>> m_translators;
@@ -271,6 +293,35 @@ private:
 	// translations by duration: < 0.5, 1, 2, 4, 8 ms and longer, and the longest.)
 	uint64_t                          m_wait_ns = 0, m_start_delay_ns = 0, m_started = 0, m_longest_ns = 0;
 	std::array<uint64_t, 6>           m_durations {};
+
+	// (envio2/envio3) The ACB thread; its jobs to translate (FIFO) and its results (under m_detached_mutex); start
+	// states for reuse; the GPU thread's: what is in flight (handed, translated or blocked at a wait: its serial and
+	// the effects log's end when it was handed: the log keeps what the oldest needs), the blocked commits.
+	struct DetachedJob {
+		uint64_t                          serial = 0;
+		std::unique_ptr<CommandProcessor> start;
+		std::span<const uint32_t>         commands;
+		Pm4Execution                      execution;
+		uint64_t                          effects_from = 0;
+	};
+	struct Flying {
+		uint64_t serial = 0, effects_from = 0;
+	};
+	[[nodiscard]] bool DetachedOn() const noexcept { return m_detached.joinable(); }
+	void               Landed(uint64_t serial); // (out of flight: committed, or stopped / dropped)
+	std::thread                                    m_detached;
+	std::function<void()>                          m_detached_wake;
+	std::mutex                                     m_detached_mutex;
+	std::condition_variable                        m_detached_job_cv, m_detached_done_cv;
+	std::deque<DetachedJob>                        m_detached_jobs;
+	std::vector<std::unique_ptr<Result>>           m_detached_results;
+	std::vector<std::unique_ptr<CommandProcessor>> m_detached_starts;
+	bool                                           m_detached_quit = false;
+	std::vector<Flying>                           m_in_flight;
+	std::vector<std::unique_ptr<Result>>           m_detached_blocked;
+	size_t                                         m_max_in_flight = 1;
+	int                                            m_queue_event_id = 0;
+	const char*                       m_name   = "Speculation";
 };
 
 } // namespace Libs::Graphics

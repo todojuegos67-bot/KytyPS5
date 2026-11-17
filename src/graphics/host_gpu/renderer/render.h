@@ -238,6 +238,16 @@ public:
 	// run). The GPU thread's executor only.
 	[[nodiscard]] bool DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t src, uint32_t count, uint32_t period,
 	                                uint64_t commands, uint64_t commands_bytes);
+	// (copia1, KYTY_COPIA1=1; local/copia1.h) A run of consecutive sealed announcements made as DsLinearCopy makes each,
+	// in their order, under one check of its terms, one render lock and one census scope. Returns how many were made:
+	// the first `made` of them; the one after (if any) was not made and its game's packets run, and the rest are left
+	// to the command processor again.
+	struct DsLinearCopyItem {
+		uint64_t dst = 0, src = 0;
+		uint32_t count = 0, period = 0;
+		uint64_t commands = 0, commands_bytes = 0;
+	};
+	[[nodiscard]] uint32_t DsLinearCopyBatch(CommandBuffer& buffer, const DsLinearCopyItem* items, uint32_t n);
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);

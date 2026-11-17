@@ -90,6 +90,9 @@ private:
 		uint32_t                    spec_chunk  = 0;
 		bool                        spec_normal = false;
 		std::optional<Pm4Execution> spec_end;
+		// (envio2, KYTY_ENVIO2) A compute one handed to the ACB thread, committed when the GPU thread takes it again.
+		bool envio2_handed = false;
+		bool envio3_cont   = false; // (envio3: the one handed is a continuation, after a wait)
 	};
 
 	void              Enqueue(Submission submission);
@@ -130,6 +133,10 @@ private:
 	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
 	std::unique_ptr<Speculation>                                     m_speculation;
 	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
+	// (envio2, KYTY_ENVIO2) The compute queues' translation on their own thread (Kyty.Acb2), the GPU thread's; the
+	// last serial each compute queue committed (mode 2's order check).
+	std::unique_ptr<Speculation>                                     m_acb_spec;
+	std::array<uint64_t, QueueCount>                                 m_envio2_last {};
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;

@@ -21,3 +21,14 @@
 Todo esto va activado por defecto. Para desactivar una parte, pon en settings.ini, sección [Avanzado], en extra: KYTY_RAIZ=0, KYTY_PARPADEO6=0, KYTY_REND1=0, KYTY_RAM16=0 o KYTY_RAM17=0.
 
 Sin cambios en la calidad ni en los trofeos. No incluye DLSS 5: necesita tu propio nvngx_dlssnr.dll.
+
+## Versión del 17-11
+
+**Ratón nativo (por defecto con teclado y ratón)**
+- La cámara gira exactamente lo que mueves el ratón (1:1), en horizontal y vertical, sin pasar por la emulación del stick.
+- La sensibilidad se puede cambiar en directo, sin reiniciar: desde el menú del juego (Controles) o editando settings.ini ([Mandos]: raton_sensibilidad, raton_antizona, raton_sens_x, raton_sens_y).
+
+**Menos RAM**
+- La memoria que el juego no está usando se guarda en el archivo temporal en vez de dejar que Windows la comprima (unos 0,4 GB más de RAM libre).
+
+Para desactivarlos: en settings.ini, [Avanzado], extra: KYTY_CAM1=0 o KYTY_RAM18=0.

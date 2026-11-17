@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "local/envio1.h"
 
 #include "common/assert.h"
 #include "common/profiler.h"
@@ -371,6 +372,7 @@ void EndTransitGroup() noexcept {
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	Envio1::Scope  envio1_layout(Envio1::TexLayout); // (envio1: a transition that records a barrier)
 	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
 	                        vk::AccessFlagBits2::eColorAttachmentWrite |
 	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
@@ -397,6 +399,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	// KYTY_ASYNC_COMPUTE: a layout transition is a write of the image too (the other lane must be done with it).
 	LaneSync::Note(lane_marks, static_cast<bool>(destination_access & writes) || !barriers.empty());
 	if (barriers.empty()) {
+		envio1_layout.Drop();
 		return;
 	}
 	m_scheduler.EndRendering();
@@ -408,6 +411,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	const Envio1::Scope envio1_dirty(Envio1::Dirty); // (envio1: a texture's dirty data)
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};

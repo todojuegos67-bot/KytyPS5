@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/envio1.h"
 #include "local/rt-local-lights.h"
 #include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
@@ -804,9 +805,41 @@ bool RenderExecutor::DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t 
 	m_context.GetCommandScheduler().PopPendingOperations();
 	LiveCensus::Scope census(LiveCensus::Dispatch, shader, 0);
 	LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader);
+	Envio1::NoteDispatch();
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
 	RenderLockGuard   lock(m_context.GetMutex());
+	envio1_lock.reset();
 	LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, shader, 11);
 	return DemonsSouls::TryLinearCopyRanges(m_context.GetBufferCache(), dst, src, count, period, commands, commands_bytes);
+}
+
+// (copia1, KYTY_COPIA1; local/copia1.h) DsLinearCopy for a run of announcements: its terms checked once, then each copy
+// as DsLinearCopy makes it (the 64th-use rule per copy), in order, under one lock and one census scope; the first copy
+// not made ends the run.
+uint32_t RenderExecutor::DsLinearCopyBatch(CommandBuffer& buffer, const DsLinearCopyItem* items, uint32_t n) {
+	if (n == 0 || buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed))
+		return 0;
+	auto&      learned = Catalog();
+	const auto shader  = learned.m_linear_copy_shader.load(std::memory_order_relaxed);
+	if (shader == 0 || ShaderMapGeneration() != learned.m_linear_copy_generation) return 0;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	LiveCensus::Scope census(LiveCensus::Dispatch, shader, 0);
+	LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader);
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard   lock(m_context.GetMutex());
+	envio1_lock.reset();
+	LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, shader, 11);
+	uint32_t made = 0;
+	for (; made < n; ++made) {
+		if ((++m_linear_copy_hook_uses & 63u) == 0) break;
+		Envio1::NoteDispatch();
+		const auto& item = items[made];
+		if (!DemonsSouls::TryLinearCopyRanges(m_context.GetBufferCache(), item.dst, item.src, item.count, item.period,
+		                                      item.commands, item.commands_bytes))
+			break;
+	}
+	return made;
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -860,6 +893,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<RenderLockGuard> lock;
 	{
 		LiveCensus::Scope census_lock(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 12);
+		Envio1::NoteDispatch();
+		const Envio1::Scope envio1_lock(Envio1::Lock); // (envio1)
 		if (Role() == 0) lock.emplace(m_context.GetMutex());
 	}
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return;
@@ -1391,6 +1426,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		FrameGen::SsrCaptureGbuffer(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                            std::span<const TextureBinding> {bindings.images});
 	PreparedBindings* descriptor_stage = &bindings;
+	const Envio1::Scope envio1_record(Envio1::Record); // (envio1: to the end of the dispatch)
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);

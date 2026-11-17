@@ -19,6 +19,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -190,10 +192,22 @@ static bool Ram16On() {
 	return on;
 }
 static void StartRam16Line(); // (below: the "[ram16]" line's thread)
+static void StartRam18();     // (ram18, below: the cold-range thread)
 
 void ApplyLowRamDefaults() {
 	static std::once_flag once;
 	std::call_once(once, [] {
+		// (ram18) KYTY_RAM18=1: the game's cold memory to the disk store (texture-offload.h); implies KYTY_RAM17=1.
+		const char* ram18    = Env("KYTY_RAM18");
+		const bool  ram18_on = ram18 != nullptr && ram18[0] == '1';
+		std::string ram18_set;
+		if (ram18_on) SetDefault("KYTY_RAM17", "1", &ram18_set);
+		// (ram20) KYTY_RAM20=1: the game's memory with a copy in video memory to the disk store and out of RAM (the RAM18
+		// cold-range path, texture-offload.h); implies KYTY_RAM17=1 (and RAM16), and the "[ram19]" lines (gpu-residency.h).
+		const char* ram20    = Env("KYTY_RAM20");
+		const bool  ram20_on = ram20 != nullptr && ram20[0] == '1' && ram20[1] == '\0';
+		std::string ram20_set;
+		if (ram20_on) SetDefault("KYTY_RAM17", "1", &ram20_set);
 		// (ram17) KYTY_RAM17=1: the disk store of the native offload (texture-offload.h); implies KYTY_RAM16=1.
 		const char* ram17 = Env("KYTY_RAM17");
 		const bool  ram17_on = ram17 != nullptr && ram17[0] == '1';
@@ -214,6 +228,29 @@ void ApplyLowRamDefaults() {
 				            "(KYTY_RAM17_HOLD_S); \"[ram17]\" line every 5 s\n",
 				            ram17_set.empty() ? "" : ", ", ram17_set.c_str(),
 				            Env("KYTY_RAM17_HOLD_S") != nullptr ? Env("KYTY_RAM17_HOLD_S") : "30");
+			if (ram18_on) {
+				std::printf("RAM18: asked (KYTY_RAM18=1%s%s; works with the native offload and KYTY_RAM17): game memory "
+				            "Windows found cold (out of the working set %s s, KYTY_RAM18_COLD_S) in %s (KYTY_RAM18_LABELS) written to the disk store and dropped, read back on "
+				            "any touch; up to %s MiB a pass (KYTY_RAM18_MB); \"[ram18]\" line every 5 s\n",
+				            ram18_set.empty() ? "" : ", ", ram18_set.c_str(),
+				            Env("KYTY_RAM18_COLD_S") != nullptr ? Env("KYTY_RAM18_COLD_S") : "10",
+				            Env("KYTY_RAM18_LABELS") != nullptr ? Env("KYTY_RAM18_LABELS") : "VirtualMemo",
+				            Env("KYTY_RAM18_MB") != nullptr ? Env("KYTY_RAM18_MB") : "256");
+				StartRam18();
+			}
+			if (ram20_on) {
+				std::printf("RAM20: asked (KYTY_RAM20=1%s%s; works with the native offload and KYTY_RAM17): game memory with a copy "
+				            "in video memory (last GPU residency pass) written to the disk store and dropped - out of RAM and of "
+				            "Windows' compression -, read back on any touch; cold (out of the working set %s s, KYTY_RAM20_COLD_S) in "
+				            "every allocator, in RAM too for images of the GPU-only zones (KYTY_RAM20_WARM=0 off; buffers: "
+				            "KYTY_RAM20_WARM_BUF=1); up to %s MiB a pass (KYTY_RAM20_MB); \"[ram20]\" line every %s s "
+				            "(KYTY_RAM20_LINE_S)\n",
+				            ram20_set.empty() ? "" : ", ", ram20_set.c_str(),
+				            Env("KYTY_RAM20_COLD_S") != nullptr ? Env("KYTY_RAM20_COLD_S") : "10",
+				            Env("KYTY_RAM20_MB") != nullptr ? Env("KYTY_RAM20_MB") : "256",
+				            Env("KYTY_RAM20_LINE_S") != nullptr ? Env("KYTY_RAM20_LINE_S") : "10");
+				StartRam18();
+			}
 			std::fflush(stdout);
 			StartRam16Line();
 		}
@@ -1351,6 +1388,469 @@ bool Ram16Census(char* out, size_t size, uint64_t* game_ram, double* ms, size_t*
 	return true;
 }
 
+// ---- (ram18) KYTY_RAM18=1 (texture-offload.h, Ram18On): the cold-range thread ----
+// Every 5 s, on a lowest-priority thread: (1) the cold ranges the render thread took since (watchers on) written to the
+// disk store and dropped (TextureOffload::DiscardRangeNative: a range that cannot be written stays in RAM); (2) the
+// committed private pages of the labels' ranges (VirtualQuery; read-write or read-only only: no-access pages are watched
+// by someone - a taken range, the GPU's kept bytes - and left alone), in 256 KiB blocks, a working-set sample every 64 KiB;
+// a block with no sample in the working set for KYTY_RAM18_COLD_S is cold: Windows trimmed it (its bytes in the
+// compression store, or never written); (3) cold blocks side by side merged into ranges of up to 1 MiB and proposed, up to
+// KYTY_RAM18_MB a pass from where the last pass stopped (TextureOffload::Ram18Propose; the render thread takes them).
+struct Ram18Pass {
+	std::atomic<uint64_t> committed {0}, resident {0}, out {0}, ready {0}, proposed {0}, pass_us {0}, drop_us {0}, drops {0};
+	std::atomic<uint64_t> passes {0};
+};
+Ram18Pass g_ram18;
+
+// ---- (ram20) KYTY_RAM20=1: the game's memory that video memory holds a copy of, out of RAM ----
+// One pass every 5 s on the RAM18 thread (lowest priority), before RAM18's own. Candidates: 256 KiB blocks of the game's
+// allocators (the census' labels), committed private read-write or read-only pages only (no-access ones are someone's:
+// a taken range, the GPU's kept bytes or its read watchers - their newer bytes are on the GPU, not ours to drop -), whose
+// four 64 KiB granules are all under a GPU cache range of the last GPU residency pass (ram-guard.cpp's measurement,
+// every 30 s). A block is taken when:
+//  - cold: no working-set sample of it for KYTY_RAM20_COLD_S (default 10): in Windows' compression store, the page file,
+//    or never written - the case of 1.07-1.45 GB "accessible out of RAM with a copy in the GPU" [M, 11-17 01:32] -; or
+//  - warm (KYTY_RAM20_WARM, default 1): in RAM, all four granules images (sampled textures, render targets, GPU-written
+//    images; buffers too with KYTY_RAM20_WARM_BUF=1) in this pass and the one before, and in an allocator the CPU does
+//    not write every frame: VirtualMemo, gpupage, gpuheap, RTSharedAll, RTPersistAl (Ghidra 01.007.000: VirtualMemo
+//    written only by the file read 0x8fed14 and the chunk memcpy 0x901459; RT arenas reserved whole at 0x91c680 through
+//    0x806b30 for the GPU; DefaultTagg / cpuheap / cpubkt / cpupage written every frame - TaggedFrameAllocator 0x811f60 -:
+//    cold only there).
+// Taken ranges go the RAM18 way (texture-offload.h): read watchers on by the render thread (OffloadScan), then written to
+// the disk store and reset by this thread; any touch - a game thread's fault, an emulator window or guarded read, a write
+// back of GPU results (NativeGuardedWrite asks first with KYTY_RAM20), a kernel write of the game's buffer (fileSystem.cpp
+// bounces it through a guarded read) - reads it back from the file on its own thread. Never from the GPU: with native
+// memory the RAM copy is the one the CPU last saw and the GPU's newer bytes stay behind their own read watchers (pages
+// with them are no-access and never taken); the file gives back exactly the bytes that were dropped.
+struct Ram20Pass_ {
+	std::atomic<uint64_t> gpu_committed {0}, warm {0}, cold_out {0}, ready_cold {0}, ready_warm {0}, proposed {0}, pass_us {0};
+	std::atomic<uint64_t> snapshot {0}, passes {0};
+};
+Ram20Pass_ g_ram20;
+
+void Ram20Pass() {
+	using namespace GpuResidency;
+	static const int      cold_s = [] {
+        const char* v = Env("KYTY_RAM20_COLD_S");
+        return v == nullptr ? 10 : std::clamp(std::atoi(v), 1, 3600);
+	}();
+	static const bool     warm_on  = Env("KYTY_RAM20_WARM") == nullptr || Env("KYTY_RAM20_WARM")[0] != '0';
+	static const bool     warm_buf = Env("KYTY_RAM20_WARM_BUF") != nullptr && Env("KYTY_RAM20_WARM_BUF")[0] == '1';
+	static const uint64_t budget   = EnvMiB("KYTY_RAM20_MB", 256 * MiB);
+	static const char* const labels[] = {"VirtualMemo", "cpuheap", "gpuheap", "cpupage", "gpupage", "cpubkt",
+	                                     "gpubkt",      "DefaultTagg", "RTSharedAll", "RTPersistAl"};
+	static const bool        warm_label[] = {true, false, true, false, true, false, false, false, true, true};
+	constexpr size_t         Labels = sizeof(labels) / sizeof(labels[0]);
+	constexpr uint64_t       Granule = uint64_t {64} << 10u, Block = uint64_t {256} << 10u, Window = uint64_t {1} << 20u;
+	constexpr size_t         PerBlock = Block / Granule, MaxPairs = 8192, Batch = 1024;
+	// The granules under a GPU range: a bit per kind, this pass's and the one before (rebuilt when a new pass came).
+	static std::unordered_map<uint64_t, uint8_t> now_map, before_map;
+	static uint64_t                              have_pass = 0;
+	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> since;
+	static std::vector<uint64_t>                 pairs(MaxPairs * 2);
+	static uint64_t                              cursor = 0;
+	const auto t0 = std::chrono::steady_clock::now();
+	{
+		auto&              snap = Ram20Ranges();
+		std::vector<Range> ranges;
+		uint64_t           pass = 0;
+		{
+			std::lock_guard lock(snap.mutex);
+			if (snap.pass != have_pass) {
+				ranges = snap.ranges;
+				pass   = snap.pass;
+			}
+		}
+		if (pass != 0) {
+			before_map.swap(now_map);
+			now_map.clear();
+			now_map.reserve(ranges.size() * 4 + 1024);
+			for (const auto& range: ranges) {
+				if (range.size == 0 || UINT64_MAX - range.address < range.size || range.kind >= Kinds) continue;
+				for (uint64_t g = range.address / Granule; g <= (range.address + range.size - 1) / Granule; g++)
+					now_map[g] |= static_cast<uint8_t>(1u << range.kind);
+			}
+			have_pass = pass;
+			g_ram20.snapshot.store(pass, std::memory_order_relaxed);
+		}
+	}
+	if (now_map.empty()) return; // (no answered residency pass yet)
+	// The labels' committed read-write / read-only blocks wholly under GPU ranges.
+	struct Cand {
+		uint64_t block;
+		uint8_t  label, mask;
+		bool     run_end, stable;
+	};
+	std::vector<Cand> cands;
+	uint64_t          gpu_committed = 0;
+	for (size_t l = 0; l < Labels; l++) {
+		const size_t n = Loader::DemonsSoulsMemMap::RangesOf(&labels[l], 1, pairs.data(), MaxPairs);
+		if (n == SIZE_MAX) return;
+		for (size_t i = 0; i < n; i++) {
+			const uint64_t lo = pairs[2 * i], hi = pairs[2 * i + 1];
+			for (uint64_t at = lo; at < hi;) {
+				MEMORY_BASIC_INFORMATION info {};
+				if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+				const uint64_t stop = std::min(hi, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+				if (stop <= at) break;
+				const DWORD protect = info.Protect & 0xffu;
+				if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && (info.Protect & PAGE_GUARD) == 0 &&
+				    (protect == PAGE_READWRITE || protect == PAGE_READONLY)) {
+					for (uint64_t block = (at + Block - 1) & ~(Block - 1); block + Block <= stop; block += Block) {
+						uint8_t mask = 0;
+						bool    all = true, stable = true;
+						for (size_t k = 0; k < PerBlock && all; k++) {
+							const auto found = now_map.find(block / Granule + k);
+							all              = found != now_map.end() && found->second != 0;
+							if (!all) break;
+							mask |= found->second;
+							const auto old = before_map.find(block / Granule + k);
+							stable         = stable && old != before_map.end() && (old->second & found->second) != 0;
+						}
+						if (!all) continue;
+						gpu_committed += Block;
+						cands.push_back({block, static_cast<uint8_t>(l), mask, block + 2 * Block > stop, stable});
+					}
+				}
+				at = stop;
+			}
+			if (cands.size() > (size_t {64} << 10u)) break;
+		}
+	}
+	std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.block < b.block; });
+	// Working-set samples: one page in each 64 KiB granule.
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(cands.size() * PerBlock);
+	for (size_t i = 0; i < cands.size(); i++)
+		for (size_t k = 0; k < PerBlock; k++) {
+			entries[i * PerBlock + k]                = {};
+			entries[i * PerBlock + k].VirtualAddress = reinterpret_cast<PVOID>(cands[i].block + k * Granule);
+		}
+	for (size_t begin = 0; begin < entries.size(); begin += Batch) {
+		const size_t count = std::min(Batch, entries.size() - begin);
+		if (begin != 0) SwitchToThread();
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), entries.data() + begin, static_cast<DWORD>(count * sizeof(entries[0]))) == 0) return;
+	}
+	// The kind a range is counted under: the first of render target, GPU-written image, texture, GPU-written buffer, buffer.
+	const auto kind_of = [](uint8_t mask) -> uint8_t {
+		for (const Kind k: {Target, Storage, Texture, GpuWrittenBuffer, GpuBuffer})
+			if ((mask & (1u << k)) != 0) return static_cast<uint8_t>(k);
+		return static_cast<uint8_t>(GpuBuffer);
+	};
+	constexpr uint8_t ImageMask = (1u << Texture) | (1u << Target) | (1u << Storage);
+	const auto        now       = std::chrono::steady_clock::now();
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> seen;
+	std::vector<uint8_t> take(cands.size(), 0);
+	uint64_t             warm = 0, cold_out = 0, ready_cold = 0, ready_warm = 0;
+	for (size_t i = 0; i < cands.size(); i++) {
+		size_t in = 0;
+		for (size_t k = 0; k < PerBlock; k++) in += (entries[i * PerBlock + k].VirtualAttributes.Flags & 1u) != 0 ? 1 : 0;
+		const auto& c = cands[i];
+		if (in == 0) {
+			cold_out += Block;
+			const auto found = since.find(c.block);
+			const auto first = found != since.end() ? found->second : now;
+			seen.emplace(c.block, first);
+			if (now - first >= std::chrono::seconds(cold_s)) {
+				take[i] = 1;
+				ready_cold += Block;
+			}
+			continue;
+		}
+		warm += in * Granule;
+		const uint8_t allowed = warm_buf ? static_cast<uint8_t>(ImageMask | (1u << GpuBuffer) | (1u << GpuWrittenBuffer)) : ImageMask;
+		if (warm_on && warm_label[c.label] && c.stable && (c.mask & ~allowed) == 0) {
+			take[i] = 1;
+			ready_warm += Block;
+		}
+	}
+	since.swap(seen);
+	// Merged by kind within 1 MiB windows (a range starts at the same place from pass to pass: its serial too), up to the
+	// budget from where the last pass stopped.
+	std::vector<std::tuple<uint64_t, uint64_t, uint8_t>> ranges;
+	const auto start    = static_cast<size_t>(std::lower_bound(cands.begin(), cands.end(), cursor, [](const Cand& c, uint64_t v) { return c.block < v; }) - cands.begin());
+	uint64_t   proposed = 0, last = cursor;
+	for (size_t step = 0; step < cands.size() && proposed < budget; step++) {
+		const size_t i = (start + step) % cands.size();
+		if (take[i] == 0) continue;
+		const uint8_t r20 = static_cast<uint8_t>(kind_of(cands[i].mask) + 1);
+		auto*         back = ranges.empty() ? nullptr : &ranges.back();
+		if (back != nullptr && std::get<0>(*back) + std::get<1>(*back) == cands[i].block && std::get<1>(*back) + Block <= Window &&
+		    (std::get<0>(*back) & ~(Window - 1)) == (cands[i].block & ~(Window - 1)) && std::get<2>(*back) == r20 && i != 0 &&
+		    !cands[i - 1].run_end) {
+			std::get<1>(*back) += Block;
+		} else {
+			ranges.emplace_back(cands[i].block, Block, r20);
+		}
+		proposed += Block;
+		last = cands[i].block + Block;
+	}
+	cursor = proposed < budget ? 0 : last;
+	TextureOffload::Ram20Propose(std::move(ranges));
+	g_ram20.gpu_committed.store(gpu_committed, std::memory_order_relaxed);
+	g_ram20.warm.store(warm, std::memory_order_relaxed);
+	g_ram20.cold_out.store(cold_out, std::memory_order_relaxed);
+	g_ram20.ready_cold.store(ready_cold, std::memory_order_relaxed);
+	g_ram20.ready_warm.store(ready_warm, std::memory_order_relaxed);
+	g_ram20.proposed.store(proposed, std::memory_order_relaxed);
+	g_ram20.pass_us.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+	                      std::memory_order_relaxed);
+	g_ram20.passes.fetch_add(1, std::memory_order_relaxed);
+}
+
+// (ram20) The "[ram20]" line into `out` ("" when nothing was read yet): what is out of RAM now by kind, what went and came
+// back since the last line, the candidates the last pass saw, and the RAM the user counts (emulator + compression) now
+// and against the first line.
+void Ram20Line(char* out, size_t size, const RamLineProcesses& procs, int seconds) {
+	static TextureOffload::Ram20View last, view;
+	static bool                      have_last = false, have_view = false;
+	static uint64_t                  first_real = 0;
+	TextureOffload::Ram20View        now;
+	const bool                       fresh = TextureOffload::Ram20Read(&now);
+	if (fresh) {
+		view      = now;
+		have_view = true;
+	}
+	out[0] = '\0';
+	if (!have_view) return;
+	constexpr double GiBd = 1024.0 * 1024.0 * 1024.0, MiBd = 1024.0 * 1024.0;
+	static const char* const names[] = {"tex", "RT", "imgGPU", "buf", "bufGPU"}; // (GpuResidency::Kind order)
+	const auto d = [&](uint64_t a, uint64_t b) { return have_last ? a - b : a; };
+	uint64_t   all_now = 0, taken = 0, reads = 0, read_bytes = 0;
+	for (size_t k = 0; k < TextureOffload::Ram20View::Kinds; k++) {
+		all_now += view.now[k];
+		taken += d(view.taken[k], last.taken[k]);
+		reads += d(view.reads[k], last.reads[k]);
+		read_bytes += d(view.read_bytes[k], last.read_bytes[k]);
+	}
+	size_t used = 0;
+	RamLineAdd(out, size, &used, "[ram20] %d s: soltado ahora %.2f GB%s (pico %.2f) =", seconds, static_cast<double>(all_now) / GiBd,
+	           fresh ? "" : " (lectura anterior)", static_cast<double>(view.peak) / GiBd);
+	for (size_t k = 0; k < TextureOffload::Ram20View::Kinds; k++)
+		RamLineAdd(out, size, &used, " %s %.2f", names[k], static_cast<double>(view.now[k]) / GiBd);
+	RamLineAdd(out, size, &used, "; tomados +%llu (MiB:", static_cast<unsigned long long>(taken));
+	for (size_t k = 0; k < TextureOffload::Ram20View::Kinds; k++)
+		RamLineAdd(out, size, &used, " %s %.0f", names[k], static_cast<double>(d(view.taken_bytes[k], last.taken_bytes[k])) / MiBd);
+	RamLineAdd(out, size, &used,
+	           "); al disco +%.0f MiB, en cero +%.0f MiB (solo soltados); vueltos por un toque +%llu (%.0f MiB, %.1f ms, el mayor %.1f "
+	           "ms en total; MiB:",
+	           static_cast<double>(d(view.written_bytes, last.written_bytes)) / MiBd,
+	           static_cast<double>(d(view.zero_bytes, last.zero_bytes)) / MiBd, static_cast<unsigned long long>(reads),
+	           static_cast<double>(read_bytes) / MiBd, static_cast<double>(d(view.read_us, last.read_us)) / 1000.0,
+	           static_cast<double>(view.read_us_max) / 1000.0);
+	for (size_t k = 0; k < TextureOffload::Ram20View::Kinds; k++)
+		RamLineAdd(out, size, &used, " %s %.0f", names[k], static_cast<double>(d(view.read_bytes[k], last.read_bytes[k])) / MiBd);
+	RamLineAdd(out, size, &used,
+	           "); no escritos (se quedan en RAM) %llu; PERDIDAS %llu; ultima pasada: con copia en GPU comprometido %.2f GB, en RAM "
+	           "%.2f, fuera de RAM %.2f, listos frios %.2f + tibios %.2f, propuestos %.0f MiB (%.1f ms, residencia #%llu)",
+	           static_cast<unsigned long long>(view.failed), static_cast<unsigned long long>(view.lost),
+	           static_cast<double>(g_ram20.gpu_committed.load()) / GiBd, static_cast<double>(g_ram20.warm.load()) / GiBd,
+	           static_cast<double>(g_ram20.cold_out.load()) / GiBd, static_cast<double>(g_ram20.ready_cold.load()) / GiBd,
+	           static_cast<double>(g_ram20.ready_warm.load()) / GiBd, static_cast<double>(g_ram20.proposed.load()) / MiBd,
+	           static_cast<double>(g_ram20.pass_us.load()) / 1000.0, static_cast<unsigned long long>(g_ram20.snapshot.load()));
+	if (procs.ok) {
+		const uint64_t real = procs.own_private + procs.compression_ws;
+		if (first_real == 0) first_real = real;
+		RamLineAdd(out, size, &used, "; RAM real: emulador %.2f + compresion de Windows %.2f = %.2f GB (al empezar %.2f, %+.2f)",
+		           static_cast<double>(procs.own_private) / GiBd, static_cast<double>(procs.compression_ws) / GiBd,
+		           static_cast<double>(real) / GiBd, static_cast<double>(first_real) / GiBd,
+		           (static_cast<double>(real) - static_cast<double>(first_real)) / GiBd);
+	}
+	if (fresh) {
+		last      = view;
+		have_last = true;
+	}
+}
+
+void Ram18Thread() {
+	SetThreadDescription(GetCurrentThread(), L"Kyty.Ram18");
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	const int      cold_s = [] {
+        const char* v = Env("KYTY_RAM18_COLD_S");
+        return v == nullptr ? 10 : std::clamp(std::atoi(v), 1, 3600);
+	}();
+	const uint64_t budget = EnvMiB("KYTY_RAM18_MB", 256 * MiB);
+	// The labels (comma-separated; default the streamed textures' zone).
+	std::vector<std::string> names;
+	{
+		const char* v    = Env("KYTY_RAM18_LABELS");
+		std::string list = v != nullptr ? v : "VirtualMemo";
+		for (size_t at = 0; at <= list.size();) {
+			const size_t comma = std::min(list.find(',', at), list.size());
+			if (comma > at) names.push_back(list.substr(at, comma - at));
+			at = comma + 1;
+		}
+	}
+	std::vector<const char*> labels;
+	for (const auto& name: names) labels.push_back(name.c_str());
+	constexpr uint64_t Block = uint64_t {256} << 10u, Sample = uint64_t {64} << 10u, Range = uint64_t {1} << 20u;
+	constexpr size_t   MaxPairs = 16384;
+	std::vector<uint64_t>                                          pairs(MaxPairs * 2);
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> since, seen;
+	std::vector<uint64_t>                                          blocks; // (block starts, ascending; a run ends where a region does)
+	std::vector<uint8_t>                                           run_end;
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION>                  entries;
+	uint64_t                                                       cursor = 0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		if (!TextureOffload::Ram18On()) { // (read once the emulator set its switches; off: the thread ends)
+			std::printf("[ram18] apagado: necesita el offload nativo (KYTY_RAIZ / KYTY_NATIVE_MEMORY) y KYTY_RAM17=1\n");
+			std::fflush(stdout);
+			return;
+		}
+		// (1) The ranges taken since: written and dropped.
+		auto drop_start = std::chrono::steady_clock::now();
+		const auto drops = TextureOffload::Ram18TakeDrops();
+		for (const auto begin: drops) {
+			(void)TextureOffload::DiscardRangeNative(begin);
+			SwitchToThread();
+		}
+		g_ram18.drop_us.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - drop_start).count()),
+		                      std::memory_order_relaxed);
+		g_ram18.drops.fetch_add(drops.size(), std::memory_order_relaxed);
+		// (ram20, KYTY_RAM20) Its own pass (the memory with a copy in video memory), whatever RAM18 proposes.
+		if (TextureOffload::Ram20Active()) Ram20Pass();
+		if (!TextureOffload::Ram18Own()) continue; // (ram20 alone: RAM18's own VirtualMemo pass off)
+		// (2) The labels' committed blocks and their working-set samples.
+		const auto   t0 = std::chrono::steady_clock::now();
+		const size_t n  = labels.empty() ? SIZE_MAX : Loader::DemonsSoulsMemMap::RangesOf(labels.data(), labels.size(), pairs.data(), MaxPairs);
+		if (n == SIZE_MAX) continue;
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		for (size_t i = 0; i < n; i++)
+			if (pairs[2 * i + 1] > pairs[2 * i]) spans.emplace_back(pairs[2 * i], pairs[2 * i + 1]);
+		std::sort(spans.begin(), spans.end());
+		blocks.clear();
+		run_end.clear();
+		uint64_t committed = 0;
+		for (const auto& [lo, hi]: spans) {
+			for (uint64_t at = lo; at < hi;) {
+				MEMORY_BASIC_INFORMATION info {};
+				if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+				const uint64_t base = reinterpret_cast<uint64_t>(info.BaseAddress);
+				const uint64_t stop = std::min(hi, base + static_cast<uint64_t>(info.RegionSize));
+				if (stop <= at) break;
+				const DWORD protect = info.Protect & 0xffu;
+				if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && (info.Protect & PAGE_GUARD) == 0 &&
+				    (protect == PAGE_READWRITE || protect == PAGE_READONLY)) {
+					committed += stop - at;
+					const uint64_t first = (at + Block - 1) & ~(Block - 1);
+					for (uint64_t block = first; block + Block <= stop; block += Block) {
+						blocks.push_back(block);
+						run_end.push_back(block + 2 * Block > stop ? 1 : 0);
+					}
+				}
+				at = stop;
+			}
+			if (blocks.size() > (uint64_t {64} << 10u)) break; // (16 GiB of blocks: more than any label holds)
+		}
+		// Samples: a page every 64 KiB of every block.
+		constexpr size_t PerBlock = Block / Sample, Batch = 1024;
+		entries.resize(blocks.size() * PerBlock);
+		for (size_t i = 0; i < blocks.size(); i++)
+			for (size_t k = 0; k < PerBlock; k++) {
+				entries[i * PerBlock + k]                = {};
+				entries[i * PerBlock + k].VirtualAddress = reinterpret_cast<PVOID>(blocks[i] + k * Sample);
+			}
+		bool ok = true;
+		for (size_t begin = 0; begin < entries.size() && ok; begin += Batch) {
+			const size_t count = std::min(Batch, entries.size() - begin);
+			if (begin != 0) SwitchToThread();
+			ok = K32QueryWorkingSetEx(GetCurrentProcess(), entries.data() + begin, static_cast<DWORD>(count * sizeof(entries[0]))) != 0;
+		}
+		if (!ok) continue;
+		// (3) Cold blocks, merged and proposed.
+		const auto now      = std::chrono::steady_clock::now();
+		uint64_t   resident = 0, out = 0, ready = 0;
+		seen.clear();
+		std::vector<uint8_t> cold(blocks.size(), 0);
+		for (size_t i = 0; i < blocks.size(); i++) {
+			size_t in = 0;
+			for (size_t k = 0; k < PerBlock; k++) in += (entries[i * PerBlock + k].VirtualAttributes.Flags & 1u) != 0 ? 1 : 0;
+			resident += in * Sample;
+			if (in != 0) continue;
+			out += Block;
+			const auto found = since.find(blocks[i]);
+			const auto first = found != since.end() ? found->second : now;
+			seen.emplace(blocks[i], first);
+			if (now - first >= std::chrono::seconds(cold_s)) {
+				cold[i] = 1;
+				ready += Block;
+			}
+		}
+		since.swap(seen);
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		const auto start = static_cast<size_t>(std::lower_bound(blocks.begin(), blocks.end(), cursor) - blocks.begin());
+		uint64_t   proposed = 0, last = cursor;
+		for (size_t step = 0; step < blocks.size() && proposed < budget; step++) {
+			const size_t i = (start + step) % blocks.size();
+			if (cold[i] == 0) continue;
+			// (Within one 1 MiB-aligned window: a range starts at the same place from pass to pass, its serial too.)
+			if (!ranges.empty() && ranges.back().first + ranges.back().second == blocks[i] && ranges.back().second + Block <= Range &&
+			    (ranges.back().first & ~(Range - 1)) == (blocks[i] & ~(Range - 1)) && i != 0 && run_end[i - 1] == 0) {
+				ranges.back().second += Block;
+			} else {
+				ranges.emplace_back(blocks[i], Block);
+			}
+			proposed += Block;
+			last = blocks[i] + Block;
+		}
+		cursor = proposed < budget ? 0 : last;
+		TextureOffload::Ram18Propose(std::move(ranges));
+		g_ram18.committed.store(committed, std::memory_order_relaxed);
+		g_ram18.resident.store(resident, std::memory_order_relaxed);
+		g_ram18.out.store(out, std::memory_order_relaxed);
+		g_ram18.ready.store(ready, std::memory_order_relaxed);
+		g_ram18.proposed.store(proposed, std::memory_order_relaxed);
+		g_ram18.pass_us.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
+		                      std::memory_order_relaxed);
+		g_ram18.passes.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// (ram18) The "[ram18]" line into `out` ("" when nothing was read yet).
+void Ram18Line(char* out, size_t size, const RamLineProcesses& procs) {
+	static TextureOffload::Ram18View last, view;
+	static bool                      have_last = false, have_view = false;
+	TextureOffload::Ram18View        now;
+	const bool                       fresh = TextureOffload::Ram18Read(&now);
+	if (fresh) {
+		view      = now;
+		have_view = true;
+	}
+	out[0] = '\0';
+	if (!have_view) return;
+	constexpr double GiBd = 1024.0 * 1024.0 * 1024.0, MiBd = 1024.0 * 1024.0;
+	const auto d = [&](uint64_t TextureOffload::Ram18View::*field) { return have_last ? view.*field - last.*field : view.*field; };
+	size_t used = 0;
+	RamLineAdd(out, size, &used,
+	           "[ram18] 5 s: memoria fria en disco ahora %.2f GB%s (pico %.2f; %llu rangos); zona %s: comprometido %.2f GB, en RAM "
+	           "%.2f, fuera de RAM %.2f, fria lista %.2f (pasada %.1f ms); tomadas +%llu (%.0f MiB); escritas +%llu (%.0f MiB, %.1f "
+	           "ms); en cero +%llu (%.0f MiB, solo soltadas); vueltas por un toque +%llu (%.0f MiB, %.1f ms, la mayor %.1f ms en "
+	           "total); desmapeadas +%.0f MiB; no escritas %llu; PERDIDAS %llu",
+	           static_cast<double>(view.now) / GiBd, fresh ? "" : " (lectura anterior)", static_cast<double>(view.peak) / GiBd,
+	           static_cast<unsigned long long>(view.ranges), Env("KYTY_RAM18_LABELS") != nullptr ? Env("KYTY_RAM18_LABELS") : "VirtualMemo",
+	           static_cast<double>(g_ram18.committed.load()) / GiBd, static_cast<double>(g_ram18.resident.load()) / GiBd,
+	           static_cast<double>(g_ram18.out.load()) / GiBd, static_cast<double>(g_ram18.ready.load()) / GiBd,
+	           static_cast<double>(g_ram18.pass_us.load()) / 1000.0, static_cast<unsigned long long>(d(&TextureOffload::Ram18View::taken)),
+	           static_cast<double>(d(&TextureOffload::Ram18View::taken_bytes)) / MiBd,
+	           static_cast<unsigned long long>(d(&TextureOffload::Ram18View::written)),
+	           static_cast<double>(d(&TextureOffload::Ram18View::written_bytes)) / MiBd,
+	           static_cast<double>(d(&TextureOffload::Ram18View::write_us)) / 1000.0,
+	           static_cast<unsigned long long>(d(&TextureOffload::Ram18View::zero)),
+	           static_cast<double>(d(&TextureOffload::Ram18View::zero_bytes)) / MiBd,
+	           static_cast<unsigned long long>(d(&TextureOffload::Ram18View::reads)),
+	           static_cast<double>(d(&TextureOffload::Ram18View::read_bytes)) / MiBd,
+	           static_cast<double>(d(&TextureOffload::Ram18View::read_us)) / 1000.0, static_cast<double>(view.read_us_max) / 1000.0,
+	           static_cast<double>(d(&TextureOffload::Ram18View::unmapped)) / MiBd, static_cast<unsigned long long>(view.failed),
+	           static_cast<unsigned long long>(view.lost));
+	if (procs.ok)
+		RamLineAdd(out, size, &used, "; RAM real: emulador %.2f + compresion de Windows %.2f = %.2f GB", static_cast<double>(procs.own_private) / GiBd,
+		           static_cast<double>(procs.compression_ws) / GiBd, static_cast<double>(procs.own_private + procs.compression_ws) / GiBd);
+	if (fresh) {
+		last      = view;
+		have_last = true;
+	}
+}
+
 // (ram16) KYTY_RAM16=1: "[ram16]" every 5 s, what the RAM cuts save now and where the PC's RAM is, from system calls and
 // the cuts' own counters (no lock of the emulator's waited for: the offload's state is only tried), and every
 // KYTY_RAM16_CENSUS_S (default 30, 0 off) the census of the game's memory in RAM ("[ram16-censo]").
@@ -1387,14 +1887,20 @@ void Ram16Thread() {
 		}
 		const uint64_t freed = Libs::LibKernel::Memory::Ram16FreedReleasedNow();
 		const uint64_t tex   = have_view ? view.saved : 0;
+		const uint64_t cold  = have_view ? view.cold_now : 0; // (ram18)
 		char           line17[640] {}; // (ram17)
+		char           line18[900] {}; // (ram18)
+		char           line20[1400] {}; // (ram20)
 		char           line[1024];
 		size_t         used = 0;
 		RamLineAdd(line, sizeof(line), &used,
 		           "[ram16] 5 s: ahorrado ahora %.2f GB = texturas fuera de RAM %.2f%s + bloques libres del juego devueltos %.2f",
-		           static_cast<double>(tex + freed) / GiBd, static_cast<double>(tex) / GiBd,
+		           static_cast<double>(tex + freed + cold) / GiBd, static_cast<double>(tex) / GiBd,
 		           !have_view ? " (offload nativo apagado o sin leer)" : fresh ? "" : " (lectura anterior)",
 		           static_cast<double>(freed) / GiBd);
+		if (TextureOffload::Ram18On())
+			RamLineAdd(line, sizeof(line), &used, " + memoria fria en disco (RAM18%s) %.2f", TextureOffload::Ram20Active() ? "+RAM20" : "",
+			           static_cast<double>(cold) / GiBd);
 		if (have_view) {
 			const uint64_t restores = have_last ? view.restores - last.restores : view.restores;
 			const uint64_t bytes    = have_last ? view.restore_bytes - last.restore_bytes : view.restore_bytes;
@@ -1442,8 +1948,23 @@ void Ram16Thread() {
 		           static_cast<double>(status.ullTotalPageFile - status.ullAvailPageFile) / GiBd,
 		           static_cast<double>(status.ullTotalPageFile) / GiBd,
 		           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+		// (ram18) Every 5 s: the cold ranges out of RAM (on disk), the zone as the last pass saw it, what went and came
+		// back, and the RAM the user counts: the emulator's private RAM plus Windows' compression store.
+		if (TextureOffload::Ram18Own()) Ram18Line(line18, sizeof(line18), procs);
+		// (ram20) Every KYTY_RAM20_LINE_S (default 10; 5-30).
+		static const int line20_s = [] {
+			const char* v = Env("KYTY_RAM20_LINE_S");
+			return v == nullptr ? 10 : std::clamp(std::atoi(v) / 5 * 5, 5, 30);
+		}();
+		static int line20_tick = 0;
+		if (TextureOffload::Ram20Active() && (line20_tick += 5) >= line20_s) {
+			line20_tick = 0;
+			Ram20Line(line20, sizeof(line20), procs, line20_s);
+		}
 		std::printf("%s\n", line);
 		if (line17[0] != '\0') std::printf("%s\n", line17);
+		if (line18[0] != '\0') std::printf("%s\n", line18);
+		if (line20[0] != '\0') std::printf("%s\n", line20);
 		if (census_s > 0 && std::chrono::steady_clock::now() - census_at >= std::chrono::seconds(census_s)) {
 			census_at = std::chrono::steady_clock::now();
 			char     text[768];
@@ -1472,6 +1993,13 @@ static void StartRam16Line() {
 #if defined(_WIN32)
 	static std::once_flag once;
 	std::call_once(once, [] { std::thread(Ram16Thread).detach(); });
+#endif
+}
+
+static void StartRam18() {
+#if defined(_WIN32)
+	static std::once_flag once;
+	std::call_once(once, [] { std::thread(Ram18Thread).detach(); });
 #endif
 }
 
@@ -1694,6 +2222,247 @@ void PrintGpuResidency(std::vector<Range>& ranges, uint64_t images, uint64_t buf
 	std::fflush(stdout);
 }
 
+// ---- (ram19) KYTY_RAM19=1: where the game's and the emulator's memory is, against the GPU caches ----
+// One pass every 30 s on this (lowest-priority) thread, after the GPU thread's copy of the caches' ranges. Nothing is
+// written or protected: VirtualQuery (state, protection) and K32QueryWorkingSetEx (in RAM) only.
+// Per allocator of the game (the census' labels): committed bytes (one sample per 64 KiB granule, weighted by the
+// committed bytes of the region in it) split into
+//   in RAM            - with the granule under a GPU cache range (by kind: a copy also in video memory) or under none;
+//   out, no access    - PAGE_NOACCESS: taken by an offload (RAM16 textures, RAM18 cold ranges: reset, on disk, or
+//                       watched GPU bytes): no RAM;
+//   out, accessible   - committed, readable, not in the working set: in Windows' compression store, in the page file,
+//                       or never written (demand-zero, costs nothing); also split by "under a GPU range" or not.
+// Then the emulator's own private memory (everything committed outside the game's ranges), one sample per 256 KiB, the
+// same three classes and the allocations with most out-of-RAM accessible memory (the compression store's likely
+// owners) and most in RAM.
+constexpr uint8_t R19None  = Kinds; // (no GPU cache range over the granule)
+constexpr size_t  R19Kinds = static_cast<size_t>(Kinds) + 1;
+
+struct R19Cell {
+	uint64_t ram[R19Kinds] {}, out_access[R19Kinds] {}, noaccess = 0, committed = 0, range = 0;
+};
+
+const char* R19KindShort(size_t kind) {
+	switch (kind) {
+		case Texture: return "tex";
+		case Target: return "RT";
+		case Storage: return "imgGPU";
+		case GpuWrittenBuffer: return "bufGPU";
+		case GpuBuffer: return "buf";
+		default: return "sinGPU";
+	}
+}
+
+void PrintRam19(const std::vector<Range>& gpu_ranges, uint64_t pass) {
+	static const char* const labels[] = {"VirtualMemo", "cpuheap", "gpuheap", "cpupage", "gpupage", "cpubkt",
+	                                     "gpubkt",      "DefaultTagg", "RTSharedAll", "RTPersistAl"};
+	constexpr size_t         Labels   = sizeof(labels) / sizeof(labels[0]);
+	constexpr size_t         MaxPairs = 8192;
+	constexpr uint64_t       Granule  = SampleSpan; // 64 KiB
+	constexpr double         GiBd     = 1024.0 * 1024.0 * 1024.0;
+	const auto               t0       = std::chrono::steady_clock::now();
+	// The GPU ranges by granule: the kind first by UnionRank.
+	std::unordered_map<uint64_t, uint8_t> gpu;
+	gpu.reserve(gpu_ranges.size() * 4 + 1024);
+	for (const auto& range: gpu_ranges) {
+		if (range.size == 0 || UINT64_MAX - range.address < range.size) continue;
+		for (uint64_t g = range.address / Granule; g <= (range.address + range.size - 1) / Granule; g++) {
+			auto [it, fresh] = gpu.try_emplace(g, static_cast<uint8_t>(range.kind));
+			if (!fresh && UnionRank(range.kind) < UnionRank(static_cast<Kind>(it->second))) it->second = static_cast<uint8_t>(range.kind);
+		}
+	}
+	// The game's ranges, sorted (label of each), for the emulator's part.
+	std::vector<uint64_t>                           pairs(MaxPairs * 2);
+	std::vector<std::tuple<uint64_t, uint64_t, uint16_t>> game;
+	for (size_t l = 0; l < Labels; l++) {
+		const size_t n = Loader::DemonsSoulsMemMap::RangesOf(&labels[l], 1, pairs.data(), MaxPairs);
+		if (n == SIZE_MAX) {
+			std::printf("[ram19] sin mapa del juego todavia (KYTY_MEMMAP=0 o sin leer): sin recuento\n");
+			std::fflush(stdout);
+			return;
+		}
+		for (size_t i = 0; i < n; i++)
+			if (pairs[2 * i + 1] > pairs[2 * i]) game.emplace_back(pairs[2 * i], pairs[2 * i + 1], static_cast<uint16_t>(l));
+	}
+	std::sort(game.begin(), game.end());
+	struct S {
+		uint64_t page = 0, weight = 0, base = 0;
+		uint16_t label = 0; // (Labels: the emulator's)
+		uint8_t  kind = R19None;
+		bool     noaccess = false;
+	};
+	std::vector<S> samples;
+	samples.reserve(size_t {1} << 18u);
+	constexpr size_t MaxS   = size_t {1} << 20u;
+	const uint64_t   offset = (pass % (Granule / PageSize)) * PageSize;
+	R19Cell          cell[Labels + 1];
+	// (1) The game's: VirtualQuery region by region inside each range.
+	for (const auto& [begin, end, label]: game) {
+		cell[label].range += end - begin;
+		MEMORY_BASIC_INFORMATION info {};
+		for (uint64_t at = begin; at < end && samples.size() < MaxS;) {
+			if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+			const uint64_t r_end = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+			if (r_end <= at) break;
+			if (info.State == MEM_COMMIT) {
+				const bool noaccess = (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || info.Protect == 0;
+				for (uint64_t g = at & ~(Granule - 1); g < r_end && samples.size() < MaxS; g += Granule) {
+					const uint64_t lo = std::max(g, at), hi = std::min(g + Granule, r_end);
+					const auto     found = gpu.find(g / Granule);
+					S              s;
+					s.page     = std::clamp(g + offset, lo & ~(PageSize - 1), (hi - 1) & ~(PageSize - 1));
+					s.weight   = hi - lo;
+					s.label    = label;
+					s.kind     = found != gpu.end() ? found->second : R19None;
+					s.noaccess = noaccess;
+					samples.push_back(s);
+				}
+			}
+			at = r_end;
+		}
+	}
+	const size_t game_samples = samples.size();
+	// (2) The emulator's: every committed private region outside the game's ranges, a sample per 256 KiB.
+	{
+		constexpr uint64_t Stride = uint64_t {256} << 10u;
+		MEMORY_BASIC_INFORMATION info {};
+		size_t                   cursor = 0;
+		for (uint64_t at = 0x10000; samples.size() < MaxS && VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == sizeof(info);) {
+			const uint64_t r_begin = reinterpret_cast<uint64_t>(info.BaseAddress), r_end = r_begin + info.RegionSize;
+			if (r_end <= at) break;
+			if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+				const bool noaccess = (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || info.Protect == 0;
+				for (uint64_t p = r_begin; p < r_end && samples.size() < MaxS; p += Stride) {
+					while (cursor < game.size() && std::get<1>(game[cursor]) <= p) cursor++;
+					if (cursor < game.size() && std::get<0>(game[cursor]) <= p) continue; // (the game's: counted above)
+					S s;
+					s.page     = p;
+					s.weight   = std::min(Stride, r_end - p);
+					s.base     = reinterpret_cast<uint64_t>(info.AllocationBase);
+					s.label    = static_cast<uint16_t>(Labels);
+					s.noaccess = noaccess;
+					samples.push_back(s);
+				}
+			}
+			if (UINT64_MAX - info.RegionSize < r_begin) break;
+			at = r_end;
+		}
+	}
+	const double walk_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	// (3) The working set, in batches.
+	constexpr size_t                               Batch = 1024;
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(Batch);
+	std::vector<uint8_t>                           in_ram(samples.size());
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+	bool ok = true;
+	for (size_t b = 0; b < samples.size() && ok; b += Batch) {
+		const size_t n = std::min(Batch, samples.size() - b);
+		for (size_t i = 0; i < n; i++) {
+			entries[i]                = {};
+			entries[i].VirtualAddress = reinterpret_cast<PVOID>(samples[b + i].page);
+		}
+		if (b != 0) SwitchToThread();
+		ok = K32QueryWorkingSetEx(GetCurrentProcess(), entries.data(), static_cast<DWORD>(n * sizeof(entries[0]))) != 0;
+		for (size_t i = 0; i < n && ok; i++) in_ram[b + i] = static_cast<uint8_t>(entries[i].VirtualAttributes.Flags & 1u);
+	}
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	if (!ok) {
+		std::printf("[ram19] K32QueryWorkingSetEx fallo (0x%08x)\n", static_cast<unsigned>(GetLastError()));
+		std::fflush(stdout);
+		return;
+	}
+	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> emu; // base -> in RAM, out accessible
+	for (size_t i = 0; i < samples.size(); i++) {
+		const auto& s = samples[i];
+		auto&       c = cell[s.label];
+		c.committed += s.weight;
+		if (in_ram[i] != 0) c.ram[s.kind] += s.weight;
+		else if (s.noaccess) c.noaccess += s.weight;
+		else c.out_access[s.kind] += s.weight;
+		if (s.label == Labels) {
+			auto& e = emu[s.base];
+			if (in_ram[i] != 0) e.first += s.weight;
+			else if (!s.noaccess) e.second += s.weight;
+		}
+	}
+	const auto sum = [](const uint64_t (&a)[R19Kinds], bool gpu_only) {
+		uint64_t t = 0;
+		for (size_t k = 0; k < R19Kinds; k++)
+			if (!gpu_only || k != R19None) t += a[k];
+		return t;
+	};
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	// The game, one line per allocator with anything committed.
+	R19Cell all;
+	for (size_t l = 0; l < Labels; l++) {
+		const auto& c = cell[l];
+		all.committed += c.committed;
+		all.noaccess += c.noaccess;
+		all.range += c.range;
+		for (size_t k = 0; k < R19Kinds; k++) {
+			all.ram[k] += c.ram[k];
+			all.out_access[k] += c.out_access[k];
+		}
+		if (c.committed == 0) continue;
+		char   text[700];
+		size_t used = 0;
+		text[0]     = '\0';
+		RamGuard::RamLineAdd(text, sizeof(text), &used, "[ram19] %s: rango %.2f, commit %.2f; en RAM %.2f (copia en GPU %.2f:",
+		                           labels[l], static_cast<double>(c.range) / GiBd, static_cast<double>(c.committed) / GiBd,
+		                           static_cast<double>(sum(c.ram, false)) / GiBd, static_cast<double>(sum(c.ram, true)) / GiBd);
+		for (size_t k = 0; k < R19None; k++)
+			RamGuard::RamLineAdd(text, sizeof(text), &used, " %s %.2f", R19KindShort(k), static_cast<double>(c.ram[k]) / GiBd);
+		RamGuard::RamLineAdd(text, sizeof(text), &used,
+		                           "; sin copia en GPU %.2f); fuera de RAM: sin acceso (sacado) %.2f, accesible %.2f (con copia en GPU "
+		                           "%.2f)",
+		                           static_cast<double>(c.ram[R19None]) / GiBd, static_cast<double>(c.noaccess) / GiBd,
+		                           static_cast<double>(sum(c.out_access, false)) / GiBd, static_cast<double>(sum(c.out_access, true)) / GiBd);
+		std::printf("%s\n", text);
+	}
+	const auto& e = cell[Labels];
+	std::vector<std::pair<uint64_t, uint64_t>> by_out, by_ram;
+	for (const auto& [base, v]: emu) {
+		if (v.second != 0) by_out.emplace_back(v.second, base);
+		if (v.first != 0) by_ram.emplace_back(v.first, base);
+	}
+	std::sort(by_out.begin(), by_out.end(), std::greater<>());
+	std::sort(by_ram.begin(), by_ram.end(), std::greater<>());
+	char   text[1200];
+	size_t used = 0;
+	text[0]     = '\0';
+	RamGuard::RamLineAdd(text, sizeof(text), &used,
+	                           "[ram19] emulador fuera del juego: commit %.2f, en RAM %.2f, fuera de RAM sin acceso %.2f, accesible %.2f; "
+	                           "mas fuera de RAM accesible (MiB):",
+	                           static_cast<double>(e.committed) / GiBd, static_cast<double>(sum(e.ram, false)) / GiBd,
+	                           static_cast<double>(e.noaccess) / GiBd, static_cast<double>(sum(e.out_access, false)) / GiBd);
+	for (size_t i = 0; i < by_out.size() && i < 8; i++)
+		RamGuard::RamLineAdd(text, sizeof(text), &used, " 0x%llx=%llu", static_cast<unsigned long long>(by_out[i].second),
+		                           static_cast<unsigned long long>(by_out[i].first >> 20u));
+	RamGuard::RamLineAdd(text, sizeof(text), &used, "; mas en RAM (MiB):");
+	for (size_t i = 0; i < by_ram.size() && i < 8; i++)
+		RamGuard::RamLineAdd(text, sizeof(text), &used, " 0x%llx=%llu", static_cast<unsigned long long>(by_ram[i].second),
+		                           static_cast<unsigned long long>(by_ram[i].first >> 20u));
+	std::printf("%s\n", text);
+	// The summary: the RAM that is a duplicate of video memory, and what the compression store can hold.
+	const uint64_t dup        = sum(all.ram, true);
+	const uint64_t dup_gpuw   = all.ram[Target] + all.ram[Storage] + all.ram[GpuWrittenBuffer];
+	const uint64_t out_game   = sum(all.out_access, false);
+	const uint64_t out_emu    = sum(e.out_access, false);
+	std::printf("[ram19] resumen (GB): juego commit %.2f, en RAM %.2f = con copia en GPU %.2f (de ello escrita por la GPU: RT, "
+	            "imagenes y buffers %.2f; texturas %.2f; buffers %.2f) + sin copia en GPU %.2f; fuera de RAM sin acceso %.2f; "
+	            "fuera de RAM accesible (compresion de Windows, fichero de paginacion o nunca escrito): juego %.2f (con copia en GPU "
+	            "%.2f) + emulador %.2f = %.2f; emulador en RAM %.2f; %zu muestras (juego %zu), %.0f ms (recorrido %.0f ms), %llu "
+	            "rangos de la GPU\n",
+	            static_cast<double>(all.committed) / GiBd, static_cast<double>(sum(all.ram, false)) / GiBd,
+	            static_cast<double>(dup) / GiBd, static_cast<double>(dup_gpuw) / GiBd, static_cast<double>(all.ram[Texture]) / GiBd,
+	            static_cast<double>(all.ram[GpuBuffer]) / GiBd, static_cast<double>(all.ram[R19None]) / GiBd,
+	            static_cast<double>(all.noaccess) / GiBd, static_cast<double>(out_game) / GiBd,
+	            static_cast<double>(sum(all.out_access, true)) / GiBd, static_cast<double>(out_emu) / GiBd,
+	            static_cast<double>(out_game + out_emu) / GiBd, static_cast<double>(sum(e.ram, false)) / GiBd, samples.size(),
+	            game_samples, ms, walk_ms, static_cast<unsigned long long>(gpu_ranges.size()));
+	std::fflush(stdout);
+}
+
 void Watch() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.GpuResidency");
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
@@ -1729,6 +2498,13 @@ void Watch() {
 			buffers = exchange.buffers;
 			copy_ms = exchange.copy_ms;
 		}
+		if (Ram20On()) { // (ram20: the RAM20 pass's map, a copy)
+			auto&           snap = Ram20Ranges();
+			std::lock_guard lock(snap.mutex);
+			snap.ranges = ranges;
+			snap.pass   = pass;
+		}
+		if (Ram19On()) PrintRam19(ranges, pass); // (ram19: before the line below frees the ranges)
 		PrintGpuResidency(ranges, images, buffers, copy_ms, pass);
 	}
 }

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "local/envio1.h"
 #include "gpu-residency.h"
 #include "lane-sync.h"
 #include "slow-log.h"
@@ -1422,6 +1423,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
+	const Envio1::Scope envio1_miss(Envio1::BufMiss); // (envio1: cleanup)
 	auto* buffer = m_slot_buffers.try_get(id);
 	if (buffer == nullptr || buffer->is_deleted) {
 		return;
@@ -2612,6 +2614,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	const Envio1::Scope envio1_miss(Envio1::BufMiss); // (envio1: registration and merge)
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
 	vaddr &= ~(CACHING_PAGESIZE - 1);
@@ -2674,6 +2677,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 // The CPU-dirty pages of a mapped range copied into the buffer (the written ones then GPU-owned).
 void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written) {
+	const Envio1::Scope envio1_dirty(Envio1::Dirty); // (envio1)
 	// Reused per thread: the memory tracker refuses a nested upload (CheckNotInUploadCallback).
 	thread_local std::vector<vk::BufferCopy> copies;
 	copies.clear();
@@ -3153,6 +3157,7 @@ StreamBuffer& BufferCache::GetTableUploadBuffer() noexcept {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	const Envio1::Scope envio1_obtain(Envio1::BufHit); // (envio1: the read-only rest; its serial parts nested below)
 	PolicyBeforeUse(vaddr, size, is_written); // (policy1)
 	if (auto* spec = Spec::Current()) {
 		// As below: a small range the guest wrote, read from a copy in the (speculation's) ring, as no GPU work wrote
@@ -3197,6 +3202,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		const Envio1::Scope envio1_dirty(Envio1::Dirty); // (envio1)
 		auto& upload = GetShaderUploadBuffer();
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 4);
@@ -3217,6 +3223,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    kyty_local_write_memo_mode.load(std::memory_order_relaxed) != 0) {
 		if (auto* buffer = m_slot_buffers.try_get(memo.id); buffer != nullptr && !buffer->is_deleted && buffer->IsInBounds(vaddr, size)) {
 			TouchBuffer(*buffer);
+			const Envio1::Scope envio1_mod(Envio1::BufMod); // (envio1)
 			InvalidateCopyFeedback(vaddr, size);
 			NoteGpuWrite(vaddr, size);
 			Spec::NoteGpuWrite(vaddr, size);
@@ -3236,6 +3243,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	LaneSync::NoteRange(buffer->lane_marks, vaddr, size, is_written);
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		const Envio1::Scope envio1_mod(Envio1::BufMod); // (envio1)
 		// (Not Buffer::written_serial: the write's pages were synchronized above, none of them is a CPU-dirty page an
 		// upload prologue copies later.)
 		InvalidateCopyFeedback(vaddr, size);

@@ -61,8 +61,28 @@ namespace TrustedDepth {
 
 // KYTY_DS_TRUSTED_DEPTH: 0 off, 1 trust, 2 verify. Read at its first use (the port sets its variables late).
 // (draw1) KYTY_DRAW1: 0 off, 1 trust, 2 verify, with the words as the proof (ByteProof).
+// (reuso1) KYTY_REUSO1: 0 off, 1 reuse, 2 verify. The DRAW1 registry (words read again as the proof) for every XPR
+// run, plus the [reuso1] line: hits, misses by reason, which words changed, ms saved (measured per call), frame ms.
+// It gives KYTY_DRAW1's mode when set (KYTY_DS_TRUSTED_DEPTH still wins, as for DRAW1).
+[[nodiscard]] inline int Reuso1Mode() {
+	static const int mode = [] {
+		const char* text = std::getenv("KYTY_REUSO1");
+		if (text == nullptr || text[0] == '\0' || text[1] != '\0') return 0;
+		const int value = text[0] == '1' ? 1 : text[0] == '2' ? 2 : 0;
+		if (value != 0) {
+			std::printf("reuso1: KYTY_REUSO1=%d: XPR table draws %s the registry of their earlier frame (proof: the same "
+			            "key, mappings, image starts, buffer registrations and CPU epochs, and every word read again equal); "
+			            "\"[reuso1]\" line every 5 s\n",
+			            value, value == 1 ? "reuse" : "are made the normal way and compared with");
+			std::fflush(stdout);
+		}
+		return value;
+	}();
+	return mode;
+}
 [[nodiscard]] inline int Draw1Mode() {
 	static const int mode = [] {
+		if (const int reuso = Reuso1Mode(); reuso != 0) return reuso;
 		const char* text = std::getenv("KYTY_DRAW1");
 		if (text == nullptr || text[0] == '\0' || text[1] != '\0') return 0;
 		const int value = text[0] == '1' ? 1 : text[0] == '2' ? 2 : 0;
@@ -341,6 +361,46 @@ inline void NoteMismatch(uint64_t shader, uint32_t stage, char what, uint32_t in
 	if (g_mismatch_count < g_mismatches.size()) g_mismatches[g_mismatch_count++] = {shader, stage, index, trusted, fresh, what};
 }
 
+// ---- (reuso1) what changed, and what a hit saves ------------------------------------------------------------------
+// A run read again that differs from the entry's: how many dwords differ, what the first differing one looks like, and
+// which run of the entry (0 = the first read, from the user data) it is.
+enum DiffKind : uint32_t { DiffVBase, DiffVHigh, DiffFloat, DiffOther, DiffKinds };
+inline constexpr const char* DiffKindNames[DiffKinds] = {"base_v#", "alto_v#", "float", "otra"};
+inline uint64_t g_diff_kind[DiffKinds] {};
+inline uint64_t g_diff_count[5] {}; // 1, 2, 3-4, 5-16, >16 dwords
+inline uint64_t g_diff_run[3] {};   // run 0, 1, 2+
+inline void NoteWordDiff(const uint32_t* now, const uint32_t* old, uint32_t count, uint32_t run) {
+	uint32_t first = UINT32_MAX, differ = 0;
+	for (uint32_t i = 0; i < count; ++i)
+		if (now[i] != old[i]) {
+			if (first == UINT32_MAX) first = i;
+			++differ;
+		}
+	if (first == UINT32_MAX) return;
+	const auto plausible_float = [](uint32_t w) {
+		const uint32_t e = (w >> 23u) & 0xffu;
+		return w == 0 || (e >= 100u && e <= 154u);
+	};
+	const uint32_t a = now[first], b = old[first];
+	const uint64_t delta = a > b ? a - b : b - a;
+	DiffKind kind = DiffOther;
+	// (A V#'s dword 0 is its base's low 32 bits, dword 1's low 16 bits the rest; V#s are 4-dword aligned in a run when
+	// the run starts at one, which this cannot know: "base_v#" is a likely, not a proven, class.)
+	if ((first & 3u) == 0 && (a & 3u) == 0 && (b & 3u) == 0 && delta < (1u << 28u)) kind = DiffVBase;
+	else if ((first & 3u) == 1 && (a >> 16u) == (b >> 16u)) kind = DiffVHigh;
+	else if (plausible_float(a) && plausible_float(b)) kind = DiffFloat;
+	++g_diff_kind[kind];
+	++g_diff_count[differ == 1 ? 0 : differ == 2 ? 1 : differ <= 4 ? 2 : differ <= 16 ? 3 : 4];
+	++g_diff_run[run < 2 ? run : 2];
+}
+// The preparation's cycles of the draws the registry follows: [0] not hit, [1] hit (calls, cycles).
+inline uint64_t g_prep[2][2] {};
+inline void NotePrep(bool hit, uint64_t cycles) {
+	auto& p = g_prep[hit ? 1 : 0];
+	++p[0];
+	p[1] += cycles;
+}
+
 // ---- the line -----------------------------------------------------------------------------------------------------
 // LiveControl::Flip (the render thread): every 5 s while KYTY_RENDER_STATS or KYTY_DS_TRUSTED_DEPTH is on.
 inline void OnFlip(int64_t flip_ns) {
@@ -463,6 +523,34 @@ inline void OnFlip(int64_t flip_ns) {
 			            static_cast<unsigned long long>(g_counts[CMismatchWords]));
 		}
 		std::printf("\n");
+		// (reuso1) Its own line: hits, misses by reason, which words changed, the saving measured per call.
+		if (Reuso1Mode() != 0) {
+			const auto   per     = [&](Count c) { return static_cast<double>(g_counts[c]) / n; };
+			const double hits    = per(Reuso1Mode() == 1 ? CHit : CWouldHit);
+			const double us_miss = g_prep[0][0] != 0 ? static_cast<double>(g_prep[0][1]) * us_per_tc / static_cast<double>(g_prep[0][0]) : 0.0;
+			const double us_hit  = g_prep[1][0] != 0 ? static_cast<double>(g_prep[1][1]) * us_per_tc / static_cast<double>(g_prep[1][0]) : 0.0;
+			const double prep_ms = (static_cast<double>(g_prep[0][1]) + static_cast<double>(g_prep[1][1])) * us_per_tc / 1e3 / n;
+			uint64_t     diffs   = 0;
+			for (const auto d: g_diff_kind) diffs += d;
+			const auto pct = [&](uint64_t v) { return diffs != 0 ? 100.0 * static_cast<double>(v) / static_cast<double>(diffs) : 0.0; };
+			std::printf("[reuso1] %.1f s, %llu frames, frame %.2f ms | modo %d: elegibles/frame %.0f, %s %.0f (%.1f%%) | fallos/frame: "
+			            "primera vez %.1f, palabras cambiadas %.1f, clave inestable %.1f, clave distinta %.1f, registro/mapeos %.1f, cpu %.1f, "
+			            "copia_anillo %.1f, rangos %.1f, sucias %.1f, par no apto %.1f",
+			            wall_ms / 1e3, static_cast<unsigned long long>(frames), wall_ms / n, Reuso1Mode(), per(CEligible),
+			            Reuso1Mode() == 1 ? "aciertos" : "acertarian", hits, per(CEligible) != 0 ? 100.0 * hits / per(CEligible) : 0.0,
+			            per(CFirstSight), per(CInvalidBytes), per(CUnstable), per(CInvalidKey), per(CInvalidReg), per(CInvalidCpu),
+			            per(CRefuseRing), per(CRefuseRanges), per(CRefuseDirty), per(CPairIneligible));
+			std::printf(" | preparacion us/llamada: normal %.3f, acierto %.3f; ms/frame de preparacion %.2f; AHORRO estimado %.2f ms/frame",
+			            us_miss, us_hit, prep_ms, Reuso1Mode() == 1 && us_miss > us_hit ? hits * (us_miss - us_hit) / 1e3 : 0.0);
+			std::printf(" | palabras cambiadas (%llu): primera %s=%.0f%% %s=%.0f%% %s=%.0f%% %s=%.0f%%; dwords distintos 1/2/3-4/5-16/>16 "
+			            "%.0f/%.0f/%.0f/%.0f/%.0f%%; run 0/1/2+ %.0f/%.0f/%.0f%% | DISCREPANCIAS llamadas %llu palabras %llu%s\n",
+			            static_cast<unsigned long long>(diffs), DiffKindNames[0], pct(g_diff_kind[0]), DiffKindNames[1], pct(g_diff_kind[1]),
+			            DiffKindNames[2], pct(g_diff_kind[2]), DiffKindNames[3], pct(g_diff_kind[3]), pct(g_diff_count[0]),
+			            pct(g_diff_count[1]), pct(g_diff_count[2]), pct(g_diff_count[3]), pct(g_diff_count[4]), pct(g_diff_run[0]),
+			            pct(g_diff_run[1]), pct(g_diff_run[2]), static_cast<unsigned long long>(g_counts[CMismatchCalls]),
+			            static_cast<unsigned long long>(g_counts[CMismatchWords]),
+			            Reuso1Mode() == 2 ? " (=2: se dibuja siempre lo normal)" : "");
+		}
 		// The mismatches (=2), at most every 60 s.
 		if (g_mismatch_count != 0 && (last_list_ns == 0 || flip_ns - last_list_ns >= 60'000'000'000ll)) {
 			last_list_ns = flip_ns;
@@ -492,6 +580,10 @@ inline void OnFlip(int64_t flip_ns) {
 	g_counts[CMismatchCalls] = mismatch_calls;
 	g_counts[CMismatchWords] = mismatch_words;
 	for (auto& c: g_refused_class) c = 0;
+	for (auto& c: g_diff_kind) c = 0;
+	for (auto& c: g_diff_count) c = 0;
+	for (auto& c: g_diff_run) c = 0;
+	for (auto& p: g_prep) p[0] = p[1] = 0;
 	last_ns  = flip_ns;
 	last_tsc = tsc;
 	frames   = 0;

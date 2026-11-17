@@ -43,6 +43,47 @@ inline bool Enabled() {
 	return on;
 }
 
+// (ram19) KYTY_RAM19=1 (off by default): the "[ram19]" lines every 30 s (ram-guard.cpp, PrintRam19): the game's memory
+// per allocator split by what the GPU caches hold over it and by where it is (RAM, taken by an offload, out of RAM but
+// accessible: Windows' compression store, the page file or never written), and the emulator's own allocations the same
+// way. It also answers the request at the end of a submission (GpuResourceManager::EndSubmission): with the game's own
+// flips (KYTY_RAIZ) no FlipPreparation comes, so AdvanceFrame never answered ("no answer from the GPU thread in 10 s" in
+// every log of 11-16/11-17). Off: one static bool read at a submission's end, nothing else.
+// (ram20) KYTY_RAM20=1 (off by default; see Ram20On below) needs the same answer and lines: it turns them on too.
+inline bool Ram20On();
+inline bool Ram19On() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RAM19");
+		return (value != nullptr && value[0] == '1' && value[1] == '\0') || Ram20On();
+	}();
+	return on;
+}
+
+// (ram20) KYTY_RAM20=1 (off by default; with native memory, KYTY_RAIZ=1): the game's memory that has a copy in video
+// memory (under a GPU cache's image or buffer, as the last GPU residency pass saw it) let go of in RAM and in Windows'
+// compression store: written to the RAM17 disk store and reset (texture-offload.h, the RAM18 cold-range path: no-access
+// with read watchers, any touch reads it back from the file on its own thread), "[ram20]" line. It turns on KYTY_RAM17
+// (and with it RAM16) and the "[ram19]" lines (ram-guard.cpp). Off: one static bool read where it is asked.
+inline bool Ram20On() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_RAM20");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return on;
+}
+
+// (ram20) The GPU caches' ranges of the last answered residency pass (ram-guard.cpp's measurement thread stores them;
+// the RAM18/RAM20 thread reads them). `pass`: its number (0: none yet).
+struct Ram20Snapshot {
+	std::mutex         mutex;
+	std::vector<Range> ranges;
+	uint64_t           pass = 0;
+};
+inline Ram20Snapshot& Ram20Ranges() {
+	static auto* snapshot = new Ram20Snapshot; // (never destroyed: detached threads)
+	return *snapshot;
+}
+
 // The measurement thread's request and the GPU thread's answer.
 struct Exchange {
 	std::mutex              mutex;

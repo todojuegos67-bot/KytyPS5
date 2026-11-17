@@ -6192,6 +6192,10 @@ struct SsrGbuffer {
 	std::array<uint64_t, 2>     packed_addresses {};   // the packed layers' last two addresses (double-buffered)
 	std::array<float, 16>       prev_view_proj {};     // the previous frame's (rows x, y, w; z from the current)
 	bool                        have_prev = false;
+	// (rtrefl1) the frame before's camera, kept so the reflections can take the camera of the G-buffer copy's own frame
+	std::array<float, 16>       old_view_proj {}, old_prev_view_proj {};
+	uint64_t                    old_vp_flip = ~0ull;
+	bool                        old_have_prev = false;
 } g_ssr_gb;
 
 bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
@@ -6781,6 +6785,12 @@ void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	for (uint32_t i = 0; i < 16; ++i) {
 		vp[i] = AsFloat(srt[SrtViewProj + i]);
 		if (!std::isfinite(vp[i])) return;
+	}
+	if (g_ssr_gb.have_vp) { // (rtrefl1) keep the last frame's camera
+		g_ssr_gb.old_view_proj      = g_ssr_gb.view_proj;
+		g_ssr_gb.old_prev_view_proj = g_ssr_gb.prev_view_proj;
+		g_ssr_gb.old_vp_flip        = g_ssr_gb.vp_flip;
+		g_ssr_gb.old_have_prev      = g_ssr_gb.have_prev;
 	}
 	g_ssr_gb.view_proj = vp;
 	g_ssr_gb.have_vp   = true;
@@ -7738,10 +7748,42 @@ void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& ou
 	out.up_valid = SsrUpInView(view_to_clip, out.up);
 	out.prev     = false;
 	std::array<float, 16> vp {}, pv {};
+	// (rtrefl1) KYTY_RTREFL1=1: the camera of the same guest frame as the G-buffer copy (depth / normals) the pass reads.
+	// Before, the newest camera was taken (up to 2 flips old) while the copy may be another frame's: in motion the
+	// depth was reprojected with a camera one frame off, a shift that changes with the speed (the "ondas"). Counted
+	// either way (same frame / the frame before / neither) and logged every 600 calls; with the switch on, the matching
+	// camera is taken (the kept frame-before one if the newest is ahead), and with none matching: motion vectors only.
+	static const bool fix = [] {
+		const char* e = std::getenv("KYTY_RTREFL1");
+		return e != nullptr && e[0] == '1';
+	}();
+	static uint32_t calls = 0, same = 0, older = 0, none = 0;
 	{
 		std::lock_guard lock(g_ssr_gb.mutex);
-		if (!g_ssr_gb.have_vp || !g_ssr_gb.have_prev || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 2) return;
-		vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+		const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
+		const bool cur_ok = g_ssr_gb.have_vp && g_ssr_gb.have_prev;
+		const bool match_cur = cur_ok && g_ssr_gb.vp_flip == copied;
+		const bool match_old = g_ssr_gb.old_have_prev && g_ssr_gb.old_vp_flip == copied;
+		if (cur_ok) {
+			++calls;
+			if (match_cur) ++same;
+			else if (match_old) ++older;
+			else ++none;
+			if (calls == 600) {
+				std::printf("RT reflections: camera vs G-buffer frame (rtrefl1, fix %s): same frame %u, frame before %u, "
+				            "neither %u of 600\n", fix ? "on" : "off", same, older, none);
+				std::fflush(stdout);
+				calls = same = older = none = 0;
+			}
+		}
+		if (fix) {
+			if (match_cur) vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+			else if (match_old) vp = g_ssr_gb.old_view_proj, pv = g_ssr_gb.old_prev_view_proj;
+			else return;
+		} else {
+			if (!cur_ok || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 2) return;
+			vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+		}
 	}
 	// Current clip -> previous clip = VP_prev * VP^-1 (row-major, column vectors: clip = M * world).
 	std::array<double, 16> inv {};

@@ -31,6 +31,9 @@ float DirectGamePitchRateDeg();
 int  DirectHoldStickX();
 void DirectNoteStickRouted(int64_t counts); // mouse counts that went to the emulated stick path (log)
 void DirectSetStick(int x, int y);    // the emulated right stick last sent (0..255), to learn the signs
+bool Cam1Active();                      // (raton2) KYTY_CAM1=1
+void Cam1SetSens(double x, double y);   // (raton2) KYTY_CAM1_SENS_X / _Y, live
+void Cam1GetSens(double* x, double* y);
 void DirectSetDegPerCount(float deg); // degrees per mouse count (deg per count * sensitivity)
 // (mouse1) Native mouse camera (KYTY_DS_MOUSE_NATIVE=1 with KYTY_KBM=1; off by default: nothing below runs and the code
 // above is unchanged). The mouse's counts become the camera's own stick input, in angle units, where the game reads it

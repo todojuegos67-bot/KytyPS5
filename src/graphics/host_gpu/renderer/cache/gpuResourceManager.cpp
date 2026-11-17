@@ -1,3 +1,4 @@
+#include "local/envio3.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
@@ -783,6 +784,10 @@ void GpuResourceManager::NativeFlushGpuWrites() {
 }
 
 void GpuResourceManager::InvalidateCpuWrittenPages(uint64_t vaddr, uint64_t size) {
+	// (envio3, KYTY_ENVIO3) A compute submission in flight on Kyty.Acb2 (Spec::t_effects set on the GPU thread) checks
+	// what was found CPU-written since it was handed: its commit stops at a clean read or image over it and re-uploads
+	// the buffers it reads there (Speculation::CommitSegments / Before). Off: nothing (t_effects is null).
+	if (Envio3::Mode() != 0) Spec::NoteHostWrite(vaddr, size);
 	// (Fresh memory stands down with native memory - no backing view -: a first write is noted all the same. Unlike
 	// the fault, the page is invalidated in any case: another watcher may hold it, and an extra invalidation is safe.)
 	if (FreshMemory::Get() != nullptr)
@@ -1230,6 +1235,19 @@ void GpuResourceManager::EndSubmission() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	// (ram19) KYTY_RAM19=1: the GPU residency request answered here too (see AdvanceFrame): with the game's own flips no
+	// FlipPreparation comes and AdvanceFrame never ran. Same copy, same thread (the buffer cache is this thread's).
+	if (GpuResidency::Ram19On() && GpuResidency::Requested()) {
+		const auto                       start = std::chrono::steady_clock::now();
+		std::vector<GpuResidency::Range> ranges;
+		if (const uint64_t request = GpuResidency::Take(&ranges); request != 0) {
+			uint64_t images = 0, buffers = 0;
+			m_texture_cache.CollectResidencyRanges(ranges, images);
+			m_buffer_cache.CollectResidencyRanges(ranges, buffers);
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+			GpuResidency::Deliver(request, std::move(ranges), images, buffers, ms);
+		}
+	}
 	if (std::exchange(m_gpu_flip_pending, false)) RunCollectors();
 }
 

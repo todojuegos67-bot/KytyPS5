@@ -1,5 +1,9 @@
 #include "local/skip-shader.h"
+#include "local/envio1.h"
+#include "local/envio2.h"
+#include "local/envio3.h"
 #include "local/sync-stats.h"
+#include "local/copia1.h" // (copia1)
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "local/anti-lag.h"
 
@@ -54,6 +58,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <bit>
 #include <x86intrin.h>
@@ -1069,6 +1074,31 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 	}
+	// (envio2) KYTY_ENVIO2=1/2: the compute queues translated on their own thread (local/envio2.h). Not with what else
+	// translates elsewhere or in another order (KYTY_PAR_QUEUES, KYTY_SPECULATE: one effects log per thread) nor with the
+	// second Vulkan queue (its commits go to the one queue, lane 0).
+	if (Envio2::Mode() != 0) {
+		const bool lanes = gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().LanesOn();
+		const bool speculate = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !PageManager::NativeWriteWatch();
+		if (ParQueues::On() || speculate || lanes) {
+			std::printf("envio2: KYTY_ENVIO2 off: needs KYTY_PAR_QUEUES and KYTY_SPECULATE off and one Vulkan queue "
+			            "(par %d, speculate %u, lanes %d)\n",
+			            ParQueues::On() ? 1 : 0, kyty_local_speculate_mode.load(std::memory_order_relaxed), lanes ? 1 : 0);
+		} else {
+			gpu->m_acb_spec = std::make_unique<Speculation>(gpu->m_renderer, static_cast<int>(ComputeQueueBase), [gpu] {
+				Common::LockGuard lock(gpu->m_queue_mutex);
+				gpu->m_work_available.SignalAll();
+			});
+			std::printf("envio2: KYTY_ENVIO2=%u: compute queues (ACB) translated on Kyty.Acb2, committed in order by "
+			            "this thread%s\n",
+			            Envio2::Mode(), Envio2::Mode() == 2 ? " (verification: committed at once, no overlap)" : "");
+			if (Envio3::Mode() != 0)
+				std::printf("envio3: KYTY_ENVIO3=%u: up to %u compute submissions in flight, continuations after waits on "
+				            "Kyty.Acb2, sweeps logged for their commits\n",
+				            Envio3::Mode(), Envio3::MaxInFlight);
+		}
+		std::fflush(stdout);
+	}
 	LiveControl::Start();
 	Blackbox::Start(); // (the crash / freeze black box: logs/blackbox-<stamp>.txt, local/blackbox-run.h)
 	XprCapture::Initialize();
@@ -1211,6 +1241,7 @@ void GuestGpu::ThreadRun(void* data) {
 		if (should_stop) {
 			// (par1) The ACB thread first: it records into this thread's stream, gone when this thread returns.
 			if (gpu->m_acb_thread.joinable()) gpu->m_acb_thread.join();
+			gpu->m_acb_spec.reset(); // (envio2: its thread; nothing is handed, the queues are empty)
 			{
 				ParQueues::WorkScope work;
 				gpu->m_gfx_cp->BufferWait();
@@ -1227,7 +1258,10 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				ParQueues::WorkScope work; // (par1: nothing unless KYTY_PAR_QUEUES=1)
 				LiveCensus::Scope census(LiveCensus::GuestCommand, 0);
+				// (envio2: what a guest command writes while a compute submission is handed is logged for its commit.)
+				Spec::t_effects = gpu->m_acb_spec && gpu->m_acb_spec->Pending() ? &gpu->m_acb_spec->Log() : nullptr;
 				command();
+				Spec::t_effects = nullptr;
 			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -1428,9 +1462,14 @@ bool GuestGpu::Process(Submission& submission) {
 		m_idle.SignalAll();
 		if (Serie1::Mode() != 0) ++Serie1::g_c.frames; // (serie1; the GPU thread's, as every Serie1 counter)
 		if (ParQueues::On()) m_work_available.SignalAll(); // (par1: the ACB thread waits for the next frame's)
+		Envio1::NoteFrame(); // (envio1, KYTY_ENVIO1=1)
+		if (const double frames = Envio2::NoteFrame(); frames > 0) Envio3::Print(frames); // (envio2/envio3)
 		return true;
 	}
 	const bool first_slice = !submission.started;
+	// (envio1, KYTY_ENVIO1=1: a compute queue's submission, measured.)
+	const Envio1::AcbScope envio1_acb(submission.queue_id != 0);
+	const Envio2::GpuScope envio2_gpu(submission.queue_id != 0 && m_acb_spec != nullptr); // (envio2)
 	auto& cp = GetProcessor(submission.queue_id);
 	// (serie1) KYTY_SERIE1=1/2: a queue-0 command buffer of the XPR culling's shape (dispatches and a label, no draw, no
 	// indirect buffer, no flip: local/serie1.h). =1: recorded into a command buffer of the second Vulkan queue (lane 1),
@@ -1464,10 +1503,14 @@ bool GuestGpu::Process(Submission& submission) {
 	// before each retry of an unsatisfied wait was most of the ~1100 sweeps a second. Nothing otherwise.
 	// (ww2, KYTY_WRITE_WATCH_MODE=poll: no sweep when one began after the game queued this submission - it read every
 	// write the game made before queueing it, PageManager::SweptSince; the queue was a few submissions deep.)
-	if (first_slice)
+	if (first_slice) {
+		// (envio3: what it finds CPU-written is logged for the compute submissions in flight, Speculation::Log.)
+		Spec::t_effects = Envio3::Mode() != 0 && m_acb_spec && m_acb_spec->Pending() ? &m_acb_spec->Log() : nullptr;
 		m_renderer.GetGpuResources().SweepCpuWrites(PageManager::SweptSince(submission.sweep_stamp)
 		                                                ? GpuResourceManager::SweepReason::CoveredSubmission
 		                                                : GpuResourceManager::SweepReason::Handover);
+		Spec::t_effects = nullptr;
+	}
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -1493,7 +1536,9 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 		~EffectsScope() { Spec::t_effects = nullptr; }
 		KYTY_CLASS_NO_COPY(EffectsScope);
-	} effects_scope {m_speculation.get()};
+	} effects_scope {m_speculation ? m_speculation.get()
+	                 : m_acb_spec && m_acb_spec->Pending() ? m_acb_spec.get() // (envio2: one handed or blocked)
+	                                                        : nullptr};
 
 	cp.BufferInit();
 	bool complete = true;
@@ -1655,9 +1700,124 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
+			// (envio2, KYTY_ENVIO2) Handed to the ACB thread at its first slice (when it has none): the GPU thread goes
+			// on with the other queues and commits it, in this queue's order, when it takes it again (blocked meanwhile;
+			// the ACB thread's end wakes it). Mode 2: committed at once. What it did not commit goes on the normal way
+			// from where the commit left it (the safe fallback).
+			// (envio3, KYTY_ENVIO3) Several in flight (one per compute queue head, Speculation::Full), and continuations:
+			// a submission at a WAIT_REG_MEM (where a commit stopped, "wait on memory the CPU writes", or a slice resumed
+			// there) has the wait run here - its sweep of CPU writes included, CommandProcessor::WaitRegMem - and the
+			// rest handed to the ACB thread again. Not satisfied: the slice waits, as the normal way would.
+			bool envio2_progress = false;
+			bool envio2_stop     = false; // (the slice ends here: handed, blocked or whole)
+			if (m_acb_spec) {
+				const uint64_t spec_serial = uint64_t {submission.queue_id} << 48u | submission.serial;
+				const bool     envio3      = Envio3::Mode() != 0;
+				const auto     hand        = [&](bool continuation) {
+					if (!m_acb_spec->Hand(spec_serial, cp, submission.commands, submission.command_execution)) return false;
+					submission.envio2_handed = true;
+					submission.envio3_cont   = continuation;
+					if (continuation) Envio2::Add(Envio3::g_totals.continuations);
+					return true;
+				};
+				if (first_slice) {
+					Envio2::Add(Envio2::g_totals.submissions);
+					if (hand(false)) {
+						Envio2::Add(Envio2::g_totals.handed);
+					} else {
+						Envio2::Add(Envio2::g_totals.fallback[Envio2::Busy]);
+					}
+				} else if (!submission.envio2_handed && !m_acb_spec->BlockedHanded(spec_serial)) {
+					// (A slice resumed the normal way: at a wait, envio3 tries a continuation below.)
+					if (!envio3 || !CommandProcessor::AtWait(submission.command_execution))
+						Envio2::Add(Envio2::g_totals.fallback[Envio2::NotFirst]);
+				}
+				for (bool first_round = true;; first_round = false) {
+					auto outcome   = Speculation::Outcome::None;
+					bool committed = false;
+					if (submission.envio2_handed) {
+						if (Envio2::Mode() == 1 && first_slice && first_round) {
+							// (Mode 1: handed in this slice; committed when the GPU thread takes it again.)
+							envio2_stop = true;
+							complete                     = false;
+							break;
+						}
+						submission.envio2_handed = false;
+						uint64_t waited          = 0;
+						outcome   = m_acb_spec->CommitHanded(spec_serial, cp, submission.command_execution, waited);
+						committed = true;
+						if (waited != 0) {
+							Envio2::Add(Envio2::g_totals.forced);
+							Envio2::Add(Envio2::g_totals.forced_ns, waited);
+						}
+						// (The order check: a queue's submissions committed in their order; its continuations after it.)
+						if (submission.serial < m_envio2_last[submission.queue_id] ||
+						    (submission.serial == m_envio2_last[submission.queue_id] && !submission.envio3_cont))
+							Envio2::Add(Envio2::g_totals.order_errors);
+						m_envio2_last[submission.queue_id] = submission.serial;
+					} else if (m_acb_spec->BlockedHanded(spec_serial)) {
+						outcome   = m_acb_spec->ResumeHanded(spec_serial, cp, submission.command_execution);
+						committed = true;
+					}
+					if (committed) {
+						switch (outcome) {
+							case Speculation::Outcome::Whole: Envio2::Add(Envio2::g_totals.whole); break;
+							case Speculation::Outcome::Blocked: Envio2::Add(Envio2::g_totals.fallback[Envio2::Blocked]); break;
+							case Speculation::Outcome::None: Envio2::Add(Envio2::g_totals.fallback[Envio2::None]); break;
+							default: Envio2::Add(Envio2::g_totals.fallback[Envio2::Partly]); break;
+						}
+					}
+					if (outcome == Speculation::Outcome::Blocked) {
+						// (What it committed before the wait goes to the GPU; the submission waits as at a wait of its own.)
+						cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+					if (outcome == Speculation::Outcome::Whole) {
+						envio2_stop = true;
+						complete    = true;
+						m_renderer.GetGpuResources().EndSubmission();
+						cp.BufferFlushDeferrable();
+						break;
+					}
+					envio2_progress |= outcome == Speculation::Outcome::Partly;
+					// (envio3) A continuation: at a wait, after a commit that stopped there or a slice resumed there.
+					if (!envio3 || !CommandProcessor::AtWait(submission.command_execution) ||
+					    (!committed && first_slice))
+						break;
+					if (m_acb_spec->Full()) {
+						Envio2::Add(Envio3::g_totals.cont_full);
+						if (!committed) Envio2::Add(Envio2::g_totals.fallback[Envio2::NotFirst]);
+						break;
+					}
+					uint32_t     dwords = 0;
+					const auto*  packet = CommandProcessor::SuspendedPacket(submission.command_execution, dwords);
+					Pm4Execution wait;
+					if (cp.Process(wait, {packet, dwords}) != Pm4ProcessResult::Complete) {
+						// (Not satisfied yet: the slice waits there, as the normal way's would; what was committed goes.)
+						Envio2::Add(Envio3::g_totals.cont_unsatisfied);
+						if (envio2_progress) cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+					CommandProcessor::SkipSuspendedPacket(submission.command_execution);
+					envio2_progress = true;
+					if (!hand(true)) break; // (the rest the normal way, after the wait)
+					if (Envio2::Mode() == 1) {
+						// (What was committed goes to the GPU now; the rest when the GPU thread takes it again.)
+						cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+				}
+			}
+			if (envio2_stop) break;
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
+			if (submission.command_execution.MadeProgress() || envio2_progress) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
 				}
@@ -1805,13 +1965,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	};
 	LiveCensus::Pm4Clock pm4_clock; // (render3, KYTY_RENDER_STATS: the walk's time by packet class; nothing otherwise)
 	const uint32_t       lane_mode = Render5::Mode(Render5::RegLane); // (render5, KYTY_REG_LANE)
+	// (otros1, KYTY_OTROS1: with KYTY_RENDER_STATS, the walk's time by packet kind, otros1.h)
+	const bool otros1_on = Otros1::Mode() != 0 && LiveCensus::RenderStatsOn();
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		pm4_clock.Next();
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
+			const uint64_t pre0 = otros1_on ? __rdtsc() : 0; // (otros1: the preamble's own time)
 			g_gpu_state->ProcessCommands();
 			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
 			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+			if (otros1_on) {
+				Otros1::g_pre_cycles += __rdtsc() - pre0;
+				++Otros1::g_pre_calls;
+			}
 		}
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
@@ -1835,6 +2002,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 		pm4_clock.Class(Pm4ClassOf(opcode));
+		pm4_clock.Key(packet_header); // (otros1)
+		// (otros1, KYTY_OTROS1) The register pairs an indirect block carries (its handler and the draw state observer
+		// each read the block).
+		if (otros1_on && (opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+		                  opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
+		    remaining_dw >= 5) {
+			const uint32_t space = opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u : opcode == Pm4::IT_SET_SH_REG_INDIRECT ? 1u : 2u;
+			Otros1::g_pairs[space] += packet[4] & 0x3fffu;
+			++Otros1::g_indirect[space];
+		}
 
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
@@ -1937,6 +2114,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					pm4_clock.Next();
 					if (verify) between();
 					pm4_clock.Class(Pm4ClassOf(op));
+					pm4_clock.Key(header); // (otros1)
 				}
 				const auto handler = g_cp_op_func[op];
 				if (verify && (!KeepsDeferredProtection(op) || handler == nullptr || header == DsLinearCopyHook::Header))
@@ -1966,6 +2144,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					pm4_clock.Next();
 					if (verify) between();
 					pm4_clock.Class(Pm4ClassOf(0));
+					pm4_clock.Key(0x80000000u); // (otros1)
 					cursor.offset_dw++;
 					++taken;
 				}
@@ -2056,6 +2235,50 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				if (DsLinearCopyHook::Mode() == 2) {
 					// (Verify: the dispatch that follows compares its copy with the announcement's.)
 					DemonsSouls::ExpectLinearCopy(dst, src, count, period, reinterpret_cast<uint64_t>(packet), bytes);
+				} else if (Copia1::On()) {
+					// (copia1, local/copia1.h) This announcement and those right after it (only one-dword NOPs between),
+					// made in one run, in order; `ends[i]`: the offset past copy i's game packets and the NOPs after them.
+					CheckBuffer();
+					std::array<RenderExecutor::DsLinearCopyItem, Copia1::MaxRun> items;
+					std::array<uint32_t, Copia1::MaxRun> starts {}, ends {};
+					uint32_t       n   = 0;
+					uint32_t       at  = cursor.offset_dw;
+					Copia1::Flush  why = Copia1::Full;
+					while (true) {
+						const auto* p    = cursor.commands.data() + at;
+						const auto  left = total_dw - at;
+						if (n != 0) {
+							if (left == 0) { why = Copia1::BufferEnd; break; }
+							if (!DsLinearCopyHook::IsPacket(p, left)) { why = Copia1::OtherPacket; break; }
+							if (!DsLinearCopyHook::IsSealed(p, left)) { why = Copia1::NotSealed; break; }
+						}
+						const uint32_t sp = p[DsLinearCopyHook::SpanWord];
+						items[n]          = {.dst            = DsLinearCopyHook::Address(p, DsLinearCopyHook::DstWord),
+						                     .src            = DsLinearCopyHook::Address(p, DsLinearCopyHook::SrcWord),
+						                     .count          = p[DsLinearCopyHook::CountWord],
+						                     .period         = p[DsLinearCopyHook::PeriodWord],
+						                     .commands       = reinterpret_cast<uint64_t>(p),
+						                     .commands_bytes = uint64_t {DsLinearCopyHook::PacketDwords + sp} * sizeof(uint32_t)};
+						starts[n] = at;
+						at += DsLinearCopyHook::PacketDwords + sp;
+						while (at < total_dw && cursor.commands[at] == 0x80000000u) ++at;
+						ends[n] = at;
+						if (++n == Copia1::MaxRun) { why = Copia1::Full; break; }
+					}
+					const auto t0   = std::chrono::steady_clock::now();
+					const auto made = m_renderer.GetComputeRenderExecutor().DsLinearCopyBatch(CurrentBuffer(), items.data(), n);
+					const auto ns   = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+					for (uint32_t i = 0; i < made; ++i) DsLinearCopyHook::Count(DsLinearCopyHook::Taken);
+					if (made < n) {
+						// (Copy `made` refused: its announcement alone is passed over, its game's packets run; the
+						// announcements after it come to this branch again.)
+						DsLinearCopyHook::Count(DsLinearCopyHook::Passed);
+						why = Copia1::Refused;
+						advance = starts[made] + DsLinearCopyHook::PacketDwords - cursor.offset_dw;
+					} else {
+						advance = ends[n - 1] - cursor.offset_dw;
+					}
+					Copia1::NoteRun(made, static_cast<uint64_t>(ns), why);
 				} else {
 					CheckBuffer();
 					if (m_renderer.GetComputeRenderExecutor().DsLinearCopy(CurrentBuffer(), dst, src, count, period,

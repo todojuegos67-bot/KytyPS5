@@ -10,6 +10,7 @@
 #include <x86intrin.h>
 
 #include "blackbox.h"
+#include "otros1.h"
 #include "render5.h"
 #include "sync-stats.h"
 
@@ -429,13 +430,26 @@ public:
 			g_pm4_packets[m_class] += 1;
 		}
 	}
+	// (otros1, KYTY_OTROS1) The packet's kind (Otros1::KeyOf its header), after Class.
+	void Key(uint32_t header) {
+		if (m_on && m_otros) {
+			m_key = Otros1::KeyOf(header);
+			Otros1::g_packets[m_key] += 1;
+		}
+	}
 
 private:
 	void Mark(uint64_t now) {
 		g_pm4_cycles[m_class] += now - m_start;
+		if (m_otros) {
+			Otros1::g_cycles[m_key] += now - m_start;
+			m_key = Otros1::Unkeyed; // (until Key names the next packet)
+		}
 		m_start = now;
 	}
 	bool      m_on;
+	bool      m_otros  = m_on && Otros1::Mode() != 0;
+	uint32_t  m_key    = Otros1::Unkeyed;
 	uint32_t  m_class  = Pm4Other;
 	uint64_t  m_start  = 0;
 	Pm4Clock* m_parent = nullptr;

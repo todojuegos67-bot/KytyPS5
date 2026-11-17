@@ -892,8 +892,9 @@ void LogFloorPaths() {
 // ~3 bilinear fetches more per trace pixel and 4 more for the history in motion, ~0.05-0.1 ms at 1280x720 (estimate).
 bool ReprojWanted() {
 	static const bool on = [] {
-		const char* e = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
-		const bool  v = e != nullptr && e[0] == '1';
+		const char* e  = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
+		const char* e1 = std::getenv("KYTY_RTREFL1"); // (rtrefl1: the master switch turns this on too)
+		const bool  v  = (e != nullptr && e[0] == '1') || (e1 != nullptr && e1[0] == '1');
 		std::printf("RT reflections: reprojection fix (rtrefl1) %s (KYTY_RT_REFLECTIONS_REPROJ=%s): %s\n", v ? "on" : "off",
 		            e != nullptr ? e : "(unset)",
 		            v ? "history at the best of surface / reflected-point (own and 3x3 hit distance) positions, Catmull-Rom in "

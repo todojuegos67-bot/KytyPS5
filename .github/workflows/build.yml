@@ -22,6 +22,10 @@ on:
         description: 'Publish the release (not a draft) and mark it as the latest'
         type: boolean
         default: false
+      not_latest:
+        description: 'With publish: publish it public but do NOT mark it as the latest'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -473,7 +477,7 @@ jobs:
           else
             draft="--draft"  # (10-24) siempre borrador salvo publish=true
             latest="--latest=false"  # (10-24) solo la que autorice el usuario (publish=true) pasa a ser la ultima
-            if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
+            if [ "${{ inputs.publish }}" = "true" ]; then draft=""; latest="--latest"; [ "${{ inputs.not_latest }}" = "true" ] && latest="--latest=false"; [ -s "package/$PACKAGE/NOVEDADES.txt" ] && notes="$(cat "package/$PACKAGE/NOVEDADES.txt")"; fi
             gh release create "$tag" "$PACKAGE.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $draft \
               --title "$PACKAGE" --notes "$notes" $latest 2> gh-err.txt || { echo "::error::gh release create: $(tr '\n' ' ' < gh-err.txt)"; exit 1; }
           fi

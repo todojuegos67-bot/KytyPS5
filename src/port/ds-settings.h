@@ -185,6 +185,8 @@ struct Settings {
 	bool        kbm = false;         // KYTY_KBM: keyboard and mouse
 	float       kbm_sens = 1.0f;     // KYTY_KBM_SENS
 	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
+	float       kbm_sens_x = 1.0f;   // (raton2) raton_sens_x: KYTY_CAM1_SENS_X (live)
+	float       kbm_sens_y = 1.0f;   // (raton2) raton_sens_y: KYTY_CAM1_SENS_Y (live)
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
 	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; "id=0" = the game's own, an absent id = its GameSetting::def, e.g. gs_spot off)

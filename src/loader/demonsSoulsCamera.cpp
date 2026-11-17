@@ -53,6 +53,7 @@
 
 #include <xbyak/xbyak.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -338,8 +339,51 @@ struct NativeState {
 	double  deg_yaw = 0.0, deg_yaw_net = 0.0, deg_pitch = 0.0, deg_pitch_net = 0.0, deg_pitch_clipped = 0.0;
 	float   last_dt = 0.0f, last_ry = 0.0f, last_rp = 0.0f, last_zoom = 0.0f, last_expo = 0.0f;
 	uint32_t last_yaw_off = 0;
+	// (cam1) KYTY_CAM1=1 (implies the native mouse camera; off by default).
+	bool    cam1 = false, cam1_comp = false;              // (raton2) COMP off by default: KYTY_CAM1_COMP=1 turns it on
+	std::atomic<double> sens_x {1.0}, sens_y {1.0};    // KYTY_CAM1_SENS_X / _Y (raton2: changed live, read each frame)
+	double  carry_y = 0.0, carry_p = 0.0;             // game radians the smoothing could not reach this frame
+	bool    have_prev = false, prev_mouse = false;    // the last free frame's rendered angles / was it a mouse frame
+	double  prev_ry = 0.0, prev_rp = 0.0;             // rendered yaw / pitch (atan2 of cd+0xd0 - cd+0x100)
+	double  ask_y = 0.0, ask_p = 0.0;                 // the angle asked in the last mouse frame (game radians, signed)
+	double  m_ask_y = 0.0, m_got_y = 0.0, m_ask_p = 0.0, m_got_p = 0.0; // 5 s sums: asked vs rendered next frame
+	double  m_k = 0.0;                                // the last smoothing factor read
+	int     m_pairs = 0, m_comp = 0, m_capped = 0;
 };
 NativeState g_native;
+
+// (cam1) What Ghidra shows (01.007.000, base 0; disassembly read again for cam1):
+//   0x18cf00+0x8c: with camera input (ctx+0x118 == 1) the pitch / yaw are RE-READ from the vector cd+0xd0 - cd+0x100
+//     (0x182e40: -atan2(v.y, |v.xz|), 0x182ea0: atan2(v.x, v.z)) before the stick's step is added.
+//   0x18f0d0: cd+0x100 (the camera drawn) moves towards the target cd+0xf0 by a FIXED per-frame factor k = cd+0x194
+//     (cd+0x1b0 with ctx+0x74 bit 0x800), no dt, the distance blended by cd+0x1a0/0x1b4; no smoothing with cd+0x12c != 0
+//     or ctx+0x74 bit 8.
+// So in a frame with camera input the drawn camera turns k x the angle asked (target = drawn + asked, then a lerp of k):
+// the rest is not delayed, it is lost (the next frame starts again from the drawn camera). A pad's rates were tuned with
+// that; a mouse asks an exact angle. KYTY_CAM1 asks the angle theta whose chord lerp by k turns the drawn camera by
+// exactly phi: theta = phi + asin(sin(phi) (1 - k) / k) (the drawn point k of the way from the drawn to the target
+// direction, back on the sphere). theta is capped at 120 deg; what is beyond goes to the next frame (carry).
+constexpr double Cam1MaxTheta = 2.0943951023931957; // 120 deg
+
+double Cam1Theta(double phi, double k, double* carry) {
+	*carry = 0.0;
+	if (!(k > 1e-3) || k >= 0.999 || phi == 0.0) return phi;
+	const double a    = std::fabs(phi);
+	const double sgn  = phi < 0 ? -1.0 : 1.0;
+	const double acap = std::atan2(k * std::sin(Cam1MaxTheta), 1.0 - k + k * std::cos(Cam1MaxTheta));
+	if (a >= acap) {
+		*carry = sgn * (a - acap);
+		return sgn * Cam1MaxTheta;
+	}
+	const double s = std::min(1.0, std::sin(a) * (1.0 - k) / k);
+	return sgn * std::min(Cam1MaxTheta, a + std::asin(s));
+}
+
+double WrapPi(double a) {
+	while (a > 3.14159265358979323846) a -= 2.0 * 3.14159265358979323846;
+	while (a < -3.14159265358979323846) a += 2.0 * 3.14159265358979323846;
+	return a;
+}
 
 double EnvDouble(const char* name, double def, double lo, double hi) {
 	const char* v = std::getenv(name);
@@ -394,6 +438,16 @@ void NativeStats(int64_t now) {
 	            static_cast<long long>(n.most), static_cast<double>(g_dpc.load(std::memory_order_relaxed)),
 	            static_cast<double>(n.last_dt), static_cast<double>(n.last_ry), n.last_yaw_off, static_cast<double>(n.last_rp),
 	            static_cast<double>(n.last_zoom), static_cast<double>(n.last_expo), g_yaw_sign.load(), g_pitch_sign.load());
+	if (n.cam1)
+		std::printf("Demon's Souls cam1 (5 s): smoothing compensation %s, k %.3f (cd+0x194/0x1b0, per frame), %d frames "
+		            "compensated (%d capped, carried), sens x %.2f y %.2f; drawn camera the frame after a mouse frame: yaw asked "
+		            "%.1f deg got %.1f deg (%.2f), pitch asked %.1f deg got %.1f deg (%.2f) over %d frames (stand still: 1.00 = "
+		            "1:1)\n",
+		            n.cam1_comp ? "ON" : "OFF (KYTY_CAM1_COMP=0)", n.m_k, n.m_comp, n.m_capped, n.sens_x.load(), n.sens_y.load(),
+		            n.m_ask_y / RadPerDeg, n.m_got_y / RadPerDeg, n.m_ask_y > 0 ? n.m_got_y / n.m_ask_y : 0.0, n.m_ask_p / RadPerDeg,
+		            n.m_got_p / RadPerDeg, n.m_ask_p > 0 ? n.m_got_p / n.m_ask_p : 0.0, n.m_pairs);
+	n.m_ask_y = n.m_got_y = n.m_ask_p = n.m_got_p = 0.0;
+	n.m_pairs = n.m_comp = n.m_capped = 0;
 	std::fflush(stdout);
 	n.log_ns  = now;
 	n.applied = n.lost_not_free = n.lost_aim = n.lost_stale = n.kept = n.most = 0;
@@ -429,12 +483,32 @@ void KYTY_SYSV_ABI NativeFollowHook(uint8_t* ctx, uint64_t* xy) {
 		// the emulated stick at once; what arrived since the last frame has no camera to turn.
 		n.free_ns.store(0, std::memory_order_relaxed);
 		if (NativeTake(&dx, &dy)) n.lost_not_free += std::llabs(dx) + std::llabs(dy);
+		n.carry_y = n.carry_p = 0.0, n.have_prev = n.prev_mouse = false;
 		NativeStats(now);
 		return;
 	}
 	n.frames_free++;
 	n.free_ns.store(now, std::memory_order_relaxed);
-	if (!NativeTake(&dx, &dy)) {
+	if (n.cam1) {
+		// The drawn camera's angles now (the last frame's result): measure what the last mouse frame turned.
+		float v[4] {0, 0, 0, 0}, p[4] {0, 0, 0, 0};
+		std::memcpy(v, cd + 0xd0, sizeof(v));
+		std::memcpy(p, cd + 0x100, sizeof(p));
+		const double x = static_cast<double>(v[0]) - p[0], y = static_cast<double>(v[1]) - p[1], z = static_cast<double>(v[2]) - p[2];
+		if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && (x != 0.0 || z != 0.0)) {
+			const double ryaw = std::atan2(x, z), rpitch = -std::atan2(y, std::hypot(x, z));
+			if (n.have_prev && n.prev_mouse) {
+				n.m_ask_y += std::fabs(n.ask_y), n.m_got_y += std::fabs(WrapPi(ryaw - n.prev_ry));
+				n.m_ask_p += std::fabs(n.ask_p), n.m_got_p += std::fabs(rpitch - n.prev_rp);
+				n.m_pairs++;
+			}
+			n.have_prev = true, n.prev_ry = ryaw, n.prev_rp = rpitch;
+		} else {
+			n.have_prev = false;
+		}
+		n.prev_mouse = false;
+	}
+	if (!NativeTake(&dx, &dy) && !(n.cam1 && (n.carry_y != 0.0 || n.carry_p != 0.0))) {
 		// No counts this frame. A pad's stick is left as read; an idle stick shortly after the mouse stays "moved".
 		if ((*xy & 0x7fffffff7fffffffULL) == 0 && n.hold_ns > 0 && now - n.mouse_ns.load(std::memory_order_relaxed) < n.hold_ns) {
 			const float held[2] {0.0f, 1e-6f};
@@ -463,9 +537,30 @@ void KYTY_SYSV_ABI NativeFollowHook(uint8_t* ctx, uint64_t* xy) {
 	}
 	n.kept_frames = 0;
 	const double dpc   = static_cast<double>(g_dpc.load(std::memory_order_relaxed));
-	const double deg_y = static_cast<double>(dx) * dpc, deg_p = static_cast<double>(dy) * dpc * n.pitch_scale;
-	const float  stick[2] {static_cast<float>(ps * deg_p * RadPerDeg / (static_cast<double>(rp) * dt)),
-	                       static_cast<float>(ys * deg_y * RadPerDeg / (static_cast<double>(ry) * dt))};
+	const double deg_y = static_cast<double>(dx) * dpc * n.sens_x.load(std::memory_order_relaxed),
+	             deg_p = static_cast<double>(dy) * dpc * n.pitch_scale * n.sens_y.load(std::memory_order_relaxed);
+	// Game radians to turn the drawn camera by (signed as the game's stick lanes).
+	double ang_p = ps * deg_p * RadPerDeg, ang_y = ys * deg_y * RadPerDeg;
+	if (n.cam1) {
+		ang_y += n.carry_y, ang_p += n.carry_p;
+		n.carry_y = n.carry_p = 0.0;
+		n.ask_y = ang_y, n.ask_p = ang_p, n.prev_mouse = true;
+		uint32_t flags74 = 0;
+		std::memcpy(&flags74, ctx + 0x74, sizeof(flags74));
+		const bool  smoothed = cd[0x12c] == 0 && (flags74 & 8) == 0;
+		const float k        = F(cd, (flags74 & 0x800) != 0 ? 0x1b0 : 0x194);
+		n.m_k                = k;
+		if (n.cam1_comp && smoothed && std::isfinite(k) && k > 1e-3f && k < 0.999f) {
+			double cy = 0.0, cp = 0.0;
+			ang_y = Cam1Theta(ang_y, k, &cy);
+			ang_p = Cam1Theta(ang_p, k, &cp);
+			n.carry_y = std::clamp(cy, -0.5236, 0.5236), n.carry_p = std::clamp(cp, -0.5236, 0.5236); // (30 deg at most)
+			n.m_comp++;
+			if (cy != 0.0 || cp != 0.0) n.m_capped++;
+		}
+	}
+	const float  stick[2] {static_cast<float>(ang_p / (static_cast<double>(rp) * dt)),
+	                       static_cast<float>(ang_y / (static_cast<double>(ry) * dt))};
 	std::memcpy(xy, stick, sizeof(stick));
 	if (n.linear_flag != nullptr) n.linear_flag->store(1, std::memory_order_relaxed);
 	n.mouse_ns.store(now, std::memory_order_relaxed);
@@ -521,7 +616,8 @@ void KYTY_SYSV_ABI NativeAimHook(const uint8_t* aim, const uint8_t* args, uint64
 		return;
 	}
 	const double dpc   = static_cast<double>(g_dpc.load(std::memory_order_relaxed));
-	const double deg_y = static_cast<double>(dx) * dpc, deg_p = static_cast<double>(dy) * dpc * n.pitch_scale;
+	const double deg_y = static_cast<double>(dx) * dpc * n.sens_x.load(std::memory_order_relaxed),
+	             deg_p = static_cast<double>(dy) * dpc * n.pitch_scale * n.sens_y.load(std::memory_order_relaxed);
 	const double unzoom = n.aim_zoom ? 1.0 : 1.0 / static_cast<double>(zoom);
 	const double a = ps * deg_p * RadPerDeg * unzoom / (static_cast<double>(dt) * rp);
 	const double b = ys * deg_y * RadPerDeg * unzoom / (static_cast<double>(dt) * ry);
@@ -670,7 +766,11 @@ bool InstallNative(Program* program, uint64_t tilt, uint64_t linear, uint64_t* f
 	n.pitch_scale = EnvDouble("KYTY_DS_MOUSE_PITCH_SCALE", 1.0, 0.1, 4.0) * (Is1("KYTY_DS_MOUSE_INVERT_Y") ? -1.0 : 1.0);
 	n.hold_ns     = static_cast<int64_t>(EnvDouble("KYTY_DS_MOUSE_HOLD_MS", 100.0, 0.0, 1000.0) * 1e6);
 	if (const char* z = std::getenv("KYTY_DS_MOUSE_AIM_ZOOM"); z != nullptr && z[0] == '0') n.aim_zoom = false;
-	n.stats      = Is1("KYTY_DS_MOUSE_STATS");
+	n.cam1       = Is1("KYTY_CAM1");
+	n.cam1_comp  = Is1("KYTY_CAM1_COMP"); // (raton2) off unless KYTY_CAM1_COMP=1 (on, it multiplied the turn by ~10)
+	n.sens_x.store(n.cam1 ? EnvDouble("KYTY_CAM1_SENS_X", 1.0, 0.05, 20.0) : 1.0);
+	n.sens_y.store(n.cam1 ? EnvDouble("KYTY_CAM1_SENS_Y", 1.0, 0.05, 20.0) : 1.0);
+	n.stats      = Is1("KYTY_DS_MOUSE_STATS") || n.cam1;
 	g_yaw_sign   = EnvSign("KYTY_KBM_YAW_SIGN");
 	g_pitch_sign = EnvSign("KYTY_KBM_PITCH_SIGN");
 	const auto jmp = [](uint64_t at, const uint8_t* to, size_t size) {
@@ -694,7 +794,7 @@ bool InstallNative(Program* program, uint64_t tilt, uint64_t linear, uint64_t* f
 
 // (mouse1) Read at each call (the port sets its environment before the emulator starts; nothing is cached here).
 bool NativeWanted() {
-	return Is1("KYTY_DS_MOUSE_NATIVE") && Is1("KYTY_KBM") && !Is1("KYTY_KBM_CALIBRATE");
+	return (Is1("KYTY_DS_MOUSE_NATIVE") || Is1("KYTY_CAM1")) && Is1("KYTY_KBM") && !Is1("KYTY_KBM_CALIBRATE");
 }
 
 bool NativeInstalled() {
@@ -791,6 +891,21 @@ void DirectSetStick(int x, int y) {
 	g_stick_y.store(y, std::memory_order_relaxed);
 }
 
+// (raton2) The native camera's per-axis multipliers, changed live (settings.ini raton_sens_x / raton_sens_y).
+bool Cam1Active() {
+	return g_native.cam1;
+}
+
+void Cam1SetSens(double x, double y) {
+	if (std::isfinite(x) && x > 0.0) g_native.sens_x.store(std::clamp(x, 0.05, 20.0), std::memory_order_relaxed);
+	if (std::isfinite(y) && y > 0.0) g_native.sens_y.store(std::clamp(y, 0.05, 20.0), std::memory_order_relaxed);
+}
+
+void Cam1GetSens(double* x, double* y) {
+	*x = g_native.sens_x.load(std::memory_order_relaxed);
+	*y = g_native.sens_y.load(std::memory_order_relaxed);
+}
+
 void DirectSetDegPerCount(float deg) {
 	if (std::isfinite(deg) && deg > 0.0f) g_dpc.store(deg, std::memory_order_relaxed);
 }
@@ -876,6 +991,10 @@ void InstallNoRamp(Program* program) {
 			              static_cast<long long>(g_native.hold_ns / 1000000), g_native.stats ? "on (every 5 s)" : "off (KYTY_DS_MOUSE_STATS=1)",
 			              g_yaw_sign.load(), g_pitch_sign.load());
 			mode_line(text);
+			if (g_native.cam1)
+				std::printf("Demon's Souls cam1 (KYTY_CAM1=1): native mouse camera + the game's camera smoothing compensated "
+				            "(%s), sens x %.2f y %.2f (KYTY_CAM1_SENS_X/_Y), a 'cam1' line every 5 s\n",
+				            g_native.cam1_comp ? "on (KYTY_CAM1_COMP=1)" : "off", g_native.sens_x.load(), g_native.sens_y.load());
 		} else {
 			char text[384];
 			std::snprintf(text, sizeof(text),
