@@ -252,6 +252,13 @@ private:
         u32 w = 0, h = 0, samples = 1;
         vk::Format format{};
         bool depth_test = false, depth_write = false;
+        // Bound with the G-buffer MRT (Ghidra: renderer FUN_026c39f0 creates GBuffer RT0
+        // (WS normal) / RT1 with format 10 = RGBA8 at the scene size and attaches the shared scene
+        // depth +0x200 to them, to the HDR target and to Light Acc): >= 2 colour attachments of
+        // the depth's size, >= 2 of them RGBA8. Counted per render-pass begin; rt0 = that MRT's first RGBA8 target (RT0).
+        u32 gbuf_draws = 0;
+        VideoCore::ImageId rt0_id{};
+        u64 rt0_uid = 0;
     };
     std::vector<BbRtDepthSeen> bb_rt_depth_seen;
     bool bb_rt_depth_fresh = false;  // a depth target was written since the last composite

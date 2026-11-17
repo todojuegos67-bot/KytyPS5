@@ -28,6 +28,7 @@ layout(std140, binding = 2) uniform Params {
     vec4 misc;       // density, max march distance, steps, frame
     vec4 misc2;      // history valid, temporal blend, far distance, y sign
     vec4 fog;        // view-space world up, height falloff 1/H (game fog CB, 0: uniform)
+    vec4 dbg;        // x: BB_RT_DEBUG_VIEW (2 volumetric only, 3 chosen depth), 0 off
 } p;
 layout(binding = 3) uniform sampler2D src_tex;  // mode 1: raw, mode 2: accumulated (nearest)
 layout(binding = 4) uniform sampler2D hist_tex; // previous accumulated (linear)
@@ -166,7 +167,16 @@ void main() {
             ws += w;
         }
         vec3 add = ws > 1e-5 ? sum / ws : texelFetch(src_tex, hc, 0).rgb;
-        if (!any(isnan(add)) && !any(isinf(add))) {
+        int dv = int(p.dbg.x + 0.5);
+        if (dv == 2) {
+            // In-scattering alone, x4 so a faint fog is visible.
+            vec3 a = (any(isnan(add)) || any(isinf(add))) ? vec3(1.0, 0.0, 1.0)
+                                                          : clamp(add, vec3(0.0), vec3(MaxAdd)) * 4.0;
+            imageStore(scene, c, vec4(a, 1.0));
+        } else if (dv == 3) {
+            float g = 1.0 - clamp(log2(1.0 + dref) / log2(1.0 + p.misc2.z), 0.0, 1.0);
+            imageStore(scene, c, vec4(vec3(g), 1.0));
+        } else if (!any(isnan(add)) && !any(isinf(add))) {
             vec4 sc = imageLoad(scene, c);
             if (!any(isnan(sc)) && !any(isinf(sc))) {
                 imageStore(scene, c, vec4(sc.rgb + clamp(add, vec3(0.0), vec3(MaxAdd)), sc.a));

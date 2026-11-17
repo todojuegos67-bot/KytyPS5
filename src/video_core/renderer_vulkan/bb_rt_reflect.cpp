@@ -96,6 +96,7 @@ struct alignas(16) VolParams {
     float misc[4];  // density, max march distance, steps, frame
     float misc2[4]; // history valid, temporal blend, far distance, y sign
     float fog[4];   // view-space world up (xyz), height falloff 1/H (density *= exp(-dy / H))
+    float dbg[4];   // BB_RT_DEBUG_VIEW (x), 0: off
 };
 static_assert(sizeof(VolParams) <= 512);
 
@@ -109,6 +110,7 @@ struct alignas(16) ShParams {
     float misc[4];  // strength, max ray length, frame, history valid
     float misc2[4]; // temporal blend, far distance, y sign, G-buffer normals
     float view[16];
+    float dbg[4];   // BB_RT_DEBUG_VIEW (x), 0: off
 };
 static_assert(sizeof(ShParams) <= 512);
 
@@ -1031,7 +1033,8 @@ void RtReflect::Log() {
 
 bool RtReflect::InitVolumetric() {
     const auto device = instance.GetDevice();
-    vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", 1.0f, 0.0f, 10.0f);
+    vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", 0.5f, 0.0f, 10.0f);
+    dbg_view = u32(EnvFloat("BB_RT_DEBUG_VIEW", 0.0f, 0.0f, 4.0f));
     vol_density = EnvFloat("BB_RT_VOLUMETRIC_DENSITY", 0.02f, 0.0001f, 1.0f);
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DENSITY"); e && e[0]) density_env = true;
     vol_dist = EnvFloat("BB_RT_VOLUMETRIC_DIST", 60.0f, 2.0f, 1000.0f);
@@ -1197,10 +1200,12 @@ void RtReflect::GameFog() {
     if (!BB::Upscale::RtFogBlock(f, age) || age > 120 || !(f[1] > 0.0f)) {
         fog_height = 0.0f;
         for (float& t : fog_tint) t = 1.0f;
-        fog_density = vol_density;
-        fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY" : "fallback (default density, no fog CB seen)";
+        // No fog CB: no in-scattering unless the density is forced (BB_RT_VOLUMETRIC_DENSITY).
+        fog_density = density_env ? vol_density : 0.0f;
+        fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY" : "no fog CB seen: no in-scattering";
         return;
     }
+    // In-scattering only where the game's own fog has a density (fog CB slot 6 float 2 > 0).
     fog_density = density_env ? vol_density : std::clamp(f[2], 0.0f, 1.0f);
     fog_height = std::clamp(f[3], -10.0f, 10.0f);
     const float m = std::max({f[4], f[5], f[6]});
@@ -1357,6 +1362,7 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
     vp.color[2] = used_color[2];
     vp.color[3] = vol_strength;
     vp.misc[0] = fog_density;
+    vp.dbg[0] = float(dbg_view);
     vp.fog[0] = static_cast<float>(view[1]); // world +y in view space (column 1 of the 3x4 view)
     vp.fog[1] = static_cast<float>(view[5]);
     vp.fog[2] = static_cast<float>(view[9]);
@@ -1728,10 +1734,19 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
         in.normal ? vk::DescriptorImageInfo{nearest, in.normal_view, lay(in.normal_layout)}
                   : depth_info;
     sh_normal = bool(in.normal);
-    if (sh_on && sh_ok) {
+    // BB_RT_DEBUG_VIEW: 1 shadow mask, 3 chosen depth, 4 N.L facing (shadow pass writes the
+    // scene); 2 volumetric only (3 too when the shadows are off). The other pass is skipped.
+    if (vol_on && vol_ok) {
+        GameFog();
+    }
+    const bool sh_run = sh_on && sh_ok && dbg_view != 2;
+    const bool vol_run =
+        vol_on && vol_ok && (dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run)) &&
+        (fog_density > 0.0f || dbg_view == 2 || dbg_view == 3);
+    if (sh_run) {
         Shadows(cmd, in, proj, inv, vd, rp, prev_p, cam_prev_ok, depth_info, normal_info);
     }
-    if (vol_on && vol_ok) {
+    if (vol_run) {
         const vk::MemoryBarrier2 cc{
             .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
             .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
@@ -1963,6 +1978,7 @@ void RtReflect::ReadProbe(const float* proj, float far_dist) {
 bool RtReflect::InitShadows() {
     const auto device = instance.GetDevice();
     sh_strength = EnvFloat("BB_RT_SHADOWS_STRENGTH", 0.6f, 0.0f, 1.0f);
+    dbg_view = u32(EnvFloat("BB_RT_DEBUG_VIEW", 0.0f, 0.0f, 4.0f));
     sh_cone = EnvFloat("BB_RT_SHADOWS_CONE", 0.02f, 0.0f, 0.2f);
     sh_dist = EnvFloat("BB_RT_SHADOWS_DIST", 80.0f, 2.0f, 1000.0f);
     constexpr auto C = vk::ShaderStageFlagBits::eCompute;
@@ -2079,6 +2095,7 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
     sp.misc2[1] = far_dist;
     sp.misc2[2] = 1.0f;
     sp.misc2[3] = sh_normal ? 1.0f : 0.0f;
+    sp.dbg[0] = float(dbg_view);
     std::memcpy(static_cast<u8*>(sh_params.mapped) + slot * ParamSize, &sp, sizeof(sp));
     ReadTimer(sh_queries, sh_query_used, slot, sh_ms_sum, sh_ms_n);
     if (sh_queries) {

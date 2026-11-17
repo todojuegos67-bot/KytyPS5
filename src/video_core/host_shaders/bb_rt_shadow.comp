@@ -23,6 +23,7 @@ layout(std140, binding = 2) uniform Params {
     vec4 misc;       // strength, max ray length, frame, history valid
     vec4 misc2;      // temporal blend, far distance, y sign, normal source (1: G-buffer)
     mat4 view;       // world -> view (G-buffer normals)
+    vec4 dbg;        // x: BB_RT_DEBUG_VIEW (1 shadow mask, 3 chosen depth, 4 N.L facing), 0 off
 } p;
 layout(binding = 3) uniform sampler2D src_tex;
 layout(binding = 4) uniform sampler2D hist_tex;
@@ -176,7 +177,16 @@ void main() {
         vec2 hp = (vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw);
         ivec2 hc = clamp(ivec2(hp), ivec2(0), ivec2(p.size.xy) - 1);
         vec4 ref = texelFetch(src_tex, hc, 0);
-        if (ref.a > 0.0) {
+        int dv = int(p.dbg.x + 0.5);
+        if (dv == 3) {
+            // Chosen depth: view distance, log scale (white near, black far / sky red).
+            float g = ref.a > 0.0 ? 1.0 - clamp(log2(1.0 + ref.a) / log2(1.0 + p.misc2.y), 0.0, 1.0)
+                                  : 0.0;
+            imageStore(scene, c, vec4(ref.a > 0.0 ? vec3(g) : vec3(0.5, 0.0, 0.0), 1.0));
+        } else if (dv == 4) {
+            imageStore(scene, c, vec4(vec3(ref.a > 0.0 ? clamp(ref.g, 0.0, 1.0) : 0.0), 1.0));
+        }
+        if (ref.a > 0.0 && dv != 3 && dv != 4) {
             float sum = 0.0, ws = 0.0, fsum = 0.0;
             for (int y = -2; y <= 2; ++y) {
                 for (int x = -2; x <= 2; ++x) {
@@ -197,10 +207,15 @@ void main() {
             float facing = ws > 1e-5 ? fsum / ws : ref.g;
             float k = p.misc.x * (1.0 - clamp(vis, 0.0, 1.0)) * clamp(facing, 0.0, 1.0);
             k = (isnan(k) || isinf(k)) ? 0.0 : clamp(k, 0.0, p.misc.x);
-            if (k > 0.0) {
+            if (dv == 1) {
+                // Shadow mask: the multiplier the scene would get (white lit, dark shadowed).
+                imageStore(scene, c, vec4(vec3(1.0 - k), 1.0));
+            } else if (k > 0.0) {
                 vec4 sc = imageLoad(scene, c);
                 imageStore(scene, c, vec4(sc.rgb * (1.0 - k), sc.a));
             }
+        } else if (dv == 1) {
+            imageStore(scene, c, vec4(0.0, 0.0, 0.5, 1.0)); // sky / no depth: blue
         }
     }
     if (nr != 0u) {

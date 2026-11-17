@@ -215,7 +215,7 @@ private:
 
     // bb-rt-vol state.
     bool vol_on = false, vol_ok = false, vol_fresh = true;
-    float vol_strength = 1.0f, vol_density = 0.02f, vol_dist = 60.0f;
+    float vol_strength = 0.5f, vol_density = 0.02f, vol_dist = 60.0f;
     float vol_color[3]{0.55f, 0.62f, 0.80f};
     u32 vol_steps = 12;
     vk::DescriptorSetLayout vol_set{};
@@ -257,6 +257,7 @@ private:
     // bb-rt-shadow state (BB_RT_SHADOWS=1).
     bool sh_on = false, sh_ok = false, sh_fresh = true;
     float sh_strength = 0.6f, sh_cone = 0.02f, sh_dist = 80.0f;
+    u32 dbg_view = 0; // BB_RT_DEBUG_VIEW=1..4 (shadow mask, volumetric, depth, N.L)
     vk::DescriptorSetLayout sh_set{};
     vk::PipelineLayout sh_layout{};
     vk::Pipeline sh_pipe{};

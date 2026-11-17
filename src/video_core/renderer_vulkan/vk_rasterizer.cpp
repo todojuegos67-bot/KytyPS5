@@ -741,10 +741,39 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         return scene && u64(w) * scene->info.size.height == u64(h) * scene->info.size.width;
     };
     VideoCore::Image* d32 = nullptr;
+    VideoCore::Image* gbuf_rt0 = nullptr;
     bool d32_reused = false;
+    const char* d32_how = "none";
     if (depth_fresh) {
+        // 1) The depth bound with the G-buffer MRT (Ghidra FUN_026c39f0: the scene depth
+        //    renderer+0x200 is the depth of GBuffer RT0/RT1, Light Acc and the HDR target; the
+        //    frame order is Shadow, DynShadow, Reflect, FeedBackBlur, then View: ZPre, Geom,
+        //    Lighting, Composite, Forward, Effect - GPU perf labels at 0x049c2664..0x049c27aa).
+        //    Most G-buffer passes wins, then the larger one.
+        u32 best_g = 0;
+        u64 best_ga = 0;
+        for (const auto& c : seen) {
+            const u64 ar = u64(c.w) * c.h;
+            if (c.gbuf_draws == 0 || c.samples != 1 || !same_aspect(c.w, c.h) ||
+                c.gbuf_draws < best_g || (c.gbuf_draws == best_g && ar < best_ga)) {
+                continue;
+            }
+            if (auto* img = texture_cache.TryGetImage(c.id, c.uid)) {
+                d32 = img;
+                best_g = c.gbuf_draws;
+                best_ga = ar;
+                gbuf_rt0 = c.rt0_uid ? texture_cache.TryGetImage(c.rt0_id, c.rt0_uid) : nullptr;
+                bb_rt_depth_last_id = c.id;
+                bb_rt_depth_last_uid = c.uid;
+                bb_rt_depth_last_addr = c.addr;
+                d32_how = "G-buffer MRT depth";
+            }
+        }
         u64 best_area = 0;
         for (const auto& c : seen) {
+            if (d32) {
+                break; // 2) size heuristic only without a G-buffer pass
+            }
             const u64 ar = u64(c.w) * c.h;
             if (!c.depth_write || c.samples != 1 || !same_aspect(c.w, c.h) || ar < best_area) {
                 continue;
@@ -752,6 +781,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             if (auto* img = texture_cache.TryGetImage(c.id, c.uid)) {
                 d32 = img; // later entries (more recently bound) win ties
                 best_area = ar;
+                d32_how = "size heuristic (no G-buffer MRT seen)";
                 bb_rt_depth_last_id = c.id;
                 bb_rt_depth_last_uid = c.uid;
                 bb_rt_depth_last_addr = c.addr;
@@ -775,6 +805,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
                 d32 = nullptr;
             }
             d32_reused = d32 != nullptr;
+            d32_how = d32 ? "reused" : "none";
         }
     } else {
         ++n_d32_stale;
@@ -785,26 +816,36 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         static int seen_logged = 0;
         static bool miss_logged = false;
         const bool miss = depth_fresh && (!d32 || d32_reused);
-        if (seen_logged < 2 || (miss && !miss_logged)) {
+        static const char* last_how = nullptr;
+        const bool how_changed = depth_fresh && last_how != d32_how && seen_logged < 12;
+        if (depth_fresh) {
+            last_how = d32_how;
+        }
+        if (seen_logged < 2 || how_changed || (miss && !miss_logged)) {
             ++seen_logged;
             miss_logged |= miss;
             std::string list;
             for (const auto& c : seen) {
-                list += fmt::format(" [{:#x} {}x{} {} x{} test {} write {}{}]", c.addr, c.w, c.h,
-                                    vk::to_string(c.format), c.samples, c.depth_test ? "on" : "off",
-                                    c.depth_write ? "on" : "off",
-                                    same_aspect(c.w, c.h) ? "" : ", other aspect");
+                list += fmt::format(" [{:#x} {}x{} {} x{} test {} write {}{}{}]", c.addr, c.w,
+                                    c.h, vk::to_string(c.format), c.samples,
+                                    c.depth_test ? "on" : "off", c.depth_write ? "on" : "off",
+                                    same_aspect(c.w, c.h) ? "" : ", other aspect",
+                                    c.gbuf_draws ? fmt::format(", G-buffer MRT x{}", c.gbuf_draws)
+                                                 : std::string{});
             }
             LOG_INFO(Render_Vulkan,
                      "[rt-light] depth targets since the previous composite (scene {}):{} -> "
-                     "scene D32 {}{}",
+                     "scene D32 {}{} [{}], G-buffer RT0 {}",
                      scene ? fmt::format("{}x{}", scene->info.size.width, scene->info.size.height)
                            : std::string("none"),
                      list.empty() ? " none" : list,
                      d32 ? fmt::format("{:#x} {}x{}", d32->info.guest_address,
                                        d32->info.size.width, d32->info.size.height)
                          : std::string("none"),
-                     d32_reused ? " (reused from an earlier frame)" : "");
+                     d32_reused ? " (reused from an earlier frame)" : "", d32_how,
+                     gbuf_rt0 ? fmt::format("{:#x} {}x{}", gbuf_rt0->info.guest_address,
+                                            gbuf_rt0->info.size.width, gbuf_rt0->info.size.height)
+                              : std::string("none"));
         }
     }
     // Once per scene image between two scene renders: the composite is drawn twice per frame;
@@ -851,6 +892,12 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     }
     if (normal && area(normal) < area(scene) / 4) {
         normal = nullptr;
+    }
+    // G-buffer RT0 (Ghidra FUN_026c67b0 debug view "GBuffer RT0(RGB:WS Normal)" = renderer
+    // +0x250): the world-space normals of the pass the depth came from; the RGBA8 the composite
+    // samples need not be the normals.
+    if (gbuf_rt0 && !gbuf_rt0->info.props.is_depth && gbuf_rt0->info.num_samples == 1) {
+        normal = gbuf_rt0;
     }
     if (!scene) {
         ++n_noscene;
@@ -2247,11 +2294,43 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (bb_rt_reflect) {
             const bool writes =
                 regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+            // G-buffer MRT test (see BbRtDepthSeen): colour attachments of the depth's size.
+            u32 n_same = 0, n_rgba8 = 0;
+            VideoCore::ImageId rt0{};
+            u64 rt0_uid = 0;
+            for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                const auto cid = cb_descs[cb].image_id;
+                if (!cid || !state.color_attachments[cb].image_view) {
+                    continue;
+                }
+                const auto& ci = texture_cache.GetImage(cid);
+                if (ci.info.size.width != image.info.size.width ||
+                    ci.info.size.height != image.info.size.height) {
+                    continue;
+                }
+                ++n_same;
+                if (ci.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+                    ci.info.pixel_format == vk::Format::eR8G8B8A8Srgb) {
+                    if (n_rgba8++ == 0) {
+                        rt0 = cid;
+                        rt0_uid = ci.image_uid;
+                    }
+                }
+            }
+            const bool gbuf = regs.depth_control.depth_enable && n_same >= 2 && n_rgba8 >= 2 &&
+                              image.info.num_samples == 1;
             bool merged = false;
             for (auto& c : bb_rt_depth_seen) {
                 if (c.id == image_id && c.uid == image.image_uid) {
                     c.depth_test |= bool(regs.depth_control.depth_enable);
                     c.depth_write |= writes;
+                    if (gbuf) {
+                        ++c.gbuf_draws;
+                        if (!c.rt0_uid) {
+                            c.rt0_id = rt0;
+                            c.rt0_uid = rt0_uid;
+                        }
+                    }
                     merged = true;
                 }
             }
@@ -2259,7 +2338,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 bb_rt_depth_seen.push_back({image_id, image.image_uid, image.info.guest_address,
                                             image.info.size.width, image.info.size.height,
                                             image.info.num_samples, image.info.pixel_format,
-                                            bool(regs.depth_control.depth_enable), writes});
+                                            bool(regs.depth_control.depth_enable), writes,
+                                            gbuf ? 1u : 0u, gbuf ? rt0 : VideoCore::ImageId{},
+                                            gbuf ? rt0_uid : 0});
             }
             bb_rt_depth_fresh |= writes && image.info.num_samples == 1;
         }
