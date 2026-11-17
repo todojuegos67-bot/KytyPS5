@@ -130,15 +130,16 @@ int main(int argc, char* argv[]) {
             const DWORD n = GetModuleFileNameW(nullptr, exe_path, MAX_PATH * 4);
             if (n > 0 && n < MAX_PATH * 4) {
                 const std::filesystem::path dir = std::filesystem::path(exe_path).parent_path();
-                const std::filesystem::path ps1 = dir / L"Launcher-bloodborne.ps1";
+                const std::filesystem::path cmd = dir / L"Launcher-bloodborne.cmd";
                 std::error_code ec;
-                if (std::filesystem::exists(ps1, ec)) {
-                    const std::wstring params =
-                        L"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
-                        ps1.wstring() + L"\"";
+                if (std::filesystem::exists(cmd, ec)) {
+                    // Start the launcher exactly like double-clicking Launcher-bloodborne.cmd:
+                    // drop compatibility / DPI settings Windows applies to this exe so the
+                    // launcher does not inherit them (they change its layout and fonts).
+                    SetEnvironmentVariableW(L"__COMPAT_LAYER", nullptr);
                     const auto r = reinterpret_cast<INT_PTR>(
-                        ShellExecuteW(nullptr, L"open", L"powershell.exe", params.c_str(),
-                                      dir.wstring().c_str(), SW_HIDE));
+                        ShellExecuteW(nullptr, L"open", cmd.wstring().c_str(), nullptr,
+                                      dir.wstring().c_str(), SW_SHOWMINNOACTIVE));
                     if (r > 32) {
                         return 0;
                     }
