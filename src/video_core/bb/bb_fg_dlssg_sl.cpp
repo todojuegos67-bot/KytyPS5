@@ -555,7 +555,14 @@ uint32_t BeforePresent(uint32_t frame) {
             std::scoped_lock lock{g_options_mutex};
             on = g_options_set && g_options.on;
         }
-        limiter.Wait(on ? static_cast<double>(g_real_cap.load(std::memory_order_relaxed)) : 0.0);
+        // bb-sl-nocap: our own limiter fought DLSS-G/Reflex pacing (real fps fell to cap / N,
+        // e.g. 14 instead of 55 at x4). DLSS-G paces its frames itself: opt-in only.
+        static const bool use_cap = [] {
+            const char* v = std::getenv("BB_FG_SL_CAP");
+            return v != nullptr && v[0] == '1';
+        }();
+        limiter.Wait(use_cap && on ? static_cast<double>(g_real_cap.load(std::memory_order_relaxed))
+                                   : 0.0);
     }
     Marker(sl::PCLMarker::eRenderSubmitEnd, frame);
     Marker(sl::PCLMarker::ePresentStart, frame);
