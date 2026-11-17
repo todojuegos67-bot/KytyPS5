@@ -894,11 +894,12 @@ u32 Presenter::BbEnsureGenerated(Frame* frame, u32 count) {
 
 // Supermedo's UpdateFrameGenLimit: the images the display shows per game frame (60 FPS on 144 Hz
 // has room for one generated frame, on 240 Hz for three), decided once a second from that
-// second's game frame rate: down at once when 10% short, up after two seconds with 5% to spare;
-// paused for a while when presenting holds the game back.
+// second's game frame rate (bb-fg-cap: bb_fg.cpp DynamicFg for dlss-dyn, the real-fps cap for
+// dlss-x2..x4); paused for a while when presenting holds the game back.
 void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
     if (!wanted) {
         bb_frame_gen_limit = 0;
+        bb_real_cap_fps = 0;
         bb_present_busy = 0.0;
         return;
     }
@@ -910,31 +911,32 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
     u32 limit = before;
     ++bb_limit_frames;
     const double window_s = std::chrono::duration<double>(now - bb_limit_window).count();
-    if (window_s >= 1.0) {
-        const double ratio = hz * window_s / bb_limit_frames;
-        bb_limit_window = now;
-        bb_limit_frames = 0;
-        if (window_s < 2.0) { // not the first, nor after a pause of the game
-            if (limit > 0 && ratio < (limit + 1) * 0.9) {
-                while (limit > 0 && ratio < (limit + 1) * 0.9) {
-                    --limit;
-                }
-                bb_limit_up_seconds = 0;
-            } else if (limit < 3 && ratio >= (limit + 2) * 0.95) {
-                if (++bb_limit_up_seconds >= 2) {
-                    ++limit;
-                    bb_limit_up_seconds = 0;
-                }
-            } else {
-                bb_limit_up_seconds = 0;
+    const u32 max_gen = std::max<u32>(BB::FG::Dlss::WantedCount(), 1u);
+    if (BB::FG::Cfg().dynamic) {
+        // bb-fg-cap: dlss-dyn: the shared rule (bb_fg.cpp DynamicFg): the largest multiplier with
+        // real x N within refresh - refresh^2/3600, holding the real rate at floor(cap / N) when
+        // that stays >= BB_FG_DYN_FLOOR (was: refresh / real with 10% / 5% margins and no hold,
+        // so real x N could run over what the display shows and generated frames were dropped).
+        static BB::FG::DynamicFg dyn;
+        if (window_s >= 1.0) {
+            const double real = bb_limit_frames / window_s;
+            bb_limit_window = now;
+            bb_limit_frames = 0;
+            if (window_s < 2.0) { // not the first, nor after a pause of the game
+                dyn.Update("dlssg", real, int(max_gen) + 1);
             }
         }
-    }
-    // Fixed multipliers (dlss-x2..x4) as chosen, past the display's refresh rate (Supermedo's
-    // frame_gen_fit_display off); dlss-dyn fits the display. (Supermedo caps the game under FIFO
-    // through VideoOut; this build has no such cap, so FIFO keeps the fitted limit.)
-    if (!BB::FG::Cfg().dynamic && !swapchain.IsFifo()) {
+        limit = u32(dyn.cur - 1);
+        bb_real_cap_fps = dyn.hold_fps;
+    } else {
+        // Fixed multipliers (dlss-x2..x4) as chosen (Supermedo's frame_gen_fit_display off),
+        // bb-fg-cap: with the real rate held at floor(cap / N) so real x N fits the display.
+        if (window_s >= 1.0) {
+            bb_limit_window = now;
+            bb_limit_frames = 0;
+        }
         limit = 3;
+        bb_real_cap_fps = BB::FG::FixedRealCapFps(int(max_gen) + 1, "dlssg");
     }
     bb_present_busy += (std::min(present_ms / interval, 1.2) - bb_present_busy) * 0.1;
     // bb: the "presenting does not keep up" pause measured the whole present call, which by design
@@ -959,6 +961,8 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
     if (now < bb_frame_gen_hold_until) {
         limit = 0;
     }
+    if (limit == 0) bb_real_cap_fps = 0;
+    BB::FG::NoteDlssMultiplier(limit > 0 ? int(std::min(limit, max_gen)) + 1 : 1);
     if (limit != before && BB::FG::Cfg().dynamic) {
         BB::Upscale::Checkpoint(fmt::format("Frame generation: {} generated per game frame "
                                             "(display {} Hz, game {:.0f} FPS)",
@@ -1890,6 +1894,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // frames (the generated ones belong to the time before this frame). A frame shown again has
     // none.
     u32 bb_generated = is_reusing_frame ? 0 : frame->generated_count;
+    if (!is_reusing_frame && is_game_frame) {
+        // bb-fg-cap: DLSS-G (NGX) generating: the game's frames at most bb_real_cap_fps a second
+        // (real x N within the display's cap, so every game frame gets its N-1 generated ones).
+        static BB::FG::RealLimiter limiter;
+        limiter.Wait(bb_generated > 0 ? double(bb_real_cap_fps.load(std::memory_order_relaxed))
+                                      : 0.0);
+    }
     const auto bb_start = std::chrono::steady_clock::now();
     if (!is_reusing_frame && is_game_frame) {
         const double ms =
