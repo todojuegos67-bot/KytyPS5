@@ -1193,33 +1193,59 @@ void RtReflect::ResetLightHistory(const char* why) {
     l_reset_why = why;
 }
 
-// The game's fog: CB slot 6 (FUN_02651f10 packs the FOG MANAGER's param).
+// The game's fog: CB slot 6 (FUN_02651f10 packs the FOG MANAGER's param; layout in
+// bb_upscale.h). v0.y = 1/p+0x20 is 0 exactly when the game's fog param has no distance
+// (p+0x20 <= 0): the game itself has no fog there, the volumetric light stays off.
 void RtReflect::GameFog() {
     float f[24];
     u64 age = 0;
-    if (!BB::Upscale::RtFogBlock(f, age) || age > 120 || !(f[1] > 0.0f)) {
+    const bool have = BB::Upscale::RtFogBlock(f, age) && age <= 120;
+    if (!have || density_env) {
         fog_height = 0.0f;
         for (float& t : fog_tint) t = 1.0f;
+    }
+    if (!have) {
         // No fog CB: no in-scattering unless the density is forced (BB_RT_VOLUMETRIC_DENSITY).
         fog_density = density_env ? vol_density : 0.0f;
-        fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY" : "no fog CB seen: no in-scattering";
+        fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY (no fog CB seen)"
+                              : "no fog CB seen (slot 6 not recognised in 120 frames)";
         return;
     }
-    // In-scattering only where the game's own fog has a density (fog CB slot 6 float 2 > 0).
-    fog_density = density_env ? vol_density : std::clamp(f[2], 0.0f, 1.0f);
+    // Density at the camera height: id * exp2(-camY * iH) (v0.z), recomputed in double since
+    // the game's float overflows to +inf (or NaN with id 0) for |camY * iH| > 128.
+    const double id = f[1], ih = f[3], cam_y = f[15];
+    const double e = std::clamp(-cam_y * ih, -1000.0, 1000.0);
+    const double dens = id > 0.0 ? id * std::exp2(e) : 0.0;
     fog_height = std::clamp(f[3], -10.0f, 10.0f);
     const float m = std::max({f[4], f[5], f[6]});
     for (int i = 0; i < 3; ++i) fog_tint[i] = m > 1e-6f ? f[4 + i] / m : 1.0f;
-    fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY + ghidra:fog CB slot 6 height/colour"
-                          : "ghidra:fog CB slot 6 (FUN_02651f10) floats 2,3,4-6";
+    if (density_env) {
+        fog_density = vol_density;
+        fog_src = "BB_RT_VOLUMETRIC_DENSITY + ghidra:fog CB slot 6 height/colour";
+    } else if (!(id > 0.0)) {
+        fog_density = 0.0f;
+        fog_src = "fog density 0 (game): fog CB slot 6 v0.y = 1/dist = 0";
+    } else {
+        fog_density = static_cast<float>(std::clamp(dens, 0.0, 1.0));
+        fog_src = fog_density > 0.0f
+                      ? "ghidra:fog CB slot 6 (FUN_02651f10) 1/dist*exp2(-camY/H), 1/H, colour"
+                      : "fog density 0 (game): exp2(-camY/H) underflows at this camera height";
+    }
     if (!logged_game_fog) {
         logged_game_fog = true;
         LOG_INFO(Render_Vulkan,
-                 "[rt-vol] game fog CB: v0 ({:.4f}, {:.5f}, {:.5f}, {:.5f}) v1 ({:.3f}, {:.3f}, "
-                 "{:.3f}, {:.3f}) v3 ({:.3f}, {:.3f}, {:.5f}, {:.3f}) v4 ({:.3f}, {:.3f}, {:.3f})",
+                 "[rt-vol] game fog CB: v0 ({:.4f}, {:.5f}, {:.5g}, {:.5f}) v1 ({:.3f}, {:.3f}, "
+                 "{:.3f}, {:.3f}) v3 ({:.3f}, {:.3f}, {:.5f}, {:.3f}) v4 ({:.3f}, {:.3f}, {:.3f}) "
+                 "-> density {:.5g} ({})",
                  f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[12], f[13], f[14], f[15], f[16],
-                 f[17], f[18]);
+                 f[17], f[18], fog_density, fog_src);
     }
+}
+
+void RtReflect::VolSkip(const char* why) {
+    if (!vol_on) return;
+    ++vol_skips;
+    vol_skip_why = why;
 }
 
 bool RtReflect::LightDir(const double* view, float out_view[3]) {
@@ -1319,7 +1345,11 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
                            const vk::DescriptorImageInfo& depth_info) {
     const u32 w = lw_, h = lh_;
     float lv[3];
-    if (!LightDir(view, lv)) return;
+    if (!LightDir(view, lv)) {
+        VolSkip("no validated game light");
+        LogVolumetric();
+        return;
+    }
     if (vol_w != w || vol_h != h || !vraw.image) {
         FreeImage(vraw);
         for (auto& i : vacc) FreeImage(i);
@@ -1472,28 +1502,44 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
 }
 
 void RtReflect::LogVolumetric() {
+    if (!vol_on) return;
     const auto now = std::chrono::steady_clock::now();
     if (vol_last_log != std::chrono::steady_clock::time_point{} &&
         now - vol_last_log < std::chrono::seconds(5)) {
         return;
     }
     vol_last_log = now;
-    u32 c[2];
-    std::memcpy(c, static_cast<const u32*>(counters.mapped) + 8, sizeof(c));
+    const u64 runs = vol_dispatches - vol_last_dispatches;
+    const u64 skips = vol_skips;
+    const char* why = vol_skip_why;
+    vol_skips = 0;
+    vol_skip_why = "none";
+    vol_last_dispatches = vol_dispatches;
+    if (runs == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[rt-vol] 5 s: 0 dispatches (volumetric skipped {} times, last reason: {}); "
+                 "fog density {:.5f}, height falloff {:.5f} from {}",
+                 skips, why, fog_density, fog_height, fog_src);
+        vol_ms_sum = 0.0;
+        vol_ms_n = 0;
+        return;
+    }
+    u32 c[2]{};
+    if (counters.mapped) {
+        std::memcpy(c, static_cast<const u32*>(counters.mapped) + 8, sizeof(c));
+    }
     const u32 samples = c[0] - vol_last_counts[0], lit = c[1] - vol_last_counts[1];
     vol_last_counts[0] = c[0];
     vol_last_counts[1] = c[1];
     LOG_INFO(Render_Vulkan,
-             "[rt-vol] 5 s: {} dispatches, {}x{} trace, {} light rays, {:.1f}% unshadowed, GPU "
-             "{:.3f} ms per pass, strength {:.2f}; light dir world ({:.3f}, {:.3f}, {:.3f}) from "
-             "{}; colour ({:.3f}, {:.3f}, {:.3f}) from {} x fog tint ({:.2f}, {:.2f}, {:.2f}); "
-             "density {:.5f}, height falloff {:.5f} from {}",
-             vol_dispatches - vol_last_dispatches, vol_w, vol_h, samples,
-             samples ? 100.0 * lit / samples : 0.0, vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0,
-             vol_strength, used_dir[0], used_dir[1], used_dir[2], light_src, used_color[0],
-             used_color[1], used_color[2], color_src, fog_tint[0], fog_tint[1], fog_tint[2],
-             fog_density, fog_height, fog_src);
-    vol_last_dispatches = vol_dispatches;
+             "[rt-vol] 5 s: {} dispatches (ran; skipped {}, last reason: {}), {}x{} trace, {} "
+             "light rays, {:.1f}% unshadowed, GPU {:.3f} ms per pass, strength {:.2f}; light dir "
+             "world ({:.3f}, {:.3f}, {:.3f}) from {}; colour ({:.3f}, {:.3f}, {:.3f}) from {} x "
+             "fog tint ({:.2f}, {:.2f}, {:.2f}); density {:.5f}, height falloff {:.5f} from {}",
+             runs, skips, why, vol_w, vol_h, samples, samples ? 100.0 * lit / samples : 0.0,
+             vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0, vol_strength, used_dir[0], used_dir[1],
+             used_dir[2], light_src, used_color[0], used_color[1], used_color[2], color_src,
+             fog_tint[0], fog_tint[1], fog_tint[2], fog_density, fog_height, fog_src);
     vol_ms_sum = 0.0;
     vol_ms_n = 0;
 }
@@ -1740,9 +1786,15 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
         GameFog();
     }
     const bool sh_run = sh_on && sh_ok && dbg_view != 2;
+    const bool vol_view = dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run);
     const bool vol_run =
-        vol_on && vol_ok && (dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run)) &&
-        (fog_density > 0.0f || dbg_view == 2 || dbg_view == 3);
+        vol_on && vol_ok && vol_view && (fog_density > 0.0f || dbg_view == 2 || dbg_view == 3);
+    if (vol_on && !vol_run) {
+        VolSkip(!vol_ok ? "volumetric images failed"
+                : !vol_view ? "BB_RT_DEBUG_VIEW shows another pass"
+                            : fog_src); // no fog CB / fog density 0 (game)
+        LogVolumetric();
+    }
     if (sh_run) {
         Shadows(cmd, in, proj, inv, vd, rp, prev_p, cam_prev_ok, depth_info, normal_info);
     }

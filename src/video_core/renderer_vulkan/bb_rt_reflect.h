@@ -78,6 +78,12 @@ public:
     };
     LightSkip LastSkip() const { return l_skip; }
     bool HistoryRestarted() const { return l_hist_restarted; }
+    // A scene render without the volumetric pass (reason), and the 5 s [rt-vol] line (printed
+    // whether or not it ran) when due. No-op without BB_RT_VOLUMETRIC=1.
+    void VolTick(const char* skip_why) {
+        if (skip_why) VolSkip(skip_why);
+        LogVolumetric();
+    }
     std::string LightSourceText() const;
 
     explicit RtReflect(const Vulkan::Instance& instance);
@@ -152,7 +158,8 @@ private:
     bool LightDir(const double* view, float out_view[3]);
     bool GameLight();
     void GameFog();
-    void LogVolumetric();
+    void LogVolumetric(); // the 5 s [rt-vol] line: ran, or 0 dispatches with the skip reason
+    void VolSkip(const char* why);
 
     const Vulkan::Instance& instance;
     bool tried = false, ok = false;
@@ -228,6 +235,8 @@ private:
     vk::QueryPool vol_queries{};
     std::array<bool, Ring> vol_query_used{};
     u64 vol_dispatches = 0, vol_last_dispatches = 0;
+    u64 vol_skips = 0;              // scene renders without a volumetric pass in this 5 s
+    const char* vol_skip_why = "none";
     double vol_ms_sum = 0.0;
     u32 vol_ms_n = 0;
     u32 vol_last_counts[2]{};

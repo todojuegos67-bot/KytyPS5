@@ -702,18 +702,100 @@ bool Finite(const float* f, int n) {
 }
 } // namespace
 
-void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
+namespace {
+// Light-set CB (Ghidra, eboot 1.09): FUN_02651f10 (per-material constant setup, called from
+// the object draw paths FUN_02650690 / FUN_02650f70 / FUN_02654a10 for pass types 0 and 4)
+// gets the material's CB slot 5 ((*ctx->vtbl[3])(ctx, 5), vtable 0x57b7880 -> FUN_0264dd30:
+// *(G->+0x6070)->+0x248 + slot * 8, i.e. ONE global CB object per slot shared by every draw) and
+// FUN_026deeb0 / FUN_026dfe80 pack the LIGHT SET into it: a 288-byte block uploaded with
+// FUN_02568a20(gfx, gfx + 0xb730, cb, 0, 0, data), stored in the context's CB table
+// (+0x990 = slot 5 of the table at +0x968, dirty range 5..6, dirty bit 0x200000 at +0x1978).
+// Layout: floats 0-15 = 4 directions (light 0 = set+0x40 raw world; 1-3 world or, when the
+// light's flag is set, transformed by the matrix at owner+0x3f8), 16-31 diffuse rgb^2*a,
+// 32-47 specular rgb^2*a, 48-59 ambient terms, 60-63 set+0x230 rgb^2*a, u32 65 = flag
+// (set+0x24e, 0 or 1), 68-71 = set+0x90/+0xf0/+0x150/+0x1b0.
+// It is consumed by the forward-lit object draws, NOT by the composite (PS 0x3fe9e964, its
+// 208 B buffer) or the SSR draw (PS 0x6c2323c2, its 320 B buffer): those two are rejected.
+bool IsLightSetCb(const u32* data, size_t bytes, u64 hash) {
     const float* f = reinterpret_cast<const float*>(data);
-    const bool light_hash = hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2;
-    // Diagnostic: the read-only buffers the lighting draws bind, once per (hash, size).
-    if ((light_hash && bytes >= 64) || (bytes >= 288 && bytes <= 320)) {
+    const bool rejected = hash == 0x3fe9e964 || hash == 0x6c2323c2 || hash == 0x8747a367;
+    if (rejected || bytes < 288 || bytes > 320 || !Finite(f, 72)) return false;
+    const auto len = [&](int i) {
+        return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
+    };
+    bool ok = data[65] <= 1u;                        // bool flag
+    ok = ok && std::abs(len(0) - 1.0f) < 0.02f;      // light 0: unit world direction
+    for (int i = 1; i < 4 && ok; ++i) {
+        const float l = len(4 * i);
+        ok = l < 1e-4f || std::abs(l - 1.0f) < 0.05f; // unused (0) or unit
+    }
+    for (int i = 16; i < 48 && ok; ++i) {
+        ok = f[i] >= 0.0f && f[i] < 1e4f; // squared colours x intensity
+    }
+    for (int i = 60; i < 63 && ok; ++i) {
+        ok = f[i] >= 0.0f && f[i] < 1e4f;
+    }
+    return ok && f[16] + f[17] + f[18] > 1e-5f; // light 0 lit
+}
+// Fog CB (Ghidra, eboot 1.09, FUN_02651f10 right after the light set: CB slot 6, the same
+// FUN_02568a20 upload, dirty bit 0x400000, context +0x998). Fog param p (FUN_026d9ea0 lookup in
+// the FOG MANAGER table G+0x5888, lerped between two params by ctx+0x340 when they differ),
+// camera c = owner+0x3f8 (c+0x34 = camera y):
+//   s  = p+0x28 (byte) ? 1 : -1,   iH = 1 / (s * max(p+0x24, 0.1))  -> |iH| <= 10, never 0
+//   id = p+0x20 > 0 ? 1 / p+0x20 : 0
+//   v0 = (p+0x1c * p+0x2c, id, id * exp2(-c.y * iH), iH)       (FUN_02fbf198 = exp2f)
+//   v1 = (p+0x10 rgb^2, p+0x30)
+//   v2 = (v0.x, p+0x54, id, iH)
+//   v3 = (p+0x4c * p+0x2c, G+0x5b94 + p+0x58, iH * (p+0x50 > 0 ? 1 / p+0x50 : 0), c.y)
+//   v4 = (p+0x40 rgb^2, p+0x30)
+//   v5.x = int 1. 84 bytes of data (stack 0x118..0xc4); the copy length is the CB object's size
+//   (cb+0x2c), not decoded statically, so the V# may be larger (the tail is not the fog).
+// v2.x / v2.z / v2.w / v4.w are register copies of v0.x / v0.y / v0.w / v1.w: bit-identical.
+// v0.z overflows to +inf (or 0 * inf = NaN when id is 0) once |c.y * iH| > 128, so it is never
+// required to be finite (the old Finite(20) test rejected the CB for every such camera height).
+const char* FogCbReject(const u32* data, size_t bytes) {
+    const float* f = reinterpret_cast<const float*>(data);
+    if (bytes < 84) return "smaller than 84 B";
+    if (data[8] != data[0]) return "v2.x != v0.x";
+    if (data[10] != data[1]) return "v2.z != v0.y";
+    if (data[11] != data[3]) return "v2.w != v0.w";
+    if (data[19] != data[7]) return "v4.w != v1.w";
+    if (!(std::abs(f[3]) <= 10.001f) || f[3] == 0.0f) return "v0.w not 1/H (|.| in (0, 10])";
+    if (!(f[1] >= 0.0f) || !std::isfinite(f[1])) return "v0.y (1/dist) not finite >= 0";
+    for (int i : {4, 5, 6, 16, 17, 18}) {
+        if (!(f[i] >= 0.0f) || !std::isfinite(f[i])) return "fog colour (squared) not >= 0";
+    }
+    for (int i : {0, 7, 9, 12, 13, 14, 15}) {
+        if (!std::isfinite(f[i])) return "v0.x / v1.w / v2.y / v3 not finite";
+    }
+    return nullptr;
+}
+struct FogSource {
+    u64 hash = 0;
+    size_t bytes = 0;
+    u32 stage = 0, index = 0;
+    bool light_draw = false;
+    bool operator==(const FogSource&) const = default;
+};
+FogSource g_fog_src{};
+} // namespace
+
+void OnDrawConstants(const DrawCb* cbs, size_t n) {
+    // Diagnostic (kept from bb-rt-vol): the read-only buffers the lighting draws bind.
+    for (size_t i = 0; i < n; ++i) {
+        const u64 hash = cbs[i].hash;
+        const size_t bytes = cbs[i].bytes;
+        const bool light_hash = hash == 0x3fe9e964 || hash == 0x8747a367 || hash == 0x6c2323c2;
+        if (!((light_hash && bytes >= 64) || (bytes >= 288 && bytes <= 320))) continue;
+        const u32* data = cbs[i].data;
+        const float* f = reinterpret_cast<const float*>(data);
         static std::vector<std::pair<u64, size_t>> seen;
         std::scoped_lock lk{g_cam_mutex};
         if (seen.size() < 32 &&
             std::ranges::find(seen, std::pair{hash, bytes}) == seen.end()) {
             seen.emplace_back(hash, bytes);
-            const auto len = [&](int i) {
-                return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
+            const auto len = [&](int k) {
+                return std::sqrt(f[k] * f[k] + f[k + 1] * f[k + 1] + f[k + 2] * f[k + 2]);
             };
             LOG_INFO(Render_Vulkan,
                      "[rt-light] CB candidate: shader {:#x} {} B: f0-7 ({:.3f} {:.3f} {:.3f} "
@@ -723,63 +805,88 @@ void OnLightingConstants(const u32* data, size_t bytes, u64 hash) {
                      len(8), len(12), f[16], f[17], f[18], f[19], data[20]);
         }
     }
-    // Fog CB (FUN_02651f10): v2.x == v0.x, v2.z == v0.y (1/dist), v2.w == v0.w (1/H),
-    // colours (squares) >= 0.
-    if (bytes >= 84 && bytes <= 512 && Finite(f, 20) && f[10] == f[1] && f[11] == f[3] &&
-        f[8] == f[0] && f[1] >= 0.0f && f[4] >= 0.0f && f[5] >= 0.0f && f[6] >= 0.0f &&
-        f[16] >= 0.0f && f[17] >= 0.0f && f[18] >= 0.0f && (f[1] > 0.0f || f[3] != 0.0f)) {
-        std::scoped_lock lk{g_cam_mutex};
-        std::memcpy(g_rt_lighting.fog, f, 21 * sizeof(float));
-        g_rt_lighting.fog_frame = g_rt_frame;
-        g_rt_lighting.fog_valid = true;
-        return;
+    int light_i = -1;
+    for (size_t i = 0; i < n && light_i < 0; ++i) {
+        if (IsLightSetCb(cbs[i].data, cbs[i].bytes, cbs[i].hash)) light_i = int(i);
     }
-    // Light-set CB (Ghidra, eboot 1.09): FUN_02651f10 (per-material constant setup, called from
-    // the object draw paths FUN_02650690 / FUN_02650f70 / FUN_02654a10 for pass types 0 and 4)
-    // gets the material's CB slot 5 ((*ctx->vtbl[3])(ctx, 5)) and FUN_026deeb0 / FUN_026dfe80
-    // pack the LIGHT SET into it: a 288-byte block (stack 0x158..0x38) uploaded with
-    // FUN_02568a20(gfx, gfx + 0xb730, cb, 0, 0, data), stored in the context's CB table
-    // (+0x990 = slot 5 of the table at +0x968, dirty range 5..6, dirty bit 0x200000 at +0x1978).
-    // Layout: floats 0-15 = 4 directions (light 0 = set+0x40 raw world; 1-3 world or, when the
-    // light's flag is set, transformed by the matrix at owner+0x3f8), 16-31 diffuse rgb^2*a,
-    // 32-47 specular rgb^2*a, 48-59 ambient terms, 60-63 set+0x230 rgb^2*a, u32 65 = flag
-    // (set+0x24e, 0 or 1), 68-71 = set+0x90/+0xf0/+0x150/+0x1b0.
-    // It is consumed by the forward-lit object draws, NOT by the composite (PS 0x3fe9e964, its
-    // 208 B buffer) or the SSR draw (PS 0x6c2323c2, its 320 B buffer): those two are rejected.
-    const bool rejected = hash == 0x3fe9e964 || hash == 0x6c2323c2 || hash == 0x8747a367;
-    if (!rejected && bytes >= 288 && bytes <= 320 && Finite(f, 72)) {
-        const auto len = [&](int i) {
-            return std::sqrt(f[i] * f[i] + f[i + 1] * f[i + 1] + f[i + 2] * f[i + 2]);
-        };
-        bool ok = data[65] <= 1u;                        // bool flag
-        ok = ok && std::abs(len(0) - 1.0f) < 0.02f;      // light 0: unit world direction
-        for (int i = 1; i < 4 && ok; ++i) {
-            const float l = len(4 * i);
-            ok = l < 1e-4f || std::abs(l - 1.0f) < 0.05f; // unused (0) or unit
+    // Fog: the first buffer of the draw with the FUN_02651f10 layout; in a light-set draw the
+    // buffers after the light set (slot 6 follows slot 5) are tried first.
+    int fog_i = -1;
+    if (light_i >= 0) {
+        for (size_t i = light_i + 1; i < n && fog_i < 0; ++i) {
+            if (!FogCbReject(cbs[i].data, cbs[i].bytes)) fog_i = int(i);
         }
-        for (int i = 16; i < 48 && ok; ++i) {
-            ok = f[i] >= 0.0f && f[i] < 1e4f; // squared colours x intensity
-        }
-        for (int i = 60; i < 63 && ok; ++i) {
-            ok = f[i] >= 0.0f && f[i] < 1e4f;
-        }
-        ok = ok && f[16] + f[17] + f[18] > 1e-5f; // light 0 lit
-        if (!ok) {
-            return;
-        }
-        std::scoped_lock lk{g_cam_mutex};
-        if (g_rt_lighting.light_hash != hash || g_rt_lighting.light_bytes != bytes) {
+    }
+    for (size_t i = 0; i < n && fog_i < 0; ++i) {
+        if (int(i) != light_i && !FogCbReject(cbs[i].data, cbs[i].bytes)) fog_i = int(i);
+    }
+    if (light_i < 0 && fog_i < 0) return;
+    std::scoped_lock lk{g_cam_mutex};
+    if (light_i >= 0) {
+        const DrawCb& c = cbs[light_i];
+        const float* f = reinterpret_cast<const float*>(c.data);
+        if (g_rt_lighting.light_hash != c.hash || g_rt_lighting.light_bytes != c.bytes) {
             LOG_INFO(Render_Vulkan,
                      "[rt-light] light-set CB source: shader {:#x}, {} B V# (strict layout "
                      "check passed): dir0 ({:.3f} {:.3f} {:.3f}) diffuse0 ({:.3f} {:.3f} {:.3f}) "
                      "flag {}",
-                     hash, bytes, f[0], f[1], f[2], f[16], f[17], f[18], data[65]);
+                     c.hash, c.bytes, f[0], f[1], f[2], f[16], f[17], f[18], c.data[65]);
         }
         std::memcpy(g_rt_lighting.light, f, 72 * sizeof(float));
         g_rt_lighting.light_frame = g_rt_frame;
         g_rt_lighting.light_valid = true;
-        g_rt_lighting.light_hash = hash;
-        g_rt_lighting.light_bytes = bytes;
+        g_rt_lighting.light_hash = c.hash;
+        g_rt_lighting.light_bytes = c.bytes;
+        // Every other read-only buffer of the draws that carry the light set, once per
+        // (shader, size): the fog CB (slot 6) should be among them.
+        static std::vector<std::pair<u64, size_t>> seen;
+        for (size_t i = 0; i < n; ++i) {
+            if (int(i) == light_i) continue;
+            const DrawCb& o = cbs[i];
+            if (seen.size() >= 64 ||
+                std::ranges::find(seen, std::pair{o.hash, o.bytes}) != seen.end()) {
+                continue;
+            }
+            seen.emplace_back(o.hash, o.bytes);
+            const float* g = reinterpret_cast<const float*>(o.data);
+            const size_t nf = std::min<size_t>(24, o.bytes / 4);
+            std::string vals;
+            for (size_t k = 0; k < nf; ++k) {
+                vals += fmt::format("{}{:.5g}", k == 0 ? "" : (k % 4 == 0 ? " | " : " "), g[k]);
+            }
+            const char* why = FogCbReject(o.data, o.bytes);
+            LOG_INFO(Render_Vulkan,
+                     "[rt-vol] light-set draw CB: {} shader {:#x} buffer {} ({} B), light set = "
+                     "{} shader {:#x} buffer {} ({} B) of {} buffers; fog layout: {}; f0-{}: {}",
+                     o.stage == 0 ? "VS" : "PS", o.hash, o.index, o.bytes,
+                     c.stage == 0 ? "VS" : "PS", c.hash, c.index, c.bytes, n,
+                     why ? why : "MATCH", nf ? nf - 1 : 0, vals);
+        }
+    }
+    if (fog_i >= 0) {
+        const DrawCb& c = cbs[fog_i];
+        const FogSource src{c.hash, c.bytes, c.stage, c.index, light_i >= 0};
+        // A light-set draw's fog CB is preferred: another draw's match only fills in when none
+        // was seen for a few frames.
+        if (src.light_draw || !g_fog_src.light_draw || g_rt_frame - g_rt_lighting.fog_frame > 4) {
+            static std::vector<FogSource> logged; // once per source, first 16
+            if (logged.size() < 16 && std::ranges::find(logged, src) == logged.end()) {
+                logged.push_back(src);
+                const float* f = reinterpret_cast<const float*>(c.data);
+                LOG_INFO(Render_Vulkan,
+                         "[rt-vol] fog CB source (FUN_02651f10 layout): {} shader {:#x} buffer "
+                         "{} ({} B V#){}: v0 ({:.5g} {:.5g} {:.5g} {:.5g}) v1 ({:.4g} {:.4g} "
+                         "{:.4g} {:.4g}) v3 ({:.4g} {:.4g} {:.5g} {:.4g}) v5.x {:#x}",
+                         c.stage == 0 ? "VS" : "PS", c.hash, c.index, c.bytes,
+                         src.light_draw ? ", in a light-set draw" : ", NOT in a light-set draw",
+                         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[12], f[13], f[14],
+                         f[15], c.data[20]);
+            }
+            g_fog_src = src;
+            std::memcpy(g_rt_lighting.fog, c.data, 21 * sizeof(float));
+            g_rt_lighting.fog_frame = g_rt_frame;
+            g_rt_lighting.fog_valid = true;
+        }
     }
 }
 void RtLightSource(u64& hash, size_t& bytes) {

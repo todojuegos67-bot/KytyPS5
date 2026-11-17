@@ -91,8 +91,9 @@ void main() {
         for (int i = 0; i < steps; ++i) {
             float t = (float(i) + j) * dt;
             vec3 S = V * t;
-            // Height fog (game fog CB): density at the camera height * exp(-dy / H).
-            float ds = dens * exp(clamp(-vy * t * p.fog.w, -20.0, 20.0));
+            // Height fog (game fog CB, Ghidra FUN_02651f10: exp2f): density at the camera
+            // height * exp2(-dy * iH), iH = +-1/H as the game packs it (v0.w).
+            float ds = dens * exp2(clamp(-vy * t * p.fog.w, -28.0, 28.0));
             od += ds * dt;
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, tlas,

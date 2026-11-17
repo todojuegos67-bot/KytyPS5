@@ -361,6 +361,8 @@ bool BbRtShadowRequested() { // BB_RT_SHADOWS=1 (independent of the others)
 bool BbRtLightRequested() {
     return BbRtVolRequested() || BbRtShadowRequested();
 }
+// bb-rt-vol: the read-only buffers of the draw being bound (light set / fog search).
+thread_local std::vector<BB::Upscale::DrawCb> bb_draw_cbs;
 bool BbRtAnyRequested() {
     return BbRtReflectRequested() || BbRtLightRequested();
 }
@@ -901,6 +903,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     }
     if (!scene) {
         ++n_noscene;
+        bb_rt_reflect->VolTick("lighting not run: no scene image");
         status();
         return;
     }
@@ -909,6 +912,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     }
     if (!depth && !zcopy) {
         ++n_nodepth;
+        bb_rt_reflect->VolTick("lighting not run: no depth");
         status();
         return;
     }
@@ -967,7 +971,13 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         ++(use_copy ? n_r32f : n_d32);
         n_hist_reset += bb_rt_reflect->HistoryRestarted() ? 1 : 0;
     } else {
-        ++n_skip[size_t(bb_rt_reflect->LastSkip())];
+        const auto skip = bb_rt_reflect->LastSkip();
+        ++n_skip[size_t(skip)];
+        static constexpr std::array<const char*, size_t(Skip::Count)> why{
+            "lighting not run", "lighting not run: no camera (scene block)",
+            "lighting not run: bad projection", "lighting not run: R32F depth encoding unknown",
+            "lighting not run: no validated game light", "lighting not run: allocation"};
+        bb_rt_reflect->VolTick(why[size_t(skip)]);
     }
     status();
 }
@@ -1293,6 +1303,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->regs);
+    bb_draw_cbs.clear();
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1302,6 +1313,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
+    }
+    if (!bb_draw_cbs.empty()) {
+        BB::Upscale::OnDrawConstants(bb_draw_cbs.data(), bb_draw_cbs.size());
+        bb_draw_cbs.clear();
     }
 
     if (uses_dma) {
@@ -1700,16 +1715,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));
                 }
-                // bb-rt-vol: the game's light-set (material CB slot 5, 288 B) and fog (slot 6)
-                // constant buffers, layouts from Ghidra (FUN_026deeb0, FUN_02651f10); bound to
-                // the forward-lit object draws (any VS / PS), see OnLightingConstants.
+                // bb-rt-vol: the game's light-set (material CB slot 5, 288 B) and fog (slot 6,
+                // 84 B of data) constant buffers, layouts from Ghidra (FUN_026deeb0,
+                // FUN_02651f10); bound to the forward-lit object draws (any VS / PS). Collected
+                // for the whole draw, see OnDrawConstants (after the stage loop).
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
-                    !desc.is_written && size >= 84 && size <= 320 && BbRtLightRequested() &&
+                    !desc.is_written && size >= 64 && size <= 1024 && BbRtLightRequested() &&
+                    bb_draw_cbs.size() < 32 &&
                     memory->IsValidMapping(vsharp.base_address, size)) {
-                    BB::Upscale::OnLightingConstants(
-                        reinterpret_cast<const u32*>(vsharp.base_address),
-                        static_cast<size_t>(size), stage.pgm_hash);
+                    bb_draw_cbs.push_back(BB::Upscale::DrawCb{
+                        .data = reinterpret_cast<const u32*>(vsharp.base_address),
+                        .bytes = static_cast<size_t>(size),
+                        .hash = stage.pgm_hash,
+                        .stage = stage.sw_stage == Shader::SwStage::Vertex ? 0u : 1u,
+                        .index = static_cast<u32>(&desc - stage.buffers.data()),
+                    });
                 }
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",

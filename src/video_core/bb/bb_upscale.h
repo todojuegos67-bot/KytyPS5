@@ -67,11 +67,20 @@ bool RtSceneBlock(float out[216]);
 //  MANAGER's light set): floats 0-15 four directional-light directions (world space, xyz; w =
 //  set+0x80/+0xe0/+0x140/+0x1a0), 16-31 their diffuse colours (rgb^2 * intensity), 32-47 their
 //  specular colours, 48-63 hemisphere ambient, 64-67 (set+0x90, +0xf0, +0x150, +0x1b0).
-//  Fog CB (>= 84 bytes, CB slot 6, written by FUN_02651f10 from the FOG MANAGER's fog param):
-//  v0 (a*k, 1/dist, 1/dist*exp(-camY/H), 1/H), v1 (fog rgb^2, p30), v2 (a*k, p54, 1/dist, 1/H),
-//  v3 (a2*k, base height, 1/(H*p50), camY), v4 (colour2 rgb^2, p30), v5.x = 1 (int).
-// Fed by the rasterizer with the read-only buffers of a draw (hash: the shader's pgm hash).
-void OnLightingConstants(const u32* data, size_t bytes, u64 hash);
+//  Fog CB (84 bytes of data, CB slot 6, written by FUN_02651f10 from the FOG MANAGER's fog
+//  param; iH = +-1/max(H, 0.1), sign from p+0x28): v0 (a*k, 1/dist, 1/dist*exp2(-camY*iH), iH),
+//  v1 (fog rgb^2, p30), v2 (a*k, p54, 1/dist, iH), v3 (a2*k, base height, iH/p50, camY),
+//  v4 (colour2 rgb^2, p30), v5.x = 1 (int). v0.z may be +inf / NaN (exp2 overflow).
+// One read-only buffer a draw binds (VS / PS), as handed over by the rasterizer.
+struct DrawCb {
+    const u32* data;
+    size_t bytes;
+    u64 hash;   // pgm hash of the stage that binds it
+    u32 stage;  // 0 VS, 1 PS
+    u32 index;  // buffer index within that stage
+};
+// All read-only buffers of one draw (after every stage was bound): light set and fog captured.
+void OnDrawConstants(const DrawCb* cbs, size_t n);
 bool RtLightBlock(float out[72], u64& age_frames);
 void RtLightSource(u64& hash, size_t& bytes); // shader hash / buffer size of the last light CB
 bool RtFogBlock(float out[24], u64& age_frames);
