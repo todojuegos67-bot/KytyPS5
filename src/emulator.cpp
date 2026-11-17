@@ -678,22 +678,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string window_title = "";
     std::string remote_url(Common::g_scm_remote_url);
     std::string remote_host = Common::GetRemoteNameFromLink();
-    if (Common::g_is_release) {
-        if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
-        } else {
-            window_title =
-                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
-        }
-    } else {
-        if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
-        } else {
-            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
-        }
-    }
+    // Bloodborne port: the window is the game, not the emulator.
+    (void)remote_url;
+    (void)remote_host;
+    (void)game_title;
+    window_title = "Bloodborne";
     BB::Upscale::PreInstance(); // bb-clean-021: Streamline before the window
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,

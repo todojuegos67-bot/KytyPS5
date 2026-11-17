@@ -10,7 +10,7 @@
 LANGUAGE LANG_NEUTRAL, 0x8
 
 // ICON
-IDI_ICON1 ICON "shadps4.ico"
+IDI_ICON1 ICON "bloodborne.ico"
 
 // VERSION
 VS_VERSION_INFO VERSIONINFO
@@ -27,12 +27,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "\0"
-            VALUE "FileDescription", "shadPS4 - PlayStation 4 Emulator\0"
+            VALUE "FileDescription", "Bloodborne\0"
             VALUE "FileVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
             VALUE "InternalName", "shadPS4\0"
             VALUE "LegalCopyright", "Copyright 2025 shadPS4 Team\0"
-            VALUE "OriginalFilename", "shadPS4.exe\0"
-            VALUE "ProductName", "shadPS4\0"
+            VALUE "OriginalFilename", "Bloodborne.exe\0"
+            VALUE "ProductName", "Bloodborne\0"
             VALUE "ProductVersion", xstr(EMULATOR_VERSION_MAJOR) "." xstr(EMULATOR_VERSION_MINOR) "." xstr(EMULATOR_VERSION_PATCH) ".0\0"
         END
     END
