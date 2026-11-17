@@ -158,8 +158,9 @@ uint32_t BeforePresent(uint32_t frame);
 void AfterPresent(uint32_t frame, bool presented);
 bool PresentAllowed();
 // Exit: DLSS-G off, Reflex off, wait for an in-flight present (bounded), slShutdown. Any thread,
-// once; bounded waits only.
-void Shutdown();
+// once; bounded waits only. swapchain_idle false (a present could still be running, or the GPU
+// did not go idle): no slShutdown at all, the process is terminated without it.
+void Shutdown(bool swapchain_idle = true);
 // bb-sl-metrics: the last second's numbers (from AfterPresent's once-a-second slDLSSGGetState and
 // [dlssg-sl] counters), for the F8 "Metricas" panel and the [bbport] line. Read only: calling it
 // changes nothing in Streamline's path. False until Ready() and the first second has passed.

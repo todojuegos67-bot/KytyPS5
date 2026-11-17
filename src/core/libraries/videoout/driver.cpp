@@ -345,7 +345,34 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
     request_cv.notify_one();
 }
 
+bool VideoOutDriver::StopPresentThread(std::chrono::milliseconds timeout) {
+    if (!present_thread.joinable()) {
+        return true;
+    }
+    present_thread.request_stop();
+    {
+        std::scoped_lock lock{mutex};
+        request_cv.notify_all();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!present_thread_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!present_thread_done.load(std::memory_order_acquire)) {
+        return false; // still inside a flip: the exit gate keeps it off the swapchain
+    }
+    present_thread.join();
+    return true;
+}
+
 void VideoOutDriver::PresentThread(std::stop_token token) {
+    struct Done {
+        std::atomic<bool>& flag;
+        ~Done() {
+            flag.store(true, std::memory_order_release);
+        }
+    } done{present_thread_done};
     // bb-cap40: BB_FPS_CAP between 35 and 59 (Soulsborne ligero: 40 with the 60 FPS++ patch,
     // which flips on every vblank and times the physics by the real frame time) runs the vblank
     // at that rate, so the game makes that many frames. 30 / 60 / unlocked keep the setting.

@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -141,6 +142,14 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
 
     const bool report_unhandled =
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
+    if (Core::Emulator::IsExiting()) {
+        // bb-exit-present: a fault while the process is exiting (a driver / Streamline thread
+        // racing the teardown) is not a game crash: log it and end the process quietly.
+        LOG_WARNING(Debug, "Exception {:#x} at {} during exit: ending the process", code,
+                    address);
+        Common::Log::Flush();
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();

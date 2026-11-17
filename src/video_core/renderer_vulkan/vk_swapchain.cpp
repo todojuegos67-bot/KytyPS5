@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
+#include <thread>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -16,6 +18,53 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+namespace ExitGate {
+namespace {
+std::atomic<bool> g_stop{false};
+std::atomic<int> g_users{0};
+std::atomic<VkDevice> g_device{VK_NULL_HANDLE};
+} // namespace
+
+bool Enter() {
+    g_users.fetch_add(1, std::memory_order_acq_rel);
+    if (g_stop.load(std::memory_order_acquire)) {
+        g_users.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    return true;
+}
+
+void Leave() {
+    g_users.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool Stopped() {
+    return g_stop.load(std::memory_order_acquire);
+}
+
+bool Stop(std::chrono::milliseconds timeout) {
+    g_stop.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (g_users.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const bool idle = g_users.load(std::memory_order_acquire) == 0;
+    if (!idle) {
+        LOG_WARNING(Render_Vulkan, "Exit: a present is still in flight after {} ms",
+                    timeout.count());
+        return false;
+    }
+    if (const VkDevice dev = g_device.load(std::memory_order_acquire); dev != VK_NULL_HANDLE) {
+        const vk::Result r = vk::Device{dev}.waitIdle();
+        LOG_INFO(Render_Vulkan, "Exit: presenting stopped, vkDeviceWaitIdle returned {}",
+                 vk::to_string(r));
+        return r == vk::Result::eSuccess;
+    }
+    return true;
+}
+} // namespace ExitGate
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -41,6 +90,8 @@ Swapchain::~Swapchain() {
 }
 
 void Swapchain::Create(u32 width_, u32 height_) {
+    ExitGate::g_device.store(static_cast<VkDevice>(instance.GetDevice()),
+                             std::memory_order_release);
     width = width_;
     height = height_;
     needs_recreation = false;
@@ -135,6 +186,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
+    const ExitGate::Scope gate;
+    if (!gate.ok) return; // bb-exit-present: exiting, leave the swapchain alone
     LOG_DEBUG(Render_Vulkan, "Recreate the swapchain: width={} height={} HDR={}", width_, height_,
               needs_hdr);
     Create(width_, height_);
@@ -179,6 +232,8 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    const ExitGate::Scope gate;
+    if (!gate.ok) return false; // bb-exit-present
     if (!swapchain) {
         needs_recreation = true;
         return false;
@@ -214,6 +269,8 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present(u64 present_id) {
+    const ExitGate::Scope gate;
+    if (!gate.ok) return true; // bb-exit-present: exiting, nothing more is presented
     if (!swapchain) {
         needs_recreation = true;
         return false;

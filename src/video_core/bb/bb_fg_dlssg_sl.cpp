@@ -548,7 +548,7 @@ bool PresentAllowed() {
     return !g_shutting_down.load(std::memory_order_acquire);
 }
 
-void Shutdown() {
+void Shutdown(bool swapchain_idle) {
     if (!g_hooked || g_shutting_down.exchange(true, std::memory_order_acq_rel)) return;
     BBLogf("[dlssg-sl] shutdown: DLSS-G off, Reflex off, slShutdown");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
@@ -556,7 +556,13 @@ void Shutdown() {
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    const bool idle = g_in_present.load(std::memory_order_acquire) == 0;
+    const bool idle = swapchain_idle && g_in_present.load(std::memory_order_acquire) == 0;
+    if (!idle) {
+        // bb-exit-present: something may still touch the swapchain: no Streamline call at all.
+        g_ready.store(false, std::memory_order_release);
+        BBLogf("[dlssg-sl] shutdown: swapchain not idle: skipping Streamline shutdown");
+        return;
+    }
     if (g_ready && g.dlssg_set_options != nullptr) {
         std::scoped_lock lock{g_options_mutex};
         sl::DLSSGOptions o{};
@@ -677,7 +683,7 @@ void AfterPresent(uint32_t, bool) {}
 bool PresentAllowed() {
     return true;
 }
-void Shutdown() {}
+void Shutdown(bool) {}
 bool Stats(SecondStats&) {
     return false;
 }

@@ -472,6 +472,10 @@ s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom
     return ORBIS_OK;
 }
 
+bool StopPresentThread(std::chrono::milliseconds timeout) {
+    return driver ? driver->StopPresentThread(timeout) : true;
+}
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     driver = std::make_unique<VideoOutDriver>(EmulatorSettings.GetInternalScreenWidth(),
                                               EmulatorSettings.GetInternalScreenHeight());

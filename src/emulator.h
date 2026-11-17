@@ -34,6 +34,9 @@ public:
     void UpdatePlayTime(const std::string_view serial);
     void Shutdown();
     static void StartExitWatchdog();
+    // bb-exit-present: true once the exit path started (the crash handler then ends the
+    // process quietly instead of reporting a crash).
+    static bool IsExiting();
 
     /**
      * This will kill the current process and launch a new process with the same configuration

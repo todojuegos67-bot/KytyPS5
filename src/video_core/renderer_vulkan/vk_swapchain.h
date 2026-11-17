@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include "common/types.h"
@@ -13,6 +14,23 @@ class WindowSDL;
 }
 
 namespace Vulkan {
+
+// bb-exit-present: exit gate around every swapchain / Streamline call (acquire, present,
+// recreate). Stop() closes it, waits (bounded) for the threads inside to leave, then
+// vkDeviceWaitIdle. Returns true when nothing can touch the swapchain any more and the GPU is
+// idle: only then may Streamline be shut down.
+namespace ExitGate {
+bool Enter();  // false: stopping, do not touch the swapchain (no Leave then)
+void Leave();
+bool Stopped();
+bool Stop(std::chrono::milliseconds timeout);
+struct Scope {
+    bool ok = Enter();
+    ~Scope() {
+        if (ok) Leave();
+    }
+};
+} // namespace ExitGate
 
 class Instance;
 class Scheduler;

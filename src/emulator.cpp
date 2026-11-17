@@ -49,6 +49,8 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/bb/bb_fg.h"
+#include "core/libraries/videoout/video_out.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
@@ -87,7 +89,17 @@ Emulator::Emulator() {
 #endif
     std::at_quick_exit([]() {
         StartExitWatchdog();
-        BB::FG::DlssSl::Shutdown();
+        // bb-exit-present: Alt+F4 / window close (SDL_EVENT_QUIT ends Run's loop), in-game quit
+        // and every other quick_exit come here. Order: stop the VideoOut present thread (no new
+        // guest flips), close the swapchain exit gate and wait for the present in flight (every
+        // acquire / present / recreate checks it), vkDeviceWaitIdle, and only then DLSS-G off,
+        // Reflex off, slShutdown. If any of that does not finish, Streamline is not touched.
+        const bool joined = Libraries::VideoOut::StopPresentThread(std::chrono::milliseconds(1000));
+        const bool idle = Vulkan::ExitGate::Stop(std::chrono::milliseconds(1500));
+        LOG_INFO(Common, "Exit: present thread {}, swapchain {}", joined ? "joined" : "not joined",
+                 idle ? "idle (GPU idle)" : "NOT idle: no Streamline shutdown");
+        Common::Log::Flush();
+        BB::FG::DlssSl::Shutdown(idle);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
         Common::Log::Flush();
 #ifdef _WIN32
@@ -98,8 +110,17 @@ Emulator::Emulator() {
     });
 }
 
+namespace {
+std::atomic<bool> g_exiting{false};
+}
+
+bool Emulator::IsExiting() {
+    return g_exiting.load(std::memory_order_acquire);
+}
+
 void Emulator::StartExitWatchdog() {
     static std::atomic_flag started{};
+    g_exiting.store(true, std::memory_order_release);
     if (started.test_and_set()) {
         return;
     }

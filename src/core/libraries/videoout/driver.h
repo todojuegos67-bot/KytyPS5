@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
@@ -77,6 +80,9 @@ struct ServiceThreadParams {
 
 class VideoOutDriver {
 public:
+    // bb-exit-present: stop the present thread and join it (bounded). True: joined.
+    bool StopPresentThread(std::chrono::milliseconds timeout);
+
     VideoOutDriver(u32 width, u32 height);
     ~VideoOutDriver();
 
@@ -119,6 +125,7 @@ private:
     std::mutex mutex;
     VideoOutPort main_port{};
     std::queue<Request> requests;
+    std::atomic<bool> present_thread_done{false};
     std::condition_variable request_cv; // bb-vardt: wakes the immediate present loop
     // Last member: destroyed (stop + join) first, before the mutex / queue / cv it waits on.
     std::jthread present_thread;

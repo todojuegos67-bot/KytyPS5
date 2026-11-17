@@ -970,6 +970,8 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
 // Supermedo's PresentImage for a generated frame: acquire, blit into the swapchain image (the
 // frame's place in the window), submit after the frame's own work, present.
 bool Presenter::BbPresentGenerated(Frame* frame, u32 index, bool first) {
+    const ExitGate::Scope exit_gate;
+    if (!exit_gate.ok) return false; // bb-exit-present
     if (!swapchain.AcquireNextImage()) {
         return false;
     }
@@ -1851,6 +1853,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             free_cv.notify_one();
         }
     };
+
+    // bb-exit-present: held for the whole present (acquire, generated frames, Streamline,
+    // present) so the exit path can wait for it before turning DLSS-G off and slShutdown.
+    const ExitGate::Scope exit_gate;
+    if (!exit_gate.ok) {
+        free_frame();
+        return;
+    }
 
     // Recreate the swapchain if the window was resized, or (bb-alttab) if the surface changed
     // size without the window doing so: minimized and back (Alt+Tab), exclusive fullscreen lost.

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <core/libraries/system/userservice.h>
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/videoout/buffer.h"
@@ -142,5 +144,7 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
 s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, void** unk);
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
+// bb-exit-present: stop and join the VideoOut present thread (bounded). True: joined.
+bool StopPresentThread(std::chrono::milliseconds timeout);
 
 } // namespace Libraries::VideoOut
