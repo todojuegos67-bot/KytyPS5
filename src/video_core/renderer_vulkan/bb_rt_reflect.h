@@ -53,6 +53,7 @@ public:
         vk::ImageView depth_view;
         vk::ImageLayout depth_layout;
         bool depth_has_stencil;
+        bool depth_is_copy; // the engine's R32F colour copy: converted to device depth first
         vk::Image normal; // G-buffer RT0, null when not bound
         vk::ImageView normal_view;
         vk::ImageLayout normal_layout;
@@ -71,6 +72,12 @@ public:
     bool Init();
     bool LightingOn() const { return ok && ((vol_on && vol_ok) || (sh_on && sh_ok)); }
     bool RunLighting(vk::CommandBuffer cmd, const LightInput& in);
+    // One-time readback (5 texels each) of the R32F depth copy and the scene D32 (d32 may be
+    // null); logged a few frames later with the camera near / far, and the R32F encoding
+    // (raw device depth / view distance / distance over far) chosen from it.
+    void ProbeDepth(vk::CommandBuffer cmd, vk::Image r32f, vk::ImageLayout r32f_layout,
+                    vk::Image d32, vk::ImageLayout d32_layout, bool d32_stencil, u32 rw, u32 rh,
+                    u32 dw, u32 dh);
 
     // Records the pass into `cmd` (outside a render pass). Image layouts are restored.
     // Returns false when it did nothing (not supported, no camera, an allocation failed).
@@ -105,7 +112,10 @@ private:
         VmaAllocation alloc{};
         vk::ImageView view{};
     };
-    bool MakeImage(Img& i, u32 width, u32 height);
+    bool MakeImage(Img& i, u32 width, u32 height,
+                   vk::Format format = vk::Format::eR16G16B16A16Sfloat);
+    bool InitDepthCvt();
+    void ReadProbe(const float* proj, float far_dist);
     void FreeImage(Img& i);
     void FreeSized();
     void Log();
@@ -245,6 +255,22 @@ private:
     double l_ms_sum = 0.0;
     u32 l_ms_n = 0;
     std::chrono::steady_clock::time_point last_log{};
+
+    // R32F depth copy -> device depth (bb_rt_depthcvt.comp) and its encoding probe.
+    int depth_enc = -1;       // 0 raw device depth, 1 view distance, 2 distance / far; -1 unknown
+    bool depth_enc_env = false;
+    const char* depth_enc_src = "unknown";
+    vk::DescriptorSetLayout cvt_set{};
+    vk::PipelineLayout cvt_layout{};
+    vk::Pipeline cvt_pipe{};
+    bool cvt_ok = false, cvt_tried = false;
+    Img dcvt;
+    u32 dcvt_w = 0, dcvt_h = 0;
+    Buf probe;
+    int probe_state = 0;      // 0 not taken, 1 recorded (waiting), 2 read
+    u32 probe_wait = 0;
+    bool probe_has_d32 = false;
+    u32 probe_rw = 0, probe_rh = 0;
 };
 
 } // namespace BB

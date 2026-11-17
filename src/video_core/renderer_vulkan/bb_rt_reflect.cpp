@@ -11,6 +11,7 @@
 #include <span>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_upscale.h"
+#include "video_core/host_shaders/bb_rt_depthcvt_comp.h"
 #include "video_core/host_shaders/bb_rt_mesh_comp.h"
 #include "video_core/host_shaders/bb_rt_post_comp.h"
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
@@ -148,6 +149,11 @@ RtReflect::~RtReflect() {
     if (sh_set) device.destroyDescriptorSetLayout(sh_set);
     if (sh_queries) device.destroyQueryPool(sh_queries);
     if (l_queries) device.destroyQueryPool(l_queries);
+    if (cvt_pipe) device.destroyPipeline(cvt_pipe);
+    if (cvt_layout) device.destroyPipelineLayout(cvt_layout);
+    if (cvt_set) device.destroyDescriptorSetLayout(cvt_set);
+    FreeImage(dcvt);
+    FreeBuffer(probe);
     FreeBuffer(instances);
     FreeBuffer(params);
     FreeBuffer(counters);
@@ -206,10 +212,10 @@ void RtReflect::FreeBuffer(Buf& b) {
     b = {};
 }
 
-bool RtReflect::MakeImage(Img& i, u32 width, u32 height) {
+bool RtReflect::MakeImage(Img& i, u32 width, u32 height, vk::Format format) {
     const VkImageCreateInfo ici = vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
-        .format = vk::Format::eR16G16B16A16Sfloat,
+        .format = format,
         .extent = {width, height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
@@ -230,7 +236,7 @@ bool RtReflect::MakeImage(Img& i, u32 width, u32 height) {
     auto [r, v] = instance.GetDevice().createImageView({
         .image = i.image,
         .viewType = vk::ImageViewType::e2D,
-        .format = vk::Format::eR16G16B16A16Sfloat,
+        .format = format,
         .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     });
     if (r != vk::Result::eSuccess) {
@@ -1484,6 +1490,10 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     for (int r = 0; r < 3; ++r)
         for (int c = 0; c < 4; ++c) vd[r * 4 + c] = view[r * 4 + c];
     vd[15] = 1.0;
+    ReadProbe(proj, far_dist);
+    if (in.depth_is_copy && (depth_enc < 0 || !InitDepthCvt())) {
+        return false; // R32F encoding not known yet (probe pending) or no converter
+    }
     // Trace (and depth-mesh) size: the depth, halved when it is the full render size.
     const u32 ds = in.depth_width > 1100 ? 2u : 1u;
     lw_ = std::max(1u, in.depth_width / ds);
@@ -1507,9 +1517,11 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     };
     std::array<Tr, 3> trs{};
     u32 ntr = 0;
-    const auto depth_aspect = in.depth_has_stencil
-                                  ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
-                                  : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
+    const auto depth_aspect =
+        in.depth_is_copy ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor}
+        : in.depth_has_stencil
+            ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+            : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
     if (in.scene_layout != vk::ImageLayout::eGeneral) {
         trs[ntr++] = {in.scene, in.scene_layout, vk::ImageAspectFlagBits::eColor};
     }
@@ -1556,7 +1568,51 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
         l_query_used[tslot] = true;
     }
     layouts(true);
-    const vk::DescriptorImageInfo depth_info{nearest, in.depth_view, lay(in.depth_layout)};
+    vk::DescriptorImageInfo depth_info{nearest, in.depth_view, lay(in.depth_layout)};
+    if (in.depth_is_copy) {
+        // R32F copy -> device depth in dcvt (R32F, depth size), then used as the depth.
+        if (dcvt_w != in.depth_width || dcvt_h != in.depth_height || !dcvt.image) {
+            FreeImage(dcvt);
+            if (!MakeImage(dcvt, in.depth_width, in.depth_height, vk::Format::eR32Sfloat)) {
+                layouts(false);
+                return false;
+            }
+            dcvt_w = in.depth_width;
+            dcvt_h = in.depth_height;
+        }
+        const vk::ImageMemoryBarrier2 to_gen{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = dcvt.image,
+            .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                .pImageMemoryBarriers = &to_gen});
+        const vk::DescriptorImageInfo dst_i{{}, dcvt.view, vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 2> wr{{
+            {.dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &depth_info},
+            {.dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst_i},
+        }};
+        float pc[8] = {float(depth_enc), proj[14] < 0.0f ? -1.0f : 1.0f, far_dist, 0.0f,
+                       proj[10], proj[11], proj[14], proj[15]};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, cvt_pipe);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, cvt_layout, 0, wr);
+        cmd.pushConstants(cvt_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), pc);
+        cmd.dispatch((in.depth_width + 7) / 8, (in.depth_height + 7) / 8, 1);
+        const vk::MemoryBarrier2 cw{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        };
+        cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &cw});
+        depth_info = vk::DescriptorImageInfo{nearest, dcvt.view, vk::ImageLayout::eGeneral};
+    }
     if (own_mesh) {
         const u32 slot = ring_pos++ % Ring;
         Params prm{};
@@ -1585,9 +1641,9 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     std::memcpy(l_prev_view, vd, sizeof(l_prev_view));
     std::memcpy(l_prev_proj, pd, sizeof(l_prev_proj));
     l_have_prev = true;
-    const vk::DescriptorImageInfo normal_info{
-        nearest, in.normal ? in.normal_view : in.depth_view,
-        in.normal ? lay(in.normal_layout) : lay(in.depth_layout)};
+    const vk::DescriptorImageInfo normal_info =
+        in.normal ? vk::DescriptorImageInfo{nearest, in.normal_view, lay(in.normal_layout)}
+                  : depth_info;
     sh_normal = bool(in.normal);
     if (sh_on && sh_ok) {
         Shadows(cmd, in, proj, inv, vd, rp, prev_p, cam_prev_ok, depth_info, normal_info);
@@ -1612,6 +1668,205 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
                                                 .pMemoryBarriers = &all_before});
     }
     return true;
+}
+
+bool RtReflect::InitDepthCvt() {
+    if (cvt_ok || cvt_tried) return cvt_ok;
+    cvt_tried = true;
+    const auto device = instance.GetDevice();
+    constexpr auto C = vk::ShaderStageFlagBits::eCompute;
+    const std::array<vk::DescriptorSetLayoutBinding, 2> b{{
+        {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {1, vk::DescriptorType::eStorageImage, 1, C},
+    }};
+    auto [lr, l] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(b.size()),
+        .pBindings = b.data(),
+    });
+    if (lr != vk::Result::eSuccess) return false;
+    cvt_set = l;
+    const vk::PushConstantRange range{C, 0, 32};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &cvt_set,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess) return false;
+    cvt_layout = pl;
+    const auto module = Vulkan::CompileSPV(BB_RT_DEPTHCVT_COMP, device);
+    if (!module) return false;
+    auto [cr, pipe] = device.createComputePipeline(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{.stage = C, .module = module, .pName = "main"},
+                .layout = cvt_layout,
+            });
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess) return false;
+    cvt_pipe = pipe;
+    cvt_ok = true;
+    return true;
+}
+
+namespace {
+constexpr std::array<std::array<float, 2>, 6> ProbeAt{{
+    {0.5f, 0.5f}, {0.25f, 0.25f}, {0.75f, 0.25f}, {0.25f, 0.75f}, {0.75f, 0.75f}, {0.5f, 0.9f}}};
+}
+
+void RtReflect::ProbeDepth(vk::CommandBuffer cmd, vk::Image r32f, vk::ImageLayout r32f_layout,
+                           vk::Image d32, vk::ImageLayout d32_layout, bool d32_stencil, u32 rw,
+                           u32 rh, u32 dw, u32 dh) {
+    if (probe_state != 0) return;
+    if (const char* e = std::getenv("BB_RT_LIGHT_DEPTH_ENC"); e && e[0] >= '0' && e[0] <= '2') {
+        depth_enc = e[0] - '0';
+        depth_enc_env = true;
+        depth_enc_src = "BB_RT_LIGHT_DEPTH_ENC";
+    }
+    if (r32f_layout == vk::ImageLayout::eUndefined ||
+        (d32 && d32_layout == vk::ImageLayout::eUndefined)) {
+        return;
+    }
+    if (!probe.buffer &&
+        !MakeBuffer(probe, 256, vk::BufferUsageFlagBits::eTransferDst, true)) {
+        probe_state = 2;
+        return;
+    }
+    const u32 n = static_cast<u32>(ProbeAt.size());
+    const auto d_aspect = d32_stencil
+                              ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+                              : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth};
+    std::array<vk::ImageMemoryBarrier2, 2> b{};
+    u32 nb = 0;
+    const auto bar = [&](bool to) {
+        nb = 0;
+        b[nb++] = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .oldLayout = to ? r32f_layout : vk::ImageLayout::eTransferSrcOptimal,
+            .newLayout = to ? vk::ImageLayout::eTransferSrcOptimal : r32f_layout,
+            .image = r32f,
+            .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        if (d32) {
+            b[nb++] = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = to ? d32_layout : vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = to ? vk::ImageLayout::eTransferSrcOptimal : d32_layout,
+                .image = d32,
+                .subresourceRange{d_aspect, 0, 1, 0, 1},
+            };
+        }
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = nb,
+                                                .pImageMemoryBarriers = b.data()});
+    };
+    bar(true);
+    std::array<vk::BufferImageCopy, ProbeAt.size()> rc{}, dc{};
+    for (u32 i = 0; i < n; ++i) {
+        const auto at = [&](u32 w, u32 h) {
+            return vk::Offset3D{std::min<s32>(s32(ProbeAt[i][0] * w), s32(w) - 1),
+                                std::min<s32>(s32(ProbeAt[i][1] * h), s32(h) - 1), 0};
+        };
+        rc[i] = vk::BufferImageCopy{
+            .bufferOffset = i * 4,
+            .imageSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .imageOffset = at(rw, rh),
+            .imageExtent = {1, 1, 1},
+        };
+        dc[i] = vk::BufferImageCopy{
+            .bufferOffset = 64 + i * 4,
+            .imageSubresource{vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+            .imageOffset = at(dw, dh),
+            .imageExtent = {1, 1, 1},
+        };
+    }
+    cmd.copyImageToBuffer(r32f, vk::ImageLayout::eTransferSrcOptimal, probe.buffer, rc);
+    if (d32) {
+        cmd.copyImageToBuffer(d32, vk::ImageLayout::eTransferSrcOptimal, probe.buffer, dc);
+    }
+    bar(false);
+    probe_state = 1;
+    probe_wait = 0;
+    probe_has_d32 = bool(d32);
+    probe_rw = rw;
+    probe_rh = rh;
+}
+
+// A few frames after ProbeDepth: log the texels and the camera near / far, and choose the R32F
+// encoding: per texel, the D32 device depth d gives view distance z(d); the copy r is compared
+// with d (raw), z(d) (view distance) and z(d) / far (normalised).
+void RtReflect::ReadProbe(const float* proj, float far_dist) {
+    if (probe_state != 1 || ++probe_wait < 8) return;
+    probe_state = 2;
+    const u32 n = static_cast<u32>(ProbeAt.size());
+    float r[ProbeAt.size()], d[ProbeAt.size()];
+    std::memcpy(r, probe.mapped, sizeof(r));
+    std::memcpy(d, static_cast<const u8*>(probe.mapped) + 64, sizeof(d));
+    const auto zat = [&](double nz) {
+        const double a = proj[10] - nz * proj[14];
+        const double b = proj[11] - nz * proj[15];
+        return std::fabs(a) > 1e-12 ? -b / a : 0.0;
+    };
+    const double z0 = zat(0.0), z1 = zat(1.0);
+    const double near_d = std::min(std::fabs(z0), std::fabs(z1));
+    const double far_d = std::max(std::fabs(z0), std::fabs(z1));
+    std::string txt;
+    double err[3]{};
+    u32 used = 0;
+    float rmax = 0.0f;
+    for (u32 i = 0; i < n; ++i) {
+        rmax = std::max(rmax, r[i]);
+        if (probe_has_d32) {
+            const double dist = std::fabs(zat(d[i]));
+            txt += fmt::format(" ({:.2f},{:.2f}) r32f {:.6g} d32 {:.6g} view-dist(d32) {:.4g};",
+                               ProbeAt[i][0], ProbeAt[i][1], r[i], d[i], dist);
+            if (d[i] > 0.0f && d[i] < 1.0f && dist > 1e-4 && std::isfinite(r[i])) {
+                const double rr = r[i];
+                err[0] += std::fabs(rr - d[i]) / std::max<double>(std::fabs(d[i]), 1e-6);
+                err[1] += std::fabs(rr - dist) / dist;
+                err[2] += std::fabs(rr - dist / far_dist) / (dist / far_dist);
+                ++used;
+            }
+        } else {
+            txt += fmt::format(" ({:.2f},{:.2f}) r32f {:.6g};", ProbeAt[i][0], ProbeAt[i][1],
+                               r[i]);
+        }
+    }
+    static constexpr const char* Names[3] = {"raw device depth", "view distance",
+                                             "view distance / far"};
+    int best = -1;
+    if (used > 0) {
+        best = 0;
+        for (int k = 1; k < 3; ++k) {
+            if (err[k] < err[best]) best = k;
+        }
+        for (double& e : err) e /= used;
+    }
+    if (!depth_enc_env) {
+        if (best >= 0 && err[best] < 0.2) {
+            depth_enc = best;
+            depth_enc_src = "readback vs D32 (verified)";
+        } else if (best < 0 && rmax > 1.5f) {
+            depth_enc = 1;
+            depth_enc_src = "readback, values > 1 (assumed view distance, no D32 to compare)";
+        } else {
+            depth_enc_src = "readback inconclusive (R32F copy unused; set BB_RT_LIGHT_DEPTH_ENC)";
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "[rt-light] depth probe ({}x{} R32F copy{}):{} camera near {:.4f} far {:.2f} "
+             "(projection from the 864 B scene block), RtCamera far {:.2f}; mean rel. error vs "
+             "raw {:.4f}, view distance {:.4f}, distance/far {:.4f} over {} texels -> R32F "
+             "encoding: {} ({})",
+             probe_rw, probe_rh, probe_has_d32 ? " vs scene D32" : "", txt, near_d, far_d,
+             far_dist, err[0], err[1], err[2], used,
+             depth_enc >= 0 ? Names[depth_enc] : "unknown", depth_enc_src);
 }
 
 bool RtReflect::InitShadows() {

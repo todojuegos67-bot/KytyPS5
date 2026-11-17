@@ -1,0 +1,39 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-light: the engine's R32F depth copy (sampled by the composite PS 0x3fe9e964) -> device
+// depth (ndc z in [0,1]) for bb_rt_mesh / bb_rt_shadow / bb_rt_vol, which unproject device depth.
+// mode 0: the copy already holds device depth. mode 1: positive view distance d; the view z is
+// sgn * d and depth = (p10 z + p11) / (p14 z + p15) (row-major projection, column vectors).
+// mode 2: distance over far (d * far).
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, r32f) uniform writeonly image2D dst;
+
+layout(push_constant) uniform Pc {
+    vec4 coef; // mode, view z sign, far, unused
+    vec4 p;    // proj[10], proj[11], proj[14], proj[15]
+} pc;
+
+void main() {
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(dst);
+    if (xy.x >= size.x || xy.y >= size.y) {
+        return;
+    }
+    float v = texelFetch(src, xy, 0).r;
+    const int mode = int(pc.coef.x + 0.5);
+    float d = v;
+    if (mode != 0) {
+        float dist = mode == 2 ? v * pc.coef.z : v;
+        dist = clamp(dist, 1e-4, pc.coef.z);
+        const float z = pc.coef.y * dist;
+        const float w = pc.p.z * z + pc.p.w;
+        d = abs(w) > 1e-12 ? (pc.p.x * z + pc.p.y) / w : 1.0;
+    }
+    if (isnan(d) || isinf(d)) {
+        d = 1.0;
+    }
+    imageStore(dst, xy, vec4(clamp(d, 0.0, 1.0), 0.0, 0.0, 0.0));
+}

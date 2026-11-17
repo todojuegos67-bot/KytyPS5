@@ -61,6 +61,7 @@ add_host_shader(bb_rt_reflect.comp bb_rt_reflect_comp)
 add_host_shader(bb_rt_post.comp bb_rt_post_comp)
 add_host_shader(bb_rt_vol.comp bb_rt_vol_comp)
 add_host_shader(bb_rt_shadow.comp bb_rt_shadow_comp)
+add_host_shader(bb_rt_depthcvt.comp bb_rt_depthcvt_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)

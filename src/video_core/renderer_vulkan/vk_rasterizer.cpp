@@ -651,7 +651,12 @@ void Rasterizer::BbRtReflectRun() {
 // bb-rt-light (BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1): right before the game's composite draw
 // (PS 0x3fe9e964, which runs whether or not the game's SSR is on), outside the render pass: RT
 // shadows darken and volumetric light is added into the lit scene (the largest RGBA16F image the
-// composite samples). Depth: the depth image it samples; RT0: the largest RGBA8 it samples.
+// composite samples, 1708x960 0x272af0000 in the user's log). RT0: the largest RGBA8 it samples.
+// Depth: the composite samples no depth-format image, only the engine's R32F copy of the depth
+// (Ghidra: the GX window's "DepthR32F" texture, window+0x78, debug view at 0x0259a9ca). The
+// lighting uses the frame's scene depth target (D32, tracked in BeginRendering) when it is still
+// alive; else the R32F copy, converted to device depth (encoding from a one-time readback that
+// compares both, BB_RT_LIGHT_DEPTH_ENC=0/1/2 forces raw / view distance / distance over far).
 void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     bool is_composite = false;
     for (const auto* stage : pipeline.GetStages()) {
@@ -663,35 +668,39 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     if (!is_composite || !bb_rt_reflect->LightingOn()) {
         return;
     }
-    // Once per game frame: a second composite draw in the same frame would darken twice.
-    static u32 last_frame = ~0u;
-    static u64 skipped = 0;
-    const u32 frame = DebugState.GetFrameNum();
-    if (frame == last_frame) {
-        if (++skipped == 1) {
-            LOG_INFO(Render_Vulkan, "[rt-light] composite PS {:#x} drawn twice in a frame: the "
-                                    "RT lighting runs on the first only",
-                     BbCompositePsHash);
+    // Per 5 s status (also when nothing ran, with the reason).
+    static u64 n_seen = 0, n_ran = 0, n_dup = 0, n_nodepth = 0, n_noscene = 0, n_r32f = 0,
+               n_d32 = 0, n_fail = 0;
+    static auto last_status = std::chrono::steady_clock::time_point{};
+    ++n_seen;
+    const auto status = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_status != std::chrono::steady_clock::time_point{} &&
+            now - last_status < std::chrono::seconds(5)) {
+            return;
         }
-        return;
-    }
-    last_frame = frame;
-    VideoCore::Image* depth = nullptr;
+        last_status = now;
+        LOG_INFO(Render_Vulkan,
+                 "[rt-light] 5 s: composite draws {}, lighting ran {} (depth: scene D32 {}, R32F "
+                 "copy {}), skipped: same scene twice in a frame {}, no depth {}, no scene {}, not run "
+                 "(no camera / R32F encoding not known yet / allocation) {}",
+                 n_seen, n_ran, n_d32, n_r32f, n_dup, n_nodepth, n_noscene, n_fail);
+        n_seen = n_ran = n_dup = n_nodepth = n_noscene = n_r32f = n_d32 = n_fail = 0;
+    };
+    VideoCore::Image* depth = nullptr;  // depth-format image sampled by the draw (none so far)
+    VideoCore::Image* zcopy = nullptr;  // R32F colour copy of the depth sampled by the draw
     VideoCore::Image* normal = nullptr;
     VideoCore::Image* scene = nullptr;
     const auto area = [](const VideoCore::Image* i) {
         return i ? u64(i->info.size.width) * i->info.size.height : 0ull;
     };
     std::string desc;
-    static bool logged = false;
     for (const auto& image_id : bound_images) {
         auto& img = texture_cache.GetImage(image_id);
         const auto f = img.info.pixel_format;
-        if (!logged) {
-            desc += fmt::format(" [{} guest={:#x} {}x{} {}]",
-                                img.binding.is_target ? "target" : "tex", img.info.guest_address,
-                                img.info.size.width, img.info.size.height, vk::to_string(f));
-        }
+        desc += fmt::format(" [{} {:#x} {}x{} {}]", img.binding.is_target ? "target" : "tex",
+                            img.info.guest_address, img.info.size.width, img.info.size.height,
+                            vk::to_string(f));
         if (img.info.num_samples > 1) {
             continue;
         }
@@ -699,6 +708,9 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             if (!depth || (!img.binding.is_target && depth->binding.is_target)) {
                 depth = &img;
             }
+        } else if (!img.binding.is_target && f == vk::Format::eR32Sfloat &&
+                   area(&img) > area(zcopy)) {
+            zcopy = &img;
         } else if (!img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat &&
                    area(&img) > area(scene)) {
             scene = &img;
@@ -707,24 +719,71 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             normal = &img;
         }
     }
+    // The frame's scene depth (D32) from BeginRendering, if still the same image.
+    VideoCore::Image* d32 = nullptr;
+    const u32 frame = DebugState.GetFrameNum();
+    if (bb_rt_depth_frame == frame || bb_rt_depth_frame + 1 == frame) {
+        d32 = texture_cache.TryGetImage(bb_rt_depth_id, bb_rt_depth_uid);
+        if (d32 && scene &&
+            u64(d32->info.size.width) * scene->info.size.height !=
+                u64(d32->info.size.height) * scene->info.size.width) {
+            d32 = nullptr; // a different aspect ratio: not the scene depth
+        }
+    }
+    // Once per game frame and scene image: the composite is drawn twice per frame; a second
+    // draw on the same scene image would darken / add twice. A draw on another scene image runs.
+    static u32 last_frame = ~0u;
+    static VAddr last_scene = 0;
+    static int dup_logged = 0;
+    const VAddr scene_addr = scene ? scene->info.guest_address : 0;
+    if (frame == last_frame && scene_addr == last_scene) {
+        ++n_dup;
+        if (dup_logged < 1) {
+            ++dup_logged;
+            LOG_INFO(Render_Vulkan,
+                     "[rt-light] composite PS {:#x} drawn again in the same frame on the same "
+                     "scene image {:#x} (images:{}): the RT lighting runs once per frame and "
+                     "scene image",
+                     BbCompositePsHash, scene_addr, desc);
+        }
+        status();
+        return;
+    }
+    static bool logged = false;
     if (!logged) {
         logged = true;
         LOG_INFO(Render_Vulkan,
-                 "[rt-light] composite PS {:#x} images:{} -> scene {}, depth {}, RT0 {}",
+                 "[rt-light] composite PS {:#x} images:{} -> scene {}, depth: sampled depth {}, "
+                 "R32F copy {}, frame scene D32 {}; RT0 {}",
                  BbCompositePsHash, desc.empty() ? " none" : desc,
                  scene ? fmt::format("{:#x} {}x{}", scene->info.guest_address,
                                      scene->info.size.width, scene->info.size.height)
-                       : std::string("none (skipped)"),
-                 depth ? fmt::format("{:#x} {}x{}", depth->info.guest_address,
-                                     depth->info.size.width, depth->info.size.height)
-                       : std::string("none (skipped)"),
+                       : std::string("none"),
+                 depth ? fmt::format("{:#x}", depth->info.guest_address) : std::string("none"),
+                 zcopy ? fmt::format("{:#x} {}x{}", zcopy->info.guest_address,
+                                     zcopy->info.size.width, zcopy->info.size.height)
+                       : std::string("none"),
+                 d32 ? fmt::format("{:#x} {}x{} {}", d32->info.guest_address,
+                                   d32->info.size.width, d32->info.size.height,
+                                   vk::to_string(d32->info.pixel_format))
+                     : std::string("none"),
                  normal ? fmt::format("{:#x}", normal->info.guest_address)
                         : std::string("none (depth normals)"));
     }
     if (normal && area(normal) < area(scene) / 4) {
         normal = nullptr;
     }
-    if (!scene || !depth) {
+    if (!scene) {
+        ++n_noscene;
+        status();
+        return;
+    }
+    if (!depth) {
+        depth = d32;
+    }
+    if (!depth && !zcopy) {
+        ++n_nodepth;
+        status();
         return;
     }
     const auto layout_of = [](const VideoCore::Image& img) {
@@ -739,24 +798,50 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
     VideoCore::ImageViewInfo nv{};
     nv.format = vk::Format::eR8G8B8A8Unorm;
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    // One-time readback of a few texels of the R32F copy and the D32 (encoding evidence).
+    if (zcopy && d32) {
+        bb_rt_reflect->ProbeDepth(
+            cmd, zcopy->GetImage(), layout_of(*zcopy), d32->GetImage(), layout_of(*d32),
+            bool(d32->aspect_mask & vk::ImageAspectFlagBits::eStencil), zcopy->info.size.width,
+            zcopy->info.size.height, d32->info.size.width, d32->info.size.height);
+    } else if (zcopy) {
+        bb_rt_reflect->ProbeDepth(cmd, zcopy->GetImage(), layout_of(*zcopy), vk::Image{},
+                                  vk::ImageLayout::eUndefined, false, zcopy->info.size.width,
+                                  zcopy->info.size.height, 0, 0);
+    }
+    const bool use_copy = !depth;
+    VideoCore::Image* dimg = use_copy ? zcopy : depth;
+    VideoCore::ImageViewInfo cvv{};
+    cvv.format = vk::Format::eR32Sfloat;
     const BB::RtReflect::LightInput in{
-        .depth = depth->GetImage(),
-        .depth_view = *depth->FindView(dv, false).image_view,
-        .depth_layout = layout_of(*depth),
-        .depth_has_stencil = bool(depth->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .depth = dimg->GetImage(),
+        .depth_view = *dimg->FindView(use_copy ? cvv : dv, false).image_view,
+        .depth_layout = layout_of(*dimg),
+        .depth_has_stencil =
+            !use_copy && bool(dimg->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .depth_is_copy = use_copy,
         .normal = normal ? normal->GetImage() : vk::Image{},
         .normal_view = normal ? *normal->FindView(nv, false).image_view : vk::ImageView{},
         .normal_layout = normal ? layout_of(*normal) : vk::ImageLayout::eUndefined,
         .scene = scene->GetImage(),
         .scene_storage_view = *scene->FindView(sv, false).image_view,
         .scene_layout = layout_of(*scene),
-        .depth_width = depth->info.size.width,
-        .depth_height = depth->info.size.height,
+        .depth_width = dimg->info.size.width,
+        .depth_height = dimg->info.size.height,
         .scene_width = scene->info.size.width,
         .scene_height = scene->info.size.height,
     };
-    scheduler.EndRendering();
-    bb_rt_reflect->RunLighting(scheduler.CommandBuffer(), in);
+    if (bb_rt_reflect->RunLighting(cmd, in)) {
+        last_frame = frame;
+        last_scene = scene_addr;
+        ++n_ran;
+        ++(use_copy ? n_r32f : n_d32);
+    } else {
+        ++n_fail;
+    }
+    status();
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
@@ -2083,6 +2168,17 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        if (bb_rt_reflect && regs.depth_control.depth_enable &&
+            regs.depth_control.depth_write_enable && image.info.num_samples == 1) {
+            const u32 fr = DebugState.GetFrameNum();
+            const u64 ar = u64(image.info.size.width) * image.info.size.height;
+            if (fr != bb_rt_depth_frame || ar >= bb_rt_depth_area) {
+                bb_rt_depth_frame = fr;
+                bb_rt_depth_area = ar;
+                bb_rt_depth_id = image_id;
+                bb_rt_depth_uid = image.image_uid;
+            }
+        }
         if (BB::Upscale::Capture()) {
             // bb-clean-021: the scene depth (the presented image's size, depth test on): the
             // upscaler's depth and the draws that get the sub-pixel jitter (none without an

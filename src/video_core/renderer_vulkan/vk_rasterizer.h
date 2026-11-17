@@ -239,6 +239,12 @@ private:
     bool bb_rt_full_pending = false;
     VAddr bb_rt_ssr_addr = 0;
     u64 bb_rt_full_subs = 0;
+    // bb-rt-light: the largest single-sample depth target written this frame (the scene depth,
+    // D32): the composite samples only an R32F copy of it, so the lighting takes it from here.
+    VideoCore::ImageId bb_rt_depth_id{};
+    u64 bb_rt_depth_uid = 0;
+    u32 bb_rt_depth_frame = ~0u;
+    u64 bb_rt_depth_area = 0;
 };
 
 } // namespace Vulkan

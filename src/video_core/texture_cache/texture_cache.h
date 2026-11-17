@@ -191,6 +191,18 @@ public:
         return slot_image_views[id];
     }
 
+    /// bb-rt-light: the image with this id if it is still the same registered image (uid).
+    [[nodiscard]] Image* TryGetImage(ImageId id, u64 uid) {
+        if (!id || !slot_images.IsAllocated(id)) {
+            return nullptr;
+        }
+        auto& image = slot_images[id];
+        if (image.image_uid != uid || !(image.flags & ImageFlagBits::Registered)) {
+            return nullptr;
+        }
+        return &image;
+    }
+
     /// Get the associated depth stencil image if it is still valid.
     ImageId GetAssociatedDepth(Image& image) {
         if (!image.depth_id) {
