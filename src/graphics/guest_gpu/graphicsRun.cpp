@@ -40,7 +40,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <unordered_map>
 #include <unordered_set>
+#include <string>
+#include <vector>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -851,6 +855,12 @@ struct State {
 	uint64_t                     shape_h    = 1469598103934665603ull;
 	uint64_t                     piece_dw   = 0;
 	std::unordered_set<uint64_t> prev_exact, cur_exact, prev_shape, cur_shape;
+	// Field diff: every piece's dwords and shape, by position in the submission.
+	std::vector<uint32_t>                        piece_words;
+	std::vector<std::vector<uint32_t>>           prev_pieces, cur_pieces;
+	std::vector<uint64_t>                        prev_shapes, cur_shapes;
+	std::unordered_map<uint32_t, uint64_t>       field_changes;
+	uint64_t compared = 0, only_sh_user_data = 0, unchanged = 0;
 	uint64_t pieces = 0, exact_hits = 0, shape_hits = 0, dwords = 0, exact_hit_dw = 0, frames = 0;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
@@ -870,11 +880,16 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		s.cur_exact.clear();
 		s.prev_shape.swap(s.cur_shape);
 		s.cur_shape.clear();
+		s.prev_pieces.swap(s.cur_pieces);
+		s.cur_pieces.clear();
+		s.prev_shapes.swap(s.cur_shapes);
+		s.cur_shapes.clear();
 		s.frames++;
 	}
 	for (uint32_t i = 0; i < len_dw; i++) {
 		s.exact_h = Mix(s.exact_h, packet[i]);
 	}
+	s.piece_words.insert(s.piece_words.end(), packet, packet + len_dw);
 	s.shape_h = Mix(s.shape_h, opcode | (static_cast<uint64_t>(len_dw) << 8u));
 	s.piece_dw += len_dw;
 	if (!is_draw) {
@@ -891,6 +906,50 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 	}
 	s.cur_exact.insert(s.exact_h);
 	s.cur_shape.insert(s.shape_h);
+	const auto index = s.cur_pieces.size();
+	if (index < s.prev_pieces.size() && s.prev_shapes[index] == s.shape_h &&
+	    s.prev_pieces[index].size() == s.piece_words.size()) {
+		const auto& a          = s.prev_pieces[index];
+		const auto& b          = s.piece_words;
+		bool        any        = false;
+		bool        non_sh_ud  = false;
+		// Walk the packets: a field is opcode + register for SET_*_REG, else opcode + dword.
+		for (size_t pos = 0; pos < b.size();) {
+			const uint32_t header = b[pos];
+			const uint32_t op     = (header >> 8u) & 0xffu;
+			const uint32_t len    = std::max<uint32_t>(((header >> 16u) & 0x3fffu) + 2u, 1u);
+			const bool     set_reg = op == 0x69u || op == 0x76u || op == 0x79u || op == 0x68u;
+			for (uint32_t k = 1; k < len && pos + k < b.size(); k++) {
+				if (a[pos + k] == b[pos + k]) {
+					continue;
+				}
+				any = true;
+				uint32_t field = 0;
+				if (set_reg && k >= 2) {
+					field = (op << 16u) | ((b[pos + 1] & 0xffffu) + (k - 2u));
+					// SPI_SHADER_USER_DATA_* (SH regs 0x4c..0x8b, 0x10c..0x14b, etc.) are the per-draw data.
+					const uint32_t reg = (b[pos + 1] & 0xffffu) + (k - 2u);
+					if (!(op == 0x76u && ((reg & 0xffu) >= 0x0cu && (reg & 0xffu) < 0x4cu))) {
+						non_sh_ud = true;
+					}
+				} else {
+					field     = (op << 16u) | 0x8000u | k;
+					non_sh_ud = true;
+				}
+				s.field_changes[field]++;
+			}
+			pos += len;
+		}
+		s.compared++;
+		if (!any) {
+			s.unchanged++;
+		} else if (!non_sh_ud) {
+			s.only_sh_user_data++;
+		}
+	}
+	s.cur_pieces.push_back(s.piece_words);
+	s.cur_shapes.push_back(s.shape_h);
+	s.piece_words.clear();
 	s.exact_h  = 1469598103934665603ull;
 	s.shape_h  = 1469598103934665603ull;
 	s.piece_dw = 0;
@@ -904,6 +963,28 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		             100.0 * static_cast<double>(s.exact_hit_dw) / static_cast<double>(std::max<uint64_t>(s.dwords, 1)),
 		             100.0 * static_cast<double>(s.shape_hits) / static_cast<double>(s.pieces),
 		             static_cast<double>(s.dwords) / static_cast<double>(s.pieces));
+		std::vector<std::pair<uint64_t, uint32_t>> top;
+		for (const auto& [f, n] : s.field_changes) {
+			top.emplace_back(n, f);
+		}
+		std::sort(top.begin(), top.end(), std::greater<>());
+		std::string fields;
+		for (size_t i = 0; i < top.size() && i < 16; i++) {
+			char buf[64];
+			(void)std::snprintf(buf, sizeof(buf), " op%02x:%s%04x=%.1f%%", top[i].second >> 16u,
+			                    (top[i].second & 0x8000u) != 0 ? "dw" : "reg", top[i].second & 0x7fffu,
+			                    100.0 * static_cast<double>(top[i].first) / static_cast<double>(std::max<uint64_t>(s.compared, 1)));
+			fields += buf;
+		}
+		LOGF_UNMUTED("Replay fields (10 s): %" PRIu64 " pieces compared by position, unchanged %.1f%%, "
+		             "only SH user data changed %.1f%%, other fields changed %.1f%% |%s\n",
+		             s.compared, 100.0 * static_cast<double>(s.unchanged) / static_cast<double>(std::max<uint64_t>(s.compared, 1)),
+		             100.0 * static_cast<double>(s.only_sh_user_data) / static_cast<double>(std::max<uint64_t>(s.compared, 1)),
+		             100.0 * static_cast<double>(s.compared - s.unchanged - s.only_sh_user_data) /
+		                 static_cast<double>(std::max<uint64_t>(s.compared, 1)),
+		             fields.c_str());
+		s.field_changes.clear();
+		s.compared = s.only_sh_user_data = s.unchanged = 0;
 		s.pieces = s.exact_hits = s.shape_hits = s.dwords = s.exact_hit_dw = s.frames = 0;
 	}
 }
