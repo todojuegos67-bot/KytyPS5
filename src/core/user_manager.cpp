@@ -98,6 +98,10 @@ enum class TransferOption : s32 {
     SdlCancelled = -1,
 };
 TransferOption AskMigrationOption() {
+    // Bloodborne port: copy old saves/trophies silently (nothing is deleted, no dialog).
+    if (true) {
+        return TransferOption::Copy;
+    }
     TransferOption user_choice = TransferOption::Nothing;
 #ifndef _WIN32
     SDL_MessageBoxButtonData btns[4]

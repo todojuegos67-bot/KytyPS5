@@ -121,6 +121,18 @@ int main(int argc, char* argv[]) {
     // ---- Capture args after `--` verbatim ----
     app.allow_extras();
 
+#ifdef _WIN32
+    // Bloodborne port: hide the console window Windows opens for this exe when it was
+    // started from the launcher / Explorer (keep it when run from an existing terminal).
+    if (argc > 1) {
+        DWORD procs[4];
+        if (GetConsoleProcessList(procs, 4) <= 1) {
+            if (HWND con = GetConsoleWindow()) {
+                ShowWindow(con, SW_HIDE);
+            }
+        }
+    }
+#endif
     // ---- No-args behavior ----
     if (argc == 1) {
 #ifdef _WIN32

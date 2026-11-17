@@ -403,8 +403,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                         btns,
                         nullptr,
                     };
-                    int result = 1;
-                    SDL_ShowMessageBox(&msg_box, &result);
+                    // Bloodborne port: update the old config automatically, no dialog.
+                    (void)msg_box;
+                    int result = 0;
                     if (result == 0) {
                         if (TransferSettings()) {
                             Save();
