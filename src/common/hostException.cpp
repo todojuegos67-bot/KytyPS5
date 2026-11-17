@@ -1,4 +1,11 @@
 #include "common/hostException.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <string>
 #include <vector>
 
