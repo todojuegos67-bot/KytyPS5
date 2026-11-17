@@ -184,7 +184,22 @@ void IndirectWriteTables::PrepareRoot(uint64_t address) {
 	if (end <= begin || !GuestRange {begin, end - begin}.Valid()) {
 		return;
 	}
-	(void)m_context.GetBufferCache().FindBuffer(begin, end - begin);
+	auto& buffer_cache = m_context.GetBufferCache();
+	// Cache again the targets whose buffers the garbage collector released. Prepare does this for dispatches with
+	// tables; a dispatch with only roots may store into another root's window, which the collector may have released
+	// since that root's own dispatch (2 stores lost 11-71 KiB past a root after 140 s, session 78).
+	std::vector<GuestRange> released;
+	buffer_cache.ConsumeReleasedRanges([&](uint64_t start, uint64_t finish) {
+		m_targets.ForEachInRange(start, finish - start, [&](uint64_t from, uint64_t to) {
+			released.push_back({from, to - from});
+		});
+	});
+	for (const auto& range: released) {
+		if (m_context.IsMapped(range.address, range.size)) {
+			(void)buffer_cache.FindBuffer(range.address, range.size);
+		}
+	}
+	(void)buffer_cache.FindBuffer(begin, end - begin);
 	m_targets.Add(begin, end - begin); // the garbage collector may release it (Prepare caches it again)
 	if (m_roots.insert(address).second) {
 		LOGF("Compute: runtime V# stores from 0x%016" PRIx64 ": cached %" PRIu64 " KiB after it\n", address,
