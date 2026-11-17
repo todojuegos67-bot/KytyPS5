@@ -863,6 +863,13 @@ struct State {
 	// Exact pieces of the last 4 submissions: GT7's per-frame rings may repeat every 2-4 frames.
 	std::array<std::unordered_set<uint64_t>, 4> hist;
 	std::array<uint64_t, 4>                     hist_hits {};
+	// Chunks: GT7's worker threads write their own pieces of the frame stream and link them
+	// with chained INDIRECT_BUFFER packets (Ghidra: FUN_0002aac0). Per chunk: draws, and whether
+	// it sets its own state (context regs, PS/VS program) before its first draw.
+	uint64_t ch_chunks = 0, ch_draws = 0, ch_max_draws = 0, ch_ctx_first = 0, ch_pgm_first = 0,
+	         ch_empty = 0, ch_submissions_seen = 0, ch_ib_plain = 0;
+	uint64_t cur_draws = 0;
+	bool     cur_ctx = false, cur_pgm = false;
 	uint64_t compared = 0, only_sh_user_data = 0, unchanged = 0;
 	uint64_t pieces = 0, exact_hits = 0, shape_hits = 0, dwords = 0, exact_hit_dw = 0, frames = 0;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
@@ -874,6 +881,17 @@ inline State& Get() {
 inline uint64_t Mix(uint64_t h, uint64_t v) {
 	h ^= v + 0x9e3779b97f4a7c15ull + (h << 6u) + (h >> 2u);
 	return h * 1099511628211ull;
+}
+inline void EndChunk(State& s) {
+	s.ch_chunks++;
+	s.ch_draws += s.cur_draws;
+	s.ch_max_draws = std::max(s.ch_max_draws, s.cur_draws);
+	if (s.cur_draws == 0) {
+		s.ch_empty++;
+	}
+	s.cur_draws = 0;
+	s.cur_ctx   = false;
+	s.cur_pgm   = false;
 }
 inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32_t opcode, bool is_draw) {
 	auto& s = Get();
@@ -887,6 +905,8 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 			s.hist[i].swap(s.hist[i - 1]);
 		}
 		s.hist[0] = s.prev_exact;
+		EndChunk(s);
+		s.ch_submissions_seen++;
 		s.prev_pieces.swap(s.cur_pieces);
 		s.cur_pieces.clear();
 		s.prev_shapes.swap(s.cur_shapes);
@@ -897,6 +917,29 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		s.exact_h = Mix(s.exact_h, packet[i]);
 	}
 	s.piece_words.insert(s.piece_words.end(), packet, packet + len_dw);
+	if (s.cur_draws == 0) {
+		if (opcode == 0x69u) {
+			s.cur_ctx = true;
+		}
+		// SH program address registers: SPI_SHADER_PGM_LO_PS (0x08), _VS/_ES/_GS (0x48, 0x88, 0xc8...)
+		if (opcode == 0x76u && len_dw >= 2 && ((packet[1] & 0x3fu) == 0x08u)) {
+			s.cur_pgm = true;
+		}
+	}
+	if (is_draw) {
+		if (s.cur_draws == 0) {
+			s.ch_ctx_first += s.cur_ctx ? 1u : 0u;
+			s.ch_pgm_first += s.cur_pgm ? 1u : 0u;
+		}
+		s.cur_draws++;
+	}
+	if (opcode == 0x3fu && len_dw >= 4) {
+		if ((packet[3] & (1u << 20u)) != 0) {
+			EndChunk(s);
+		} else {
+			s.ch_ib_plain++;
+		}
+	}
 	s.shape_h = Mix(s.shape_h, opcode | (static_cast<uint64_t>(len_dw) << 8u));
 	s.piece_dw += len_dw;
 	if (!is_draw) {
@@ -1001,6 +1044,16 @@ inline void Packet(uint64_t seq, const uint32_t* packet, uint32_t len_dw, uint32
 		             100.0 * static_cast<double>(s.hist_hits[2]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)),
 		             100.0 * static_cast<double>(s.hist_hits[3]) / static_cast<double>(std::max<uint64_t>(s.pieces, 1)));
 		s.hist_hits = {};
+		LOGF_UNMUTED("Replay chunks (10 s): %" PRIu64 " chunks in %" PRIu64 " submissions (%.1f per submission), "
+		             "%.1f draws per chunk (max %" PRIu64 "), empty %" PRIu64 ", plain IB calls %" PRIu64
+		             ", chunks setting context regs before their first draw %.1f%%, setting a PS program %.1f%%\n",
+		             s.ch_chunks, s.ch_submissions_seen,
+		             static_cast<double>(s.ch_chunks) / static_cast<double>(std::max<uint64_t>(s.ch_submissions_seen, 1)),
+		             static_cast<double>(s.ch_draws) / static_cast<double>(std::max<uint64_t>(s.ch_chunks, 1)), s.ch_max_draws,
+		             s.ch_empty, s.ch_ib_plain,
+		             100.0 * static_cast<double>(s.ch_ctx_first) / static_cast<double>(std::max<uint64_t>(s.ch_chunks - s.ch_empty, 1)),
+		             100.0 * static_cast<double>(s.ch_pgm_first) / static_cast<double>(std::max<uint64_t>(s.ch_chunks - s.ch_empty, 1)));
+		s.ch_chunks = s.ch_draws = s.ch_max_draws = s.ch_ctx_first = s.ch_pgm_first = s.ch_empty = s.ch_submissions_seen = s.ch_ib_plain = 0;
 		s.field_changes.clear();
 		s.compared = s.only_sh_user_data = s.unchanged = 0;
 		s.pieces = s.exact_hits = s.shape_hits = s.dwords = s.exact_hit_dw = s.frames = 0;
