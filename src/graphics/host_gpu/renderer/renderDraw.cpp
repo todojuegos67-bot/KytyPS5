@@ -3504,7 +3504,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	const RendererLock lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetLocks(), kRendererLockAll);
 	if (args.index_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
 		                  -1);
@@ -3696,7 +3696,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	const RendererLock lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetLocks(), kRendererLockAll);
 	if (args.gpu_args_address == 0 &&
 	    (args.vertex_count == 0 ||
 	     (args.instance_count == 0 && args.gpu_instance_count_address == 0))) {

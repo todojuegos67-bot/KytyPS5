@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "kernel/eventQueue.h"
 
 #include <memory>
@@ -42,7 +43,8 @@ public:
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 
-	Common::Mutex&      GetMutex() { return m_mutex; }
+	// The renderer's locks and their order: rendererLock.h. Take them with RendererLock.
+	RendererLocks&      GetLocks() { return m_locks; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
 	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
@@ -107,7 +109,7 @@ private:
 	};
 
 	GraphicContext&           m_graphics;
-	Common::Mutex             m_mutex;
+	RendererLocks             m_locks;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;

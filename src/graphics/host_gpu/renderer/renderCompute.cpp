@@ -1585,7 +1585,7 @@ void RenderExecutor::DispatchDirectPart(TranslationContext& tc, uint64_t submit_
 		return;
 	}
 
-	const RendererLock lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetLocks(), kRendererLockAll);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -2026,7 +2026,7 @@ void RenderExecutor::DispatchIndirectPart(TranslationContext& tc, uint64_t submi
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	const RendererLock lock(m_context.GetMutex());
+	const RendererLock lock(m_context.GetLocks(), kRendererLockAll);
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();

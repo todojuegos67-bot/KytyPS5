@@ -1162,7 +1162,10 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	const RendererLock render_lock(m_impl->renderer.GetLocks(),
+	                               kRendererLockBuffer | kRendererLockTexture |
+	                                   kRendererLockScheduler,
+	                               false);
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
@@ -1178,7 +1181,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard       render_lock(m_impl->renderer.GetMutex());
+	const RendererLock      render_lock(m_impl->renderer.GetLocks(), kRendererLockScheduler, false);
 	const RendererHoldTimer hold;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -1277,7 +1280,10 @@ void Presenter::Impl::Present() {
 		bool     pictured  = false;
 		uint64_t dump_tick = 0;
 		{
-			Common::LockGuard       render_lock(renderer.GetMutex());
+			const RendererLock      render_lock(renderer.GetLocks(),
+			                                    kRendererLockBuffer | kRendererLockTexture |
+			                                        kRendererLockScheduler,
+			                                    false);
 			const RendererHoldTimer hold;
 			auto&                   command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =

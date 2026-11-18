@@ -869,7 +869,8 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 		// KYTY_PRECOMPILE=1 (pipelineSeeds.h): the recorded pipelines into the driver cache, saved,
 		// and the end of the process; the game itself does not run.
 		{
-			Common::LockGuard lock(g_window->render_context->GetMutex());
+			const RendererLock lock(g_window->render_context->GetLocks(), kRendererLockPipeline,
+			                        false);
 			auto&             cache = g_window->render_context->GetPipelineCache();
 			cache.PrecompileSeeds();
 			cache.Save();
@@ -886,7 +887,7 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
-	Common::LockGuard lock(g_window->render_context->GetMutex());
+	const RendererLock lock(g_window->render_context->GetLocks(), kRendererLockPipeline, false);
 	g_window->render_context->GetPipelineCache().Save();
 }
 

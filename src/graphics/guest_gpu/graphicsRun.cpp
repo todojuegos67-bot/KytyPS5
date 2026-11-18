@@ -2002,7 +2002,7 @@ bool GuestGpu::GuestPm4Barriers() {
 }
 
 void CommandProcessor::EmitGlobalBarrier(const std::source_location& site) {
-	const RendererLock lock(m_renderer.GetMutex());
+	const RendererLock lock(m_renderer.GetLocks(), kRendererLockScheduler);
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
