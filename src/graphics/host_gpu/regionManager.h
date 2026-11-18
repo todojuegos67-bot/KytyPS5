@@ -8,7 +8,9 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -431,6 +433,127 @@ public:
 	}
 	[[nodiscard]] size_t HotCount() const noexcept { return m_hot_count; }
 
+	// KYTY_NATIVE_MEM=1 (nativeMem.h): "kept" pages are hot pages of GT7's GPU pool with a 64-bit
+	// hash of their bytes and the time they last changed. A refresh (RefreshKept, at a slice or a
+	// passed wait) hashes the kept pages that were uploaded since (clean): one whose bytes changed
+	// was written without a fault and becomes CPU-dirty, so its next use uploads it, as a write
+	// fault would have made it. A full refresh (at a slice) hashes the CPU-dirty ones too, for
+	// their change time; a settling one (once a frame) makes every clean kept page CPU-dirty,
+	// whatever its hash. A kept page whose bytes did not change for `idle_us` is tracked again:
+	// CPU-dirty (its next upload takes its bytes and write-protects it) and no longer hot. All
+	// with the lock held.
+	struct KeptResult {
+		size_t kept      = 0;
+		size_t redirtied = 0;
+		size_t written   = 0;
+		size_t dropped   = 0;
+		size_t hashed    = 0;
+	};
+	// The pages of [vaddr, vaddr + size) that hold no GPU-written bytes become kept (hot), at most
+	// `room` of them; how many did.
+	size_t MarkKept(uint64_t vaddr, uint64_t size, size_t room) {
+		if (room == 0) {
+			return 0;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits pages;
+		pages.SetRange(start, end);
+		pages &= ~m_hot;
+		pages &= ~m_gpu_dirty;
+		if (pages.None()) {
+			return 0;
+		}
+		EnsureKeptState();
+		size_t marked = 0;
+		for (size_t page = start; page < end; page++) {
+			if (!pages.Get(page)) {
+				continue;
+			}
+			if (marked == room) {
+				pages.Unset(page);
+				continue;
+			}
+			m_kept->hashed.Unset(page);
+			marked++;
+		}
+		m_hot |= pages;
+		m_hot_count = m_hot.Count();
+		UpdateCpuProtection();
+		return marked;
+	}
+	// hash(address, &value) -> false when the page's bytes cannot be read (it is tracked again).
+	// now_us: a monotonic time in microseconds (the same clock for every call).
+	template <typename Hash>
+	KeptResult RefreshKept(bool full, bool settle, uint64_t now_us, uint64_t idle_us, Hash&& hash) {
+		KeptResult result;
+		if (m_hot_count == 0) {
+			return result;
+		}
+		EnsureKeptState();
+		RegionBits redirty;
+		RegionBits drop;
+		for (size_t word = 0; word < RegionBits::kWordCount; word++) {
+			uint64_t bits = m_hot.Word(word);
+			while (bits != 0) {
+				const size_t page = word * 64 + static_cast<size_t>(std::countr_zero(bits));
+				bits &= bits - 1;
+				const bool clean  = !m_cpu_dirty.Get(page);
+				const bool hashed = m_kept->hashed.Get(page);
+				// A CPU-dirty page is uploaded whole at its next use: its bytes matter only for its
+				// change time (a full refresh) or its first hash.
+				if (clean || !hashed || full) {
+					uint64_t value = 0;
+					result.hashed++;
+					if (!hash(m_cpu_addr + page * TRACKER_PAGE_SIZE, &value)) {
+						drop.Set(page);
+						continue;
+					}
+					if (!hashed || value != m_kept->hash[page]) {
+						if (hashed && clean) {
+							result.written++;
+						}
+						m_kept->hash[page]    = value;
+						m_kept->changed[page] = now_us;
+						m_kept->hashed.Set(page);
+						if (clean) {
+							redirty.Set(page);
+						}
+						continue;
+					}
+				}
+				if (now_us - m_kept->changed[page] >= idle_us) {
+					drop.Set(page);
+					continue;
+				}
+				if (settle && clean) {
+					redirty.Set(page);
+				}
+			}
+		}
+		if (drop.Any()) {
+			// Tracked again: CPU-dirty first, so the upload that write-protects it takes what the
+			// CPU wrote there unseen.
+			result.redirtied += DirtyHot(drop);
+			m_hot &= ~drop;
+			result.dropped = drop.Count();
+		}
+		if (redirty.Any()) {
+			result.redirtied += DirtyHot(redirty);
+		}
+		m_hot_count = m_hot.Count();
+		if (result.dropped != 0) {
+			UpdateCpuProtection();
+		}
+		result.kept = m_hot_count;
+		return result;
+	}
+	// Whether the page holding vaddr is hot (kept).
+	[[nodiscard]] bool IsHotPage(uint64_t vaddr) const {
+		const auto [start, end] = GetPageRange(vaddr, 1);
+		(void)end;
+		return m_hot_count != 0 && m_hot.Get(start);
+	}
+
 	// Memory mapped again (RenderContext::MapMemory, KYTY_MAP_REDIRTY): the pages of
 	// [vaddr, vaddr + size) that are neither CPU-dirty nor GPU-written become CPU-dirty, since the
 	// mapping brought bytes no write fault announced; and the region is pending for the next BDA
@@ -548,6 +671,19 @@ private:
 		}
 	}
 
+	// KYTY_NATIVE_MEM=1: the kept pages' hashes and idle counts, made for a region at its first
+	// kept page.
+	struct KeptState {
+		std::array<uint64_t, TRACKER_REGION_PAGES> hash {};
+		std::array<uint64_t, TRACKER_REGION_PAGES> changed {};
+		RegionBits                                 hashed;
+	};
+	void EnsureKeptState() {
+		if (m_kept == nullptr) {
+			m_kept = std::make_unique<KeptState>();
+		}
+	}
+
 	template <DirtySource source>
 	RegionBits& GetBits() {
 		if constexpr (source == DirtySource::Cpu) {
@@ -614,6 +750,7 @@ private:
 	RegionBits   m_readable;
 	RegionBits             m_hot;
 	size_t                 m_hot_count = 0;
+	std::unique_ptr<KeptState> m_kept;
 };
 
 } // namespace Libs::Graphics

@@ -703,6 +703,18 @@ size_t BufferCache::MarkHotPages(uint64_t vaddr, uint64_t size) {
 	return pages;
 }
 
+size_t BufferCache::MarkKeptPages(uint64_t vaddr, uint64_t size, size_t cap) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	const auto pages = m_memory_tracker.MarkKept(vaddr, size, cap);
+	if (pages != 0 && m_known_fill_count.load(std::memory_order_relaxed) != 0) {
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		ForgetFills(vaddr, size);
+	}
+	return pages;
+}
+
 void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;

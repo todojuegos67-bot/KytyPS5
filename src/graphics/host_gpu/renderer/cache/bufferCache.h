@@ -198,6 +198,17 @@ public:
 	}
 	void                 ClearHotPages() { m_memory_tracker.ClearHot(); }
 	[[nodiscard]] size_t HotPages() const noexcept { return m_memory_tracker.HotPages(); }
+	// KYTY_NATIVE_MEM=1 (nativeMem.h): kept pages, hot pages whose bytes are hashed at each
+	// refresh (MemoryTracker::MarkKept / RefreshKept). The known fills over them are forgotten,
+	// as with MarkHotPages.
+	size_t MarkKeptPages(uint64_t vaddr, uint64_t size, size_t cap);
+	template <typename Hash>
+	RegionManager::KeptResult RefreshKeptPages(bool full, bool settle, uint64_t now_us,
+	                                           uint64_t idle_us, Hash&& hash) {
+		return m_memory_tracker.RefreshKept(full, settle, now_us, idle_us,
+		                                    std::forward<Hash>(hash));
+	}
+	[[nodiscard]] bool IsKeptPage(uint64_t vaddr) { return m_memory_tracker.IsHotPage(vaddr); }
 	// Whether a shader has stored through shader addresses: those stores mark no range, so no
 	// block can be proven free of GPU-written bytes.
 	[[nodiscard]] bool AddressWritesSeen() const noexcept {

@@ -1578,6 +1578,123 @@ void TestFatalPaths() {
   }
 }
 
+
+// KYTY_NATIVE_MEM=1 (graphics/host_gpu/nativeMem.h): kept pages. A model of the
+// game writing pages of an upload heap between publish points (refreshes)
+// while uploads copy guest bytes to a GPU copy: after every upload the GPU copy
+// of the uploaded range equals guest memory, with or without kept pages, and
+// kept pages fault less. The hash is the bytes' own (XXH3 in the emulator).
+uint64_t HashBytes(const uint8_t *bytes, size_t size) {
+  uint64_t value = 1469598103934665603ull;
+  for (size_t i = 0; i < size; i++) {
+    value = (value ^ bytes[i]) * 1099511628211ull;
+  }
+  return value;
+}
+
+uint64_t RunKeptModel(bool keep, uint32_t seed, uint64_t *stale) {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  constexpr uint64_t pages = 64;
+  auto *memory = Allocate(page_manager, pages);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = page_size * pages;
+  std::vector<uint8_t> gpu(size, 0);
+  std::memset(memory, 0, size);
+  const auto upload = [&](uint64_t vaddr, uint64_t bytes) {
+    tracker.ForEachUploadRange(
+        vaddr, bytes, false,
+        [&](uint64_t range, uint64_t range_bytes) noexcept {
+          std::memcpy(gpu.data() + (range - address),
+                      reinterpret_cast<const void *>(range), range_bytes);
+        },
+        []() noexcept {});
+  };
+  const auto hash = [&](uint64_t vaddr, uint64_t *value) {
+    *value = HashBytes(reinterpret_cast<const uint8_t *>(vaddr), page_size);
+    return true;
+  };
+  upload(address, size);
+  std::mt19937 random(seed);
+  uint64_t faults = 0;
+  uint64_t frame = 0;
+  // A ring of pages written in bursts: each burst writes a few bytes of a
+  // window of pages, several times between publishes, as the game fills its
+  // GPU pool.
+  uint64_t head = 0;
+  for (int step = 0; step < 6000; step++) {
+    const auto op = random() % 10;
+    if (op < 6) {
+      const auto page = (head + random() % 4) % pages;
+      const auto offset = random() % page_size;
+      auto *byte = memory + page * page_size + offset;
+      if (!IsWritable(byte)) {
+        faults++;
+        // The fault handler: the page becomes CPU-dirty (and writable), and
+        // with keep, kept.
+        const auto page_address = address + page * page_size;
+        tracker.MarkRegionAsCpuModified(page_address, page_size);
+        if (keep) {
+          (void)tracker.MarkKept(page_address, page_size, 1024);
+        }
+        Check(IsWritable(byte), "a faulted page did not become writable");
+      }
+      *byte = static_cast<uint8_t>(random());
+      if (random() % 8 == 0) {
+        head = (head + 1) % pages;
+      }
+    } else {
+      // A publish point (a slice every fourth one, else a wait), then uses.
+      const bool slice = op == 6;
+      if (keep) {
+        const bool settle = slice && random() % 4 == 0;
+        // The model's clock: a step is a microsecond; kept 300 unchanged.
+        (void)tracker.RefreshKept(slice, settle, static_cast<uint64_t>(step), 300,
+                                  hash);
+      }
+      if (slice) {
+        frame++;
+      }
+      for (int use = 0; use < 3; use++) {
+        const auto first = random() % pages;
+        const auto count = 1 + random() % 8;
+        const auto bytes = std::min<uint64_t>(count, pages - first) * page_size;
+        const auto vaddr = address + first * page_size;
+        upload(vaddr, bytes);
+        if (std::memcmp(gpu.data() + first * page_size,
+                        reinterpret_cast<const void *>(vaddr), bytes) != 0) {
+          (*stale)++;
+        }
+      }
+    }
+  }
+  tracker.ClearHot();
+  tracker.MarkRegionAsCpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+  return faults;
+}
+
+void TestKeptPages() {
+  for (uint32_t seed = 1; seed <= 6; seed++) {
+    uint64_t stale_tracked = 0;
+    uint64_t stale_kept = 0;
+    const auto tracked = RunKeptModel(false, seed, &stale_tracked);
+    const auto kept = RunKeptModel(true, seed, &stale_kept);
+    std::printf("MemoryTrackerTests: kept pages, seed %u: write faults %llu "
+                "tracked, %llu kept; stale uploads %llu tracked, %llu kept\n",
+                seed, static_cast<unsigned long long>(tracked),
+                static_cast<unsigned long long>(kept),
+                static_cast<unsigned long long>(stale_tracked),
+                static_cast<unsigned long long>(stale_kept));
+    Check(stale_tracked == 0 && stale_kept == 0,
+          "an upload after a publish missed a CPU write");
+    Check(kept < tracked, "kept pages did not fault less");
+  }
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 void *g_fault_stack = nullptr;
 constexpr size_t FAULT_STACK_SIZE = 64 * 1024;
@@ -1670,6 +1787,7 @@ int main(int argc, char **argv) {
   TestRangeInvalidation();
   TestReleaseForCpuWrite();
   TestHotPages();
+  TestKeptPages();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

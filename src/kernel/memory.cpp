@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/nativeMem.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -135,6 +136,7 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
+	Graphics::NativeMem::RemovePool(vaddr, size);
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
@@ -1523,6 +1525,11 @@ const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 		return nullptr;
 	}
 	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
+const uint8_t* FindBackingBytes(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space == nullptr ? nullptr
+	                                        : g_guest_address_space->FindBacking(vaddr, size);
 }
 
 bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -4315,6 +4322,13 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	}
 
 	MapGpuRange(out_addr, len);
+
+	// KYTY_NATIVE_MEM=1: GT7's 2 MiB GPU pool chunks (eboot 0x5710), written without page
+	// faults (graphics/host_gpu/nativeMem.h).
+	if (Graphics::NativeMem::IsPoolMapping(out_addr, len, flags, alignment,
+	                                       gpu_mode == GpuAccessMode::ReadWrite)) {
+		Graphics::NativeMem::AddPool(out_addr, len);
+	}
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);

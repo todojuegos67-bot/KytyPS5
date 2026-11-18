@@ -167,6 +167,49 @@ public:
 	void DirtyHotIn(uint64_t vaddr, uint64_t size);
 	// No page is hot any more.
 	void ClearHot();
+	// KYTY_NATIVE_MEM=1 (RegionManager::MarkKept / RefreshKept): the pages of the range become
+	// kept, while fewer than `cap` pages are hot; how many did. Only regions that exist.
+	size_t MarkKept(uint64_t vaddr, uint64_t size, size_t cap);
+	// The hashing runs under each region's lock alone: a fault handler's MarkKept (which takes the
+	// hot mutex) does not wait for the whole refresh.
+	template <typename Hash>
+	RegionManager::KeptResult RefreshKept(bool full, bool settle, uint64_t now_us, uint64_t idle_us,
+	                                      Hash&& hash) {
+		CheckNotInUploadCallback();
+		RegionManager::KeptResult    total;
+		std::vector<RegionManager*>& regions = m_kept_scratch;
+		{
+			std::scoped_lock hot_lock(m_hot_mutex);
+			regions.assign(m_hot_regions.begin(), m_hot_regions.end());
+		}
+		for (auto* manager: regions) {
+			std::scoped_lock lock(manager->lock);
+			const auto       result = manager->RefreshKept(full, settle, now_us, idle_us, hash);
+			total.redirtied += result.redirtied;
+			total.written += result.written;
+			total.dropped += result.dropped;
+			total.hashed += result.hashed;
+		}
+		std::scoped_lock hot_lock(m_hot_mutex);
+		size_t           kept = 0;
+		for (size_t i = 0; i < m_hot_regions.size();) {
+			auto*            manager = m_hot_regions[i];
+			std::scoped_lock lock(manager->lock);
+			if (manager->HotCount() == 0) {
+				manager->in_hot_list = false;
+				m_hot_regions[i]     = m_hot_regions.back();
+				m_hot_regions.pop_back();
+				continue;
+			}
+			kept += manager->HotCount();
+			i++;
+		}
+		m_hot_pages.store(kept, std::memory_order_relaxed);
+		total.kept = kept;
+		return total;
+	}
+	// Whether the page holding vaddr is hot (kept). Lock-free false while no page is.
+	[[nodiscard]] bool IsHotPage(uint64_t vaddr);
 	// The pages that are hot now.
 	[[nodiscard]] size_t HotPages() const noexcept {
 		return m_hot_pages.load(std::memory_order_relaxed);
@@ -404,6 +447,8 @@ private:
 	std::mutex                                     m_hot_mutex;
 	std::vector<RegionManager*>                    m_hot_regions;
 	std::atomic<size_t>                            m_hot_pages {0};
+	// RefreshKept's copy of m_hot_regions (the GPU thread's alone).
+	std::vector<RegionManager*>                    m_kept_scratch;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
 };

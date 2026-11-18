@@ -622,7 +622,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// The wait passed: what the CPU wrote to its hot pages before it let the GPU go on (the
 	// next slice does this for a wait that suspends), and for shaders that read memory through
 	// addresses, a walk of what it wrote since the last one (round 90, RenderContext::PrepareBda).
-	m_renderer.RefreshHotPages();
+	m_renderer.RefreshHotPagesAtWait(addr);
 	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
 	// Round 166 (barriers:guest): what comes after the wait comes after what it waited for.

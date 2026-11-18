@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -7,11 +6,13 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/nativeMem.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/bufferAddressLog.h"
 #include "graphics/host_gpu/renderer/faultPages.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/timeline.h"
@@ -32,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -259,6 +261,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	     m_command_scheduler.AsyncSubmit() ? "on" : "off");
 	// Reads KYTY_FAULT_BLOCK_KB (and logs it) here rather than in the first fault's handler.
 	(void)FaultBlockBytes();
+	// KYTY_NATIVE_MEM (logged once here, not first in a fault handler).
+	(void)NativeMem::Enabled();
 	// Round 111: submissions wait for the page protections deferred before them.
 	m_command_scheduler.SetSubmitBarrier(&m_page_manager);
 }
@@ -324,13 +328,28 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		const bool hot_pages    = Bisect::HotPages() && !m_buffer_cache.AddressWritesSeen();
 		bool       texture_done = false;
 		auto       outcome      = Outcome::BlocksOff;
+		// KYTY_NATIVE_MEM=1 (nativeMem.h): a write to GT7's GPU pool releases its block at its
+		// first fault and leaves the faulting page kept (written from now on without faults).
+		// Not while shaders store through addresses (those stores mark no range), nor with the
+		// MT GPU workers (their write registry hears of a block's writes at its release only).
+		const bool native_pool = NativeMem::Enabled() && NativeMem::InPool(fault_vaddr);
+		const bool native_keep =
+		    native_pool && !m_buffer_cache.AddressWritesSeen() && !MtGpu::WorkersMode();
+		const auto keep_native = [&](uint64_t vaddr, uint64_t size, bool released_block) {
+			if (!native_pool) {
+				return;
+			}
+			const auto kept =
+			    native_keep ? m_buffer_cache.MarkKeptPages(vaddr, size, NativeMem::PageCap()) : 0;
+			NativeMem::NoteFault(released_block, kept);
+		};
 		if (const auto block_bytes = FaultBlockBytes(); block_bytes != 0) {
 			const auto now      = NowMs();
 			const auto block    = Common::AlignDown(fault_vaddr, block_bytes);
 			bool       released = false;
 			// The pages released around an image (round 79), the faulting one among them or not.
 			uint64_t around = 0;
-			if (!BlockFaultedRecently(block / block_bytes, now)) {
+			if (!native_pool && !BlockFaultedRecently(block / block_bytes, now)) {
 				outcome = Outcome::NotRecent;
 			} else if (m_buffer_cache.AddressWritesSeen()) {
 				outcome = Outcome::AddressWrites;
@@ -368,14 +387,19 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			if (released && around != 0) {
 				// The released runs were journaled as they were released.
 				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+				keep_native(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE), TRACKER_PAGE_SIZE,
+				            true);
 				return true;
 			}
 			if (released) {
 				LibKernel::Memory::JournalWrite(block, block_bytes,
 				                                LibKernel::Memory::WriteSource::CpuWriteFault);
 				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+				keep_native(Common::AlignDown(fault_vaddr, TRACKER_PAGE_SIZE), TRACKER_PAGE_SIZE,
+				            true);
 				// A block released again and again stays writable (hot pages).
-				if (hot_pages && FaultRecurs((block / block_bytes) | (uint64_t {1} << 35u), now)) {
+				if (!native_pool && hot_pages &&
+				    FaultRecurs((block / block_bytes) | (uint64_t {1} << 35u), now)) {
 					FaultPages::NoteHotMarked(m_buffer_cache.MarkHotPages(block, block_bytes));
 				}
 				return true;
@@ -397,8 +421,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			MtGpu::NoteWrite(MtGpu::WriteKind::Host, fault_vaddr, fault_size);
 		}
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
+		keep_native(page, TRACKER_PAGE_SIZE, false);
 		// A page written again and again stays writable (hot pages).
-		if (hot_pages && FaultRecurs(page / TRACKER_PAGE_SIZE, NowMs())) {
+		if (!native_pool && hot_pages && FaultRecurs(page / TRACKER_PAGE_SIZE, NowMs())) {
 			FaultPages::NoteHotMarked(m_buffer_cache.MarkHotPages(page, TRACKER_PAGE_SIZE));
 		}
 	} else {
@@ -778,8 +803,91 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+void RenderContext::RefreshHotPagesAtWait(const void* label) {
+	if (!NativeMem::Enabled()) {
+		RefreshHotPages();
+		return;
+	}
+	FaultPages::StartIfActive();
+	if (m_buffer_cache.HotPages() == 0) {
+		return;
+	}
+	// The CPU let the GPU go on: what it wrote to kept pages before is for the commands after the
+	// wait. Whether it did: a write fault anywhere since the last refresh (the game's writes to
+	// memory the tracker watches move g_cpu_write_epoch, the GPU thread's own do not), or the
+	// label lies in a kept page (written without a fault). A wait one queue released for another
+	// (its label written by the GPU thread) asks for nothing.
+	const auto writes = g_cpu_write_epoch.load(std::memory_order_acquire);
+	if (writes == m_native_write_epoch &&
+	    !m_buffer_cache.IsKeptPage(reinterpret_cast<uint64_t>(label))) {
+		NativeMem::Refresh skipped;
+		skipped.at_wait = true;
+		skipped.skipped = true;
+		NativeMem::NoteRefresh(skipped);
+		return;
+	}
+	RefreshKeptPages(true);
+}
+
+// KYTY_NATIVE_MEM=1, GPU thread: the kept pages' refresh (RegionManager::RefreshKept). At a slice
+// it hashes the CPU-dirty ones too (their change time decides when they are tracked again), and
+// the first slice of a new frame settles them (every clean one uploaded again at its next use,
+// whatever its hash: a page whose bytes went back to what they were at its last check). The pages
+// it makes CPU-dirty move g_cpu_write_epoch as the write faults they stand for would have, so the
+// walk for memory-reading shaders runs again after a wait (PrepareBda).
+void RenderContext::RefreshKeptPages(bool at_wait) {
+	if (m_buffer_cache.AddressWritesSeen()) {
+		if (m_buffer_cache.HotPages() != 0) {
+			m_buffer_cache.ClearHotPages();
+			FaultPages::NoteHotCleared();
+		}
+		return;
+	}
+	const auto frame  = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	const bool settle = !at_wait && frame != m_native_settled_frame;
+	if (settle) {
+		m_native_settled_frame = frame;
+	}
+	NativeMem::Refresh refresh;
+	refresh.at_wait = at_wait;
+	if (m_buffer_cache.HotPages() != 0) {
+		const auto start  = std::chrono::steady_clock::now();
+		const auto now_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(start.time_since_epoch())
+		        .count());
+		const auto result = m_buffer_cache.RefreshKeptPages(
+		    !at_wait, settle, now_us, NativeMem::IdleMicros(), [](uint64_t vaddr, uint64_t* value) {
+			    const auto* bytes = LibKernel::Memory::FindBackingBytes(vaddr, TRACKER_PAGE_SIZE);
+			    if (bytes == nullptr) {
+				    return false;
+			    }
+			    *value = XXH3_64bits(bytes, TRACKER_PAGE_SIZE);
+			    return true;
+		    });
+		refresh.hash_ns =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - start)
+		                              .count());
+		refresh.kept      = result.kept;
+		refresh.redirtied = result.redirtied;
+		refresh.written   = result.written;
+		refresh.dropped   = result.dropped;
+		refresh.hashed    = result.hashed;
+		if (result.redirtied != 0) {
+			g_cpu_write_epoch.fetch_add(1, std::memory_order_release);
+		}
+	}
+	m_native_write_epoch = g_cpu_write_epoch.load(std::memory_order_acquire);
+	NativeMem::NoteRefresh(refresh);
+	NativeMem::MaybeReport(NowMs());
+}
+
 void RenderContext::RefreshHotPages() {
 	FaultPages::StartIfActive();
+	if (NativeMem::Enabled()) {
+		RefreshKeptPages(false);
+		return;
+	}
 	// Hot pages stay writable to the CPU and are uploaded again after each refresh, so a shader
 	// store through an address (which marks no range) there would be overwritten: none once one
 	// was seen.

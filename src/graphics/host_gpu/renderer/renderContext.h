@@ -78,6 +78,9 @@ public:
 	// CPU-dirty again, as their writes do not fault. Every few seconds no page is hot any more
 	// (each has to fault its way back in), and none is while hot pages are off.
 	void               RefreshHotPages();
+	// At a WAIT_REG_MEM that passed on `label`: RefreshHotPages, or with KYTY_NATIVE_MEM=1 the kept
+	// pages' refresh when the CPU may have released the wait (nativeMem.h).
+	void               RefreshHotPagesAtWait(const void* label);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
@@ -144,6 +147,11 @@ private:
 	uint64_t                  m_bda_synced_waits      = 0; // g_guest_wait_seq at that walk
 	uint64_t                  m_bda_synced_writes     = 0; // g_cpu_write_epoch at that walk
 	uint64_t                  m_hot_cleared_ms        = 0;
+	// KYTY_NATIVE_MEM=1: g_cpu_write_epoch at the last refresh of the kept pages, and the frame of
+	// their last settling refresh.
+	uint64_t m_native_write_epoch   = 0;
+	uint64_t m_native_settled_frame = UINT64_MAX;
+	void     RefreshKeptPages(bool at_wait);
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

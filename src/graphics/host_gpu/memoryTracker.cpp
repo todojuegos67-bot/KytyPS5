@@ -276,6 +276,40 @@ void MemoryTracker::DirtyHotIn(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+size_t MemoryTracker::MarkKept(uint64_t vaddr, uint64_t size, size_t cap) {
+	CheckNotInUploadCallback();
+	size_t           marked = 0;
+	std::scoped_lock hot_lock(m_hot_mutex);
+	const auto       hot = m_hot_pages.load(std::memory_order_relaxed);
+	if (hot >= cap) {
+		return 0;
+	}
+	size_t room = cap - hot;
+	Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       pages = manager->MarkKept(manager->GetCpuAddr() + offset, bytes, room);
+		if (pages != 0 && !manager->in_hot_list) {
+			manager->in_hot_list = true;
+			m_hot_regions.push_back(manager);
+		}
+		marked += pages;
+		room -= pages;
+	});
+	m_hot_pages.fetch_add(marked, std::memory_order_relaxed);
+	return marked;
+}
+
+bool MemoryTracker::IsHotPage(uint64_t vaddr) {
+	if (m_hot_pages.load(std::memory_order_relaxed) == 0) {
+		return false;
+	}
+	CheckNotInUploadCallback();
+	return Iterate<false>(vaddr, 1, [](RegionManager* manager, uint64_t offset, uint64_t) {
+		std::scoped_lock lock(manager->lock);
+		return manager->IsHotPage(manager->GetCpuAddr() + offset);
+	});
+}
+
 void MemoryTracker::ClearHot() {
 	CheckNotInUploadCallback();
 	std::scoped_lock hot_lock(m_hot_mutex);

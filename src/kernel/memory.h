@@ -183,6 +183,10 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// KYTY_NATIVE_MEM=1 (graphics/host_gpu/nativeMem.h): the backing bytes of [vaddr, vaddr + size)
+// when one mapping holds them, else nullptr, whatever the GPU did there (the kept pages' hashes).
+// Any thread; read through the backing view, so an unmap meanwhile cannot fault the reader.
+[[nodiscard]] const uint8_t* FindBackingBytes(uint64_t vaddr, uint64_t size);
 // Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
 // TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
 // queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).
