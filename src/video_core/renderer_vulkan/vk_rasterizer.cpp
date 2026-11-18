@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -384,6 +385,177 @@ u32 BbRtReflectHookNth() {
 }
 } // namespace
 
+namespace {
+// bb-rt-water: the forward draws into the HDR target between the composite and the hook, by PS
+// (5 s census), and the F6 list (render thread writes, SDL thread reads).
+struct BbFwdPs {
+    u64 draws = 0;
+    bool half_tex = false; // samples an RGBA8 texture of half the scene size
+    bool water = false;
+};
+std::mutex bb_fwd_mutex;
+std::map<u64, BbFwdPs> bb_fwd_census;
+std::vector<u64> bb_fwd_list; // the last census' PS hashes (F6 cycles through them)
+std::atomic<int> bb_fwd_hide{-1};
+u64 bb_fwd_hidden_ps = 0;
+
+// BB_RT_REFLECT_WATER_PS=<hex>[,<hex>...]: the water draws' pixel shaders (replaces the automatic
+// rule). BB_RT_REFLECT_WATER_AUTO=0: no automatic rule.
+const std::vector<u64>& BbWaterPsList() {
+    static const std::vector<u64> list = [] {
+        std::vector<u64> v;
+        const char* e = std::getenv("BB_RT_REFLECT_WATER_PS");
+        while (e && *e) {
+            char* end = nullptr;
+            const u64 h = std::strtoull(e, &end, 16);
+            if (end == e) break;
+            if (h) v.push_back(h);
+            e = *end ? end + 1 : end;
+        }
+        return v;
+    }();
+    return list;
+}
+bool BbWaterAuto() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_REFLECT_WATER_AUTO");
+        return !(e && e[0] == '0') && BbWaterPsList().empty();
+    }();
+    return on;
+}
+} // namespace
+
+// F6 (BB_RT_REFLECT=1): hides the next forward PS of the census (none after the last), so the
+// one that draws the water can be found; logged (BB::RtReflectCycleHide, at the end).
+void BbRtCycleHide() {
+    std::scoped_lock lk{bb_fwd_mutex};
+    int i = bb_fwd_hide.load() + 1;
+    if (i >= int(bb_fwd_list.size())) i = -1;
+    bb_fwd_hide.store(i);
+    bb_fwd_hidden_ps = i >= 0 ? bb_fwd_list[i] : 0;
+    if (i >= 0) {
+        LOG_INFO(Render_Vulkan, "[rt-water] F6: hiding forward PS {:#x} ({} of {})",
+                 bb_fwd_hidden_ps, i + 1, bb_fwd_list.size());
+    } else {
+        LOG_INFO(Render_Vulkan, "[rt-water] F6: hiding none");
+    }
+}
+
+// bb-rt-water: before BeginRendering of every draw while this frame's reflection pass is pending.
+// A forward draw into the HDR target (depth test on, no depth write) is a water draw when its PS
+// is listed (BB_RT_REFLECT_WATER_PS) or, automatically, when it samples an RGBA8 texture of half
+// the scene's size. HIPÓTESIS (run_refl1 / run_refl2): that texture is the planar reflection
+// rendered by the frame's "Reflect" pass (Ghidra: ReflectCamera, GPU label order Shadow,
+// DynShadow, Reflect, ..., View) - 854x480 at 1708x960, 640x360 at 1280x720 - that the water
+// material (FresnelMin/Max, ReflectionOffset) distorts. Water draws then write the scene depth
+// (Ghidra / logs: they test but never write it), so the pass finds the water surface; the depth
+// is saved before the first one and restored after the pass. True: the draw is to be skipped (F6).
+bool Rasterizer::BbRtWaterDraw(const GraphicsPipeline& pipeline) {
+    bb_rt_water_draw = false;
+    if (!bb_rt_refl_pending) {
+        return false;
+    }
+    const auto& regs = liverpool->regs;
+    if (!regs.depth_control.depth_enable || regs.depth_control.depth_write_enable ||
+        !regs.depth_buffer.DepthValid() ||
+        regs.depth_buffer.DepthAddress() != bb_rt_depth_last_addr) {
+        return false;
+    }
+    u64 ps = 0;
+    for (const auto* stage : pipeline.GetStages()) {
+        if (stage && stage->sw_stage == Shader::SwStage::Fragment) {
+            ps = stage->pgm_hash;
+        }
+    }
+    bool to_hdr = false, half_tex = false;
+    VideoCore::Image* hdr = nullptr;
+    for (const auto& image_id : bound_images) {
+        auto& img = texture_cache.GetImage(image_id);
+        if (img.binding.is_target && BbAddr(img) == bb_rt_hdr_addr) {
+            to_hdr = true;
+            hdr = &img;
+        }
+    }
+    if (!to_hdr || !ps) {
+        return false;
+    }
+    for (const auto& image_id : bound_images) {
+        const auto& img = texture_cache.GetImage(image_id);
+        const auto f = img.info.pixel_format;
+        if (!img.binding.is_target &&
+            (f == vk::Format::eR8G8B8A8Unorm || f == vk::Format::eR8G8B8A8Srgb) &&
+            img.info.size.width == hdr->info.size.width / 2 &&
+            img.info.size.height == hdr->info.size.height / 2) {
+            half_tex = true;
+        }
+    }
+    const auto& list = BbWaterPsList();
+    const bool water = std::ranges::find(list, ps) != list.end() || (BbWaterAuto() && half_tex);
+    {
+        std::scoped_lock lk{bb_fwd_mutex};
+        auto& e = bb_fwd_census[ps];
+        ++e.draws;
+        e.half_tex |= half_tex;
+        e.water |= water;
+        if (bb_fwd_hide.load() >= 0 && ps == bb_fwd_hidden_ps) {
+            return true;
+        }
+    }
+    if (water && bb_rt_reflect->ReflectOn()) {
+        bb_rt_water_draw = true;
+        ++bb_rt_water_draws;
+    }
+    return false;
+}
+
+void Rasterizer::BbRtWaterLog() {
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    last = now;
+    std::scoped_lock lk{bb_fwd_mutex};
+    std::vector<std::pair<u64, BbFwdPs>> v(bb_fwd_census.begin(), bb_fwd_census.end());
+    std::ranges::sort(v, [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+    std::string d;
+    u32 n_water = 0;
+    for (size_t i = 0; i < v.size() && i < 24; ++i) {
+        d += fmt::format(" {:#x} x{}{}{}", v[i].first, v[i].second.draws,
+                         v[i].second.half_tex ? " half-res-RGBA8" : "",
+                         v[i].second.water ? " WATER" : "");
+        n_water += v[i].second.water ? 1 : 0;
+    }
+    if (!v.empty()) {
+        LOG_INFO(Render_Vulkan,
+                 "[rt-water] 5 s forward PS into the HDR target (draws; WATER = depth written for "
+                 "the reflections, rule {}): {} PS, {} water PS:{}",
+                 !BbWaterPsList().empty() ? "BB_RT_REFLECT_WATER_PS"
+                 : BbWaterAuto()          ? "auto: samples a half-size RGBA8 (planar reflection)"
+                                          : "off",
+                 v.size(), n_water, d);
+    }
+    // F6 list: sorted by hash, stable while the scene does not change much.
+    bb_fwd_list.clear();
+    for (const auto& [h, e] : bb_fwd_census) bb_fwd_list.push_back(h);
+    if (bb_fwd_hide.load() >= int(bb_fwd_list.size())) bb_fwd_hide.store(-1);
+    bb_fwd_census.clear();
+}
+
+void Rasterizer::BbRtRestoreDepth() {
+    if (!bb_rt_depth_saved) {
+        return;
+    }
+    bb_rt_depth_saved = false;
+    VideoCore::Image* d32 = texture_cache.TryGetImage(bb_rt_depth_last_id, bb_rt_depth_last_uid);
+    if (!d32) {
+        return;
+    }
+    scheduler.EndRendering();
+    bb_rt_reflect->RestoreDepth(scheduler.CommandBuffer(), d32->GetImage(), BbLayoutOf(*d32),
+                                bool(d32->aspect_mask & vk::ImageAspectFlagBits::eStencil));
+}
+
 // bb-rt-reflect: at the composite draw (PS 0x3fe9e964, before it is drawn): the G-buffer
 // snapshot (scene depth, RT0, RT1 of the G-buffer MRT) and the composite's colour target, the
 // HDR target the forward pass (water: material draw phase "NormalDraw_Water") draws into next.
@@ -396,6 +568,9 @@ void Rasterizer::BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt
         // The previous frame's pass never found its hook.
         bb_rt_reflect->NoteSkip("no draw read the HDR target after the forward pass");
     }
+    // (a depth saved but never restored belongs to the previous frame: dropped, never copied
+    // over this frame's G-buffer depth)
+    bb_rt_depth_saved = false;
     bb_rt_refl_pending = false;
     VideoCore::Image* hdr = nullptr;
     for (const auto& image_id : bound_images) {
@@ -453,6 +628,8 @@ void Rasterizer::BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt
                  rt1 ? fmt::format("{:#x}", BbAddr(*rt1)) : std::string("none"));
     }
     bb_rt_hdr_addr = BbAddr(*hdr);
+    bb_rt_water_draws = 0;
+    BbRtWaterLog();
     bb_rt_refl_pending = true;
     bb_rt_refl_fwd = 0;
     bb_rt_refl_reads = 0;
@@ -500,6 +677,21 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
     }
     if (writes_hdr) {
         bb_rt_refl_fwd += regs.depth_control.depth_enable ? 1 : 0;
+        if (bb_rt_water_draw && !bb_rt_depth_saved) {
+            // The first water draw: the scene depth saved before the water writes into it.
+            VideoCore::Image* d32 =
+                texture_cache.TryGetImage(bb_rt_depth_last_id, bb_rt_depth_last_uid);
+            scheduler.EndRendering();
+            if (d32 && bb_rt_reflect->SaveDepth(scheduler.CommandBuffer(), d32->GetImage(),
+                                                BbLayoutOf(*d32), d32->info.pixel_format,
+                                                d32->info.size.width, d32->info.size.height,
+                                                bool(d32->aspect_mask &
+                                                     vk::ImageAspectFlagBits::eStencil))) {
+                bb_rt_depth_saved = true;
+            } else {
+                bb_rt_water_draw = false; // no copy to restore from: the water writes no depth
+            }
+        }
         return;
     }
     if (!trigger) {
@@ -507,6 +699,11 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
     }
     bb_rt_refl_pending = false;
     bb_rt_reflect->NoteForwardDraws(bb_rt_refl_fwd);
+    bb_rt_reflect->NoteWaterDraws(bb_rt_water_draws);
+    struct Restore {
+        Rasterizer& r;
+        ~Restore() { r.BbRtRestoreDepth(); }
+    } restore{*this};
     const auto hfmt = hdr->info.pixel_format;
     const bool r11 = hfmt == vk::Format::eB10G11R11UfloatPack32;
     if ((!r11 && hfmt != vk::Format::eR16G16B16A16Sfloat) || hdr->info.num_samples > 1) {
@@ -921,6 +1118,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!BindResources(pipeline)) {
         return;
     }
+    if (bb_rt_reflect && BbRtWaterDraw(*pipeline)) {
+        ResetBindings(false);
+        return; // F6: this forward PS hidden (water identification)
+    }
     const auto state = BeginRendering(pipeline);
     if (BB::SsrProbe::Enabled()) {
         BB::SsrProbe::OnDraw(BbSsrDesc(*pipeline, regs,
@@ -953,6 +1154,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 regs.num_indices, regs.num_instances.NumInstances());
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    if (bb_rt_water_draw) {
+        // bb-rt-reflect: the water surface writes the scene depth (restored after the pass).
+        scheduler.GetDynamicState().SetDepthWriteEnabled(true);
+    }
     scheduler.bb_prof_next_label = bb_prof_label;
     scheduler.BeginRendering(state);
 
@@ -1004,6 +1209,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!BindResources(pipeline)) {
         return;
     }
+    if (bb_rt_reflect && BbRtWaterDraw(*pipeline)) {
+        ResetBindings(false);
+        return; // F6: this forward PS hidden (water identification)
+    }
     const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
@@ -1042,6 +1251,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     BbObjMvDraw(pipeline, arg_address + offset, max_count, 0);
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
+    if (bb_rt_water_draw) {
+        // bb-rt-reflect: the water surface writes the scene depth (restored after the pass).
+        scheduler.GetDynamicState().SetDepthWriteEnabled(true);
+    }
     scheduler.bb_prof_next_label = bb_prof_label;
     scheduler.BeginRendering(state);
 
@@ -2473,7 +2686,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         // Stencil writes can be enabled while depth writes are off.
         const bool stencil_write =
             has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
-        const auto new_layout = desc.view_info.is_storage
+        const bool depth_writable = desc.view_info.is_storage || bb_rt_water_draw;
+        const auto new_layout = depth_writable
                                     ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
                                                   : vk::ImageLayout::eDepthAttachmentOptimal
                                 : stencil_write
@@ -3361,3 +3575,9 @@ u32 Rasterizer::GetGpuCommandProcessorThreadId() {
 #endif
 
 } // namespace Vulkan
+
+namespace BB {
+void RtReflectCycleHide() {
+    Vulkan::BbRtCycleHide();
+}
+} // namespace BB

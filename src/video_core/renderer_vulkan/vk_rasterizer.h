@@ -137,6 +137,9 @@ private:
     // bb-rt-reflect: G-buffer snapshot at the composite draw, pass before the post-process.
     void BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt0, VideoCore::Image* rt1);
     void BbRtReflectPost(const GraphicsPipeline& pipeline);
+    bool BbRtWaterDraw(const GraphicsPipeline& pipeline); // true: skip the draw (F6)
+    void BbRtWaterLog();
+    void BbRtRestoreDepth(); // the scene depth as before the water draws wrote it
     void BbRtLightRun(const GraphicsPipeline& pipeline); // bb-rt-light: before the composite
     bool BindResources(const Pipeline* pipeline);
 
@@ -248,6 +251,10 @@ private:
     u32 bb_rt_refl_fwd = 0;
     u32 bb_rt_refl_chain_logged = 0;
     u32 bb_rt_refl_reads = 0;
+    // bb-rt-water: this draw is a water draw (writes the scene depth); the depth was saved.
+    bool bb_rt_water_draw = false;
+    bool bb_rt_depth_saved = false;
+    u32 bb_rt_water_draws = 0;
     // bb-rt-light: the largest single-sample depth target written (depth write on) since the
     // last composite draw, in command-stream order (no frame counter: the flip counter is bumped
     // on the presenter thread and drifts against the GPU command stream). The composite samples

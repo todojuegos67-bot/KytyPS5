@@ -126,6 +126,13 @@ public:
     void NoteSkip(const char* why);
     // (Log) the forward draws into the HDR target between the snapshot and the run.
     void NoteForwardDraws(u32 n) { fwd_draws += n; }
+    void NoteWaterDraws(u32 n) { water_draws += n; }
+    // The scene depth before the water draws write it (forced depth write, see the rasterizer's
+    // BbRtWaterDraw), and its restore after the pass. Layouts restored.
+    bool SaveDepth(vk::CommandBuffer cmd, vk::Image depth, vk::ImageLayout layout,
+                   vk::Format format, u32 width, u32 height, bool stencil);
+    void RestoreDepth(vk::CommandBuffer cmd, vk::Image depth, vk::ImageLayout layout,
+                      bool stencil);
 
 private:
     struct Buf {
@@ -217,7 +224,13 @@ private:
     u32 snap_depth_w = 0, snap_depth_h = 0;
     std::chrono::steady_clock::time_point t0{};
     const char* hist_reset_why = "start";
-    u64 hist_resets = 0, skips = 0, fwd_draws = 0;
+    u64 hist_resets = 0, skips = 0, fwd_draws = 0, water_draws = 0;
+    // Saved scene depth (own image, the scene depth's format; transfer only).
+    vk::Image dsave{};
+    VmaAllocation dsave_alloc{};
+    vk::Format dsave_fmt{};
+    u32 dsave_w = 0, dsave_h = 0;
+    bool dsave_valid = false;
     const char* last_skip = "none";
     Buf rcounters;
 
@@ -244,7 +257,7 @@ private:
 
     // Stats (logged every 5 s).
     u64 dispatches = 0, last_dispatches = 0;
-    std::array<u32, 16> last_counts{};
+    std::array<u32, 24> last_counts{};
     double gpu_ms_sum = 0.0;
     u32 gpu_ms_n = 0;
     bool logged_camera = false;

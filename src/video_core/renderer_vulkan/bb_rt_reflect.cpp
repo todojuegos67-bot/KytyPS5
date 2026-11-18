@@ -174,6 +174,7 @@ RtReflect::~RtReflect() {
     for (auto& i : sacc) FreeImage(i);
     FreeMesh(rmesh);
     FreeMesh(lmesh);
+    if (dsave) vmaDestroyImage(instance.GetAllocator(), dsave, dsave_alloc);
     FreeBuffer(rcounters);
     if (snap_pipe) device.destroyPipeline(snap_pipe);
     if (snap_layout) device.destroyPipelineLayout(snap_layout);
@@ -450,11 +451,11 @@ bool RtReflect::Init() {
     using U = vk::BufferUsageFlagBits;
     if (!MakeBuffer(params, ParamSize * Ring, U::eUniformBuffer, true) ||
         !MakeBuffer(counters, 64, U::eStorageBuffer, true) ||
-        !MakeBuffer(rcounters, 64, U::eStorageBuffer, true)) {
+        !MakeBuffer(rcounters, 128, U::eStorageBuffer, true)) {
         return false;
     }
     std::memset(counters.mapped, 0, 64);
-    std::memset(rcounters.mapped, 0, 64);
+    std::memset(rcounters.mapped, 0, 128);
     auto [qr, qp] = device.createQueryPool({
         .queryType = vk::QueryType::eTimestamp,
         .queryCount = Ring * 2,
@@ -1148,6 +1149,111 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const PostInput& in, const char*& why
     return true;
 }
 
+bool RtReflect::SaveDepth(vk::CommandBuffer cmd, vk::Image depth, vk::ImageLayout layout,
+                          vk::Format format, u32 width, u32 height, bool stencil) {
+    dsave_valid = false;
+    if (!ok || !refl_on || !depth) return false;
+    if (!dsave || dsave_fmt != format || dsave_w != width || dsave_h != height) {
+        if (dsave) {
+            (void)instance.GetDevice().waitIdle(); // a resize only
+            vmaDestroyImage(instance.GetAllocator(), dsave, dsave_alloc);
+            dsave = vk::Image{};
+        }
+        const VkImageCreateInfo ici = vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        };
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        VkImage img{};
+        if (vmaCreateImage(instance.GetAllocator(), &ici, &aci, &img, &dsave_alloc, nullptr) !=
+            VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "[rt-water] depth save image {}x{} {}: allocation failed",
+                      width, height, vk::to_string(format));
+            return false;
+        }
+        dsave = img;
+        dsave_fmt = format;
+        dsave_w = width;
+        dsave_h = height;
+    }
+    const vk::ImageAspectFlags aspect = DepthAspect(stencil);
+    const auto barrier = [&](vk::Image img, vk::ImageLayout from, vk::ImageLayout to) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .oldLayout = from,
+            .newLayout = to,
+            .image = img,
+            .subresourceRange{aspect, 0, 1, 0, 1},
+        };
+    };
+    std::array<vk::ImageMemoryBarrier2, 2> pre{
+        barrier(depth, layout, vk::ImageLayout::eTransferSrcOptimal),
+        barrier(dsave, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal)};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 2,
+                                            .pImageMemoryBarriers = pre.data()});
+    const vk::ImageCopy region{
+        .srcSubresource{vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+        .dstSubresource{vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+        .extent = {width, height, 1},
+    };
+    cmd.copyImage(depth, vk::ImageLayout::eTransferSrcOptimal, dsave,
+                  vk::ImageLayout::eTransferDstOptimal, region);
+    const auto post = barrier(depth, vk::ImageLayout::eTransferSrcOptimal, layout);
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                            .pImageMemoryBarriers = &post});
+    dsave_valid = true;
+    return true;
+}
+
+void RtReflect::RestoreDepth(vk::CommandBuffer cmd, vk::Image depth, vk::ImageLayout layout,
+                             bool stencil) {
+    if (!dsave_valid || !depth) return;
+    dsave_valid = false;
+    const vk::ImageAspectFlags aspect = DepthAspect(stencil);
+    const auto barrier = [&](vk::Image img, vk::ImageLayout from, vk::ImageLayout to) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .oldLayout = from,
+            .newLayout = to,
+            .image = img,
+            .subresourceRange{aspect, 0, 1, 0, 1},
+        };
+    };
+    std::array<vk::ImageMemoryBarrier2, 2> pre{
+        barrier(depth, layout, vk::ImageLayout::eTransferDstOptimal),
+        barrier(dsave, vk::ImageLayout::eTransferDstOptimal,
+                vk::ImageLayout::eTransferSrcOptimal)};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 2,
+                                            .pImageMemoryBarriers = pre.data()});
+    const vk::ImageCopy region{
+        .srcSubresource{vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+        .dstSubresource{vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+        .extent = {dsave_w, dsave_h, 1},
+    };
+    cmd.copyImage(dsave, vk::ImageLayout::eTransferSrcOptimal, depth,
+                  vk::ImageLayout::eTransferDstOptimal, region);
+    std::array<vk::ImageMemoryBarrier2, 2> post{
+        barrier(depth, vk::ImageLayout::eTransferDstOptimal, layout),
+        barrier(dsave, vk::ImageLayout::eTransferSrcOptimal,
+                vk::ImageLayout::eTransferDstOptimal)};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 2,
+                                            .pImageMemoryBarriers = post.data()});
+}
+
 void RtReflect::NoteSkip(const char* why) {
     ++skips;
     last_skip = why;
@@ -1164,10 +1270,10 @@ void RtReflect::Log() {
     const bool first = last_log == std::chrono::steady_clock::time_point{};
     last_log = now;
     // Counters written by the GPU (cumulative, wrapping): the last 5 s by difference.
-    std::array<u32, 16> c{};
+    std::array<u32, 24> c{};
     std::memcpy(c.data(), rcounters.mapped, sizeof(c));
-    std::array<u32, 16> d{};
-    for (int i = 0; i < 16; ++i) d[i] = c[i] - last_counts[i];
+    std::array<u32, 24> d{};
+    for (int i = 0; i < 24; ++i) d[i] = c[i] - last_counts[i];
     last_counts = c;
     const u64 runs = dispatches - last_dispatches;
     last_dispatches = dispatches;
@@ -1185,15 +1291,20 @@ void RtReflect::Log() {
              "[rt-reflect] 5 s: {} passes, {} frames without one (last: {}); trace {}x{} q{}; "
              "surfaces reflected {} px ({:.1f}% of {} px with depth): water {:.1f}%, puddles "
              "{:.1f}%, glossy {:.1f}%; rays {} ({:.0f} per pass): on-screen hits {:.1f}%, sky "
-             "{:.1f}%, no data {:.1f}% (game's own reflection kept); history reused {:.1f}% of "
-             "reflective px, restarts {} (last: {}); other forward px {:.1f}%, forward draws into "
-             "the HDR target {}; GPU {:.3f} ms per pass",
+             "{:.1f}%, distant (miss, on-screen direction) {:.1f}%, no data {:.1f}% (hit off "
+             "screen {:.1f}%, hit rejected {:.1f}%, miss off screen {:.1f}%: game's own "
+             "reflection kept); history reused {:.1f}% of reflective px, restarts {} (last: {}); "
+             "other forward px {:.1f}%, forward draws into the HDR target {}, water draws {} "
+             "(depth written); GPU {:.3f} ms per pass",
              runs, skips, last_skip, w, h, quality, refl, 100.0 * refl / valid, d[1],
              100.0 * d[2] / valid, 100.0 * d[3] / valid, 100.0 * d[4] / valid, d[5],
              runs ? double(d[5]) / double(runs) : 0.0, 100.0 * d[6] / rays_n,
-             100.0 * d[7] / rays_n, 100.0 * d[8] / rays_n,
+             100.0 * d[7] / rays_n, 100.0 * d[16] / rays_n, 100.0 * d[8] / rays_n,
+             100.0 * d[17] / rays_n, 100.0 * d[18] / rays_n,
+             100.0 * (d[8] - std::min(d[8], d[17] + d[18])) / rays_n,
              100.0 * d[9] / std::max<double>(refl, 1.0), hist_resets, hist_reset_why,
-             100.0 * d[10] / valid, fwd_draws, gpu_ms_n ? gpu_ms_sum / gpu_ms_n : 0.0);
+             100.0 * d[10] / valid, fwd_draws, water_draws,
+             gpu_ms_n ? gpu_ms_sum / gpu_ms_n : 0.0);
     LOG_INFO(Render_Vulkan,
              "[rt-reflect] 5 s G-buffer RT1.R (shininess) of the G-buffer px: <0.25 {:.1f}%, "
              "<0.5 {:.1f}%, <0.75 {:.1f}%, >=0.75 {:.1f}% (gloss from {:.2f}, puddles from "
@@ -1203,6 +1314,7 @@ void RtReflect::Log() {
     skips = 0;
     hist_resets = 0;
     fwd_draws = 0;
+    water_draws = 0;
     gpu_ms_sum = 0.0;
     gpu_ms_n = 0;
 }

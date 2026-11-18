@@ -33,7 +33,7 @@ layout(std140, binding = 5) uniform Params {
     vec4 misc6;
     mat4 inv_view;
 } p;
-layout(std430, binding = 6) buffer Counters { uint n[16]; } cnt;
+layout(std430, binding = 6) buffer Counters { uint n[24]; } cnt;
 layout(binding = 7) uniform sampler2D depth_tex;            // final scene depth (mode 2)
 #ifdef HDR_R11
 // The game's HDR target is B10G11R11_UFLOAT (Bloodborne: composite target 0x2709f0000): written

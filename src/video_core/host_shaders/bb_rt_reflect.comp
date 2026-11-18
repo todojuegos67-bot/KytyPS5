@@ -24,7 +24,7 @@ layout(binding = 0) uniform sampler2D depth_tex; // final scene depth, render si
 layout(binding = 1) uniform sampler2D snap_tex;  // G-buffer snapshot, trace size (nearest)
 layout(binding = 2) uniform sampler2D color_tex; // HDR scene, render size (linear)
 layout(binding = 3) uniform accelerationStructureEXT tlas;
-layout(std430, binding = 4) buffer Counters { uint n[16]; } cnt;
+layout(std430, binding = 4) buffer Counters { uint n[24]; } cnt;
 layout(std140, binding = 5) uniform Params {
     mat4 proj;
     mat4 inv_proj;
@@ -43,7 +43,7 @@ layout(std140, binding = 5) uniform Params {
 layout(binding = 6, rgba16f) uniform writeonly image2D raw_out;
 layout(binding = 7, rgba32f) uniform writeonly image2D guide_out;
 
-shared uint s_cnt[16];
+shared uint s_cnt[24];
 
 ivec2 DS() { return ivec2(p.size.xy); }
 int Sc() { return max(int(p.misc3.w + 0.5), 1); }
@@ -161,7 +161,7 @@ vec2 Ripple(vec2 xz, float t) {
 }
 
 void main() {
-    if (gl_LocalInvocationIndex < 16u) {
+    if (gl_LocalInvocationIndex < 24u) {
         s_cnt[gl_LocalInvocationIndex] = 0u;
     }
     barrier();
@@ -169,7 +169,7 @@ void main() {
     const ivec2 ts = ivec2(p.misc6.zw);
     const bool inside = c.x < ts.x && c.y < ts.y;
     uint n_valid = 0u, cls = 0u, n_rays = 0u, n_hit = 0u, n_sky = 0u, n_none = 0u, n_fwd = 0u,
-         n_ref = 0u, bucket = 4u;
+         n_ref = 0u, bucket = 4u, n_dist = 0u, n_offs = 0u, n_rej = 0u;
     if (inside) {
         vec4 raw = vec4(0.0);
         vec4 guide = vec4(0.0);
@@ -200,7 +200,9 @@ void main() {
             bool gok;
             vec3 G = UnprojectUv((vec2(dp) + 0.5) / vec2(DS()), snap.w, gok);
             float gdist = gok ? length(G) : p.misc.x;
-            bool nearer = gdist - dist > 0.01 * dist + 0.02;
+            // Only the water draws write the depth after the G-buffer (forced, see BbRtWaterDraw): the
+            // same texel of both depths, so any real difference is the water surface.
+            bool nearer = gdist - dist > 1e-4 * dist + 1e-3;
             vec3 N = Nd;
             float rough = 0.0, gloss = 0.0, shine = -1.0;
             if (nearer) {
@@ -297,6 +299,11 @@ void main() {
                             ++n_hit;
                         } else {
                             ++n_none;
+                            if (on) {
+                                ++n_rej;
+                            } else {
+                                ++n_offs;
+                            }
                         }
                     } else {
                         // Left the scene: the sky where the direction is on screen and the depth
@@ -307,11 +314,17 @@ void main() {
                         if (on) {
                             UnprojectPx(ivec2(uv * vec2(DS())), sok);
                         }
-                        if (on && !sok) {
+                        if (on) {
+                            // The sky there, or (a miss through a hole of the depth mesh / past
+                            // the ray length) the distant scene in that direction, half weight.
                             col = textureLod(color_tex, uv, 0.0).rgb;
                             vec2 e = min(uv, 1.0 - uv);
-                            w = smoothstep(0.0, 0.06, min(e.x, e.y));
-                            ++n_sky;
+                            w = smoothstep(0.0, 0.06, min(e.x, e.y)) * (sok ? 0.5 : 1.0);
+                            if (sok) {
+                                ++n_dist;
+                            } else {
+                                ++n_sky;
+                            }
                         } else {
                             ++n_none;
                         }
@@ -350,8 +363,11 @@ void main() {
     if (n_fwd != 0u) atomicAdd(s_cnt[10], 1u);
     if (bucket < 4u) atomicAdd(s_cnt[11u + bucket], 1u);
     if (n_ref != 0u) atomicAdd(s_cnt[15], n_ref);
+    if (n_dist != 0u) atomicAdd(s_cnt[16], n_dist);
+    if (n_offs != 0u) atomicAdd(s_cnt[17], n_offs);
+    if (n_rej != 0u) atomicAdd(s_cnt[18], n_rej);
     barrier();
-    if (gl_LocalInvocationIndex < 16u && gl_LocalInvocationIndex != 9u) {
+    if (gl_LocalInvocationIndex < 24u && gl_LocalInvocationIndex != 9u) {
         atomicAdd(cnt.n[gl_LocalInvocationIndex], s_cnt[gl_LocalInvocationIndex]);
     }
 }

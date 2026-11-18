@@ -45,6 +45,7 @@ CMRC_DECLARE(res);
 
 namespace BB {
 void RtReflectCycleDebug(); // video_core/renderer_vulkan/bb_rt_reflect.cpp
+void RtReflectCycleHide();  // video_core/renderer_vulkan/vk_rasterizer.cpp
 }
 
 namespace Frontend {
@@ -280,10 +281,15 @@ void WindowSDL::WaitEvent() {
         const char* e = std::getenv("BB_RT_REFLECT");
         return e && e[0] == '1';
     }();
+    // F6: hides the next forward pixel shader into the HDR target (finds the water's PS).
     if (rt_reflect && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
-        event.key.key == SDLK_F7) {
+        (event.key.key == SDLK_F7 || event.key.key == SDLK_F6)) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-            BB::RtReflectCycleDebug();
+            if (event.key.key == SDLK_F7) {
+                BB::RtReflectCycleDebug();
+            } else {
+                BB::RtReflectCycleHide();
+            }
         }
         return;
     }
