@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
+#include "graphics/host_gpu/renderer/mtGpuWorkers.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -2769,6 +2770,158 @@ uint32_t RenderExecutor::DrawBindingStages(TranslationContext& tc, const DrawRen
 	return stage_count;
 }
 
+namespace {
+
+// KYTY_MT_GPU=1/4: the GPU thread's refresh of a stage and a worker's walk of it hold the same
+// descriptors, user data and flattened SRT (everything PrepareBindings reads from them).
+bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                  const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.user_data == b.user_data && a.flattened_srt == b.flattened_srt &&
+	       a.bindless_heaps == b.bindless_heaps &&
+	       a.bindless_sampler_heaps == b.bindless_sampler_heaps &&
+	       a.buffer_write_extents == b.buffer_write_extents &&
+	       a.specialization_reads == b.specialization_reads && a.uniform_fill == b.uniform_fill &&
+	       a.gpu_fills == b.gpu_fills;
+}
+
+uint64_t SpecNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+bool RenderExecutor::SpeculateDraw(MtGpu::SpecDraw& d) {
+	// Lock order: the translation mutex, then pipeline -> buffer -> texture. Only tried: the GPU
+	// thread takes them the other way round (its draw's RendererLock, then this mutex inside the
+	// translation), so a worker never waits while it holds one. Never the scheduler.
+	if (!m_translation_mutex.try_lock()) {
+		return false;
+	}
+	const std::unique_lock translation(m_translation_mutex, std::adopt_lock);
+	auto&              mutexes = m_context.GetLocks().mutexes;
+	constexpr uint32_t Needed  = 3; // kRendererLockPipeline, Buffer, Texture
+	uint32_t           held    = 0;
+	struct Release {
+		std::array<Common::Mutex, 4>& mutexes;
+		uint32_t&                     held;
+		~Release() {
+			while (held > 0) {
+				mutexes[--held].Unlock();
+			}
+		}
+	} const release {mutexes, held};
+	while (held < Needed && mutexes[held].TryLock()) {
+		held++;
+	}
+	if (held < Needed) {
+		return false;
+	}
+	d.translated = false;
+	d.failure    = nullptr;
+	d.epoch      = MtGpu::Epoch();
+	d.binds.clear();
+	auto& tc = d.tc;
+	tc.deferred.clear();
+	tc.images.Clear();
+	tc.bound_ids.clear();
+	tc.deferring = true;
+	tc.bind_log  = &d.binds;
+	struct Unlog {
+		TranslationContext& tc;
+		~Unlog() { tc.bind_log = nullptr; }
+	} const unlog {tc};
+	const MtGpu::SpeculationScope speculation;
+	const MtGpu::ReadRecorder     reads(d.zones);
+	if (!m_context.GetPipelineCache().SpeculatePrograms(d.inputs, d.walked, d.stages,
+	                                                    d.normalized)) {
+		d.failure = "programa por traducir";
+		return true;
+	}
+	const ScopedContext scope(*this, tc);
+	const uint32_t      pixel        = d.inputs.pixel ? 1u : 0u;
+	const uint32_t      vertex_count = d.walked.stage_count - pixel;
+	// As TranslateDrawBindings: the vertex stages, then the pixel stage.
+	for (uint32_t i = 0; i < vertex_count && !MtGpu::SpeculationFailed(); i++) {
+		tc.graphics.vertex[i].normalize_unnormalized = d.normalized[pixel + i];
+		PrepareBindings(d.stages[pixel + i], tc.graphics.vertex[i]);
+	}
+	if (pixel != 0 && !MtGpu::SpeculationFailed()) {
+		if (!tc.graphics.pixel) tc.graphics.pixel.emplace();
+		PrepareBindings(d.stages[0], *tc.graphics.pixel);
+	}
+	d.failure    = speculation.Failure();
+	d.translated = d.failure == nullptr;
+	return true;
+}
+
+const char* RenderExecutor::ValidateSpeculatedDraw(const MtGpu::SpecDraw& d,
+                                                   const DrawRenderState& state,
+                                                   size_t                 vertex_stage_count) {
+	if (!d.translated) {
+		return d.failure != nullptr ? d.failure : "sin traducir";
+	}
+	const uint32_t pixel = d.inputs.pixel ? 1u : 0u;
+	if (d.inputs.pixel != state.ps_active || d.walked.stage_count != pixel + vertex_stage_count) {
+		return "etapas distintas";
+	}
+	const auto same_stage = [](const ShaderStageRuntime& mine,
+	                           const ShaderStageRuntime& gpu) -> const char* {
+		if (mine.program != gpu.program || gpu.resources == nullptr) {
+			return "programa distinto";
+		}
+		if (!SameSnapshot(*mine.resources, *gpu.resources)) {
+			return "descriptores distintos";
+		}
+		return nullptr;
+	};
+	for (size_t i = 0; i < vertex_stage_count; i++) {
+		if (const char* why = same_stage(d.stages[pixel + i], state.vertex_info[i].stage)) {
+			return why;
+		}
+		if (d.normalized[pixel + i] != state.programs.vertex[i].normalized_samplers) {
+			return "normalizado distinto";
+		}
+	}
+	if (pixel != 0) {
+		if (const char* why = same_stage(d.stages[0], state.ps_input_info.stage)) {
+			return why;
+		}
+	}
+	if (const char* why = MtGpu::ZonesWrittenSince(d.zones, d.epoch)) {
+		return why;
+	}
+	auto& textures = m_context.GetTextureCache();
+	for (const auto& [id, storage]: d.binds) {
+		const auto* image = textures.m_slot_images.try_get(id);
+		if (image == nullptr || (!image->info.data.Empty() && !image->registered)) {
+			return "imagen retirada";
+		}
+	}
+	return nullptr;
+}
+
+void RenderExecutor::AdoptSpeculatedDraw(TranslationContext& tc, MtGpu::SpecDraw& d,
+                                         DrawRenderState& state, size_t vertex_stage_count) {
+	// The binding flags as the normal translation sets them: its BindImage calls, in order.
+	for (const auto& [id, storage]: d.binds) {
+		BindImage(id, storage);
+	}
+	for (size_t i = 0; i < vertex_stage_count; i++) {
+		tc.graphics.vertex[i]         = std::move(d.tc.graphics.vertex[i]);
+		tc.graphics.vertex[i].runtime = &state.vertex_info[i].stage;
+	}
+	if (state.ps_active) {
+		if (!tc.graphics.pixel) tc.graphics.pixel.emplace();
+		*tc.graphics.pixel         = std::move(*d.tc.graphics.pixel);
+		tc.graphics.pixel->runtime = &state.ps_input_info.stage;
+	}
+	// What the translation would have done to the shared state, in its order.
+	RunDeferred(d.tc);
+}
+
 void RenderExecutor::RunDeferred(TranslationContext& tc) {
 	// Moved out first: an action may translate again (a nested draw-as-operation) into tc.
 	auto actions = std::move(tc.deferred);
@@ -2980,10 +3133,89 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 	if (self_check) {
 		tc.trace = &main_trace;
 	}
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h): a worker's translation of this draw, used when it is
+	// still this draw's (=1), or compared with the normal one below (=4).
+	const bool          workers     = MtGpu::WorkersEnabled() && !mesh_active && !translated;
+	MtGpu::SpecDraw*    spec        = nullptr;
+	const char*         spec_reason = nullptr;
+	bool                from_worker = false;
+	uint64_t            consume_ns  = 0;
+	std::vector<const char*> spec_trace;
+	if (workers) {
+		const auto begin = SpecNowNs();
+		spec             = MtGpu::TakeSpecDraw(DrawPrep::Current(), &spec_reason);
+		if (spec != nullptr) {
+			spec_reason = ValidateSpeculatedDraw(*spec, state, vertex_stages.size());
+			if (spec_reason == nullptr && !MtGpu::WorkersCompare()) {
+				AdoptSpeculatedDraw(tc, *spec, state, vertex_stages.size());
+				from_worker = true;
+			}
+			if (spec_reason == nullptr && MtGpu::WorkersCompare()) {
+				tc.trace = &spec_trace;
+			}
+		}
+		consume_ns = SpecNowNs() - begin;
+	}
+	const uint64_t translate_begin = workers && !from_worker ? SpecNowNs() : 0;
 	const uint32_t                   stage_count =
-	    translated ? DrawBindingStages(tc, state, vertex_stages.size(), descriptor_stages)
-	               : TranslateDrawBindings(tc, state, vertex_stages.size(), descriptor_stages);
+	    translated || from_worker
+	        ? DrawBindingStages(tc, state, vertex_stages.size(), descriptor_stages)
+	        : TranslateDrawBindings(tc, state, vertex_stages.size(), descriptor_stages);
 	tc.trace = nullptr;
+	if (workers) {
+		if (!from_worker) {
+			MtGpu::NoteNormalTranslation(SpecNowNs() - translate_begin);
+		}
+		bool differs = false;
+		if (spec != nullptr && spec_reason == nullptr && MtGpu::WorkersCompare()) {
+			// =4: the worker's translation against the normal one, which is used.
+			const auto     begin  = SpecNowNs();
+			const uint64_t vs     = vertex_stages.front().stage.program->shader_hash;
+			const uint64_t ps     = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+			const auto     report = [&](const char* stage, const std::string& what) {
+                differs = true;
+                static std::atomic<uint32_t> logged {0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    Log::WriteUnmuted(fmt::format(
+                        "MT GPU =4: diferencia vs {:016x} ps {:016x} {}: {}\n", vs, ps, stage, what));
+                }
+			};
+			for (size_t i = 0; i < vertex_stages.size(); i++) {
+				spec->tc.graphics.vertex[i].runtime = &state.vertex_info[i].stage;
+				if (auto what = CompareBindings(bindings.vertex[i], spec->tc.graphics.vertex[i]);
+				    !what.empty()) {
+					report("vertex", what);
+				}
+			}
+			if (state.ps_active && spec->tc.graphics.pixel) {
+				spec->tc.graphics.pixel->runtime = &state.ps_input_info.stage;
+				if (auto what = CompareBindings(*bindings.pixel, *spec->tc.graphics.pixel);
+				    !what.empty()) {
+					report("pixel", what);
+				}
+			}
+			if (auto what = CompareImageFlags(tc.images, spec->tc.images); !what.empty()) {
+				report("image flags", what);
+			}
+			if (spec->tc.deferred.size() != spec_trace.size()) {
+				report("deferred", fmt::format("acciones {} vs {}", spec->tc.deferred.size(),
+				                               spec_trace.size()));
+			} else {
+				for (size_t k = 0; k < spec_trace.size(); k++) {
+					if (std::string_view(spec->tc.deferred[k].name) != spec_trace[k]) {
+						report("deferred", fmt::format("accion {}: {} vs {}", k,
+						                               spec->tc.deferred[k].name, spec_trace[k]));
+						break;
+					}
+				}
+			}
+			spec->tc.deferred.clear();
+			consume_ns += SpecNowNs() - begin;
+		}
+		if (spec != nullptr) {
+			MtGpu::NoteSpecOutcome(spec_reason, from_worker, differs, consume_ns);
+		}
+	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	// KYTY_MT_GPU=3: the same stages again in a second context, before PrepareGraphicsBindings
 	// (which rebinds through the shared images); the pipeline is compared below.

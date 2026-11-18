@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
+#include "graphics/host_gpu/renderer/mtGpuWorkers.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -142,6 +144,10 @@ DrawPrepScanner::DrawPrepScanner(RenderContext& renderer, const char* name): m_r
 		m_workers.emplace_back([this] { WorkerRun(); });
 	}
 	m_thread = std::thread([this] { Run(); });
+	// KYTY_MT_GPU=1/4: the translation workers take the chunks this scanner gives them.
+	if (std::strcmp(name, "graphics") == 0) {
+		MtGpu::StartWorkers(renderer);
+	}
 }
 
 DrawPrepScanner::QueueState& DrawPrepScanner::State(uint32_t queue) {
@@ -178,6 +184,9 @@ DrawPrepScanner::~DrawPrepScanner() {
 		if (worker.joinable()) {
 			worker.join();
 		}
+	}
+	if (MtGpu::WorkersEnabled()) {
+		MtGpu::StopWorkers(); // no-op for a scanner that did not start them
 	}
 }
 
@@ -403,6 +412,10 @@ void DrawPrepScanner::ScanDraw(uint64_t seq, uint32_t ordinal, const uint32_t* g
 	if (m_renderer.GetPipelineCache().DrawPrepDescribeGraphics(sh.GetVs(), sh.GetPs(),
 	                                                           ctx.GetShaderRegisters(), ctx, ucfg,
 	                                                           mapping, ps_active, inputs)) {
+		if (MtGpu::WorkersEnabled()) {
+			// KYTY_MT_GPU=1/4: what these registers make of the draw, for the open chunk.
+			MtGpu::SpecAddDraw(key, inputs);
+		}
 		Dispatch(key, inputs);
 	}
 }
@@ -522,6 +535,16 @@ void DrawPrepScanner::Scan(const Item& item) {
 		LogScanStopped("a command buffer it could not copy, or one the GPU thread had passed",
 		               header, reinterpret_cast<uint64_t>(guest));
 	};
+	// KYTY_MT_GPU=1/4: the chunk open at the end of the scan (however it ends) goes to the
+	// translation workers.
+	struct ChunkEnd {
+		bool on;
+		~ChunkEnd() {
+			if (on) {
+				MtGpu::SpecChunkEnd();
+			}
+		}
+	} const chunk_end {MtGpu::WorkersEnabled() && m_queue == 0};
 	std::vector<Cursor> stack(1);
 	if (!copy(0, item.commands.data(), item.commands.size(), stack[0])) {
 		unreadable(0, item.commands.data());
@@ -688,6 +711,9 @@ void DrawPrepScanner::Scan(const Item& item) {
 					}
 					if (chained) {
 						MtGpu::NotePrepared(reinterpret_cast<uint64_t>(sub));
+						if (MtGpu::WorkersEnabled() && m_queue == 0) {
+							MtGpu::SpecChunkBegin(item.seq, reinterpret_cast<uint64_t>(sub));
+						}
 						stack.back() = next;
 					} else {
 						stack.push_back(next);

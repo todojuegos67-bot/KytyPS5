@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
+#include "graphics/host_gpu/renderer/mtGpuWorkers.h"
 
 #include "common/logging/log.h"
 #include "common/perfStats.h"
@@ -428,6 +429,9 @@ void NoteSpeculation(const char* reason) {
 }
 
 void Report(uint64_t frames, double seconds) {
+	if (WorkersMode()) {
+		ReportWorkers(seconds);
+	}
 	if (SelfCheckEnabled()) {
 		const uint64_t checked = g_checked.load(std::memory_order_relaxed);
 		const uint64_t differ  = g_differ.load(std::memory_order_relaxed);
