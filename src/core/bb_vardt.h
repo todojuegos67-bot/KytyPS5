@@ -12,7 +12,9 @@
 // limiter (BB_FPS_CAP keeps its vblank / pacer meaning and is not read here); per-frame
 // time-step reads use the live dt, frame-count -> seconds conversions stay 1/30;
 // Havok semi-fixed substeps; the presenter flips each frame as soon as it arrives
-// (BB_VRR_PRESENT, on by default with BB_VARIABLE_DT=1).
+// (BB_VRR_PRESENT, on by default with BB_VARIABLE_DT=1). BB_RUN_FIX (on by default with
+// BB_VARIABLE_DT=1, BB_RUN_FIX=0 off): the ChrCtrl sprint wall check uses move / dt instead of
+// move * 30, so characters no longer drop to half speed while sprinting at high fps.
 namespace BB::VarDt {
 bool Enabled();          // BB_VARIABLE_DT=1
 bool ImmediatePresent(); // Enabled() and BB_VRR_PRESENT != 0

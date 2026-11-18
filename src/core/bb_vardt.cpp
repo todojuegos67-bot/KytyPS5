@@ -34,7 +34,10 @@
 //  8. camera DirectPitchRate (per-frame lerp factor [cam+0x23C] = 0.06 from the ctor at
 //     0x143A64D, used at 0x143F97E / 0x143FA9F) is replaced by 1 - 0.94^(dt*30) each frame;
 //  9. the per-frame damping 0.95 (vmulps at 0x1A4ABCA) and the cloth stiffness 1.0 defaults keep
-//     the reviewed laws (0.95^(dt*30), min(dt*30, 1)), re-evaluated each guest flip.
+//     the reviewed laws (0.95^(dt*30), min(dt*30, 1)), re-evaluated each guest flip;
+// 10. BB_RUN_FIX (default on, BB_RUN_FIX=0 off): the ChrCtrl sprint wall check at 0x1514C24
+//     measured the frame's move * 30 (m/s only at 30 fps) and halved sprint speed at high fps;
+//     it now uses move / frame dt, and its 0.8 / 1.2 per-frame factors follow dt (see RunCmpVa).
 #include "core/bb_vardt.h"
 
 #include <algorithm>
@@ -43,6 +46,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <string>
 #include "common/logging/log.h"
@@ -140,6 +144,44 @@ const u8 HavokCmpOrig[8] = {0xC5, 0xF8, 0x2F, 0x05, 0x16, 0xF7, 0x08, 0x03}; // 
 bool g_ragdoll_fix = false;
 u32 g_ragdoll_frames = 0, g_ragdoll_zero_steps = 0;
 double g_ragdoll_last_log = 0;
+// BB_RUN_FIX (default on with BB_VARIABLE_DT=1; BB_RUN_FIX=0 turns it off): the ChrCtrl physics
+// update 0x1514500 (called from 0x1E388F2 for every character, player and NPCs) has a "running
+// into a wall" check after the Havok character proxy moved (0x1514B92..0x1514CCD):
+//   if (root-motion speed [ctrl+0x1E4] > 5.0 m/s && grounded [proxyOwner+0x212]) {
+//       d = |pos [proxyOwner+0x1E0] - previous pos [+0x1F0]|   (the move of THIS frame)
+//       if (d * 30.0 < 1.0) { scale [ctrl+0x1E0] = scale <= 0.5 ? 0.5 : scale * 0.8; }   // blocked
+//       else ...
+//   } else scale = scale >= 1 ? 1 : scale * 1.2;
+// and 0x1514500 multiplies the root-motion displacement by the scale when it is < 1. "d * 30" is
+// the speed in m/s only at 30 fps (the debug panel 0x1517710 prints the same |pos - prev| * 30
+// as "Position : x y z (speed)"). At f fps a character moving at v m/s gives d * 30 = v * 30 / f,
+// so while sprinting (v ~ 5-7 m/s) the check fires on its own above ~150-200 fps, and once any
+// obstacle, slope or a short frame trips it the scale sinks to 0.5 and stays there whenever
+// 0.5 * v * 30 / f < 1, i.e. above ~15 * v (~80-100 fps): the character runs at half speed.
+// Fix: 0x1514C24 "vmulss xmm0, xmm0, [30.0f @0x492632C]" becomes "d / frame dt" (LiveDt, the dt
+// of this frame: exact at any fps, d * 30 at 30 fps), and the per-frame factors 0.8 / 1.2
+// (0x4926334 / 0x4926338, one reader each) follow 0.8^(dt*30) / 1.2^(dt*30). The check is
+// reached through a small host cave that also counts the checks for the 5 s log line; if no
+// executable memory can be had, an in-place "vdivss xmm0, xmm0, [rip -> LiveDt]" is written.
+constexpr u32 RunCmpVa = 0x1514C24;
+const u8 RunCmpOrig[8] = {0xC5, 0xFA, 0x59, 0x05, 0x00, 0x17, 0x41, 0x03}; // -> 30.0 @0x492632C
+constexpr u32 RunThirtyVa = 0x492632C, RunDecayVa = 0x4926334, RunGrowVa = 0x4926338;
+constexpr u32 RunCavePtrVa = 0x56D3FD0; // u64: host cave address for "call [rip+disp]" (bss slack)
+constexpr float RunDecay30 = 0.8f, RunGrow30 = 1.2f;
+struct alignas(16) RunStats {
+    float actual_sum;   // +0: d / dt (m/s)
+    u32 n;              // +4: checks (root motion > 5 m/s, grounded)
+    float intended_sum; // +8: root-motion speed [ctrl+0x1E4]
+    float scale_sum;    // +12: move scale [ctrl+0x1E0] before this frame's update
+    float one;          // +16: 1.0 (the threshold, for the cave's compare)
+    u32 blocked;        // +20: checks with d / dt < 1 m/s
+};
+RunStats* g_run = nullptr;   // host memory, written by the guest through the cave
+bool g_run_fix = false, g_run_factors = false;
+double g_run_last_log = 0;
+u32 g_run_frames = 0;
+const char* g_run_how = "";
+
 constexpr u32 FramePtrVa = 0x55404F8;  // the frame limiter object pointer
 constexpr u32 OffPeriod = 0x18, OffMeasured = 0x264;
 
@@ -391,6 +433,89 @@ bool ReadFrame(float* measured, float* period) {
     return true;
 }
 
+void* AllocExec(size_t n) {
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+#else
+    void* p = mmap(nullptr, n, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+void InstallRunFix() {
+    const char* e = std::getenv("BB_RUN_FIX");
+    if (e != nullptr && e[0] == '0') {
+        LOG_INFO(Lib_VideoOut, "[runfix] BB_RUN_FIX=0: off (sprint wall check stays 'dist * 30')");
+        return;
+    }
+    if (!InsideV(RunCmpVa, 8) || !InsideV(RunCavePtrVa, 8) || !InsideV(RunGrowVa, 4) ||
+        std::memcmp(AtV(RunCmpVa), RunCmpOrig, 8) != 0 || Read32(RunThirtyVa) != Bits(30.0f)) {
+        LOG_WARNING(Lib_VideoOut, "[runfix] ChrCtrl wall check at 0x1514C24 is not the expected "
+                                  "1.09 code: left alone");
+        return;
+    }
+    // Host cave, entered with "call [rip -> RunCavePtrVa]"; rax, xmm1 and the flags are dead at
+    // 0x1514C24 (rax is reloaded at 0x1514C95 on every path, xmm1 at 0x1514C2C, flags at C34).
+    u8* cave = static_cast<u8*>(AllocExec(4096));
+    if (cave != nullptr) {
+        g_run = reinterpret_cast<RunStats*>(cave + 2048);
+        *g_run = RunStats{};
+        g_run->one = 1.0f;
+        const u64 live = reinterpret_cast<u64>(AtV(LiveDtVa));
+        const u64 st = reinterpret_cast<u64>(g_run);
+        u8 c[128];
+        size_t n = 0;
+        const auto put = [&](std::initializer_list<u8> b) {
+            for (const u8 x : b) c[n++] = x;
+        };
+        const auto put64 = [&](u64 v) {
+            std::memcpy(c + n, &v, 8);
+            n += 8;
+        };
+        put({0x48, 0xB8}), put64(live);                      // mov rax, &LiveDt
+        put({0xC5, 0xFA, 0x5E, 0x00});                        // vdivss xmm0, xmm0, [rax]
+        put({0x48, 0xB8}), put64(st);                         // mov rax, &stats
+        put({0xC5, 0xFA, 0x58, 0x08});                        // vaddss xmm1, xmm0, [rax]
+        put({0xC5, 0xFA, 0x11, 0x08});                        // vmovss [rax], xmm1
+        put({0xF0, 0xFF, 0x40, 0x04});                        // lock inc dword [rax+4]
+        put({0xC4, 0xC1, 0x7A, 0x10, 0x8D, 0xE4, 0x01, 0x00, 0x00}); // vmovss xmm1,[r13+0x1E4]
+        put({0xC5, 0xF2, 0x58, 0x48, 0x08});                  // vaddss xmm1, xmm1, [rax+8]
+        put({0xC5, 0xFA, 0x11, 0x48, 0x08});                  // vmovss [rax+8], xmm1
+        put({0xC4, 0xC1, 0x7A, 0x10, 0x8D, 0xE0, 0x01, 0x00, 0x00}); // vmovss xmm1,[r13+0x1E0]
+        put({0xC5, 0xF2, 0x58, 0x48, 0x0C});                  // vaddss xmm1, xmm1, [rax+12]
+        put({0xC5, 0xFA, 0x11, 0x48, 0x0C});                  // vmovss [rax+12], xmm1
+        put({0xC5, 0xF8, 0x2E, 0x40, 0x10});                  // vucomiss xmm0, [rax+16] (1.0)
+        put({0x73, 0x04});                                    // jae +4
+        put({0xF0, 0xFF, 0x40, 0x14});                        // lock inc dword [rax+20]
+        put({0xC3});                                          // ret
+        std::memcpy(cave, c, n);
+        const u64 cave_addr = reinterpret_cast<u64>(cave);
+        std::memcpy(AtV(RunCavePtrVa), &cave_addr, 8);
+        u8 b[8] = {0xFF, 0x15, 0, 0, 0, 0, 0x66, 0x90}; // call [rip+disp32]; 2-byte nop
+        const s32 d = static_cast<s32>(static_cast<s64>(RunCavePtrVa) - (RunCmpVa + 6));
+        std::memcpy(b + 2, &d, 4);
+        std::memcpy(AtV(RunCmpVa), b, 8);
+        g_run_how = "host cave (counts the checks)";
+    } else {
+        u8 b[8] = {0xC5, 0xFA, 0x5E, 0x05, 0, 0, 0, 0}; // vdivss xmm0, xmm0, [rip -> LiveDt]
+        const s32 d = static_cast<s32>(static_cast<s64>(LiveDtVa) - (RunCmpVa + 8));
+        std::memcpy(b + 4, &d, 4);
+        std::memcpy(AtV(RunCmpVa), b, 8);
+        g_run_how = "in place (no executable memory for the cave: no speed log)";
+    }
+    g_run_fix = true;
+    if (Read32(RunDecayVa) == Bits(RunDecay30) && Read32(RunGrowVa) == Bits(RunGrow30)) {
+        MakeWritable(RunDecayVa, RunGrowVa);
+        g_run_factors = true;
+    }
+    LOG_INFO(Lib_VideoOut,
+             "[runfix] on: ChrCtrl sprint wall check 0x1514C24 'move of the frame * 30 < 1 m/s' "
+             "-> 'move / frame dt < 1 m/s' ({}); move-scale factors 0.8 / 1.2 per frame "
+             "(0x4926334 / 0x4926338) -> 0.8^(dt*30) / 1.2^(dt*30): {}",
+             g_run_how, g_run_factors ? "yes" : "NOT FOUND, left per frame");
+}
+
 float EnvFloat(const char* name, float def, float lo, float hi, bool* set = nullptr) {
     const char* m = std::getenv(name);
     if (set) *set = m != nullptr && *m;
@@ -629,6 +754,7 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     if (!restored.empty()) {
         LOG_INFO(Lib_VideoOut, "[vardt] XML lines put back to the original code: {}", restored);
     }
+    InstallRunFix();
 }
 
 void OnGuestFlip(int flip_mode) {
@@ -643,6 +769,10 @@ void OnGuestFlip(int flip_mode) {
             if (g_site_live[i]) Write32(Sites[i].va, Bits(Value(Sites[i], dt)));
         }
         if (g_cam) Write32(PitchRateVa, Bits(PitchRate(dt)));
+        if (g_run_factors) {
+            Write32(RunDecayVa, Bits(std::pow(RunDecay30, dt * 30.0f)));
+            Write32(RunGrowVa, Bits(std::pow(RunGrow30, dt * 30.0f)));
+        }
     }
     float measured = 0, period = 0;
     const bool frame = ReadFrame(&measured, &period);
@@ -673,6 +803,35 @@ void OnGuestFlip(int flip_mode) {
                      havok_acc * 1e3);
             g_ragdoll_frames = g_ragdoll_zero_steps = 0;
             g_ragdoll_last_log = now;
+        }
+    }
+    if (g_run_fix) {
+        ++g_run_frames;
+        if (g_run_last_log == 0) g_run_last_log = now;
+        if (now - g_run_last_log >= 5.0) {
+            const double secs = now - g_run_last_log;
+            if (g_run != nullptr) {
+                // Written by guest threads without a lock: a snapshot, good enough for a log.
+                volatile RunStats* v = g_run;
+                RunStats s{};
+                s.actual_sum = v->actual_sum, s.n = v->n, s.intended_sum = v->intended_sum;
+                s.scale_sum = v->scale_sum, s.blocked = v->blocked;
+                v->actual_sum = 0.0f;
+                v->intended_sum = 0.0f;
+                v->scale_sum = 0.0f;
+                v->n = 0;
+                v->blocked = 0;
+                const double k = s.n ? 1.0 / s.n : 0.0;
+                LOG_INFO(Lib_VideoOut,
+                         "[runfix] {:.1f}s {:.1f} fps: {} fast-move checks (root motion > 5 m/s, "
+                         "grounded; mostly the player sprinting): root-motion speed avg {:.2f} "
+                         "m/s, actual speed (move / dt) avg {:.2f} m/s, move scale avg {:.3f}, "
+                         "blocked (< 1 m/s) {}",
+                         secs, g_run_frames / secs, s.n, s.intended_sum * k,
+                         s.actual_sum * k, s.scale_sum * k, s.blocked);
+            }
+            g_run_frames = 0;
+            g_run_last_log = now;
         }
     }
     if (g_last_flip > 0) g_flip_iv.Add(now - g_last_flip);
