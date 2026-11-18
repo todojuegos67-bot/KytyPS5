@@ -1,0 +1,29 @@
+Path tracing for Bloodborne PC
+==============================
+
+Author: Joao Vitor Alves
+Upstream: https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing (commit 04d398f)
+License: GNU General Public License, version 2 (LICENSES/GPL-2.0-only.txt, the upstream LICENSE
+file verbatim).
+
+The mod was written for SuperMedo's Bloodborne PC port (https://github.com/Supermedo/bloodborne_pc,
+GPL-2.0-or-later). This repository carries it, adapted to this renderer, in:
+
+  src/video_core/renderer_vulkan/rt/        the path tracer (vk_ray_tracing.*, rt_*.h, DLSS RR guides)
+  src/video_core/renderer_vulkan/pt_shim/   its log helper (bbport_stdout.h)
+  src/video_core/host_shaders/rt_*.comp, dlss_rr_*.comp
+  tests/pathtracing/                        its unit tests
+  data/pathtracing/glass_masks/             its glass masks
+  documents/pathtracing/                    its design notes and its patch to SuperMedo's engine
+
+Changes made here (GPL-2.0 section 2a): environment knobs renamed BB_RT_* -> BB_PT_* and BB_RT ->
+BB_PATHTRACING (our older BB_RT_* features keep their names), include paths, the compatibility
+layer pt_compat.h, the presets pt_config.h, log output through our logger, F9 handling in our
+window code, Ray Reconstruction turned off (not hosted), and the small changes listed in
+documents/pathtracing/PATH_TRACING.md. Each vendored file carries a header naming the author.
+
+rt/scene_resolution.h is from SuperMedo's port (GPL-2.0-or-later), with the mod's ProxyAccess
+addition.
+
+NVIDIA's nvngx_dlssd.dll (DLSS Ray Reconstruction) is not included; it ships under the NVIDIA
+DLSS SDK licence and is not used by this port yet.

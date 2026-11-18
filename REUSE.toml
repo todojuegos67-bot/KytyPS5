@@ -117,3 +117,9 @@ SPDX-License-Identifier = "MIT"
 path = "src/video_core/host_shaders/fsr/*"
 SPDX-FileCopyrightText = "Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved."
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["data/pathtracing/**", "documents/pathtracing/PATH_TRACING-upstream.md", "documents/pathtracing/supermedo-1.9.8.6-pathtracing.patch"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Joao Vitor Alves (path tracing for Bloodborne PC, https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing)"
+SPDX-License-Identifier = "GPL-2.0-only"

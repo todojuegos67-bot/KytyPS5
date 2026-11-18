@@ -62,6 +62,9 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+    /// Like Create, but returns false instead of asserting when the allocation fails.
+    bool TryCreate(const vk::ImageCreateInfo& image_ci);
+    VkResult CreateImpl(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
 
@@ -169,6 +172,9 @@ public:
     BackingImage* backing{};
     u64* memory_usage_counter{};
     u64 image_uid{};
+    // Path tracing (rt/vk_ray_tracing.cpp): last tick of GPU work that reads this image as a
+    // hit-surface texture, ~0 while a cached BLAS still refers to it. 0 = not held.
+    u64 rt_hold_tick{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 cpu_hash{};

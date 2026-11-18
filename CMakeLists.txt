@@ -39,6 +39,9 @@ cmake_dependent_option(ENABLE_SYSTEM_VULKAN "Enable the system Vulkan driver" OF
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
+# Path tracing mod by Joao Vitor Alves (GPL-2.0), documents/pathtracing/PATH_TRACING.md. Built in
+# by default; it only runs with BB_PATHTRACING=1. OFF leaves it (and its 34 shaders) out.
+option(ENABLE_PATHTRACING "Build the path tracing engine (runtime switch BB_PATHTRACING=1)" ON)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
@@ -1435,6 +1438,20 @@ target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURC
 
 if (ENABLE_DISCORD_RPC)
     target_compile_definitions(shadps4 PRIVATE ENABLE_DISCORD_RPC)
+endif()
+
+if (ENABLE_PATHTRACING)
+    target_compile_definitions(shadps4 PRIVATE ENABLE_PATHTRACING)
+    target_sources(shadps4 PRIVATE
+        src/video_core/renderer_vulkan/rt/vk_ray_tracing.cpp
+        src/video_core/renderer_vulkan/rt/vk_ray_tracing.h
+        src/video_core/renderer_vulkan/rt/vk_ray_tracing_ptlas.cpp
+        src/video_core/renderer_vulkan/rt/vk_ray_tracing_ptlas.h
+        src/video_core/renderer_vulkan/rt/vk_dlss_rr.cpp
+        src/video_core/renderer_vulkan/rt/vk_dlss_rr.h
+        src/video_core/renderer_vulkan/rt/pt_compat.h
+        src/video_core/renderer_vulkan/rt/pt_config.h
+        src/video_core/renderer_vulkan/pt_shim/bbport_stdout.h)
 endif()
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")

@@ -22,6 +22,8 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/rt/pt_config.h"
+#include "video_core/renderer_vulkan/rt/rt_gi_pipeline.h"
 
 #include <vk_mem_alloc.h>
 
@@ -442,8 +444,10 @@ bool Instance::CreateDevice() {
         const char* e = std::getenv(n);
         return e && e[0] == '1';
     };
+    // Path tracing (BB_PATHTRACING=1, rt/vk_ray_tracing.cpp) needs the same AS + ray query base.
+    const bool pt_wanted = Vulkan::Rt::PtMasterSwitch();
     if (bb_env_on("BB_RT_REFLECT") || bb_env_on("BB_RT_VOLUMETRIC") ||
-        bb_env_on("BB_RT_SHADOWS")) {
+        bb_env_on("BB_RT_SHADOWS") || pt_wanted) {
         const auto has = [&](std::string_view n) {
             return std::find(available_extensions.begin(), available_extensions.end(), n) !=
                    available_extensions.end();
@@ -489,6 +493,84 @@ bool Instance::CreateDevice() {
         }
     }
     bb_rt_reflect = bb_rt_on;
+    // Path tracing mod (Joao Vitor Alves, GPL-2.0; adapted from supermedo-1.9.8.6.patch,
+    // vk_instance.cpp): optional extras on top of ray query, only with BB_PATHTRACING=1.
+    if (pt_wanted && bb_rt_on) {
+        const auto has = [&](std::string_view n) {
+            return std::find(available_extensions.begin(), available_extensions.end(), n) !=
+                   available_extensions.end();
+        };
+        const auto enable = [&](const char* n) {
+            if (std::find_if(enabled_extensions.begin(), enabled_extensions.end(),
+                             [&](const char* x) { return std::string_view{x} == n; }) ==
+                enabled_extensions.end()) {
+                LOG_INFO(Render_Vulkan, "Enabling extension: {} (path tracing)", n);
+                enabled_extensions.push_back(n);
+            }
+            return true;
+        };
+        pt_ray_query = true;
+        // The preset fills the unset BB_PT_* knobs read here (BB_PT_OMM, BB_PT_GI_PIPELINE...).
+        Vulkan::Rt::ApplyPtPreset();
+        const auto f12 = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                      vk::PhysicalDeviceVulkan12Features>()
+                             .get<vk::PhysicalDeviceVulkan12Features>();
+        pt_descriptor_indexing = f12.descriptorBindingPartiallyBound &&
+                                 f12.runtimeDescriptorArray &&
+                                 f12.shaderSampledImageArrayNonUniformIndexing;
+        const char* omm_env = std::getenv("BB_PT_OMM");
+        const bool omm_wanted = !omm_env || omm_env[0] != '0';
+        if (omm_wanted && has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
+            pt_opacity_micromap =
+                physical_device
+                    .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                  vk::PhysicalDeviceOpacityMicromapFeaturesEXT>()
+                    .get<vk::PhysicalDeviceOpacityMicromapFeaturesEXT>()
+                    .micromap &&
+                enable(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+        }
+        pt_cluster_as_exposed = has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        if (!bb_env_on("BB_PT_PTLAS")) {
+            pt_ptlas_problem = "default off, BB_PT_PTLAS=1 to enable";
+        } else if (!has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+            pt_ptlas_problem = "VK_NV_partitioned_acceleration_structure not exposed";
+        } else if (!physical_device
+                        .getFeatures2<vk::PhysicalDeviceFeatures2,
+                                      vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV>()
+                        .get<vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV>()
+                        .partitionedAccelerationStructure) {
+            pt_ptlas_problem = "partitionedAccelerationStructure feature not supported";
+        } else {
+            pt_partitioned_as = enable(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+            pt_ptlas_problem = "";
+        }
+        pt_rt_pipeline_exposed = has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        pt_rt_reorder_exposed = has(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+        const Vulkan::Rt::GiPipelineMode gi_mode = Vulkan::Rt::GiPipelineFromEnv(
+            std::getenv("BB_PT_GI_PIPELINE"), std::getenv("BB_PT_GI_SER"),
+            pt_rt_pipeline_exposed, pt_rt_reorder_exposed, properties.vendorID);
+        if (gi_mode.pipeline) {
+            const auto pf = physical_device.getFeatures2<
+                vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceRayTracingPipelineFeaturesKHR,
+                vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV>();
+            pt_rt_pipeline =
+                pf.get<vk::PhysicalDeviceRayTracingPipelineFeaturesKHR>().rayTracingPipeline &&
+                enable(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+            pt_rt_reorder =
+                pt_rt_pipeline && gi_mode.ser &&
+                pf.get<vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV>()
+                    .rayTracingInvocationReorder &&
+                enable(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[pathtracing] device: ray query on, descriptor indexing {}, opacity micromaps {}, "
+                 "RT pipeline {}, SER {}, PTLAS {}",
+                 pt_descriptor_indexing, pt_opacity_micromap, pt_rt_pipeline, pt_rt_reorder,
+                 pt_partitioned_as ? std::string{"on"} : pt_ptlas_problem);
+    } else if (pt_wanted) {
+        LOG_WARNING(Render_Vulkan, "[pathtracing] off: VK_KHR_acceleration_structure, "
+                                   "VK_KHR_ray_query or bufferDeviceAddress unavailable");
+    }
 
     // bb-dlssg-sl: up to 4 in the graphics family (Streamline's DLSS-G queues after ours).
     static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -747,6 +829,44 @@ bool Instance::CreateDevice() {
         rt_ci.pNext = &bb_rt_as;
         rt_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
         rt_ci.ppEnabledExtensionNames = enabled_extensions.data();
+    }
+    // Path tracing: optional features chained after the AS / ray query pair above.
+    static vk::PhysicalDeviceOpacityMicromapFeaturesEXT pt_omm_f{};
+    static vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV pt_ptlas_f{};
+    static vk::PhysicalDeviceRayTracingPipelineFeaturesKHR pt_pipe_f{};
+    static vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV pt_ser_f{};
+    if (pt_ray_query) {
+        auto& pt_ci = device_chain.get<vk::DeviceCreateInfo>();
+        if (pt_descriptor_indexing) {
+            auto& f12 = device_chain.get<vk::PhysicalDeviceVulkan12Features>();
+            f12.shaderSampledImageArrayNonUniformIndexing = true;
+            f12.descriptorBindingPartiallyBound = true;
+            f12.runtimeDescriptorArray = true;
+        }
+        const auto link = [&](auto& feature) {
+            feature.pNext = const_cast<void*>(pt_ci.pNext);
+            pt_ci.pNext = &feature;
+        };
+        if (pt_opacity_micromap) {
+            pt_omm_f = vk::PhysicalDeviceOpacityMicromapFeaturesEXT{.micromap = true};
+            link(pt_omm_f);
+        }
+        if (pt_partitioned_as) {
+            pt_ptlas_f = vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV{
+                .partitionedAccelerationStructure = true};
+            link(pt_ptlas_f);
+        }
+        if (pt_rt_pipeline) {
+            pt_pipe_f = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR{.rayTracingPipeline = true};
+            link(pt_pipe_f);
+        }
+        if (pt_rt_reorder) {
+            pt_ser_f = vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV{
+                .rayTracingInvocationReorder = true};
+            link(pt_ser_f);
+        }
+        pt_ci.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+        pt_ci.ppEnabledExtensionNames = enabled_extensions.data();
     }
     if (BB::Upscale::Capture()) {
         std::string names;

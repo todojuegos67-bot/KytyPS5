@@ -4,6 +4,7 @@
 #pragma once
 
 #include <span>
+#include <string>
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -83,6 +84,40 @@ public:
     /// bb-rt: BB_RT_REFLECT, BB_RT_VOLUMETRIC or BB_RT_SHADOWS =1 and the device got AS + ray query.
     bool IsRtReflectEnabled() const {
         return bb_rt_reflect;
+    }
+
+    // Path tracing mod (BB_PATHTRACING=1, rt/vk_ray_tracing.cpp, by Joao Vitor Alves, GPL-2.0).
+    // All false unless BB_PATHTRACING=1 and the device has AS + ray query + bufferDeviceAddress.
+    static inline void (*lost_hook)() = nullptr; // set by the path tracer; called on device loss
+    bool IsRayQuerySupported() const {
+        return pt_ray_query;
+    }
+    bool IsOpacityMicromapSupported() const {
+        return pt_ray_query && pt_opacity_micromap;
+    }
+    bool IsClusterAccelerationStructureExposed() const {
+        return pt_cluster_as_exposed;
+    }
+    bool IsPartitionedAccelerationStructureSupported() const {
+        return pt_ray_query && pt_partitioned_as;
+    }
+    const std::string& PartitionedAccelerationStructureProblem() const {
+        return pt_ptlas_problem;
+    }
+    bool IsRayTracingPipelineSupported() const {
+        return pt_ray_query && pt_rt_pipeline;
+    }
+    bool IsRayTracingReorderSupported() const {
+        return pt_ray_query && pt_rt_pipeline && pt_rt_reorder;
+    }
+    bool IsRayTracingPipelineExposed() const {
+        return pt_rt_pipeline_exposed;
+    }
+    bool IsRayTracingReorderExposed() const {
+        return pt_rt_reorder_exposed;
+    }
+    bool IsRtSurfaceSupported() const {
+        return pt_ray_query && pt_descriptor_indexing;
     }
 
     bool IsAnisotropicFilteringSupported() const {
@@ -554,6 +589,17 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool bb_rt_reflect{}; // bb-rt-reflect: BB_RT_REFLECT=1 and AS + ray query enabled
+    // Path tracing (BB_PATHTRACING=1).
+    bool pt_ray_query{};
+    bool pt_opacity_micromap{};
+    bool pt_cluster_as_exposed{};
+    bool pt_partitioned_as{};
+    std::string pt_ptlas_problem{"ray queries unavailable"};
+    bool pt_rt_pipeline{};
+    bool pt_rt_reorder{};
+    bool pt_rt_pipeline_exposed{};
+    bool pt_rt_reorder_exposed{};
+    bool pt_descriptor_indexing{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

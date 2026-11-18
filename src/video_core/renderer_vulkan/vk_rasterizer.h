@@ -31,6 +31,9 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+#ifdef ENABLE_PATHTRACING
+class RayTracing; // path tracing mod (rt/vk_ray_tracing.h)
+#endif
 
 class Rasterizer {
 public:
@@ -233,6 +236,11 @@ private:
     bool needs_barrier{};
 
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
+#ifdef ENABLE_PATHTRACING
+    // Path tracing mod by Joao Vitor Alves (BB_PATHTRACING=1; documents/pathtracing). Null unless
+    // the switch is on. Its draw / light / composite hooks are not wired yet (see the docs).
+    std::unique_ptr<RayTracing> ray_tracing;
+#endif
     bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
     // bb-rt-fullres (BB_RT_REFLECT_FULLRES=1): set when the last RT pass produced the full-res
     // image; the next draw with the composite PS samples it instead of the SSR target.

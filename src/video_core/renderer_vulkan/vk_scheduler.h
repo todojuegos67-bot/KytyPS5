@@ -369,6 +369,14 @@ public:
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
+    /// Waits for everything submitted so far (not the open command buffer). Path tracing.
+    void WaitSubmitted() {
+        const u64 tick = CurrentTick();
+        if (tick > 1) {
+            Wait(tick - 1);
+        }
+    }
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 

@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/rt/pt_config.h"
 #include "imgui/bb_menu.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderdoc.h"
@@ -266,6 +267,18 @@ void WindowSDL::WaitEvent() {
         event.key.key == SDLK_F8) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
             BB::Upscale::ToggleOverlay();
+        }
+        return;
+    }
+
+    // Path tracing mod (BB_PATHTRACING=1 only): F9 switches path tracing off / on in game, as in
+    // the mod. It takes F9 from shadPS4's hotkey_pause while path tracing is on.
+    if (Vulkan::Rt::PtMasterSwitch() &&
+        (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.key == SDLK_F9) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+            const bool on = Vulkan::Rt::ToggleEffects();
+            LOG_INFO(Render_Vulkan, "[pathtracing] F9: path tracing {}", on ? "on" : "off");
         }
         return;
     }

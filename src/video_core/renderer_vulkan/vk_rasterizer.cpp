@@ -17,6 +17,9 @@
 #include "core/bb_hud_native_hook.h"
 #include "core/bb_ssr_probe.h"
 #include "video_core/renderer_vulkan/bb_rt_reflect.h"
+#ifdef ENABLE_PATHTRACING
+#include "video_core/renderer_vulkan/rt/vk_ray_tracing.h"
+#endif
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -84,6 +87,22 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             LOG_ERROR(Render_Vulkan, "[rt] init failed: RT features off");
         }
     }
+
+#ifdef ENABLE_PATHTRACING
+    // Path tracing (BB_PATHTRACING=1, default off: no object, no work). Started here, after the
+    // caches it uses; it frees itself before them (declared after them in vk_rasterizer.h).
+    if (RayTracing::Wanted()) {
+        if (BbRtAnyRequested()) {
+            LOG_WARNING(Render_Vulkan, "[pathtracing] BB_RT_REFLECT / BB_RT_VOLUMETRIC / "
+                                       "BB_RT_SHADOWS are also on: both tracers will run");
+        }
+        ray_tracing = std::make_unique<RayTracing>(instance, scheduler, runtime, texture_cache,
+                                                   buffer_cache);
+        LOG_INFO(Render_Vulkan, "[pathtracing] engine {}", ray_tracing->Enabled()
+                     ? "on"
+                     : "off (see the 'Ray tracing:' lines above for the reason)");
+    }
+#endif
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();

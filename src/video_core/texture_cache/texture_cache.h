@@ -7,6 +7,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <boost/container/small_vector.hpp>
@@ -203,6 +204,30 @@ public:
         return &image;
     }
 
+    /// Path tracing (BB_PATHTRACING=1): like TryGetImage, but uid 0 matches any image in the slot
+    /// and unregistered images (pending deletion, still alive) are returned too.
+    [[nodiscard]] Image* TryGetImageRt(ImageId id, u64 uid) {
+        if (!id || !slot_images.IsAllocated(id)) {
+            return nullptr;
+        }
+        auto& image = slot_images[id];
+        return !uid || image.image_uid == uid ? &image : nullptr;
+    }
+    /// Path tracing: keeps the image alive until `tick` is free on the GPU (~0: until released
+    /// with a finite tick). DeleteImage defers the erase of a held image (EraseHeldImages).
+    void HoldImage(ImageId id, u64 uid, u64 tick) {
+        Image* image = TryGetImageRt(id, uid);
+        if (!image) {
+            return;
+        }
+        image->rt_hold_tick = tick;
+        if (tick == ~0ull) {
+            TouchImage(*image);
+        }
+    }
+    bool HoldReleased(const Image& image);
+    void EraseHeldImages();
+
     /// Get the associated depth stencil image if it is still valid.
     ImageId GetAssociatedDepth(Image& image) {
         if (!image.depth_id) {
@@ -392,6 +417,8 @@ private:
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
+    /// Frees the image slot and its views (the deferred half of DeleteImage).
+    void EraseImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image);
@@ -433,6 +460,12 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    struct HeldErase {
+        ImageId image_id;
+        u64 uid;
+        u64 tick;
+    };
+    std::vector<HeldErase> held_erases; // path tracing: deletions waiting for the RT hold
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;

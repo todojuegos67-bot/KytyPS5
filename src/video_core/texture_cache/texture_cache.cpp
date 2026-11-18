@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/renderer_vulkan/rt/rt_surface.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -1226,6 +1227,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    EraseHeldImages();
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
@@ -1259,15 +1261,44 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
     }
 
+    // Path tracing: a texture the ray tracer still reads waits for its hold (EraseHeldImages).
+    if (image.rt_hold_tick) {
+        held_erases.push_back({image_id, image.image_uid, scheduler.CurrentTick()});
+        return;
+    }
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
-        Image& image = slot_images[image_id];
-        for (auto& backing : image.backing_images) {
-            for (const ImageViewId image_view_id : backing.image_view_ids) {
-                slot_image_views.Erase(image_view_id);
-            }
+    scheduler.DeferOperation([this, image_id] { EraseImage(image_id); });
+}
+
+void TextureCache::EraseImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    for (auto& backing : image.backing_images) {
+        for (const ImageViewId image_view_id : backing.image_view_ids) {
+            slot_image_views.Erase(image_view_id);
         }
-        slot_images.Erase(image_id);
+    }
+    slot_images.Erase(image_id);
+}
+
+bool TextureCache::HoldReleased(const Image& image) {
+    return Vulkan::Rt::HoldReleased(image.rt_hold_tick,
+                                    [&](u64 tick) { return scheduler.IsFree(tick); });
+}
+
+void TextureCache::EraseHeldImages() {
+    if (held_erases.empty()) {
+        return;
+    }
+    std::erase_if(held_erases, [&](const HeldErase& h) {
+        if (!slot_images.IsAllocated(h.image_id) ||
+            slot_images[h.image_id].image_uid != h.uid) {
+            return true;
+        }
+        if (!scheduler.IsFree(h.tick) || !HoldReleased(slot_images[h.image_id])) {
+            return false;
+        }
+        EraseImage(h.image_id);
+        return true;
     });
 }
 
