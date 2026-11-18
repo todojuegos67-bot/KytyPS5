@@ -39,14 +39,74 @@ struct ImageUsage {
 	bool video_out     = false;
 };
 
+// What the image itself keeps of its use by the draw being emitted: the attachment state set
+// while recording (AcquireRenderTargets), and whether the cache replaced it under a draw that
+// had bound it. Cleared by RenderExecutor::ResetBindings. MT GPU stage C (gt7-mt-1117): the
+// binding flags proper (bound, target, storage) moved to ImageBindingTable, per translation
+// context; these stay here because only the emission (serialised, scheduler lock) writes the
+// attachment state, and needs_rebind is the cache's verdict on the image, whoever bound it.
 struct ImageBinding {
 	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
 	vk::AccessFlags2 attachment_access;
-	bool             is_bound      = false;
-	bool             is_target     = false;
-	bool             needs_rebind  = false;
-	bool             force_general = false;
-	bool             shader_write  = false;
+	bool             needs_rebind = false;
+};
+
+// MT GPU stage C: one translation context's binding flags of one image (were ImageBinding's).
+struct ImageBindFlags {
+	bool is_bound      = false;
+	bool is_target     = false;
+	bool force_general = false;
+	bool shader_write  = false;
+
+	ImageBindFlags& operator|=(const ImageBindFlags& o) noexcept {
+		is_bound |= o.is_bound;
+		is_target |= o.is_target;
+		force_general |= o.force_general;
+		shader_write |= o.shader_write;
+		return *this;
+	}
+	bool operator==(const ImageBindFlags&) const = default;
+};
+
+// MT GPU stage C: the binding flags of the images one translation context has bound (a few
+// dozen at most per draw: a flat vector, in the order they were first bound). Written by its
+// context (BindImage, BindRenderTarget, ResetBindings) and by the texture cache (merges,
+// destruction); read by both. Owned by RenderExecutor::TranslationContext; the texture cache
+// reads every registered table (TextureCache::BindFlags). Not thread-safe by itself: written
+// and read under the texture cache's lock.
+class ImageBindingTable {
+public:
+	[[nodiscard]] const ImageBindFlags* Find(ImageId id) const noexcept {
+		for (const auto& [key, flags]: m_entries) {
+			if (key == id) return &flags;
+		}
+		return nullptr;
+	}
+	[[nodiscard]] ImageBindFlags Get(ImageId id) const noexcept {
+		const auto* flags = Find(id);
+		return flags != nullptr ? *flags : ImageBindFlags {};
+	}
+	ImageBindFlags& At(ImageId id) {
+		for (auto& [key, flags]: m_entries) {
+			if (key == id) return flags;
+		}
+		return m_entries.emplace_back(id, ImageBindFlags {}).second;
+	}
+	void Erase(ImageId id) noexcept {
+		for (size_t i = 0; i < m_entries.size(); i++) {
+			if (m_entries[i].first == id) {
+				m_entries.erase(m_entries.begin() + static_cast<std::ptrdiff_t>(i));
+				return;
+			}
+		}
+	}
+	void Clear() noexcept { m_entries.clear(); }
+	[[nodiscard]] const std::vector<std::pair<ImageId, ImageBindFlags>>& Entries() const noexcept {
+		return m_entries;
+	}
+
+private:
+	std::vector<std::pair<ImageId, ImageBindFlags>> m_entries;
 };
 
 // Round 167 (images:lean): while one lives on the GPU thread, the image uses made are a draw's or

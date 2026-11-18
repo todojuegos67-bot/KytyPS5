@@ -1606,33 +1606,37 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.info.data.Empty()) {
 		return;
 	}
-	if (image.binding.is_bound) {
-		image.binding.force_general |= image.binding.shader_write != storage;
+	auto& flags = m_active->images.At(id);
+	if (flags.is_bound) {
+		flags.force_general |= flags.shader_write != storage;
 	}
-	image.binding.is_bound = true;
-	image.binding.shader_write |= storage;
-	m_bound_images.push_back(id);
+	flags.is_bound = true;
+	flags.shader_write |= storage;
+	m_active->bound_ids.push_back(id);
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
-	if (!image.binding.is_target) {
+	auto& flags = m_active->images.At(id);
+	if (!flags.is_target) {
 		NoteBindlessStateChange(image);
 	}
-	image.binding.is_target = true;
-	m_bound_images.push_back(id);
+	flags.is_target = true;
+	m_active->bound_ids.push_back(id);
 }
 
 void RenderExecutor::ResetBindings() {
-	for (const auto id: m_bound_images) {
+	auto& tc = *m_active;
+	for (const auto id: tc.bound_ids) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
-			if (image->binding.is_target) {
+			if (tc.images.Get(id).is_target) {
 				NoteBindlessStateChange(*image);
 			}
+			tc.images.Erase(id);
 			image->binding = {};
 		}
 	}
-	m_bound_images.clear();
+	tc.bound_ids.clear();
 }
 
 // The T#s of keys [first, first + count) of a bindless heap whose keys' T#s are `stride` bytes
@@ -3835,9 +3839,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
-				if (old_image->binding.is_target) {
+				if (m_active->images.Get(old_image->self_id).is_target) {
 					NoteBindlessStateChange(*old_image);
 				}
+				m_active->images.Erase(old_image->self_id);
 				old_image->binding = {};
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -4041,9 +4046,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
-				if (old_image->binding.is_target) {
+				if (m_active->images.Get(old_image->self_id).is_target) {
 					NoteBindlessStateChange(*old_image);
 				}
+				m_active->images.Erase(old_image->self_id);
 				old_image->binding = {};
 			}
 			target.desc.view_info.base_level = target.guest_mip_level;
@@ -4133,10 +4139,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 				}
 			}
-			for (const auto id: m_bound_images) {
+			for (const auto id: m_active->bound_ids) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-				if (image == nullptr ||
-				    (!image->binding.shader_write && !image->binding.is_target)) continue;
+				const auto  flags = m_active->images.Get(id);
+				if (image == nullptr || (!flags.shader_write && !flags.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
 					if (written.size != 0) {
@@ -4249,7 +4255,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto make_readable = [&](ImageId id) {
 				auto* image = cache.m_slot_images.try_get(id);
 				if (image == nullptr || !image->registered || !image->bindless_pinned ||
-				    image->binding.is_target || image->info.data.Empty()) {
+				    cache.BindFlags(id).is_target || image->info.data.Empty()) {
 					return;
 				}
 				const auto layout = image->info.IsDepth()
@@ -4296,7 +4302,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			        : 0;
 			for (size_t i = begin; i < resolved.size(); i++) {
 				auto* image = m_context.GetTextureCache().m_slot_images.try_get(resolved[i]);
-				if (image == nullptr || !image->registered || image->binding.is_target ||
+				if (image == nullptr || !image->registered ||
+				    m_context.GetTextureCache().BindFlags(resolved[i]).is_target ||
 				    image->info.data.Empty()) {
 					continue;
 				}
@@ -4320,6 +4327,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
+			const auto bind_flags = m_active->images.Get(binding.image_id);
 			// The draw's or dispatch's own textures (images:lean, round 167).
 			const GuestImageUses        guest_use;
 			const auto&                 view = binding.desc.view_info;
@@ -4332,7 +4340,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                            vk::AccessFlagBits2::eShaderWrite
 				                      : vk::AccessFlagBits2::eShaderRead,
 				              range, vk_buffer);
-			} else if (image.binding.is_target) {
+			} else if (bind_flags.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
 				if (image.info.IsDepth()) {
@@ -4346,11 +4354,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				}
 				image.Transit(layout,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
-				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
+				                  (bind_flags.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
 				              {}, vk_buffer);
-			} else if (image.binding.force_general && !image.info.IsDepth()) {
-				const vk::AccessFlags2 storage_access = image.binding.shader_write
+			} else if (bind_flags.force_general && !image.info.IsDepth()) {
+				const vk::AccessFlags2 storage_access = bind_flags.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
 				image.Transit(vk::ImageLayout::eGeneral,

@@ -115,6 +115,25 @@ public:
 	}
 	void MarkGpuWritten(ImageId id);
 
+	// MT GPU stage C (gt7-mt-1117): the translation contexts' binding tables. The cache asks
+	// whether an image is bound by any live context (an image bound by one must not be merged
+	// away or freed under it); with one context (KYTY_MT_GPU=0) that is exactly the flags the
+	// image used to carry. Registered by RenderContext (the GPU thread's context) and for the
+	// lifetime of any other one (KYTY_MT_GPU=3's shadow). Under the texture cache's lock.
+	void RegisterBindingTable(ImageBindingTable* table);
+	void UnregisterBindingTable(ImageBindingTable* table);
+	[[nodiscard]] ImageBindFlags BindFlags(ImageId id) const noexcept {
+		ImageBindFlags flags;
+		for (const auto* table: m_binding_tables) {
+			flags |= table->Get(id);
+		}
+		return flags;
+	}
+	[[nodiscard]] bool BoundOrTarget(ImageId id) const noexcept {
+		const auto flags = BindFlags(id);
+		return flags.is_bound || flags.is_target;
+	}
+
 	// A fill of exactly an image's memory (a color or depth image's, or a depth image's stencil
 	// plane) as a clear of that image to the fill's word; false when there is no such image or the
 	// word does not decode for its format.
@@ -484,7 +503,7 @@ private:
 	// the image before, 250 to 500 times a frame. Caller holds m_lock.
 	[[nodiscard]] bool        KeepReadOnlyAlias(const ImageInfo& requested, BindingType binding,
 	                                            const Image& cached) const;
-	[[nodiscard]] static bool ReadOnlyAliasCandidate(const Image& image);
+	[[nodiscard]] bool ReadOnlyAliasCandidate(const Image& image) const;
 	void                      MarkReadOnlyAlias(Image& image);
 	// A GPU write to `image`: the read-only aliases that start where it does are freed (their
 	// bytes are no longer what the memory holds). Caller holds m_lock.
@@ -550,6 +569,7 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	std::vector<ImageBindingTable*>                   m_binding_tables;
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                                          m_registered_pages;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;

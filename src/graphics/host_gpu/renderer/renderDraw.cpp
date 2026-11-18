@@ -908,7 +908,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
+		const auto  layout = m_active->images.Get(target.image_id).is_bound
+		                                ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
 		vk::ImageView           attachment_view   = image_view;
 		vk::ImageLayout         attachment_layout = layout;
@@ -2715,6 +2716,27 @@ std::string CompareBindings(const PreparedBindings& a, const PreparedBindings& b
 	return {};
 }
 
+// KYTY_MT_GPU=3, stage C: the textures' binding flags the two translations set. Only what
+// PrepareBindings sets (bound, storage, general); the main table may also hold this draw's
+// earlier targets and targets carried over by a merge, which the shadow does not bind.
+std::string CompareImageFlags(const ImageBindingTable& main, const ImageBindingTable& shadow) {
+	const auto texture_flags = [](ImageBindFlags flags) {
+		flags.is_target = false;
+		return flags;
+	};
+	for (const auto& [id, flags]: shadow.Entries()) {
+		if (texture_flags(main.Get(id)) != texture_flags(flags)) {
+			return fmt::format("image {} flags", id.index);
+		}
+	}
+	for (const auto& [id, flags]: main.Entries()) {
+		if (flags.is_bound && shadow.Find(id) == nullptr) {
+			return fmt::format("image {} bound only in the main context", id.index);
+		}
+	}
+	return {};
+}
+
 void ReportSelfCheck(uint64_t vs_hash, uint64_t ps_hash, const char* stage, const std::string& what) {
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -2932,6 +2954,16 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 	const uint64_t check_ps = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
 	if (self_check) {
 		TranslationContext shadow;
+		// Stage C: the shadow binds into its own flag table, which the cache reads beside the
+		// main one while it lives; its flags are compared below and then dropped.
+		auto& texture_cache = m_context.GetTextureCache();
+		texture_cache.RegisterBindingTable(&shadow.images);
+		struct Unregister {
+			TextureCache&      cache;
+			ImageBindingTable* table;
+			~Unregister() { cache.UnregisterBindingTable(table); }
+		} const shadow_registered {texture_cache, &shadow.images};
+		const ScopedContext shadow_scope(*this, shadow);
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 			shadow.graphics.vertex[i].normalize_unnormalized =
 			    state.programs.vertex[i].normalized_samplers;
@@ -2949,6 +2981,10 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 				self_check_same = false;
 				ReportSelfCheck(check_vs, check_ps, "pixel", what);
 			}
+		}
+		if (auto what = CompareImageFlags(tc.images, shadow.images); !what.empty()) {
+			self_check_same = false;
+			ReportSelfCheck(check_vs, check_ps, "image flags", what);
 		}
 	}
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});

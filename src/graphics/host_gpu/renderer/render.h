@@ -242,14 +242,38 @@ public:
 	};
 	// MT GPU stage B (gt7-mt-1117): what translating one draw or dispatch writes for itself, out
 	// of the executor so that two contexts can coexist (KYTY_MT_GPU=3 translates the first draw
-	// of each chunk twice and compares). Not in it, because it lives in shared objects: the
-	// images' binding flags (TextureCache::Image::binding, set by BindImage/BindRenderTarget and
-	// cleared by ResetBindings through m_bound_images), the texture memo, the bindless survey
-	// and the descriptor scratch vectors (descriptors.cpp).
+	// of each chunk twice and compares). Stage C: the images' binding flags too (were
+	// Image::binding, set by BindImage/BindRenderTarget and cleared by ResetBindings), which the
+	// texture cache reads through its registered tables (TextureCache::BindFlags). Not in it
+	// yet: the texture memo, the bindless survey and state (m_bindless_*), and the descriptor
+	// scratch vectors (descriptors.cpp): shared, the GPU thread's only.
 	struct TranslationContext {
-		GraphicsBindings graphics;
-		PreparedBindings compute;
+		GraphicsBindings     graphics;
+		PreparedBindings     compute;
+		ImageBindingTable    images;
+		// The images bound since the last ResetBindings, as bound (repeats kept): the order
+		// ResetBindings visits them in, as m_bound_images before.
+		std::vector<ImageId> bound_ids;
 	};
+	// The context BindImage, BindRenderTarget, ResetBindings and the binding readers work on:
+	// m_translation, except while a ScopedContext names another (KYTY_MT_GPU=3's shadow). Not a
+	// thread_local: one per executor; stage d gives each worker its own executor state or passes
+	// the context down explicitly.
+	class ScopedContext {
+	public:
+		ScopedContext(RenderExecutor& executor, TranslationContext& tc)
+		    : m_executor(executor), m_previous(executor.m_active) {
+			executor.m_active = &tc;
+		}
+		~ScopedContext() { m_executor.m_active = m_previous; }
+		KYTY_CLASS_NO_COPY(ScopedContext);
+
+	private:
+		RenderExecutor&     m_executor;
+		TranslationContext* m_previous;
+	};
+	[[nodiscard]] TranslationContext& MainTranslation() { return m_translation; }
+	[[nodiscard]] TranslationContext& ActiveTranslation() { return *m_active; }
 
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	~RenderExecutor();
@@ -391,7 +415,7 @@ private:
 	std::vector<MsColorTarget>            m_ms_color_targets;
 	// The translation context of the GPU thread (the only one used to draw).
 	TranslationContext                    m_translation;
-	std::vector<ImageId>                  m_bound_images;
+	TranslationContext*                   m_active = &m_translation;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
 

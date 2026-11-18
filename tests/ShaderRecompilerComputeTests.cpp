@@ -8341,8 +8341,8 @@ public:
       Require(
           name, "cache-only video-out discovery",
           compressed_video == compressed_image &&
-              !compressed_video_image.binding.is_bound &&
-              !compressed_video_image.binding.is_target &&
+              !texture_cache.BindFlags(compressed_video_image.self_id).is_bound &&
+              !texture_cache.BindFlags(compressed_video_image.self_id).is_target &&
               !compressed_video_image.binding.needs_rebind &&
               !compressed_video_image.usage.video_out,
           "FindImage claimed caller-owned video-out usage or binding state");
@@ -12966,8 +12966,8 @@ public:
                   TextureCacheTestAccess::NullImageCount(texture_cache) == 1,
               "null view dimension or usage created another image allocation");
       Require(name, "null descriptors share final cache acquisition",
-              null_image.info.data.Empty() && !null_image.binding.is_bound &&
-                  !null_image.binding.is_target &&
+              null_image.info.data.Empty() && !texture_cache.BindFlags(null_image.self_id).is_bound &&
+                  !texture_cache.BindFlags(null_image.self_id).is_target &&
                   !null_image.binding.needs_rebind &&
                   null_image.usage.texture && null_image.usage.storage &&
                   null_image.IsGpuModified() &&
@@ -13559,7 +13559,7 @@ public:
       const auto storage_id = storage_discovery.images[0].image_id;
       Require(name, "storage prefetch purity",
               storage_discovery.images[0].image_view == nullptr &&
-                  texture_cache.GetImage(storage_id).binding.is_bound &&
+                  texture_cache.BindFlags(storage_id).is_bound &&
                   !texture_cache.GetImage(storage_id).usage.storage &&
                   !TextureCacheTestAccess::PendingDownload(texture_cache,
                                                            storage_id),
@@ -13638,8 +13638,8 @@ public:
       Require(name, "VS-to-PS image acquisition order",
               storage_binding.image_id == storage_id &&
                   sampled_binding.image_id == storage_id &&
-                  texture_cache.GetImage(storage_id).binding.force_general &&
-                  texture_cache.GetImage(storage_id).binding.shader_write &&
+                  texture_cache.BindFlags(storage_id).force_general &&
+                  texture_cache.BindFlags(storage_id).shader_write &&
                   texture_cache.GetImage(storage_id).IsGpuModified() &&
                   texture_cache.GetImage(storage_id).usage.storage &&
                   texture_cache.GetImage(storage_id).usage.texture,
@@ -13682,7 +13682,7 @@ public:
           RenderExecutorTestAccess::PrepareGraphicsBindings(
               executor, vertex_sampled_runtime, pixel_storage_runtime, true);
       Require(name, "late writable alias promotion",
-              texture_cache.GetImage(storage_id).binding.force_general,
+              texture_cache.BindFlags(storage_id).force_general,
               "an already sampled image was not promoted when a later "
               "storage alias bound the same backing");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
@@ -14609,7 +14609,7 @@ public:
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         Require(name, "attachment binding reset",
-                !shared_image.binding.is_target &&
+                !texture_cache.BindFlags(shared_image.self_id).is_target &&
                     shared_image.binding.attachment_layout ==
                         vk::ImageLayout::eUndefined &&
                     !shared_image.binding.attachment_access,
@@ -14676,12 +14676,12 @@ public:
               video_subresource_owner != nullptr &&
                   video_parent_owner != nullptr &&
                   video_parent_id != video_subresource_id &&
-                  !video_subresource_owner->binding.is_bound &&
-                  !video_subresource_owner->binding.is_target &&
+                  !texture_cache.BindFlags(video_subresource_owner->self_id).is_bound &&
+                  !texture_cache.BindFlags(video_subresource_owner->self_id).is_target &&
                   !video_subresource_owner->binding.needs_rebind &&
                   !video_subresource_owner->usage.video_out &&
-                  !video_parent_owner->binding.is_bound &&
-                  !video_parent_owner->binding.is_target &&
+                  !texture_cache.BindFlags(video_parent_owner->self_id).is_bound &&
+                  !texture_cache.BindFlags(video_parent_owner->self_id).is_target &&
                   !video_parent_owner->binding.needs_rebind &&
                   !video_parent_owner->usage.video_out,
               "FindImage leaked caller-owned state across a video-out "
@@ -14775,8 +14775,8 @@ public:
                   array_rendering.width == 128 &&
                   array_rendering.height == 128 &&
                   array_rendering.num_layers == 1 &&
-                  texture_cache.GetImage(expanded_array_id).binding.is_bound &&
-                  texture_cache.GetImage(expanded_array_id).binding.is_target,
+                  texture_cache.BindFlags(expanded_array_id).is_bound &&
+                  texture_cache.BindFlags(expanded_array_id).is_target,
               "the retained single-layer target did not rebind to the expanded "
               "backing");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -15040,13 +15040,13 @@ public:
       Require(name, "cache-only depth discovery",
               !texture_cache.FindImageFromRange(stencil_address,
                                                 stencil_layout.size, false) &&
-                  !texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(depth_id).binding.is_target &&
+                  !texture_cache.BindFlags(depth_id).is_bound &&
+                  !texture_cache.BindFlags(depth_id).is_target &&
                   !texture_cache.GetImage(depth_id).usage.depth_target,
               "FindImage created depth acquisition state or a stencil proxy");
       RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
       Require(name, "depth prefetch purity",
-              texture_cache.GetImage(depth_id).binding.is_target &&
+              texture_cache.BindFlags(depth_id).is_target &&
                   !texture_cache.GetImage(depth_id).usage.depth_target &&
                   !texture_cache.FindImageFromRange(stencil_address,
                                                     stencil_layout.size, false),
@@ -15076,8 +15076,8 @@ public:
       const auto &discovered_target =
           texture_cache.GetImage(target_subresource_id);
       Require(name, "cache-only target discovery",
-              !discovered_target.binding.is_bound &&
-                  !discovered_target.binding.is_target &&
+              !texture_cache.BindFlags(discovered_target.self_id).is_bound &&
+                  !texture_cache.BindFlags(discovered_target.self_id).is_target &&
                   !discovered_target.binding.needs_rebind &&
                   !discovered_target.usage.render_target &&
                   !TextureCacheTestAccess::PendingDownload(
@@ -15095,7 +15095,7 @@ public:
       RenderExecutorTestAccess::BindRenderTarget(executor,
                                                  target_subresource_id);
       Require(name, "target prefetch purity",
-              texture_cache.GetImage(target_subresource_id).binding.is_target &&
+              texture_cache.BindFlags(target_subresource_id).is_target &&
                   !texture_cache.GetImage(target_subresource_id)
                        .usage.render_target &&
                   !TextureCacheTestAccess::PendingDownload(
@@ -15108,7 +15108,7 @@ public:
                   target_parent_id != target_subresource_id &&
                   target_subresource_owner != nullptr &&
                   target_subresource_owner->binding.needs_rebind &&
-                  texture_cache.GetImage(target_parent_id).binding.is_target &&
+                  texture_cache.BindFlags(target_parent_id).is_target &&
                   !TextureCacheTestAccess::PendingDownload(texture_cache,
                                                            target_parent_id),
               "target overlap did not transfer target state to the merged "
@@ -15176,7 +15176,7 @@ public:
               rebound_rendering.depth_stencil_attachment.image_view != nullptr &&
               rebound_rendering.num_color_attachments == 1 &&
               rebound_rendering.width == 1 && rebound_rendering.height == 1 &&
-              texture_cache.GetImage(target_parent_id).binding.is_target &&
+              texture_cache.BindFlags(target_parent_id).is_target &&
               texture_cache.GetImage(target_parent_id).usage.render_target &&
               texture_cache.GetImage(target_parent_id).IsGpuModified() &&
               texture_cache.GetImage(depth_id).usage.depth_target &&
@@ -15193,8 +15193,8 @@ public:
       Require(name, "draw-scoped target reset",
               TextureCacheTestAccess::Owner(texture_cache,
                                             target_subresource_id) == nullptr &&
-                  !texture_cache.GetImage(target_parent_id).binding.is_target &&
-                  !texture_cache.GetImage(depth_id).binding.is_target,
+                  !texture_cache.BindFlags(target_parent_id).is_target &&
+                  !texture_cache.BindFlags(depth_id).is_target,
               "RenderExecutor retained target binding state after reset");
 
       constexpr uint64_t ordered_color_address = base + 0x80000;
@@ -15267,9 +15267,9 @@ public:
               prepared.images.size() == 1 &&
                   sampled_stencil_id != depth_id &&
                   prepared.images[0].image_view == nullptr &&
-                  texture_cache.GetImage(sampled_stencil_id).binding.is_bound &&
-                  !texture_cache.GetImage(stencil_proxy_id).binding.is_bound &&
-                  !texture_cache.GetImage(stencil_proxy_id).binding.is_target,
+                  texture_cache.BindFlags(sampled_stencil_id).is_bound &&
+                  !texture_cache.BindFlags(stencil_proxy_id).is_bound &&
+                  !texture_cache.BindFlags(stencil_proxy_id).is_target,
               "the first sampled-stencil lookup did not remain an ordinary "
               "discovery before final depth acquisition");
 
@@ -15299,8 +15299,8 @@ public:
               redirected.images.size() == 1 &&
                   redirected.images[0].image_id == depth_id &&
                   redirected.images[0].image_view == nullptr &&
-                  texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(sampled_stencil_id).binding.is_bound,
+                  texture_cache.BindFlags(depth_id).is_bound &&
+                  !texture_cache.BindFlags(sampled_stencil_id).is_bound,
               "the established stencil association did not redirect the next "
               "discovery to the depth owner");
       context.GetRenderExecutor().RebindImages(redirected);

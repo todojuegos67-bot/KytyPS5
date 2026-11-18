@@ -1244,6 +1244,15 @@ void TextureCache::DeleteImage(ImageId id) {
 	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 }
 
+void TextureCache::RegisterBindingTable(ImageBindingTable* table) {
+	EXIT_IF(table == nullptr || std::ranges::find(m_binding_tables, table) != m_binding_tables.end());
+	m_binding_tables.push_back(table);
+}
+
+void TextureCache::UnregisterBindingTable(ImageBindingTable* table) {
+	std::erase(m_binding_tables, table);
+}
+
 void TextureCache::ReleaseImage(ImageId id) {
 	const auto* image = m_slot_images.try_get(id);
 	if (image != nullptr && on_image_release && on_image_release(*image)) {
@@ -1262,6 +1271,10 @@ void TextureCache::ReleaseImage(ImageId id) {
 		}
 		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 		return;
+	}
+	// Its flags die with it, as when they were the image's.
+	for (auto* table: m_binding_tables) {
+		table->Erase(id);
 	}
 	m_slot_images.erase(id);
 	Profiler::Add(Profiler::Counter::ImagesDestroyed);
@@ -2094,7 +2107,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
-	if (cached.binding.is_bound || cached.binding.is_target) {
+	if (BoundOrTarget(cached_id)) {
 		cached.binding.needs_rebind = true;
 	}
 	bool copied = false;
@@ -2181,7 +2194,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    cached.info.extent.depth == 1 && requested.resources == cached.info.resources &&
 		    requested.resources.levels == 1 && requested.resources.layers == 1 &&
 		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
-		    !cached.IsGpuModified() && !cached.binding.is_target && [&] {
+		    !cached.IsGpuModified() && !BindFlags(cached_id).is_target && [&] {
 			    size_t owners = 0;
 			    ForEachPage(requested.data.address, 1, [&](uint64_t page) {
 				    if (const auto* list = m_image_page_table.Find(page)) {
@@ -2264,11 +2277,17 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
 		}
-		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-		if (cached.binding.is_target && !m_slot_images[merged_id].binding.is_target) {
+		cached.binding.needs_rebind |= BoundOrTarget(cached_id);
+		if (BindFlags(cached_id).is_target && !BindFlags(merged_id).is_target) {
 			NoteBindlessStateChange(m_slot_images[merged_id]);
 		}
-		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		// The merged image is a target in each context the merged-away one was (and, as before,
+		// not added to that context's bound list: ResetBindings leaves it).
+		for (auto* table: m_binding_tables) {
+			if (table->Get(cached_id).is_target) {
+				table->At(merged_id).is_target = true;
+			}
+		}
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id, "merged into a larger image", true);
@@ -2285,11 +2304,12 @@ namespace {
 constexpr uint64_t ReadOnlyAliasMaxBytes = uint64_t {64} << 10u;
 } // namespace
 
-bool TextureCache::ReadOnlyAliasCandidate(const Image& image) {
+bool TextureCache::ReadOnlyAliasCandidate(const Image& image) const {
 	return image.registered && !image.depth_id && image.stencil_ids.empty() &&
 	       !image.IsGpuModified() && !image.gpu_pixels && !image.IsBufferModified() &&
 	       !image.usage.storage && !image.usage.render_target && !image.usage.depth_target &&
-	       !image.usage.video_out && !image.binding.is_target && !image.binding.shader_write &&
+	       !image.usage.video_out && !BindFlags(image.self_id).is_target &&
+	       !BindFlags(image.self_id).shader_write &&
 	       image.info.samples == 1 && image.backing.samples == 1 && !image.info.HasStencil() &&
 	       !image.info.HasMetadata() && !image.info.data.Empty() &&
 	       image.info.data.size <= ReadOnlyAliasMaxBytes;
@@ -2335,14 +2355,14 @@ void TextureCache::FreeReadOnlyAliasesOf(const Image& image) {
 			// here would leave the draw a target that is gone).
 			if (other != nullptr && other != &image && other->registered &&
 			    other->read_only_alias && other->info.data.address == image.info.data.address &&
-			    !other->IsGpuModified() && !other->binding.is_target) {
+			    !other->IsGpuModified() && !BindFlags(id).is_target) {
 				siblings.push_back(id);
 			}
 		});
 	}
 	siblings.ForEach([&](ImageId id) {
 		auto& other = m_slot_images[id];
-		if (other.binding.is_bound || other.binding.is_target) {
+		if (BoundOrTarget(id)) {
 			other.binding.needs_rebind = true;
 		}
 		FreeImage(id, "a GPU write over a read-only alias of it");
@@ -2359,7 +2379,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
-	if (source.binding.is_bound || source.binding.is_target) {
+	if (BoundOrTarget(source_id)) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
@@ -4025,7 +4045,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 					MarkReadOnlyAlias(*kept);
 					return;
 				}
-				if (kept->binding.is_bound || kept->binding.is_target) {
+				if (BoundOrTarget(kept->self_id)) {
 					kept->binding.needs_rebind = true;
 				}
 				FreeImage(id, "an image of another kind over the same memory");
@@ -6964,7 +6984,7 @@ void TextureCache::RunGarbageCollector() {
 		std::erase_if(m_guest_dropped, [&](ImageId id) {
 			auto* image = m_slot_images.try_get(id);
 			if (image == nullptr || !image->registered || image->bindless_pinned ||
-			    image->binding.is_target || image->IsGpuModified()) {
+			    BindFlags(id).is_target || image->IsGpuModified()) {
 				return true;
 			}
 			// A grace of 300 frames (10-20 s): the guest drops entries and takes the same texture
