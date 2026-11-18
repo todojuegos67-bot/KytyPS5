@@ -396,8 +396,10 @@ public:
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            rasterizer->InvalidateMemory(addr, 1,
-                                         ptid == rasterizer->GetGpuCommandProcessorThreadId());
+            const bool gpu_thread = ptid == rasterizer->GetGpuCommandProcessorThreadId();
+            if (rasterizer->InvalidateMemory(addr, 1, gpu_thread) && !gpu_thread) {
+                rasterizer->FaultAround(addr); // bb-native-hot
+            }
 
             // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
             // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here
@@ -437,7 +439,14 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
+                return false;
+            }
+            if (!is_gpu_thread) {
+                // bb-native-hot: unprotect the rest of the written block in one batch.
+                rasterizer->FaultAround(addr);
+            }
+            return true;
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

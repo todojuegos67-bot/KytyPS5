@@ -62,6 +62,42 @@ public:
         });
     }
 
+    /// bb-native fault-around: marks the write-protected (uploaded, CPU-clean) pages of
+    /// [cpu_addr, cpu_addr + size) as CPU modified so they are unprotected now, in one batched
+    /// protection change, instead of each taking its own write fault later. Pages holding GPU
+    /// written data are left alone (no readback, no loss of GPU data). Returns the pages changed.
+    u64 MarkCleanPagesAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
+        u64 changed = 0;
+        IteratePages(cpu_addr, size, [&changed](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            u64 run_begin = 0, run_size = 0;
+            const auto flush_run = [&] {
+                if (run_size != 0) {
+                    manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(
+                        run_begin, run_size);
+                    run_size = 0;
+                }
+            };
+            for (u64 page = offset; page < offset + size; page += BYTES_PER_PAGE) {
+                const bool clean = !manager->template IsRegionModified<Type::CPU>(page, 1) &&
+                                   !manager->template IsRegionModified<Type::GPU>(page, 1);
+                if (!clean) {
+                    flush_run();
+                    continue;
+                }
+                if (run_size == 0) {
+                    run_begin = page;
+                }
+                run_size += BYTES_PER_PAGE;
+                ++changed;
+            }
+            flush_run();
+            manager->Unlock(bounds);
+        });
+        return changed;
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {

@@ -1063,6 +1063,9 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     const u64 gp = take(c.gfx_pipelines), cp = take(c.cs_pipelines), sh = take(c.shaders);
     const double comp_ms = take(c.compile_us) / 1000.0;
     const u64 faults = take(c.cpu_writes), binds = take(c.sparse_binds);
+    const u64 fa_pages = take(c.fault_around_pages); // bb-native-hot
+    const double wait_stream = take(c.wait_stream_us) / 1000.0;
+    const double wait_fbuf = take(c.wait_faultbuf_us) / 1000.0;
     const double mib = 1024.0 * 1024.0 * el;
     const double up = take(c.buf_up_bytes) / mib, down = take(c.buf_down_bytes) / mib;
     const u64 tex_n = take(c.tex_uploads);
@@ -1072,12 +1075,13 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     LOG_INFO(Render_Vulkan,
              "[perf2] 10s: fps {:.1f} frame {:.2f} ms (worst {:.1f}, >50ms {}) cpu {:.2f} gpu "
              "{:.2f} fence {:.2f} | compiles {} gfx {} cs {} shaders ({:.0f} ms) | cpu-write "
-             "faults {:.0f}/s | uploads buf {:.1f} tex {:.1f} MiB/s ({:.0f} img/s) readback {:.2f} "
-             "MiB/s | sparse binds {} | gpu waits {:.0f}/s {:.1f} ms/s | BB_PERF2={}",
+             "faults {:.0f}/s (fault-around {:.0f} pages/s) | uploads buf {:.1f} tex {:.1f} "
+             "MiB/s ({:.0f} img/s) readback {:.2f} MiB/s | sparse binds {} | gpu waits {:.0f}/s {:.1f} ms/s (stream buffer {:.1f}, "
+             "fault buffer {:.1f}) | BB_PERF2={}",
              a.frames / el, el * 1000.0 / a.frames, a.worst, a.slow, a.cpu / a.frames,
              a.gpu_n ? a.gpu / a.gpu_n : 0.0, a.wait / a.frames, gp, cp, sh, comp_ms,
-             faults / el, up, tex, tex_n / el, down, binds, waits / el, wait_total / el,
-             BBPerf2::Enabled() ? 1 : 0);
+             faults / el, fa_pages / el, up, tex, tex_n / el, down, binds, waits / el,
+             wait_total / el, wait_stream / el, wait_fbuf / el, BBPerf2::Enabled() ? 1 : 0);
     a = {};
     a.start = now;
 }

@@ -83,6 +83,9 @@ public:
     void CopyBufferImpl(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// bb-native fault-around: after a guest write fault at addr, unprotects the rest of its
+    /// aligned 64 KiB block in one batch (BB_NATIVE_FAULTAROUND=0 off, =N pages, default 16).
+    void FaultAround(VAddr addr);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);

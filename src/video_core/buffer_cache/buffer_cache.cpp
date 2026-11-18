@@ -129,6 +129,12 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+u64 BufferCache::FaultAroundMemory(VAddr device_addr, u64 size) {
+    const u64 pages = memory_tracker->MarkCleanPagesAsCpuModified(device_addr, size);
+    BBPerf2::Add(BBPerf2::Get().fault_around_pages, pages);
+    return pages;
+}
+
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     gpu_modified_ranges.Subtract(device_addr, size);

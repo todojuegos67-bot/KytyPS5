@@ -94,6 +94,9 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// bb-native fault-around: unprotects the CPU-clean pages of a range in one batch.
+    u64 FaultAroundMemory(VAddr device_addr, u64 size);
+
     /// Unmark a region as modified from the GPU.
     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
 

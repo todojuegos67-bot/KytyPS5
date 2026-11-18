@@ -25,6 +25,10 @@ struct Counters {
     std::atomic<u64> sparse_binds{};    // sparse ranges made resident
     std::atomic<u64> waits{};           // Scheduler::Wait calls that blocked
     std::atomic<u64> wait_us{};         // time blocked in Scheduler::Wait
+    // bb-native-hot
+    std::atomic<u64> fault_around_pages{}; // pages unprotected ahead of a write fault (batched)
+    std::atomic<u64> wait_stream_us{};     // of wait_us: staging stream buffer wrap waits
+    std::atomic<u64> wait_faultbuf_us{};   // of wait_us: GPU page-fault buffer readback waits
 };
 
 inline Counters& Get() {
@@ -43,6 +47,12 @@ inline bool Enabled() {
         return v && v[0] == '1';
     }();
     return on;
+}
+
+// bb-native-hot: BB_NATIVE_<X>=0 turns one native fast path off (default on), for bisecting.
+inline bool NativeOn(const char* name) {
+    const char* v = std::getenv(name);
+    return !(v && v[0] == '0' && v[1] == '\0');
 }
 
 } // namespace BBPerf2

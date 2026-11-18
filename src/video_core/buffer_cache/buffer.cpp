@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <numeric>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -287,7 +289,12 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
         if (!scheduler.IsFree(watch.tick) && !allow_wait) {
             return false;
         }
+        const auto t0 = std::chrono::steady_clock::now(); // bb-native-hot: wait attribution
         scheduler.Wait(watch.tick);
+        BBPerf2::Add(BBPerf2::Get().wait_stream_us,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

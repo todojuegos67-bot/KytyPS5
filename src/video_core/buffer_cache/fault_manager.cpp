@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "video_core/bb/bb_gpu_profile.h"
+#include "video_core/bb/bb_perf2.h"
 #include "common/div_ceil.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
@@ -87,7 +89,12 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
+        const auto t0 = std::chrono::steady_clock::now(); // bb-native-hot: wait attribution
         scheduler.Wait(wait_tick);
+        BBPerf2::Add(BBPerf2::Get().wait_faultbuf_us,
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
         scheduler.PopPendingOperations();
     }
 

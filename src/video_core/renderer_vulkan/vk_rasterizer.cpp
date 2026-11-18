@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -2863,6 +2864,52 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
+}
+
+// bb-native-hot (fault-around). Ghidra: the game's GX buffer update (0x26b3560 -> 0x26b1c40,
+// Ghidra 0x2ab3560 / 0x2ab1c40) takes fresh space from the command buffer with the Gnm
+// allocator 0x2ab07f0 (it allocates downward from the buffer's end, 64-byte aligned), memcpys the
+// data there and DMAs it; the command packets grow upward from the start. Every frame the same
+// command-buffer memory is filled again, page after page, and each 4 KiB page that the buffer
+// cache uploaded last frame takes its own write fault (VEH + handler + VirtualProtect under the
+// address space lock), ~90k faults/s in run_pt2. After one fault the rest of its aligned block is
+// unprotected at once: the next writes to it are plain stores. Only CPU-clean, not GPU-written
+// pages are touched, and they are marked CPU-modified, so the GPU still gets the guest's current
+// bytes (at worst a page is uploaded that was not written). Pages a texture also watches stay
+// protected through the page manager's watcher count.
+static u32 FaultAroundPages() {
+    static const u32 pages = [] {
+        const char* v = std::getenv("BB_NATIVE_FAULTAROUND");
+        u32 n = 16;
+        if (v && *v) {
+            n = static_cast<u32>(std::strtoul(v, nullptr, 10));
+        }
+        n = std::min<u32>(n, 16); // (the window stays inside the 64 KiB DmaForget covers)
+        if (n < 2) {
+            LOG_INFO(Render_Vulkan, "[native] fault-around off (BB_NATIVE_FAULTAROUND=0)");
+            return 0u;
+        }
+        n = std::bit_floor(n);
+        LOG_INFO(Render_Vulkan,
+                 "[native] fault-around on: {} pages ({} KiB) per guest write fault "
+                 "(BB_NATIVE_FAULTAROUND=0 off)",
+                 n, n * 4);
+        return n;
+    }();
+    return pages;
+}
+
+void Rasterizer::FaultAround(VAddr addr) {
+    const u32 pages = FaultAroundPages();
+    if (pages == 0) {
+        return;
+    }
+    const u64 window = u64{pages} << 12;
+    const VAddr begin = addr & ~(window - 1);
+    if (!IsMapped(begin, window)) {
+        return;
+    }
+    buffer_cache.FaultAroundMemory(begin, window);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
