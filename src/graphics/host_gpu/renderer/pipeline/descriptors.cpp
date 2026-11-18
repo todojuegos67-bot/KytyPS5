@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/image/imageDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1041,6 +1042,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 				const auto* image = texture_cache.m_slot_images.try_get(entry.memo.id);
 				if (image != nullptr && image->registered && !image->depth_id &&
 				    !image->binding.needs_rebind) {
+					if (MtGpu::OnWorker()) {
+						// KYTY_MT_GPU=1/4: what FindImage would have noted as read.
+						MtGpu::NoteRead(entry.desc.info.data.address, entry.desc.info.data.size);
+					}
 					g_texture_memo_counts.found++;
 					TextureBinding binding {entry.memo.id, nullptr, entry.desc};
 					binding.desc.view_info.base_level = entry.memo.base_level;
@@ -1401,6 +1406,9 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion, same_backing);
+	if (MtGpu::OnWorker() && MtGpu::SpeculationFailed()) {
+		return {}; // KYTY_MT_GPU=1/4: a worker's lookup found nothing it may use
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	// Round 124: the shader reads it as a single-sample image (an instruction of a single-sample
@@ -1603,6 +1611,9 @@ static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBuffe
 }
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
+	if (auto* log = ActivePtr()->bind_log; log != nullptr) {
+		log->emplace_back(id, storage); // KYTY_MT_GPU=1/4: replayed by the GPU thread
+	}
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
 		return;
@@ -3343,6 +3354,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
 	}();
 	const auto                   watched_use = WatchedShaderUse(program.shader_hash);
+	const bool                   on_worker   = MtGpu::OnWorker();
+	if (on_worker) {
+		// KYTY_MT_GPU=1/4: a translation worker leaves to the GPU thread the draws whose
+		// translation logs in order (watched shaders, the frame graph, grid probes) or touches
+		// the bindless table (registration, heap surveys, uploads of the flattened SRT).
+		const bool bindless = (!snapshot.bindless_heaps.empty() ||
+		                       !snapshot.bindless_sampler_heaps.empty() ||
+		                       std::ranges::any_of(program.info.images,
+		                                           &ShaderRecompiler::IR::ImageResource::runtime)) &&
+		                      m_context.GetBindlessTable().Enabled();
+		const char* why = watched_use != UINT32_MAX                      ? "shader vigilado"
+		                  : FrameGraph::Active() || FrameGraph::Logging() ? "frame graph"
+		                  : (program.stage == ShaderType::Pixel &&
+		                     GpuTiming::ProbesGridsOf(program.shader_hash))
+		                      ? "sonda de rejillas"
+		                  : bindless ? "bindless"
+		                             : nullptr;
+		if (why != nullptr) {
+			MtGpu::SpeculationFail(why);
+			return;
+		}
+	}
 	static std::atomic<uint32_t> frame_uses {0};
 	const bool in_watched_frame =
 	    watched_use != UINT32_MAX &&
@@ -3470,6 +3503,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		if (on_worker && MtGpu::SpeculationFailed()) {
+			return; // KYTY_MT_GPU=1/4: the GPU thread translates this draw itself
+		}
 		if (hiz_off &&
 		    program.info.images[i].resource_class !=
 		        ShaderRecompiler::IR::ImageResourceClass::Storage &&
@@ -3490,6 +3526,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			auto desc = NullTextureDesc(program.info.images[i], TextureCache::BindingType::Texture);
 			const auto id = m_context.GetTextureCache().FindImage(desc);
 			binding       = {id, nullptr, std::move(desc)};
+		}
+		if (on_worker && MtGpu::SpeculationFailed()) {
+			return;
 		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
@@ -3852,14 +3891,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				const ImageId old_id = old_image->self_id;
 				if (ActivePtr()->images.Get(old_id).is_target) {
-					Effect("bindless state", [this, &texture_cache, old_id] {
+					Effect("bindless state", [this, old_id] {
+						auto& texture_cache = m_context.GetTextureCache();
 						if (auto* img = texture_cache.m_slot_images.try_get(old_id)) {
 							NoteBindlessStateChange(*img);
 						}
 					});
 				}
 				ActivePtr()->images.Erase(old_id);
-				Effect("rebind", [&texture_cache, old_id] {
+				Effect("rebind", [this, old_id] {
+					auto& texture_cache = m_context.GetTextureCache();
 					if (auto* img = texture_cache.m_slot_images.try_get(old_id)) {
 						img->binding = {};
 					}
@@ -3892,7 +3933,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// The next binding of the descriptor is looked up as without the memo, and kept again
 			// when the image may be kept.
 			g_texture_memo_counts.refused++;
-			Effect("memo forget", [this, &resource, value = snapshot.images[i]] {
+			Effect("memo forget", [this, resource, value = snapshot.images[i]] {
 				ForgetTextureMemo(resource, value);
 			});
 			binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -3959,7 +4000,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 			if (plain_view) {
-				Effect("memo record", [this, &resource, value = snapshot.images[i], binding] {
+				Effect("memo record", [this, resource, value = snapshot.images[i], binding] {
 					RecordTextureMemo(resource, value, binding);
 				});
 			}
@@ -3967,8 +4008,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		// After FindTexture, which may refresh it from guest memory.
 		if (binding.desc.type != TextureCache::BindingType::Storage) {
 			if (const auto passing = PassingDepth(i); passing.has_value()) {
-				Effect("unmapped depth", [&texture_cache, id = binding.image_id, p = *passing] {
-					texture_cache.ResetUnmappedDepth(id, p);
+				Effect("unmapped depth", [this, id = binding.image_id, p = *passing] {
+					m_context.GetTextureCache().ResetUnmappedDepth(id, p);
 				});
 			}
 		}

@@ -45,6 +45,9 @@ struct RenderExecutorTestAccess;
 namespace GpuTiming {
 struct DrawDetail;
 } // namespace GpuTiming
+namespace MtGpu {
+struct SpecDraw;
+} // namespace MtGpu
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -272,6 +275,9 @@ public:
 		bool                                  deferring = false;
 		// When set (KYTY_MT_GPU=3's normal translation): the names of the effects run, in order.
 		std::vector<const char*>*             trace = nullptr;
+		// When set (KYTY_MT_GPU=1/4's workers): BindImage's calls, in order, for the GPU thread
+		// to make them again in its own context when it takes the translation.
+		std::vector<std::pair<ImageId, bool>>* bind_log = nullptr;
 	};
 	// Runs tc.deferred in order (EMIT) and empties it; stops at the first action that says so.
 	static void RunDeferred(TranslationContext& tc);
@@ -297,6 +303,11 @@ public:
 		const RenderExecutor* m_previous_owner;
 	};
 	[[nodiscard]] TranslationContext& MainTranslation() { return m_translation; }
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker: translates a draw the scanner
+	// described and the worker walked, into draw.tc in deferred mode, holding m_translation_mutex
+	// and the pipeline, buffer and texture locks (tried in that order, never waited for, never
+	// the scheduler's). False when one of them was not free (nothing done: try again later).
+	bool SpeculateDraw(MtGpu::SpecDraw& draw);
 	[[nodiscard]] TranslationContext& ActiveTranslation() { return *ActivePtr(); }
 
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -407,6 +418,14 @@ private:
 	uint32_t TranslateDrawBindings(TranslationContext& tc, DrawRenderState& state,
 	                               size_t vertex_stage_count,
 	                               std::array<PreparedBindings*, 4>& stages);
+	// KYTY_MT_GPU=1/4, GPU thread: why a worker's translation of this draw may not be used
+	// (null: it may), and the use of one: its BindImage calls made again in tc, its bindings
+	// moved into tc (over this draw's runtimes), its deferred actions run.
+	[[nodiscard]] const char* ValidateSpeculatedDraw(const MtGpu::SpecDraw& draw,
+	                                                 const DrawRenderState& state,
+	                                                 size_t                 vertex_stage_count);
+	void AdoptSpeculatedDraw(TranslationContext& tc, MtGpu::SpecDraw& draw,
+	                         DrawRenderState& state, size_t vertex_stage_count);
 	// The same `stages` for bindings already translated.
 	static uint32_t DrawBindingStages(TranslationContext& tc, const DrawRenderState& state,
 	                                  size_t vertex_stage_count,

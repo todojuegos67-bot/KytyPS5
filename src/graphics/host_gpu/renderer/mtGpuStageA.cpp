@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -127,12 +128,37 @@ void CloseChunk() {
 
 } // namespace
 
-bool StageAEnabled() {
-	static const bool enabled = [] {
+uint32_t Mode() {
+	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_MT_GPU");
-		const bool  on    = value != nullptr && std::strcmp(value, "2") == 0;
+		if (value == nullptr || value[0] < '0' || value[0] > '9' || value[1] != '\0') {
+			return 0u;
+		}
+		return static_cast<uint32_t>(value[0] - '0');
+	}();
+	return mode;
+}
+
+bool RegistryEnabled() {
+	static const bool enabled = [] {
+		const auto mode = Mode();
+		const bool on   = mode == 1 || mode == 2 || mode == 4;
 		if (on) {
 			g_zones = std::make_unique<std::atomic<uint64_t>[]>(size_t {1} << TableBits);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+bool WorkersMode() {
+	return Mode() == 1 || Mode() == 4;
+}
+
+bool StageAEnabled() {
+	static const bool enabled = [] {
+		const bool on = Mode() == 2 && RegistryEnabled();
+		if (on) {
 			Log::WriteUnmuted("MT GPU stage A: record only (KYTY_MT_GPU=2)\n");
 		}
 		return on;
@@ -141,20 +167,20 @@ bool StageAEnabled() {
 }
 
 void NoteWrite(WriteKind kind, uint64_t vaddr, uint64_t size) {
-	if (!StageAEnabled() || size == 0) {
+	if (!RegistryEnabled() || size == 0) {
 		return;
 	}
 	const bool     timed = Sampled();
 	const uint64_t t0    = timed ? NowNs() : 0;
-	const uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_relaxed) + 1u;
+	const uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1u;
 	const uint64_t stamp = (epoch << 2u) | static_cast<uint64_t>(kind);
 	const uint64_t first = vaddr >> ZoneBits;
 	const uint64_t last  = (vaddr + size - 1u) >> ZoneBits;
 	if (last - first >= WideZones) {
-		g_wide.store(stamp, std::memory_order_relaxed);
+		g_wide.store(stamp, std::memory_order_release);
 	} else {
 		for (uint64_t z = first; z <= last; z++) {
-			g_zones[z & TableMask].store(stamp, std::memory_order_relaxed);
+			g_zones[z & TableMask].store(stamp, std::memory_order_release);
 		}
 	}
 	Add(Writes);
@@ -166,8 +192,7 @@ void NoteWrite(WriteKind kind, uint64_t vaddr, uint64_t size) {
 
 bool SelfCheckEnabled() {
 	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_MT_GPU");
-		const bool  on    = value != nullptr && std::strcmp(value, "3") == 0;
+		const bool on = Mode() == 3;
 		if (on) {
 			Log::WriteUnmuted("MT GPU stage B: self-check of the translation context (KYTY_MT_GPU=3)\n");
 		}
@@ -242,7 +267,26 @@ void NoteDraw() {
 	}
 }
 
+namespace {
+// Worker: the zones its translation reads (ReadRecorder).
+thread_local std::vector<uint64_t>* t_worker_zones = nullptr;
+} // namespace
+
 void NoteRead(uint64_t vaddr, uint64_t size) {
+	if (auto* zones = t_worker_zones; zones != nullptr) {
+		if (size == 0) {
+			return;
+		}
+		const uint64_t first = vaddr >> ZoneBits;
+		uint64_t       last  = (vaddr + size - 1u) >> ZoneBits;
+		if (last - first >= WideZones) {
+			last = first + WideZones - 1u; // as below: a read that large, its head
+		}
+		for (uint64_t z = first; z <= last; z++) {
+			zones->push_back(z);
+		}
+		return;
+	}
 	if (!StageAEnabled() || !t_chunk.open || !t_chunk.prepared || size == 0) {
 		return;
 	}
@@ -290,10 +334,88 @@ SpeculationScope::~SpeculationScope() {
 	t_speculation = m_previous;
 }
 
+namespace {
+thread_local bool     t_on_worker = false;
+std::atomic<uint64_t> g_worker_alerts {0};
+} // namespace
+
+bool OnWorker() {
+	return t_on_worker;
+}
+
+void SetOnWorker() {
+	t_on_worker = true;
+}
+
 void NonDeferrable(const char* reason) {
+	if (t_on_worker) {
+		// The workers' guards stop before anything that records or creates: reaching one of
+		// these on a worker is a path they missed (its effect has run on the worker).
+		const auto n = g_worker_alerts.fetch_add(1, std::memory_order_relaxed);
+		if (n < 16) {
+			Log::WriteUnmuted(fmt::format(
+			    "MT GPU ALERTA: efecto no diferible en un trabajador: {} (#{})\n", reason, n + 1));
+		}
+	}
 	if (auto* scope = t_speculation; scope != nullptr && scope->m_failure == nullptr) {
 		scope->m_failure = reason;
 	}
+}
+
+void SpeculationFail(const char* reason) {
+	if (auto* scope = t_speculation; scope != nullptr && scope->m_failure == nullptr) {
+		scope->m_failure = reason;
+	}
+}
+
+bool SpeculationFailed() {
+	return t_speculation != nullptr && t_speculation->m_failure != nullptr;
+}
+
+uint64_t WorkerAlerts() {
+	return g_worker_alerts.load(std::memory_order_relaxed);
+}
+
+uint64_t Epoch() {
+	return g_epoch.load(std::memory_order_acquire);
+}
+
+ReadRecorder::ReadRecorder(std::vector<uint64_t>& zones)
+    : m_previous(t_worker_zones), m_zones(zones) {
+	m_zones.clear();
+	t_worker_zones = &m_zones;
+}
+
+ReadRecorder::~ReadRecorder() {
+	t_worker_zones = m_previous;
+	std::sort(m_zones.begin(), m_zones.end());
+	m_zones.erase(std::unique(m_zones.begin(), m_zones.end()), m_zones.end());
+}
+
+const char* ZonesWrittenSince(const std::vector<uint64_t>& zones, uint64_t epoch) {
+	const auto verdict = [&](uint64_t stamp) -> const char* {
+		if ((stamp >> 2u) <= epoch) {
+			return nullptr;
+		}
+		switch (static_cast<WriteKind>(stamp & 3u)) {
+			case WriteKind::Gpu: return "escritura GPU";
+			case WriteKind::Host: return "escritura host";
+			default: return "imagen creada/retirada";
+		}
+	};
+	if (!RegistryEnabled()) {
+		return "sin registro";
+	}
+	if (const char* why = verdict(g_wide.load(std::memory_order_acquire)); why != nullptr) {
+		return why;
+	}
+	for (const auto z: zones) {
+		if (const char* why = verdict(g_zones[z & TableMask].load(std::memory_order_acquire));
+		    why != nullptr) {
+			return why;
+		}
+	}
+	return nullptr;
 }
 
 void NoteSpeculation(const char* reason) {

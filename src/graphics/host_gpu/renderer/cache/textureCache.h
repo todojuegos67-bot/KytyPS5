@@ -464,6 +464,9 @@ private:
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
+	// KYTY_MT_GPU=1/4: FindImage on a translation worker (MtGpu::OnWorker), lookup only.
+	[[nodiscard]] ImageId     FindImageOnWorker(ImageDesc& desc, bool exact_format,
+	                                            bool* same_backing);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);

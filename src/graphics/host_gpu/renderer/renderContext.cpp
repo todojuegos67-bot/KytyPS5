@@ -361,6 +361,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			}
 			NoteWriteFault(released, around != 0, now);
 			FaultPages::Note(fault_vaddr, frame, outcome);
+			if (released && MtGpu::WorkersMode()) {
+				// KYTY_MT_GPU=1/4: the block is writable from now on without faults.
+				MtGpu::NoteWrite(MtGpu::WriteKind::Host, block, block_bytes);
+			}
 			if (released && around != 0) {
 				// The released runs were journaled as they were released.
 				m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
@@ -386,6 +390,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (!texture_done) {
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		if (MtGpu::WorkersMode()) {
+			// Stamped again once the caches have seen it: a worker that took its epoch between
+			// the first stamp and the invalidation read the caches before it.
+			MtGpu::NoteWrite(MtGpu::WriteKind::Host, fault_vaddr, fault_size);
 		}
 		m_bindless_table.OnCpuWrite(fault_vaddr, fault_size);
 		// A page written again and again stays writable (hot pages).
@@ -530,6 +539,9 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	MtGpu::NoteWrite(MtGpu::WriteKind::Host, vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	if (MtGpu::WorkersMode()) {
+		MtGpu::NoteWrite(MtGpu::WriteKind::Host, vaddr, size); // as in the fault path
+	}
 	m_bindless_table.OnCpuWrite(vaddr, size);
 	return true;
 }

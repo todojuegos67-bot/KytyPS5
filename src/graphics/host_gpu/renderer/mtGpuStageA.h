@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MTGPUSTAGEA_H_
 
 #include <cstdint>
+#include <vector>
 
 // Multi-threaded GPU thread, stage A (gt7-mt-1117; KYTY_MT_GPU=2, off by default): record only.
 //
@@ -19,6 +20,13 @@
 namespace Libs::Graphics::MtGpu {
 
 [[nodiscard]] bool StageAEnabled();
+// KYTY_MT_GPU as a number (0 when unset or not a number): 1 workers, 2 stage A, 3 self-check,
+// 4 workers checked against the normal translation.
+[[nodiscard]] uint32_t Mode();
+// KYTY_MT_GPU=1 or 4: translation workers (mtGpuWorkers.h).
+[[nodiscard]] bool WorkersMode();
+// The write registry (NoteWrite) is kept: KYTY_MT_GPU=1, 2 or 4.
+[[nodiscard]] bool RegistryEnabled();
 
 enum class WriteKind : uint32_t { None = 0, Gpu = 1, Host = 2, ImageRetired = 3 };
 
@@ -60,11 +68,42 @@ public:
 
 private:
 	friend void NonDeferrable(const char* reason);
+	friend void SpeculationFail(const char* reason);
+	friend bool SpeculationFailed();
 	SpeculationScope* m_previous;
 	const char*       m_failure = nullptr;
 };
 // GPU thread: one translated draw, accepted (null) or failed for `reason`.
 void NoteSpeculation(const char* reason);
+
+// KYTY_MT_GPU=1/4 (mtGpuWorkers.h): the translation workers' side of the above.
+// The calling thread is one of them (set once per thread, by the pool).
+[[nodiscard]] bool OnWorker();
+void               SetOnWorker();
+// A worker stops a translation it cannot do without side effects (an image to make, a copy):
+// marks the scope failed, as NonDeferrable, but nothing was done (no alert).
+void SpeculationFail(const char* reason);
+// Whether the speculation scope of this thread has failed.
+[[nodiscard]] bool SpeculationFailed();
+// The registry's epoch now (every write later has a larger one).
+[[nodiscard]] uint64_t Epoch();
+// Worker: while one lives, NoteRead records the 64 KiB zones read here (sorted, unique at end).
+class ReadRecorder {
+public:
+	explicit ReadRecorder(std::vector<uint64_t>& zones);
+	~ReadRecorder();
+	ReadRecorder(const ReadRecorder&)            = delete;
+	ReadRecorder& operator=(const ReadRecorder&) = delete;
+
+private:
+	std::vector<uint64_t>* m_previous;
+	std::vector<uint64_t>& m_zones;
+};
+// GPU thread: null when no zone of `zones` (nor a wide write) was written after `epoch`; else
+// what wrote one ("escritura GPU", "escritura host", "imagen creada/retirada").
+[[nodiscard]] const char* ZonesWrittenSince(const std::vector<uint64_t>& zones, uint64_t epoch);
+// NonDeferrable reached on a worker (a path the workers' guards missed): counted and logged.
+[[nodiscard]] uint64_t WorkerAlerts();
 
 // GPU thread, after the "Spec" line: the "MT GPU stage A" line (Log::WriteUnmuted).
 void Report(uint64_t frames, double seconds);

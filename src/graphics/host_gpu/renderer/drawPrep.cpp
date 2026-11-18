@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -339,6 +340,9 @@ StageResult* Take(uint32_t stage) {
 }
 
 void Add(Counter counter, uint64_t value) {
+	if (MtGpu::OnWorker()) {
+		return; // KYTY_MT_GPU=1/4: a translation worker's walks are not the scanner's
+	}
 	g_counters[static_cast<size_t>(counter)].value.fetch_add(value, std::memory_order_relaxed);
 	if (t_has_current ? t_current.queue != 0 : t_scanner_compute) {
 		g_compute_counters[static_cast<size_t>(counter)].value.fetch_add(value,

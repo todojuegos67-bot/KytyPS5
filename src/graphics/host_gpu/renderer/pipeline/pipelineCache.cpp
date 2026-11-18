@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -4654,7 +4655,11 @@ struct PipelineCache::ProgramCache {
 		// threads (round 73: its workers have copies of their own): past it, new programs are
 		// walked under the lock as before.
 		constexpr size_t           MaxCopies = 12288;
-		static std::atomic<size_t> total {0};
+		static std::atomic<size_t> scanner_total {0};
+		// KYTY_MT_GPU=1/4: the translation workers' copies have a budget of their own, so they
+		// never leave the scanner's walks without theirs.
+		static std::atomic<size_t> worker_total {0};
+		auto& total = MtGpu::OnWorker() ? worker_total : scanner_total;
 		if (total.load(std::memory_order_relaxed) >= MaxCopies) {
 			return nullptr;
 		}
@@ -4756,6 +4761,35 @@ struct PipelineCache::ProgramCache {
 		result.serial   = ++serials;
 		DrawPrep::Add(DrawPrep::Counter::Prepared);
 		return true;
+	}
+
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker under the pipeline lock: the
+	// permutation Get would find for a stage ScanStage walked (its entry looked up again here, as
+	// an entry may have gone since), with Get's push-data cursor; null when Get would translate
+	// one. `handle`: the permutation's (for its normalized copy).
+	template <typename InputInfo>
+	const ShaderRecompiler::IR::CompiledShaderInfo*
+	FindScannedPermutation(const ShaderParams& params, const InputInfo& input_info, ShaderType stage,
+	                       const DrawPrep::StageResult& scanned, uint32_t& push_data_cursor,
+	                       const ShaderProgram** handle) {
+		thread_local ProgramKey key;
+		auto*                   entry = FindForScan(params, input_info, stage, key);
+		if (entry == nullptr || entry != scanned.entry || !scanned.ok) {
+			return nullptr;
+		}
+		for (auto& candidate: entry->permutations) {
+			const auto& layout = candidate.program.bindings;
+			if (layout.push_data_start_dword ==
+			        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                                 layout.ShaderDataDwords()) &&
+			    candidate.specialization_hash == scanned.specialization_hash &&
+			    candidate.specialization == scanned.specialization) {
+				candidate.program.bindings.AdvancePushData(push_data_cursor);
+				*handle = &candidate.handle;
+				return &candidate.program;
+			}
+		}
+		return nullptr;
 	}
 
 	// The first field in which two refreshes differ, or null.
@@ -6377,6 +6411,51 @@ bool PipelineCache::DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketR
 		out.stage_count++;
 	}
 	return out.stage_count != 0;
+}
+
+bool PipelineCache::SpeculatePrograms(const DrawPrepInputs& inputs, const DrawPrep::PacketResult& walked,
+                                      std::array<ShaderStageRuntime, 4>& stages,
+                                      std::array<bool, 4>&               normalized) {
+	// As GetGraphicsPrograms: the pixel stage first, then the vertex stages, one push-data
+	// cursor through them (mesh draws are not speculated: the cursor starts at 0).
+	if (inputs.compute) {
+		return false;
+	}
+	const uint32_t vertex_count =
+	    inputs.tess_info.empty() ? 1u : static_cast<uint32_t>(inputs.tess_info.size());
+	const uint32_t count = (inputs.pixel ? 1u : 0u) + vertex_count;
+	if (walked.stage_count != count || count > stages.size() ||
+	    (inputs.tess_info.empty() && inputs.vertex_info.logical_stage == ShaderType::Mesh)) {
+		return false;
+	}
+	uint32_t push_data_cursor = 0;
+	uint32_t index            = 0;
+	normalized.fill(false);
+	if (inputs.pixel) {
+		const ShaderProgram* handle = nullptr;
+		const auto*          program = m_program_cache->FindScannedPermutation(
+            inputs.pixel_params, inputs.pixel_info, ShaderType::Pixel, walked.stages[index],
+            push_data_cursor, &handle);
+		if (program == nullptr) {
+			return false;
+		}
+		stages[index] = {.program = program, .resources = &walked.stages[index].resources};
+		index++;
+	}
+	for (uint32_t i = 0; i < vertex_count; i++, index++) {
+		const auto&          params  = inputs.tess_info.empty() ? inputs.vertex_params : inputs.tess_params[i];
+		const auto&          info    = inputs.tess_info.empty() ? inputs.vertex_info : inputs.tess_info[i];
+		const ShaderProgram* handle  = nullptr;
+		const auto*          program = m_program_cache->FindScannedPermutation(
+            params, info, info.logical_stage, walked.stages[index], push_data_cursor, &handle);
+		if (program == nullptr) {
+			return false;
+		}
+		stages[index] = {.program = program, .resources = &walked.stages[index].resources};
+		normalized[index] = handle->normalized_module != nullptr && UnnormalizedSamplingFix() &&
+		                    StageSamplersAllUnnormalized(stages[index]);
+	}
+	return true;
 }
 
 bool PipelineCache::IsSkipListed(uint64_t shader_addr) {

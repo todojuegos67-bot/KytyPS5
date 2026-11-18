@@ -1158,6 +1158,11 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
+	if (MtGpu::WorkersMode()) {
+		// KYTY_MT_GPU=1/4: a worker's lookup over this memory may now find something else.
+		MtGpu::NoteWrite(MtGpu::WriteKind::ImageRetired, image.info.data.address,
+		                 image.info.data.size);
+	}
 	NoteImageChurn(image, true);
 	NoteBindlessStateChange(image);
 	image.lru_tick = LruClock();
@@ -1198,6 +1203,11 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
+	if (MtGpu::WorkersMode()) {
+		// KYTY_MT_GPU=1/4: a worker's lookup over this memory may now find something else.
+		MtGpu::NoteWrite(MtGpu::WriteKind::ImageRetired, image.info.data.address,
+		                 image.info.data.size);
+	}
 	NoteImageChurn(image, false);
 }
 
@@ -3878,7 +3888,72 @@ void NoteUnplacedBinding(const TextureCache::ImageDesc& desc, const ImageInfo& f
 
 } // namespace
 
+// KYTY_MT_GPU=1/4: FindImage on a translation worker, which may not make, copy, free or clear
+// anything: only an image found as it is, with the same backing at the descriptor's address (the
+// lookup FindImage starts with). Anything else (no such image, one too small, an overlap to
+// resolve, a null image not made yet, colour metadata to materialize, a video-out read) fails the
+// speculation (MtGpu::SpeculationFail) and gives no image: the GPU thread translates the draw.
+// The range is noted as read (the worker's zones), and the image touched as FindImage touches it
+// (its LRU; the tick it was used in is set by the emission's FindTexture).
+ImageId TextureCache::FindImageOnWorker(ImageDesc& desc, bool exact_format, bool* same_backing) {
+	if (same_backing != nullptr) {
+		*same_backing = false;
+	}
+	if (desc.type == BindingType::VideoOut) {
+		MtGpu::SpeculationFail("lectura de video out");
+		return {};
+	}
+	ValidateImageDesc(desc);
+	if (desc.info.data.Empty()) {
+		std::scoped_lock lock {m_lock};
+		const auto key = std::pair {desc.info.pixel_format, desc.info.type};
+		if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
+			return found->second;
+		}
+		MtGpu::SpeculationFail("imagen nula nueva");
+		return {};
+	}
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+	    desc.info.metadata.kind == ImageMetadataKind::Cmask) {
+		MtGpu::SpeculationFail("metadatos de color");
+		return {};
+	}
+	MtGpu::NoteRead(desc.info.data.address, desc.info.data.size);
+	std::scoped_lock lock {m_lock};
+	ImageId    result {};
+	const bool hide_aliases = m_read_only_aliases != 0 && Bisect::ReadOnlyAliasesOff();
+	if (const auto* owners =
+	        m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
+	    owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image != nullptr && SameBacking(image->info, desc.info, exact_format) &&
+			    !(hide_aliases && image->read_only_alias)) {
+				result = id;
+			}
+		});
+	}
+	if (!result) {
+		MtGpu::SpeculationFail("imagen sin la misma memoria");
+		return {};
+	}
+	auto& image = m_slot_images[result];
+	if ((exact_format && image.info.pixel_format != desc.info.pixel_format) ||
+	    image.info.resources < desc.info.resources) {
+		MtGpu::SpeculationFail("imagen por rehacer");
+		return {};
+	}
+	if (same_backing != nullptr) {
+		*same_backing = true;
+	}
+	TouchImage(image);
+	return result;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_backing) {
+	if (MtGpu::OnWorker()) {
+		return FindImageOnWorker(desc, exact_format, same_backing);
+	}
 	if (same_backing != nullptr) {
 		*same_backing = false;
 	}
@@ -7323,6 +7398,10 @@ ImageId TextureCache::SingleSampleDepth(ImageId id) {
 	    source->info.resources.levels != 1 || source->depth_id) {
 		return id;
 	}
+	if (MtGpu::OnWorker()) {
+		MtGpu::SpeculationFail("copia de una muestra (profundidad)");
+		return id;
+	}
 	// What FindTexture does with an image it binds, done here for the source the copy is made
 	// from: its use is noted, and what the CPU or a buffer write put in its memory is uploaded
 	// first (which changes its content serial, so the copy is made again).
@@ -7388,6 +7467,10 @@ ImageId TextureCache::SingleSampleStencil(ImageId depth_id) {
 	    source->backing.image_type != vk::ImageType::e2D || source->info.resources.layers == 0 ||
 	    source->info.resources.layers != source->backing.layers ||
 	    source->info.resources.levels != 1 || source->depth_id) {
+		return depth_id;
+	}
+	if (MtGpu::OnWorker()) {
+		MtGpu::SpeculationFail("copia de una muestra (stencil)");
 		return depth_id;
 	}
 	// As SingleSampleDepth (FindTexture's refresh), for the depth image and its stencil planes.
@@ -7480,6 +7563,10 @@ ImageId TextureCache::SubExtentCopy(ImageId id, const ImageInfo& requested) {
 	    (requested.extent.width == info.extent.width &&
 	     requested.extent.height == info.extent.height) ||
 	    !ImageViewOps::FormatsCompatible(info.pixel_format, requested.pixel_format)) {
+		return id;
+	}
+	if (MtGpu::OnWorker()) {
+		MtGpu::SpeculationFail("copia de una esquina");
 		return id;
 	}
 	// FindTexture's refresh of an image it binds, for the image the copy is made from (an upload

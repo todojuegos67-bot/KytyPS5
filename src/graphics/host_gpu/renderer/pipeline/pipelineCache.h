@@ -337,6 +337,13 @@ public:
 	bool DrawPrepDescribeCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                             const ShaderComputeInputInfo& input_info, DrawPrepInputs& inputs);
 	bool DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketResult& out);
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker under the pipeline lock: the
+	// programs GetGraphicsPrograms would give a draw the scanner described (`inputs`) and a
+	// worker walked (DrawPrepWalk, `walked`), as runtimes over the walked resources, in the walk's
+	// order (the pixel stage first); `normalized`: a vertex stage runs its normalized copy. False
+	// when a stage has no program yet (Get would translate it) or the draw is not one for it.
+	bool SpeculatePrograms(const DrawPrepInputs& inputs, const DrawPrep::PacketResult& walked,
+	                       std::array<ShaderStageRuntime, 4>& stages, std::array<bool, 4>& normalized);
 	// Round 99: `partition`, when given, asks for the program of the partition of
 	// partition->target (ShaderCallPartition: 0 for the first one) when the shader's call is
 	// partitioned, and receives every partition's target (empty when it is not partitioned); the
