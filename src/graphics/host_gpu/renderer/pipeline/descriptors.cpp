@@ -1006,6 +1006,7 @@ static bool RejectBindlessTexture(const char* what, uint64_t address) {
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               bool                                         memo) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -1606,27 +1607,27 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.info.data.Empty()) {
 		return;
 	}
-	auto& flags = m_active->images.At(id);
+	auto& flags = ActivePtr()->images.At(id);
 	if (flags.is_bound) {
 		flags.force_general |= flags.shader_write != storage;
 	}
 	flags.is_bound = true;
 	flags.shader_write |= storage;
-	m_active->bound_ids.push_back(id);
+	ActivePtr()->bound_ids.push_back(id);
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
-	auto& flags = m_active->images.At(id);
+	auto& flags = ActivePtr()->images.At(id);
 	if (!flags.is_target) {
 		NoteBindlessStateChange(image);
 	}
 	flags.is_target = true;
-	m_active->bound_ids.push_back(id);
+	ActivePtr()->bound_ids.push_back(id);
 }
 
 void RenderExecutor::ResetBindings() {
-	auto& tc = *m_active;
+	auto& tc = *ActivePtr();
 	for (const auto id: tc.bound_ids) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
 			if (tc.images.Get(id).is_target) {
@@ -1914,6 +1915,7 @@ bool RenderExecutor::ResettleBindlessKey(BindlessTable::Heap& heap, uint32_t key
 }
 
 void RenderExecutor::SyncBindlessHeaps() {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	auto& table = m_context.GetBindlessTable();
 	if (!BindlessEngineEnabled() || !table.Enabled()) {
 		return;
@@ -2509,6 +2511,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	prepared.bindless_patches.clear();
 	prepared.bindless_heaps.clear();
 	const auto& program  = *runtime.program;
@@ -3326,6 +3329,7 @@ void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -3531,9 +3535,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		    samples_big_depth(i), prepared.normalize_unnormalized));
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
-		if (m_bindless_surveyed.insert(use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u))
-		        .second) {
-			SurveyBindlessHeap(use);
+		const uint64_t key = use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u);
+		if (!m_bindless_surveyed.contains(key)) {
+			Effect("bindless survey", [this, key, use] {
+				if (m_bindless_surveyed.insert(key).second) {
+					SurveyBindlessHeap(use);
+				}
+			});
 		}
 	}
 	PrepareBindlessHeaps(runtime, prepared);
@@ -3595,6 +3603,7 @@ static uint64_t SparseWriteSize(RenderContext& context, uint64_t shader, uint64_
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -3684,6 +3693,7 @@ static uint32_t BindingLengthDwords(uint64_t range, bool written) {
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -3739,11 +3749,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		} else {
-			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			ActivePtr()->bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
 			for (const auto& [offset, region, entries]: prepared.bindless_patches) {
-				if (static_cast<size_t>(offset) + 1u < m_bindless_srt.size()) {
-					m_bindless_srt[offset]      = region;
-					m_bindless_srt[offset + 1u] = entries;
+				if (static_cast<size_t>(offset) + 1u < ActivePtr()->bindless_srt.size()) {
+					ActivePtr()->bindless_srt[offset]      = region;
+					ActivePtr()->bindless_srt[offset + 1u] = entries;
 				}
 				// The first 256 distinct patches are logged; after that no draw takes the lock.
 				static std::atomic<bool>            logging_done = false;
@@ -3759,10 +3769,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					LOGF("Bindless patch: stage=%u hash=0x%016" PRIx64
 					     " offset=%u region=%u entries=%u srt_words=%zu\n",
 					     static_cast<uint32_t>(program.stage), program.shader_hash, offset, region,
-					     entries, m_bindless_srt.size());
+					     entries, ActivePtr()->bindless_srt.size());
 				}
 			}
-			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
+			prepared.flattened_srt = NativeUpload(m_context, ActivePtr()->bindless_srt);
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		}
 	}
@@ -3773,6 +3783,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	ReportTextureMemo();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -3839,11 +3850,20 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
-				if (m_active->images.Get(old_image->self_id).is_target) {
-					NoteBindlessStateChange(*old_image);
+				const ImageId old_id = old_image->self_id;
+				if (ActivePtr()->images.Get(old_id).is_target) {
+					Effect("bindless state", [this, &texture_cache, old_id] {
+						if (auto* img = texture_cache.m_slot_images.try_get(old_id)) {
+							NoteBindlessStateChange(*img);
+						}
+					});
 				}
-				m_active->images.Erase(old_image->self_id);
-				old_image->binding = {};
+				ActivePtr()->images.Erase(old_id);
+				Effect("rebind", [&texture_cache, old_id] {
+					if (auto* img = texture_cache.m_slot_images.try_get(old_id)) {
+						img->binding = {};
+					}
+				});
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
@@ -3872,7 +3892,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			// The next binding of the descriptor is looked up as without the memo, and kept again
 			// when the image may be kept.
 			g_texture_memo_counts.refused++;
-			ForgetTextureMemo(program.info.images[i], snapshot.images[i]);
+			Effect("memo forget", [this, &resource, value = snapshot.images[i]] {
+				ForgetTextureMemo(resource, value);
+			});
 			binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 			binding.mip_views.clear();
@@ -3937,13 +3959,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 			if (plain_view) {
-				RecordTextureMemo(resource, snapshot.images[i], binding);
+				Effect("memo record", [this, &resource, value = snapshot.images[i], binding] {
+					RecordTextureMemo(resource, value, binding);
+				});
 			}
 		}
 		// After FindTexture, which may refresh it from guest memory.
 		if (binding.desc.type != TextureCache::BindingType::Storage) {
 			if (const auto passing = PassingDepth(i); passing.has_value()) {
-				texture_cache.ResetUnmappedDepth(binding.image_id, *passing);
+				Effect("unmapped depth", [&texture_cache, id = binding.image_id, p = *passing] {
+					texture_cache.ResetUnmappedDepth(id, p);
+				});
 			}
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
@@ -4018,6 +4044,7 @@ void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) 
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
@@ -4046,10 +4073,10 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
-				if (m_active->images.Get(old_image->self_id).is_target) {
+				if (ActivePtr()->images.Get(old_image->self_id).is_target) {
 					NoteBindlessStateChange(*old_image);
 				}
-				m_active->images.Erase(old_image->self_id);
+				ActivePtr()->images.Erase(old_image->self_id);
 				old_image->binding = {};
 			}
 			target.desc.view_info.base_level = target.guest_mip_level;
@@ -4071,6 +4098,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
+	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	const auto vk_buffer    = buffer.Recorder();
 	size_t descriptor_count = 0;
@@ -4139,9 +4167,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 				}
 			}
-			for (const auto id: m_active->bound_ids) {
+			for (const auto id: ActivePtr()->bound_ids) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-				const auto  flags = m_active->images.Get(id);
+				const auto  flags = ActivePtr()->images.Get(id);
 				if (image == nullptr || (!flags.shader_write && !flags.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
@@ -4220,12 +4248,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 	spec_check_phase.End();
-	m_descriptor_buffers.clear();
-	m_descriptor_images.clear();
-	m_descriptor_writes.clear();
-	m_descriptor_buffers.reserve(descriptor_count);
-	m_descriptor_images.reserve(descriptor_count);
-	m_descriptor_writes.reserve(write_count);
+	ActivePtr()->descriptor_buffers.clear();
+	ActivePtr()->descriptor_images.clear();
+	ActivePtr()->descriptor_writes.clear();
+	ActivePtr()->descriptor_buffers.reserve(descriptor_count);
+	ActivePtr()->descriptor_images.reserve(descriptor_count);
+	ActivePtr()->descriptor_writes.reserve(write_count);
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -4327,7 +4355,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
-			const auto bind_flags = m_active->images.Get(binding.image_id);
+			const auto bind_flags = ActivePtr()->images.Get(binding.image_id);
 			// The draw's or dispatch's own textures (images:lean, round 167).
 			const GuestImageUses        guest_use;
 			const auto&                 view = binding.desc.view_info;
@@ -4381,12 +4409,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
 			write.descriptorCount   = NativeDescriptorCount(binding);
-			const auto buffer_start = m_descriptor_buffers.size();
-			const auto image_start  = m_descriptor_images.size();
+			const auto buffer_start = ActivePtr()->descriptor_buffers.size();
+			const auto image_start  = ActivePtr()->descriptor_images.size();
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				for (const auto resource: binding.resources) {
-					m_descriptor_images.push_back(MakeImageInfo(
+					ActivePtr()->descriptor_images.push_back(MakeImageInfo(
 					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
 				}
 			} else {
@@ -4395,7 +4423,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT_IF(descriptors.buffers.size() != binding.resources.size());
 						for (const auto& view: descriptors.buffers) {
 							EXIT_IF(view.buffer == nullptr);
-							m_descriptor_buffers.push_back(view);
+							ActivePtr()->descriptor_buffers.push_back(view);
 						}
 						break;
 					case BindingKind::BdaPagetable:
@@ -4404,7 +4432,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						const auto* bda_buffer = binding.kind == BindingKind::BdaPagetable
 						                             ? cache.GetBdaPageTableBuffer()
 						                             : cache.GetFaultBuffer();
-						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
+						ActivePtr()->descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
 						break;
 					}
@@ -4421,27 +4449,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							view = &descriptors.shared_memory;
 						}
 						EXIT_IF(view->buffer == nullptr);
-						m_descriptor_buffers.push_back(*view);
+						ActivePtr()->descriptor_buffers.push_back(*view);
 						break;
 					}
 					case BindingKind::Samplers:
 						for (const auto resource: binding.resources) {
 							const auto sampler = descriptors.samplers.at(resource);
 							EXIT_IF(sampler == nullptr);
-							m_descriptor_images.emplace_back(sampler, nullptr,
+							ActivePtr()->descriptor_images.emplace_back(sampler, nullptr,
 							                                 vk::ImageLayout::eUndefined);
 						}
 						break;
 					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
 			}
-			if (m_descriptor_buffers.size() != buffer_start) {
-				write.pBufferInfo = m_descriptor_buffers.data() + buffer_start;
+			if (ActivePtr()->descriptor_buffers.size() != buffer_start) {
+				write.pBufferInfo = ActivePtr()->descriptor_buffers.data() + buffer_start;
 			}
-			if (m_descriptor_images.size() != image_start) {
-				write.pImageInfo = m_descriptor_images.data() + image_start;
+			if (ActivePtr()->descriptor_images.size() != image_start) {
+				write.pImageInfo = ActivePtr()->descriptor_images.data() + image_start;
 			}
-			m_descriptor_writes.push_back(write);
+			ActivePtr()->descriptor_writes.push_back(write);
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			const auto expected =
@@ -4465,24 +4493,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        push_data.dwords.data());
 	}
 
-	if (!m_descriptor_writes.empty()) {
+	if (!ActivePtr()->descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
-		ScrubDeadDescriptorViews(m_descriptor_writes.data(),
-		                         static_cast<uint32_t>(m_descriptor_writes.size()),
+		ScrubDeadDescriptorViews(ActivePtr()->descriptor_writes.data(),
+		                         static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),
 		                         "a draw's descriptors");
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			                               static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),
+			                               ActivePtr()->descriptor_writes.data());
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
+			for (auto& write: ActivePtr()->descriptor_writes) {
 				write.dstSet = set;
 			}
 			// The update moves to the recording thread with the bind: the set is fresh.
 			vk_buffer.updateAndBindDescriptorSet(
 			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data());
+			    static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()), ActivePtr()->descriptor_writes.data());
 		}
 	}
 	if (pipeline.uses_bindless) {

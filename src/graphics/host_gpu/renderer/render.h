@@ -13,6 +13,8 @@
 
 #include <unordered_set>
 #include <array>
+#include <functional>
+#include <mutex>
 #include <memory>
 #include <optional>
 #include <span>
@@ -244,9 +246,15 @@ public:
 	// of the executor so that two contexts can coexist (KYTY_MT_GPU=3 translates the first draw
 	// of each chunk twice and compares). Stage C: the images' binding flags too (were
 	// Image::binding, set by BindImage/BindRenderTarget and cleared by ResetBindings), which the
-	// texture cache reads through its registered tables (TextureCache::BindFlags). Not in it
-	// yet: the texture memo, the bindless survey and state (m_bindless_*), and the descriptor
-	// scratch vectors (descriptors.cpp): shared, the GPU thread's only.
+	// texture cache reads through its registered tables (TextureCache::BindFlags). Stage D: the
+	// descriptor scratch vectors (descriptors.cpp) and the flattened bindless SRT, and the list
+	// of deferred actions: what a split draw (TRANSLATE, then EMIT) runs in EMIT, in order. The
+	// texture memo and the bindless survey/state (m_bindless_*) stay in the executor, shared,
+	// under m_translation_mutex.
+	struct DeferredAction {
+		const char*           name = nullptr;
+		std::function<bool()> run; // false: stop (the draw is not drawn)
+	};
 	struct TranslationContext {
 		GraphicsBindings     graphics;
 		PreparedBindings     compute;
@@ -254,26 +262,42 @@ public:
 		// The images bound since the last ResetBindings, as bound (repeats kept): the order
 		// ResetBindings visits them in, as m_bound_images before.
 		std::vector<ImageId> bound_ids;
+		std::vector<vk::DescriptorBufferInfo> descriptor_buffers;
+		std::vector<vk::DescriptorImageInfo>  descriptor_images;
+		std::vector<vk::WriteDescriptorSet>   descriptor_writes;
+		std::vector<uint32_t>                 bindless_srt;
+		std::vector<DeferredAction>           deferred;
+		// Deferred mode (KYTY_MT_GPU=3's shadow): translation only reads; the shared effects it
+		// would have (Effect below) are queued in `deferred`, in order, for EMIT.
+		bool                                  deferring = false;
+		// When set (KYTY_MT_GPU=3's normal translation): the names of the effects run, in order.
+		std::vector<const char*>*             trace = nullptr;
 	};
+	// Runs tc.deferred in order (EMIT) and empties it; stops at the first action that says so.
+	static void RunDeferred(TranslationContext& tc);
 	// The context BindImage, BindRenderTarget, ResetBindings and the binding readers work on:
-	// m_translation, except while a ScopedContext names another (KYTY_MT_GPU=3's shadow). Not a
-	// thread_local: one per executor; stage d gives each worker its own executor state or passes
-	// the context down explicitly.
+	// m_translation, except while a ScopedContext names another on this thread (KYTY_MT_GPU=3's
+	// shadow; stage d's workers). Per thread: a worker's ScopedContext does not change the GPU
+	// thread's.
 	class ScopedContext {
 	public:
 		ScopedContext(RenderExecutor& executor, TranslationContext& tc)
-		    : m_executor(executor), m_previous(executor.m_active) {
-			executor.m_active = &tc;
+		    : m_previous(t_active), m_previous_owner(t_owner) {
+			t_active = &tc;
+			t_owner  = &executor;
 		}
-		~ScopedContext() { m_executor.m_active = m_previous; }
+		~ScopedContext() {
+			t_active = m_previous;
+			t_owner  = m_previous_owner;
+		}
 		KYTY_CLASS_NO_COPY(ScopedContext);
 
 	private:
-		RenderExecutor&     m_executor;
-		TranslationContext* m_previous;
+		TranslationContext*   m_previous;
+		const RenderExecutor* m_previous_owner;
 	};
 	[[nodiscard]] TranslationContext& MainTranslation() { return m_translation; }
-	[[nodiscard]] TranslationContext& ActiveTranslation() { return *m_active; }
+	[[nodiscard]] TranslationContext& ActiveTranslation() { return *ActivePtr(); }
 
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	~RenderExecutor();
@@ -367,6 +391,26 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// Stage d. KYTY_MT_GPU=0: ExecutePreparedDraw is EmitPreparedDraw(..., false), as before.
+	// KYTY_MT_GPU=3: TRANSLATE (TranslateDrawBindings under an MtGpu::SpeculationScope; failed:
+	// the normal way), then EMIT: the rest of the draw (notes, Bisect/EQAA, ObtainBuffer and
+	// FindBuffer, PrepareGraphicsBindings's rebind, DumpTessellatedDraw, AcquireVertexBuffers and
+	// PrepareIndexBuffer, TryGetGraphicsPipeline, AcquireRenderTargets and the recording) as a
+	// deferred action of the context, run in order by RunDeferred.
+	void EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
+	                      const DrawCallInfo& draw, DrawRenderState& state,
+	                      vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+	                      const DrawIndexBufferSource& index_source, bool primitive_restart_enable,
+	                      bool translated);
+	// The draw's stages' PrepareBindings into tc.graphics; returns the stage count and fills
+	// `stages` (vertex stages, then the pixel stage).
+	uint32_t TranslateDrawBindings(TranslationContext& tc, DrawRenderState& state,
+	                               size_t vertex_stage_count,
+	                               std::array<PreparedBindings*, 4>& stages);
+	// The same `stages` for bindings already translated.
+	static uint32_t DrawBindingStages(TranslationContext& tc, const DrawRenderState& state,
+	                                  size_t vertex_stage_count,
+	                                  std::array<PreparedBindings*, 4>& stages);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -415,7 +459,32 @@ private:
 	std::vector<MsColorTarget>            m_ms_color_targets;
 	// The translation context of the GPU thread (the only one used to draw).
 	TranslationContext                    m_translation;
-	TranslationContext*                   m_active = &m_translation;
+	static inline thread_local TranslationContext*   t_active = nullptr;
+	static inline thread_local const RenderExecutor* t_owner  = nullptr;
+	[[nodiscard]] TranslationContext* ActivePtr() {
+		return t_owner == this && t_active != nullptr ? t_active : &m_translation;
+	}
+	// A shared effect of translation: run now (named in tc.trace when traced), or queued in
+	// the active context when it is deferring.
+	template <typename F>
+	void Effect(const char* name, F&& fn) {
+		auto* tc = ActivePtr();
+		if (tc->deferring) {
+			tc->deferred.push_back({name, [f = std::forward<F>(fn)]() mutable {
+				                        f();
+				                        return true;
+			                        }});
+			return;
+		}
+		if (tc->trace != nullptr) {
+			tc->trace->push_back(name);
+		}
+		fn();
+	}
+	// Stage d: the state translation shares between contexts (texture memo, m_bindless_*,
+	// m_runtime_image_requests, m_image_occurrences). Lock order: this first, then RendererLocks
+	// (pipeline, buffer, texture, scheduler); never taken under a RendererLock.
+	std::recursive_mutex                  m_translation_mutex;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
 
@@ -440,10 +509,6 @@ private:
 	uint64_t                              m_bindless_snapshot_frame   = 0;
 	std::vector<ImageId>                  m_bindless_unused;
 	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
-	std::vector<uint32_t>                 m_bindless_srt;
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
-	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;

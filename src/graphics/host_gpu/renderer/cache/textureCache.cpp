@@ -1095,6 +1095,7 @@ void NoteImageFreed(const char* why) {
 } // namespace
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	MtGpu::NonDeferrable("imagen nueva"); // stage d: records now
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	m_slot_images[id].self_id = id;
 	Profiler::Add(Profiler::Counter::ImagesCreated);
@@ -1281,6 +1282,7 @@ void TextureCache::ReleaseImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
+	MtGpu::NonDeferrable("imagen retirada"); // stage d: records now
 	auto& image = m_slot_images[id];
 	if (image.registered) {
 		NoteImageFreed(why);
@@ -1964,6 +1966,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	MtGpu::NonDeferrable("copia de imagen"); // stage d: records now
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -2010,6 +2013,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
+	MtGpu::NonDeferrable("copia de mip"); // stage d: records now
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -2376,6 +2380,7 @@ void TextureCache::FreeReadOnlyAliasesOf(const Image& image) {
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	MtGpu::NonDeferrable("imagen ampliada"); // stage d: records now
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -2501,6 +2506,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	MtGpu::NonDeferrable("subida de imagen"); // stage d: records now
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -2610,6 +2616,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 }
 
 void TextureCache::InitializeImage(ImageId id) {
+	MtGpu::NonDeferrable("imagen nueva"); // stage d: records now
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;

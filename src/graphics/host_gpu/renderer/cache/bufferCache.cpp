@@ -288,6 +288,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 template <bool async>
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
+	MtGpu::NonDeferrable("descarga de buffer"); // stage d: records now
 	Profiler::Add(Profiler::Counter::Readbacks);
 	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
 	const auto buffer_address = buffer.CpuAddress();
@@ -2161,6 +2162,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	MtGpu::NonDeferrable("buffer nuevo"); // stage d: records now
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
@@ -2446,6 +2448,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
                                uint64_t total_size, vk::Buffer source) {
+	MtGpu::NonDeferrable("subida de buffer"); // stage d: records now
 	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
 		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
 		std::unique_lock lock(m_dirty_ranges_mutex);
@@ -2504,6 +2507,7 @@ static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t 
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
+	MtGpu::NonDeferrable("subida de buffer"); // stage d: records now
 	if (copies.empty()) {
 		return nullptr;
 	}

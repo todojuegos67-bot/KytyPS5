@@ -42,6 +42,30 @@ void NoteRead(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool TakeSelfCheckDraw();
 void NoteSelfCheck(bool same);
 
+// Stage d (KYTY_MT_GPU=3 for now): a draw is split in TRANSLATE (its bindings, into its own
+// RenderExecutor::TranslationContext, recording nothing) and EMIT (the context's deferred
+// actions, in order). What translation cannot defer (a texture cache copy or image creation,
+// a scheduler Finish) calls NonDeferrable: under a SpeculationScope on that thread it marks
+// the translation failed (the draw then goes the normal way); elsewhere it does nothing.
+[[nodiscard]] bool DeferredDrawEnabled();
+void NonDeferrable(const char* reason);
+class SpeculationScope {
+public:
+	SpeculationScope();
+	~SpeculationScope();
+	SpeculationScope(const SpeculationScope&)            = delete;
+	SpeculationScope& operator=(const SpeculationScope&) = delete;
+	// The first NonDeferrable reason seen in the scope, or null.
+	[[nodiscard]] const char* Failure() const { return m_failure; }
+
+private:
+	friend void NonDeferrable(const char* reason);
+	SpeculationScope* m_previous;
+	const char*       m_failure = nullptr;
+};
+// GPU thread: one translated draw, accepted (null) or failed for `reason`.
+void NoteSpeculation(const char* reason);
+
 // GPU thread, after the "Spec" line: the "MT GPU stage A" line (Log::WriteUnmuted).
 void Report(uint64_t frames, double seconds);
 

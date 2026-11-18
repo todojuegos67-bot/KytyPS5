@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -781,6 +782,7 @@ public:
 		policy.Count(false);
 		// Reports from earlier work cannot be attributed to this transaction.
 		cache.ProcessFaultBuffer();
+		MtGpu::NonDeferrable("Finish del scheduler"); // stage d: cannot be deferred
 		scheduler.Finish();
 		RangeSet ranges;
 		// buffer_sources is indexed by memory slot (FindBuffers), not by program.info.buffers:

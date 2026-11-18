@@ -908,7 +908,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
-		const auto  layout = m_active->images.Get(target.image_id).is_bound
+		const auto  layout = ActivePtr()->images.Get(target.image_id).is_bound
 		                                ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
 		vk::ImageView           attachment_view   = image_view;
@@ -2737,12 +2737,67 @@ void ReportSelfCheck(uint64_t vs_hash, uint64_t ps_hash, const char* stage, cons
 
 } // namespace
 
+uint32_t RenderExecutor::TranslateDrawBindings(TranslationContext& tc, DrawRenderState& state,
+                                               size_t                            vertex_stage_count,
+                                               std::array<PreparedBindings*, 4>& stages) {
+	auto&                  bindings    = tc.graphics;
+	uint32_t               stage_count = 0;
+	const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
+	for (uint32_t i = 0; i < vertex_stage_count; i++) {
+		bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
+		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+		stages[stage_count++] = &bindings.vertex[i];
+	}
+	if (state.ps_active) {
+		if (!bindings.pixel) bindings.pixel.emplace();
+		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+		stages[stage_count++] = &*bindings.pixel;
+	}
+	return stage_count;
+}
+
+uint32_t RenderExecutor::DrawBindingStages(TranslationContext& tc, const DrawRenderState& state,
+                                           size_t                            vertex_stage_count,
+                                           std::array<PreparedBindings*, 4>& stages) {
+	uint32_t stage_count = 0;
+	for (uint32_t i = 0; i < vertex_stage_count; i++) {
+		stages[stage_count++] = &tc.graphics.vertex[i];
+	}
+	if (state.ps_active) {
+		stages[stage_count++] = &*tc.graphics.pixel;
+	}
+	return stage_count;
+}
+
+void RenderExecutor::RunDeferred(TranslationContext& tc) {
+	// Moved out first: an action may translate again (a nested draw-as-operation) into tc.
+	auto actions = std::move(tc.deferred);
+	tc.deferred.clear();
+	for (auto& action: actions) {
+		if (!action.run()) {
+			break;
+		}
+	}
+}
+
 void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit_id,
-                                         CommandBuffer& buffer,
-                                         const DrawCallInfo& draw, DrawRenderState& state,
-                                         vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+                                         CommandBuffer& buffer, const DrawCallInfo& draw,
+                                         DrawRenderState& state, vk::PrimitiveTopology topology,
+                                         const DrawEmitInfo&          emit,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+                                         bool                         primitive_restart_enable) {
+	// The normal way, at every KYTY_MT_GPU value: KYTY_MT_GPU=3 checks the deferred
+	// translation beside it (the shadow in EmitPreparedDraw) and keeps this one.
+	EmitPreparedDraw(tc, submit_id, buffer, draw, state, topology, emit, index_source,
+	                 primitive_restart_enable, false);
+}
+
+void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id,
+                                      CommandBuffer& buffer, const DrawCallInfo& draw,
+                                      DrawRenderState& state, vk::PrimitiveTopology topology,
+                                      const DrawEmitInfo&          emit,
+                                      const DrawIndexBufferSource& index_source,
+                                      bool primitive_restart_enable, bool translated) {
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -2920,26 +2975,20 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = tc.graphics;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
-	uint32_t                         stage_count = 0;
-	{
-		const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
-		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-			bindings.vertex[i].normalize_unnormalized =
-			    state.programs.vertex[i].normalized_samplers;
-			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-			descriptor_stages[stage_count++] = &bindings.vertex[i];
-		}
-		if (state.ps_active) {
-			if (!bindings.pixel) bindings.pixel.emplace();
-			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-			descriptor_stages[stage_count++] = &*bindings.pixel;
-		}
+	const bool self_check = MtGpu::SelfCheckEnabled() && !mesh_active && !translated;
+	std::vector<const char*> main_trace;
+	if (self_check) {
+		tc.trace = &main_trace;
 	}
+	const uint32_t                   stage_count =
+	    translated ? DrawBindingStages(tc, state, vertex_stages.size(), descriptor_stages)
+	               : TranslateDrawBindings(tc, state, vertex_stages.size(), descriptor_stages);
+	tc.trace = nullptr;
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	// KYTY_MT_GPU=3: the same stages again in a second context, before PrepareGraphicsBindings
 	// (which rebinds through the shared images); the pipeline is compared below.
-	const bool self_check = MtGpu::SelfCheckEnabled() && MtGpu::TakeSelfCheckDraw();
 	bool       self_check_same = true;
+	const char* deferred_failure = nullptr;
 	const uint64_t check_vs = vertex_stages.front().stage.program->shader_hash;
 	const uint64_t check_ps = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
 	if (self_check) {
@@ -2954,6 +3003,10 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 			~Unregister() { cache.UnregisterBindingTable(table); }
 		} const shadow_registered {texture_cache, &shadow.images};
 		const ScopedContext shadow_scope(*this, shadow);
+		// Deferred translation: shared effects queued (Effect), what cannot be deferred marks
+		// the speculation failed (counted by reason; the normal translation is the one used).
+		shadow.deferring = true;
+		const MtGpu::SpeculationScope speculation;
 		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 			shadow.graphics.vertex[i].normalize_unnormalized =
 			    state.programs.vertex[i].normalized_samplers;
@@ -2976,6 +3029,29 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 			self_check_same = false;
 			ReportSelfCheck(check_vs, check_ps, "image flags", what);
 		}
+		deferred_failure = speculation.Failure();
+		// EMIT of the shadow: its queued effects must be the ones the normal translation ran,
+		// in the same order. They are not run again (the normal translation already did).
+		if (deferred_failure == nullptr) {
+			std::string what;
+			if (shadow.deferred.size() != main_trace.size()) {
+				what = fmt::format("deferred actions {} vs {}", shadow.deferred.size(),
+				                   main_trace.size());
+			} else {
+				for (size_t k = 0; k < main_trace.size(); k++) {
+					if (std::string_view(shadow.deferred[k].name) != main_trace[k]) {
+						what = fmt::format("deferred action {}: {} vs {}", k,
+						                   shadow.deferred[k].name, main_trace[k]);
+						break;
+					}
+				}
+			}
+			if (!what.empty()) {
+				self_check_same = false;
+				ReportSelfCheck(check_vs, check_ps, "deferred", what);
+			}
+		}
+		shadow.deferred.clear();
 	}
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
@@ -3036,6 +3112,7 @@ void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit
 			}
 		}
 		MtGpu::NoteSelfCheck(self_check_same);
+		MtGpu::NoteSpeculation(deferred_failure);
 	}
 	if (deferred_pipeline == nullptr) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());

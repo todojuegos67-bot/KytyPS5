@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <fmt/format.h>
@@ -262,13 +264,65 @@ void NoteRead(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+bool DeferredDrawEnabled() {
+	static const bool enabled = [] {
+		const bool on = SelfCheckEnabled();
+		if (on) {
+			Log::WriteUnmuted("MT GPU stage D: draws split in translate + deferred emit (KYTY_MT_GPU=3)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+namespace {
+thread_local SpeculationScope* t_speculation = nullptr;
+std::mutex                     g_spec_mutex;
+uint64_t                       g_spec_accepted = 0;
+std::map<std::string, uint64_t> g_spec_failed; // by reason, since the last report
+} // namespace
+
+SpeculationScope::SpeculationScope(): m_previous(t_speculation) {
+	t_speculation = this;
+}
+
+SpeculationScope::~SpeculationScope() {
+	t_speculation = m_previous;
+}
+
+void NonDeferrable(const char* reason) {
+	if (auto* scope = t_speculation; scope != nullptr && scope->m_failure == nullptr) {
+		scope->m_failure = reason;
+	}
+}
+
+void NoteSpeculation(const char* reason) {
+	const std::scoped_lock lock(g_spec_mutex);
+	if (reason == nullptr) {
+		g_spec_accepted++;
+	} else {
+		g_spec_failed[reason]++;
+	}
+}
+
 void Report(uint64_t frames, double seconds) {
 	if (SelfCheckEnabled()) {
 		const uint64_t checked = g_checked.load(std::memory_order_relaxed);
 		const uint64_t differ  = g_differ.load(std::memory_order_relaxed);
+		const std::scoped_lock lock(g_spec_mutex);
+		std::string failed;
+		uint64_t    total = 0;
+		for (const auto& [reason, count]: g_spec_failed) {
+			failed += fmt::format(" {} {},", reason, count);
+			total += count;
+		}
 		Log::WriteUnmuted(fmt::format(
-		    "MT GPU stage B ({:.0f} s): draws comprobados {}, con diferencias {} (total {} / {})\n",
-		    seconds, checked - g_checked_last, differ - g_differ_last, checked, differ));
+		    "MT GPU stage D ({:.0f} s): draws comprobados {}, diferencias {}, diferidos ok {}, "
+		    "fallos diferidos {}:{} (total {} / {})\n",
+		    seconds, checked - g_checked_last, differ - g_differ_last, g_spec_accepted, total,
+		    failed.empty() ? " -" : failed, checked, differ));
+		g_spec_accepted = 0;
+		g_spec_failed.clear();
 		g_checked_last = checked;
 		g_differ_last  = differ;
 	}

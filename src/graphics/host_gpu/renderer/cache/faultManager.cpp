@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -352,6 +353,7 @@ void FaultManager::NoteDmaShader(uint64_t hash, std::string label) {
 }
 
 ShaderFaultReport FaultManager::CollectFaults() {
+	MtGpu::NonDeferrable("Finish del scheduler"); // stage d: records now
 	ShaderFaultReport report;
 	ProcessFaultBufferImpl(&report);
 	// The report is owned by this stack frame; its deferred callback must finish
