@@ -15,9 +15,10 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/bb/bb_dlss5.h"
-#include "video_core/bb/bb_upscale.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_mv_comp.h"
+#include "video_core/host_shaders/bb_rcas_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -34,6 +35,7 @@ PresentSr::~PresentSr() {
     Destroy(color);
     Destroy(motion);
     Destroy(output);
+    Destroy(sharp);
     Destroy(reactive);
     Destroy(lum[0]);
     Destroy(lum[1]);
@@ -44,6 +46,12 @@ PresentSr::~PresentSr() {
     if (pipeline) device.destroyPipeline(pipeline);
     if (layout) device.destroyPipelineLayout(layout);
     if (set_layout) device.destroyDescriptorSetLayout(set_layout);
+    if (rcas_pipeline)
+        device.destroyPipeline(rcas_pipeline);
+    if (rcas_layout)
+        device.destroyPipelineLayout(rcas_layout);
+    if (rcas_set_layout)
+        device.destroyDescriptorSetLayout(rcas_set_layout);
     if (sampler) device.destroySampler(sampler);
     if (queries) device.destroyQueryPool(queries);
 }
@@ -189,6 +197,7 @@ void PresentSr::FrameBegin(vk::CommandBuffer cmd) {
     cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, queries, slot * PerSlot);
     slot_written[slot] = false;
     slot_sr[slot] = false;
+    slot_rcas[slot] = false;
     slot_open = true;
 }
 
@@ -210,11 +219,20 @@ bool PresentSr::Poll(double& gpu_ms, double& sr_ms, double& mv_ms) {
     const u32 s = (slot + Slots - 4) % Slots;
     if (!slot_written[s]) return false;
     u64 t[PerSlot]{};
-    const auto r = instance.GetDevice().getQueryPoolResults(
-        queries, s * PerSlot, PerSlot, sizeof(t), t, sizeof(u64), vk::QueryResultFlagBits::e64);
+    const auto r =
+        instance.GetDevice().getQueryPoolResults(queries, s * PerSlot, Main, Main * sizeof(u64), t,
+                                                 sizeof(u64), vk::QueryResultFlagBits::e64);
     if (r != vk::Result::eSuccess) return false;
     slot_written[s] = false;
     const double k = ns_per_tick / 1e6;
+    if (slot_rcas[s]) {
+        slot_rcas[s] = false;
+        if (instance.GetDevice().getQueryPoolResults(
+                queries, s * PerSlot + Main, 2, 2 * sizeof(u64), t + Main, sizeof(u64),
+                vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+            BB::Upscale::NoteSharpen(double(t[Main + 1] - t[Main]) * k);
+        }
+    }
     gpu_ms = double(t[3] - t[0]) * k;
     mv_ms = double(t[2] - t[1]) * k;
     sr_ms = double(t[3] - t[2]) * k;
@@ -418,6 +436,7 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
     if (!sr) {
         return {};
     }
+    sharpened = false;
 
     BB::SR::Desc desc{};
     desc.cmd = cmd;
@@ -516,6 +535,7 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
         BB_GPU_SCOPE(cmd, "ours: DLSS 5 neural rendering");
         (void)BB::Dlss5::Apply(desc);
     }
+    sharpened = Sharpen(cmd, out);
     Barrier(cmd, output, vk::ImageLayout::eShaderReadOnlyOptimal);
     static bool said = false;
     if (!said) {
@@ -525,7 +545,114 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                                             BB::SR::KindName(BB::Upscale::Cfg().kind),
                                             BB::SR::QualityName(BB::Upscale::Cfg().quality)));
     }
-    return output.view;
+    return sharpened ? sharp.view : output.view;
+}
+
+bool PresentSr::InitRcas() {
+    if (rcas_tried)
+        return rcas_pipeline != nullptr;
+    rcas_tried = true;
+    const auto device = instance.GetDevice();
+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+        {0, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eCompute},
+    }};
+    auto [lr, l] = device.createDescriptorSetLayout({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    });
+    if (lr != vk::Result::eSuccess)
+        return false;
+    rcas_set_layout = l;
+    const vk::PushConstantRange range{vk::ShaderStageFlagBits::eCompute, 0, sizeof(float)};
+    auto [pr, pl] = device.createPipelineLayout({
+        .setLayoutCount = 1,
+        .pSetLayouts = &rcas_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    });
+    if (pr != vk::Result::eSuccess)
+        return false;
+    rcas_layout = pl;
+    const auto module = Vulkan::CompileSPV(BB_RCAS_COMP, device);
+    if (!module)
+        return false;
+    const vk::ComputePipelineCreateInfo ci{
+        .stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "main"},
+        .layout = rcas_layout,
+    };
+    auto [cr, p] = device.createComputePipeline({}, ci);
+    device.destroyShaderModule(module);
+    if (cr != vk::Result::eSuccess)
+        return false;
+    rcas_pipeline = p;
+    return true;
+}
+
+bool PresentSr::Sharpen(vk::CommandBuffer cmd, vk::Extent2D out) {
+    const auto kind = BB::Upscale::Cfg().kind;
+    if (kind != BB::SR::Kind::Dlss && kind != BB::SR::Kind::Xess)
+        return false;
+    static const bool enabled = [] {
+        const char* v = std::getenv("BB_DLSS_RCAS");
+        const bool on = v == nullptr || v[0] != '0';
+        if (!on)
+            BB::Upscale::Checkpoint("[sharpen] RCAS after DLSS / XeSS off (BB_DLSS_RCAS=0)");
+        return on;
+    }();
+    if (!enabled)
+        return false;
+    const float sharpness = std::clamp(BB::Upscale::LiveSharpness(), 0.0f, 1.0f);
+    static float said = -1.0f;
+    if (sharpness != said) {
+        said = sharpness;
+        BB::Upscale::Checkpoint(
+            sharpness > 0.0f
+                ? fmt::format("[sharpen] RCAS after {}: strength {:.2f} ({:.2f} stops), {}x{}",
+                              BB::SR::KindName(kind), sharpness, 2.0f - 2.0f * sharpness, out.width,
+                              out.height)
+                : fmt::format("[sharpen] RCAS after {}: strength 0.00 (off)",
+                              BB::SR::KindName(kind)));
+    }
+    if (sharpness <= 0.0f)
+        return false;
+    if (!InitRcas() || !Ensure(sharp, out, vk::Format::eR16G16B16A16Sfloat))
+        return false;
+    const float stops = 2.0f - 2.0f * sharpness;
+    Barrier(cmd, output, vk::ImageLayout::eGeneral);
+    Barrier(cmd, sharp, vk::ImageLayout::eGeneral);
+    const bool timed = slot_open && !slot_rcas[slot];
+    if (timed) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, queries,
+                            slot * PerSlot + Main);
+    }
+    {
+        BB_GPU_SCOPE(cmd, "ours: RCAS after DLSS / XeSS (bb_rcas.comp)");
+        const vk::DescriptorImageInfo src_info{{}, output.view, vk::ImageLayout::eGeneral};
+        const vk::DescriptorImageInfo dst_info{{}, sharp.view, vk::ImageLayout::eGeneral};
+        const std::array writes{
+            vk::WriteDescriptorSet{.dstBinding = 0,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &src_info},
+            vk::WriteDescriptorSet{.dstBinding = 1,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &dst_info},
+        };
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, rcas_pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, rcas_layout, 0, writes);
+        cmd.pushConstants(rcas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(stops), &stops);
+        cmd.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
+    }
+    if (timed) {
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, queries,
+                            slot * PerSlot + Main + 1);
+        slot_rcas[slot] = true;
+    }
+    Barrier(cmd, sharp, vk::ImageLayout::eShaderReadOnlyOptimal);
+    return true;
 }
 
 bool PresentSr::EnsureDepth(OwnImage& img, vk::Extent2D extent, vk::Format format) {

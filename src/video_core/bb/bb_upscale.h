@@ -115,6 +115,8 @@ struct Stats {
 };
 void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, double mv_ms,
                u32 in_w, u32 in_h, u32 sr_w, u32 sr_h, u32 out_w, u32 out_h, bool upscaled);
+// The GPU time of the RCAS pass after DLSS / XeSS (one frame), for the [perf] line.
+void NoteSharpen(double ms);
 const Stats& LastStats();
 bool OverlayShown();
 void ToggleOverlay();

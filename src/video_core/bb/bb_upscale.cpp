@@ -410,8 +410,54 @@ void StartupDone() {
     }
 }
 
+namespace {
+// Before the first LiveSharpness call: the launcher's file written before the start is the
+// value the environment already gave.
+const auto g_sharp_start = std::filesystem::file_time_type::clock::now();
+} // namespace
+
+// The launcher's Nitidez slider while playing: BB_UPSCALE_SHARPNESS_FILE (one line
+// "BB_UPSCALE_SHARPNESS=0.80"), re-read at most twice a second when its time stamp changes.
 float LiveSharpness() {
-    return Cfg().sharpness;
+    static std::atomic<float> value{-1.0f};
+    static std::mutex mx;
+    static std::chrono::steady_clock::time_point next{};
+    static std::filesystem::file_time_type seen = g_sharp_start;
+    static const std::string path = [] {
+        const char* f = Env("BB_UPSCALE_SHARPNESS_FILE");
+        return f != nullptr ? std::string(f) : std::string();
+    }();
+    if (value.load(std::memory_order_relaxed) < 0.0f) {
+        value.store(Cfg().sharpness, std::memory_order_relaxed);
+    }
+    if (path.empty() || !mx.try_lock()) {
+        return value.load(std::memory_order_relaxed);
+    }
+    std::lock_guard lock{mx, std::adopt_lock};
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next) {
+        next = now + std::chrono::milliseconds(500);
+        std::error_code ec;
+        const auto stamp = std::filesystem::last_write_time(path, ec);
+        if (!ec && stamp > seen) {
+            seen = stamp;
+            std::ifstream in(path);
+            std::string text;
+            std::getline(in, text);
+            if (const auto eq = text.find('='); eq != std::string::npos)
+                text = text.substr(eq + 1);
+            char* end = nullptr;
+            const float v = std::strtof(text.c_str(), &end);
+            if (end != text.c_str() && std::isfinite(v)) {
+                const float s = std::clamp(v, 0.0f, 1.0f);
+                if (s != value.load(std::memory_order_relaxed)) {
+                    value.store(s, std::memory_order_relaxed);
+                    Checkpoint(fmt::format("[sharpen] live sharpness {:.2f} ({})", s, path));
+                }
+            }
+        }
+    }
+    return value.load(std::memory_order_relaxed);
 }
 
 void PreInstance() {
@@ -1086,6 +1132,16 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     a.start = now;
 }
 
+namespace {
+double g_sharpen_ms = 0.0;
+u32 g_sharpen_n = 0;
+} // namespace
+
+void NoteSharpen(double ms) {
+    g_sharpen_ms += ms;
+    ++g_sharpen_n;
+}
+
 void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, double mv_ms,
                u32 in_w, u32 in_h, u32 sr_w, u32 sr_h, u32 out_w, u32 out_h, bool upscaled) {
     const auto now = std::chrono::steady_clock::now();
@@ -1130,15 +1186,20 @@ void NoteFrame(double cpu_ms, double wait_ms, double gpu_ms, double sr_ms, doubl
         g_hist_mean.erase(g_hist_mean.begin());
         g_hist_max.erase(g_hist_max.begin());
     }
-    LOG_INFO(Render_Vulkan,
-             "[perf] fps {:.1f} frame {:.2f} ms | cpu {:.2f} ms (fence wait {:.2f}) | gpu {:.2f} "
-             "ms | upscaler {} {} {}x{} -> {} -> {}x{} (window) sr {:.3f} ms mv {:.3f} ms{}",
-             s.fps, s.frame_ms, s.cpu_ms, s.wait_ms, s.gpu_ms,
-             Enabled() ? SR::KindName(Cfg().kind) : "off",
-             Enabled() ? SR::QualityName(Cfg().quality) : "-", in_w, in_h,
-             s.sr_w ? fmt::format("{}x{}", s.sr_w, s.sr_h) : std::string("not upscaled"), out_w,
-             out_h, s.sr_ms, s.mv_ms,
-             Cfg().kind == SR::Kind::Taa ? fmt::format(" | taa {:.3f} ms", s.sr_ms) : std::string());
+    LOG_INFO(
+        Render_Vulkan,
+        "[perf] fps {:.1f} frame {:.2f} ms | cpu {:.2f} ms (fence wait {:.2f}) | gpu {:.2f} "
+        "ms | upscaler {} {} {}x{} -> {} -> {}x{} (window) sr {:.3f} ms mv {:.3f} ms{}",
+        s.fps, s.frame_ms, s.cpu_ms, s.wait_ms, s.gpu_ms,
+        Enabled() ? SR::KindName(Cfg().kind) : "off",
+        Enabled() ? SR::QualityName(Cfg().quality) : "-", in_w, in_h,
+        s.sr_w ? fmt::format("{}x{}", s.sr_w, s.sr_h) : std::string("not upscaled"), out_w, out_h,
+        s.sr_ms, s.mv_ms,
+        (Cfg().kind == SR::Kind::Taa ? fmt::format(" | taa {:.3f} ms", s.sr_ms) : std::string()) +
+            (g_sharpen_n != 0 ? fmt::format(" | rcas {:.3f} ms", g_sharpen_ms / g_sharpen_n)
+                              : std::string()));
+    g_sharpen_ms = 0.0;
+    g_sharpen_n = 0;
     g_acc = {};
     g_acc.start = now;
 }

@@ -41,7 +41,7 @@ public:
                       BB::FG::Inputs* fg = nullptr, VideoCore::ImageId* depth_id = nullptr);
     // The image behind Run's returned view (RGBA16F, SHADER_READ_ONLY_OPTIMAL after Run).
     [[nodiscard]] vk::Image OutputImage() const {
-        return output.image;
+        return sharpened ? sharp.image : output.image;
     }
 
     // Timestamps: begin of a frame's GPU work, its end (once per frame, around the flip).
@@ -70,6 +70,9 @@ private:
     void Destroy(OwnImage& img);
     void Barrier(vk::CommandBuffer cmd, OwnImage& img, vk::ImageLayout layout);
     bool Init();
+    // AMD RCAS on the output of an upscaler without a sharpening of its own (DLSS, XeSS).
+    bool Sharpen(vk::CommandBuffer cmd, vk::Extent2D out);
+    bool InitRcas();
 
     const Vulkan::Instance& instance;
     bool init_tried = false, init_ok = false;
@@ -78,6 +81,12 @@ private:
     vk::PipelineLayout layout{};
     vk::Pipeline pipeline{};
     OwnImage color, motion, output;
+    OwnImage sharp;
+    bool sharpened = false;
+    bool rcas_tried = false;
+    vk::DescriptorSetLayout rcas_set_layout{};
+    vk::PipelineLayout rcas_layout{};
+    vk::Pipeline rcas_pipeline{};
     // bb-clean (1.49 bb_mv.comp): reactive mask and the luminance ping-pong it compares against.
     OwnImage reactive, lum[2];
     u32 lum_index = 0;
@@ -89,13 +98,15 @@ private:
     FgSlot fg_slots[FgSlots]{};
     u32 fg_next = 0;
 
-    static constexpr u32 Slots = 8, PerSlot = 4; // begin, before mv, after mv / before sr, end
+    // begin, before mv, after mv / before sr, end; RCAS begin, end (only when it ran)
+    static constexpr u32 Slots = 8, Main = 4, PerSlot = 6;
     vk::QueryPool queries{};
     double ns_per_tick = 1.0;
     u32 slot = 0;
     bool slot_open = false;
     bool slot_written[Slots]{};
     bool slot_sr[Slots]{};
+    bool slot_rcas[Slots]{};
     u32 frames = 0;
     vk::Extent2D last_in{}, last_out{};
 };
