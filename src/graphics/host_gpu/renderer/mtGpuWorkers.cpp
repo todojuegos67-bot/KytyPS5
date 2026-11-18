@@ -587,7 +587,7 @@ void ReportWorkers(double seconds) {
 	    "cola llena {}, draws descartados {}), alcanzados {}, aceptados {}, rechazados por: {}; sin alcanzar {}. Draws: "
 	    "traducidos por trabajadores {} de {} (fallos: {}), mirados por el hilo GPU {}, emitidos "
 	    "desde trabajador {}{}, rechazados por: {}. Hilo GPU: traduccion normal {:.1f} us/draw, "
-	    "consumo {:.1f} ms, ahorro estimado {:.1f} ms{}; locks en manos de trabajadores {:.1f} ms "
+	    "consumo {:.1f} ms, ahorro estimado {:.1f} ms{}; traduccion en trabajadores {:.1f} ms "
 	    "({} reintentos); alertas {}. Tiempo de los trabajadores (ms): {}; ventaja media {:.1f} us "
 	    "({} trozos empezados antes de que llegue el hilo GPU, {} sin empezar), por draw terminado "
 	    "{:.1f} us ({} draws). Imagen sin la misma "

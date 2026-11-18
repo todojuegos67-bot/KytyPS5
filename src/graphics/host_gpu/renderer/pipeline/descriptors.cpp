@@ -257,6 +257,30 @@ static const bool g_bounded_buffer_writes = [] {
 }();
 
 // Diagnostics: names the shader whose bindings are prepared, for KYTY_WATCH_GPU_WRITE.
+// Stage d: m_translation_mutex, except on a translation worker (KYTY_MT_GPU=1/4): a worker's
+// translation reads none of what it guards (the texture memo, m_bindless_*): it has its own
+// context and texture descriptions (thread-local), reads the texture cache through its worker
+// view, and fails before anything bindless.
+class TranslationLock {
+public:
+	explicit TranslationLock(std::recursive_mutex& mutex)
+	    : m_mutex(MtGpu::OnWorker() ? nullptr : &mutex) {
+		if (m_mutex != nullptr) {
+			m_mutex->lock();
+		}
+	}
+	~TranslationLock() {
+		if (m_mutex != nullptr) {
+			m_mutex->unlock();
+		}
+	}
+	TranslationLock(const TranslationLock&)            = delete;
+	TranslationLock& operator=(const TranslationLock&) = delete;
+
+private:
+	std::recursive_mutex* m_mutex;
+};
+
 struct DiagShaderScope {
 	explicit DiagShaderScope(uint64_t hash) { BufferCache::s_diag_shader_hash = hash; }
 	~DiagShaderScope() { BufferCache::s_diag_shader_hash = 0; }
@@ -1007,7 +1031,9 @@ static bool RejectBindlessTexture(const char* what, uint64_t address) {
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               bool                                         memo) {
-	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
+	const TranslationLock translation_lock(m_translation_mutex); // stage d
+	// KYTY_MT_GPU=1/4: a worker keeps no memo (RecordTextureMemo is the GPU thread's).
+	memo = memo && !MtGpu::OnWorker();
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
@@ -1403,12 +1429,13 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
                                                    bool shader_conversion, vk::Format pixel_format,
                                                    vk::Format view_format, uint32_t size,
                                                    bool* same_backing) {
+	if (MtGpu::OnWorker()) {
+		return FindResolvedTextureOnWorker(resource, descriptor, std::move(desc), shader_conversion,
+		                                   pixel_format, view_format, same_backing);
+	}
 	auto&      texture_cache       = m_context.GetTextureCache();
 	const bool storage             = resource.written;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion, same_backing);
-	if (MtGpu::OnWorker() && MtGpu::SpeculationFailed()) {
-		return {}; // KYTY_MT_GPU=1/4: a worker's lookup found nothing it may use
-	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	// Round 124: the shader reads it as a single-sample image (an instruction of a single-sample
@@ -1504,6 +1531,77 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	return {id, nullptr, std::move(desc)};
 }
 
+// KYTY_MT_GPU=1/4: FindResolvedTexture on a translation worker, over the texture cache's worker
+// view (no lock). The same steps; where the GPU thread would copy (a sample of a multisample depth
+// image or its stencil, a corner of a larger image), end the emulator on a view it cannot make,
+// or log, the speculation fails instead and the GPU thread translates the draw.
+TextureBinding RenderExecutor::FindResolvedTextureOnWorker(
+    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+    vk::Format view_format, bool* same_backing) {
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto& view         = texture_cache.WorkerView();
+	const bool storage       = resource.written;
+	auto       id            = texture_cache.FindImage(desc, shader_conversion, same_backing);
+	if (MtGpu::SpeculationFailed()) {
+		return {};
+	}
+	auto image = view.Get(id);
+	if (image == nullptr) {
+		MtGpu::SpeculationFail("imagen sin registro de trabajador");
+		return {};
+	}
+	const bool stencil_association = static_cast<bool>(image->depth_id);
+	const bool single_sample_read =
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
+	if (stencil_association) {
+		id    = image->depth_id;
+		image = view.Get(id);
+		if (image == nullptr) {
+			MtGpu::SpeculationFail("imagen sin registro de trabajador");
+			return {};
+		}
+		MtGpu::NoteRead(image->info.data.address, image->info.data.size);
+		if (image->samples > 1 && single_sample_read && !storage &&
+		    TextureCache::WorkerMayCopySample(*image, true)) {
+			MtGpu::SpeculationFail("copia de una muestra (stencil)");
+			return {};
+		}
+	} else if (image->info.IsDepth()) {
+		const bool viewable =
+		    !storage && IsSupportedSampledDepthResource(resource) &&
+		    (descriptor.TileMode() != Prospero::TileMode::kDepth ||
+		     IsSupportedDepthTextureEncoding(descriptor, resource.r128)) &&
+		    IsSupportedSampledDepthView(image->info.pixel_format, pixel_format,
+		                                descriptor.DstSelXYZW());
+		if (!viewable) {
+			MtGpu::SpeculationFail("vista de profundidad no soportada");
+			return {};
+		}
+		if (image->samples > 1 && single_sample_read &&
+		    TextureCache::WorkerMayCopySample(*image, false)) {
+			MtGpu::SpeculationFail("copia de una muestra (profundidad)");
+			return {};
+		}
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		                             descriptor.DstSelXYZW());
+		if (TextureCache::WorkerMayCopyCorner(*image, desc.info)) {
+			MtGpu::SpeculationFail("copia de una esquina");
+			return {};
+		}
+	}
+	if (image->samples > 1 && single_sample_read) {
+		// The GPU thread logs it and binds a null texture: left to it.
+		MtGpu::SpeculationFail("multimuestra leida como una muestra");
+		return {};
+	}
+	return {id, nullptr, std::move(desc)};
+}
+
 // Round 142: KYTY_CUBE_EDGE_CLAMP=0 turns it off. A cube map is sampled here as a 2D array of
 // its faces (face coordinates and face index from V_CUBE*), so the sampler's address mode applies
 // inside each face. The console's cube addressing ignores it and filters across the face edges;
@@ -1562,6 +1660,14 @@ static vk::Sampler NativeSampler(RenderContext&                                 
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
+	if (MtGpu::OnWorker()) {
+		// KYTY_MT_GPU=1/4: a worker makes no sampler; one not made yet fails its draw.
+		const auto found = context.GetSamplerCache().FindSampler(descriptor, sampler.integer_border);
+		if (!found) {
+			MtGpu::SpeculationFail("sampler por crear");
+		}
+		return found;
+	}
 	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
@@ -1614,8 +1720,17 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (auto* log = ActivePtr()->bind_log; log != nullptr) {
 		log->emplace_back(id, storage); // KYTY_MT_GPU=1/4: replayed by the GPU thread
 	}
-	auto& image = m_context.GetTextureCache().GetImage(id);
-	if (image.info.data.Empty()) {
+	if (MtGpu::OnWorker()) {
+		// KYTY_MT_GPU=1/4: the image as the worker view holds it.
+		const auto record = m_context.GetTextureCache().WorkerView().Get(id);
+		if (record == nullptr) {
+			MtGpu::SpeculationFail("imagen sin registro de trabajador");
+			return;
+		}
+		if (record->info.data.Empty()) {
+			return;
+		}
+	} else if (m_context.GetTextureCache().GetImage(id).info.data.Empty()) {
 		return;
 	}
 	auto& flags = ActivePtr()->images.At(id);
@@ -2522,7 +2637,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
-	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
+	const TranslationLock translation_lock(m_translation_mutex); // stage d
 	prepared.bindless_patches.clear();
 	prepared.bindless_heaps.clear();
 	const auto& program  = *runtime.program;
@@ -3340,7 +3455,7 @@ void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
-	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
+	const TranslationLock translation_lock(m_translation_mutex); // stage d
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -3357,20 +3472,22 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool                   on_worker   = MtGpu::OnWorker();
 	if (on_worker) {
 		// KYTY_MT_GPU=1/4: a translation worker leaves to the GPU thread the draws whose
-		// translation logs in order (watched shaders, the frame graph, grid probes) or touches
-		// the bindless table (registration, heap surveys, uploads of the flattened SRT).
-		const bool bindless = (!snapshot.bindless_heaps.empty() ||
-		                       !snapshot.bindless_sampler_heaps.empty() ||
-		                       std::ranges::any_of(program.info.images,
-		                                           &ShaderRecompiler::IR::ImageResource::runtime)) &&
-		                      m_context.GetBindlessTable().Enabled();
+		// translation logs in order (watched shaders, the frame graph, grid probes), touches
+		// the bindless table or its state (registration, heap surveys, uploads of the flattened
+		// SRT; with the table off too: the survey set is the GPU thread's), or reads images
+		// outside the worker view (KYTY_BISECT's steps).
+		const bool bindless = !snapshot.bindless_heaps.empty() ||
+		                      !snapshot.bindless_sampler_heaps.empty() ||
+		                      std::ranges::any_of(program.info.images,
+		                                          &ShaderRecompiler::IR::ImageResource::runtime);
 		const char* why = watched_use != UINT32_MAX                      ? "shader vigilado"
 		                  : FrameGraph::Active() || FrameGraph::Logging() ? "frame graph"
 		                  : (program.stage == ShaderType::Pixel &&
 		                     GpuTiming::ProbesGridsOf(program.shader_hash))
 		                      ? "sonda de rejillas"
-		                  : bindless ? "bindless"
-		                             : nullptr;
+		                  : bindless         ? "bindless"
+		                  : Bisect::Active() ? "bisect"
+		                                     : nullptr;
 		if (why != nullptr) {
 			MtGpu::SpeculationFail(why);
 			return;
@@ -3519,7 +3636,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			// Its later uploads are checked (TextureCache::CheckLightGridUpload), and what this
 			// binding reads (CheckLightGridView).
 			TextureCache::NoteLightGridShape(binding.desc.info);
-			CheckLightGridView(runtime, i, binding);
+			if (!on_worker) {
+				// A diagnostic over the image as the cache holds it (GPU thread only).
+				CheckLightGridView(runtime, i, binding);
+			}
 		}
 		if (grids_off && grid) {
 			// KYTY_BISECT's grids:off: a null texture, whose cells read as zero lights.

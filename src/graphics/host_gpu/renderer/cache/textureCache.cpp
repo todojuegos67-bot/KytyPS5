@@ -1156,6 +1156,11 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
+	if (MtGpu::WorkersMode()) {
+		// Published before the stamps below (textureWorkerView.h).
+		PublishWorkerImage(id);
+		m_worker_view.AddStart(image.info.data.address, id);
+	}
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
 	if (MtGpu::WorkersMode()) {
@@ -1201,6 +1206,11 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	if (MtGpu::WorkersMode()) {
+		// Published before the stamps below (textureWorkerView.h).
+		m_worker_view.RemoveStart(image.info.data.address, id);
+		m_worker_view.Set(id, nullptr);
+	}
 	m_image_set_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_zone_stamps.Stamp(image.info.data.address, image.info.data.size);
 	if (MtGpu::WorkersMode()) {
@@ -1860,6 +1870,10 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.mip_layout[0]   = {0, info.bytes_per_block, 1, 1};
 	const auto id        = InsertImage(info);
 	m_null_images.emplace(key, id);
+	if (MtGpu::WorkersMode()) {
+		PublishWorkerImage(id);
+		m_worker_view.AddNull(key.first, key.second, id);
+	}
 	return id;
 }
 
@@ -3854,8 +3868,15 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		}
 		depth.stencil_ids.push_back(association);
 	}
+	const bool relinked         = record.depth_id != depth_id;
 	record.depth_id             = depth_id;
 	record.stencil_subresources = depth.stencil_subresources;
+	if (relinked && record.registered && MtGpu::WorkersMode()) {
+		// The workers read depth_id: published, then stamped (textureWorkerView.h).
+		PublishWorkerImage(association);
+		MtGpu::NoteWrite(MtGpu::WriteKind::ImageRetired, record.info.data.address,
+		                 record.info.data.size);
+	}
 	return association;
 }
 
@@ -3888,53 +3909,165 @@ void NoteUnplacedBinding(const TextureCache::ImageDesc& desc, const ImageInfo& f
 
 } // namespace
 
-// KYTY_MT_GPU=1/4 (measurement): what lies at a descriptor's memory when a worker found no image
-// of the same backing there: none, an image at the same address that differs in one field (the
-// first SameBacking compares), or only images that start elsewhere over it. Under m_lock.
-const char* TextureCache::DescribeWorkerMiss(const ImageDesc& desc, bool exact_format) {
-	const auto& want  = desc.info;
-	const char* field = nullptr;
-	if (const auto* owners = m_image_page_table.Find(want.data.address >> ImagePageTable::kPageBits);
-	    owners != nullptr) {
-		owners->ForEach([&](ImageId id) {
-			const auto* image = m_slot_images.try_get(id);
-			if (image == nullptr || image->info.data.address != want.data.address ||
-			    field != nullptr) {
-				return;
-			}
-			const auto& have = image->info;
-			field = have.data.size != want.data.size         ? "misma direccion, otro tamano"
-			        : have.extent != want.extent              ? "misma direccion, otro extent"
-			        : have.resources.levels < want.resources.levels ||
-			                have.resources.layers < want.resources.layers
-			            ? "misma direccion, menos mips/capas"
-			        : have.samples != want.samples            ? "misma direccion, otras muestras"
-			        : have.bytes_per_block != want.bytes_per_block ? "misma direccion, otro bloque"
-			        : have.tile_mode != want.tile_mode        ? "misma direccion, otro tile"
-			        : have.GetColorTransform() != want.GetColorTransform()
-			            ? "misma direccion, otra transformacion de color"
-			        : have.type != want.type                  ? "misma direccion, otro tipo"
-			        : !ImageViewOps::FormatsCompatible(have.pixel_format, want.pixel_format) ||
-			                (exact_format && have.pixel_format != want.pixel_format)
-			            ? "misma direccion, otro formato"
-			            : "misma direccion, alias de solo lectura oculto";
-		});
-	}
-	if (field != nullptr) {
-		return field;
-	}
-	return FindImagesInRegion(want.data.address, want.data.size, false).empty()
-	           ? "ninguna imagen ahi"
-	           : "solo imagenes que empiezan en otra direccion";
+namespace {
+
+// KYTY_MT_GPU=1/4: the images a worker's FindImage found (SpeculateDraw sets it), for the GPU
+// thread to touch them as FindImage would have when it uses the translation.
+thread_local TextureWorkerView::FoundLog* t_worker_found = nullptr;
+
+bool SameRange(const GuestRange& a, const GuestRange& b) {
+	return a.address == b.address && a.size == b.size;
 }
 
-// KYTY_MT_GPU=1/4: FindImage on a translation worker, which may not make, copy, free or clear
-// anything: only an image found as it is, with the same backing at the descriptor's address (the
-// lookup FindImage starts with). Anything else (no such image, one too small, an overlap to
-// resolve, a null image not made yet, colour metadata to materialize, a video-out read) fails the
-// speculation (MtGpu::SpeculationFail) and gives no image: the GPU thread translates the draw.
-// The range is noted as read (the worker's zones), and the image touched as FindImage touches it
-// (its LRU; the tick it was used in is set by the emission's FindTexture).
+bool SameImageInfo(const ImageInfo& a, const ImageInfo& b) {
+	const auto& am = a.metadata;
+	const auto& bm = b.metadata;
+	return SameRange(a.data, b.data) && SameRange(a.stencil, b.stencil) &&
+	       SameRange(am.range, bm.range) && am.kind == bm.kind && am.control == bm.control &&
+	       am.clear_word == bm.clear_word && am.clear_word1 == bm.clear_word1 &&
+	       am.compression == bm.compression && am.stencil_compressed == bm.stencil_compressed &&
+	       am.clear_register_valid == bm.clear_register_valid &&
+	       am.dcc_alpha_msb == bm.dcc_alpha_msb && a.htile_clear_mask == b.htile_clear_mask &&
+	       a.pixel_format == b.pixel_format && a.guest_format == b.guest_format &&
+	       a.type == b.type && a.extent == b.extent && a.resources == b.resources &&
+	       a.pitch == b.pitch && a.bytes_per_block == b.bytes_per_block &&
+	       a.samples == b.samples && a.tile_mode == b.tile_mode && a.bgra16 == b.bgra16 &&
+	       a.mip_layout == b.mip_layout;
+}
+
+} // namespace
+
+void TextureCache::SetWorkerFoundLog(TextureWorkerView::FoundLog* log) {
+	t_worker_found = log;
+}
+
+void TextureCache::TouchFound(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered) {
+		return;
+	}
+	image->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*image);
+}
+
+void TextureCache::PublishWorkerImage(ImageId id) {
+	if (!MtGpu::WorkersMode()) {
+		return;
+	}
+	const auto* image = m_slot_images.try_get(id);
+	if (image == nullptr) {
+		m_worker_view.Set(id, nullptr);
+		return;
+	}
+	auto record             = std::make_shared<TextureWorkerView::Record>();
+	record->id              = id;
+	record->info            = image->info;
+	record->depth_id        = image->depth_id;
+	record->samples         = image->backing.samples;
+	record->backing_layers  = image->backing.layers;
+	record->backing_type    = image->backing.image_type;
+	record->backing_format  = image->backing.format;
+	record->has_backing     = image->backing.image != nullptr;
+	m_worker_view.Set(id, std::move(record));
+}
+
+uint64_t TextureCache::ResolutionHash(const ImageDesc& desc, bool exact_format) {
+	const auto& i = desc.info;
+	const auto& v = desc.view_info;
+	const std::array<uint64_t, 10> words {
+	    i.data.address,
+	    i.data.size,
+	    (uint64_t {i.extent.width} << 32u) | i.extent.height,
+	    (uint64_t {i.extent.depth} << 32u) | (uint64_t {i.resources.levels} << 16u) |
+	        i.resources.layers,
+	    (uint64_t {static_cast<uint32_t>(i.pixel_format)} << 32u) |
+	        static_cast<uint32_t>(i.guest_format),
+	    (uint64_t {static_cast<uint32_t>(i.tile_mode)} << 32u) | static_cast<uint32_t>(i.type),
+	    (uint64_t {static_cast<uint32_t>(v.format)} << 32u) | v.base_level,
+	    (uint64_t {v.base_layer} << 32u) | (uint64_t {v.level_count} << 16u) | v.layer_count,
+	    i.metadata.range.address,
+	    (uint64_t {static_cast<uint32_t>(desc.type)} << 1u) | (exact_format ? 1u : 0u)};
+	return XXH3_64bits(words.data(), sizeof(words));
+}
+
+bool TextureCache::SameResolution(const TextureWorkerView::Resolution& a,
+                                  const TextureWorkerView::Resolution& b) {
+	return a.hash == b.hash && a.type == b.type && a.exact == b.exact &&
+	       a.view_info == b.view_info && SameImageInfo(a.info, b.info);
+}
+
+void TextureCache::PublishWorkerResolution(const ImageDesc& in, bool exact_format,
+                                           const ImageDesc& desc, ImageId result) {
+	TextureWorkerView::Resolution resolution;
+	resolution.hash        = ResolutionHash(in, exact_format);
+	resolution.info        = in.info;
+	resolution.view_info   = in.view_info;
+	resolution.type        = static_cast<uint8_t>(in.type);
+	resolution.exact       = exact_format;
+	resolution.result      = result;
+	resolution.base_level  = desc.view_info.base_level;
+	resolution.base_layer  = desc.view_info.base_layer;
+	resolution.range_stamp = RangeStamp(in.info.data.address, in.info.data.size);
+	resolution.epoch       = MtGpu::Epoch();
+	if (const auto kept = m_worker_view.Resolutions(resolution.hash); kept != nullptr) {
+		for (const auto& r: *kept) {
+			if (SameResolution(r, resolution) && r.result == result &&
+			    r.base_level == resolution.base_level && r.base_layer == resolution.base_layer &&
+			    r.range_stamp == resolution.range_stamp &&
+			    !MtGpu::RangeWrittenSince(in.info.data.address, in.info.data.size, r.epoch)) {
+				return; // already there as it is, and still current
+			}
+		}
+	}
+	m_worker_view.AddResolution(std::move(resolution), &TextureCache::SameResolution);
+}
+
+// KYTY_MT_GPU=1/4 (measurement): what lies at a descriptor's memory when a worker found no image
+// of the same backing there: no image starting there, or an image at the same address that
+// differs in one field (the first SameBacking compares). From the worker view.
+const char* TextureCache::DescribeWorkerMiss(const ImageDesc& desc, bool exact_format) const {
+	const auto& want   = desc.info;
+	const auto  bucket = m_worker_view.StartsBucket(want.data.address);
+	if (bucket != nullptr) {
+		for (const auto& [address, id]: *bucket) {
+			if (address != want.data.address) {
+				continue;
+			}
+			const auto image = m_worker_view.Get(id);
+			if (image == nullptr) {
+				continue;
+			}
+			const auto& have = image->info;
+			return have.data.size != want.data.size         ? "misma direccion, otro tamano"
+			       : have.extent != want.extent              ? "misma direccion, otro extent"
+			       : have.resources.levels < want.resources.levels ||
+			               have.resources.layers < want.resources.layers
+			           ? "misma direccion, menos mips/capas"
+			       : have.samples != want.samples            ? "misma direccion, otras muestras"
+			       : have.bytes_per_block != want.bytes_per_block ? "misma direccion, otro bloque"
+			       : have.tile_mode != want.tile_mode        ? "misma direccion, otro tile"
+			       : have.GetColorTransform() != want.GetColorTransform()
+			           ? "misma direccion, otra transformacion de color"
+			       : have.type != want.type                  ? "misma direccion, otro tipo"
+			       : !ImageViewOps::FormatsCompatible(have.pixel_format, want.pixel_format) ||
+			               (exact_format && have.pixel_format != want.pixel_format)
+			           ? "misma direccion, otro formato"
+			           : "misma direccion, otra";
+		}
+	}
+	return "ninguna imagen empieza ahi";
+}
+
+// KYTY_MT_GPU=1/4: FindImage on a translation worker, from the worker view (no lock): it may not
+// make, copy, free or clear anything. An image found as it is, with the same backing at the
+// descriptor's address (the lookup FindImage starts with), or the image FindImage's overlap loop
+// gave the same description before with no change to the image set, while no image near the
+// description's memory has been registered or unregistered since (its RangeStamp). Anything else
+// (no such image, more than one, one too small, a null image not made yet, colour metadata to
+// materialize, a video-out read) fails the speculation (MtGpu::SpeculationFail) and gives no
+// image: the GPU thread translates the draw. The ranges it used are noted as read (the worker's
+// zones), and what it found logged for the GPU thread to touch (TouchFound).
 ImageId TextureCache::FindImageOnWorker(ImageDesc& desc, bool exact_format, bool* same_backing) {
 	if (same_backing != nullptr) {
 		*same_backing = false;
@@ -3943,12 +4076,14 @@ ImageId TextureCache::FindImageOnWorker(ImageDesc& desc, bool exact_format, bool
 		MtGpu::SpeculationFail("lectura de video out");
 		return {};
 	}
+	if (Bisect::ReadOnlyAliasesOff()) {
+		MtGpu::SpeculationFail("alias de solo lectura (bisect)");
+		return {};
+	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
-		std::scoped_lock lock {m_lock};
-		const auto key = std::pair {desc.info.pixel_format, desc.info.type};
-		if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
-			return found->second;
+		if (const auto id = m_worker_view.NullImage(desc.info.pixel_format, desc.info.type)) {
+			return id;
 		}
 		MtGpu::SpeculationFail("imagen nula nueva");
 		return {};
@@ -3959,36 +4094,75 @@ ImageId TextureCache::FindImageOnWorker(ImageDesc& desc, bool exact_format, bool
 		return {};
 	}
 	MtGpu::NoteRead(desc.info.data.address, desc.info.data.size);
-	std::scoped_lock lock {m_lock};
-	ImageId    result {};
-	const bool hide_aliases = m_read_only_aliases != 0 && Bisect::ReadOnlyAliasesOff();
-	if (const auto* owners =
-	        m_image_page_table.Find(desc.info.data.address >> ImagePageTable::kPageBits);
-	    owners != nullptr) {
-		owners->ForEach([&](ImageId id) {
-			const auto* image = m_slot_images.try_get(id);
-			if (image != nullptr && SameBacking(image->info, desc.info, exact_format) &&
-			    !(hide_aliases && image->read_only_alias)) {
-				result = id;
+	std::shared_ptr<const TextureWorkerView::Record> found;
+	uint32_t                                         matches = 0;
+	if (const auto bucket = m_worker_view.StartsBucket(desc.info.data.address); bucket != nullptr) {
+		for (const auto& [address, id]: *bucket) {
+			if (address != desc.info.data.address) {
+				continue;
 			}
-		});
+			auto image = m_worker_view.Get(id);
+			if (image != nullptr && SameBacking(image->info, desc.info, exact_format)) {
+				found = std::move(image);
+				matches++;
+			}
+		}
 	}
-	if (!result) {
-		MtGpu::SpeculationFail("imagen sin la misma memoria");
-		MtGpu::NoteImageMiss(DescribeWorkerMiss(desc, exact_format));
+	if (matches > 1) {
+		// FindImage takes the last of them in its page's owner order, which the view does not keep.
+		MtGpu::SpeculationFail("varias imagenes con la misma memoria");
 		return {};
 	}
-	auto& image = m_slot_images[result];
-	if ((exact_format && image.info.pixel_format != desc.info.pixel_format) ||
-	    image.info.resources < desc.info.resources) {
-		MtGpu::SpeculationFail("imagen por rehacer");
-		return {};
+	if (found != nullptr) {
+		if ((exact_format && found->info.pixel_format != desc.info.pixel_format) ||
+		    found->info.resources < desc.info.resources) {
+			MtGpu::SpeculationFail("imagen por rehacer");
+			return {};
+		}
+		if (same_backing != nullptr) {
+			*same_backing = true;
+		}
+		if (t_worker_found != nullptr) {
+			t_worker_found->images.push_back(found->id);
+		}
+		return found->id;
 	}
-	if (same_backing != nullptr) {
-		*same_backing = true;
+	// The overlap loop's result for this description, as the GPU thread found it last.
+	const auto hash = ResolutionHash(desc, exact_format);
+	if (const auto kept = m_worker_view.Resolutions(hash); kept != nullptr) {
+		TextureWorkerView::Resolution want;
+		want.hash      = hash;
+		want.info      = desc.info;
+		want.view_info = desc.view_info;
+		want.type      = static_cast<uint8_t>(desc.type);
+		want.exact     = exact_format;
+		for (const auto& r: *kept) {
+			if (!SameResolution(r, want)) {
+				continue;
+			}
+			const auto image = m_worker_view.Get(r.result);
+			if (image == nullptr ||
+			    r.range_stamp != RangeStamp(desc.info.data.address, desc.info.data.size)) {
+				break; // an image near it registered or unregistered since: looked up again
+			}
+			if (t_worker_found == nullptr) {
+				break; // nowhere to note what must stay unwritten: not used
+			}
+			MtGpu::NoteRead(image->info.data.address, image->info.data.size);
+			desc.view_info.base_level = r.base_level;
+			desc.view_info.base_layer = r.base_layer;
+			t_worker_found->images.push_back(r.result);
+			t_worker_found->unwritten.push_back(
+			    {desc.info.data.address, desc.info.data.size, r.epoch});
+			t_worker_found->unwritten.push_back(
+			    {image->info.data.address, image->info.data.size, r.epoch});
+			MtGpu::NoteImageMiss("resuelta por solapamiento conocido");
+			return r.result;
+		}
 	}
-	TouchImage(image);
-	return result;
+	MtGpu::SpeculationFail("imagen sin la misma memoria");
+	MtGpu::NoteImageMiss(DescribeWorkerMiss(desc, exact_format));
+	return {};
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_backing) {
@@ -4009,6 +4183,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 	}
 	MtGpu::NoteRead(desc.info.data.address, desc.info.data.size);
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	// KYTY_MT_GPU=1/4: the description as given, for the worker view's copy of an overlap result.
+	std::optional<ImageDesc> worker_in;
+	if (MtGpu::WorkersMode()) {
+		worker_in.emplace(desc);
+	}
+	bool keep_resolution = false;
 
 	ImageId result {};
 	{
@@ -4145,7 +4325,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 			*same_backing = backing_match && static_cast<bool>(result);
 		}
 		if (MtGpu::WorkersMode()) {
-			// KYTY_MT_GPU=1/4 (measurement): what a worker's lookup would have needed here.
+			// KYTY_MT_GPU=1/4: an overlap resolved to an image that was there, with no image made
+			// or dropped: the workers may give the same description the same image (and view
+			// base) while nothing near it is registered or unregistered.
+			keep_resolution = !backing_match && result && kept_aliases.empty() &&
+			                  ImageSetGeneration() == lookup_generation;
+			// (measurement) what a worker's lookup would have needed here.
 			MtGpu::NoteGpuImageLookup(
 			    backing_match && result                                 ? "misma memoria"
 			    : !result                                               ? "imagen nueva"
@@ -4240,6 +4425,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (keep_resolution && worker_in.has_value() && image.registered) {
+			PublishWorkerResolution(*worker_in, exact_format, desc, result);
+		}
 	}
 	DescribeUintArrayImage(result, desc);
 	MaterializeColorClear(result, desc, metadata_base_layer);
@@ -7435,6 +7623,37 @@ void LogSingleSampleStats(size_t depth_images, size_t stencil_images) {
 }
 
 } // namespace
+
+bool TextureCache::WorkerMayCopySample(const TextureWorkerView::Record& image, bool stencil) {
+	// SingleSampleDepth's and SingleSampleStencil's tests before they copy, over the record.
+	if (!MsDepthSample0Enabled()) {
+		return false;
+	}
+	return !(image.samples <= 1 || !image.info.IsDepth() ||
+	         (stencil && !HasStencilAspect(image.backing_format)) || !image.has_backing ||
+	         image.backing_type != vk::ImageType::e2D || image.info.resources.layers == 0 ||
+	         image.info.resources.layers != image.backing_layers ||
+	         image.info.resources.levels != 1 || image.depth_id);
+}
+
+bool TextureCache::WorkerMayCopyCorner(const TextureWorkerView::Record& image,
+                                       const ImageInfo&                 requested) {
+	// SubExtentCopy's tests before it copies, over the record (its needs_rebind is not in the
+	// record: a copy is taken as possible).
+	const auto& info = image.info;
+	return !(image.depth_id || !image.has_backing || info.data.Empty() || info.IsDepth() ||
+	         info.HasStencil() || info.IsBlock() || info.IsVolume() || image.samples != 1 ||
+	         image.backing_type != vk::ImageType::e2D || requested.samples != 1 ||
+	         requested.type != info.type || requested.data.address != info.data.address ||
+	         requested.data.size != info.data.size || requested.tile_mode != info.tile_mode ||
+	         requested.resources != info.resources || requested.resources.levels != 1 ||
+	         requested.extent.depth != info.extent.depth || requested.extent.width == 0 ||
+	         requested.extent.height == 0 || requested.extent.width > info.extent.width ||
+	         requested.extent.height > info.extent.height ||
+	         (requested.extent.width == info.extent.width &&
+	          requested.extent.height == info.extent.height) ||
+	         !ImageViewOps::FormatsCompatible(info.pixel_format, requested.pixel_format));
+}
 
 ImageId TextureCache::SingleSampleDepth(ImageId id) {
 	if (!MsDepthSample0Enabled()) {

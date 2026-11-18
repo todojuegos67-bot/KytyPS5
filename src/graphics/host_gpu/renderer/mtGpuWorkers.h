@@ -22,14 +22,19 @@
 // of the draw (PipelineCache::DrawPrepInputs: the stages' parameters and inputs, from its
 // registers at that draw) with the draw's key, and the draw can be taken at once.
 //
-// A worker takes the oldest draw no worker has taken (several workers share a chunk): walks the stages' descriptors as the scanner's
-// walks do (DrawPrepWalk: only bytes no GPU work wrote, recorded), then, holding the
-// translation mutex and the pipeline, buffer and texture locks (tried, never waited for, never
-// the scheduler's), finds the stages' programs and translates the draw's bindings in deferred
-// mode in its own TranslationContext (RenderExecutor::SpeculateDraw). Whatever would create,
-// copy, free or record (an image not there yet, colour metadata, a copy, a bindless heap, a
-// diagnostic that logs in order) fails the draw: the GPU thread translates it as always. The
-// 64 KiB zones the translation read are recorded with the write registry's epoch (stage A).
+// A worker takes the oldest draw no worker has taken (several workers share a chunk): walks
+// the stages' descriptors as the scanner's walks do (DrawPrepWalk: only bytes no GPU work wrote,
+// recorded), then, without any lock (no try-lock, no renderer lock, not m_translation_mutex),
+// finds the stages' programs in the permutations each program entry publishes and translates the
+// draw's bindings in deferred mode in its own TranslationContext (RenderExecutor::SpeculateDraw),
+// reading the texture cache through its worker view (textureWorkerView.h: read-copy-update
+// records the GPU thread publishes when it registers, unregisters or changes an image, and the
+// overlap results FindImage reached with no change to the image set). It creates nothing: an
+// image, null image, sampler or program not there yet, colour metadata, a copy, a bindless heap,
+// a diagnostic that logs in order fail the draw, and the GPU thread translates it as always.
+// The 64 KiB zones the translation read are recorded with the write registry's epoch (stage A),
+// read before anything else: every change the GPU thread publishes is stamped after it is
+// published.
 //
 // The GPU thread, at each draw (EmitPreparedDraw): when no worker has finished the draw it is
 // passed over (it never waits; a worker not started on it never starts); when one has, the
@@ -63,6 +68,7 @@ struct SpecDraw {
 	std::array<bool, 4>                   normalized {};
 	RenderExecutor::TranslationContext    tc;
 	std::vector<std::pair<ImageId, bool>> binds; // BindImage's calls, in order
+	TextureWorkerView::FoundLog           found; // what its FindImage calls found
 	// Who has it: Free (no one yet), Running (a worker), Done (the worker's results above are
 	// complete: release/acquire), Abandoned (the GPU thread got there first: no worker starts it).
 	static constexpr uint32_t Free      = 0;

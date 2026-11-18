@@ -337,8 +337,8 @@ public:
 	bool DrawPrepDescribeCompute(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
 	                             const ShaderComputeInputInfo& input_info, DrawPrepInputs& inputs);
 	bool DrawPrepWalk(const DrawPrepInputs& inputs, DrawPrep::PacketResult& out);
-	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker under the pipeline lock: the
-	// programs GetGraphicsPrograms would give a draw the scanner described (`inputs`) and a
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker, without the pipeline lock (each
+	// program entry's published permutations): the programs GetGraphicsPrograms would give a draw the scanner described (`inputs`) and a
 	// worker walked (DrawPrepWalk, `walked`), as runtimes over the walked resources, in the walk's
 	// order (the pixel stage first); `normalized`: a vertex stage runs its normalized copy. False
 	// when a stage has no program yet (Get would translate it) or the draw is not one for it.

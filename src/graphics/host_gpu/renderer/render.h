@@ -304,9 +304,8 @@ public:
 	};
 	[[nodiscard]] TranslationContext& MainTranslation() { return m_translation; }
 	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker: translates a draw the scanner
-	// described and the worker walked, into draw.tc in deferred mode, holding m_translation_mutex
-	// and the pipeline, buffer and texture locks (tried in that order, never waited for, never
-	// the scheduler's). False when one of them was not free (nothing done: try again later).
+	// described and the worker walked, into draw.tc in deferred mode, without any lock (the
+	// caches' published views, its own context). Always true (kept for the caller's loop).
 	bool SpeculateDraw(MtGpu::SpecDraw& draw);
 	[[nodiscard]] TranslationContext& ActiveTranslation() { return *ActivePtr(); }
 
@@ -386,6 +385,10 @@ private:
 	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
 	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
 	    vk::Format view_format, uint32_t size, bool* same_backing = nullptr);
+	[[nodiscard]] TextureBinding FindResolvedTextureOnWorker(
+	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	    vk::Format view_format, bool* same_backing);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -502,7 +505,9 @@ private:
 	}
 	// Stage d: the state translation shares between contexts (texture memo, m_bindless_*,
 	// m_runtime_image_requests, m_image_occurrences). Lock order: this first, then RendererLocks
-	// (pipeline, buffer, texture, scheduler); never taken under a RendererLock.
+	// (pipeline, buffer, texture, scheduler); never taken under a RendererLock. Not taken by the
+	// translation workers (KYTY_MT_GPU=1/4), which read none of it (TranslationLock,
+	// descriptors.cpp).
 	std::recursive_mutex                  m_translation_mutex;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;

@@ -2460,14 +2460,18 @@ struct PipelineCache::ProgramCache {
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: a permutation stays where it is as more are added (the workers hold pointers to
+		// them, and so do draws in flight).
+		std::deque<Permutation>                      permutations;
+		// KYTY_MT_GPU=1/4: the permutations as the GPU thread last added one (read-copy-update:
+		// a new list replaces the old one after each push_back), for the translation workers,
+		// which read it without the pipeline lock (FindScannedPermutation).
+		std::atomic<std::shared_ptr<const std::vector<const Permutation*>>> published;
 		// Held around every walk of resource_plan, whose memo and replay state are mutable: the
 		// draw-prep scanner (KYTY_DRAW_PREP) walks programs while the GPU thread does.
 		std::mutex walk_mutex;
@@ -2872,6 +2876,14 @@ struct PipelineCache::ProgramCache {
 		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
 		});
 		const auto& permutation = source.permutations.back();
+		if (MtGpu::WorkersMode()) {
+			const auto old  = source.published.load(std::memory_order_relaxed);
+			auto       list = old != nullptr
+			                      ? std::make_shared<std::vector<const Permutation*>>(*old)
+			                      : std::make_shared<std::vector<const Permutation*>>();
+			list->push_back(&permutation);
+			source.published.store(std::move(list), std::memory_order_release);
+		}
 		RecordSeed(options, input_info, source.specialization, push_data_cursor, permutation.handle);
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -4763,7 +4775,8 @@ struct PipelineCache::ProgramCache {
 		return true;
 	}
 
-	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker under the pipeline lock: the
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h), a translation worker, without the pipeline lock (the
+	// entry's published permutations; the program map under its shared lock): the
 	// permutation Get would find for a stage ScanStage walked (its entry looked up again here, as
 	// an entry may have gone since), with Get's push-data cursor; null when Get would translate
 	// one. `handle`: the permutation's (for its normalized copy).
@@ -4777,8 +4790,13 @@ struct PipelineCache::ProgramCache {
 		if (entry == nullptr || entry != scanned.entry || !scanned.ok) {
 			return nullptr;
 		}
-		for (auto& candidate: entry->permutations) {
-			const auto& layout = candidate.program.bindings;
+		const auto published = entry->published.load(std::memory_order_acquire);
+		if (published == nullptr) {
+			return nullptr;
+		}
+		for (const auto* permutation: *published) {
+			const auto& candidate = *permutation;
+			const auto& layout    = candidate.program.bindings;
 			if (layout.push_data_start_dword ==
 			        ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 			                                                 layout.ShaderDataDwords()) &&

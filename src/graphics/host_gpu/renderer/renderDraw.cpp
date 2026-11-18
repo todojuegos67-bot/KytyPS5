@@ -2794,35 +2794,20 @@ uint64_t SpecNowNs() {
 } // namespace
 
 bool RenderExecutor::SpeculateDraw(MtGpu::SpecDraw& d) {
-	// Lock order: the translation mutex, then pipeline -> buffer -> texture. Only tried: the GPU
-	// thread takes them the other way round (its draw's RendererLock, then this mutex inside the
-	// translation), so a worker never waits while it holds one. Never the scheduler.
-	if (!m_translation_mutex.try_lock()) {
-		return false;
-	}
-	const std::unique_lock translation(m_translation_mutex, std::adopt_lock);
-	auto&              mutexes = m_context.GetLocks().mutexes;
-	constexpr uint32_t Needed  = 3; // kRendererLockPipeline, Buffer, Texture
-	uint32_t           held    = 0;
-	struct Release {
-		std::array<Common::Mutex, 4>& mutexes;
-		uint32_t&                     held;
-		~Release() {
-			while (held > 0) {
-				mutexes[--held].Unlock();
-			}
-		}
-	} const release {mutexes, held};
-	while (held < Needed && mutexes[held].TryLock()) {
-		held++;
-	}
-	if (held < Needed) {
-		return false;
-	}
+	// No lock (KYTY_MT_GPU=1/4): the worker reads the program cache's published permutations,
+	// the texture cache's worker view and its own context and copies; what it does not find
+	// there fails the draw. The epoch is read first: anything the GPU thread changed after it is
+	// stamped after it (and published before the stamp), so the GPU thread rejects a translation
+	// that read it stale (ValidateSpeculatedDraw).
 	d.translated = false;
 	d.failure    = nullptr;
 	d.epoch      = MtGpu::Epoch();
 	d.binds.clear();
+	d.found.Clear();
+	TextureCache::SetWorkerFoundLog(&d.found);
+	struct Unfound {
+		~Unfound() { TextureCache::SetWorkerFoundLog(nullptr); }
+	} const unfound;
 	auto& tc = d.tc;
 	tc.deferred.clear();
 	tc.images.Clear();
@@ -2893,6 +2878,13 @@ const char* RenderExecutor::ValidateSpeculatedDraw(const MtGpu::SpecDraw& d,
 	if (const char* why = MtGpu::ZonesWrittenSince(d.zones, d.epoch)) {
 		return why;
 	}
+	// Overlap results the worker took from the texture cache's view: their memory unwritten
+	// since the GPU thread found them.
+	for (const auto& since: d.found.unwritten) {
+		if (MtGpu::RangeWrittenSince(since.address, since.size, since.epoch) != nullptr) {
+			return "solapamiento conocido caducado";
+		}
+	}
 	auto& textures = m_context.GetTextureCache();
 	for (const auto& [id, storage]: d.binds) {
 		const auto* image = textures.m_slot_images.try_get(id);
@@ -2905,6 +2897,12 @@ const char* RenderExecutor::ValidateSpeculatedDraw(const MtGpu::SpecDraw& d,
 
 void RenderExecutor::AdoptSpeculatedDraw(TranslationContext& tc, MtGpu::SpecDraw& d,
                                          DrawRenderState& state, size_t vertex_stage_count) {
+	// What FindImage does to the images it finds (their use noted), which the worker left to
+	// the GPU thread.
+	auto& textures = m_context.GetTextureCache();
+	for (const auto id: d.found.images) {
+		textures.TouchFound(id);
+	}
 	// The binding flags as the normal translation sets them: its BindImage calls, in order.
 	for (const auto& [id, storage]: d.binds) {
 		BindImage(id, storage);

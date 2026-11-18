@@ -393,6 +393,24 @@ ReadRecorder::~ReadRecorder() {
 	m_zones.erase(std::unique(m_zones.begin(), m_zones.end()), m_zones.end());
 }
 
+const char* RangeWrittenSince(uint64_t vaddr, uint64_t size, uint64_t epoch) {
+	if (size == 0) {
+		return nullptr;
+	}
+	// The zones NoteRead would record for the range.
+	thread_local std::vector<uint64_t> zones;
+	zones.clear();
+	const uint64_t first = vaddr >> ZoneBits;
+	uint64_t       last  = (vaddr + size - 1u) >> ZoneBits;
+	if (last - first >= WideZones) {
+		last = first + WideZones - 1u;
+	}
+	for (uint64_t z = first; z <= last; z++) {
+		zones.push_back(z);
+	}
+	return ZonesWrittenSince(zones, epoch);
+}
+
 const char* ZonesWrittenSince(const std::vector<uint64_t>& zones, uint64_t epoch) {
 	const auto verdict = [&](uint64_t stamp) -> const char* {
 		if ((stamp >> 2u) <= epoch) {

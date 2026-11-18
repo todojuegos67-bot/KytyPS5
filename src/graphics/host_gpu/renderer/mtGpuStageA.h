@@ -107,6 +107,8 @@ private:
 // GPU thread: null when no zone of `zones` (nor a wide write) was written after `epoch`; else
 // what wrote one ("escritura GPU", "escritura host", "imagen creada/retirada").
 [[nodiscard]] const char* ZonesWrittenSince(const std::vector<uint64_t>& zones, uint64_t epoch);
+// The same for the zones NoteRead records for [vaddr, vaddr + size).
+[[nodiscard]] const char* RangeWrittenSince(uint64_t vaddr, uint64_t size, uint64_t epoch);
 // NonDeferrable reached on a worker (a path the workers' guards missed): counted and logged.
 [[nodiscard]] uint64_t WorkerAlerts();
 

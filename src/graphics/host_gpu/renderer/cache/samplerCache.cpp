@@ -43,6 +43,28 @@ uint64_t SamplerCache::NextGeneration() {
 	return next.fetch_add(1, std::memory_order_relaxed);
 }
 
+vk::Sampler SamplerCache::FindSampler(const ShaderSamplerResource& r, bool integer_border) {
+	const bool       keep_lod = r.ForceUnormCoords() && UnnormalizedLodEnabled();
+	const SamplerKey key {r.fields[0], r.fields[1],    r.fields[2],
+	                      r.fields[3], integer_border, keep_lod};
+	struct Front {
+		uint64_t    generation = 0;
+		SamplerKey  key {};
+		vk::Sampler sampler = nullptr;
+	};
+	thread_local std::array<Front, 64> front {};
+	auto&                              slot = front[SamplerKeyHash {}(key) % front.size()];
+	if (slot.generation == m_generation && slot.key == key) {
+		return slot.sampler;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		slot = {m_generation, key, iter->second};
+		return iter->second;
+	}
+	return nullptr;
+}
+
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool integer_border) {
 	const bool       keep_lod = r.ForceUnormCoords() && UnnormalizedLodEnabled();
 	const SamplerKey key {r.fields[0], r.fields[1],    r.fields[2],

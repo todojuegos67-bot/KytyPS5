@@ -27,6 +27,9 @@ public:
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
 	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border);
+	// The sampler GetSampler would give, if it has made it already (null otherwise): never makes
+	// one (KYTY_MT_GPU=1/4's translation workers).
+	vk::Sampler FindSampler(const ShaderSamplerResource& r, bool integer_border);
 
 private:
 	// The S# words, the integer border variant, and whether an unnormalized sampler keeps its LOD

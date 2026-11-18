@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/imageZoneStamps.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/textureWorkerView.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/conditionalClear.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -81,6 +82,20 @@ public:
 	// backing (SameBacking), as it was: no overlap had to be resolved and no image was made.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
 	                                      bool* same_backing = nullptr);
+	// KYTY_MT_GPU=1/4 (mtGpuWorkers.h). Worker: the images as the GPU thread last published
+	// them (no lock). GPU thread: an image a worker's lookup found, touched as FindImage touches
+	// what it finds (when its translation is used); the images a worker's FindImage found are
+	// logged in `log` while set on its thread.
+	[[nodiscard]] const TextureWorkerView& WorkerView() const noexcept { return m_worker_view; }
+	void                                   TouchFound(ImageId id);
+	static void SetWorkerFoundLog(TextureWorkerView::FoundLog* log);
+	// Worker, over a record of the view: whether SingleSampleDepth/SingleSampleStencil
+	// (`stencil`) may make a copy of it, and whether SubExtentCopy may for `requested` (true when
+	// in doubt: the worker leaves the draw to the GPU thread).
+	[[nodiscard]] static bool WorkerMayCopySample(const TextureWorkerView::Record& image,
+	                                              bool                             stencil);
+	[[nodiscard]] static bool WorkerMayCopyCorner(const TextureWorkerView::Record& image,
+	                                              const ImageInfo&                 requested);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -484,7 +499,15 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
-	[[nodiscard]] const char* DescribeWorkerMiss(const ImageDesc& desc, bool exact_format);
+	[[nodiscard]] const char* DescribeWorkerMiss(const ImageDesc& desc, bool exact_format) const;
+	// KYTY_MT_GPU=1/4: the worker view's record of image `id` as it is now (GPU thread), and the
+	// view's copy of FindImage's overlap result for `in` (what it became: `desc`, `result`).
+	void PublishWorkerImage(ImageId id);
+	void PublishWorkerResolution(const ImageDesc& in, bool exact_format, const ImageDesc& desc,
+	                             ImageId result);
+	[[nodiscard]] static uint64_t ResolutionHash(const ImageDesc& desc, bool exact_format);
+	[[nodiscard]] static bool     SameResolution(const TextureWorkerView::Resolution& a,
+	                                             const TextureWorkerView::Resolution& b);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -577,6 +600,8 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	RegisteredPageCounts                                          m_registered_pages;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
+	// KYTY_MT_GPU=1/4: what the translation workers read, without the locks (textureWorkerView.h).
+	TextureWorkerView                                             m_worker_view;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	// SingleSampleDepth's copies, by the multisample depth image they copy: the copy (an image
