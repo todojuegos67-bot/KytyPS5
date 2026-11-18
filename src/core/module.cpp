@@ -25,6 +25,7 @@
 #include "core/module.h"
 #include "core/tls.h"
 #include "video_core/bb/bb_reflex.h"
+#include "video_core/bb/bb_reflex_game.h"
 
 namespace Core {
 
@@ -457,6 +458,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     if (MemoryPatcher::g_eboot_address == base_virtual_addr) {
         // After the static patching: the detours are the code that runs.
         BB::NativeMvHook::OnEbootPatched(base_virtual_addr, base_size);
+        BB::ReflexGame::OnEbootPatched(base_virtual_addr, base_size); // BB_REFLEX_GAME=1
         BB::ObjCol::OnEbootPatched(base_virtual_addr, base_size);
         BB::GameGfx::OnEbootPatched(base_virtual_addr, base_size);
         BB::RumbleHits::OnEbootPatched(base_virtual_addr, base_size);

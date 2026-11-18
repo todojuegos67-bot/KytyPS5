@@ -175,6 +175,12 @@ struct SecondStats {
     bool reflex = false;      // slReflexSetOptions(low latency) returned eOk
 };
 bool Stats(SecondStats& out);
+// bb-reflex-game (bb_reflex_game.h, BB_REFLEX_GAME=1 only): the game's own frame loop places the
+// simulation / render-submit-start markers and the Reflex sleep. Host threads only.
+bool GameReady();          // ready and PCL's slPCLSetMarker there (not shutting down)
+bool GameSleepAvailable(); // slReflexSleep there (loaded only with BB_REFLEX_GAME)
+bool GameMarker(uint32_t marker, uint32_t frame); // sl::PCLMarker value on frame's token
+bool GameSleep(uint32_t frame);                   // slReflexSleep(frame's token)
 } // namespace DlssSl
 
 bool PanelInfo(float& real, float& shown, const char*& state);

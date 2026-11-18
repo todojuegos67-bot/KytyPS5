@@ -25,6 +25,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_reflex.h"
+#include "video_core/bb/bb_reflex_game.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern Frontend::WindowSDL* g_window;
@@ -2428,6 +2429,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
 
     // bb-reflex: RENDERSUBMIT_END, before the GPU thread can reach the flip it queues.
     BB::Reflex::OnGuestFlip();
+    BB::ReflexGame::OnGuestFlip(); // bb-reflex-game: the game frame index goes with the flip
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
 }
@@ -2466,6 +2468,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     WaitGpuIdle();
 
     BB::Reflex::OnGuestSubmit(); // bb-reflex: RENDERSUBMIT_START of the frame being submitted
+    BB::ReflexGame::OnGuestSubmit(); // bb-reflex-game: eRenderSubmitStart (BB_REFLEX_GAME=1)
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
 }

@@ -15,6 +15,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_reflex.h"
+#include "video_core/bb/bb_reflex_game.h"
 #include "video_core/bb/bb_smooth.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -319,6 +320,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     Vulkan::Frame* frame;
+    BB::ReflexGame::OnGpuFlipBegin(); // bb-reflex-game: this flip's game frame index (if any)
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
     } else {

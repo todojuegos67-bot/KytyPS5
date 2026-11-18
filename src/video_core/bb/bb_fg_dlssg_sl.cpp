@@ -31,6 +31,7 @@
 #include <thread>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
+#include "video_core/bb/bb_reflex_game.h"
 #include "video_core/bb/bb_sr.h"
 
 #if defined(_WIN32) && defined(BB_STREAMLINE)
@@ -69,6 +70,7 @@ SL_STRUCT_END()
 } // namespace sl
 using PFun_slPCLSetMarker = sl::Result(sl::PCLMarker marker, const sl::FrameToken& frame);
 using PFun_slReflexSetOptions = sl::Result(const sl::ReflexOptions& options);
+using PFun_slReflexSleep = sl::Result(const sl::FrameToken& frame);
 using BbPFun_slShutdown = sl::Result();
 #endif
 
@@ -95,6 +97,7 @@ struct Api {
     PFun_slDLSSGGetState* dlssg_get_state = nullptr;
     PFun_slReflexSetOptions* reflex_set_options = nullptr;
     PFun_slPCLSetMarker* pcl_set_marker = nullptr;
+    PFun_slReflexSleep* reflex_sleep = nullptr; // BB_REFLEX_GAME only
     PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
     PFN_vkDestroySwapchainKHR destroy_swapchain = nullptr;
     PFN_vkGetSwapchainImagesKHR get_swapchain_images = nullptr;
@@ -342,6 +345,7 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         Feature(sl::kFeatureDLSS_G, "slDLSSGGetState", g.dlssg_get_state);
     if (reflex) Feature(sl::kFeatureReflex, "slReflexSetOptions", g.reflex_set_options);
     if (pcl) Feature(sl::kFeaturePCL, "slPCLSetMarker", g.pcl_set_marker);
+    if (reflex && ReflexGame::Requested()) Feature(sl::kFeatureReflex, "slReflexSleep", g.reflex_sleep);
     if (!functions) {
         // The swapchain still goes through the proxies (harmless without DLSS-G options).
         BBLogf("DLSS-G (Streamline): DLSS-G not available: off (swapchain through the proxies)");
@@ -428,21 +432,30 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
     if (!g_ready || g_shutting_down.load(std::memory_order_relaxed)) return 0;
     // DLSS super resolution's token when it evaluated this frame (its constants are set),
     // else the next index of the same stream and our own constants.
+    // bb-reflex-game: the game frame's own index (its simulation / render-submit-start markers
+    // were placed from the game's frame loop), else the old way.
+    const uint32_t game = ReflexGame::GpuFrameId();
     uint32_t frame = SR::Dlss::LastFrameIndex();
     bool own = false;
-    if (frame == 0 || frame == g_last_used.load(std::memory_order_relaxed)) {
+    if (game != 0) {
+        own = frame != game;
+        frame = game;
+    } else if (frame == 0 || frame == g_last_used.load(std::memory_order_relaxed)) {
         frame = SR::Dlss::NextFrameIndex();
         own = true;
     }
     g_last_used.store(frame, std::memory_order_relaxed);
+    ReflexGame::OnTagged(frame);
     sl::FrameToken* token = Token(frame);
     if (token == nullptr) {
         g_sec_errors.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
-    Marker(sl::PCLMarker::eSimulationStart, frame);
-    Marker(sl::PCLMarker::eSimulationEnd, frame);
-    Marker(sl::PCLMarker::eRenderSubmitStart, frame);
+    if (game == 0) {
+        Marker(sl::PCLMarker::eSimulationStart, frame);
+        Marker(sl::PCLMarker::eSimulationEnd, frame);
+        Marker(sl::PCLMarker::eRenderSubmitStart, frame);
+    }
 
     const bool valid = inputs != nullptr && inputs->valid && inputs->render.width > 0 &&
                        inputs->render.height > 0;
@@ -539,6 +552,7 @@ uint32_t BeforePresent(uint32_t frame) {
     } else {
         NoteUntagged(false);
     }
+    ReflexGame::OnPresentFrame(frame); // bb-reflex-game: its game markers sent first
     Marker(sl::PCLMarker::eRenderSubmitEnd, frame);
     Marker(sl::PCLMarker::ePresentStart, frame);
     return frame;
@@ -642,6 +656,41 @@ bool Stats(SecondStats& out) {
     return true;
 }
 
+bool GameReady() {
+    return g_ready.load(std::memory_order_acquire) && g.pcl_set_marker != nullptr &&
+           !g_shutting_down.load(std::memory_order_acquire);
+}
+
+bool GameSleepAvailable() {
+    return g.reflex_sleep != nullptr && g_reflex_on;
+}
+
+// Counted as a present in flight, so Shutdown waits for it (bounded) before slShutdown.
+bool GameMarker(uint32_t marker, uint32_t frame) {
+    if (marker > static_cast<uint32_t>(sl::PCLMarker::eRenderSubmitStart) || !GameReady()) return false;
+    g_in_present.fetch_add(1, std::memory_order_acq_rel);
+    bool ok = false;
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        sl::FrameToken* token = Token(frame);
+        ok = token != nullptr &&
+             g.pcl_set_marker(static_cast<sl::PCLMarker>(marker), *token) == sl::Result::eOk;
+    }
+    g_in_present.fetch_sub(1, std::memory_order_acq_rel);
+    return ok;
+}
+
+bool GameSleep(uint32_t frame) {
+    if (!GameSleepAvailable() || !GameReady()) return false;
+    g_in_present.fetch_add(1, std::memory_order_acq_rel);
+    bool ok = false;
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        sl::FrameToken* token = Token(frame);
+        ok = token != nullptr && g.reflex_sleep(*token) == sl::Result::eOk;
+    }
+    g_in_present.fetch_sub(1, std::memory_order_acq_rel);
+    return ok;
+}
+
 #else // no Streamline SDK in this build
 
 void OnDevice(vk::Instance, vk::PhysicalDevice, vk::Device) {
@@ -684,6 +733,18 @@ bool PresentAllowed() {
     return true;
 }
 void Shutdown(bool) {}
+bool GameReady() {
+    return false;
+}
+bool GameSleepAvailable() {
+    return false;
+}
+bool GameMarker(uint32_t, uint32_t) {
+    return false;
+}
+bool GameSleep(uint32_t) {
+    return false;
+}
 bool Stats(SecondStats&) {
     return false;
 }

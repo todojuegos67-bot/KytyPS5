@@ -3,6 +3,7 @@
 
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_reflex.h"
+#include "video_core/bb/bb_reflex_game.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -183,8 +184,10 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
 
     // bb-reflex: RENDERSUBMIT_END, before the GPU thread can reach the flip.
     BB::Reflex::OnGuestFlip();
+    BB::ReflexGame::OnGuestFlip(); // bb-reflex-game: the game frame index goes with the flip
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         BB::Reflex::OnGuestFlipDropped();
+        BB::ReflexGame::OnGuestFlipDropped();
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
     }

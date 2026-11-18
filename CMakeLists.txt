@@ -1233,6 +1233,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_fg_dlssg_sl.cpp
                src/video_core/bb/bb_reflex.cpp
                src/video_core/bb/bb_reflex.h
+               src/video_core/bb/bb_reflex_game.cpp
+               src/video_core/bb/bb_reflex_game.h
                src/video_core/bb/bb_reflex_vk.h
                src/video_core/bb/bb_smooth.cpp
                src/video_core/bb/bb_smooth.h

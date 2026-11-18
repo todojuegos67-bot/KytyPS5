@@ -19,6 +19,7 @@
 #include <vector>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_kyty_compat.h"
+#include "video_core/bb/bb_reflex_game.h"
 #include "video_core/bb/bb_sr.h"
 
 #if defined(_WIN32) && defined(BB_STREAMLINE)
@@ -624,7 +625,9 @@ bool Evaluate(const Desc& desc) {
     // One frame index stream for every Streamline feature (DLSS and DLSS-G): its frame-based
     // tagging and Reflex / PCL follow it, two counters interleaved made DLSS-G read another
     // frame's constants.
-    uint32_t frame = NextFrameIndex();
+    // bb-reflex-game: the game frame's index when its frame loop placed the markers.
+    uint32_t frame = BB::ReflexGame::GpuFrameId();
+    if (frame == 0) frame = NextFrameIndex();
     g_last_frame.store(frame, std::memory_order_relaxed);
     sl::FrameToken* token = nullptr;
     if (g_api.get_new_frame_token(token, &frame) != sl::Result::eOk || token == nullptr) {
