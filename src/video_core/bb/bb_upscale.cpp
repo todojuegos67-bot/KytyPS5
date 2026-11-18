@@ -1071,6 +1071,14 @@ Camera EndFrame(u32 flip_w, u32 flip_h) {
         const u32 i = (++g_frame_no % phases) + 1;
         g_jitter[0] = Halton(i, 2) - 0.5f;
         g_jitter[1] = Halton(i, 3) - 0.5f;
+        // bb-jitter-fs: BB_JITTER_SCALE (0..1, default 1) scales the jitter (a bisect aid: the
+        // forest-rock shadow flicker follows the jitter's y, every 18 frames at ratio 1.5).
+        static const float scale = [] {
+            const char* e = Env("BB_JITTER_SCALE");
+            return e ? std::clamp(static_cast<float>(std::atof(e)), 0.0f, 1.0f) : 1.0f;
+        }();
+        g_jitter[0] *= scale;
+        g_jitter[1] *= scale;
     } else {
         g_jitter[0] = g_jitter[1] = 0.0f;
     }

@@ -2121,6 +2121,170 @@ void Rasterizer::BbUpdateUiTransform() {
         bb_ui_pass.output.second);
 }
 
+// bb-jitter-fs (BB_JITTER_FS): the upscaler's sub-pixel jitter moves the scene geometry by the
+// viewport offset (UpdateViewportScissorState), not the game's projection. A full-screen pass
+// that rebuilds world positions from the jittered scene depth (the deferred shadow mask: scene
+// depth + the 4096x4096 cascade atlas, ps 0xf55643de in [hud-trace]) then puts every pixel up to
+// half a pixel off its surface along the view ray; on rock facets turned the wrong way that is
+// enough to fail the game's shadow bias, and those facets go dark whenever the jitter's y is
+// below about -0.2 render pixels: one frame in three, darkest on Halton phase 9 of 18 (the
+// flicker of the forest-rock video, every 18 game frames). Shifting such a pass by the same
+// jitter makes its interpolated rays / UVs land on the unjittered position of the surface the
+// pixel holds (|jitter| < 0.5, so a point-sampled depth fetch still reads the same texel).
+// BB_JITTER_FS: 0 off, 1 (default) passes that read the scene depth and a shadow map,
+// 2 every full-screen pass reading a depth-like image of the scene / its half / quarter size.
+// BB_JITTER_FS_PS=0xhash,... only those pixel shaders; BB_JITTER_FS_SKIP=0xhash,... never.
+namespace {
+struct JitterFsCfg {
+    int mode = 1;
+    std::vector<u64> only, skip;
+};
+const JitterFsCfg& JitterFsConfig() {
+    static const JitterFsCfg cfg = [] {
+        JitterFsCfg c;
+        const auto list = [](const char* s, std::vector<u64>& out) {
+            while (s && *s) {
+                char* end = nullptr;
+                const u64 v = std::strtoull(s, &end, 16);
+                if (end == s) break;
+                out.push_back(v);
+                s = end;
+                while (*s == ',' || *s == ' ' || *s == ';') ++s;
+            }
+        };
+        if (const char* s = std::getenv("BB_JITTER_FS"); s && *s) c.mode = std::atoi(s);
+        list(std::getenv("BB_JITTER_FS_PS"), c.only);
+        list(std::getenv("BB_JITTER_FS_SKIP"), c.skip);
+        BB::Upscale::Checkpoint(fmt::format(
+            "[jitter-fs] BB_JITTER_FS={} (0 off, 1 shadow-mask passes, 2 every depth-reading "
+            "full-screen pass), only {} ps, skip {} ps",
+            c.mode, c.only.size(), c.skip.size()));
+        return c;
+    }();
+    return cfg;
+}
+bool DepthLike(const AmdGpu::Image& t) {
+    switch (t.GetDataFmt()) {
+    case AmdGpu::DataFormat::Format32:
+    case AmdGpu::DataFormat::Format8_24:
+    case AmdGpu::DataFormat::Format24_8:
+    case AmdGpu::DataFormat::FormatX24_8_32:
+        return true;
+    case AmdGpu::DataFormat::Format16:
+        return t.GetNumberFmt() == AmdGpu::NumberFormat::Unorm;
+    default:
+        return false;
+    }
+}
+struct JitterFsPass {
+    u64 vs = 0, ps = 0;
+    u32 w = 0, h = 0;
+    bool shadow = false, applied = false;
+    u32 draws = 0;
+};
+struct JitterFsStats {
+    std::chrono::steady_clock::time_point start{};
+    u32 applied = 0, candidates = 0;
+    std::vector<JitterFsPass> passes;
+} g_jitter_fs_stats;
+bool Near(u32 a, u32 b) {
+    return a + 8 > b && a < b + 8;
+}
+} // namespace
+
+void Rasterizer::BbJitterFsEval(const GraphicsPipeline* pipeline) {
+    bb_jitter_fs[0] = bb_jitter_fs[1] = 0.0f;
+    const auto& regs = liverpool->regs;
+    if (bb_jitter_draw || !BB::Upscale::Capture() || !cb_descs[0].image_id ||
+        regs.num_indices > 6 || regs.num_instances.NumInstances() > 1 || regs.IsClipDisabled() ||
+        bb_cut.UiPhase() || bb_cut.NativeUiDraw()) {
+        return;
+    }
+    float jx = 0.f, jy = 0.f;
+    BB::Upscale::Jitter(jx, jy);
+    const auto& cfg = JitterFsConfig();
+    if (cfg.mode <= 0 || (jx == 0.0f && jy == 0.0f)) {
+        return;
+    }
+    const u32 sw = BB::Upscale::g_scene_w, sh = BB::Upscale::g_scene_h;
+    if (!sw || !sh) {
+        return;
+    }
+    const auto& im = texture_cache.GetImage(cb_descs[0].image_id);
+    const u32 tw = im.info.size.width, th = im.info.size.height;
+    u32 div = 0;
+    for (u32 d : {1u, 2u, 4u}) {
+        if (Near(tw, sw / d) && Near(th, sh / d)) {
+            div = d;
+            break;
+        }
+    }
+    if (div == 0) {
+        return;
+    }
+    bool depth_read = false, shadow_read = false;
+    u64 vs = 0, ps = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) continue;
+        if (stage->sw_stage == Shader::SwStage::Vertex) vs = stage->pgm_hash;
+        if (stage->sw_stage == Shader::SwStage::Fragment) ps = stage->pgm_hash;
+        for (const auto& image_desc : stage->images) {
+            const auto t = image_desc.GetSharp(*stage);
+            if (t.Address() == 0 || !DepthLike(t)) continue;
+            const u32 w = u32(t.width) + 1, h = u32(t.height) + 1;
+            if ((Near(w, sw) && Near(h, sh)) || (Near(w, tw) && Near(h, th))) {
+                depth_read = true;
+            } else if (w == h && w >= 1024) {
+                shadow_read = true;
+            }
+        }
+    }
+    if (!depth_read) {
+        return;
+    }
+    const auto listed = [](const std::vector<u64>& l, u64 h) {
+        return std::find(l.begin(), l.end(), h) != l.end();
+    };
+    bool apply = cfg.mode >= 2 ? true : (div == 1 && shadow_read);
+    if (!cfg.only.empty()) apply = listed(cfg.only, ps);
+    if (listed(cfg.skip, ps)) apply = false;
+    if (apply) {
+        bb_jitter_fs[0] = bb_jitter_fs[1] = 1.0f / float(div);
+    }
+    // [jitter-fs] every 10 s: the full-screen passes reading the scene depth, applied or not.
+    auto& st = g_jitter_fs_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (st.start.time_since_epoch().count() == 0) st.start = now;
+    ++st.candidates;
+    st.applied += apply ? 1 : 0;
+    bool found = false;
+    for (auto& p : st.passes) {
+        if (p.vs == vs && p.ps == ps && p.w == tw) {
+            ++p.draws;
+            found = true;
+            break;
+        }
+    }
+    if (!found && st.passes.size() < 24) {
+        st.passes.push_back({vs, ps, tw, th, shadow_read, apply, 1});
+    }
+    const double secs = std::chrono::duration<double>(now - st.start).count();
+    if (secs >= 10.0) {
+        std::string text = fmt::format(
+            "[jitter-fs] {:.1f} s: full-screen passes reading the scene depth {:.1f}/s, shifted "
+            "by the jitter {:.1f}/s (BB_JITTER_FS={}; jitter now {:+.3f} {:+.3f}):",
+            secs, st.candidates / secs, st.applied / secs, cfg.mode, jx, jy);
+        for (const auto& p : st.passes) {
+            text += fmt::format(" vs{:#x}/ps{:#x} {}x{}{} {}x{:.1f}/s;", p.vs, p.ps, p.w, p.h,
+                                p.shadow ? " shadow" : "", p.applied ? "SHIFT" : "keep",
+                                p.draws / secs);
+        }
+        BB::Upscale::Checkpoint(text);
+        st = {};
+        st.start = now;
+    }
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
@@ -2376,6 +2540,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     } else {
         state.depth_stencil_attachment = {};
     }
+    BbJitterFsEval(pipeline);
 
     // Supermedo: every attachment of such a pass must be redirected; viewports and scissors
     // are scaled.
@@ -2956,6 +3121,12 @@ void Rasterizer::UpdateViewportScissorState() const {
                 BB::Upscale::Jitter(jx, jy);
                 viewport.x += jx;
                 viewport.y += jy;
+            } else if (bb_jitter_fs[0] != 0.0f) {
+                // bb-jitter-fs: see BbJitterFsEval.
+                float jx = 0.f, jy = 0.f;
+                BB::Upscale::Jitter(jx, jy);
+                viewport.x += jx * bb_jitter_fs[0];
+                viewport.y += jy * bb_jitter_fs[1];
             }
             viewport.width = xscale * 2.0f * bb_target_scale[0];
             viewport.height = yscale * 2.0f * bb_target_scale[1];
