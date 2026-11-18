@@ -25,6 +25,11 @@ namespace Libs::Graphics::MtGpu {
 [[nodiscard]] uint32_t Mode();
 // KYTY_MT_GPU=1 or 4: translation workers (mtGpuWorkers.h).
 [[nodiscard]] bool WorkersMode();
+// KYTY_MT_GPU=1/4 (mtGpuWorkers.cpp), measurement. Worker: why FindImage found no image of the
+// same backing ("imagen sin la misma memoria"): what lies at the descriptor's memory. GPU
+// thread: how its FindImage ended while the workers run. Both counted in the 10 s line.
+void NoteImageMiss(const char* what);
+void NoteGpuImageLookup(const char* what);
 // The write registry (NoteWrite) is kept: KYTY_MT_GPU=1, 2 or 4.
 [[nodiscard]] bool RegistryEnabled();
 

@@ -3888,6 +3888,46 @@ void NoteUnplacedBinding(const TextureCache::ImageDesc& desc, const ImageInfo& f
 
 } // namespace
 
+// KYTY_MT_GPU=1/4 (measurement): what lies at a descriptor's memory when a worker found no image
+// of the same backing there: none, an image at the same address that differs in one field (the
+// first SameBacking compares), or only images that start elsewhere over it. Under m_lock.
+const char* TextureCache::DescribeWorkerMiss(const ImageDesc& desc, bool exact_format) {
+	const auto& want  = desc.info;
+	const char* field = nullptr;
+	if (const auto* owners = m_image_page_table.Find(want.data.address >> ImagePageTable::kPageBits);
+	    owners != nullptr) {
+		owners->ForEach([&](ImageId id) {
+			const auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || image->info.data.address != want.data.address ||
+			    field != nullptr) {
+				return;
+			}
+			const auto& have = image->info;
+			field = have.data.size != want.data.size         ? "misma direccion, otro tamano"
+			        : have.extent != want.extent              ? "misma direccion, otro extent"
+			        : have.resources.levels < want.resources.levels ||
+			                have.resources.layers < want.resources.layers
+			            ? "misma direccion, menos mips/capas"
+			        : have.samples != want.samples            ? "misma direccion, otras muestras"
+			        : have.bytes_per_block != want.bytes_per_block ? "misma direccion, otro bloque"
+			        : have.tile_mode != want.tile_mode        ? "misma direccion, otro tile"
+			        : have.GetColorTransform() != want.GetColorTransform()
+			            ? "misma direccion, otra transformacion de color"
+			        : have.type != want.type                  ? "misma direccion, otro tipo"
+			        : !ImageViewOps::FormatsCompatible(have.pixel_format, want.pixel_format) ||
+			                (exact_format && have.pixel_format != want.pixel_format)
+			            ? "misma direccion, otro formato"
+			            : "misma direccion, alias de solo lectura oculto";
+		});
+	}
+	if (field != nullptr) {
+		return field;
+	}
+	return FindImagesInRegion(want.data.address, want.data.size, false).empty()
+	           ? "ninguna imagen ahi"
+	           : "solo imagenes que empiezan en otra direccion";
+}
+
 // KYTY_MT_GPU=1/4: FindImage on a translation worker, which may not make, copy, free or clear
 // anything: only an image found as it is, with the same backing at the descriptor's address (the
 // lookup FindImage starts with). Anything else (no such image, one too small, an overlap to
@@ -3935,6 +3975,7 @@ ImageId TextureCache::FindImageOnWorker(ImageDesc& desc, bool exact_format, bool
 	}
 	if (!result) {
 		MtGpu::SpeculationFail("imagen sin la misma memoria");
+		MtGpu::NoteImageMiss(DescribeWorkerMiss(desc, exact_format));
 		return {};
 	}
 	auto& image = m_slot_images[result];
@@ -3972,6 +4013,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
+		const auto lookup_generation = ImageSetGeneration();
 		// An image with the same backing starts at the same address, so it is among the owners of
 		// the first page: those are looked at first, and the overlaps in the rest of the range only
 		// when none of them is. The images of a binding found again (nearly all of them) were
@@ -4101,6 +4143,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool* same_b
 		}
 		if (same_backing != nullptr) {
 			*same_backing = backing_match && static_cast<bool>(result);
+		}
+		if (MtGpu::WorkersMode()) {
+			// KYTY_MT_GPU=1/4 (measurement): what a worker's lookup would have needed here.
+			MtGpu::NoteGpuImageLookup(
+			    backing_match && result                                 ? "misma memoria"
+			    : !result                                               ? "imagen nueva"
+			    : ImageSetGeneration() != lookup_generation || !kept_aliases.empty()
+			        ? "solapamiento con cambios"
+			        : "solapamiento sin cambios (imagen existente)");
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);

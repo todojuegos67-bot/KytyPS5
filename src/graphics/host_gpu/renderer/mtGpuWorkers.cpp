@@ -8,6 +8,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -43,6 +44,8 @@ struct SpecChunk {
 	// 0 waiting, 1 done (the workers' results are complete).
 	std::atomic<uint32_t> done {0};
 	std::atomic<bool>     cancel {false};
+	// When a worker started it (NowNs), 0: not yet (the lead over the GPU thread).
+	std::atomic<uint64_t> start_ns {0};
 	// GPU thread only.
 	bool        reached = false;
 	bool        dropped = false;   // not done when reached: none of it is used
@@ -80,6 +83,16 @@ std::shared_ptr<SpecChunk> g_open;
 // The GPU thread's current chunk.
 std::shared_ptr<SpecChunk> g_current;
 
+constexpr uint32_t MaxWorkers = 8;
+
+// Where each worker's time goes, since the last report (its own slot: no lock).
+struct WorkerTime {
+	std::atomic<uint64_t> wait_ns {0};  // a lock not free: the attempt and the sleep after it
+	std::atomic<uint64_t> work_ns {0};  // walking and translating
+	std::atomic<uint64_t> idle_ns {0};  // nothing to do (waiting for a chunk)
+};
+std::array<WorkerTime, MaxWorkers>& g_worker_time = *new std::array<WorkerTime, MaxWorkers>;
+
 // Counters since the last report.
 struct Stats {
 	std::mutex                        mutex;
@@ -102,6 +115,14 @@ struct Stats {
 	uint64_t                          consume_ns     = 0;
 	uint64_t                          normal_draws   = 0;
 	uint64_t                          normal_ns      = 0;
+	// The lead: how long before the GPU thread reached a chunk a worker had started it.
+	uint64_t                          lead_ns        = 0;
+	uint64_t                          lead_chunks    = 0; // started before the GPU thread
+	uint64_t                          lead_late      = 0; // not started when reached
+	// "imagen sin la misma memoria", by what the worker found there (NoteImageMiss).
+	std::map<std::string, uint64_t>   image_misses;
+	// The GPU thread's FindImage while the workers run (NoteGpuImageLookup).
+	std::map<const char*, uint64_t>   gpu_lookups; // by literal (one per outcome)
 };
 Stats& g_stats = *new Stats;
 
@@ -140,9 +161,10 @@ void Publish(std::shared_ptr<SpecChunk> chunk) {
 }
 
 // Worker: the chunk's draws in order, until the GPU thread reaches or passes them.
-void RunChunk(RenderContext& renderer, SpecChunk& chunk) {
+void RunChunk(RenderContext& renderer, SpecChunk& chunk, WorkerTime& time) {
 	auto& executor = renderer.GetRenderExecutor();
 	auto& pipeline = renderer.GetPipelineCache();
+	chunk.start_ns.store(NowNs(), std::memory_order_relaxed);
 	for (auto& draw: chunk.draws) {
 		auto&      d      = *draw;
 		const auto passed = [&] {
@@ -154,7 +176,10 @@ void RunChunk(RenderContext& renderer, SpecChunk& chunk) {
 			break;
 		}
 		// The descriptor walk outside the locks: only bytes no GPU work wrote, recorded.
-		if (!pipeline.DrawPrepWalk(d.inputs, d.walked)) {
+		const auto walk_begin = NowNs();
+		const bool walked     = pipeline.DrawPrepWalk(d.inputs, d.walked);
+		time.work_ns.fetch_add(NowNs() - walk_begin, std::memory_order_relaxed);
+		if (!walked) {
 			d.failure = "recorrido del SRT";
 			NoteWorkerDraw(d.failure, 0, 0);
 			continue;
@@ -164,12 +189,15 @@ void RunChunk(RenderContext& renderer, SpecChunk& chunk) {
 		while (!passed()) {
 			const auto begin = NowNs();
 			if (executor.SpeculateDraw(d)) {
-				NoteWorkerDraw(d.failure, NowNs() - begin, retries);
+				const auto held = NowNs() - begin;
+				time.work_ns.fetch_add(held, std::memory_order_relaxed);
+				NoteWorkerDraw(d.failure, held, retries);
 				done = true;
 				break;
 			}
 			retries++;
 			std::this_thread::sleep_for(std::chrono::microseconds(20));
+			time.wait_ns.fetch_add(NowNs() - begin, std::memory_order_relaxed);
 		}
 		if (!done) {
 			d.failure = "hilo GPU por delante";
@@ -179,7 +207,8 @@ void RunChunk(RenderContext& renderer, SpecChunk& chunk) {
 	chunk.done.store(1, std::memory_order_release);
 }
 
-void WorkerRun() {
+void WorkerRun(uint32_t index) {
+	auto& time = g_worker_time[index % MaxWorkers];
 	KYTY_PROFILER_THREAD("Thread_MtGpuWorker");
 	Common::RegisterGpuSideThread("Thread_MtGpuWorker");
 	// The walks' clean-backing reads, as the draw-prep scanner's workers make them.
@@ -190,12 +219,14 @@ void WorkerRun() {
 		std::vector<std::shared_ptr<SpecChunk>> dead;
 		{
 			std::unique_lock lock(g_pool.mutex);
+			const auto       idle_begin = NowNs();
 			g_pool.ready.wait(lock, [] {
 				return g_pool.stop || !g_pool.work.empty() || !g_pool.graveyard.empty();
 			});
 			if (g_pool.stop) {
 				return;
 			}
+			time.idle_ns.fetch_add(NowNs() - idle_begin, std::memory_order_relaxed);
 			dead.swap(g_pool.graveyard);
 			if (!g_pool.work.empty()) {
 				chunk = std::move(g_pool.work.front());
@@ -204,7 +235,7 @@ void WorkerRun() {
 		}
 		dead.clear();
 		if (chunk != nullptr) {
-			RunChunk(*g_pool.renderer, *chunk);
+			RunChunk(*g_pool.renderer, *chunk, time);
 		}
 	}
 }
@@ -268,7 +299,7 @@ void StartWorkers(RenderContext& renderer) {
 	}
 	g_pool.renderer = &renderer;
 	for (uint32_t i = 0; i < ThreadCount(); i++) {
-		g_pool.threads.emplace_back(WorkerRun);
+		g_pool.threads.emplace_back(WorkerRun, i);
 	}
 }
 
@@ -330,6 +361,17 @@ SpecDraw* TakeSpecDraw(const DrawPrep::Key* key, const char** reason) {
 	}
 	if (!chunk.reached) {
 		chunk.reached = true;
+		{
+			const auto started = chunk.start_ns.load(std::memory_order_relaxed);
+			const auto now     = NowNs();
+			std::scoped_lock lock(g_stats.mutex);
+			if (started != 0 && started <= now) {
+				g_stats.lead_ns += now - started;
+				g_stats.lead_chunks++;
+			} else {
+				g_stats.lead_late++;
+			}
+		}
 		if (chunk.done.load(std::memory_order_acquire) == 0) {
 			// Not finished: dropped, never waited for.
 			chunk.cancel.store(true, std::memory_order_relaxed);
@@ -397,6 +439,19 @@ void NoteWorkerDraw(const char* failure, uint64_t held_ns, uint32_t lock_retries
 	}
 }
 
+void NoteImageMiss(const char* what) {
+	std::scoped_lock lock(g_stats.mutex);
+	g_stats.image_misses[what]++;
+}
+
+void NoteGpuImageLookup(const char* what) {
+	if (!WorkersEnabled()) {
+		return;
+	}
+	std::scoped_lock lock(g_stats.mutex);
+	g_stats.gpu_lookups[what]++;
+}
+
 void ReportWorkers(double seconds) {
 	if (!WorkersEnabled()) {
 		return;
@@ -414,13 +469,27 @@ void ReportWorkers(double seconds) {
 	    s.normal_draws == 0 ? 0.0 : static_cast<double>(s.normal_ns) / 1000.0 / s.normal_draws;
 	const double used      = static_cast<double>(WorkersCompare() ? s.validated : s.emitted);
 	const double saved_ms  = (used * normal_us * 1000.0 - static_cast<double>(s.consume_ns)) / 1e6;
+	std::string  times;
+	for (uint32_t i = 0; i < std::min(ThreadCount(), MaxWorkers); i++) {
+		auto&      t    = g_worker_time[i];
+		const auto ms   = [](std::atomic<uint64_t>& v) {
+            return static_cast<double>(v.exchange(0, std::memory_order_relaxed)) / 1e6;
+		};
+		const double wait = ms(t.wait_ns);
+		const double work = ms(t.work_ns);
+		const double idle = ms(t.idle_ns);
+		times += fmt::format("{}#{} esperando locks {:.0f} / traduciendo {:.0f} / inactivo {:.0f}",
+		                     times.empty() ? "" : ", ", i, wait, work, idle);
+	}
 	Log::WriteUnmuted(fmt::format(
 	    "MT GPU trabajadores ({:.0f} s, KYTY_MT_GPU={}): trozos especulados {} (descartados por "
 	    "cola llena {}), alcanzados {}, aceptados {}, rechazados por: {}; sin alcanzar {}. Draws: "
 	    "traducidos por trabajadores {} de {} (fallos: {}), mirados por el hilo GPU {}, emitidos "
 	    "desde trabajador {}{}, rechazados por: {}. Hilo GPU: traduccion normal {:.1f} us/draw, "
 	    "consumo {:.1f} ms, ahorro estimado {:.1f} ms{}; locks en manos de trabajadores {:.1f} ms "
-	    "({} reintentos); alertas {}\n",
+	    "({} reintentos); alertas {}. Tiempo de los trabajadores (ms): {}; ventaja media {:.1f} us "
+	    "({} trozos empezados antes de que llegue el hilo GPU, {} sin empezar). Imagen sin la misma "
+	    "memoria por: {}. FindImage del hilo GPU: {}\n",
 	    seconds, Mode(), s.chunks_made, s.chunks_dropped, s.chunks_seen, s.chunks_ok,
 	    list(s.chunk_rejects), s.chunks_missed, s.worker_ok, s.worker_draws,
 	    list(s.worker_failures), s.taken, s.emitted,
@@ -428,7 +497,15 @@ void ReportWorkers(double seconds) {
 	                     : std::string(),
 	    list(s.draw_rejects), normal_us, static_cast<double>(s.consume_ns) / 1e6, saved_ms,
 	    WorkersCompare() ? " (si se usaran)" : "", static_cast<double>(s.worker_held_ns) / 1e6,
-	    s.lock_retries, WorkerAlerts()));
+	    s.lock_retries, WorkerAlerts(), times,
+	    s.lead_chunks == 0 ? 0.0 : static_cast<double>(s.lead_ns) / 1000.0 / s.lead_chunks,
+	    s.lead_chunks, s.lead_late, list(s.image_misses), [&] {
+		    std::map<std::string, uint64_t> named;
+		    for (const auto& [what, n]: s.gpu_lookups) {
+			    named[what] += n;
+		    }
+		    return list(named);
+	    }()));
 	g_stats.chunks_made = g_stats.chunks_dropped = g_stats.chunks_seen = g_stats.chunks_ok = 0;
 	g_stats.chunks_missed = 0;
 	g_stats.chunk_rejects.clear();
@@ -437,6 +514,9 @@ void ReportWorkers(double seconds) {
 	g_stats.worker_draws = g_stats.worker_ok = g_stats.worker_held_ns = g_stats.lock_retries = 0;
 	g_stats.taken = g_stats.emitted = g_stats.validated = g_stats.differ = 0;
 	g_stats.consume_ns = g_stats.normal_draws = g_stats.normal_ns = 0;
+	g_stats.lead_ns = g_stats.lead_chunks = g_stats.lead_late = 0;
+	g_stats.image_misses.clear();
+	g_stats.gpu_lookups.clear();
 }
 
 } // namespace Libs::Graphics::MtGpu
