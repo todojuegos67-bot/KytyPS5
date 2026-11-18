@@ -2683,19 +2683,9 @@ std::string CompareBindings(const PreparedBindings& a, const PreparedBindings& b
 	};
 	if (a.runtime != b.runtime) return "runtime";
 	if (a.normalize_unnormalized != b.normalize_unnormalized) return "normalize";
-	if (a.buffer_sources.size() != b.buffer_sources.size()) return "buffer_sources.size";
-	for (size_t i = 0; i < a.buffer_sources.size(); i++) {
-		const auto& x = a.buffer_sources[i];
-		const auto& y = b.buffer_sources[i];
-		if (x.address != y.address || x.size != y.size || !(x.id == y.id)) {
-			return fmt::format("buffer_sources[{}] 0x{:x}+{} / 0x{:x}+{}", i, x.address, x.size,
-			                   y.address, y.size);
-		}
-	}
-	if (a.buffers.size() != b.buffers.size()) return "buffers.size";
-	for (size_t i = 0; i < a.buffers.size(); i++) {
-		if (!same_buffer(a.buffers[i], b.buffers[i])) return fmt::format("buffers[{}]", i);
-	}
+	// buffer_sources and buffers are filled later, by FindBuffers/RebindBuffers in
+	// PrepareGraphicsBindings, after this check: the main context still holds the previous
+	// draw's, so they are not compared (stage B self-check, first run: 100% of its differences).
 	if (a.images.size() != b.images.size()) return "images.size";
 	for (size_t i = 0; i < a.images.size(); i++) {
 		const auto& x = a.images[i];
