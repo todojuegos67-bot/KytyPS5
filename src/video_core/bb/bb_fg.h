@@ -67,6 +67,7 @@ struct DynamicFg {
     int cur = 2;      // current multiplier (2..4)
     int hold_fps = 0; // real fps held for `cur` (0: none)
     int pending = 0, agree = 0;
+    bool allow_hold = true; // false: fit only, no held real rate (Streamline paces itself)
     bool Update(const char* who, double real_fps, int max_mult);
 };
 // Sleeps the calling (present) thread so calls come at most `fps` times a second (0: no limit).

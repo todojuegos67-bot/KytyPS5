@@ -1898,8 +1898,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         // bb-fg-cap: DLSS-G (NGX) generating: the game's frames at most bb_real_cap_fps a second
         // (real x N within the display's cap, so every game frame gets its N-1 generated ones).
         static BB::FG::RealLimiter limiter;
-        limiter.Wait(bb_generated > 0 ? double(bb_real_cap_fps.load(std::memory_order_relaxed))
-                                      : 0.0);
+        // bb-sl-nocap2: only for the NGX path. With Streamline the game fell to cap / N (14 fps
+        // at x4): Streamline paces its own generated frames.
+        const bool ngx_only = !BB::FG::DlssSl::Ready();
+        limiter.Wait(ngx_only && bb_generated > 0
+                         ? double(bb_real_cap_fps.load(std::memory_order_relaxed))
+                         : 0.0);
     }
     const auto bb_start = std::chrono::steady_clock::now();
     if (!is_reusing_frame && is_game_frame) {

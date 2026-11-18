@@ -314,6 +314,7 @@ bool DynamicFg::Update(const char* who, double real, int max_mult) {
         const char* v = std::getenv("BB_FG_DYN_HOLD");
         return v == nullptr || std::strcmp(v, "0") != 0;
     }();
+    const bool hold = hold_on && allow_hold;
     const auto hold_of = [&](int n) { return static_cast<int>(std::floor(cap / n + 1e-9)); };
     // Preferred: the largest N whose held real rate stays at or above the floor (x4 at 56 real on
     // a 240 Hz display; x2 at 69 on 144 Hz, where x3 / x4 would hold the game under 50).
@@ -332,10 +333,10 @@ bool DynamicFg::Update(const char* who, double real, int max_mult) {
             break;
         }
     }
-    const bool pinned = hold_on && hold_fps > 0 && real >= 0.97 * hold_fps;
+    const bool pinned = hold && hold_fps > 0 && real >= 0.97 * hold_fps;
     int want = fit;
     const char* why = "fit";
-    if (hold_on) {
+    if (hold) {
         if (pinned && cur > base) {
             // held at this N's rate, so the game can do more: one step towards the preferred N
             want = cur - 1;
@@ -350,12 +351,12 @@ bool DynamicFg::Update(const char* who, double real, int max_mult) {
     pending = want;
     const int before = cur;
     if (want < cur || (want > cur && agree >= 1)) cur = want;
-    hold_fps = hold_on ? hold_of(cur) : 0;
+    hold_fps = hold ? hold_of(cur) : 0;
     Printf("[%s] dynamic: real %.1f fps%s, output cap %.1f (refresh %.3f Hz): preferred x%d (hold "
            "%d >= floor %.0f), fits x%d -> want x%d (%s) -> x%d%s, real held at %d fps%s",
            who, real, pinned ? " (at the hold)" : "", cap, DisplayRefreshHz(), base, hold_of(base),
            floor_fps, fit, want, why, cur, before != cur ? " (changed)" : "", hold_fps,
-           hold_on ? "" : " (BB_FG_DYN_HOLD=0: none)");
+           hold ? "" : " (no hold)");
     return before != cur;
 }
 

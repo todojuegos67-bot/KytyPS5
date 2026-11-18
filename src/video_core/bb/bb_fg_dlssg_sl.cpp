@@ -640,9 +640,10 @@ void AfterPresent(uint32_t frame, bool presented) {
         const int max_mult = max > 0 ? static_cast<int>(std::min(max, 3u)) + 1 : 4;
         if (Cfg().dynamic) {
             static DynamicFg dyn;
+            dyn.allow_hold = false;
             if (secs < 2.0) dyn.Update("dlssg-sl", real, max_mult);
             g_dyn_mult.store(dyn.cur, std::memory_order_relaxed);
-            g_real_cap.store(dyn.hold_fps, std::memory_order_relaxed);
+            g_real_cap.store(0, std::memory_order_relaxed); // bb-sl-nocap2: no hold with Streamline
         } else {
             g_real_cap.store(FixedRealCapFps(static_cast<int>(WantedFrames()) + 1, "dlssg-sl"),
                              std::memory_order_relaxed);
