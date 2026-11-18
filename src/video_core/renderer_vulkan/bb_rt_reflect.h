@@ -4,13 +4,14 @@
 // reflections composited into the game's HDR scene before the post-process / upscaler / HUD.
 //  1. Snapshot (right before the composite draw PS 0x3fe9e964): G-buffer depth, RT0 world normal
 //     and RT1 shininess at the trace size (bb_rt_gsnap.comp).
-//  2. Run (before the first draw that samples the composite's HDR target after the forward pass):
+//  2. Run (before the first draw that samples the composite's HDR target - RGBA16F or, as in
+//     Bloodborne, B10G11R11 - after the forward pass):
 //     depth mesh of the final depth (bb_rt_mesh.comp) -> BLAS + TLAS, classification (water =
 //     forward surface nearer than the G-buffer depth and facing up; puddles / glossy from RT1),
 //     one ray query per reflective pixel (bb_rt_reflect.comp), temporal + a-trous filter and a
 //     depth-aware upsample blended into the HDR scene (bb_rt_post.comp).
 // Options: BB_RT_REFLECT_STRENGTH (0..2, 1), _WATER_MIN (0..0.9, 0.35), _RIPPLE (0..0.2, 0.02),
-// _PUDDLE (shininess, 0.85), _REFINE=0, _HOOK=first|<n>; BB_RT_DEBUG_VIEW=5/6/7 or F7 (debug).
+// _PUDDLE (shininess, 0.85), _REFINE=0, _HOOK=<n>; BB_RT_DEBUG_VIEW=5/6/7 or F7 (debug).
 // No ray query / acceleration structures: nothing is created, the game renders as before.
 // BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1 (each independent of BB_RT_REFLECT) run in RunLighting,
 // before the composite draw, on their own depth mesh.
@@ -49,8 +50,9 @@ public:
     // The HDR scene after the forward pass and the scene depth (same image as the snapshot's).
     struct PostInput {
         vk::Image hdr;
-        vk::ImageView hdr_storage_view;
-        vk::ImageView hdr_view;
+        vk::ImageView hdr_storage_view; // RGBA16F, or R32UI over a B10G11R11 target (hdr_r11)
+        vk::ImageView hdr_view;         // sampled, the target's own format
+        bool hdr_r11;
         vk::ImageLayout hdr_layout;
         vk::Image depth;
         vk::ImageView depth_view;
@@ -192,6 +194,7 @@ private:
     vk::DescriptorSetLayout mesh_set{}, ray_set{}, post_set{}, snap_set{};
     vk::PipelineLayout mesh_layout{}, ray_layout{}, post_layout{}, snap_layout{};
     vk::Pipeline mesh_pipe{}, ray_pipe{}, post_pipe{}, snap_pipe{};
+    vk::Pipeline post_r11_pipe{}; // composite into a B10G11R11 HDR target
     // Quality (BB_RT_REFLECT_QUALITY=1..3, default 2): see Init.
     u32 quality = 2, rays = 1, trace_div = 2, spatial_passes = 1;
     float temporal_glossy = 0.15f, temporal_mirror = 0.25f, filter_strength = 1.0f;

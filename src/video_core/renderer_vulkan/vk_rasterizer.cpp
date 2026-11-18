@@ -370,17 +370,11 @@ vk::ImageLayout BbLayoutOf(const VideoCore::Image& img) {
     return img.backing->subresource_states.empty() ? img.backing->state.layout
                                                    : img.backing->subresource_states[0].layout;
 }
-// BB_RT_REFLECT_HOOK=first: run before the first draw that reads the HDR target, even one that
-// copies it into a same-size RGBA16F target (default: such a copy is skipped, it can be the
-// refraction source the water draw reads, drawn before the water). BB_RT_REFLECT_HOOK=<n>: before
-// the n-th draw that reads it (the "[rt-reflect] frame N after composite" lines list them).
-bool BbRtReflectHookFirst() {
-    static const bool on = [] {
-        const char* e = std::getenv("BB_RT_REFLECT_HOOK");
-        return e && std::string_view{e} == "first";
-    }();
-    return on;
-}
+// BB_RT_REFLECT_HOOK=<n>: run before the n-th draw that reads the HDR target after the composite
+// (default 1; the "[rt-reflect] frame N after composite" lines list them). In the user's log
+// (build 3141ea13) every frame is: composite, ~17 forward draws into the HDR target (B10G11R11,
+// MRT with 0x271080000), then a single reader, PS 0x8650418f, which copies it into a same-size
+// RGBA16F target (the start of the post-process): that first reader is the hook.
 u32 BbRtReflectHookNth() {
     static const u32 n = [] {
         const char* e = std::getenv("BB_RT_REFLECT_HOOK");
@@ -398,19 +392,9 @@ void Rasterizer::BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt
     if (!d32) {
         return; // no depth written since the previous composite: the same frame drawn again
     }
-    static u32 miss_streak = 0;
-    static bool hook_first_auto = false;
     if (bb_rt_refl_pending) {
         // The previous frame's pass never found its hook.
         bb_rt_reflect->NoteSkip("no draw read the HDR target after the forward pass");
-        if (!hook_first_auto && ++miss_streak >= 30) {
-            hook_first_auto = true;
-            LOG_WARNING(Render_Vulkan, "[rt-reflect] 30 frames without the pre-post hook: from "
-                                       "now on the first draw reading the HDR target runs it "
-                                       "(as BB_RT_REFLECT_HOOK=first)");
-        }
-    } else {
-        miss_streak = 0;
     }
     bb_rt_refl_pending = false;
     VideoCore::Image* hdr = nullptr;
@@ -472,7 +456,6 @@ void Rasterizer::BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt
     bb_rt_refl_pending = true;
     bb_rt_refl_fwd = 0;
     bb_rt_refl_reads = 0;
-    bb_rt_reflect_hook_first = BbRtReflectHookFirst() || hook_first_auto;
 }
 
 // bb-rt-reflect: before the first draw after the composite that samples the HDR target without
@@ -484,7 +467,7 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
     }
     const auto& regs = liverpool->regs;
     VideoCore::Image* hdr = nullptr;
-    bool writes_hdr = false, copy_target = false;
+    bool writes_hdr = false;
     for (const auto& image_id : bound_images) {
         auto& img = texture_cache.GetImage(image_id);
         if (BbAddr(img) == bb_rt_hdr_addr && !img.info.props.is_depth) {
@@ -498,19 +481,8 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
     if (!writes_hdr && !hdr) {
         return;
     }
-    for (const auto& image_id : bound_images) {
-        const auto& img = texture_cache.GetImage(image_id);
-        if (hdr && img.binding.is_target && !img.info.props.is_depth &&
-            img.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
-            img.info.size.width == hdr->info.size.width &&
-            img.info.size.height == hdr->info.size.height) {
-            copy_target = true;
-        }
-    }
     bb_rt_refl_reads += writes_hdr ? 0 : 1;
-    const u32 nth = BbRtReflectHookNth();
-    const bool trigger = !writes_hdr && (nth ? bb_rt_refl_reads >= nth
-                                             : (!copy_target || bb_rt_reflect_hook_first));
+    const bool trigger = !writes_hdr && bb_rt_refl_reads >= std::max(BbRtReflectHookNth(), 1u);
     if (bb_rt_refl_chain_logged < 2) {
         // The draws touching the HDR target between the composite and the hook (2 frames).
         static u32 lines = 0;
@@ -520,8 +492,7 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
                      BbSsrDesc(pipeline, regs, writes_hdr ? "writes HDR" : "reads HDR", true),
                      trigger ? "PASS RUNS HERE"
                      : writes_hdr ? (regs.depth_control.depth_enable ? "forward draw" : "draw")
-                     : copy_target ? "same-size RGBA16F copy, skipped"
-                                   : "skipped (BB_RT_REFLECT_HOOK)");
+                                  : "skipped (BB_RT_REFLECT_HOOK)");
         }
         if (trigger) {
             ++bb_rt_refl_chain_logged;
@@ -536,8 +507,16 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
     }
     bb_rt_refl_pending = false;
     bb_rt_reflect->NoteForwardDraws(bb_rt_refl_fwd);
-    if (hdr->info.pixel_format != vk::Format::eR16G16B16A16Sfloat || hdr->info.num_samples > 1) {
-        bb_rt_reflect->NoteSkip("HDR target not single-sample RGBA16F");
+    const auto hfmt = hdr->info.pixel_format;
+    const bool r11 = hfmt == vk::Format::eB10G11R11UfloatPack32;
+    if ((!r11 && hfmt != vk::Format::eR16G16B16A16Sfloat) || hdr->info.num_samples > 1) {
+        if (static bool logged = false; !logged) {
+            logged = true;
+            LOG_WARNING(Render_Vulkan, "[rt-reflect] HDR target {:#x} format {} x{} samples: "
+                                       "not RGBA16F / B10G11R11, no pass",
+                        BbAddr(*hdr), vk::to_string(hfmt), hdr->info.num_samples);
+        }
+        bb_rt_reflect->NoteSkip("HDR target format not RGBA16F / B10G11R11 (or multisampled)");
         return;
     }
     VideoCore::Image* d32 = texture_cache.TryGetImage(bb_rt_depth_last_id, bb_rt_depth_last_uid);
@@ -547,17 +526,20 @@ void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
                                     : "scene depth image gone");
         return;
     }
+    // B10G11R11: written through an R32UI storage view (the cache's images are mutable-format
+    // with extended usage; R32UI storage is always supported, B10G11R11 storage is optional).
     VideoCore::ImageViewInfo sv{};
-    sv.format = vk::Format::eR16G16B16A16Sfloat;
+    sv.format = r11 ? vk::Format::eR32Uint : vk::Format::eR16G16B16A16Sfloat;
     sv.is_storage = true;
     VideoCore::ImageViewInfo cv{};
-    cv.format = vk::Format::eR16G16B16A16Sfloat;
+    cv.format = hfmt;
     VideoCore::ImageViewInfo dv{};
     dv.format = vk::Format::eR32Sfloat;
     const BB::RtReflect::PostInput in{
         .hdr = hdr->GetImage(),
         .hdr_storage_view = *hdr->FindView(sv, false).image_view,
         .hdr_view = *hdr->FindView(cv, false).image_view,
+        .hdr_r11 = r11,
         .hdr_layout = BbLayoutOf(*hdr),
         .depth = d32->GetImage(),
         .depth_view = *d32->FindView(dv, false).image_view,

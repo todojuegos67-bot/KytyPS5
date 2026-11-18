@@ -17,6 +17,7 @@
 #include "video_core/host_shaders/bb_rt_gsnap_comp.h"
 #include "video_core/host_shaders/bb_rt_mesh_comp.h"
 #include "video_core/host_shaders/bb_rt_post_comp.h"
+#include "video_core/host_shaders/bb_rt_post_r11_comp.h"
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
 #include "video_core/host_shaders/bb_rt_shadow_comp.h"
 #include "video_core/host_shaders/bb_rt_vol_comp.h"
@@ -196,6 +197,7 @@ RtReflect::~RtReflect() {
     if (vol_set) device.destroyDescriptorSetLayout(vol_set);
     if (vol_queries) device.destroyQueryPool(vol_queries);
     if (post_pipe) device.destroyPipeline(post_pipe);
+    if (post_r11_pipe) device.destroyPipeline(post_r11_pipe);
     if (post_layout) device.destroyPipelineLayout(post_layout);
     if (post_set) device.destroyDescriptorSetLayout(post_set);
     if (queries) device.destroyQueryPool(queries);
@@ -439,6 +441,8 @@ bool RtReflect::Init() {
         (refl_on &&
          (!pipeline(Vulkan::CompileSPV(BB_RT_REFLECT_COMP, device), ray_layout, ray_pipe) ||
           !pipeline(Vulkan::CompileSPV(BB_RT_POST_COMP, device), post_layout, post_pipe) ||
+          !pipeline(Vulkan::CompileSPV(BB_RT_POST_R11_COMP, device), post_layout,
+                    post_r11_pipe) ||
           !pipeline(Vulkan::CompileSPV(BB_RT_GSNAP_COMP, device), snap_layout, snap_pipe)))) {
         LOG_ERROR(Render_Vulkan, "[rt-reflect] compute pipelines failed");
         return false;
@@ -1015,9 +1019,10 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const PostInput& in, const char*& why
     if (!logged_camera) {
         logged_camera = true;
         LOG_INFO(Render_Vulkan,
-                 "[rt-reflect] first pass: HDR {}x{}, scene depth {}x{}, trace {}x{}, depth mesh "
-                 "{}x{} cells; camera fov_y {:.1f} deg, far {:.0f}",
-                 in.hdr_width, in.hdr_height, in.depth_width, in.depth_height, w, h, rmesh.gw,
+                 "[rt-reflect] first pass: HDR {}x{} {}, scene depth {}x{}, trace {}x{}, depth "
+                 "mesh {}x{} cells; camera fov_y {:.1f} deg, far {:.0f}",
+                 in.hdr_width, in.hdr_height,
+                 in.hdr_r11 ? "B10G11R11 (written packed through an R32UI view)" : "RGBA16F", in.depth_width, in.depth_height, w, h, rmesh.gw,
                  rmesh.gh,
                  proj[5] != 0.0f ? 2.0 * std::atan(1.0 / std::fabs(proj[5])) * 57.29578 : 0.0,
                  far_dist);
@@ -1111,7 +1116,8 @@ bool RtReflect::Run(vk::CommandBuffer cmd, const PostInput& in, const char*& why
             {.dstBinding = 8, .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &hdr_img},
         }};
-        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, post_pipe);
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute,
+                         mode == 2 && in.hdr_r11 ? post_r11_pipe : post_pipe);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, post_layout, 0, pw);
         const std::array<u32, 2> pc{mode, step};
         cmd.pushConstants(post_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), pc.data());

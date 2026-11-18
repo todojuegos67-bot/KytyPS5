@@ -247,7 +247,6 @@ private:
     bool bb_rt_refl_pending = false;
     u32 bb_rt_refl_fwd = 0;
     u32 bb_rt_refl_chain_logged = 0;
-    bool bb_rt_reflect_hook_first = false;
     u32 bb_rt_refl_reads = 0;
     // bb-rt-light: the largest single-sample depth target written (depth write on) since the
     // last composite draw, in command-stream order (no frame counter: the flip counter is bumped

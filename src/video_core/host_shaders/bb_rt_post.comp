@@ -35,7 +35,33 @@ layout(std140, binding = 5) uniform Params {
 } p;
 layout(std430, binding = 6) buffer Counters { uint n[16]; } cnt;
 layout(binding = 7) uniform sampler2D depth_tex;            // final scene depth (mode 2)
+#ifdef HDR_R11
+// The game's HDR target is B10G11R11_UFLOAT (Bloodborne: composite target 0x2709f0000): written
+// through an R32UI view of that (mutable-format) image, packed / unpacked here, because storage
+// support for B10G11R11 itself is optional.
+layout(binding = 8, r32ui) uniform uimage2D hdr;
+vec3 UnpackR11(uint v) {
+    // 11-bit / 10-bit unsigned floats = the top bits of a half (5-bit exponent, bias 15).
+    vec2 rg = unpackHalf2x16(((v & 0x7FFu) << 4) | (((v >> 11) & 0x7FFu) << 20));
+    float b = unpackHalf2x16(((v >> 22) & 0x3FFu) << 5).x;
+    return vec3(rg, b);
+}
+uint PackUf(float x, uint drop, uint maxv) {
+    x = isnan(x) ? 0.0 : clamp(x, 0.0, 65000.0);
+    uint hb = packHalf2x16(vec2(x, 0.0)) & 0x7FFFu;
+    return min((hb + (1u << (drop - 1u))) >> drop, maxv);
+}
+uint PackR11(vec3 c) {
+    return PackUf(c.r, 4u, 0x7BFu) | (PackUf(c.g, 4u, 0x7BFu) << 11) |
+           (PackUf(c.b, 5u, 0x3DFu) << 22);
+}
+vec4 LoadHdr(ivec2 c) { return vec4(UnpackR11(imageLoad(hdr, c).r), 1.0); }
+void StoreHdr(ivec2 c, vec4 v) { imageStore(hdr, c, uvec4(PackR11(v.rgb))); }
+#else
 layout(binding = 8, rgba16f) uniform image2D hdr;           // HDR scene (mode 2, in place)
+vec4 LoadHdr(ivec2 c) { return imageLoad(hdr, c); }
+void StoreHdr(ivec2 c, vec4 v) { imageStore(hdr, c, v); }
+#endif
 layout(push_constant) uniform Push { uint mode; uint step; } pc;
 
 shared uint s_ok;
@@ -208,7 +234,7 @@ void Composite(ivec2 c) {
     if (r.a < 0.002 && dbg < 5u) {
         return;
     }
-    vec4 scene = imageLoad(hdr, c);
+    vec4 scene = LoadHdr(c);
     vec3 refl = r.a > 1e-4 ? Decompress(r.rgb / r.a) : vec3(0.0);
     float a = clamp(r.a, 0.0, 0.95);
     vec3 o = mix(scene.rgb, refl, a);
@@ -226,7 +252,7 @@ void Composite(ivec2 c) {
     if (any(isnan(o)) || any(isinf(o))) {
         return;
     }
-    imageStore(hdr, c, vec4(o, scene.a));
+    StoreHdr(c, vec4(o, scene.a));
 }
 
 void main() {
