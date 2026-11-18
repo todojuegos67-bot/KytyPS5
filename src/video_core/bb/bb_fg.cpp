@@ -239,8 +239,20 @@ void NoteDlssPanel(float real, float shown) {
 }
 
 const char* PanelName() {
-    if (Cfg().kind == Kind::Dlss) return DlssSl::Requested() ? "DLSS-G (Streamline)" : "DLSS-G";
-    return "FSR 3 x2";
+    // bb-f8-mode: the mode chosen in the launcher (every frame generation and every mode).
+    const auto& c = Cfg();
+    const int m = std::clamp(c.multiplier, 2, 4);
+    if (c.kind == Kind::Dlss) {
+        if (DlssSl::Requested()) {
+            static const char* sl[] = {"DLSS-G x2 (Streamline)", "DLSS-G x3 (Streamline)",
+                                       "DLSS-G x4 (Streamline)"};
+            return c.dynamic ? "DLSS-G dinamico (Streamline)" : sl[m - 2];
+        }
+        static const char* ngx[] = {"DLSS-G x2", "DLSS-G x3", "DLSS-G x4"};
+        return c.dynamic ? "DLSS-G dinamico" : ngx[m - 2];
+    }
+    static const char* amd[] = {"FSR 3 x2", "FSR 3 x3", "FSR 3 x4"};
+    return c.dynamic ? "FSR 3 dinamico" : amd[m - 2];
 }
 
 bool PanelInfo(float& real, float& shown, const char*& state) {
