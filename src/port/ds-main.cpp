@@ -74,7 +74,7 @@ fs::path ExePath() {
 }
 
 void Message(const std::string& text, UINT flags = MB_ICONWARNING) {
-	MessageBoxW(nullptr, Wide(text).c_str(), L"Demon's Souls", MB_OK | MB_TOPMOST | flags);
+	MessageBoxW(nullptr, Wide(Port::I18n::T(text.c_str())).c_str(), L"Demon's Souls", MB_OK | MB_TOPMOST | flags);
 }
 
 std::string ReadText(const fs::path& path) {
@@ -118,17 +118,17 @@ bool RamWarning() {
 	for (const auto& [name, bytes]: by_name) top.emplace_back(bytes, name);
 	std::sort(top.rbegin(), top.rend());
 	char head[256];
-	std::snprintf(head, sizeof(head), "Solo quedan %.1f GB de RAM libres (de %.0f GB). El juego necesita unos 12 GB y puede ir a tirones o cerrarse.\n\n",
+	std::snprintf(head, sizeof(head), Port::I18n::T("Solo quedan %.1f GB de RAM libres (de %.0f GB). El juego necesita unos 12 GB y puede ir a tirones o cerrarse.\n\n"),
 	              free_gb, total);
-	std::string text = std::string(head) + "Los programas que mas RAM usan ahora:\n";
+	std::string text = std::string(head) + Port::I18n::T("Los programas que mas RAM usan ahora:\n");
 	for (size_t i = 0; i < top.size() && i < 5; i++) {
 		char line[200];
 		std::snprintf(line, sizeof(line), "   - %s: %.1f GB\n", top[i].second.c_str(), static_cast<double>(top[i].first) / (1024.0 * 1024.0 * 1024.0));
 		text += line;
 	}
-	text += "\nCierralos si puedes (navegador, Discord, etc.).\n\nAceptar: jugar igualmente    Cancelar: salir";
+	text += Port::I18n::T("\nCierralos si puedes (navegador, Discord, etc.).\n\nAceptar: jugar igualmente    Cancelar: salir");
 	std::printf("[port] RAM: %.1f GB free of %.0f GB (warned)\n", free_gb, total);
-	return MessageBoxW(nullptr, Wide(text).c_str(), L"Memoria RAM", MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST) == IDOK;
+	return MessageBoxW(nullptr, Wide(text).c_str(), Wide(Port::I18n::T("Memoria RAM")).c_str(), MB_OKCANCEL | MB_ICONWARNING | MB_TOPMOST) == IDOK;
 }
 
 // ---- (10-27) The PC: Launcher-souls.ps1's Select-BestGpu (the dedicated graphics card before the integrated one: NVIDIA,
@@ -328,6 +328,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowSplash(const std::string& image) {
+	SplashStatus("Cargando...");
 	int               channels = 0;
 	const std::string bytes    = ReadText(fs::path(Wide(image)));
 	auto*             pixels   = bytes.empty() ? nullptr
@@ -365,7 +366,7 @@ void ShowSplash(const std::string& image) {
 void SplashHint(const std::string& text) {
 	{
 		std::scoped_lock lock(g_splash.mutex);
-		g_splash.hint = Wide(text);
+		g_splash.hint = Wide(Port::I18n::T(text.c_str()));
 	}
 	if (HWND w = g_splash.window.load(); w != nullptr) InvalidateRect(w, nullptr, FALSE);
 }
@@ -381,7 +382,7 @@ void SplashProgress(float f) {
 void SplashStatus(const std::string& text) {
 	{
 		std::scoped_lock lock(g_splash.mutex);
-		g_splash.status = Wide(text);
+		g_splash.status = Wide(Port::I18n::T(text.c_str()));
 	}
 	if (HWND w = g_splash.window.load(); w != nullptr) InvalidateRect(w, nullptr, FALSE);
 }
@@ -403,7 +404,7 @@ std::string PickFolder() {
 	DWORD options = 0;
 	dialog->GetOptions(&options);
 	dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-	dialog->SetTitle(L"Demon's Souls: elige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys)");
+	dialog->SetTitle(Wide(Port::I18n::T("Demon's Souls: elige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys)")).c_str());
 	if (SUCCEEDED(dialog->Show(nullptr))) {
 		IShellItem* item = nullptr;
 		if (SUCCEEDED(dialog->GetResult(&item))) {
@@ -1036,12 +1037,33 @@ void RequestRestart(bool to_launcher) {
 } // namespace Port
 
 int main(int argc, char* argv[]) {
-	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
-	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	g_exe               = ExePath();
 	const fs::path root = g_exe.parent_path();
 	SetCurrentDirectoryW(root.c_str());
+	// Language must be initialized before any startup dialog, including Steam, update helpers and the single-instance
+	// timeout below.
+	const std::string ini   = Utf8((root / L"settings.ini").wstring());
+	const std::string image = Utf8((root / L"fondo-souls.jpg").wstring());
 	std::error_code ec;
+	Port::Settings settings;
+	if (!Port::LoadSettings(ini, &settings)) {
+		// A first run: the launcher's game-path.txt and ram16.txt when this folder has them.
+		const std::string old = ReadText(root / L"game-path.txt");
+		if (!old.empty()) {
+			std::string path = old;
+			if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF) path = path.substr(3);
+			while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' ')) path.pop_back();
+			settings.game = path;
+		}
+		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
+	}
+	// (ds-pc-port9) An empty idioma_interfaz: Windows' UI language at every start, not stored.
+	const std::string ui_language = settings.menu_language.empty() ? Port::I18n::DetectWindowsLanguage() : settings.menu_language;
+	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(ui_language);
+	Port::I18n::SetLanguage(ui_language);
+
+	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
+	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	// (10-27) What an update left: the exe and the DLLs that were running then, renamed to .old.
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
@@ -1098,26 +1120,6 @@ int main(int argc, char* argv[]) {
 	ReportPreviousWerCrash(root / L"logs"); // (ds-pc-port38) a fast fail of an earlier run, from Windows Error Reporting
 
 	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-	const std::string ini   = Utf8((root / L"settings.ini").wstring());
-	const std::string image = Utf8((root / L"fondo-souls.jpg").wstring());
-	Port::Settings settings;
-	if (!Port::LoadSettings(ini, &settings)) {
-		// A first run: the launcher's game-path.txt and ram16.txt when this folder has them.
-		const std::string old = ReadText(root / L"game-path.txt");
-		if (!old.empty()) {
-			std::string path = old;
-			if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF) path = path.substr(3);
-			while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' ')) path.pop_back();
-			settings.game = path;
-		}
-		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
-	}
-	// (10-27b) The menus' language: settings.ini's idioma_menu, else (a first start) the Windows UI language; the
-	// game's follows it until chosen.
-	// (ds-pc-port9) An empty idioma_interfaz: Windows' UI language (GetUserDefaultUILanguage) at every start, not stored.
-	const std::string ui_language = settings.menu_language.empty() ? Port::I18n::DetectWindowsLanguage() : settings.menu_language;
-	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(ui_language);
-	Port::I18n::SetLanguage(ui_language);
 	std::printf("[port] language: %s (%s)\n", ui_language.c_str(), settings.menu_language.empty() ? "Windows" : "chosen");
 	if (!restarted && !RamWarning()) return 0;
 	ShowSplash(image);
@@ -1135,7 +1137,8 @@ int main(int argc, char* argv[]) {
 	if (force_launcher && restarted && !fg_relaunch) std::printf("[port] restarted after an update / restore: the launcher first\n");
 	while (!start_menu && !IsGame(settings.game)) {
 		if (!settings.game.empty())
-			Message("No hay eboot.bin en:\n" + settings.game + "\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys).");
+			Message(std::string(Port::I18n::T("No hay eboot.bin en:\n")) + settings.game +
+			        Port::I18n::T("\n\nElige la carpeta del juego volcado (la que tiene eboot.bin y sce_sys)."));
 		SplashStatus("Elige la carpeta del juego...");
 		const std::string picked = PickFolder();
 		if (picked.empty()) {

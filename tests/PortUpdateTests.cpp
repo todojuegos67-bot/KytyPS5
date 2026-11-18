@@ -1,6 +1,6 @@
 // The Demon's Souls PC port's in-place update (src/port/ds-update.cpp): copy, exclusions, settings.ini merge, backups,
 // rollback, restore and the .old clean-up, on a temporary folder. Plain std::filesystem: runs on Linux too:
-//   g++ -std=c++20 -Isrc tests/PortUpdateTests.cpp src/port/ds-update.cpp src/port/ds-settings.cpp -o port_update_tests
+//   g++ -std=c++20 -Isrc tests/PortUpdateTests.cpp src/port/ds-update.cpp src/port/ds-settings.cpp src/port/ds-i18n.cpp -o port_update_tests
 // Also BuildLaunch's environment against Launcher-souls.ps1 (10-27): the ray tracing rows ($hwTbl), the 16 GB profile.
 #include "port/ds-settings.h"
 #include "port/ds-update.h"

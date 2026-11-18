@@ -2,6 +2,7 @@
 
 #include "port/ds-resume.h"
 
+#include "port/ds-i18n.h"
 #include "port/ds-port.h"
 
 #include "kernel/fileSystem.h"
@@ -183,7 +184,7 @@ std::string       g_text;
 
 void SetText(const char* text) {
 	std::scoped_lock lock(g_text_mutex);
-	g_text = text;
+	g_text = I18n::T(text);
 }
 
 void QuitWorker(fs::path root) {

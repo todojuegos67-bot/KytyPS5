@@ -929,7 +929,7 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		// (10-28) Only the rows that truly need a restart; saved now, applied at the next start.
 		const ImVec2 ls = ImGui::CalcTextSize(text.c_str());
 		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.68f);
-		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), "(requiere reinicio)");
+		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), I18n::T("(requiere reinicio)"));
 		ImGui::PopFont();
 	}
 	const char*  shown = I18n::T(value);
@@ -1647,13 +1647,13 @@ void CheckWork() {
 	// (10-28, the emulator launcher) Both versions shown; an installed version with the same or a newer date (the 8-digit
 	// YYYYMMDD in the tag) is never offered the published one (no downgrade).
 	const std::string cur  = Update::CurrentVersion();
-	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
+	const std::string both = std::string(I18n::T("Version instalada: ")) + cur + I18n::T("\nUltima version del port en GitHub: ") + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
-	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
-	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
-	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
+	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + I18n::T("\nYa tienes la ultima version."));
+	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + I18n::T("\nTu version es mas nueva. No hace falta actualizar."));
+	else SetUpd(UpdateUi::Available, both + I18n::T("\nNueva version ") + r.tag + I18n::T(" \xE2\x80\x94 Cruz para actualizar"));
 #else
-	SetUpd(UpdateUi::Failed, "Solo en Windows.");
+	SetUpd(UpdateUi::Failed, I18n::T("Solo en Windows."));
 #endif
 }
 
@@ -1667,7 +1667,7 @@ void InstallWork() {
 	g_upd.cancel = false;
 	g_upd.done   = 0;
 	g_upd.total  = r.size;
-	SetUpd(UpdateUi::Working, "Descargando " + r.asset + "...");
+	SetUpd(UpdateUi::Working, std::string(I18n::T("Descargando ")) + r.asset + "...");
 	wchar_t temp[MAX_PATH + 1] = {};
 	GetTempPathW(MAX_PATH, temp);
 	std::string safe = r.tag;
@@ -1676,10 +1676,10 @@ void InstallWork() {
 	const std::filesystem::path zip = std::filesystem::path(temp) / std::filesystem::u8path("ds-update-" + safe + ".zip");
 	std::string                 error;
 	if (!Update::Download(r, zip, [](int64_t d, int64_t t) { g_upd.done = d; g_upd.total = t; Bump(); }, &g_upd.cancel, &error)) {
-		SetUpd(UpdateUi::Failed, error + ". No se ha cambiado nada.");
+		SetUpd(UpdateUi::Failed, error + I18n::T(". No se ha cambiado nada."));
 		return;
 	}
-	SetUpd(UpdateUi::Working, "Instalando (copia de seguridad y archivos nuevos)...");
+	SetUpd(UpdateUi::Working, I18n::T("Instalando (copia de seguridad y archivos nuevos)..."));
 	const auto     root = PortRoot();
 	Update::Result res;
 	if (Update::Writable(root)) res = Update::InstallZip(root, zip, r.tag, g_rt.game_rel);
@@ -1688,8 +1688,8 @@ void InstallWork() {
 	std::filesystem::remove(zip, ec);
 	// Restarted by itself (before, a line asked to close and open it again: missed, the update looked like it did nothing).
 	if (res.ok) {
-		SetUpd(UpdateUi::Done, "Actualizacion completada a la version " + r.tag +
-		                           ". Reiniciando con la nueva version... Tus shaders compilados y partidas guardadas se mantienen.");
+		SetUpd(UpdateUi::Done, std::string(I18n::T("Actualizacion completada a la version ")) + r.tag +
+		                           I18n::T(". Reiniciando con la nueva version... Tus shaders compilados y partidas guardadas se mantienen."));
 		std::this_thread::sleep_for(std::chrono::seconds(3));
 		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
@@ -1704,7 +1704,7 @@ void RestoreWork() {
 		if (g_upd.chosen < 0 || g_upd.chosen >= static_cast<int>(g_upd.backups.size())) return;
 		b = g_upd.backups[g_upd.chosen];
 	}
-	SetUpd(UpdateUi::Working, "Restaurando la version " + b.version + "...");
+	SetUpd(UpdateUi::Working, std::string(I18n::T("Restaurando la version ")) + b.version + "...");
 	const auto     root = PortRoot();
 	Update::Result res;
 	if (Update::Writable(root)) {
@@ -1716,7 +1716,7 @@ void RestoreWork() {
 		                                          std::filesystem::u8path(Update::CurrentVersion()).wstring(), g_rt.game_rel.wstring()});
 	}
 	if (res.ok) {
-		SetUpd(UpdateUi::Done, "Restaurada la version " + b.version + ". Reiniciando...");
+		SetUpd(UpdateUi::Done, std::string(I18n::T("Restaurada la version ")) + b.version + I18n::T(". Reiniciando..."));
 		std::this_thread::sleep_for(std::chrono::seconds(3));
 		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
@@ -1728,12 +1728,12 @@ void OpenRestore() {
 	g_upd.backups = Update::ListBackups(PortRoot());
 	g_upd.chosen  = 0;
 	g_upd.state   = g_upd.backups.empty() ? UpdateUi::Failed : UpdateUi::Choosing;
-	g_upd.text    = g_upd.backups.empty() ? "No hay versiones anteriores guardadas" : "Elige la version a restaurar:";
+	g_upd.text    = g_upd.backups.empty() ? I18n::T("No hay versiones anteriores guardadas") : I18n::T("Elige la version a restaurar:");
 	Bump();
 }
 
 void OpenCheck() {
-	SetUpd(UpdateUi::Checking, "Buscando la ultima version en GitHub...");
+	SetUpd(UpdateUi::Checking, I18n::T("Buscando la ultima version en GitHub..."));
 	StartWorker(CheckWork);
 }
 
@@ -1786,7 +1786,7 @@ void UpdateNotice(float width, float height) {
 	if (ImGui::Button(I18n::T("Actualizar ahora"), {220 * g_unit, 40 * g_unit})) {
 		g_notice_done = true;
 		g_tab_request = 4;
-		SetUpd(UpdateUi::Working, "Descargando...");
+		SetUpd(UpdateUi::Working, I18n::T("Descargando..."));
 		StartWorker(InstallWork);
 	}
 	ImGui::SameLine();
@@ -1802,7 +1802,7 @@ void DrawShaderBlock(float unit) {
 		std::snprintf(label, sizeof(label), "%d / %d", v.done, v.total);
 		ImGui::ProgressBar(static_cast<float>(v.done) / static_cast<float>(v.total), {-1, 30 * unit}, label);
 	} else if (v.running) {
-		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, "Preparando...");
+		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, I18n::T("Preparando..."));
 	}
 	ImGui::TextColored(v.failed ? kWarn : (v.finished ? kGold : kDim), "%s",
 	                   v.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(v.text.c_str()));
@@ -1818,7 +1818,7 @@ void DrawShaderBlock(float unit) {
 void InfoLine(const char* caption, const std::string& value, const ImVec4& color) {
 	ImGui::TextColored(kDim, "%s", I18n::T(caption));
 	ImGui::PushStyleColor(ImGuiCol_Text, color);
-	ImGui::TextWrapped("%s", value.c_str());
+	ImGui::TextWrapped("%s", I18n::T(value.c_str()));
 	ImGui::PopStyleColor();
 	ImGui::Spacing();
 }
@@ -1883,7 +1883,7 @@ void DrawTrophyTab(float unit) {
 	}
 	Section("Trofeos");
 	if (rows.empty()) {
-		ImGui::TextWrapped("%s", "Aún no hay datos de trofeos: se cargan al iniciar el juego.");
+		ImGui::TextWrapped("%s", I18n::T("Aún no hay datos de trofeos: se cargan al iniciar el juego."));
 		return;
 	}
 	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
@@ -1897,12 +1897,12 @@ void DrawTrophyTab(float unit) {
 	}
 	const float frac = total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f;
 	ImGui::PushFont(nullptr, 30.0f * unit);
-	ImGui::TextColored(kGold, "%d%% completado", static_cast<int>(frac * 100.0f));
+	ImGui::TextColored(kGold, I18n::T("%d%% completado"), static_cast<int>(frac * 100.0f));
 	ImGui::PopFont();
 	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.80f, 0.63f, 0.30f, 1.0f});
 	ImGui::ProgressBar(frac, {-1.0f, 22.0f * unit}, "");
 	ImGui::PopStyleColor();
-	ImGui::Text("%d / %d trofeos", earned, static_cast<int>(rows.size()));
+	ImGui::Text(I18n::T("%d / %d trofeos"), earned, static_cast<int>(rows.size()));
 	ImGui::Separator();
 	static const ImVec4 grade_col[5] = {{0.6f, 0.6f, 0.6f, 1.0f}, {0.70f, 0.85f, 1.00f, 1.0f}, {1.00f, 0.82f, 0.30f, 1.0f},
 	                                    {0.78f, 0.80f, 0.84f, 1.0f}, {0.80f, 0.52f, 0.30f, 1.0f}};
@@ -1918,9 +1918,9 @@ void DrawTrophyTab(float unit) {
 		const float  h      = 64.0f * unit;
 		ImGui::Selectable("##t", false, ImGuiSelectableFlags_None, {w, h}); // focusable: D-pad / arrows scroll the list
 		if (ImGui::IsItemFocused() || ImGui::IsItemHovered()) {
-			g_desc_title = secret ? "Trofeo oculto" : r.name;
-			g_desc_text  = std::string(grade_txt[g]) + (r.earned ? " - obtenido" : " - sin obtener") + "\n\n" +
-			              (secret ? "Se revelar\xC3\xA1 al obtenerlo." : r.detail);
+			g_desc_title = secret ? I18n::T("Trofeo oculto") : r.name;
+			g_desc_text  = std::string(I18n::T(grade_txt[g])) + I18n::T(r.earned ? " - obtenido" : " - sin obtener") + "\n\n" +
+			              (secret ? I18n::T("Se revelar\xC3\xA1 al obtenerlo.") : r.detail);
 		}
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		const float r0 = 12.0f * unit;
@@ -1929,8 +1929,8 @@ void DrawTrophyTab(float unit) {
 		else dl->AddCircleFilled({at.x + 8 * unit + r0, at.y + h * 0.5f}, r0, ImGui::GetColorU32(grey));
 		const float tx = at.x + 16 * unit + 2 * r0 + 6 * unit;
 		dl->AddText({tx, at.y + 4 * unit}, ImGui::GetColorU32(r.earned ? ImVec4 {1, 1, 1, 1} : grey),
-		            secret ? "Trofeo oculto" : r.name.c_str());
-		const std::string sub = secret ? std::string(grade_txt[g]) : std::string(grade_txt[g]) + " - " + r.detail;
+		            secret ? I18n::T("Trofeo oculto") : r.name.c_str());
+		const std::string sub = secret ? std::string(I18n::T(grade_txt[g])) : std::string(I18n::T(grade_txt[g])) + " - " + r.detail;
 		dl->PushClipRect(at, {at.x + w, at.y + h}, true);
 		dl->AddText({tx, at.y + h * 0.5f + 2 * unit}, ImGui::GetColorU32(r.earned ? grade_col[g] : ImVec4 {0.35f, 0.35f, 0.35f, 1.0f}), sub.c_str());
 		dl->PopClipRect();
@@ -1949,22 +1949,22 @@ void DrawPcTab(float unit) {
 	ImGui::TextColored(kGold, "%s", I18n::T("TU EQUIPO"));
 	ImGui::PopFont();
 	const auto& pc  = g_rt.pc;
-	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string("8 GB simulados") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
-	if (!pc.nvidia && !pc.gpu.empty()) gpu += "  (sin DLSS: solo NVIDIA)";
+	std::string gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
+	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string(I18n::T("8 GB simulados")) : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
+	if (!pc.nvidia && !pc.gpu.empty()) gpu += I18n::T("  (sin DLSS: solo NVIDIA)");
 	InfoLine("Grafica", gpu, ink);
-	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string("16 GB RAM (simulados)") : std::to_string(pc.ram_gb) + " GB RAM"), ink);
+	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string(I18n::T("16 GB RAM (simulados)")) : std::to_string(pc.ram_gb) + " GB RAM"), ink);
 	if (!pc.recommended.empty()) {
 		InfoLine("Modo recomendado", pc.recommended, pc.unsupported ? red : kGold);
 		InfoLine("Esperado (estimacion)", pc.expected, pc.unsupported ? red : ink);
 	} else {
-		InfoLine("Modo recomendado", "Grafica sin datos: empieza por el Modo Souls equilibrado y mira las metricas.", ink);
+		InfoLine("Modo recomendado", I18n::T("Grafica sin datos: empieza por el Modo Souls equilibrado y mira las metricas."), ink);
 	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
 	ImGui::Spacing();
-	ImGui::TextColored(kDim, "Version instalada: %s", Update::CurrentVersion());
+	ImGui::TextColored(kDim, I18n::T("Version instalada: %s"), Update::CurrentVersion());
 
 	UpdateUi::State state;
 	std::string     text;
@@ -1979,7 +1979,7 @@ void DrawPcTab(float unit) {
 	// (10-28c) "Actualizar version" / "Volver a la version anterior" live only in the bottom bar (next to JUGAR / Salir);
 	// here only the confirmation once a newer port version was found.
 	if (state == UpdateUi::Available) {
-		if (ImGui::Button(("Actualizar a " + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
+		if (ImGui::Button((std::string(I18n::T("Actualizar a ")) + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
 	}
 	ImGui::EndDisabled();
 	// (10-27c) "Anadir a Steam": a non-Steam shortcut with its icon and artwork (ds-steam.cpp).
@@ -1988,11 +1988,11 @@ void DrawPcTab(float unit) {
 		static std::string steam_text;
 		static std::atomic<bool> steam_busy {false};
 		ImGui::BeginDisabled(steam_busy.load());
-		if (ImGui::Button("Añadir a Steam", {bw, bh})) {
+		if (ImGui::Button(I18n::T("Añadir a Steam"), {bw, bh})) {
 			steam_busy = true;
 			{
 				std::scoped_lock lock(steam_mutex);
-				steam_text = "Añadiendo a Steam...";
+				steam_text = I18n::T("Añadiendo a Steam...");
 			}
 			std::thread([] {
 				std::string report;
@@ -2004,13 +2004,13 @@ void DrawPcTab(float unit) {
 		}
 		ImGui::EndDisabled();
 		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
+			ImGui::SetTooltip("%s", I18n::T("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca."));
 		std::scoped_lock lock(steam_mutex);
-		if (!steam_text.empty()) ImGui::TextWrapped("%s", steam_text.c_str());
-		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso.");
+		if (!steam_text.empty()) ImGui::TextWrapped("%s", I18n::T(steam_text.c_str()));
+		else ImGui::TextColored(kDim, "%s", I18n::T("Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso."));
 	}
-	if (!text.empty()) ImGui::TextWrapped("%s", text.c_str());
-	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
+	if (!text.empty()) ImGui::TextWrapped("%s", I18n::T(text.c_str()));
+	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind(I18n::T("Descargando"), 0) == 0) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
@@ -2023,8 +2023,8 @@ void DrawPcTab(float unit) {
 			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i)) {
 				g_upd.chosen = i;
 				g_upd.state  = UpdateUi::Confirming;
-				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
-				             ". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.";
+				g_upd.text   = std::string(I18n::T("Se restaura la version ")) + g_upd.backups[i].version +
+				             I18n::T(". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.");
 			}
 		}
 	}
@@ -2073,6 +2073,58 @@ void ResolutionRow(Settings& s) {
 	ImGui::TextColored(kDim, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
 }
 
+// Optimize() builds its report from runtime hardware values. Translate its current formats here, keeping those
+// values and the producing settings code untouched. An unknown future format is left as-is rather than partially translated.
+std::string ConfigWhyText(const std::string& line) {
+	const char* exact = I18n::T(line.c_str());
+	if (std::strcmp(exact, line.c_str()) != 0) return exact;
+	if (std::strcmp(I18n::T("JUGAR"), "PLAY") != 0) return line; // dynamic rewording is English-only
+	std::smatch m;
+	char        out[2048];
+	static const std::regex hardware(R"(^Gráfica: (.+) \(potencia (\d+) de 100; RTX 5080 = 100\)\. Procesador: (.+) \((\d+) de 100\)\.$)");
+	if (std::regex_match(line, m, hardware)) {
+		const std::string cpu = I18n::T(m[3].str().c_str());
+		std::snprintf(out, sizeof(out), I18n::T("GPU: %s (performance %s out of 100; RTX 5080 = 100). CPU: %s (%s out of 100)."),
+		              m[1].str().c_str(), m[2].str().c_str(), cpu.c_str(), m[4].str().c_str());
+		return out;
+	}
+	static const std::regex upscaler(R"(^Reescalado: (.+) a (\d+x\d+) \(el 3D a (\d+x\d+)\)\.$)");
+	if (std::regex_match(line, m, upscaler)) {
+		const std::string mode = I18n::T(m[1].str().c_str());
+		std::snprintf(out, sizeof(out), I18n::T("Upscaling: %s to %s (3D at %s)."), mode.c_str(), m[2].str().c_str(), m[3].str().c_str());
+		return out;
+	}
+	static const std::regex detail(R"(^Detalle (.+), texturas (.+) \((\d+) GB de VRAM\), sombras (.+), distancia (.+) \(según el procesador\), filtrado x16 (sí|no)\.$)");
+	if (std::regex_match(line, m, detail)) {
+		const std::string quality = I18n::T(m[1].str().c_str()), textures = I18n::T(m[2].str().c_str());
+		const std::string shadows = I18n::T(m[4].str().c_str()), distance = I18n::T(m[5].str().c_str());
+		const std::string filtering = I18n::T(m[6].str().c_str());
+		std::snprintf(out, sizeof(out), I18n::T("Detail %s, textures %s (%s GB of VRAM), shadows %s, draw distance %s (CPU-dependent), 16x filtering: %s."),
+		              quality.c_str(), textures.c_str(), m[3].str().c_str(), shadows.c_str(), distance.c_str(), filtering.c_str());
+		return out;
+	}
+	static const std::regex ram_off(R"(^RAM (\d+) GB: no hacen falta las mejoras para equipos de 16 GB\.$)");
+	if (std::regex_match(line, m, ram_off)) {
+		std::snprintf(out, sizeof(out), I18n::T("RAM %s GB: 16 GB improvements are not needed."), m[1].str().c_str());
+		return out;
+	}
+	static const std::regex ram_on(R"(^RAM (\d+) GB: activadas las mejoras para equipos de 16 GB \(perfil de memoria\); texturas y distancia como mucho en Alto\.$)");
+	if (std::regex_match(line, m, ram_on)) {
+		std::snprintf(out, sizeof(out), I18n::T("RAM %s GB: 16 GB memory profile enabled; textures and draw distance capped at High."), m[1].str().c_str());
+		return out;
+	}
+	static const std::regex expected(
+	    R"(^Esperado: unos (\d+) FPS de media(?: \(tu monitor va a (\d+) Hz: la frame generation de Gráficos puede llenarlo\))?(\. Tu procesador limita: por debajo de 60 FPS en las zonas pesadas aunque bajes gráficos)?\. Es una estimación: puedes cambiar cualquier opción en F2\.$)");
+	if (std::regex_match(line, m, expected)) {
+		std::string text = std::string(I18n::T("Expected: about ")) + m[1].str() + I18n::T(" FPS on average");
+		if (m[2].matched) text += std::string(I18n::T(" (your monitor runs at ")) + m[2].str() + I18n::T(" Hz: frame generation in Graphics can fill it)");
+		if (m[3].matched) text += I18n::T(". Your CPU is the bottleneck: below 60 FPS in demanding areas even if you lower graphics settings");
+		text += I18n::T(". This is an estimate: you can change any option with F2.");
+		return text;
+	}
+	return line;
+}
+
 // (10-28) The Configurador: the detected hardware, "Optimizar según tu equipo" (Optimize, ds-settings.cpp) and "Continuar".
 // (10-28b) `in_tab`: inside the launcher's Sistema tab (no title, no "Continuar").
 void DrawConfigurator(float unit, bool in_tab = false) {
@@ -2080,45 +2132,45 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	const auto&  pc = g_rt.pc;
 	if (!in_tab) {
 		ImGui::PushFont(nullptr, 34.0f * unit);
-		ImGui::TextColored(kGold, "%s", "Configurador");
+		ImGui::TextColored(kGold, "%s", I18n::T("Configurador"));
 		ImGui::PopFont();
 	}
 	ImGui::PushTextWrapPos(0.0f);
-	ImGui::TextColored(kDim, "%s", "Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales.");
+	ImGui::TextColored(kDim, "%s", I18n::T("Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales."));
 	ImGui::PopTextWrapPos();
 	ImGui::Spacing();
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.12f, 0.10f, 0.08f, 0.85f});
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
 	ImGui::BeginChild("##hw", {0, 330 * unit}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
-	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  -  " + (g_rt.launched.simulate_vram8 ? std::string("8 GB de VRAM (simulados)") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB de VRAM");
+	std::string gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
+	if (pc.vram > 0) gpu += "  -  " + (g_rt.launched.simulate_vram8 ? std::string(I18n::T("8 GB de VRAM (simulados)")) : std::to_string((pc.vram + (512ull << 20)) >> 30) + I18n::T(" GB de VRAM"));
 	InfoLine("Tarjeta gráfica", gpu, ink);
 	std::string cpu = pc.cpu.empty() ? std::string("?") : pc.cpu;
-	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + " núcleos / " + std::to_string(pc.cpu_threads) + " hilos";
+	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + I18n::T(" núcleos / ") + std::to_string(pc.cpu_threads) + I18n::T(" hilos");
 	InfoLine("Procesador", cpu, ink);
 	const bool low = g_rt.launched.simulate_ram16 || (pc.ram_gb > 0 && pc.ram_gb <= 20);
-	InfoLine("Memoria RAM", (g_rt.launched.simulate_ram16 ? std::string("16 GB (simulados)") : std::to_string(pc.ram_gb) + " GB") + (low ? "  (se activan las mejoras para equipos de 16 GB de RAM)" : ""), low ? kWarn : ink);
-	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + " a " + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
+	InfoLine("Memoria RAM", (g_rt.launched.simulate_ram16 ? std::string(I18n::T("16 GB (simulados)")) : std::to_string(pc.ram_gb) + " GB") + (low ? I18n::T("  (se activan las mejoras para equipos de 16 GB de RAM)") : ""), low ? kWarn : ink);
+	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + I18n::T(" a ") + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
-	if (pc.unsupported) ImGui::TextColored(kWarn, "%s", pc.expected.c_str());
+	if (pc.unsupported) ImGui::TextColored(kWarn, "%s", I18n::T(pc.expected.c_str()));
 	ImGui::Spacing();
 	const float bw = 420 * unit, bh = 60 * unit;
-	if (ImGui::Button("Optimizar según tu equipo", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Optimizar según tu equipo"), {bw, bh})) {
 		g_cfg_why         = Optimize(pc, &g_edit);
 		g_edit.configured = true;
 		Save();
 		if (!g_config_mode && !g_start_mode) ApplyLive(g_edit);
 	}
 	if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-		g_desc_title = "Optimizar según tu equipo";
-		g_desc_text  = "Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.";
+		g_desc_title = I18n::T("Optimizar según tu equipo");
+		g_desc_text  = I18n::T("Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.");
 		if (!in_tab) ImGui::SetTooltip("%s", g_desc_text.c_str());
 	}
 	if (!in_tab) {
 	ImGui::SameLine();
-	if (ImGui::Button("Continuar", {bw * 0.6f, bh})) {
+	if (ImGui::Button(I18n::T("Continuar"), {bw * 0.6f, bh})) {
 		if (!g_edit.configured) {
 			g_edit.configured = true;
 			Save();
@@ -2126,19 +2178,19 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 		g_cfg_open = false;
 		if (g_config_mode) g_start_result = 1;
 	}
-	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_cfg_why.empty() ? "Sigue con tus ajustes actuales." : "Sigue con los ajustes elegidos.");
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_cfg_why.empty() ? I18n::T("Sigue con tus ajustes actuales.") : I18n::T("Sigue con los ajustes elegidos."));
 	}
 	if (!g_cfg_why.empty()) {
 		ImGui::Spacing();
 		ImGui::PushFont(nullptr, 30.0f * unit);
-		ImGui::TextColored(kGold, "%s", "Hemos elegido:");
+		ImGui::TextColored(kGold, "%s", I18n::T("Hemos elegido:"));
 		ImGui::PopFont();
 		ImGui::PushTextWrapPos(0.0f);
-		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
+		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", ConfigWhyText(line).c_str());
 		ImGui::PopTextWrapPos();
-		ImGui::TextColored(kDim, "%s", g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F2."
-		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F2."
-		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
+		ImGui::TextColored(kDim, "%s", g_start_mode ? I18n::T("Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F2.")
+		                               : g_config_mode ? I18n::T("Después puedes cambiar cualquier opción en el juego con F2.")
+		                                              : I18n::T("Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego."));
 	}
 }
 
@@ -2216,7 +2268,7 @@ void Draw(float width, float height) {
 	}
 	ImGui::Begin("##PortMenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::PushFont(font, 40.0f * unit);
-	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : "AJUSTES");
+	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : I18n::T("AJUSTES"));
 	ImGui::PopFont();
 	ImGui::SameLine();
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
@@ -2279,7 +2331,7 @@ void Draw(float width, float height) {
 			if (t == 5) DrawTrophyTab(unit);
 			else if (groups[t].empty()) {
 				Section("Sonido");
-				ImGui::TextWrapped("%s", "El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido.");
+				ImGui::TextWrapped("%s", I18n::T("El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido."));
 			}
 			for (const int section: groups[t]) {
 			if (groups[t].size() > 1) Section(section_names[section]);
@@ -2318,7 +2370,7 @@ void Draw(float width, float height) {
 					ChoiceRow("Intensidad DLSS 5", s.dlss5_strength != g_rt.launched.dlss5_strength, kDlss5Strengths, kDlss5StrengthCount, s.dlss5_strength,
 					          kDlss5StrengthTip);
 					ImGui::EndDisabled();
-					if (!nvidia) ImGui::TextColored(kDim, "Sin DLSS: tu grafica no es NVIDIA.");
+					if (!nvidia) ImGui::TextColored(kDim, "%s", I18n::T("Sin DLSS: tu grafica no es NVIDIA."));
 					break;
 				}
 				case 1: { // Frame generation
@@ -2327,8 +2379,8 @@ void Draw(float width, float height) {
 					for (const char* id: {"sin-fg", "amd-x2", "amd-x3", "amd-x4", "amd-dinamico", "dlss-x2", "dlss-x3", "dlss-x4", "dlss-dinamico"})
 						if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
 					if (fixed)
-						ImGui::TextColored(kWarn, "%s", s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
-						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+						ImGui::TextColored(kWarn, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
+						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla)."));
 					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
 					ChoiceRow("Frame generation", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
@@ -2361,8 +2413,8 @@ void Draw(float width, float height) {
 							PortLive::fg_generate = g_fg_live;
 						}
 					}
-					ImGui::TextColored(kDim, "FPS desbloqueados siempre, salvo en los modos Souls de FPS fijos.");
-					ImGui::TextColored(kDim, "El menu se muestra sin frames generados (no se arrastra con la imagen).");
+					ImGui::TextColored(kDim, "%s", I18n::T("FPS desbloqueados siempre, salvo en los modos Souls de FPS fijos."));
+					ImGui::TextColored(kDim, "%s", I18n::T("El menu se muestra sin frames generados (no se arrastra con la imagen)."));
 					break;
 				}
 				case 2: { // Calidad grafica (the launcher's group, in its order)
@@ -2384,7 +2436,7 @@ void Draw(float width, float height) {
 					CheckRow("Viñeta", true, s.vignette, "Oscurecimiento de los bordes de la imagen (Sí = como en PS5).");
 					CheckRow("Bloom", true, s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5).");
 					CheckRow("Adaptación de la vista", true, s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5).");
-					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
+					ImGui::TextColored(kDim, "%s", I18n::T("Son ajustes internos del juego: los lee al arrancar."));
 					break;
 				}
 				case 3: { // Ray tracing (ds-torch-1028's launcher rows, in its order; hardware RT only with the experimental switch)
@@ -2474,7 +2526,7 @@ void Draw(float width, float height) {
 					ImGui::Spacing();
 					ImGui::TextColored(kDim, "%s", I18n::T("Carpeta del juego:"));
 					ImGui::TextWrapped("%s", s.game.c_str());
-					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
+					ImGui::TextColored(kDim, "%s", g_start_mode ? I18n::T("Se cambia abajo (Cambiar...).") : I18n::T("Se cambia en el menu de inicio, antes del juego."));
 					break;
 				}
 				case 10: { // (ds-pc-port37) Ajustes del juego: the emulator launcher's window, as a section of its own
@@ -2504,13 +2556,13 @@ void Draw(float width, float height) {
 				case 6: { // Sistema
 					if (!g_start_mode) {
 					// (10-28) The Configurador again: the detected hardware and "Optimizar según tu equipo".
-					if (ImGui::Button("Configurador", {420 * unit, 56 * unit})) {
+					if (ImGui::Button(I18n::T("Configurador"), {420 * unit, 56 * unit})) {
 						g_cfg_open = true;
 						g_cfg_why.clear();
 					}
 					if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-						g_desc_title = "Configurador";
-						g_desc_text  = "Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.";
+						g_desc_title = I18n::T("Configurador");
+						g_desc_text  = I18n::T("Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.");
 					}
 					ImGui::Spacing();
 					}
@@ -2562,7 +2614,7 @@ void Draw(float width, float height) {
 					         "Jugar con teclado y ratón: WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Con él activo la cámara gira sin la aceleración del juego, también con el stick derecho del mando: si juegas con mando, déjalo desactivado.");
 					ImGui::BeginDisabled(!s.kbm);
 					const auto restart_note = [&](bool changed) {
-						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
+						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", I18n::T("   (requiere reinicio)"));
 					};
 					// (11-10) Sensitivity and anti-dead-zone apply live (with keyboard and mouse on since the start).
 					bool mouse_live = false;
@@ -2602,7 +2654,7 @@ void Draw(float width, float height) {
 					}
 					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? I18n::T("Mando: botones de serie.") : I18n::T("Mando: remapeado."));
 					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
-					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
+					if (ImGui::CollapsingHeader(I18n::T("Teclas (teclado y ratón)"))) {
 						static const char* kDefault =
 						    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;L2=Shift+Mouse:Right;R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
 						static const std::pair<const char*, const char*> names[] = {
@@ -2623,7 +2675,7 @@ void Draw(float width, float height) {
 								const std::string c = item.substr(0, eq);
 								std::string        shown = c;
 								for (const auto& [k, v]: names)
-									if (c == k) shown = v;
+									if (c == k) shown = I18n::T(v);
 								ImGui::TableNextRow();
 								ImGui::TableSetColumnIndex(0);
 								ImGui::TextUnformatted(shown.c_str());
@@ -2632,9 +2684,9 @@ void Draw(float width, float height) {
 							}
 							ImGui::EndTable();
 						}
-						ImGui::TextColored(kDim, "%s", "Las teclas se cambian en mapa_teclado (settings.ini) o con \"Mapear mando\" del lanzador.");
+						ImGui::TextColored(kDim, "%s", I18n::T("Las teclas se cambian en mapa_teclado (settings.ini) o con \"Mapear mando\" del lanzador."));
 					}
-					ImGui::TextColored(kDim, "%s", "F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa.");
+					ImGui::TextColored(kDim, "%s", I18n::T("F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
@@ -2647,13 +2699,13 @@ void Draw(float width, float height) {
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.055f, 0.05f, 0.75f});
 			ImGui::BeginChild("##desc", {0, page_h}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
 			ImGui::PushFont(nullptr, 30.0f * unit);
-			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? tabs[t] : g_desc_title.c_str());
+			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? I18n::T(tabs[t]) : I18n::T(g_desc_title.c_str()));
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F2 abre estas mismas opciones."
+			ImGui::TextUnformatted(I18n::T(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F2 abre estas mismas opciones."
 			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
-			                                           : g_desc_text.c_str());
+			                                           : g_desc_text.c_str()));
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();
 			ImGui::PopStyleColor();
@@ -2689,7 +2741,7 @@ void Draw(float width, float height) {
 			}
 		}
 		DrawShaderBlock(unit);
-		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F2 dentro del juego: opciones en vivo.") : g_status.c_str());
+		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F2 dentro del juego: opciones en vivo.") : I18n::T(g_status.c_str()));
 		const float bw = 300 * unit, bh = 60 * unit;
 		const auto  v  = Precompile::State();
 		if (ImGui::Button(I18n::T(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR"), {bw, bh})) {
@@ -2710,7 +2762,7 @@ void Draw(float width, float height) {
 			}
 		}
 		if (v.running && ImGui::IsItemHovered())
-			ImGui::SetTooltip("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
+			ImGui::SetTooltip("%s", I18n::T("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."));
 		ImGui::SameLine();
 		ImGui::BeginDisabled(g_upd.busy.load());
 		if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
@@ -2735,19 +2787,19 @@ void Draw(float width, float height) {
 				Save();
 			}
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("%s", "El juego arrancará directo. Para volver a verlo: F2 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
+				ImGui::SetTooltip("%s", I18n::T("El juego arrancará directo. Para volver a verlo: F2 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador."));
 		}
 	} else {
 	const bool needs = NeedsRestartLive(g_rt.launched, s);
-	if (needs) ImGui::TextColored(kWarn, "Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora).");
-	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas." : g_status.c_str());
+	if (needs) ImGui::TextColored(kWarn, "%s", I18n::T("Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora)."));
+	else ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas.") : I18n::T(g_status.c_str()));
 	const float bw = 220 * unit, bh = 52 * unit;
-	if (ImGui::Button("Aplicar", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Aplicar"), {bw, bh})) {
 		Save();
 		ApplyLive(s);
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Restablecer", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Restablecer"), {bw, bh})) {
 		// (The defaults, but the game folder and the languages stay.)
 		Settings d;
 		d.game              = s.game;
@@ -2756,10 +2808,10 @@ void Draw(float width, float height) {
 		d.game_language_set = s.game_language_set;
 		d.configured        = true;
 		s                   = d;
-		g_status            = "Valores por defecto (pulsa Aplicar para guardarlos).";
+		g_status            = I18n::T("Valores por defecto (pulsa Aplicar para guardarlos).");
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Volver", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Volver"), {bw, bh})) {
 		Save();
 		ApplyLive(s);
 		SetOpen(false);
@@ -3691,7 +3743,7 @@ void LauncherConfigurator(Settings& s) {
 		ImGui::BeginGroup();
 		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
 		ImGui::TextColored(kGoldL, "%s", I18n::T("Hemos elegido:"));
-		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
+		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", ConfigWhyText(line).c_str());
 		ImGui::PopTextWrapPos();
 		ImGui::EndGroup();
 	}
@@ -3711,9 +3763,9 @@ void LauncherPerformance(Settings& s) {
 			const float ny = RowY();
 			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
 			const bool pending = limit < 64 && PagefileConfigured();
-			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, "Memoria total de Windows (RAM + paginación): %llu GB%s",
+			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, I18n::T("Memoria total de Windows (RAM + paginación): %llu GB%s"),
 			                   static_cast<unsigned long long>(limit),
-			                   limit >= 64 ? "" : pending ? "  -  hecho: REINICIA EL PC" : "  -  pulsa el botón y reinicia");
+			                   limit >= 64 ? "" : pending ? I18n::T("  -  hecho: REINICIA EL PC") : I18n::T("  -  pulsa el botón y reinicia"));
 			RowEnd(ny, 24);
 		}
 	}
@@ -3941,7 +3993,7 @@ void LauncherAjustes(Settings& s) {
 		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
 		{
 			std::scoped_lock lock(g_steam_mutex);
-			if (!g_steam_text.empty()) ImGui::TextColored(kInkL, "%s", g_steam_text.c_str());
+			if (!g_steam_text.empty()) ImGui::TextColored(kInkL, "%s", I18n::T(g_steam_text.c_str()));
 		}
 		if (!g_status.empty()) ImGui::TextColored(kGoldL, "%s", I18n::T(g_status.c_str()));
 		ImGui::PopTextWrapPos();
@@ -3996,7 +4048,7 @@ void LauncherUpdateBox() {
 	ImGui::BeginGroup();
 	ImGui::PushItemWidth(U(396));
 	ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
-	if (!text.empty()) ImGui::TextColored(kInkL, "%s", text.c_str());
+	if (!text.empty()) ImGui::TextColored(kInkL, "%s", I18n::T(text.c_str()));
 	ImGui::PopTextWrapPos();
 	const bool  busy = g_upd.busy.load();
 	const float bh   = U(34);
@@ -4009,7 +4061,7 @@ void LauncherUpdateBox() {
 		ImGui::EndDisabled();
 		ImGui::SameLine();
 	}
-	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
+	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind(I18n::T("Descargando"), 0) == 0) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
@@ -4022,8 +4074,8 @@ void LauncherUpdateBox() {
 			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i, ImGuiSelectableFlags_None, {U(396), 0})) {
 				g_upd.chosen = i;
 				g_upd.state  = UpdateUi::Confirming;
-				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
-				             ". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.";
+				g_upd.text   = std::string(I18n::T("Se restaura la version ")) + g_upd.backups[i].version +
+				             I18n::T(". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.");
 			}
 		}
 	}
@@ -5618,22 +5670,22 @@ void Sample(LogState& L,
 			} else if (kind == "XeSS") model = L.xess_ver == "2.0.2" ? "XeSS 3.0.2" : !L.xess_ver.empty() ? "XeSS " + L.xess_ver : "XeSS";
 			else if (kind == "FSR") model = L.fsr_ver.empty() ? "FSR 3.1" : L.fsr_ver + " (AMD SDK 2.4)";
 		} else if (L.force4k) rk = "Nativo", res = "2160p (4K)";
-		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = "reescalado del juego";
+		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = I18n::T("reescalado del juego");
 		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);
 		else rk = scale_label;
-		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = "FSR 4 (IA, modelo v07)";
+		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = I18n::T("FSR 4 (IA, modelo v07)");
 		// (11-11) DLSS 5 in the Modelo row: the level it was launched with; "activo" once the log says it evaluates.
 		if (!g_rt.launched.dlss5.empty() && g_rt.launched.dlss5 != "0") {
 			std::string lvl = g_rt.launched.dlss5;
 			for (int i = 0; i < kDlss5LevelCount; i++)
-				if (g_rt.launched.dlss5 == kDlss5Levels[i].id) lvl = kDlss5Levels[i].label;
-			const std::string d5 = "DLSS 5 " + lvl + (L.dlss5_on ? " activo" : " ...");
+				if (g_rt.launched.dlss5 == kDlss5Levels[i].id) lvl = I18n::T(kDlss5Levels[i].label);
+			const std::string d5 = "DLSS 5 " + lvl + (L.dlss5_on ? I18n::T(" activo") : " ...");
 			model = model.empty() ? d5 : model + " + " + d5;
 			if (rk.empty()) rk = "Nativo";
 		}
 		if (!rk.empty()) {
 			const ImU32 col = rk == "DLSS" ? kGreen : rk == "FSR" || rk == "FSR 4" ? kRed : rk == "XeSS" ? kBlue : kOrange;
-			rows.push_back({"Escala", mode.empty() ? rk : rk + dot + mode, col});
+			rows.push_back({"Escala", mode.empty() ? std::string(I18n::T(rk.c_str())) : std::string(I18n::T(rk.c_str())) + dot + I18n::T(mode.c_str()), col});
 			if (!res.empty()) rows.push_back({"Resol.", res, col});
 			if (!model.empty()) rows.push_back({"Modelo", model, col});
 		}
@@ -5643,7 +5695,7 @@ void Sample(LogState& L,
 		const ImU32 fg_col = fg_nv ? kGreen : kRed;
 		if (fg_label.rfind("MODO ", 0) == 0 || fg_label.rfind("MODE ", 0) == 0) rows.push_back({"", fg_label, fg_col});
 		else {
-			rows.push_back({"FG", fg_label + (fg_nv ? " (modelo C)" : ""), fg_col});
+			rows.push_back({"FG", std::string(I18n::T(fg_label.c_str())) + (fg_nv ? I18n::T(" (modelo C)") : ""), fg_col});
 			if (f.fg_mult > 0) rows.push_back({"FG ahora", Fmt("x%d", f.fg_mult), fg_col});
 		}
 	}
@@ -5713,7 +5765,11 @@ void Draw(float width, float height) {
 		std::scoped_lock lock(g_mutex);
 		rows = g_rows, fps = g_fps_text, fps_col = g_fps_color, ft = g_ft, ftm = g_ft_max;
 	}
-	if (rows.empty()) rows.push_back({"", "Cargando...", kOrange});
+	for (auto& r: rows) {
+		r.name  = I18n::T(r.name.c_str());
+		r.value = I18n::T(r.value.c_str());
+	}
+	if (rows.empty()) rows.push_back({"", I18n::T("Cargando..."), kOrange});
 	const float row_px = std::round(15 * S), title_px = std::round(16 * S), fps_px = std::round(34 * S), small_px = std::round(10 * S);
 	const float pad = std::round(8 * S), row_h = std::ceil(row_px * 1.12f), title_h = std::ceil(title_px * 1.4f), fps_h = fps.empty() ? 0.0f : std::ceil(fps_px * 1.1f);
 	float name_w = std::round(90 * S), val_w = std::round(230 * S), wide_w = 0;
@@ -5751,7 +5807,7 @@ void Draw(float width, float height) {
 		const float ly = gy + graph_h - ms / top * graph_h;
 		dl->AddLine({x0, ly}, {x0 + gw, ly}, IM_COL32(60, 60, 60, 255));
 	}
-	dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255), "frametime (ms)  40   verde media, naranja picos");
+	dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255), I18n::T("frametime (ms)  40   verde media, naranja picos"));
 	dl->AddText(f, small_px, {x0, gy + graph_h - 16.7f / top * graph_h - small_px}, IM_COL32(128, 128, 128, 255), "16.7");
 	const auto line = [&](const std::vector<double>& list, ImU32 col) {
 		if (list.size() < 2) return;
@@ -6344,11 +6400,11 @@ void InstallMenu(const Runtime& runtime) {
 	const bool        fixed = FixedFg(runtime.launched);
 	const std::string fg    = fixed ? std::string("amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
-		PortLive::fg_label  = fixed ? (runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO"
+		PortLive::fg_label  = I18n::T(fixed ? (runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO"
 		                               : runtime.launched.souls_mode == "low"       ? "MODO SOULS PC LOW PROFILE"
 		                               : runtime.launched.souls_mode == "ligero-plus" ? "MODO SOULS LIGERO +"
 		                                                                            : "MODO SOULS LIGERO")
-		                            : FrameGenLabel(fg);
+		                            : FrameGenLabel(fg));
 		PortLive::fg_plain  = fixed;
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
 		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
@@ -6360,9 +6416,9 @@ void InstallMenu(const Runtime& runtime) {
                 if (id == items[i].id) return items[i].label;
             return items[0].label;
 		};
-		gfx = std::string("Texturas ") + level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce) +
-		      ", Distancia de dibujado " + level(kQualities, kQualityCount, runtime.launched.quality) + ", Sombras " +
-		      level(kShadows, kShadowCount, runtime.launched.shadows) + ", Detalle " + level(kDetails, kDetailCount, runtime.launched.detail);
+		gfx = std::string(I18n::T("Texturas ")) + I18n::T(level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce)) +
+		      I18n::T(", Distancia de dibujado ") + I18n::T(level(kQualities, kQualityCount, runtime.launched.quality)) + I18n::T(", Sombras ") +
+		      I18n::T(level(kShadows, kShadowCount, runtime.launched.shadows)) + I18n::T(", Detalle ") + I18n::T(level(kDetails, kDetailCount, runtime.launched.detail));
 		PortLive::gfx_line = gfx.c_str();
 	}
 	PortLive::g_hooks   = &kHooks;

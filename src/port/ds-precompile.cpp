@@ -46,12 +46,22 @@ std::atomic<bool> g_save_on_stop {true};
 
 void SetText(const std::string& text) {
 	std::scoped_lock lock(g_mutex);
-	g_view.text = text;
+	g_view.text = I18n::T(text.c_str());
 }
 
 std::string ReadAll(const fs::path& p) {
 	std::ifstream in(p, std::ios::binary);
 	return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+template <typename... Args>
+std::string Ui(const char* text, Args... args) {
+	const char* format = I18n::T(text);
+	const int   size   = std::snprintf(nullptr, 0, format, args...);
+	if (size <= 0) return format;
+	std::string out(static_cast<size_t>(size), '\0');
+	std::snprintf(out.data(), out.size() + 1, format, args...);
+	return out;
 }
 
 std::wstring Wide(const std::string& s) {
@@ -424,7 +434,7 @@ void Work() {
 		std::scoped_lock lock(g_mutex);
 		g_view.failed  = !g_stop;
 		g_view.running = false;
-		g_view.text    = g_stop ? "Preparacion de shaders detenida: lo hecho se guarda y sigue la proxima vez." : what;
+		g_view.text    = g_stop ? I18n::T("Preparacion de shaders detenida: lo hecho se guarda y sigue la proxima vez.") : I18n::T(what.c_str());
 	};
 	const auto run = [&](const std::string& name, const std::wstring& args, bool stoppable = true) {
 		return RunOne(name, args, false, stoppable) == 0;
@@ -622,7 +632,7 @@ void Work() {
 	if (resumed) {
 		std::printf("[port] precompile: %d of %d shards done before: going on at %d %%\n", done, total, resumed_p);
 		std::fflush(stdout);
-		SetText("Preparando shaders: continuando (" + std::to_string(resumed_p) + " % ya hecho)..."); // (ds-pc-port51)
+		SetText(Ui("Preparando shaders: continuando (%d %% ya hecho)...", resumed_p)); // (ds-pc-port51)
 	}
 	{
 		std::scoped_lock lock(g_mutex);
@@ -683,7 +693,7 @@ void Work() {
 			                 true);
 			if (c.process == nullptr) {
 				kill_all();
-				return fail("No se pudo arrancar kyty_shader_precompile.exe.");
+				return fail(Ui("No se pudo arrancar kyty_shader_precompile.exe."));
 			}
 			running.push_back({item, c, name});
 		}
@@ -719,7 +729,7 @@ void Work() {
 				}
 				kill_all();
 				(void)run("merge-failed", L"--merge", false);
-				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Lo hecho se guarda. Mira logs\\*-precompile.");
+				return fail(Ui("Fallo un trozo de la preparacion de shaders (%s). Lo hecho se guarda. Mira logs\\*-precompile.", r.name.c_str()));
 			}
 			done++;
 			done_log << done_name(r.item) << "\n";
@@ -731,20 +741,20 @@ void Work() {
 			g_view.done        = done;
 			g_view.waiting_mem = waiting_memory;
 			const int pct      = total > 0 ? done * 100 / total : 0;
-			std::string eta    = "calculando el tiempo restante";
+			std::string eta    = I18n::T("calculando el tiempo restante");
 			g_view.eta_s       = -1;
 			if (done - (total > 0 ? resumed_p * total / 100 : 0) > 0) {
 				const int       here  = done - resumed_p * total / 100;
 				const auto      spent = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - begin).count();
 				const long long left  = spent * (total - done) / here;
 				g_view.eta_s          = left;
-				eta = "quedan unos " + (left >= 3600 ? std::to_string(left / 3600) + " h " + std::to_string(left % 3600 / 60) + " min"
-				                                     : std::to_string(std::max<long long>(1, left / 60)) + " min");
+				eta = left >= 3600 ? Ui("quedan unos %lld h %lld min", left / 3600, left % 3600 / 60)
+				                   : Ui("quedan unos %lld min", std::max<long long>(1, left / 60));
 			}
-			g_view.text = "Ten paciencia: se estan precompilando los shaders del juego (solo la primera vez).\n" + std::to_string(pct) +
-			              " %  (" + std::to_string(done) + " / " + std::to_string(total) + " partes, " + eta + ")" +
-			              (resumed_p > 0 ? "  (retomada desde el " + std::to_string(resumed_p) + " %)" : std::string()) +
-			              (waiting_memory ? "  [esperando memoria libre]" : "");
+			g_view.text = Ui("Ten paciencia: se estan precompilando los shaders del juego (solo la primera vez).\n%d %%  (%d / %d partes, %s)",
+			                 pct, done, total, eta.c_str()) +
+			              (resumed_p > 0 ? "  " + Ui("(retomada desde el %d %%)", resumed_p) : std::string()) +
+			              (waiting_memory ? "  " + std::string(I18n::T("[esperando memoria libre]")) : std::string());
 		}
 	}
 
@@ -752,7 +762,7 @@ void Work() {
 	SetText("Preparando shaders: guardando la cache...");
 	// (Resumed: no --prune, which keeps only this run's pipelines: the earlier runs' shards were merged and are not made again.)
 	if (!run("merge", resumed ? L"--merge --stamp" : L"--merge --stamp --prune", false))
-		return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
+		return fail(Ui("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile."));
 	done_log.close();
 	fs::remove_all(resume_dir, ec);
 	fs::remove_all(g_nvidia, ec);
@@ -765,7 +775,7 @@ void Work() {
 	g_view.finished = true;
 	g_view.playable = true;
 	g_view.done     = g_view.total;
-	g_view.text     = "Shaders listos: todos los pipelines del juego estan en la cache de esta grafica.";
+	g_view.text     = I18n::T("Shaders listos: todos los pipelines del juego estan en la cache de esta grafica.");
 }
 #endif
 
@@ -843,7 +853,7 @@ void Start() {
 		if (g_view.running) return;
 		g_view          = {};
 		g_view.running  = true;
-		g_view.text     = "Preparando shaders...";
+		g_view.text     = I18n::T("Preparando shaders...");
 	}
 	if (g_worker.joinable()) g_worker.join();
 	g_stop   = false;
