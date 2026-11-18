@@ -265,6 +265,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
 	"${KYTY_SOURCE_DIR}/loader/*.h"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.h"
 )
 
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
@@ -1175,14 +1177,24 @@ target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
 add_executable(port_update_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PortUpdateTests.cpp"
 	"${KYTY_SOURCE_DIR}/port/ds-update.cpp"
-	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp")
+	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp")
 target_include_directories(port_update_tests PRIVATE ${inc_headers})
+target_link_libraries(port_update_tests PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+	target_link_libraries(port_update_tests PRIVATE shell32 winhttp)
+endif()
 
 # The port's UI translations (plain C++: also on Linux).
 add_executable(port_i18n_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PortI18nTests.cpp"
 	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp")
 target_include_directories(port_i18n_tests PRIVATE ${inc_headers})
+
+add_executable(port_i18n_support_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PortI18nSupportTests.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp")
+target_include_directories(port_i18n_support_tests PRIVATE ${inc_headers})
 
 add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
@@ -1336,6 +1348,7 @@ if(BUILD_TESTING)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
 	add_test(NAME port_i18n COMMAND $<TARGET_FILE:port_i18n_tests>)
+	add_test(NAME port_i18n_support COMMAND $<TARGET_FILE:port_i18n_support_tests>)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -1452,6 +1465,8 @@ if(BUILD_TESTING)
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_latency_tests
+		port_i18n_tests
+		port_i18n_support_tests
 	)
 endif()
 
@@ -1472,8 +1487,6 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-steam.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-steam.h"
-		"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp"
-		"${KYTY_SOURCE_DIR}/port/ds-i18n.h"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.h"
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.h"

@@ -328,6 +328,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void ShowSplash(const std::string& image) {
+	SplashStatus("Cargando...");
 	int               channels = 0;
 	const std::string bytes    = ReadText(fs::path(Wide(image)));
 	auto*             pixels   = bytes.empty() ? nullptr
@@ -1036,12 +1037,33 @@ void RequestRestart(bool to_launcher) {
 } // namespace Port
 
 int main(int argc, char* argv[]) {
-	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
-	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	g_exe               = ExePath();
 	const fs::path root = g_exe.parent_path();
 	SetCurrentDirectoryW(root.c_str());
+	// Language must be initialized before any startup dialog, including Steam, update helpers and the single-instance
+	// timeout below.
+	const std::string ini   = Utf8((root / L"settings.ini").wstring());
+	const std::string image = Utf8((root / L"fondo-souls.jpg").wstring());
 	std::error_code ec;
+	Port::Settings settings;
+	if (!Port::LoadSettings(ini, &settings)) {
+		// A first run: the launcher's game-path.txt and ram16.txt when this folder has them.
+		const std::string old = ReadText(root / L"game-path.txt");
+		if (!old.empty()) {
+			std::string path = old;
+			if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF) path = path.substr(3);
+			while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' ')) path.pop_back();
+			settings.game = path;
+		}
+		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
+	}
+	// (ds-pc-port9) An empty idioma_interfaz: Windows' UI language at every start, not stored.
+	const std::string ui_language = settings.menu_language.empty() ? Port::I18n::DetectWindowsLanguage() : settings.menu_language;
+	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(ui_language);
+	Port::I18n::SetLanguage(ui_language);
+
+	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
+	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
 	// (10-27) What an update left: the exe and the DLLs that were running then, renamed to .old.
 	const int olds = Port::Update::RemoveOldFiles(root);
 	fs::create_directories(root / L"logs", ec);
@@ -1067,26 +1089,6 @@ int main(int argc, char* argv[]) {
 		Message(report, ok ? MB_ICONINFORMATION : MB_ICONWARNING);
 		return ok ? 0 : 1;
 	}
-
-	// Language must be initialized before any startup dialog, including the single-instance timeout below.
-	const std::string ini   = Utf8((root / L"settings.ini").wstring());
-	const std::string image = Utf8((root / L"fondo-souls.jpg").wstring());
-	Port::Settings settings;
-	if (!Port::LoadSettings(ini, &settings)) {
-		// A first run: the launcher's game-path.txt and ram16.txt when this folder has them.
-		const std::string old = ReadText(root / L"game-path.txt");
-		if (!old.empty()) {
-			std::string path = old;
-			if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF) path = path.substr(3);
-			while (!path.empty() && (path.back() == '\r' || path.back() == '\n' || path.back() == ' ')) path.pop_back();
-			settings.game = path;
-		}
-		settings.profile16 = fs::exists(root / L"ram16.txt", ec);
-	}
-	// (ds-pc-port9) An empty idioma_interfaz: Windows' UI language at every start, not stored.
-	const std::string ui_language = settings.menu_language.empty() ? Port::I18n::DetectWindowsLanguage() : settings.menu_language;
-	if (!settings.game_language_set) settings.language = Port::I18n::GameLanguageFor(ui_language);
-	Port::I18n::SetLanguage(ui_language);
 
 	// One game at a time (a restart waits for the one before to end).
 	HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\DemonsSoulsPC");

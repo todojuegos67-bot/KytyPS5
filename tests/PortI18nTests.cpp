@@ -57,6 +57,49 @@ int main() {
 	ExpectEnglish("Cerrar el juego", "Close game");
 	ExpectEnglish("F2 o Esc: volver al juego", "F2 or Esc: back to game");
 
+	// The first-run Configurator and detected hardware.
+	ExpectEnglish("Tarjeta gr\xC3\xA1" "fica", "Graphics card");
+	ExpectEnglish("Procesador", "CPU");
+	ExpectEnglish(" n\xC3\xBA" "cleos / ", " cores / ");
+	ExpectEnglish(" hilos", " threads");
+	ExpectEnglish("16 GB RAM (simulados)", "16 GB RAM (simulated)");
+	ExpectEnglish("Continuar", "Continue");
+	ExpectEnglish("Sigue con tus ajustes actuales.", "Keep your current settings.");
+	ExpectEnglish("NO COMPATIBLE", "NOT SUPPORTED");
+	ExpectEnglish("1440p: 45 FPS reales fijos (90 en pantalla con AMD x2)", "1440p: stable 45 real FPS (90 on screen with AMD x2)");
+
+	// Direct ImGui text, trophy status and update messages.
+	ExpectEnglish("Aplicar", "Apply");
+	ExpectEnglish("Restablecer", "Reset");
+	ExpectEnglish("(requiere reinicio)", "(needs a restart)");
+	ExpectEnglish("A\xC3\xBAn no hay datos de trofeos: se cargan al iniciar el juego.", "No trophy data yet: it loads when the game starts.");
+	ExpectEnglish("%d / %d trofeos", "%d / %d trophies");
+	ExpectEnglish(" - sin obtener", " - not earned");
+	ExpectEnglish("Version instalada: ", "Installed version: ");
+	ExpectEnglish("\nUltima version del port en GitHub: ", "\nLatest port version on GitHub: ");
+	ExpectEnglish("Descargando ", "Downloading ");
+	ExpectEnglish("Restaurando la version ", "Restoring version ");
+	ExpectEnglish(". No se ha cambiado nada.", ". Nothing was changed.");
+	ExpectEnglish("  -  hecho: REINICIA EL PC", "  -  done: RESTART THE PC");
+
+	// F8 metrics and the legacy performance HUD.
+	ExpectEnglish("GPU reloj", "GPU clock");
+	ExpectEnglish("CPU reloj", "CPU clock");
+	ExpectEnglish("Latencia", "Latency");
+	ExpectEnglish("Escala", "Scale");
+	ExpectEnglish("Resol.", "Resolution");
+	ExpectEnglish("Modelo", "Model");
+	ExpectEnglish("FG ahora", "FG now");
+	ExpectEnglish("Personalizado", "Custom");
+	ExpectEnglish("reescalado del juego", "game upscaling");
+	ExpectEnglish("Ultra (Reflex apagado)", "Ultra (Reflex off)");
+	ExpectEnglish("frametime (ms)  40   verde media, naranja picos", "frametime (ms)  40   green average, orange peaks");
+	ExpectEnglish("MODO SOULS EQUILIBRADO", "SOULS BALANCED MODE");
+
+	// Hardware unit fragments composed with dynamic values.
+	ExpectEnglish(" GB de VRAM", " GB of VRAM");
+	ExpectEnglish(" a ", " at ");
+
 	// Startup dialogs and splash status messages.
 	ExpectEnglish("Solo quedan %.1f GB de RAM libres (de %.0f GB). El juego necesita unos 12 GB y puede ir a tirones o cerrarse.\n\n",
 	              "Only %.1f GB of RAM free (of %.0f GB). The game needs about 12 GB and may stutter or close.\n\n");
