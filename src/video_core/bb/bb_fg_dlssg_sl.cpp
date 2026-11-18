@@ -277,16 +277,9 @@ void SetOptions(const OptionsKey& key) {
     }
 }
 
-// bb-fg-cap: dlss-dyn's multiplier (bb_fg.cpp DynamicFg, decided once a second in AfterPresent;
-// was always the maximum, 3 generated, whatever the display could show) and the real-fps cap the
-// present thread holds the game frames to while DLSS-G is on (0: none).
-std::atomic<int> g_dyn_mult{2};
-std::atomic<int> g_real_cap{0};
-
 uint32_t WantedFrames() {
     const auto& c = Cfg();
-    uint32_t want = c.dynamic ? static_cast<uint32_t>(std::clamp(g_dyn_mult.load() - 1, 1, 3))
-                              : static_cast<uint32_t>(std::clamp(c.multiplier - 1, 1, 3));
+    uint32_t want = c.dynamic ? 3u : static_cast<uint32_t>(std::clamp(c.multiplier - 1, 1, 3));
     // numFramesToGenerateMax from the once-a-second slDLSSGGetState (0: not known yet).
     const uint32_t max = g_max_gen.load(std::memory_order_relaxed);
     return max > 0 ? std::min(want, max) : want;
@@ -546,24 +539,6 @@ uint32_t BeforePresent(uint32_t frame) {
     } else {
         NoteUntagged(false);
     }
-    {
-        // bb-fg-cap: game frames with DLSS-G on at most g_real_cap a second (real x N within the
-        // display's cap: no generated frame dropped), before the present's markers.
-        static RealLimiter limiter;
-        bool on = false;
-        {
-            std::scoped_lock lock{g_options_mutex};
-            on = g_options_set && g_options.on;
-        }
-        // bb-sl-nocap: our own limiter fought DLSS-G/Reflex pacing (real fps fell to cap / N,
-        // e.g. 14 instead of 55 at x4). DLSS-G paces its frames itself: opt-in only.
-        static const bool use_cap = [] {
-            const char* v = std::getenv("BB_FG_SL_CAP");
-            return v != nullptr && v[0] == '1';
-        }();
-        limiter.Wait(use_cap && on ? static_cast<double>(g_real_cap.load(std::memory_order_relaxed))
-                                   : 0.0);
-    }
     Marker(sl::PCLMarker::eRenderSubmitEnd, frame);
     Marker(sl::PCLMarker::ePresentStart, frame);
     return frame;
@@ -634,22 +609,6 @@ void AfterPresent(uint32_t frame, bool presented) {
     if (r == sl::Result::eOk) g_max_gen.store(s.numFramesToGenerateMax, std::memory_order_relaxed);
     const uint32_t sec_presents = g_sec_presents.exchange(0);
     {
-        // bb-fg-cap: dynamic multiplier / fixed real-fps cap from this second's game frames.
-        const double real = sec_presents / secs;
-        const uint32_t max = g_max_gen.load(std::memory_order_relaxed);
-        const int max_mult = max > 0 ? static_cast<int>(std::min(max, 3u)) + 1 : 4;
-        if (Cfg().dynamic) {
-            static DynamicFg dyn;
-            dyn.allow_hold = false;
-            if (secs < 2.0) dyn.Update("dlssg-sl", real, max_mult);
-            g_dyn_mult.store(dyn.cur, std::memory_order_relaxed);
-            g_real_cap.store(0, std::memory_order_relaxed); // bb-sl-nocap2: no hold with Streamline
-        } else {
-            g_real_cap.store(FixedRealCapFps(static_cast<int>(WantedFrames()) + 1, "dlssg-sl"),
-                             std::memory_order_relaxed);
-        }
-    }
-    {
         // bb-sl-metrics: the second's numbers for the panel / [bbport] (read-only for them).
         SecondStats st{};
         const uint32_t ppf = r == sl::Result::eOk ? s.numFramesActuallyPresented : 0;
@@ -673,6 +632,20 @@ void AfterPresent(uint32_t frame, bool presented) {
            sec_presents, g_sec_tagged.exchange(0), g_sec_off.exchange(0),
            g_sec_own_constants.exchange(0), g_sec_errors.exchange(0),
            g_options.on ? "on" : "off", g_options.frames + 1);
+    // bb-sl-pace: one line a second on who paces the frames. Streamline DLSS-G / Reflex pace the
+    // real and the generated frames themselves; we run no real-fps hold, no present limiter and no
+    // dynamic multiplier stepping here (32c126e79 stepped numFramesToGenerate x2 -> x3 -> x4 at
+    // run time and the game fell to 224 / N^2 fps: 56 at x2, 25 at x3, 14 at x4).
+    {
+        const uint32_t ppf = r == sl::Result::eOk ? s.numFramesActuallyPresented : 0;
+        const double real = sec_presents / secs;
+        BBLogf("[dlssg-sl-pace] real %.1f fps, presents %.1f/s (game frames x %u presented/frame), "
+               "multiplier x%u (options %s, fixed for the run%s), limiter: none (DLSS-G/Reflex "
+               "pace themselves)",
+               real, real * std::max(ppf, 1u), std::max(ppf, 1u),
+               g_options.on ? g_options.frames + 1 : 1u, g_options.on ? "on" : "off",
+               Cfg().dynamic ? ", dlss-dyn = the largest" : "");
+    }
 }
 
 bool Stats(SecondStats& out) {

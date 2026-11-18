@@ -197,8 +197,6 @@ private:
     std::atomic<u32> bb_frame_gen_limit{3};
     std::chrono::steady_clock::time_point bb_limit_window{};
     u32 bb_limit_frames = 0, bb_limit_up_seconds = 0;
-    // bb-fg-cap: real game frames held at this rate while DLSS-G generates (0: none).
-    std::atomic<int> bb_real_cap_fps{0};
     double bb_present_busy = 0.0;
     std::chrono::steady_clock::time_point bb_frame_gen_hold_until{};
     int bb_frame_gen_hold_seconds = 0;
