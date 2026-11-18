@@ -149,7 +149,7 @@ bool DlssGuides::EnsureTonemap() {
 void DlssGuides::DispatchTonemap(vk::CommandBuffer cmdbuf, vk::Pipeline pass, vk::ImageView src,
                                  vk::ImageView dst, u32 w, u32 h) {
     const std::array<vk::DescriptorImageInfo, 2> infos{{
-        {.imageView = src, .imageLayout = vk::ImageLayout::eGeneral},
+        {.imageView = src, .imageLayout = color_layout},
         {.imageView = dst, .imageLayout = vk::ImageLayout::eGeneral},
     }};
     std::array<vk::WriteDescriptorSet, 2> writes{};
@@ -219,8 +219,8 @@ bool DlssGuides::Linearize(vk::CommandBuffer cmdbuf, const Dlss::Resource& color
          .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
          .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
          .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-         .oldLayout = vk::ImageLayout::eGeneral,
-         .newLayout = vk::ImageLayout::eGeneral,
+         .oldLayout = color_layout,
+         .newLayout = color_layout,
          .image = color.image,
          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
     }};
@@ -436,7 +436,8 @@ bool DlssGuides::Record(vk::CommandBuffer cmdbuf, const RayTracing::RrSource& so
     std::array<vk::DescriptorImageInfo, 8> infos{};
     std::array<vk::WriteDescriptorSet, 8> writes{};
     for (u32 i = 0; i < infos.size(); ++i) {
-        infos[i] = {.imageView = bound[i], .imageLayout = vk::ImageLayout::eGeneral};
+        infos[i] = {.imageView = bound[i],
+                    .imageLayout = bound[i] == depth.view ? depth_layout : vk::ImageLayout::eGeneral};
         writes[i] = {.dstBinding = i,
                      .descriptorCount = 1,
                      .descriptorType = i < 5 ? vk::DescriptorType::eSampledImage

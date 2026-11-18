@@ -356,8 +356,11 @@ struct DirectParams {
     std::array<float, 4> far_fade;
     std::array<float, 4> ambient_cut;
     std::array<float, 4> ambient_spec_cut;
+    // bb-pathtracing-2: soft shadows (rt_direct.comp LightSourceRadius): share of the light's
+    // range, min and max radius (m).
+    std::array<float, 4> light_source;
 };
-static_assert(sizeof(DirectParams) == 304);
+static_assert(sizeof(DirectParams) == 320);
 
 struct FogParams {
     std::array<float, 4> proj;

@@ -15,6 +15,13 @@ int main() {
     assert(PtQualityFromString("bogus") == PtQuality::Low);
     assert(PtQualityFromString("medium") == PtQuality::Medium);
     assert(PtQualityFromString("high") == PtQuality::High);
+    assert(PtQualityFromString("ultra") == PtQuality::Ultra);
+    assert(std::strcmp(PtQualityName(PtQuality::Ultra), "ultra") == 0);
+    for (size_t i = 0; i < PtPresetTable.size(); ++i) {
+        for (size_t j = i + 1; j < PtPresetTable.size(); ++j) {
+            assert(std::strcmp(PtPresetTable[i].name, PtPresetTable[j].name) != 0);
+        }
+    }
     for (const auto& row : PtPresetTable) {
         for (const char* v : row.value) {
             assert(v && *v);

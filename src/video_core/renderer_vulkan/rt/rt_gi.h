@@ -285,8 +285,10 @@ constexpr bool RestirGiFromEnv(const char* value) {
     return !value || value[0] != '0';
 }
 
+// bb-pathtracing-2: "1" or "auto" (the preset default) want Ray Reconstruction; it then runs when
+// the upscaler is DLSS and nvngx_dlssd.dll loads (vk_rasterizer_pt.cpp PtRayReconstruction).
 constexpr int RayReconstructionFromEnv(const char* value) {
-    return value && value[0] == '1' ? 1 : 0;
+    return value && (value[0] == '1' || value[0] == 'a' || value[0] == 'A') ? 1 : 0;
 }
 
 constexpr uint32_t GiTmaxShift = 4;

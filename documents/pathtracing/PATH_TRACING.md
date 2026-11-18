@@ -12,12 +12,19 @@ notes are in `PATH_TRACING-upstream.md` next to this file (knob names there are 
 
 ## Status in this build
 
-**Geometry capture, camera and the rasterizer hooks are wired; not yet run in game.** With
-`BB_PATHTRACING=1` the engine starts, a geometry store is allocated, and opaque G-buffer draws
-feed the BVH every frame; GI is traced after the light composite, direct light at the light
-accumulation hook, shadows / sky / fog / exposure at the post trigger dispatch. Nothing was run on
-hardware from this tree (built and checked only: see "Verification"). With the switch off (the
-default) nothing of it runs: no object, no extension, no shader variant, no memory.
+**Runs in game** (run_pt1: RTX 5080, preset low, DLSS quality 1708x960 -> 2560x1440): geometry
+capture, BVH, GI, traced direct light and moon shadows work. bb-pathtracing-2 (this commit)
+answers that run's report:
+
+| problem (run_pt1) | cause found | change | state |
+|---|---|---|---|
+| noisy shadows | no denoiser on the direct light; RR not hosted | DLSS Ray Reconstruction hosted (`rt/pt_rr.cpp`); soft shadows give the temporal filters something to average | implemented, not run |
+| no reflections | preset low had `BB_PT_REFLECT=0` | low: reflections on for roughness <= 0.25 (wet floors, puddles on the game's water-floor shaders, metal, glass); `REFLECT_MAX_ROUGH` 0.25 / 0.4 / 0.5 / 0.6 per preset | implemented, not run |
+| lamp / fire / foliage shadows too hard and dark | every local light was a point: razor shadows, as dark at 5 m as at 5 cm; alpha-tested surfaces all cut at 0.5 | lights are small spheres (`BB_PT_LIGHT_SOURCE`, rt_direct.comp `LightSourceRadius`); the game's own alpha-test reference read from each pixel shader (literal or material constant, `FindAlphaRef`) | implemented, not run |
+| "alpha-tested surfaces 0" | that line was printed in the menu, before the first G-buffer pass; in game it counts 37 k-240 k alpha-tested surfaces | none (alpha capture works) | investigated |
+| store overflow (6.29 M of 6 M, 7782 draws dropped) | store too small for Central Yharnam | 8 / 10 / 12 / 14 M per preset; past 90 % of a frame's half, draws under 384 vertices are left out first (`BB_PT_STORE_RESERVE`) | implemented, not run |
+| `0.000 ms/frame` | the line printed in menus / loading (no traced frame); in game it was 4.8-6.3 ms; TLAS counted twice | per traced frame, with the per-pass split; "no traced frame" said | implemented, not run |
+| too expensive on low | direct 2.2 ms (4 shadow rays per pixel), GI 2.4 ms | low: 2 direct rays, shorter GI rays, smaller BVH budgets, nearer far cut-off (table below) | implemented, not measured |
 
 ### How the capture works here (ours, not the mod's)
 
@@ -62,12 +69,12 @@ default) nothing of it runs: no object, no extension, no shader variant, no memo
 Water / fog sheets, smoke / flame / glow particle capture (`BB_PT_FX_*`), alpha inheritance from
 depth-only prepasses (`BB_PT_ALPHA_INHERIT`: depth prepasses are not stored), indirect draws in
 the BVH, the liverpool light-set CB write hook (`OnLightSetWrite`; the light draw constants are
-captured), DLSS Ray Reconstruction (below), device-lost hook.
+captured), device-lost hook.
 
 ## How to enable
 
     BB_PATHTRACING=1                     # master switch, default off
-    BB_PATHTRACING_QUALITY=low           # low (default) | medium | high
+    BB_PATHTRACING_QUALITY=low           # low (default) | medium | high | ultra
     BB_PT_<knob>=<value>                 # any knob below or in PATH_TRACING-upstream.md
 
 Needs a GPU with `VK_KHR_acceleration_structure` + `VK_KHR_ray_query` + bufferDeviceAddress
@@ -80,12 +87,18 @@ Off costs no GPU time: the passes and, unlike upstream, the BVH build are skippe
 (`BB_PT_PAUSED_BUILD=1` restores upstream's "keep the BVH current while paused" for an instant
 switch back).
 
-**What the log should show** with `BB_PATHTRACING=1`: `[pt] geometry store: 6 M vertices a
-frame x 2 ...`, `[pt] path tracing engine on ...`, once in game `Ray tracing: G-buffer targets:
-0 ... 6 ...` and `Ray tracing: GI albedo target ...`, then every 5 s `[pt] geometry store, last
-5 s: ... draws stored ...` and the GPU line `[pt] preset low, on: path tracing GPU x.xxx
-ms/frame`. "draws over the store" > 0: raise `BB_PT_STORE_MVERTS`. "GI skipped (...)" lines name
-what is missing (scene colour, depth, camera, geometry).
+**What the log should show** with `BB_PATHTRACING=1`: `[pt] geometry store: 8 M vertices a
+frame x 2 ...` (the preset's size), `[pt] path tracing engine on ...`, `[pt] DLSS Ray
+Reconstruction: BB_PT_DLSS_RR=auto (wanted) ...`, `Ray tracing: reflections on ... roughness <=
+0.25` (low), once in game `Ray tracing: G-buffer targets: 0 ... 6 ...` and `Ray tracing: GI
+albedo target ...`, at the first upscaled traced frame `[pt] DLSS Ray Reconstruction on:
+1708x960 -> 2560x1440, linearised ...` (or `... off for this session: <why>`), then every 5 s
+`[pt] geometry store, last 5 s: ... draws stored ..., N draws over the store, M small draws left
+out ...`, `[pt] alpha-tested G-buffer draws, last 5 s: a with the shader's own reference literal,
+b with it read from the material constants, c at 0.50 ...` and the GPU line `[pt] preset low,
+on: path tracing GPU x.xxx ms/frame total over N traced frames (BVH build ..., GI ..., direct
+..., reflections ...)`. "draws over the store" > 0: raise `BB_PT_STORE_MVERTS`. "GI skipped
+(...)" lines name what is missing (scene colour, depth, camera, geometry).
 
 ## Knob names (clash with our older RT features)
 
@@ -98,34 +111,47 @@ Running both (`BB_PATHTRACING=1` with one of ours) works but traces twice; the l
 
 ## Quality presets (GPU cost)
 
-A preset only fills knobs you did not set (environment or the `BB_PT_CFG` live file win). All
-presets first set the mod launcher's look defaults: `BB_PT_DIRECT=1 BB_PT_GI=1 BB_PT_COMPACT=0
-BB_PT_FILL_LIGHT=off BB_PT_FILL_ENCLOSED=0.1 BB_PT_SKIN_ALPHA=1 BB_PT_FX_FOG=0 BB_PT_FX_FOG_G=0
-BB_PT_GI_LAST_BOUNCE_CACHE=1 BB_PT_GI_SER=1 BB_PT_GI_PIPELINE=1 BB_PT_RESTIR_GI=1 BB_PT_KEEP_GI=1`.
+`BB_PATHTRACING_QUALITY=low|medium|high|ultra` (default `low`; the launcher's selector writes this
+variable). A preset only fills knobs you did not set (environment or the `BB_PT_CFG` live file
+win). All presets first set the mod launcher's look defaults: `BB_PT_DIRECT=1 BB_PT_GI=1
+BB_PT_COMPACT=0 BB_PT_FILL_LIGHT=off BB_PT_FILL_ENCLOSED=0.1 BB_PT_SKIN_ALPHA=1 BB_PT_FX_FOG=0
+BB_PT_FX_FOG_G=0 BB_PT_GI_LAST_BOUNCE_CACHE=1 BB_PT_GI_SER=1 BB_PT_GI_PIPELINE=1
+BB_PT_RESTIR_GI=1 BB_PT_KEEP_GI=1`. The table is `PtPresetTable` in `rt/pt_config.h`.
 
-| knob | low | medium | high | what |
-|---|---|---|---|---|
-| `BB_PT_GI_SPARSE` | 4 | 2 | 1 | GI trace rate: 1 pixel of 2x2 / 2x1 / every pixel (ReSTIR + denoiser fill the rest) |
-| `BB_PT_SPP` | 1 | 1 | 1 | GI paths per traced pixel |
-| `BB_PT_BOUNCES` | 1 | 2 | 2 | GI bounces |
-| `BB_PT_BOUNCE_RAYS` | 1 | 1 | 1 | shadow rays per bounce hit |
-| `BB_PT_GI_TMAX` | 30 | 60 | 0 | GI ray length, metres (0 unlimited) |
-| `BB_PT_REFLECT` | 0 | 1 | 1 | traced reflections (water, puddles, glass) |
-| `BB_PT_RESTIR` | 0 | 0 | 1 | ReSTIR DI |
-| `BB_PT_DIRECT_RAYS` | 4 | 12 | 32 | shadow rays per pixel for the local lights |
-| `BB_PT_SHADOW_LIGHTS` | 2 | 3 | 4 | lights with traced shadows per pixel |
-| `BB_PT_AO` | 0 | 0 | 0 | traced AO (the game's AO is kept) |
-| `BB_PT_FAR_START` | 60 | 120 | 0 | beyond this distance (+10 m fade) no rays, stock lighting |
-| `BB_PT_KEEP_DIST` | 25 | 40 | 40 | off-screen instances kept in the BVH within (m) |
-| `BB_PT_MIN_TRIS` | 4 | 2 | 0 | opaque draws below this many triangles stay out of the BVH (new) |
-| `BB_PT_REFIT_BUDGET` | 262144 | 524288 | 0 | skinned BLAS refit triangles/frame (0 unlimited) |
-| `BB_PT_REBUILD_BUDGET` | 524288 | 1048576 | 1048576 | BLAS rebuild triangles/frame |
-| `BB_PT_MIST_STEPS` | 4 | 8 | 8 | water mist march steps |
-| `BB_PT_ADAPTIVE_MS` | 12 | 12 | 12 | frame budget: GI bounces drop while the frame is slower |
+| knob | low | medium | high | ultra | what |
+|---|---|---|---|---|---|
+| `BB_PT_GI_SPARSE` | 4 | 2 | 1 | 1 | GI trace rate: 1 pixel of 2x2 / 2x1 / every pixel (ReSTIR + denoiser fill the rest) |
+| `BB_PT_SPP` | 1 | 1 | 1 | 2 | GI paths per traced pixel |
+| `BB_PT_BOUNCES` | 1 | 2 | 2 | 3 | GI bounces |
+| `BB_PT_BOUNCE_RAYS` | 1 | 1 | 1 | 2 | shadow rays per bounce hit |
+| `BB_PT_GI_TMAX` | 25 | 60 | 0 | 0 | GI ray length, metres (0 unlimited) |
+| `BB_PT_GI_DENOISE` | 2 | 2 | 2 | 3 | built-in GI denoiser passes |
+| `BB_PT_REFLECT` | 1 | 1 | 1 | 1 | traced reflections (one GGX ray per glossy pixel) |
+| `BB_PT_REFLECT_MAX_ROUGH` | 0.25 | 0.4 | 0.5 | 0.6 | roughest surface that gets a reflection ray (G-buffer 1 gloss: roughness = 1 - gloss) |
+| `BB_PT_RESTIR` | 0 | 0 | 1 | 1 | ReSTIR DI |
+| `BB_PT_DIRECT_RAYS` | 2 | 8 | 32 | 48 | shadow rays per pixel for the local lights (strongest first) |
+| `BB_PT_SHADOW_LIGHTS` | 2 | 3 | 4 | 6 | lights of the separate shadow-mask pass (off unless `BB_PT_SHADOWS=1`) |
+| `BB_PT_LIGHT_SOURCE` | 0.02 | 0.02 | 0.02 | 0.02 | lamp / fire radius as a share of its range: soft shadows (0 = point) |
+| `BB_PT_AO` | 0 | 0 | 0 | 0 | traced AO (the game's AO is kept) |
+| `BB_PT_FAR_START` | 50 | 120 | 0 | 0 | beyond this distance (+10 m fade) no rays, stock lighting |
+| `BB_PT_KEEP_DIST` | 20 | 40 | 40 | 60 | off-screen instances kept in the BVH within (m) |
+| `BB_PT_MIN_TRIS` | 8 | 2 | 0 | 0 | opaque draws below this many triangles stay out of the BVH |
+| `BB_PT_REFIT_BUDGET` | 131072 | 524288 | 0 | 0 | skinned BLAS refit triangles/frame (0 unlimited) |
+| `BB_PT_REBUILD_BUDGET` | 393216 | 1048576 | 1048576 | 2097152 | BLAS rebuild triangles/frame |
+| `BB_PT_STORE_MVERTS` | 8 | 10 | 12 | 14 | geometry store, M vertices a frame (x2 halves, 28 B each: 448 / 560 / 672 / 784 MB) |
+| `BB_PT_MIST_STEPS` | 4 | 8 | 8 | 12 | water mist march steps |
+| `BB_PT_MOON_HALF` | 2 | 2 | 1 | 1 | moon rays: 2 = half the pixels + shared penumbra, 1 = every pixel |
+| `BB_PT_ADAPTIVE_MS` | 12 | 12 | 12 | 16 | frame budget: GI bounces drop while the frame is slower |
+| `BB_PT_DLSS_RR` | auto | auto | auto | auto | DLSS Ray Reconstruction (below) |
 
-"high" is the mod as its launcher shipped it. Ray tracing pipeline + SER (`BB_PT_GI_PIPELINE`,
-`BB_PT_GI_SER`) and opacity micromaps (`BB_PT_OMM`, default on where supported) stay on in every
-preset: they make the same rays cheaper.
+"high" is the mod as its launcher shipped it, plus reflections up to roughness 0.5. Ray tracing
+pipeline + SER (`BB_PT_GI_PIPELINE`, `BB_PT_GI_SER`) and opacity micromaps (`BB_PT_OMM`, default
+on where supported) stay on in every preset: they make the same rays cheaper.
+
+**Measured (run_pt1, RTX 5080, 1708x960 render, Central Yharnam, the old low preset):** path
+tracing GPU 4.8-6.3 ms/frame = BVH build 0.7 (TLAS 0.16) + GI 1.9-2.7 + direct 1.7-2.8; reflections
+0 (they were off in low). The new low halves the direct rays (4 -> 2) and trims GI ray length, BVH
+budgets and trace distance, and turns on mirror-like reflections (wet floors, puddles, metal). Not measured yet: the next `[pt]` line gives the new numbers per pass.
 
 **BVH reuse (already in the mod, kept):** BLAS are cached per draw identity across frames
 (`rt_blas_cache.h`): static geometry is built once and only rebuilt when its vertices change;
@@ -150,23 +176,50 @@ on area loads). Treat these as ordering only; the log gives the real numbers.
 
 **Measuring:** every 5 s (or every `BB_PT_GPU_LINE_FRAMES` frames if set) the log prints
 
-    [pt] preset low, on: path tracing GPU 3.412 ms/frame total (0 frames paused since the last line)
-    Ray tracing GPU ms/frame: build 0.41, GI 1.20, direct 0.95, ReSTIR 0.00, reflect 0.00, shadows ..., TLAS ...
+    [pt] preset low, on: path tracing GPU 3.412 ms/frame total over 300 traced frames (BVH build 0.41 incl. TLAS 0.12, GI 1.20, direct 0.95, ReSTIR DI 0.00, reflections 0.40, shadow mask 0.00, AO 0.00, fog 0.00; ...)
+    Ray tracing GPU ms/frame: build 0.41, GI 1.20, direct 0.95, ...
 
-from GPU timestamp queries around each pass (`BB_PT_GPU_TIME=0` turns the queries off).
-The mod's lines go to our log (they went to stdout upstream).
+from GPU timestamp queries around each pass (`BB_PT_GPU_TIME=0` turns the queries off). The total
+is per traced frame (all passes summed over the frames that ran any, the TLAS counted once inside
+the build). Without a traced frame (menus, loading, F9) the line says "no traced frame since the
+last line" instead of the old `0.000 ms/frame`. Not in it: the G-buffer vertex stores (the
+geometry capture's vertex shader writes, part of the game's own G-buffer pass) and DLSS RR (the
+`[perf]` line's `sr` ms is the upscaler pass, RR included). The whole-frame cost is the `[perf]`
+line's `gpu` with path tracing on vs. paused (F9).
 
 ## Denoiser / DLSS Ray Reconstruction
 
-Not hosted yet: `BB_PT_DLSS_RR=1` is ignored with a log line, and the mod's own GI denoiser
-(temporal + `BB_PT_GI_DENOISE` à-trous passes, default 2) is used. The RR guide generation
-(`rt/vk_dlss_rr.cpp`, `dlss_rr_guides.comp`, `dlss_rr_tonemap.comp`) is ported and compiles; what is
-missing is the DLSS-D evaluate: SuperMedo's NGX bridge got `CreateRrFeature/EvaluateRr`
-(`NVSDK_NGX_Feature_RayReconstruction`, `nvngx_dlssd.dll`), our DLSS SR goes through Streamline
-(`bb_sr_dlss.cpp`), which would need the `sl.dlss_d` plugin and `slDLSSDSetOptions` /
-`slEvaluateFeature(kFeatureDLSS_RR)` with the guides tagged (diffuse/specular albedo,
-normal-roughness, specular hit distance, world-to-view / view-to-clip matrices), replacing SR for
-frames where path tracing ran. `nvngx_dlssd.dll` stays user-supplied.
+**DLSS Ray Reconstruction (`rt/pt_rr.cpp`, bb-pathtracing-2).** With `BB_UPSCALER=dlss` and
+NVIDIA's `nvngx_dlssd.dll` beside `shadPS4.exe` (or in its `streamline` folder, or
+`BB_PT_DLSS_RR_DIR`), path traced frames go through DLSS-D instead of DLSS SR: RR denoises the
+noisy traced light and upscales in one network. `BB_PT_DLSS_RR=auto` (every preset) or `1`: on
+when possible; `0`: off. It is fed what the mod's RR path fed SuperMedo's bridge:
+
+- colour: the game's tonemapped image, inverse-tonemapped to linear HDR first (the mod's
+  `dlss_rr_tonemap.comp` linearize; `IsHDR` + auto exposure) and tonemapped back after
+  (`BB_PT_DLSS_RR_HDR=0` gives RR the LDR image as is);
+- guides (`vk_dlss_rr.cpp`, `dlss_rr_guides.comp`): diffuse albedo (G-buffer albedo), specular
+  albedo (G-buffer 3 specular colour), normals + roughness packed (`Roughness.Mode` packed,
+  roughness = 1 - G-buffer 1 gloss), the reflections' specular hit distance when the
+  reflection pass ran this frame;
+- depth (hardware, inverted as the game's), motion vectors (render pixels, `MVLowRes`), jitter
+  (ours, `BB_DLSS_JITTER_SIGN` applies), world-to-view and view-to-clip matrices from the scene
+  block camera;
+- quality from the DLSS mode (DLAA / Quality / Balanced / Performance / Ultra Performance);
+  `BB_PT_DLSS_RR_PRESET=D|E` picks the model (default: the runtime's).
+
+The runtime is loaded directly, as `bb_dlss5.cpp` loads `nvngx_dlssnr.dll`: `nvngx_dlssd.dll`
+(310.x) exports `NVSDK_NGX_VULKAN_Init_Ext / CreateFeature / EvaluateFeature / ReleaseFeature`
+(checked on the 310.x DLL of our streamline folder), its caller check is answered the same way,
+and its signature must be NVIDIA's (`BB_PT_DLSS_RR_UNOFFICIAL=1` skips that). Anything missing
+(DLL, init, feature creation, an evaluate error) turns RR off for the session with one
+`[pt] DLSS Ray Reconstruction off for this session: <why>` line and DLSS SR runs as before. With
+Streamline DLSS-G on (`BB_FG=dlss-sl*`), RR stays off unless `BB_PT_DLSS_RR=1`: DLSS-G takes its
+camera constants from the SR evaluate. F9 (paused) frames and frames without a G-buffer go
+through SR; a switch resets RR's history.
+
+The mod's own GI denoiser (temporal + `BB_PT_GI_DENOISE` à-trous passes) keeps running in both
+cases; it is the fallback when RR is not available (other GPUs, other upscalers).
 
 ## What was ported
 
@@ -225,6 +278,29 @@ frames where path tracing ran. `nvngx_dlssd.dll` stays user-supplied.
    our device-lost path does not call it yet), GPU checkpoints (not enabled).
 
 ## Verification done
+
+bb-pathtracing-2 commit (RR, presets, soft shadows, alpha reference, store, timing):
+
+- glslang 15 (`--target-env vulkan1.3`): `rt_direct.comp` (3 variants: direct, ReSTIR temporal,
+  ReSTIR spatial) and `dlss_rr_guides.comp` compile.
+- `clang++ -std=c++23 -fsyntax-only` clean with `-DENABLE_PATHTRACING`: pt_rr.cpp,
+  vk_dlss_rr.cpp, vk_ray_tracing.cpp, vk_rasterizer_pt.cpp, pt_capture.cpp, vk_rasterizer.cpp,
+  bb_present_sr.cpp, vk_pipeline_serialization.cpp, vk_pipeline_cache.cpp,
+  shader_info_collection_pass.cpp; and without it: vk_rasterizer.cpp, bb_present_sr.cpp,
+  vk_pipeline_serialization.cpp, vk_pipeline_cache.cpp, shader_info_collection_pass.cpp.
+  pt_rr.cpp's Windows half against a Windows-target clang (`x86_64-pc-windows-msvc`) with our stub
+  headers: only the stubs' missing PE / loader declarations fail, exactly as for bb_dlss5.cpp.
+- `tests/pathtracing`: test_pt_config (ultra, unique rows), test_rt_restir_gi,
+  test_rt_direct, test_rt_live pass.
+- `nvngx_dlssd.dll` 310.x (our streamline folder) exports checked with a PE reader:
+  `NVSDK_NGX_VULKAN_Init_Ext`, `CreateFeature`, `EvaluateFeature`, `ReleaseFeature` present, the
+  same set as `nvngx_dlssnr.dll`. The NGX parameter names are the DLSS SDK 310.9 headers'
+  (`nvsdk_ngx_helpers_dlssd_vk.h`, `nvsdk_ngx_defs*.h`).
+- Ghidra (eboot 1.09, `FUN_026deeb0`, the light-set builder): each set colour is `rgb^2 x w`
+  (squares of the four floats at +0x50, +0x60, +0xb0, +0xc0, +0x1e0, +0x1f0 times their w), as the
+  mod's notes say; the point-light record the light shaders read (`[3]` = 1 / radius^2) is the
+  mod's reading of the DPointLight shader and is what `LegacyAtten` uses.
+- Not run in game, not built on Windows.
 
 Capture / hooks commit: every changed or new C++ file `clang++ -std=c++23 -fsyntax-only` clean
 with and without `-DENABLE_PATHTRACING` (vk_rasterizer.cpp, vk_rasterizer_pt.cpp, pt_capture.cpp,

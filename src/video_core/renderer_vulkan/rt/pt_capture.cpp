@@ -19,9 +19,16 @@
 namespace Vulkan {
 
 namespace {
-// Per half (one frame's G-buffer draws). Bloodborne's busiest areas reference ~2-3 M G-buffer
-// vertices a frame; the mod used 8 M. BB_PT_STORE_MVERTS overrides (millions, 1-16).
-constexpr u32 DefaultPerHalf = 6u << 20;
+// Per half (one frame's G-buffer draws). bb-pathtracing-2: run_pt1 (RTX 5080, Central Yharnam,
+// preset low) peaked at 6.29 M with 6 M a half and dropped up to 47 k draws per 5 s, so the
+// default is 8 M and the presets set 8 / 10 / 12 / 14 (pt_config.h); BB_PT_STORE_MVERTS
+// overrides (millions, 1-24).
+constexpr u32 DefaultPerHalf = 8u << 20;
+// Past this share of a half, small draws (fewer than SmallDrawVertices store slots: debris,
+// small props, decals' carriers) are left out first, so the large occluders drawn later in the
+// frame (walls, buildings, terrain) still fit (BB_PT_STORE_RESERVE, percent, 100 = off).
+constexpr u32 DefaultReservePercent = 90;
+constexpr u64 SmallDrawVertices = 384;
 // Bytes per slot: position 16 + UV 4 + normals 8.
 constexpr u64 SlotBytes = 28;
 
@@ -50,10 +57,18 @@ PtStore::PtStore(const Instance& instance_) : instance{instance_} {
     per_half = DefaultPerHalf;
     if (const char* env = std::getenv("BB_PT_STORE_MVERTS")) {
         const long m = std::strtol(env, nullptr, 10);
-        if (m >= 1 && m <= 16) {
+        if (m >= 1 && m <= 24) {
             per_half = u32(m) << 20;
         }
     }
+    u32 reserve_percent = DefaultReservePercent;
+    if (const char* env = std::getenv("BB_PT_STORE_RESERVE")) {
+        const long r = std::strtol(env, nullptr, 10);
+        if (r >= 50 && r <= 100) {
+            reserve_percent = u32(r);
+        }
+    }
+    reserve_at = u32(u64(per_half) * reserve_percent / 100);
     capacity = 1 + 2 * per_half;
     const VkBufferCreateInfo ci = vk::BufferCreateInfo{
         .size = u64(capacity) * SlotBytes,
@@ -84,8 +99,11 @@ PtStore::PtStore(const Instance& instance_) : instance{instance_} {
     PtCapture::normals_address = address + u64(capacity) * 20;
     cursor = 0;
     LOG_INFO(Render_Vulkan,
-             "[pt] geometry store: {} M vertices a frame x 2 (BB_PT_STORE_MVERTS), {} MB VRAM",
-             per_half >> 20, (u64(capacity) * SlotBytes) >> 20);
+             "[pt] geometry store: {} M vertices a frame x 2 (BB_PT_STORE_MVERTS), {} MB VRAM; "
+             "past {}% of a frame's half draws under {} vertices are left out first "
+             "(BB_PT_STORE_RESERVE)",
+             per_half >> 20, (u64(capacity) * SlotBytes) >> 20,
+             u64(reserve_at) * 100 / std::max<u32>(per_half, 1), SmallDrawVertices);
 }
 
 PtStore::~PtStore() {
@@ -112,6 +130,10 @@ u32 PtStore::Allocate(u64 vertices) {
     }
     if (vertices > per_half - cursor) {
         ++stats.full;
+        return 0;
+    }
+    if (cursor >= reserve_at && vertices < SmallDrawVertices) {
+        ++stats.reserved;
         return 0;
     }
     const u32 base = 1 + half * per_half + cursor;

@@ -34,6 +34,7 @@ class Runtime;
 #ifdef ENABLE_PATHTRACING
 class RayTracing; // path tracing mod (rt/vk_ray_tracing.h)
 class PtStore;    // its geometry store (rt/pt_capture.h)
+class PtRayReconstruction; // DLSS Ray Reconstruction for its frames (rt/pt_rr.h)
 #endif
 
 class Rasterizer {
@@ -242,6 +243,7 @@ private:
     // the switch is on (then every hook below is a null test). vk_rasterizer_pt.cpp.
     std::unique_ptr<PtStore> pt_store; // declared before the engine: freed after it
     std::unique_ptr<RayTracing> ray_tracing;
+    std::unique_ptr<PtRayReconstruction> pt_rr; // declared after the engine: freed before it
     // Per draw (PtPrepare): what the draw is to the tracer.
     bool pt_gbuffer = false;       // opaque G-buffer draw (BVH input, scene depth)
     bool pt_light_draw = false;    // light accumulation draw (VS LightAccVertexShader)
@@ -260,6 +262,7 @@ private:
     };
     PtView pt_albedo{}, pt_normal{}, pt_alpha{}, pt_sky{};
     u32 pt_alpha_channel = 3;
+    float pt_alpha_ref_cb = -1.0f; // this draw's alpha-test reference read from its PS constants
     bool pt_draw_added = false;
     void PtInit();
     bool PtPrepare(const GraphicsPipeline* pipeline); // false: skip the draw (SkipPs)

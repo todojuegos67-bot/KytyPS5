@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <xxhash.h>
 
@@ -33,6 +35,7 @@
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_cut.h"
 #include "video_core/renderer_vulkan/rt/pt_capture.h"
+#include "video_core/renderer_vulkan/rt/pt_rr.h"
 #include "video_core/renderer_vulkan/rt/vk_ray_tracing.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -91,6 +94,21 @@ RayTracing::SceneInputs Inputs(VideoCore::ImageId depth) {
 u64 Low32(u64 hash) {
     return hash & 0xFFFFFFFFull;
 }
+
+// The alpha-test reference for shaders whose own one was not found (the mod's 0.5);
+// BB_PT_ALPHA_REF overrides it (0.05-0.95).
+float DefaultAlphaRef() {
+    static const float value = [] {
+        const char* v = std::getenv("BB_PT_ALPHA_REF");
+        const float f = v && *v ? float(std::atof(v)) : 0.5f;
+        return f >= 0.05f && f <= 0.95f ? f : 0.5f;
+    }();
+    return value;
+}
+
+struct AlphaRefStats {
+    u64 literal{}, constant{}, unknown{};
+} pt_alpha_ref_stats;
 } // namespace
 
 void Rasterizer::PtInit() {
@@ -111,6 +129,11 @@ void Rasterizer::PtInit() {
         ray_tracing.reset();
         pt_store.reset();
         PtCapture::active = false;
+    }
+    if (ray_tracing && PtCapture::active) {
+        // DLSS Ray Reconstruction for the traced frames (the upscaler pass asks it first).
+        pt_rr = std::make_unique<PtRayReconstruction>(instance, scheduler, runtime, texture_cache,
+                                                      *ray_tracing);
     }
     LOG_INFO(Render_Vulkan, "[pt] path tracing engine {}",
              PtCapture::active ? "on: G-buffer draws store their geometry, F9 toggles"
@@ -134,11 +157,19 @@ void Rasterizer::PtFrameStart() {
         LOG_INFO(Render_Vulkan,
                  "[pt] geometry store, last 5 s: {} frames, {} draws stored ({:.0f} a frame), "
                  "{:.2f} M vertices a frame, peak {:.2f} M of {} M a frame, {} draws over the "
-                 "store, index scans {} (cached {}, changed {}){}",
+                 "store, {} small draws left out near the top (BB_PT_STORE_RESERVE), index "
+                 "scans {} (cached {}, changed {}){}",
                  frames, s.draws, double(s.draws) / std::max<u64>(frames, 1),
                  double(s.vertices) / std::max<u64>(frames, 1) / 1e6, s.peak / 1e6,
-                 (pt_store->Capacity() / 2) >> 20, s.full, s.scans, s.hits, s.stale,
+                 (pt_store->Capacity() / 2) >> 20, s.full, s.reserved, s.scans, s.hits, s.stale,
                  RayTracing::Paused() ? " (paused with F9)" : "");
+        auto& a = pt_alpha_ref_stats;
+        LOG_INFO(Render_Vulkan,
+                 "[pt] alpha-tested G-buffer draws, last 5 s: {} with the shader's own reference "
+                 "literal, {} with it read from the material constants, {} at {:.2f} "
+                 "(BB_PT_ALPHA_REF; reference not found in the shader)",
+                 a.literal, a.constant, a.unknown, DefaultAlphaRef());
+        a = {};
         pt_store->stats = {};
         frames = 0;
         last = now;
@@ -150,6 +181,7 @@ bool Rasterizer::PtPrepare(const GraphicsPipeline* pipeline) {
     pt_composite_draw = pt_composite_ps = pt_capture_tex = pt_draw_added = false;
     pt_albedo = pt_normal = pt_alpha = pt_sky = {};
     pt_alpha_channel = 3;
+    pt_alpha_ref_cb = -1.0f;
     if (!ray_tracing) {
         return true;
     }
@@ -343,6 +375,7 @@ void Rasterizer::PtStoreDraw(const GraphicsPipeline* pipeline, bool is_indexed, 
     // Surface: UV (and normals) from the pixel shader's albedo / alpha-test inputs.
     u32 uv_select = 0;
     bool alpha_test = false;
+    float alpha_ref = DefaultAlphaRef();
     Rt::DrawTag tag{};
     tag.vs = vs.pgm_hash;
     tag.mrt_mask = u32(pipeline->GetGraphicsKey().mrt_mask);
@@ -365,6 +398,20 @@ void Rasterizer::PtStoreDraw(const GraphicsPipeline* pipeline, bool is_indexed, 
         tag.ps = ps.pgm_hash;
         alpha_test = ps.has_discard;
         tag.caster = u32(alpha_test ? Rt::CasterAlpha::Own : Rt::CasterAlpha::None);
+        // bb-pathtracing-2: the game's own alpha-test reference (FindAlphaRef): a literal in the
+        // shader, or the material constant read in PtBufferBound for this draw.
+        if (alpha_test && ps.rt_info_known) {
+            if (ps.rt_alpha_ref > 0.0f && ps.rt_alpha_ref < 1.0f) {
+                alpha_ref = ps.rt_alpha_ref;
+                ++pt_alpha_ref_stats.literal;
+            } else if (ps.rt_alpha_ref_buffer >= 0 && pt_alpha_ref_cb > 0.0f &&
+                       pt_alpha_ref_cb < 1.0f) {
+                alpha_ref = pt_alpha_ref_cb;
+                ++pt_alpha_ref_stats.constant;
+            } else {
+                ++pt_alpha_ref_stats.unknown;
+            }
+        }
         if (ps.rt_info_known) {
             const bool alpha_uv = alpha_test && Rt::AlphaSourceWanted() &&
                                   ps.rt_alpha_input >= 0 && ps.rt_alpha_input < 32 &&
@@ -419,6 +466,7 @@ void Rasterizer::PtStoreDraw(const GraphicsPipeline* pipeline, bool is_indexed, 
         .uv_captured = uv_select != 0,
         .normal_captured = Rt::NormalSelectValid(uv_select),
         .depth_only = false,
+        .alpha_ref = alpha_ref,
         .blended = false,
         .tag = tag,
     });
@@ -513,6 +561,13 @@ void Rasterizer::PtBufferBound(const Shader::Info& stage, u32 index, bool format
         return;
     }
     const auto* data = reinterpret_cast<const void*>(address);
+    if (fragment && pt_capture_tex && s32(index) == stage.rt_alpha_ref_buffer &&
+        u64(stage.rt_alpha_ref_dword) * 4 + 4 <= size) {
+        float ref;
+        std::memcpy(&ref, static_cast<const u8*>(data) + u64(stage.rt_alpha_ref_dword) * 4,
+                    sizeof(ref));
+        pt_alpha_ref_cb = std::isfinite(ref) ? ref : -1.0f;
+    }
     if (pt_light_draw && fragment) {
         rt.OnLightBuffer(size, data);
         rt.OnLightSetBuffer(address, size);

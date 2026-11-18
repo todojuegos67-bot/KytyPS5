@@ -43,6 +43,12 @@ public:
                 Dlss::RrGuides& out);
     bool Linearize(vk::CommandBuffer cmdbuf, const Dlss::Resource& color, Dlss::Resource& out);
     void Tonemap(vk::CommandBuffer cmdbuf, const Dlss::Resource& output);
+    // bb-pathtracing-2: the layouts our upscaler pass keeps its colour and depth inputs in
+    // (bb_present_sr.cpp: shader read only / depth-stencil read only); the mod had GENERAL.
+    void SetInputLayouts(vk::ImageLayout color, vk::ImageLayout depth) {
+        color_layout = color;
+        depth_layout = depth;
+    }
 
 private:
     struct Params {
@@ -67,6 +73,8 @@ private:
     VideoCore::TextureCache& texture_cache;
     SceneTargets& scene_targets;
     u32 width = 0, height = 0;
+    vk::ImageLayout color_layout = vk::ImageLayout::eGeneral;
+    vk::ImageLayout depth_layout = vk::ImageLayout::eGeneral;
     bool pipeline_failed = false;
     bool printed = false;
     u32 hit_logged = 0;

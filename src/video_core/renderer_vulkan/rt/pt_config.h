@@ -5,7 +5,7 @@
 // Joao Vitor Alves (GPL-2.0, https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing).
 //
 //   BB_PATHTRACING=1                      master switch (default off: nothing below runs).
-//   BB_PATHTRACING_QUALITY=low|medium|high  cost preset (default low).
+//   BB_PATHTRACING_QUALITY=low|medium|high|ultra  cost preset (default low).
 //
 // A preset only fills BB_PT_* knobs the user has NOT set, so any BB_PT_* in the environment (or
 // in the BB_PT_CFG live file, which the engine reads before the environment) still wins. The
@@ -23,7 +23,7 @@
 
 namespace Vulkan::Rt {
 
-enum class PtQuality : unsigned { Low = 0, Medium = 1, High = 2 };
+enum class PtQuality : unsigned { Low = 0, Medium = 1, High = 2, Ultra = 3 };
 
 struct PtKnob {
     const char* name;
@@ -35,6 +35,9 @@ inline PtQuality PtQualityFromString(const char* value) {
         return PtQuality::Low;
     }
     const std::string_view v{value};
+    if (v == "ultra" || v == "3") {
+        return PtQuality::Ultra;
+    }
     if (v == "high" || v == "2") {
         return PtQuality::High;
     }
@@ -45,7 +48,10 @@ inline PtQuality PtQualityFromString(const char* value) {
 }
 
 inline const char* PtQualityName(PtQuality q) {
-    return q == PtQuality::High ? "high" : q == PtQuality::Medium ? "medium" : "low";
+    return q == PtQuality::Ultra    ? "ultra"
+           : q == PtQuality::High   ? "high"
+           : q == PtQuality::Medium ? "medium"
+                                    : "low";
 }
 
 // Look-defining defaults of the mod's launcher (identical for every preset).
@@ -65,35 +71,44 @@ inline constexpr std::array<PtKnob, 13> PtBaseKnobs{{
     {"BB_PT_KEEP_GI", "1"},
 }};
 
-// Cost knobs per preset. Columns: low, medium, high. "high" is the mod as its launcher shipped
-// it (the engine defaults), "low" is the cheapest setting that keeps traced moon/lamp light and
-// one bounce.
+// Cost knobs per preset. Columns: low, medium, high, ultra. "high" is the mod as its launcher
+// shipped it (the engine defaults) plus reflections' wider roughness range; "low" is the cheapest
+// setting that keeps traced moon/lamp light, one GI bounce and mirror-like reflections (wet
+// floors, puddles, metal); "ultra" spends more rays per pixel for less noise.
+// bb-pathtracing-2: low was ~5-6 ms GPU on an RTX 5080 at 1708x960 (run_pt1: build 0.7, GI 2.4,
+// direct 2.2); its direct rays, BVH budgets and trace distances are trimmed below.
 struct PtPresetRow {
     const char* name;
-    std::array<const char*, 3> value; // low, medium, high
+    std::array<const char*, 4> value; // low, medium, high, ultra
     const char* what;
 };
 
-inline constexpr std::array<PtPresetRow, 17> PtPresetTable{{
+inline constexpr std::array<PtPresetRow, 23> PtPresetTable{{
     // Trace resolution: ReSTIR GI traces 1 of N pixels per frame (4 = 2x2 block, quarter rate;
     // 2 = 2x1, half; 1 = every pixel). The reservoirs and the denoiser fill the rest.
-    {"BB_PT_GI_SPARSE", {"4", "2", "1"}, "GI trace rate: 1 pixel of 4 / 2 / 1"},
-    {"BB_PT_SPP", {"1", "1", "1"}, "GI paths per traced pixel"},
-    {"BB_PT_BOUNCES", {"1", "2", "2"}, "GI bounces"},
-    {"BB_PT_BOUNCE_RAYS", {"1", "1", "1"}, "shadow rays per bounce hit"},
-    {"BB_PT_GI_TMAX", {"30", "60", "0"}, "GI ray max distance in metres (0 = unlimited)"},
-    {"BB_PT_REFLECT", {"0", "1", "1"}, "traced reflections (water, puddles, glass)"},
-    {"BB_PT_RESTIR", {"0", "0", "1"}, "ReSTIR DI for direct light"},
-    {"BB_PT_DIRECT_RAYS", {"4", "12", "32"}, "shadow rays per pixel for the light list"},
-    {"BB_PT_SHADOW_LIGHTS", {"2", "3", "4"}, "local lights with traced shadows per pixel"},
-    {"BB_PT_AO", {"0", "0", "0"}, "traced AO pass (the game's AO is kept)"},
-    {"BB_PT_FAR_START", {"60", "120", "0"}, "beyond this many metres (+10 m fade) no rays: stock"},
-    {"BB_PT_KEEP_DIST", {"25", "40", "40"}, "off-screen instances kept in the BVH within (m)"},
-    {"BB_PT_MIN_TRIS", {"4", "2", "0"}, "opaque draws under this many triangles stay out of the BVH"},
-    {"BB_PT_REFIT_BUDGET", {"262144", "524288", "0"}, "skinned BLAS refit triangles per frame (0 = unlimited)"},
-    {"BB_PT_REBUILD_BUDGET", {"524288", "1048576", "1048576"}, "BLAS rebuild triangles per frame"},
-    {"BB_PT_MIST_STEPS", {"4", "8", "8"}, "water mist ray-march steps"},
-    {"BB_PT_ADAPTIVE_MS", {"12", "12", "12"}, "frame-time budget: GI bounces drop above it"},
+    {"BB_PT_GI_SPARSE", {"4", "2", "1", "1"}, "GI trace rate: 1 pixel of 4 / 2 / 1"},
+    {"BB_PT_SPP", {"1", "1", "1", "2"}, "GI paths per traced pixel"},
+    {"BB_PT_BOUNCES", {"1", "2", "2", "3"}, "GI bounces"},
+    {"BB_PT_BOUNCE_RAYS", {"1", "1", "1", "2"}, "shadow rays per bounce hit"},
+    {"BB_PT_GI_TMAX", {"25", "60", "0", "0"}, "GI ray max distance in metres (0 = unlimited)"},
+    {"BB_PT_GI_DENOISE", {"2", "2", "2", "3"}, "GI denoiser passes (built-in spatial filter)"},
+    {"BB_PT_REFLECT", {"1", "1", "1", "1"}, "traced reflections (puddles, metal, glass, water)"},
+    {"BB_PT_REFLECT_MAX_ROUGH", {"0.25", "0.4", "0.5", "0.6"}, "roughest surface that gets a reflection ray"},
+    {"BB_PT_RESTIR", {"0", "0", "1", "1"}, "ReSTIR DI for direct light"},
+    {"BB_PT_DIRECT_RAYS", {"2", "8", "32", "48"}, "shadow rays per pixel for the local lights (strongest first)"},
+    {"BB_PT_SHADOW_LIGHTS", {"2", "3", "4", "6"}, "local lights with traced shadows (shadow-mask pass)"},
+    {"BB_PT_LIGHT_SOURCE", {"0.02", "0.02", "0.02", "0.02"}, "lamp / fire source radius as a share of the light's range (soft shadows)"},
+    {"BB_PT_AO", {"0", "0", "0", "0"}, "traced AO pass (the game's AO is kept)"},
+    {"BB_PT_FAR_START", {"50", "120", "0", "0"}, "beyond this many metres (+10 m fade) no rays: stock"},
+    {"BB_PT_KEEP_DIST", {"20", "40", "40", "60"}, "off-screen instances kept in the BVH within (m)"},
+    {"BB_PT_MIN_TRIS", {"8", "2", "0", "0"}, "opaque draws under this many triangles stay out of the BVH"},
+    {"BB_PT_REFIT_BUDGET", {"131072", "524288", "0", "0"}, "skinned BLAS refit triangles per frame (0 = unlimited)"},
+    {"BB_PT_REBUILD_BUDGET", {"393216", "1048576", "1048576", "2097152"}, "BLAS rebuild triangles per frame"},
+    {"BB_PT_STORE_MVERTS", {"8", "10", "12", "14"}, "geometry store, M vertices a frame (x2, 28 B each)"},
+    {"BB_PT_MIST_STEPS", {"4", "8", "8", "12"}, "water mist ray-march steps"},
+    {"BB_PT_MOON_HALF", {"2", "2", "1", "1"}, "moon rays: 2 = half the pixels + shared penumbra, 1 = all"},
+    {"BB_PT_ADAPTIVE_MS", {"12", "12", "12", "16"}, "frame-time budget: GI bounces drop above it"},
+    {"BB_PT_DLSS_RR", {"auto", "auto", "auto", "auto"}, "DLSS Ray Reconstruction (auto: on with DLSS and nvngx_dlssd.dll)"},
 }};
 
 namespace detail {

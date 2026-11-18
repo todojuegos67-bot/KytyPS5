@@ -69,6 +69,9 @@ layout(binding = 6, std140) uniform Params {
     vec4 far_fade;
     vec4 ambient_cut;
     vec4 ambient_spec_cut;
+    // bb-pathtracing-2: lamp / fire source size for soft shadows (LightSourceRadius):
+    // x share of the light's range, y min radius (m), z max radius (m), w unused.
+    vec4 light_source;
 };
 
 layout(binding = 7, std430) readonly buffer Lights {
@@ -746,14 +749,54 @@ bool LightUnshadowed(uint index) {
     return (uint(lights[index].wrap_r_flag.w + 0.5) & 2u) != 0u;
 }
 
+// bb-pathtracing-2: soft shadows. The game's lamps, candles and fires are point lights; a shadow
+// ray aimed at the exact centre gave every leaf, bar and railing a razor-edged shadow as dark at
+// 5 m as at 5 cm, which read as exaggerated next to the game's soft lighting. A light is now a
+// small sphere: each pixel aims at a point of the disc facing it (a new point every frame, so
+// DLSS / the temporal filters average the penumbra). Its radius is BB_PT_LIGHT_SOURCE x the
+// light's range (clamped to BB_PT_LIGHT_SOURCE_MIN..MAX m); a converted emitter (flag 4) uses half
+// of its flame size. 0 = the old point shadows.
+uint g_light_seed = 0u;
+uint Pcg(inout uint state);
+float Rand(inout uint state);
+
+float LightSourceRadius(DirectLight l) {
+    if (!(light_source.x > 0.0)) {
+        return 0.0;
+    }
+    const uint flags = uint(l.wrap_r_flag.w + 0.5);
+    const float r = (flags & 4u) != 0u ? 0.5 * sqrt(max(l.wrap_r_flag.z, 0.0))
+                                       : light_source.x * inversesqrt(max(l.pos_inv_r2.w, 1e-12));
+    return clamp(r, light_source.y, light_source.z);
+}
+
 float LightVisibility(uint index, Surface s) {
     if (LightUnshadowed(index)) {
         return 1.0;
     }
-    const vec3 ray = lights[index].pos_inv_r2.xyz - s.origin;
-    const float ray_len = length(ray);
+    vec3 target = lights[index].pos_inv_r2.xyz;
+    vec3 ray = target - s.origin;
+    float ray_len = length(ray);
     if (ray_len <= 1e-3) {
         return 1.0;
+    }
+    // Spot axial lights keep wrap_r_flag.z for their axis: only point / falloff lights get a disc.
+    const float radius = lights[index].spec_kind.w > 1.5 ? 0.0
+                                                        : min(LightSourceRadius(lights[index]), 0.25 * ray_len);
+    if (radius > 0.0) {
+        const vec3 axis = ray / ray_len;
+        const vec3 helper = abs(axis.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+        const vec3 t = normalize(cross(helper, axis));
+        const vec3 b = cross(axis, t);
+        const float u1 = Rand(g_light_seed), u2 = Rand(g_light_seed);
+        const float rr = radius * sqrt(u1);
+        const float phi = 6.2831853 * u2;
+        target += (t * cos(phi) + b * sin(phi)) * rr;
+        ray = target - s.origin;
+        ray_len = length(ray);
+        if (ray_len <= 1e-3) {
+            return 1.0;
+        }
     }
     return Visibility(s.origin, ray / ray_len, ray_len);
 }
@@ -1215,6 +1258,8 @@ void WriteTileDebug(ivec2 pixel, uint tile_lights) {
 }
 
 Surface MakeSurface(ivec2 pixel, vec3 p, out vec4 g3) {
+    g_light_seed = uint(pixel.x) * 7639u + uint(pixel.y) * 15511u + Frame() * 104729u + 0x68bc21ebu;
+    Pcg(g_light_seed);
     Surface s;
     s.p = p;
     s.zbuf = DepthAt(pixel);

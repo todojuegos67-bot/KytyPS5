@@ -82,7 +82,7 @@ public:
                      s32 base_vertex, bool restart);
 
     struct Stats {
-        u64 draws{}, vertices{}, full{}, scans{}, hits{}, stale{};
+        u64 draws{}, vertices{}, full{}, reserved{}, scans{}, hits{}, stale{};
         u32 peak{};
     } stats;
 
@@ -113,6 +113,7 @@ private:
     u64 address{};
     u32 capacity{};
     u32 per_half{};
+    u32 reserve_at{}; // cursor past which small draws are left out (BB_PT_STORE_RESERVE)
     u32 half{};
     u32 cursor{};
     u64 frame{};

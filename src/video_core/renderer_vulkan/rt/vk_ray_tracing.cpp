@@ -741,13 +741,10 @@ RayTracing::RayTracing(const Instance& instance_, Scheduler& scheduler_, Runtime
                     .gi_pipeline = surface_ok && instance.IsRayTracingPipelineSupported(),
                     .gi_ser = surface_ok && instance.IsRayTracingReorderSupported(),
                     .ptlas = instance.IsPartitionedAccelerationStructureSupported(),
-                    // bb-port: DLSS Ray Reconstruction needs a DLSS-D evaluate in our upscaler
-                    // (Streamline / NGX bridge), not ported yet: the mod's own denoiser runs.
-                    .rr = false};
-    if (Rt::KnobIs("BB_PT_DLSS_RR", '1')) {
-        Log("Path tracing: BB_PT_DLSS_RR=1 ignored: Ray Reconstruction is not hosted by this "
-            "port's DLSS path yet; the built-in GI denoiser is used (BB_PT_GI_DENOISE)\n");
-    }
+                    // bb-pathtracing-2: DLSS Ray Reconstruction is hosted by our upscaler pass
+                    // (bb_present_sr.cpp -> PtRayReconstruction, NGX DLSS-D loaded directly from
+                    // nvngx_dlssd.dll); it runs only with BB_UPSCALER=dlss and the DLL present.
+                    .rr = true};
     if (!surface_ok) {
         Log("Ray tracing: hit surfaces off (%s), GI, reflections and ReSTIR GI unavailable\n",
             uvs_address ? "descriptor indexing unavailable" : "no UV capture buffer");
@@ -2049,6 +2046,11 @@ void RayTracing::ReadLiveKnobs() {
     shadow_bias = EnvFloat("BB_PT_SHADOW_BIAS", 0.02f, 0.0f, 10.0f);
     shadow_tmin = EnvFloat("BB_PT_SHADOW_TMIN", 0.0f, 0.0f, 10.0f);
     shadow_gap = EnvFloat("BB_PT_SHADOW_GAP", 0.3f, 0.0f, 10.0f);
+    // bb-pathtracing-2: lamps and fires as small spheres (soft shadows, rt_direct.comp).
+    light_source_share = EnvFloat("BB_PT_LIGHT_SOURCE", 0.02f, 0.0f, 0.5f);
+    light_source_min = EnvFloat("BB_PT_LIGHT_SOURCE_MIN", 0.03f, 0.0f, 2.0f);
+    light_source_max = EnvFloat("BB_PT_LIGHT_SOURCE_MAX", 0.3f, 0.0f, 2.0f);
+    light_source_max = std::max(light_source_max, light_source_min);
     hitch_threshold_ms = double(EnvU64("BB_PT_HITCH_MS", 8, 1, 1000));
     dir_sets_mode = Rt::KnobEquals("BB_PT_DIR_SETS", "gpu")    ? DirSetsMode::Gpu
                     : Rt::KnobEquals("BB_PT_DIR_SETS", "host") ? DirSetsMode::Host
@@ -2962,6 +2964,7 @@ void RayTracing::ReadTimes(u32 slot) {
     if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
         return;
     }
+    bool any_pass = false;
     for (u32 pass = 0; pass < TimePasses; ++pass) {
         if (!(time_written[slot] & (1u << pass))) {
             continue;
@@ -2974,10 +2977,13 @@ void RayTracing::ReadTimes(u32 slot) {
         time_last_ms[pass] = double(end - begin) * timestamp_period_ns * 1e-6;
         time_sum_ms[pass] += time_last_ms[pass];
         ++time_count[pass];
+        any_pass = true;
     }
+    time_frames += any_pass ? 1u : 0u;
+    // The TLAS pass is timed inside the build pass (0): not counted twice.
     adaptive_frame_ms = 0.0;
-    for (const double ms : time_last_ms) {
-        adaptive_frame_ms += ms;
+    for (u32 pass = 0; pass < TimePasses; ++pass) {
+        adaptive_frame_ms += pass == TlasPass ? 0.0 : time_last_ms[pass];
     }
     time_written[slot] = 0;
 }
@@ -7710,6 +7716,7 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
         .ambient_cut = {ambient_cool[0], ambient_cool[1], ambient_cool[2], ambient_cut},
         .ambient_spec_cut = {spec_cut_frame == frame ? 0.0f : ambient_spec_cut, ambient_keep_lo,
                              ambient_keep_hi, ambient_keep_lit},
+        .light_source = {light_source_share, light_source_min, light_source_max, 0.0f},
     };
     std::memcpy(direct_params_ring.mapped + u64(slot) * direct_params_ring.slot_bytes, &params,
                 sizeof(params));
@@ -9981,12 +9988,35 @@ void RayTracing::PrintGpuLine() {
             return time_count[p] ? time_sum_ms[p] / double(time_count[p]) : 0.0;
         };
         const u32 hidden_total = ptlas_on ? ptlas.HiddenTotal() : 0u;
-        const double pass_total = avg(0) + avg(1) + avg(2) + avg(3) + avg(4) + avg(5) + avg(6) +
-                                  avg(7) + avg(TlasPass);
-        Log("[pt] preset %s, %s: path tracing GPU %.3f ms/frame total (%llu frames paused since "
-            "the last line)\n",
-            pt_quality_name, Paused() ? "paused (F9)" : "on", pass_total,
-            (unsigned long long)(paused_frames - paused_frames_logged));
+        // bb-pathtracing-2: the total is per traced frame (every pass's time summed over the
+        // frames that ran any pass, divided by those frames); the TLAS is inside the build pass.
+        // No traced frame (menus, loading, F9): said so instead of "0.000 ms".
+        double sum_all = 0.0;
+        for (u32 p = 0; p < TimePasses; ++p) {
+            sum_all += p == TlasPass ? 0.0 : time_sum_ms[p];
+        }
+        const double pass_total = time_frames ? sum_all / double(time_frames) : 0.0;
+        const auto per_frame = [&](u32 p) {
+            return time_frames ? time_sum_ms[p] / double(time_frames) : 0.0;
+        };
+        if (!time_enabled) {
+            Log("[pt] preset %s, %s: GPU pass timing off (BB_PT_GPU_TIME=0)\n", pt_quality_name,
+                Paused() ? "paused (F9)" : "on");
+        } else if (time_frames == 0) {
+            Log("[pt] preset %s, %s: no traced frame since the last line (menu, loading screen, "
+                "no G-buffer pass or paused; %llu frames paused)\n",
+                pt_quality_name, Paused() ? "paused (F9)" : "on",
+                (unsigned long long)(paused_frames - paused_frames_logged));
+        } else {
+            Log("[pt] preset %s, %s: path tracing GPU %.3f ms/frame total over %llu traced frames "
+                "(BVH build %.3f incl. TLAS %.3f, GI %.3f, direct %.3f, ReSTIR DI %.3f, "
+                "reflections %.3f, shadow mask %.3f, AO %.3f, fog %.3f; %llu frames paused since "
+                "the last line; DLSS RR / upscaler time is the [perf] line's 'sr')\n",
+                pt_quality_name, Paused() ? "paused (F9)" : "on", pass_total,
+                (unsigned long long)time_frames, per_frame(0), per_frame(TlasPass), per_frame(1),
+                per_frame(2), per_frame(3), per_frame(4), per_frame(5), per_frame(6), per_frame(7),
+                (unsigned long long)(paused_frames - paused_frames_logged));
+        }
         paused_frames_logged = paused_frames;
         Log("Ray tracing GPU ms/frame: build %.3f, GI %.3f, direct %.3f, ReSTIR %.3f, reflect "
             "%.3f, shadows %.3f, AO %.3f, fog %.3f (%llu timed frames); compaction %llu BLAS, "
@@ -10012,6 +10042,7 @@ void RayTracing::PrintGpuLine() {
         tlas_refit_writes_sum = 0;
         time_sum_ms = {};
         time_count = {};
+        time_frames = 0;
     }
 }
 

@@ -3,6 +3,9 @@
 
 #include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/renderer_vulkan/bb_present_sr.h"
+#ifdef ENABLE_PATHTRACING
+#include "video_core/renderer_vulkan/rt/pt_rr.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -506,7 +509,17 @@ vk::ImageView PresentSr::Run(vk::CommandBuffer cmd, VideoCore::TextureCache& tex
                 fmt::format("ours: upscaler {}", BB::SR::KindName(BB::Upscale::Cfg().kind)));
         }
         const BB::GpuProf::Scope sr_scope(cmd, named[k]);
-        ok = BB::Upscale::RunBackend(desc);
+#ifdef ENABLE_PATHTRACING
+        // bb-pathtracing-2: path traced frames go through DLSS Ray Reconstruction when it runs
+        // (rt/pt_rr.h: BB_PT_DLSS_RR, nvngx_dlssd.dll); otherwise DLSS SR as before.
+        if (BB::Upscale::Cfg().kind == BB::SR::Kind::Dlss) {
+            if (auto* rr = Vulkan::PtRayReconstruction::Current()) {
+                ok = rr->Evaluate(desc);
+            }
+        }
+        if (!ok)
+#endif
+            ok = BB::Upscale::RunBackend(desc);
     }
     if (!ok) {
         return {};

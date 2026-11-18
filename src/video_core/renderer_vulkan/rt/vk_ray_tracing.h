@@ -726,6 +726,7 @@ private:
     vk::UniqueQueryPool time_pool, compact_pool;
     std::array<double, TimePasses> time_sum_ms{};
     std::array<u64, TimePasses> time_count{};
+    u64 time_frames{}; // frames with any timed pass (bb-pathtracing-2: the per-frame total)
     std::array<u32, Slots> time_written{};
     std::array<double, TimePasses> time_last_ms{};
     std::array<std::vector<CompactQuery>, Slots> slot_compact;
@@ -991,6 +992,7 @@ private:
     float shadow_bias = 0.02f;
     float shadow_tmin = 0.0f;
     float shadow_gap = 0.3f;
+    float light_source_share = 0.02f, light_source_min = 0.03f, light_source_max = 0.3f;
     u64 shadow_frames = 0, shadow_skipped = 0, shadow_light_frames = 0;
     u64 light_draws_total = 0, light_lights_total = 0, light_unknown_buffers = 0;
     bool direct_enabled = false;

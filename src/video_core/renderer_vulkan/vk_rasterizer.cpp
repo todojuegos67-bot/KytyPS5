@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/rt/vk_ray_tracing.h"
 #endif
 #include "video_core/renderer_vulkan/rt/pt_capture.h"
+#include "video_core/renderer_vulkan/rt/pt_rr.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"

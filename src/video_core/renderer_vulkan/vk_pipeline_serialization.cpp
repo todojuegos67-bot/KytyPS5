@@ -509,6 +509,11 @@ void Info::Serialize(Serialization::Archive& ar) const {
     info.Write(rt_normal_image);
     info.Write(rt_normal_inputs[0]);
     info.Write(rt_normal_inputs[1]);
+    // bb-pathtracing-2: a second optional record, the alpha-test reference (FindAlphaRef).
+    info.Write(RtInfoMagic2);
+    info.Write(rt_alpha_ref);
+    info.Write(rt_alpha_ref_buffer);
+    info.Write(rt_alpha_ref_dword);
 }
 
 bool Info::Deserialize(Serialization::Archive& ar) {
@@ -542,6 +547,19 @@ bool Info::Deserialize(Serialization::Archive& ar) {
             info.Read(rt_normal_inputs[0]);
             info.Read(rt_normal_inputs[1]);
             rt_info_known = true;
+            // The alpha reference record (bb-pathtracing-2); caches written before it keep the
+            // default (unknown: the tracer's 0.5) without a recompile.
+            constexpr size_t RtRecord2Bytes = sizeof(u32) + sizeof(float) + sizeof(s32) + sizeof(u32);
+            if (ar.Remaining() >= RtRecord2Bytes) {
+                u32 magic2{};
+                std::memcpy(&magic2, ar.CurrPtr(), sizeof(magic2));
+                if (magic2 == RtInfoMagic2) {
+                    info.Read(magic2);
+                    info.Read(rt_alpha_ref);
+                    info.Read(rt_alpha_ref_buffer);
+                    info.Read(rt_alpha_ref_dword);
+                }
+            }
         }
     }
     return true;

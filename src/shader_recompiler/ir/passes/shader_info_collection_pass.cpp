@@ -282,6 +282,79 @@ static void FindAlbedo(IR::Program& program) {
     }
 }
 
+// bb-pathtracing-2: the alpha-test reference of a G-buffer pixel shader. The discard condition is
+// a float compare of the sampled alpha with the reference: an immediate (folded literal) or a
+// scalar constant-buffer dword (ReadConstBuffer of a bound buffer at a fixed dword). The tracer
+// used 0.5 for every alpha-tested surface (upstream too); a material cut at another value
+// thickened or thinned foliage and fences in traced shadows and GI against the raster.
+// Only "discard when alpha < ref" shapes are taken (alpha below the reference is cut).
+static bool ReachesInst(const IR::Value& root, const IR::Inst* target) {
+    return FindUpstream(root, [target](const IR::Inst& i) { return &i == target; }) != nullptr;
+}
+
+static void FindAlphaRef(Info& info, const IR::Inst& discard, const IR::Inst* extract) {
+    info.rt_alpha_ref = -1.0f;
+    info.rt_alpha_ref_buffer = -1;
+    info.rt_alpha_ref_dword = 0;
+    const IR::Value cond = discard.Arg(0);
+    if (cond.IsImmediate() || !cond.Inst()) {
+        return;
+    }
+    const IR::Inst* cmp = cond.Inst();
+    bool negated = false;
+    if (cmp->GetOpcode() == IR::Opcode::LogicalNot && !cmp->Arg(0).IsImmediate() &&
+        cmp->Arg(0).Inst()) {
+        negated = true;
+        cmp = cmp->Arg(0).Inst();
+    }
+    // less: the compare is true when its first operand is below the second.
+    bool less = false;
+    switch (cmp->GetOpcode()) {
+    case IR::Opcode::FPOrdLessThan32:
+    case IR::Opcode::FPUnordLessThan32:
+    case IR::Opcode::FPOrdLessThanEqual32:
+    case IR::Opcode::FPUnordLessThanEqual32:
+        less = true;
+        break;
+    case IR::Opcode::FPOrdGreaterThan32:
+    case IR::Opcode::FPUnordGreaterThan32:
+    case IR::Opcode::FPOrdGreaterThanEqual32:
+    case IR::Opcode::FPUnordGreaterThanEqual32:
+        less = false;
+        break;
+    default:
+        return;
+    }
+    const bool alpha_first = ReachesInst(cmp->Arg(0), extract);
+    const bool alpha_second = ReachesInst(cmp->Arg(1), extract);
+    if (alpha_first == alpha_second) {
+        return;
+    }
+    // Discard when alpha < ref: (alpha < ref) or (ref > alpha), or a negated (alpha >= ref).
+    const bool alpha_below = alpha_first ? less : !less;
+    if (alpha_below == negated) {
+        return;
+    }
+    const IR::Value ref = cmp->Arg(alpha_first ? 1 : 0);
+    if (ref.IsImmediate()) {
+        if (ref.Type() == IR::Type::F32) {
+            const float v = ref.F32();
+            if (v > 0.0f && v < 1.0f) {
+                info.rt_alpha_ref = v;
+            }
+        }
+        return;
+    }
+    const IR::Inst* load = FindUpstream(ref, [](const IR::Inst& i) {
+        return i.GetOpcode() == IR::Opcode::ReadConstBuffer && i.Arg(0).IsImmediate() &&
+               i.Arg(1).IsImmediate();
+    });
+    if (load) {
+        info.rt_alpha_ref_buffer = s32(load->Arg(0).U32());
+        info.rt_alpha_ref_dword = load->Arg(1).U32();
+    }
+}
+
 static void FindAlphaSource(IR::Program& program) {
     Info& info = program.info;
     if (info.sw_stage != SwStage::Fragment || !info.has_discard) {
@@ -315,6 +388,7 @@ static void FindAlphaSource(IR::Program& program) {
             info.rt_alpha_input = s32(u32(attr->Arg(0).Attribute()) - u32(IR::Attribute::Param0));
             info.rt_alpha_components = u8(component | ((component + 1u) & 3u) << 4);
             info.rt_alpha_channel = u8(extract->Arg(1).U32() & 3u);
+            FindAlphaRef(info, inst, extract);
             return;
         }
     }

@@ -1452,6 +1452,8 @@ if (ENABLE_PATHTRACING)
         src/video_core/renderer_vulkan/rt/vk_dlss_rr.h
         src/video_core/renderer_vulkan/rt/pt_compat.h
         src/video_core/renderer_vulkan/rt/pt_capture.cpp
+        src/video_core/renderer_vulkan/rt/pt_rr.cpp
+        src/video_core/renderer_vulkan/rt/pt_rr.h
         src/video_core/renderer_vulkan/vk_rasterizer_pt.cpp
         src/video_core/renderer_vulkan/rt/pt_capture.h
         src/video_core/renderer_vulkan/rt/pt_config.h

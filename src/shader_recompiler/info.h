@@ -126,10 +126,16 @@ struct Info : InfoPersistent {
     s32 rt_alpha_input{-1};
     u8 rt_alpha_components{};
     u8 rt_alpha_channel{3};
+    // bb-pathtracing-2 (FindAlphaRef): the alpha-test reference, an immediate (> 0) or a dword of
+    // a bound constant buffer (buffer index >= 0, read per draw); -1 / -1: unknown (0.5 used).
+    float rt_alpha_ref{-1.0f};
+    s32 rt_alpha_ref_buffer{-1};
+    u32 rt_alpha_ref_dword{};
     s32 rt_normal_image{-1};
     std::array<s32, 2> rt_normal_inputs{-1, -1};
     bool rt_info_known{}; // collected (fresh compile) or loaded with the trailing record
     static constexpr u32 RtInfoMagic = 0x54504242u; // "BBPT"
+    static constexpr u32 RtInfoMagic2 = 0x32504242u; // "BBP2": the alpha reference record
     bool has_image_gather{};
     bool has_image_query{};
     bool has_flatbuf{};
