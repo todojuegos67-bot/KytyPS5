@@ -95,9 +95,6 @@ void Swapchain::Create(u32 width_, u32 height_) {
     width = width_;
     height = height_;
     needs_recreation = false;
-    // bb-fg-cap: the refresh rate frame generation's real-fps cap follows (the window may now be
-    // fullscreen, on another display or in another mode). Not per frame: QueryDisplayConfig.
-    BB::FG::RefreshDisplayHz();
 
     Destroy();
 

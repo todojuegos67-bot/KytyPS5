@@ -632,20 +632,6 @@ void AfterPresent(uint32_t frame, bool presented) {
            sec_presents, g_sec_tagged.exchange(0), g_sec_off.exchange(0),
            g_sec_own_constants.exchange(0), g_sec_errors.exchange(0),
            g_options.on ? "on" : "off", g_options.frames + 1);
-    // bb-sl-pace: one line a second on who paces the frames. Streamline DLSS-G / Reflex pace the
-    // real and the generated frames themselves; we run no real-fps hold, no present limiter and no
-    // dynamic multiplier stepping here (32c126e79 stepped numFramesToGenerate x2 -> x3 -> x4 at
-    // run time and the game fell to 224 / N^2 fps: 56 at x2, 25 at x3, 14 at x4).
-    {
-        const uint32_t ppf = r == sl::Result::eOk ? s.numFramesActuallyPresented : 0;
-        const double real = sec_presents / secs;
-        BBLogf("[dlssg-sl-pace] real %.1f fps, presents %.1f/s (game frames x %u presented/frame), "
-               "multiplier x%u (options %s, fixed for the run%s), limiter: none (DLSS-G/Reflex "
-               "pace themselves)",
-               real, real * std::max(ppf, 1u), std::max(ppf, 1u),
-               g_options.on ? g_options.frames + 1 : 1u, g_options.on ? "on" : "off",
-               Cfg().dynamic ? ", dlss-dyn = the largest" : "");
-    }
 }
 
 bool Stats(SecondStats& out) {

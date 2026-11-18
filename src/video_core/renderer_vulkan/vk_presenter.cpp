@@ -959,10 +959,6 @@ void Presenter::BbUpdateFrameGenLimit(bool wanted, double present_ms) {
     if (now < bb_frame_gen_hold_until) {
         limit = 0;
     }
-    // bb-fg-cap: the F8 panel's multiplier for DLSS-G (NGX).
-    BB::FG::NoteDlssMultiplier(
-        limit > 0 ? int(std::min<u32>(limit, std::max<u32>(BB::FG::Dlss::WantedCount(), 1u))) + 1
-                  : 1);
     if (limit != before && BB::FG::Cfg().dynamic) {
         BB::Upscale::Checkpoint(fmt::format("Frame generation: {} generated per game frame "
                                             "(display {} Hz, game {:.0f} FPS)",

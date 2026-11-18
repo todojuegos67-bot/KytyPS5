@@ -45,40 +45,6 @@ int AmdActiveFrames();
 void ApplyAmdEnv();
 bool On();          // BB_FG asked (inputs captured even without an upscaler)
 
-// ---- bb-fg-cap: real frame rate held so real x multiplier fits the display ----
-// With a fixed multiplier N and a game faster than cap / N, the frame generation swapchain (FSR 3)
-// or the driver (DLSS-G, VRR) can only show `cap` frames a second: generated frames are dropped
-// unevenly (sometimes N-1, sometimes N-2 per real frame). The real frame rate is therefore held at
-// floor(cap / N), where cap = refresh - refresh^2 / 3600 (the VRR margin already used for the
-// display target: 224 at 240 Hz, 138 at 144 Hz, 113 at 120 Hz) of the refresh rate measured at
-// run time (QueryDisplayConfig, the display the game window is on).
-// BB_FG_FIXED_CAP: unset / auto = on, 0 = off, a number = that real fps.
-// Dynamic: the largest N with real x N <= cap; when floor(cap / N) stays >= BB_FG_DYN_FLOOR
-// (default 50) the real frame rate is held there to use that N (x4 with 56 real at 240 Hz).
-// BB_FG_DYN_HOLD=0: no hold (only the fit).
-double DisplayRefreshHz(); // 0: unknown
-double OutputCapFps();     // the shown-frame cap from the refresh (0: unknown)
-void RefreshDisplayHz();   // measure the refresh again (swapchain creation, not per frame)
-// Real fps for a fixed multiplier (0: no cap). Logs "[who] xN: real fps capped to ..." on change.
-int FixedRealCapFps(int multiplier, const char* who);
-// Dynamic multiplier with its real-fps hold, one Update a second (real: that second's real fps;
-// max_mult: the back end's largest). Returns true when `cur` changed. Logs its decision.
-struct DynamicFg {
-    int cur = 2;      // current multiplier (2..4)
-    int hold_fps = 0; // real fps held for `cur` (0: none)
-    int pending = 0, agree = 0;
-    bool allow_hold = true; // false: fit only, no held real rate (Streamline paces itself)
-    bool Update(const char* who, double real_fps, int max_mult);
-};
-// Sleeps the calling (present) thread so calls come at most `fps` times a second (0: no limit).
-struct RealLimiter {
-    double next = 0.0; // steady clock, s
-    void Wait(double fps);
-};
-// The multiplier the F8 panel shows (0: unknown). DLSS-G NGX: noted by the presenter.
-int PanelMultiplier();
-void NoteDlssMultiplier(int multiplier);
-
 bool FgBlocked(const char** why);
 bool Fsr3Requested(); // FSR 3 frame generation asked and the FidelityFX DLL loaded
 bool Fsr3Active();    // the frame interpolation swapchain exists
@@ -215,7 +181,7 @@ bool PanelInfo(float& real, float& shown, const char*& state);
 // bb-menu-ui: the presenter's measured game / shown frame rates with DLSS-G (once a second), for
 // the F8 panel (it showed "FSR 3 x2 · DLSS-G (NGX)" and no shown rate, as if FG were off).
 void NoteDlssPanel(float real, float shown);
-// The panel row's name: "DLSS-G x3", "FSR 3 x4", "FSR 3 dyn x3" (the effective multiplier).
+// The panel row's name: "DLSS-G" or "FSR 3 x2".
 const char* PanelName();
 
 } // namespace BB::FG

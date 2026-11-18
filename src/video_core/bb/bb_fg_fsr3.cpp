@@ -227,40 +227,7 @@ float EnvFloat(const char* name, float fallback) {
 // 1.58: the refresh rate of the display the window is on, exact (QueryDisplayConfig gives the
 // mode's rational rate: 239.757 is not 240); EnumDisplaySettings' integer as a
 // fallback.
-// bb-fg-cap: the top-left of the monitor the game window is on (the foreground window when it is
-// ours, else our largest visible top-level window); false: none found (the primary display).
-BOOL CALLBACK FindOwnWindow(HWND hwnd, LPARAM param) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd)) return TRUE;
-    RECT r{};
-    GetWindowRect(hwnd, &r);
-    auto* best = reinterpret_cast<std::pair<HWND, long long>*>(param);
-    const long long area = static_cast<long long>(r.right - r.left) * (r.bottom - r.top);
-    if (area > best->second) *best = {hwnd, area};
-    return TRUE;
-}
-bool GameMonitorOrigin(LONG& x, LONG& y) {
-    HWND hwnd = GetForegroundWindow();
-    DWORD pid = 0;
-    if (hwnd != nullptr) GetWindowThreadProcessId(hwnd, &pid);
-    if (hwnd == nullptr || pid != GetCurrentProcessId()) {
-        std::pair<HWND, long long> best{nullptr, 0};
-        EnumWindows(FindOwnWindow, reinterpret_cast<LPARAM>(&best));
-        hwnd = best.first;
-    }
-    if (hwnd == nullptr) return false;
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return false;
-    x = mi.rcMonitor.left;
-    y = mi.rcMonitor.top;
-    return true;
-}
-
 double QueryRefreshHz() {
-    LONG want_x = 0, want_y = 0;
-    GameMonitorOrigin(want_x, want_y); // (stays 0,0: the primary display)
     UINT32 paths = 0, modes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &paths, &modes) == ERROR_SUCCESS &&
         paths > 0) {
@@ -268,8 +235,7 @@ double QueryRefreshHz() {
         std::vector<DISPLAYCONFIG_MODE_INFO> mode(modes);
         if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &paths, path.data(), &modes, mode.data(),
                                nullptr) == ERROR_SUCCESS) {
-            // The game window's display (its source at that monitor's top-left; the primary
-            // display, 0,0, when no window was found), else the first.
+            // The primary display's path first (its source at desktop 0,0), else the first.
             double first = 0.0;
             for (UINT32 i = 0; i < paths; ++i) {
                 const auto& r = path[i].targetInfo.refreshRate;
@@ -278,8 +244,7 @@ double QueryRefreshHz() {
                 if (first <= 0.0) first = hz;
                 const UINT32 m = path[i].sourceInfo.modeInfoIdx;
                 if (m < modes && mode[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
-                    mode[m].sourceMode.position.x == want_x &&
-                    mode[m].sourceMode.position.y == want_y) {
+                    mode[m].sourceMode.position.x == 0 && mode[m].sourceMode.position.y == 0) {
                     return hz;
                 }
             }
@@ -830,48 +795,6 @@ int Generated() {
     return g_dll_patched ? AmdActiveFrames() : 1;
 }
 
-int Multiplier() {
-    return g_dll_patched ? AmdActiveFrames() + 1 : 2;
-}
-
-// bb-fg-cap: the real-frame limit of ours (BB::FG::FixedRealCapFps for a fixed x2..x4, the
-// DynamicFg hold for amd-dyn), as an interval in s (0: none), and whether the game reached it in
-// the last second (only then is it the slot grid's step: a game slower than the cap keeps the held
-// mean of its own intervals, else the grid would run ahead of the real frames).
-std::atomic<double> g_auto_interval{0.0};
-std::atomic<bool> g_auto_binding{false};
-
-// The interval the real frames are held to: the stricter of KYTY_VRR_CAP_FPS and ours.
-double LimitInterval() {
-    return std::max(CapInterval(), g_auto_interval.load(std::memory_order_relaxed));
-}
-
-// The slot grid's step from the limiters (0: none, the held mean then).
-double GridStep() {
-    double step = CapInterval();
-    if (g_auto_binding.load(std::memory_order_relaxed)) {
-        step = std::max(step, g_auto_interval.load(std::memory_order_relaxed));
-    }
-    return step;
-}
-
-// Once a second (BeforePresent's stats block): the real fps cap for a fixed multiplier or the
-// dynamic multiplier and its hold. real: the last second's real fps.
-void UpdateRealCap(double real) {
-    double hold = 0.0;
-    if (Cfg().dynamic) {
-        static DynamicFg dyn;
-        const int max_mult = g_dll_patched ? AmdFrames() + 1 : 2;
-        if (dyn.Update("fsr3", real, max_mult)) SetAmdActive(dyn.cur);
-        hold = dyn.hold_fps;
-    } else if (!BB::Smooth::Enabled()) {
-        // (bb-smooth holds the real rate on its own rungs: not doubled here)
-        hold = FixedRealCapFps(Multiplier(), "fsr3");
-    }
-    g_auto_interval.store(hold > 0.0 ? 1.0 / hold : 0.0, std::memory_order_relaxed);
-    g_auto_binding.store(hold > 0.0 && real >= 0.97 * hold, std::memory_order_relaxed);
-}
-
 // 1.51 (bb-fgmv-151): present watchdog. r149_0459: presents stopped completing ("source=none
 // [no present completed]") while the game kept rendering: the present thread blocked in the FG
 // swapchain (its acquire waited forever, UINT64_MAX). The acquire now waits at most
@@ -1073,8 +996,7 @@ vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
         if (slot.qpc == 0 && g_set_pace_slot != nullptr && g_generating && HoldPace()) {
             // The step: the guest pacer's (the real flips are held on it), else a held mean of
             // the real present intervals (moves only when the mean leaves it by 0.5 ms).
-            // bb-fg-cap: the auto real-fps cap too, while the game reaches it.
-            double step = GridStep();
+            double step = CapInterval();
             // bb-smooth: the held rung's exact interval; a new rung starts a new grid.
             static uint32_t smooth_epoch = 0;
             if (const double sg = BB::Smooth::GridInterval(); sg > 0.0) {
@@ -1162,8 +1084,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
     if (!Active()) return;
     // G-SYNC / the dynamic target: real frames wait just enough for real x (1 + generated) to stay
     // under the cap. Only while generating; movies and menus untouched.
-    // bb-fg-cap: also the automatic cap (fixed xN: floor(cap / N); amd-dyn: its hold).
-    const double interval = g_generating ? LimitInterval() : CapInterval();
+    const double interval = CapInterval();
     if (interval > 0.0 && inputs != nullptr && inputs->valid) {
         static std::chrono::steady_clock::time_point next{};
         const auto step = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -1258,7 +1179,7 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
             Printf("[fsr3] present interval sd %.2f ms (mean %.2f, max %.1f, %.0f frames); pacer "
                    "%.2f ms (%s)",
                    sd * 1e3, mean * 1e3, g_stats.pace_max * 1e3, g_stats.pace_n,
-                   LimitInterval() * 1e3, "present");
+                   CapInterval() * 1e3, "present");
         }
         if (g_take_pace_stats != nullptr) {
             LogPresentIntervals(window);
@@ -1307,14 +1228,24 @@ void BeforePresent(const Inputs* inputs, vk::SwapchainKHR swapchain, vk::Extent2
                    // same rule as bb_objmv2.cpp:597 (fog vectors need the velocity path)
                    (!Fsr3EnvOff("BB_VELOCITY") && !Fsr3EnvOff("BB_FOG_MV")) ? "on" : "off",
                    g_amd.hudless_given ? "given" : "none");
-            // (11-12) amd-dyn / bb-fg-cap: the multiplier and the real-fps cap, once a second
-            // (bb_fg.cpp DynamicFg / FixedRealCapFps; the old dynamic rule allowed real x N up to
-            // 3% over the target and never held the real rate, so x4 needed real <= 57.9 at
-            // 240 Hz and the game's 60-66 stayed at x3).
-            if (Cfg().kind == Kind::Amd && window > 0.5 && g_generating) {
-                UpdateRealCap(g_stats.real / window);
-            } else if (!g_generating) {
-                g_auto_binding.store(false, std::memory_order_relaxed);
+            // (11-12) amd-dyn: the largest multiplier with real x N within the display's target
+            // (refresh - refresh^2/3600, as Demon's Souls), changed after 2 seconds agreeing.
+            if (Cfg().kind == Kind::Amd && Cfg().dynamic && window > 0.5) {
+                static int cur = 2, want_prev = 2, agree = 0;
+                const double hz = DisplayHz() > 30.0 ? DisplayHz() : 60.0;
+                const double target = hz - hz * hz / 3600.0;
+                const double real = g_stats.real / window;
+                int want = 2;
+                for (int n = 4; n >= 2; --n) {
+                    if (real * n <= target * 1.03) { want = n; break; }
+                }
+                agree = want == want_prev ? agree + 1 : 0;
+                want_prev = want;
+                if (want != cur && agree >= 1) {
+                    Printf("[fg-amd] dynamic: x%d -> x%d (real %.1f fps, target %.0f shown)", cur, want, real, target);
+                    cur = want;
+                    SetAmdActive(cur);
+                }
             }
             const AmdSecond keep = g_amd;
             g_amd = {};
@@ -1679,10 +1610,6 @@ bool Generating() {
 void NoteSlept(double) {}
 double DisplayHz() {
     return 0.0;
-}
-void UpdateDisplayHz() {}
-int Multiplier() {
-    return 2;
 }
 bool Active() {
     return false;

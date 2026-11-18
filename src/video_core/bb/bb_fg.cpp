@@ -6,15 +6,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
-#include <chrono>
-#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
-#include <thread>
 #include "video_core/bb/bb_fg.h"
 #include "video_core/bb/bb_fg_internal.h"
 #include "video_core/bb/bb_kyty_compat.h"
@@ -234,170 +231,6 @@ bool Fsr3Active() {
     return Cfg().kind == Kind::Amd && Amd::Active();
 }
 
-// ---- bb-fg-cap (bb_fg.h) ----
-
-double DisplayRefreshHz() {
-    return Amd::DisplayHz(); // QueryDisplayConfig (exact rational rate), the game window's display
-}
-
-void RefreshDisplayHz() {
-    if (On()) Amd::UpdateDisplayHz();
-}
-
-double OutputCapFps() {
-    const double hz = DisplayRefreshHz();
-    if (!(hz > 30.0)) return 0.0;
-    const double cap = hz - hz * hz / 3600.0; // 240 -> 224, 144 -> 138.2, 120 -> 116, 60 -> 59
-    static std::atomic<double> logged_hz{0.0};
-    if (std::fabs(logged_hz.exchange(hz) - hz) > 0.001) {
-        Printf("[fg-cap] display refresh %.3f Hz (measured at run time): shown frames kept under "
-               "%.1f fps (refresh - refresh^2/3600 = refresh x %.3f, the VRR margin)",
-               hz, cap, cap / hz);
-    }
-    return cap;
-}
-
-namespace {
-double EnvNumber(const char* name, double fallback, bool* off = nullptr) {
-    const char* v = std::getenv(name);
-    if (off != nullptr) *off = false;
-    if (v == nullptr || *v == '\0') return fallback;
-    std::string s = v;
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char ch) { return std::tolower(ch); });
-    if (s == "auto" || s == "on" || s == "1") return fallback;
-    if (s == "0" || s == "off") {
-        if (off != nullptr) *off = true;
-        return 0.0;
-    }
-    char* end = nullptr;
-    const double d = std::strtod(v, &end);
-    return end != v ? d : fallback;
-}
-} // namespace
-
-int FixedRealCapFps(int multiplier, const char* who) {
-    bool off = false;
-    const double forced = EnvNumber("BB_FG_FIXED_CAP", 0.0, &off);
-    const int n = std::clamp(multiplier, 2, 4);
-    const double hz = DisplayRefreshHz();
-    const double cap = OutputCapFps();
-    int real = 0;
-    const char* how = "";
-    if (off) {
-        how = "BB_FG_FIXED_CAP=0: no cap";
-    } else if (forced >= 10.0) {
-        real = static_cast<int>(forced);
-        how = "BB_FG_FIXED_CAP";
-    } else if (cap > 0.0) {
-        real = static_cast<int>(std::floor(cap / n + 1e-9));
-        how = "floor(output cap / multiplier)";
-    } else {
-        how = "display refresh unknown: no cap";
-    }
-    static std::atomic<int> logged{-1};
-    const int key = real * 8 + n;
-    if (logged.exchange(key) != key) {
-        Printf("[%s] x%d: real fps capped to %d (output cap %.0f = refresh %.3f Hz - "
-               "refresh^2/3600; %s; BB_FG_FIXED_CAP=0 off, =<fps> forced)",
-               who, n, real, cap, hz, how);
-    }
-    return real;
-}
-
-bool DynamicFg::Update(const char* who, double real, int max_mult) {
-    max_mult = std::clamp(max_mult, 2, 4);
-    cur = std::clamp(cur, 2, max_mult);
-    double cap = OutputCapFps();
-    if (!(cap > 0.0)) cap = 59.0; // (60 Hz assumed)
-    static const double floor_fps = std::max(EnvNumber("BB_FG_DYN_FLOOR", 50.0), 1.0);
-    static const bool hold_on = [] {
-        const char* v = std::getenv("BB_FG_DYN_HOLD");
-        return v == nullptr || std::strcmp(v, "0") != 0;
-    }();
-    const bool hold = hold_on && allow_hold;
-    const auto hold_of = [&](int n) { return static_cast<int>(std::floor(cap / n + 1e-9)); };
-    // Preferred: the largest N whose held real rate stays at or above the floor (x4 at 56 real on
-    // a 240 Hz display; x2 at 69 on 144 Hz, where x3 / x4 would hold the game under 50).
-    int base = 2;
-    for (int n = max_mult; n >= 2; --n) {
-        if (hold_of(n) >= floor_fps) {
-            base = n;
-            break;
-        }
-    }
-    // Fits: the largest N with real x N within the cap as the game runs now.
-    int fit = 2;
-    for (int n = max_mult; n >= 2; --n) {
-        if (real * n <= cap) {
-            fit = n;
-            break;
-        }
-    }
-    const bool pinned = hold && hold_fps > 0 && real >= 0.97 * hold_fps;
-    int want = fit;
-    const char* why = "fit";
-    if (hold) {
-        if (pinned && cur > base) {
-            // held at this N's rate, so the game can do more: one step towards the preferred N
-            want = cur - 1;
-            why = "held, game faster: towards the preferred";
-        } else if (real >= 0.95 * hold_of(base)) {
-            want = std::max(base, fit);
-            why = want == base ? "game reaches the preferred hold" : "fit";
-        }
-    }
-    // Down at once (real x N over the cap drops generated frames); up after 2 agreeing seconds.
-    agree = want == pending ? agree + 1 : 0;
-    pending = want;
-    const int before = cur;
-    if (want < cur || (want > cur && agree >= 1)) cur = want;
-    hold_fps = hold ? hold_of(cur) : 0;
-    Printf("[%s] dynamic: real %.1f fps%s, output cap %.1f (refresh %.3f Hz): preferred x%d (hold "
-           "%d >= floor %.0f), fits x%d -> want x%d (%s) -> x%d%s, real held at %d fps%s",
-           who, real, pinned ? " (at the hold)" : "", cap, DisplayRefreshHz(), base, hold_of(base),
-           floor_fps, fit, want, why, cur, before != cur ? " (changed)" : "", hold_fps,
-           hold ? "" : " (no hold)");
-    return before != cur;
-}
-
-void RealLimiter::Wait(double fps) {
-    const double now =
-        std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (!(fps > 0.0)) return; // (a later call starts from its own time: next is in the past)
-    const double step = 1.0 / fps;
-    if (next > now) {
-        const double left = next - now;
-        if (left > 0.002) {
-            std::this_thread::sleep_for(std::chrono::duration<double>(left - 0.0015));
-        }
-        while (std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-                   .count() < next) {
-            std::this_thread::yield();
-        }
-        next += step;
-    } else {
-        // late (or the first): from now, with at most one step of credit kept
-        next = std::max(next, now - step) + step;
-    }
-}
-
-static std::atomic<int> g_dlss_mult{0};
-
-void NoteDlssMultiplier(int multiplier) {
-    g_dlss_mult.store(multiplier, std::memory_order_relaxed);
-}
-
-int PanelMultiplier() {
-    const auto& c = Cfg();
-    if (c.kind == Kind::Amd) return Fsr3Requested() ? Amd::Multiplier() : 0;
-    if (c.kind == Kind::Dlss && DlssSl::Requested()) {
-        DlssSl::SecondStats st{};
-        return DlssSl::Stats(st) ? static_cast<int>(st.multiplier) : 0;
-    }
-    if (c.kind == Kind::Dlss) return g_dlss_mult.load(std::memory_order_relaxed);
-    return 0;
-}
-
 static std::atomic<float> g_dlss_real{0.0f}, g_dlss_shown{0.0f};
 
 void NoteDlssPanel(float real, float shown) {
@@ -406,20 +239,8 @@ void NoteDlssPanel(float real, float shown) {
 }
 
 const char* PanelName() {
-    // bb-fg-cap: was "FSR 3 x2" for every AMD mode (amd-x3 / x4 / dyn shown as x2), and DLSS-G
-    // without its multiplier. Now the effective multiplier (dyn: the current one).
-    thread_local char name[48];
-    const auto& c = Cfg();
-    const int m = PanelMultiplier();
-    const char* base = c.kind == Kind::Dlss ? (DlssSl::Requested() ? "DLSS-G (Streamline)" : "DLSS-G")
-                                            : "FSR 3";
-    if (m >= 2) {
-        std::snprintf(name, sizeof(name), "%s %sx%d", base, c.dynamic ? "dyn " : "", m);
-    } else {
-        std::snprintf(name, sizeof(name), "%s %s", base,
-                      c.dynamic ? "dyn" : (c.multiplier == 2 ? "x2" : c.multiplier == 3 ? "x3" : "x4"));
-    }
-    return name;
+    if (Cfg().kind == Kind::Dlss) return DlssSl::Requested() ? "DLSS-G (Streamline)" : "DLSS-G";
+    return "FSR 3 x2";
 }
 
 bool PanelInfo(float& real, float& shown, const char*& state) {

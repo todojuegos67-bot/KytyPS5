@@ -1532,14 +1532,8 @@ void DrawOverlay() {
                                  [&] {
                                      // bb-sl-metrics: Streamline's real presented-per-frame.
                                      FG::DlssSl::SecondStats sl{};
-                                     // bb-fg-cap: else the effective multiplier (was
-                                     // round(shown / real): 224 / 64 = 3.5 for amd-x4 at the
-                                     // display's cap, shown as x3 or x4 from second to second).
-                                     const int m = FG::PanelMultiplier();
                                      return FG::DlssSl::Stats(sl) && sl.presented_per_frame > 1
                                                 ? float(sl.presented_per_frame)
-                                            : m >= 2
-                                                ? float(m)
                                                 : std::round(fg_shown / std::max(fg_real, 1.0f));
                                  }())
                    : fmt::format("FPS {:.0f}", s.fps);

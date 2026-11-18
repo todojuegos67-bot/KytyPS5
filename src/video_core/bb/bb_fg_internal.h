@@ -27,6 +27,4 @@ void SetUiLayer(const Image* ui);
 bool WantsUiLayer();
 void PanelValues(float& real, float& shown, const char*& state);
 double DisplayHz();
-void UpdateDisplayHz(); // bb-fg-cap: measure again (swapchain creation)
-int Multiplier();       // bb-fg-cap: the effective multiplier now (x2 with AMD's signed DLL)
 } // namespace BB::FG::Amd
