@@ -61,6 +61,7 @@ public:
 	// GPU thread: every range is still clean for a backing read and holds the recorded bytes.
 	[[nodiscard]] bool Validate() const;
 	[[nodiscard]] size_t RangeCount() const { return m_ranges.size(); }
+	[[nodiscard]] size_t ByteCount() const { return m_bytes.size(); }
 
 private:
 	struct Range {

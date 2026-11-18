@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -52,6 +53,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <unordered_map>
@@ -1028,10 +1030,16 @@ static bool RejectBindlessTexture(const char* what, uint64_t address) {
 	return true;
 }
 
+// gt7-drawmemo-1118: the TextureDescCache entry whose texture memo gave ResolveTexture's last
+// answer on this thread, or null (a lookup, a null descriptor, a new description). The draw memo
+// (DrawMemo, PrepareBindings) keeps it to check the same answer again without the key and hash.
+thread_local TextureDescEntry* t_memo_hit_entry = nullptr;
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value,
                                               bool                                         memo) {
 	const TranslationLock translation_lock(m_translation_mutex); // stage d
+	t_memo_hit_entry = nullptr; // gt7-drawmemo-1118: set below when the texture memo answers
 	// KYTY_MT_GPU=1/4: a worker keeps no memo (RecordTextureMemo is the GPU thread's).
 	memo = memo && !MtGpu::OnWorker();
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -1077,6 +1085,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					binding.desc.view_info.base_level = entry.memo.base_level;
 					binding.desc.view_info.base_layer = entry.memo.base_layer;
 					binding.memo_view                 = entry.memo.view;
+					t_memo_hit_entry                  = &entry;
 					return binding;
 				}
 				g_texture_memo_counts.miss_image++;
@@ -3453,9 +3462,217 @@ void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 }
 } // namespace
 
+
+// gt7-drawmemo-1118: the draw memo (drawMemo.h).
+namespace DrawMemo {
+
+int Mode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_DRAW_MEMO");
+		const int   m     = value != nullptr ? std::atoi(value) : 0;
+		const int   clamped = m < 0 || m > 2 ? 0 : m;
+		Log::WriteUnmuted(fmt::format(
+		    "Draw memo: {} (KYTY_DRAW_MEMO=1 lo usa, =2 lo verifica contra el camino normal)\n",
+		    clamped == 0 ? "apagado" : clamped == 1 ? "encendido" : "verificador"));
+		return clamped;
+	}();
+	return mode;
+}
+
+namespace {
+thread_local bool t_in_draw = false;
+
+// A stage as it was last resolved: its key (program, normalization, T# and S# words), the
+// texture memo entries that answered each image and what they held, and the samplers made.
+struct StageSlot {
+	const ShaderRecompiler::IR::CompiledShaderInfo* program          = nullptr;
+	bool                                            normalize        = false;
+	uint64_t                                        front_generation = 0;
+	uint64_t                                        hash             = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> samplers;
+	std::vector<TextureDescEntry*>                     entries;
+	std::vector<TextureMemo>                           memos;
+	std::vector<vk::Sampler>                           sampler_out;
+};
+
+struct StageTable {
+	static constexpr size_t Slots = 8192;
+	std::vector<StageSlot>  slots = std::vector<StageSlot>(Slots);
+};
+
+StageTable& Table() {
+	thread_local const auto table = std::make_unique<StageTable>();
+	return *table;
+}
+
+struct Counters {
+	uint64_t stages      = 0; // draw stages that asked the memo
+	uint64_t hits        = 0; // answered by the memo (=2: would have been)
+	uint64_t stores      = 0;
+	uint64_t ineligible  = 0; // bindless, storage images, diagnostics on, ...
+	uint64_t miss_key    = 0; // no slot with this program and these words
+	uint64_t miss_gen    = 0; // the texture descriptions were dropped since
+	uint64_t miss_entry  = 0; // an image's texture memo holds something else now
+	uint64_t miss_stamp  = 0; // an image's memory had images made or dropped over it
+	uint64_t miss_image  = 0; // an image gone, or to be bound again
+	uint64_t not_kept    = 0; // a resolve not all from the texture memo (or a light grid)
+	uint64_t images      = 0; // images given by the memo
+	uint64_t samplers    = 0; // samplers given by the memo
+	uint64_t verified    = 0; // =2: stages compared
+	uint64_t differences = 0; // =2: stages whose memo answer differs from the normal path
+};
+Counters g_counters;
+
+uint64_t KeyHash(const ShaderRecompiler::IR::CompiledShaderInfo* program, bool normalize,
+                 const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	static_assert(sizeof(ShaderRecompiler::IR::DescriptorValue) == 36);
+	auto hash = XXH3_64bits(snapshot.images.data(),
+	                        snapshot.images.size() * sizeof(ShaderRecompiler::IR::DescriptorValue));
+	hash = XXH3_64bits_withSeed(
+	    snapshot.samplers.data(),
+	    snapshot.samplers.size() * sizeof(ShaderRecompiler::IR::DescriptorValue), hash);
+	hash ^= (reinterpret_cast<uintptr_t>(program) * 0x9E3779B97F4A7C15ull) ^ (normalize ? 1u : 0u);
+	return hash;
+}
+
+bool SameWords(const std::vector<ShaderRecompiler::IR::DescriptorValue>& a,
+               const std::vector<ShaderRecompiler::IR::DescriptorValue>& b) {
+	return a.size() == b.size() &&
+	       (a.empty() ||
+	        std::memcmp(a.data(), b.data(), a.size() * sizeof(ShaderRecompiler::IR::DescriptorValue)) == 0);
+}
+
+bool SameMemo(const TextureMemo& a, const TextureMemo& b) {
+	return a.id == b.id && a.view == b.view && a.generation == b.generation &&
+	       a.base_level == b.base_level && a.base_layer == b.base_layer && a.stamp == b.stamp;
+}
+
+// Whether the memo may answer this stage at all (the conditions every image's texture memo
+// answer and PrepareBindings' plain path need; diagnostics that log or change bindings off).
+bool StageEligible(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                   const ShaderRecompiler::IR::ResourceSnapshot& snapshot, bool watched) {
+	if (watched || Bisect::Active() || !TextureDescCacheEnabled() || !TextureMemoEnabled() ||
+	    !snapshot.bindless_heaps.empty() || !snapshot.bindless_sampler_heaps.empty() ||
+	    FrameGraph::Active() || FrameGraph::Logging() ||
+	    (program.stage == ShaderType::Pixel && GpuTiming::ProbesGridsOf(program.shader_hash)) ||
+	    snapshot.images.size() < program.info.images.size()) {
+		return false;
+	}
+	for (const auto& image: program.info.images) {
+		if (!TextureMemoEligible(image) || image.runtime) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// The slot for this key whose every image the texture memo would answer as when it was kept,
+// or null (the reason counted).
+// `image_ok(id)`: the image registered, not a depth alias and not to be bound again (asked of
+// the texture cache by its friend, RenderExecutor).
+template <typename ImageOk>
+StageSlot* Find(const ShaderRecompiler::IR::CompiledShaderInfo& program, bool normalize,
+                const ShaderRecompiler::IR::ResourceSnapshot& snapshot, uint64_t hash,
+                TextureCache& texture_cache, const ImageOk& image_ok) {
+	auto& slot = Table().slots[hash & (StageTable::Slots - 1u)];
+	if (slot.program != &program || slot.hash != hash || slot.normalize != normalize ||
+	    !SameWords(slot.images, snapshot.images) || !SameWords(slot.samplers, snapshot.samplers)) {
+		g_counters.miss_key++;
+		return nullptr;
+	}
+	if (slot.front_generation != GetTextureDescFront().generation) {
+		g_counters.miss_gen++;
+		return nullptr;
+	}
+	for (size_t i = 0; i < slot.entries.size(); i++) {
+		const auto& entry = *slot.entries[i];
+		if (!SameMemo(entry.memo, slot.memos[i])) {
+			g_counters.miss_entry++;
+			return nullptr;
+		}
+		if (!MemoCurrent(entry.memo, entry.desc, texture_cache)) {
+			g_counters.miss_stamp++;
+			return nullptr;
+		}
+		if (!image_ok(entry.memo.id)) {
+			g_counters.miss_image++;
+			return nullptr;
+		}
+	}
+	return &slot;
+}
+
+// The binding ResolveTexture's texture memo gives for this entry.
+TextureBinding MemoBinding(const TextureDescEntry& entry) {
+	TextureBinding binding {entry.memo.id, nullptr, entry.desc};
+	binding.desc.view_info.base_level = entry.memo.base_level;
+	binding.desc.view_info.base_layer = entry.memo.base_layer;
+	binding.memo_view                 = entry.memo.view;
+	return binding;
+}
+
+// =2: the first field in which the memo's binding differs from the normal path's, or null.
+const char* DiffBinding(const TextureBinding& memo, const TextureBinding& normal) {
+	if (memo.image_id != normal.image_id) return "imagen";
+	if (memo.memo_view != normal.memo_view) return "vista";
+	if (memo.image_view != normal.image_view) return "vista directa";
+	if (memo.memo_generation != normal.memo_generation || memo.memo_stamp != normal.memo_stamp)
+		return "sello";
+	if (memo.desc.type != normal.desc.type) return "tipo";
+	if (memo.desc.info.data.address != normal.desc.info.data.address ||
+	    memo.desc.info.data.size != normal.desc.info.data.size)
+		return "memoria";
+	if (memo.desc.info.pixel_format != normal.desc.info.pixel_format) return "formato";
+	if (memo.desc.info.extent != normal.desc.info.extent) return "extension";
+	if (!(memo.desc.view_info == normal.desc.view_info)) return "vista (info)";
+	return nullptr;
+}
+} // namespace
+
+DrawScope::DrawScope(): m_previous(t_in_draw) {
+	t_in_draw = true;
+}
+DrawScope::~DrawScope() {
+	t_in_draw = m_previous;
+}
+bool InDraw() {
+	return t_in_draw;
+}
+
+std::string TakeReport(double /*cycles_per_us*/) {
+	auto&      c       = g_counters;
+	const auto percent = [&](uint64_t n) {
+		return c.stages != 0 ? 100.0 * static_cast<double>(n) / static_cast<double>(c.stages)
+		                     : 0.0;
+	};
+	std::string text = fmt::format(
+	    "memo (KYTY_DRAW_MEMO={}): etapas {}, aciertos {} ({:.1f}%, {} imagenes y {} samplers "
+	    "reutilizados), guardadas {}; fallos: no apta {}, clave nueva {}, descripciones "
+	    "borradas {}, memo de textura cambiado {}, imagenes creadas o borradas en su memoria {}, "
+	    "imagen retirada {}, no guardable {}",
+	    Mode(), c.stages, c.hits, percent(c.hits), c.images, c.samplers, c.stores, c.ineligible,
+	    c.miss_key, c.miss_gen, c.miss_entry, c.miss_stamp, c.miss_image, c.not_kept);
+	if (Mode() == 2) {
+		text += fmt::format("; verificador: comparadas {}, diferencias {}", c.verified,
+		                    c.differences);
+	}
+	c = {};
+	return text;
+}
+
+} // namespace DrawMemo
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
+	// gt7-drawmemo-1118: a draw stage on the GPU thread is timed by step ("Desglose draw").
+	const bool                      in_draw = DrawMemo::InDraw() && !MtGpu::OnWorker();
+	std::optional<GpuPhases::Scope> step;
+	if (in_draw) {
+		step.emplace(GpuPhases::Phase::DrawTexLock);
+	}
 	const TranslationLock translation_lock(m_translation_mutex); // stage d
+	step.reset();
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
@@ -3618,8 +3835,74 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		return false;
 	};
+	// gt7-drawmemo-1118 (KYTY_DRAW_MEMO): the stage's images and samplers of last time, when its
+	// program and descriptor words are the same and every image's texture memo still holds what
+	// it held then (DrawMemo::Find).
+	const int  memo_mode     = in_draw ? DrawMemo::Mode() : 0;
+	bool       memo_eligible = false;
+	uint64_t   memo_hash     = 0;
+	DrawMemo::StageSlot* memo_slot = nullptr;
+	if (memo_mode != 0) {
+		const GpuPhases::Scope check_phase(GpuPhases::Phase::DrawMemoCheck);
+		DrawMemo::g_counters.stages++;
+		memo_eligible = DrawMemo::StageEligible(program, snapshot, watched_use != UINT32_MAX);
+		if (!memo_eligible) {
+			DrawMemo::g_counters.ineligible++;
+		} else {
+			memo_hash = DrawMemo::KeyHash(&program, prepared.normalize_unnormalized, snapshot);
+			auto& textures = m_context.GetTextureCache();
+			memo_slot      = DrawMemo::Find(
+                program, prepared.normalize_unnormalized, snapshot, memo_hash, textures,
+                [&](ImageId id) {
+                    const auto* image = textures.m_slot_images.try_get(id);
+                    return image != nullptr && image->registered && !image->depth_id &&
+                           !image->binding.needs_rebind;
+                });
+			if (memo_slot != nullptr) {
+				DrawMemo::g_counters.hits++;
+			}
+		}
+	}
+	if (memo_mode == 1 && memo_slot != nullptr) {
+		{
+			const GpuPhases::Scope images_phase(GpuPhases::Phase::DrawTexImages);
+			GpuPhases::Count(GpuPhases::Phase::DrawTexImageCount, program.info.images.size());
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				// As ResolveTexture's texture memo answer, and the plain path after it.
+				g_texture_memo_counts.lookups++;
+				g_texture_memo_counts.found++;
+				auto binding = DrawMemo::MemoBinding(*memo_slot->entries[i]);
+				BindImage(binding.image_id,
+				          binding.desc.type == TextureCache::BindingType::Storage);
+				binding.mip_views.swap(prepared.images[i].mip_views);
+				binding.mip_views.clear();
+				prepared.images[i] = std::move(binding);
+			}
+			DrawMemo::g_counters.images += program.info.images.size();
+		}
+		const GpuPhases::Scope samplers_phase(GpuPhases::Phase::DrawTexSamplers);
+		GpuPhases::Count(GpuPhases::Phase::DrawTexSamplerCount, program.info.samplers.size());
+		prepared.samplers.assign(memo_slot->sampler_out.begin(), memo_slot->sampler_out.end());
+		DrawMemo::g_counters.samplers += memo_slot->sampler_out.size();
+	} else {
+	// The images and samplers resolved here, and whether they may be kept for the memo: every
+	// image answered by its texture memo, none a light grid.
+	bool keep = memo_eligible;
+	thread_local std::vector<TextureDescEntry*> hit_entries;
+	hit_entries.clear();
+	if (in_draw) {
+		step.emplace(GpuPhases::Phase::DrawTexImages);
+		GpuPhases::Count(GpuPhases::Phase::DrawTexImageCount, program.info.images.size());
+	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		if (keep) {
+			if (t_memo_hit_entry == nullptr) {
+				keep = false;
+			} else {
+				hit_entries.push_back(t_memo_hit_entry);
+			}
+		}
 		if (on_worker && MtGpu::SpeculationFailed()) {
 			return; // KYTY_MT_GPU=1/4: the GPU thread translates this draw itself
 		}
@@ -3632,6 +3915,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			binding       = {id, nullptr, std::move(desc)};
 		}
 		const bool grid    = pixel && IsLightGridBinding(program.info.images[i], binding);
+		keep               = keep && !grid;
 		if (grid) {
 			// Its later uploads are checked (TextureCache::CheckLightGridUpload), and what this
 			// binding reads (CheckLightGridView).
@@ -3654,6 +3938,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+	}
+	if (in_draw) {
+		step.emplace(GpuPhases::Phase::DrawTexSamplers);
+		GpuPhases::Count(GpuPhases::Phase::DrawTexSamplerCount, program.info.samplers.size());
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	// KYTY_BISECT lit:big: whether a sampler samples a depth image 4096 or more texels wide. One
@@ -3692,6 +3980,55 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.samplers.push_back(NativeSampler(
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
 		    samples_big_depth(i), prepared.normalize_unnormalized));
+	}
+	step.reset();
+	if (memo_mode == 2 && memo_slot != nullptr) {
+		// The verifier: what the memo would have given against what the normal path gave.
+		DrawMemo::g_counters.verified++;
+		const char* what = nullptr;
+		size_t      at   = 0;
+		for (size_t i = 0; i < program.info.images.size() && what == nullptr; i++) {
+			what = DrawMemo::DiffBinding(DrawMemo::MemoBinding(*memo_slot->entries[i]),
+			                             prepared.images[i]);
+			at   = i;
+		}
+		if (what == nullptr && memo_slot->sampler_out != prepared.samplers) {
+			what = "samplers";
+		}
+		if (what != nullptr) {
+			DrawMemo::g_counters.differences++;
+			static uint32_t logged = 0;
+			if (logged++ < 16) {
+				Log::WriteUnmuted(fmt::format(
+				    "Draw memo verificador: diferencia en {} (imagen {}) shader {:016x} etapa {}\n",
+				    what, at, program.shader_hash, static_cast<uint32_t>(program.stage)));
+			}
+		}
+	}
+	if (memo_mode != 0 && memo_eligible) {
+		if (keep && hit_entries.size() == program.info.images.size()) {
+			// Kept for the next draw of this program with these words.
+			auto& slot            = DrawMemo::Table().slots[memo_hash & (DrawMemo::StageTable::Slots - 1u)];
+			slot.program          = &program;
+			slot.normalize        = prepared.normalize_unnormalized;
+			slot.front_generation = GetTextureDescFront().generation;
+			slot.hash             = memo_hash;
+			slot.images           = snapshot.images;
+			slot.samplers         = snapshot.samplers;
+			slot.entries          = hit_entries;
+			slot.memos.clear();
+			for (const auto* entry: hit_entries) {
+				slot.memos.push_back(entry->memo);
+			}
+			slot.sampler_out = prepared.samplers;
+			DrawMemo::g_counters.stores++;
+		} else if (memo_slot == nullptr) {
+			DrawMemo::g_counters.not_kept++;
+		}
+	}
+	}
+	if (in_draw) {
+		step.emplace(GpuPhases::Phase::DrawTexTail);
 	}
 	for (const auto& use: snapshot.bindless_heaps) {
 		const uint64_t key = use.base ^ (static_cast<uint64_t>(use.table_offset) << 48u);

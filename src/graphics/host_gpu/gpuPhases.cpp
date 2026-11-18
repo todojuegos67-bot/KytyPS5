@@ -4,6 +4,7 @@
 #include "common/perfStats.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
@@ -608,6 +609,42 @@ void ReportIfDue(uint64_t frames) {
 	// GT7 port: the line goes where the Perf lines go (the port's log), so a run shows where
 	// the GPU thread's time per draw goes without a console.
 	Log::WriteUnmuted(line + "\n");
+	{
+		// gt7-drawmemo-1118: inside a draw's programs and textures, and the draw memo
+		// (drawMemo.h). Program gets, their key, scanner take and its byte check are of draws and
+		// dispatches together (per get); the textures' steps are of draws alone (per draw).
+		const auto per = [&](Phase phase, Phase by) {
+			const auto n = count(by);
+			return n != 0 ? static_cast<double>(count(phase)) / static_cast<double>(n) : 0.0;
+		};
+		const double tex     = each(Phase::DrawTextures, Phase::Draw);
+		const double lock    = each(Phase::DrawTexLock, Phase::Draw);
+		const double images  = each(Phase::DrawTexImages, Phase::Draw);
+		const double samples = each(Phase::DrawTexSamplers, Phase::Draw);
+		const double tail    = each(Phase::DrawTexTail, Phase::Draw);
+		const double check   = each(Phase::DrawMemoCheck, Phase::Draw);
+		std::string  desglose = fmt::format(
+            "Desglose draw ({:.1f} s): programas {:.2f} us/draw (describe {:.2f}; gets {:.2f}/draw "
+             "de {:.2f} us: clave y busqueda {:.2f}, toma del escaner {:.2f} de la que validar "
+             "bytes {:.2f} ({:.0f} bytes cada una), recorridos {:.2f} por get) | texturas {:.2f} "
+             "us/draw: lock {:.2f}, imagenes {:.2f} ({:.1f}/draw, {:.3f} us cada una), samplers "
+             "{:.2f} ({:.1f}/draw), cola {:.2f}, memo {:.2f}, resto {:.2f} | ",
+            seconds, each(Phase::DrawPrograms, Phase::Draw), each(Phase::Describe, Phase::Draw),
+            per(Phase::ProgramGet, Phase::Draw), each(Phase::ProgramGet, Phase::ProgramGet),
+            each(Phase::ProgramKey, Phase::ProgramGet),
+            each(Phase::ProgramScanned, Phase::ProgramGet),
+            each(Phase::ScanValidate, Phase::ProgramGet),
+            per(Phase::ScanValidateBytes, Phase::ScanValidate),
+            each(Phase::ProgramWalk, Phase::ProgramGet), tex, lock, images,
+            per(Phase::DrawTexImageCount, Phase::Draw),
+            count(Phase::DrawTexImageCount) != 0
+                ? us(Phase::DrawTexImages) / static_cast<double>(count(Phase::DrawTexImageCount))
+                : 0.0,
+            samples, per(Phase::DrawTexSamplerCount, Phase::Draw), tail, check,
+            tex - lock - images - samples - tail - check);
+		desglose += DrawMemo::TakeReport(cycles_per_us);
+		Log::WriteUnmuted(desglose + "\n");
+	}
 	// gt7-spec-1112: KYTY_SPECULATE's counters, on a line of their own.
 	Speculation::Report(cycles_per_us, seconds);
 	MtGpu::Report(new_frames, seconds);

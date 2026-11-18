@@ -102,6 +102,16 @@ enum class Phase : uint32_t {
 	ProgramMemoHit,  // (a count only) a get whose entry the memo gave, without hashing the key
 	ProgramMemoMiss, // (a count only) a get the memo could not serve (the map was searched)
 	ProgramMatch,    // a get's search of its entry's permutations (after the key and the refresh)
+	// gt7-drawmemo-1118: inside the steps above, for the "Desglose draw" line (drawMemo.h).
+	ScanValidate,      // TakeScanned's check of the bytes the scanner read (ReadSet::Validate)
+	ScanValidateBytes, // (a count only) the bytes those checks compared
+	DrawTexLock,       // a draw stage's PrepareBindings: taking the translation lock
+	DrawTexImages,     // its images (ResolveTexture and BindImage), or their reuse from the memo
+	DrawTexSamplers,   // its samplers (NativeSampler), or their reuse from the memo
+	DrawTexTail,       // the rest of it (bindless heaps, shader data, diagnostics)
+	DrawTexImageCount, // (a count only) the images of draw stages
+	DrawTexSamplerCount, // (a count only) the samplers of draw stages
+	DrawMemoCheck,     // the draw memo's lookup and check of a stage (KYTY_DRAW_MEMO)
 	Count
 };
 

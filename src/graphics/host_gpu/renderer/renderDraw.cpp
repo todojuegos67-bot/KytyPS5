@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawRepeats.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
@@ -2744,6 +2745,7 @@ uint32_t RenderExecutor::TranslateDrawBindings(TranslationContext& tc, DrawRende
 	auto&                  bindings    = tc.graphics;
 	uint32_t               stage_count = 0;
 	const GpuPhases::Scope phase(GpuPhases::Phase::DrawTextures);
+	const DrawMemo::DrawScope draw_memo_scope; // gt7-drawmemo-1118
 	for (uint32_t i = 0; i < vertex_stage_count; i++) {
 		bindings.vertex[i].normalize_unnormalized = state.programs.vertex[i].normalized_samplers;
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);

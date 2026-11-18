@@ -4868,9 +4868,14 @@ struct PipelineCache::ProgramCache {
 			DrawPrep::Add(DrawPrep::Counter::MissInputs);
 			return false;
 		}
-		if (!result->reads.Validate()) {
-			DrawPrep::Add(DrawPrep::Counter::MissReads);
-			return false;
+		{
+			// gt7-drawmemo-1118: the byte check timed apart ("Desglose draw").
+			const GpuPhases::Scope validate_phase(GpuPhases::Phase::ScanValidate);
+			GpuPhases::Count(GpuPhases::Phase::ScanValidateBytes, result->reads.ByteCount());
+			if (!result->reads.Validate()) {
+				DrawPrep::Add(DrawPrep::Counter::MissReads);
+				return false;
+			}
 		}
 		// A slot left to the GPU must still be GPU-written, or the walk here would read it.
 		for (const auto& fill: (again ? entry.resources : result->resources).gpu_fills) {
