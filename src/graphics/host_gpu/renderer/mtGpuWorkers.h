@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -14,13 +15,14 @@
 // default; KYTY_MT_GPU_THREADS workers, 3 by default).
 //
 // The draw-prep scanner (drawPrepScanner.cpp) reads each graphics submission ahead of the GPU
-// thread on its own register copy. Each chained INDIRECT_BUFFER (IT 0x3F, control bit 20) starts
-// a chunk; for every draw of the chunk it prepares (the shader pair known, the registers
-// followed), the scanner exports what its registers make of the draw (PipelineCache::
-// DrawPrepInputs: the stages' parameters and inputs, from its registers at that draw) with the
-// draw's key. A chunk with draws goes to the workers.
+// thread on its own register copy, from the moment the submission is enqueued (GuestGpu::
+// Enqueue). Each chained INDIRECT_BUFFER (IT 0x3F, control bit 20) starts a chunk, which goes to
+// the workers and the GPU thread right away (empty); for every draw of the chunk it prepares
+// (the shader pair known, the registers followed), the scanner exports what its registers make
+// of the draw (PipelineCache::DrawPrepInputs: the stages' parameters and inputs, from its
+// registers at that draw) with the draw's key, and the draw can be taken at once.
 //
-// A worker takes the chunk's draws in order: walks the stages' descriptors as the scanner's
+// A worker takes the oldest draw no worker has taken (several workers share a chunk): walks the stages' descriptors as the scanner's
 // walks do (DrawPrepWalk: only bytes no GPU work wrote, recorded), then, holding the
 // translation mutex and the pipeline, buffer and texture locks (tried, never waited for, never
 // the scheduler's), finds the stages' programs and translates the draw's bindings in deferred
@@ -29,9 +31,9 @@
 // diagnostic that logs in order) fails the draw: the GPU thread translates it as always. The
 // 64 KiB zones the translation read are recorded with the write registry's epoch (stage A).
 //
-// The GPU thread, at each draw (EmitPreparedDraw): when the draw's chunk is not finished by the
-// workers the chunk is cancelled and dropped (it never waits); when it is, the worker's
-// translation is used if its programs and descriptors are the GPU thread's own for the draw, no
+// The GPU thread, at each draw (EmitPreparedDraw): when no worker has finished the draw it is
+// passed over (it never waits; a worker not started on it never starts); when one has, the
+// worker's translation is used if its programs and descriptors are the GPU thread's own for the draw, no
 // zone it read was written (GPU, host, an image made or retired) after its epoch, and the images
 // it bound are still there: its BindImage calls are made again in the GPU thread's context, its
 // bindings moved in, its deferred actions run (EmitPreparedDraw then goes on as for a
@@ -61,6 +63,14 @@ struct SpecDraw {
 	std::array<bool, 4>                   normalized {};
 	RenderExecutor::TranslationContext    tc;
 	std::vector<std::pair<ImageId, bool>> binds; // BindImage's calls, in order
+	// Who has it: Free (no one yet), Running (a worker), Done (the worker's results above are
+	// complete: release/acquire), Abandoned (the GPU thread got there first: no worker starts it).
+	static constexpr uint32_t Free      = 0;
+	static constexpr uint32_t Running   = 1;
+	static constexpr uint32_t Done      = 2;
+	static constexpr uint32_t Abandoned = 3;
+	std::atomic<uint32_t>     state {Free};
+	uint64_t                  done_ns = 0; // worker: when it was Done
 	// GPU thread: taken already.
 	bool consumed = false;
 };
