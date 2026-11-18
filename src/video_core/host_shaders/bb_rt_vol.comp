@@ -9,6 +9,11 @@
 //           phase and exponential transmittance. Output (rgb in-scatter, view distance).
 //   mode 1  temporal: reprojected history (previous camera), clamped to the 3x3 neighbourhood.
 //   mode 2  joint-bilateral upsample (depth weights) to the lit scene size, added to it.
+// bb-fogfx (BB_FOG_FX 1..3, fx.x > 0): the density follows the game's fog CB (log2 density at
+// the camera, 1/H) times drifting world-space value noise; lamps / bright emitters of the lit
+// scene add a halo scaled by the fog on the pixel's own ray (mode 0); mode 2 first adds extra
+// height / distance fog (the game's colour, optical depth = fx.y x the game's along the ray, at
+// the full-res depth so edges get no halo), then the in-scattering.
 #version 460
 #extension GL_EXT_ray_query : require
 // Upper bound of the light added per pixel (scene units): no single texel can flash.
@@ -28,7 +33,12 @@ layout(std140, binding = 2) uniform Params {
     vec4 misc;       // density, max march distance, steps, frame
     vec4 misc2;      // history valid, temporal blend, far distance, y sign
     vec4 fog;        // view-space world up, height falloff 1/H (game fog CB, 0: uniform)
-    vec4 dbg;        // x: BB_RT_DEBUG_VIEW (2 volumetric only, 3 chosen depth), 0 off
+    vec4 dbg;        // x: BB_RT_DEBUG_VIEW (2 volumetric only, 3 chosen depth), 0 off;
+                     // y: fog-fx halo threshold (scene luminance)
+    vec4 fx;         // level (0 off), extra fog optical depth x game's, noise amplitude, halo
+    vec4 fx2;        // log2 game density at the camera, 1/H (signed), time (s), extra fog cap
+    vec4 fx3;        // game fog colour (rgb^2), Henyey-Greenstein g
+    mat4 inv_view;   // view -> world
 } p;
 layout(binding = 3) uniform sampler2D src_tex;  // mode 1: raw, mode 2: accumulated (nearest)
 layout(binding = 4) uniform sampler2D hist_tex; // previous accumulated (linear)
@@ -67,6 +77,65 @@ uint Hash(uint x) {
     return x;
 }
 
+float MaxAddV() {
+    return p.fx.x > 0.0 ? 1.0 : MaxAdd;
+}
+
+// bb-fogfx: 3D value noise (world space), two octaves.
+float Corner(ivec3 q) {
+    uvec3 u = uvec3(q);
+    return float(Hash(u.x ^ Hash(u.y ^ Hash(u.z + 0x9e3779b9u))) & 0xffffu) / 65535.0;
+}
+float VNoise(vec3 x) {
+    ivec3 i = ivec3(floor(x));
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = mix(Corner(i), Corner(i + ivec3(1, 0, 0)), f.x);
+    float b = mix(Corner(i + ivec3(0, 1, 0)), Corner(i + ivec3(1, 1, 0)), f.x);
+    float c = mix(Corner(i + ivec3(0, 0, 1)), Corner(i + ivec3(1, 0, 1)), f.x);
+    float d = mix(Corner(i + ivec3(0, 1, 1)), Corner(i + ivec3(1, 1, 1)), f.x);
+    return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
+}
+// Density multiplier at a view-space point: 1 +- amplitude, drifting with a slow fixed wind.
+float NoiseMul(vec3 view_pos) {
+    if (p.fx.z <= 0.0) {
+        return 1.0;
+    }
+    vec3 w = (p.inv_view * vec4(view_pos, 1.0)).xyz;
+    vec3 drift = vec3(0.6, 0.05, 0.25) * p.fx2.z;
+    vec3 x = (w - drift) * 0.085;
+    float n = 0.65 * VNoise(x) + 0.35 * VNoise(x * 2.07 + vec3(17.3, 5.1, 9.7));
+    return max(1.0 + p.fx.z * (n * 2.0 - 1.0) * 1.6, 0.0);
+}
+// Game density (fog CB) at distance t along a ray whose height grows by vy per unit.
+float GameDensity(float t, float vy) {
+    return exp2(clamp(p.fx2.x - vy * t * p.fx2.y, -60.0, 4.0));
+}
+
+// bb-fogfx: extra height / distance fog at a lit-scene pixel, from the full-res depth.
+// Optical depth = fx.y x the game's along the view ray (closed form of the exp2 height fog),
+// x drifting noise sampled half way; the sky (far plane) is left to the game.
+vec3 ExtraFog(ivec2 c, vec3 col) {
+    ivec2 dsz = textureSize(depth_tex, 0);
+    vec2 uv = (vec2(c) + 0.5) / vec2(p.size.zw);
+    float d = texelFetch(depth_tex, clamp(ivec2(uv * vec2(dsz)), ivec2(0), dsz - 1), 0).r;
+    vec4 ndc = vec4(uv.x * 2.0 - 1.0, p.misc2.w > 0.0 ? 1.0 - 2.0 * uv.y : 2.0 * uv.y - 1.0, d, 1.0);
+    vec4 v = p.inv_proj * ndc;
+    vec3 P = v.xyz / (abs(v.w) > 1e-8 ? v.w : 1.0);
+    float dist = length(P);
+    if (isnan(dist) || isinf(dist) || dist > p.misc2.z * 0.95 || dist < 1e-3) {
+        return col;
+    }
+    vec3 V = P / dist;
+    float a = dot(V, p.fog.xyz) * p.fx2.y; // log2 density lost per unit along the ray
+    float e = clamp(-a * dist, -60.0, 60.0);
+    float len = abs(a) > 1e-5 ? (1.0 - exp2(e)) / (a * 0.69314718) : dist;
+    float od = exp2(clamp(p.fx2.x, -60.0, 4.0)) * max(len, 0.0);
+    od *= p.fx.y * NoiseMul(V * min(dist, p.misc.y) * 0.5);
+    float f = min(1.0 - exp(-od), p.fx2.w);
+    return isnan(f) ? col : mix(col, p.fx3.rgb, f);
+}
+
 void main() {
     if (gl_LocalInvocationIndex < 2u) {
         s_n[gl_LocalInvocationIndex] = 0u;
@@ -88,13 +157,18 @@ void main() {
         float dens = p.misc.x;
         float acc = 0.0, od = 0.0; // in-scatter, optical depth so far
         float vy = dot(V, p.fog.xyz);  // world height gained per unit of march
+        const bool fx = p.fx.x > 0.0;
         for (int i = 0; i < steps; ++i) {
             float t = (float(i) + j) * dt;
             vec3 S = V * t;
             // Height fog (game fog CB, Ghidra FUN_02651f10: exp2f): density at the camera
             // height * exp2(-dy * iH), iH = +-1/H as the game packs it (v0.w).
-            float ds = dens * exp2(clamp(-vy * t * p.fog.w, -28.0, 28.0));
+            float ds = fx ? GameDensity(t, vy) * NoiseMul(S)
+                          : dens * exp2(clamp(-vy * t * p.fog.w, -28.0, 28.0));
             od += ds * dt;
+            if (p.color.w <= 0.0) {
+                continue; // fog-fx without a validated light: no shafts
+            }
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, tlas,
                                   gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
@@ -109,11 +183,38 @@ void main() {
                 acc += exp(-od) * ds * dt;
             }
         }
-        const float g = 0.55;
+        const float g = p.fx3.w > 0.0 ? p.fx3.w : 0.55;
         float ct = dot(V, L);
         float phase = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * ct, 1e-4), 1.5);
         vec3 o = p.color.rgb * (acc * phase * p.color.w);
-        imageStore(dst, c, vec4(any(isnan(o)) || any(isinf(o)) ? vec3(0.0) : clamp(o, vec3(0.0), vec3(MaxAdd)), dist));
+        // bb-fogfx: lamps / moon / bright emitters scatter into the fog on this pixel's ray.
+        // Scaled by that ray's own optical depth: a near object in front of a lamp (short,
+        // clear ray) gets almost none, so silhouettes are not haloed.
+        if (fx && p.fx.w > 0.0) {
+            vec2 sc = (vec2(c) + 0.5) * vec2(p.size.zw) / vec2(p.size.xy);
+            float R = 0.035 * float(p.size.w);
+            float thr = p.dbg.y > 0.0 ? p.dbg.y : 1.0;
+            vec3 h = vec3(0.0);
+            float ws = 0.0;
+            for (int k = 0; k < 12; ++k) {
+                float r = R * sqrt((float(k) + 0.5) / 12.0);
+                float a = float(k) * 2.39996 + j * 6.28318;
+                ivec2 q = clamp(ivec2(sc + r * vec2(cos(a), sin(a))), ivec2(0),
+                                ivec2(p.size.zw) - 1);
+                vec3 s = imageLoad(scene, q).rgb;
+                if (any(isnan(s)) || any(isinf(s))) {
+                    continue;
+                }
+                float lum = dot(s, vec3(0.2126, 0.7152, 0.0722));
+                float b = clamp((lum - thr) / max(lum, 1e-4), 0.0, 1.0);
+                float w = exp(-3.0 * r * r / (R * R));
+                h += min(s, vec3(16.0)) * b * w;
+                ws += w;
+            }
+            float scatter = 1.0 - exp(-od * 6.0);
+            o += h / max(ws, 1e-4) * (p.fx.w * scatter);
+        }
+        imageStore(dst, c, vec4(any(isnan(o)) || any(isinf(o)) ? vec3(0.0) : clamp(o, vec3(0.0), vec3(MaxAddV())), dist));
     } else if (pc.mode == 1u && all(lessThan(c, ivec2(p.size.xy)))) {
         vec4 cur = texelFetch(src_tex, c, 0);
         vec4 outv = cur;
@@ -147,7 +248,7 @@ void main() {
         if (any(isnan(outv.rgb)) || any(isinf(outv.rgb))) {
             outv.rgb = vec3(0.0);
         }
-        outv.rgb = clamp(outv.rgb, vec3(0.0), vec3(MaxAdd));
+        outv.rgb = clamp(outv.rgb, vec3(0.0), vec3(MaxAddV()));
         imageStore(dst, c, outv);
     } else if (pc.mode == 2u && all(lessThan(c, ivec2(p.size.zw)))) {
         vec2 hp = (vec2(c) + 0.5) * vec2(p.size.xy) / vec2(p.size.zw) - 0.5;
@@ -172,7 +273,7 @@ void main() {
         if (dv == 2) {
             // In-scattering alone, x4 so a faint fog is visible.
             vec3 a = (any(isnan(add)) || any(isinf(add))) ? vec3(1.0, 0.0, 1.0)
-                                                          : clamp(add, vec3(0.0), vec3(MaxAdd)) * 4.0;
+                                                          : clamp(add, vec3(0.0), vec3(MaxAddV())) * 4.0;
             imageStore(scene, c, vec4(a, 1.0));
         } else if (dv == 3) {
             float g = 1.0 - clamp(log2(1.0 + dref) / log2(1.0 + p.misc2.z), 0.0, 1.0);
@@ -180,7 +281,10 @@ void main() {
         } else if (!any(isnan(add)) && !any(isinf(add))) {
             vec4 sc = imageLoad(scene, c);
             if (!any(isnan(sc)) && !any(isinf(sc))) {
-                imageStore(scene, c, vec4(sc.rgb + clamp(add, vec3(0.0), vec3(MaxAdd)), sc.a));
+                if (p.fx.x > 0.0 && p.fx.y > 0.0 && dot(p.fx3.rgb, vec3(1.0)) > 0.0) {
+                    sc.rgb = ExtraFog(c, sc.rgb);
+                }
+                imageStore(scene, c, vec4(sc.rgb + clamp(add, vec3(0.0), vec3(MaxAddV())), sc.a));
             }
         }
     }

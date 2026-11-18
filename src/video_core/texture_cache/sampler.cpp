@@ -10,14 +10,26 @@ namespace VideoCore {
 
 Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                  const AmdGpu::BorderColorBuffer border_color_base, const bool is_depth,
-                 float extra_lod_bias) {
+                 float extra_lod_bias, u32 bb_filter) {
     using namespace Vulkan;
+    // bb-tex (BB_TEX_QUALITY / BB_ANISO, scene draws only, bb_texture.h): bits 0-4 force the
+    // anisotropy ratio of a linear-filtered sampler (also one the game left at 1x), bit 6 turns
+    // its point-mip filter into a linear one (trilinear). Point-filtered samplers keep the game's.
+    const bool bb_linear = LiverpoolToVK::Filter(sampler.xy_min_filter) == vk::Filter::eLinear;
+    const u32 bb_ratio = bb_linear ? (bb_filter & 31u) : 0u;
+    const bool game_aniso = AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
+                            AmdGpu::IsAnisoFilter(sampler.xy_min_filter);
     const bool anisotropy_enable = instance.IsAnisotropicFilteringSupported() &&
-                                   (AmdGpu::IsAnisoFilter(sampler.xy_mag_filter) ||
-                                    AmdGpu::IsAnisoFilter(sampler.xy_min_filter));
+                                   (bb_ratio != 0 ? bb_ratio > 1 : game_aniso);
     const float max_anisotropy =
-        anisotropy_enable ? std::clamp(sampler.MaxAniso(), 1.0f, instance.MaxSamplerAnisotropy())
-                          : 1.0f;
+        anisotropy_enable
+            ? std::clamp(bb_ratio != 0 ? float(bb_ratio) : sampler.MaxAniso(), 1.0f,
+                         instance.MaxSamplerAnisotropy())
+            : 1.0f;
+    auto mip_mode = LiverpoolToVK::MipFilter(sampler.mip_filter);
+    if ((bb_filter & 64u) && bb_linear && sampler.mip_filter == AmdGpu::MipFilter::Point) {
+        mip_mode = vk::SamplerMipmapMode::eLinear;
+    }
     auto border_color = LiverpoolToVK::BorderColor(sampler.border_color_type);
     if (border_color == vk::BorderColor::eFloatCustomEXT &&
         !instance.IsCustomBorderColorSupported()) {
@@ -48,7 +60,7 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .pNext = custom_color ? &*custom_color : nullptr,
         .magFilter = LiverpoolToVK::Filter(sampler.xy_mag_filter),
         .minFilter = LiverpoolToVK::Filter(sampler.xy_min_filter),
-        .mipmapMode = LiverpoolToVK::MipFilter(sampler.mip_filter),
+        .mipmapMode = mip_mode,
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),

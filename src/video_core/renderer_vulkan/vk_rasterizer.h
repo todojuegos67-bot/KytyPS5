@@ -155,7 +155,7 @@ public:
 
 private:
     bool BbUiSingleTarget(const GraphicsPipeline* pipeline) const;
-    void BbLodBias();
+    void BbLodBias(const GraphicsPipeline* pipeline);
     // Supermedo's UpdateUiTransform: the scale of a draw into the output-size UI images.
     void BbUpdateUiTransform();
     // bb-hud-fullres: the scissor of viewport `index` for a draw laid out for the output.
@@ -196,6 +196,7 @@ private:
     // bb-gpu6 (BB_LOD_BIAS): extra texture LOD bias of this draw's samplers (scene draws while
     // upscaling), and the one BindResources applies (0 for compute).
     float bb_lod_bias = 0.0f, bb_bind_lod_bias = 0.0f;
+    u32 bb_tex_filter = 0, bb_bind_tex_filter = 0; // bb-tex: BB::Texture::FilterBits()
 
 public:
     BB::SceneDepth bb_scene_depth; // bb-clean-021 (bb_present_sr.h)

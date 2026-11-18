@@ -262,6 +262,16 @@ private:
     float used_color[3]{};
     const char* fog_src = "fallback (BB_RT_VOLUMETRIC_DENSITY default, no height fog)";
     std::chrono::steady_clock::time_point vol_last_log{};
+    // bb-fogfx (BB_FOG_FX / BB_VOL, bb_fogfx.h): level 0 = the light-only pass above.
+    int fx_level = 0;
+    float fx_extra_od = 0.0f, fx_extra_max = 0.0f, fx_noise = 0.0f, fx_halo = 0.0f, fx_g = 0.55f;
+    float fx_halo_thr = 1.0f;
+    bool fog_game = false;         // the game's fog param has a distance (v0.y = 1/dist > 0)
+    float fog_log2_cam = -126.0f;  // log2 of the density at the camera height (no underflow)
+    float fog_rgb[3]{};            // game fog colour, v1.rgb (rgb^2)
+    bool vol_no_light = false;     // this run has no validated light: no shafts, fog / halo only
+    u64 vol_no_light_runs = 0;
+    std::chrono::steady_clock::time_point fx_t0{};
 
     // bb-rt-shadow state (BB_RT_SHADOWS=1).
     bool sh_on = false, sh_ok = false, sh_fresh = true;

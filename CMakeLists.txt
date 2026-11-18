@@ -1262,6 +1262,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/bb/bb_objmv2.cpp
                src/video_core/bb/bb_objmv2.h
                src/video_core/bb/bb_upscale.h
+               src/video_core/bb/bb_texture.h
+               src/video_core/bb/bb_fogfx.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h

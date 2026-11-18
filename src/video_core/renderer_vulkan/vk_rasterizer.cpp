@@ -33,6 +33,8 @@
 #include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/bb/bb_fogfx.h"
+#include "video_core/bb/bb_texture.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/bb_ui_composition.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -84,6 +86,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!bb_rt_reflect->Init()) {
             LOG_ERROR(Render_Vulkan, "[rt] init failed: RT features off");
         }
+    } else if (BB::FogFx::Level() > 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "[fog-fx] BB_FOG_FX={} requested but this device has no ray query / "
+                    "acceleration structures: volumetric fog off",
+                    BB::FogFx::Level());
     }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -345,12 +352,8 @@ bool BbRtFullresLogRequested() { // BB_RT_REFLECT_FULLRES=log: the draw-chain di
     }();
     return on;
 }
-bool BbRtVolRequested() { // BB_RT_VOLUMETRIC=1 (independent of BB_RT_REFLECT)
-    static const bool on = [] {
-        const char* e = std::getenv("BB_RT_VOLUMETRIC");
-        return e && e[0] == '1';
-    }();
-    return on;
+bool BbRtVolRequested() { // BB_RT_VOLUMETRIC=1 or BB_FOG_FX / BB_VOL (bb_fogfx.h)
+    return BB::FogFx::VolRequested();
 }
 bool BbRtShadowRequested() { // BB_RT_SHADOWS=1 (independent of the others)
     static const bool on = [] {
@@ -1298,6 +1301,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     buffer_infos.clear();
     image_infos.clear();
     bb_bind_lod_bias = pipeline->IsCompute() ? 0.0f : bb_lod_bias;
+    bb_bind_tex_filter = pipeline->IsCompute() ? 0u : bb_tex_filter;
 
     bool uses_dma = false;
 
@@ -1977,7 +1981,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth,
-                                     sampler.is_depth ? 0.0f : bb_bind_lod_bias);
+                                     sampler.is_depth ? 0.0f : bb_bind_lod_bias,
+                                     sampler.is_depth ? 0u : bb_bind_tex_filter);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -1994,8 +1999,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 // and FSR ask for), or they are sampled one mip too blurry and the upscaler cannot bring the
 // detail back. Scene draws only (depth test on into the scene-size depth, before the HUD cut).
 // BB_LOD_BIAS=off: none; a number: that bias instead; BB_LOD_BIAS_EXTRA adds to the automatic one.
-void Rasterizer::BbLodBias() {
+// bb-tex (BB_TEX_QUALITY / BB_ANISO, bb_texture.h): the quality row's LOD offset and the
+// anisotropy / trilinear override, on the same scene draws, with or without an upscaler.
+// Extra (5) holds alpha-tested (PS discard) and blended draws at a milder offset.
+void Rasterizer::BbLodBias(const GraphicsPipeline* pipeline) {
     bb_lod_bias = 0.0f;
+    bb_tex_filter = 0;
     static const int mode = [] {
         const char* v = std::getenv("BB_LOD_BIAS");
         if (v != nullptr && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0)) return 0;
@@ -2010,28 +2019,51 @@ void Rasterizer::BbLodBias() {
         const char* v = std::getenv("BB_LOD_BIAS_EXTRA");
         return v != nullptr ? float(std::atof(v)) : 0.0f;
     }();
-    if (mode == 0 || !BB::Upscale::Enabled() || !BB::Upscale::BackendReady()) return;
+    const auto& tex = BB::Texture::Get();
+    const bool tex_on = tex.level >= 0 || tex.aniso != 0;
+    const bool up = BB::Upscale::Enabled() && BB::Upscale::BackendReady();
+    if (!tex_on && (mode == 0 || !up)) return;
     const auto& regs = liverpool->regs;
     if (!regs.depth_control.depth_enable || !db_desc.image_id || bb_cut.UiPhase()) return;
     const auto& depth = texture_cache.GetImage(db_desc.image_id);
-    if (depth.info.size.width != BB::Upscale::g_scene_w ||
-        depth.info.size.height != BB::Upscale::g_scene_h) {
+    if (BB::Upscale::g_scene_w != 0 &&
+        (depth.info.size.width != BB::Upscale::g_scene_w ||
+         depth.info.size.height != BB::Upscale::g_scene_h)) {
         return;
     }
+    float bias = 0.0f;
     u32 ow = 0, oh = 0;
-    if (!BB::Upscale::OutputSize(ow, oh) || ow == 0 || BB::Upscale::g_scene_w == 0) return;
-    const float ratio = float(BB::Upscale::g_scene_w) / float(ow);
-    float bias = mode == 2 ? fixed : (ratio < 0.99f ? std::log2(ratio) + extra : 0.0f);
+    const bool have_out = up && BB::Upscale::OutputSize(ow, oh) && ow != 0 &&
+                          BB::Upscale::g_scene_w != 0;
+    if (mode != 0 && have_out) {
+        const float ratio = float(BB::Upscale::g_scene_w) / float(ow);
+        bias = mode == 2 ? fixed : (ratio < 0.99f ? std::log2(ratio) + extra : 0.0f);
+    }
+    bool alpha = false;
+    if (tex.level >= 0) {
+        if (pipeline != nullptr && tex.lod_offset_alpha != tex.lod_offset) {
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && stage->sw_stage == Shader::SwStage::Fragment && stage->has_discard) {
+                    alpha = true;
+                }
+            }
+            alpha = alpha || regs.blend_control[0].enable;
+        }
+        bias += alpha ? tex.lod_offset_alpha : (up ? tex.lod_offset_tu : tex.lod_offset);
+    }
     bias = std::round(bias * 8.0f) / 8.0f; // few distinct samplers
     bb_lod_bias = bias;
+    bb_tex_filter = BB::Texture::FilterBits();
     static float logged = 1e9f;
-    if (bias != logged) {
+    if (!alpha && bias != logged) {
         logged = bias;
         BB::Upscale::Checkpoint(fmt::format(
             "[lod-bias] scene textures {:+.3f} (render {}x{} -> output {}x{}; BB_LOD_BIAS={}, "
-            "BB_LOD_BIAS_EXTRA {:+.2f})",
+            "BB_LOD_BIAS_EXTRA {:+.2f}; BB_TEX_QUALITY {} {:+.2f}, alpha-tested / blended "
+            "{:+.2f}; filter bits {:#x})",
             bias, BB::Upscale::g_scene_w, BB::Upscale::g_scene_h, ow, oh,
-            mode == 2 ? "fixed" : "auto", extra));
+            mode == 2 ? "fixed" : mode == 0 ? "off" : "auto", extra, tex.level,
+            up ? tex.lod_offset_tu : tex.lod_offset, tex.lod_offset_alpha, bb_tex_filter));
     }
 }
 
@@ -2047,7 +2079,7 @@ bool Rasterizer::BbUiSingleTarget(const GraphicsPipeline* pipeline) const {
 
 void Rasterizer::BbUiDraw(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->regs;
-    BbLodBias();
+    BbLodBias(pipeline);
     if (!BB::UiCut::Active()) {
         return;
     }

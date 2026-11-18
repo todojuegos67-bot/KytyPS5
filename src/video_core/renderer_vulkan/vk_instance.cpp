@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/bb/bb_fogfx.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "core/address_space.h"
 #include "video_core/bb/bb_fg.h"
@@ -442,8 +443,9 @@ bool Instance::CreateDevice() {
         const char* e = std::getenv(n);
         return e && e[0] == '1';
     };
+    // bb-fogfx: BB_FOG_FX 1..3 / BB_VOL=1 run the volumetric pass, which needs ray query too.
     if (bb_env_on("BB_RT_REFLECT") || bb_env_on("BB_RT_VOLUMETRIC") ||
-        bb_env_on("BB_RT_SHADOWS")) {
+        bb_env_on("BB_RT_SHADOWS") || BB::FogFx::VolRequested()) {
         const auto has = [&](std::string_view n) {
             return std::find(available_extensions.begin(), available_extensions.end(), n) !=
                    available_extensions.end();

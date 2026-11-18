@@ -10,6 +10,7 @@
 #include <cstring>
 #include <span>
 #include "common/logging/log.h"
+#include "video_core/bb/bb_fogfx.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/host_shaders/bb_rt_depthcvt_comp.h"
 #include "video_core/host_shaders/bb_rt_mesh_comp.h"
@@ -97,6 +98,12 @@ struct alignas(16) VolParams {
     float misc2[4]; // history valid, temporal blend, far distance, y sign
     float fog[4];   // view-space world up (xyz), height falloff 1/H (density *= exp(-dy / H))
     float dbg[4];   // BB_RT_DEBUG_VIEW (x), 0: off
+    // bb-fogfx (BB_FOG_FX): x level (0: off), y extra fog optical depth (x the game's),
+    // z noise amplitude, w halo strength
+    float fx[4];
+    float fx2[4];      // log2 game density at the camera, 1/H (signed), time (s), extra cap
+    float fx3[4];      // game fog colour (v1 rgb^2), Henyey-Greenstein g
+    float inv_view[16]; // view -> world (noise coordinates)
 };
 static_assert(sizeof(VolParams) <= 512);
 
@@ -420,7 +427,7 @@ bool RtReflect::Init() {
         l_queries = lqp;
     }
     ok = true;
-    vol_on = EnvOn("BB_RT_VOLUMETRIC");
+    vol_on = BB::FogFx::VolRequested(); // BB_RT_VOLUMETRIC=1, BB_FOG_FX=1..3 or BB_VOL=1
     if (vol_on && !InitVolumetric()) {
         vol_on = false;
         LOG_ERROR(Render_Vulkan, "[rt-vol] init failed: volumetric light off");
@@ -1033,12 +1040,23 @@ void RtReflect::Log() {
 
 bool RtReflect::InitVolumetric() {
     const auto device = instance.GetDevice();
-    vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", 0.5f, 0.0f, 10.0f);
+    const auto& fx = BB::FogFx::Get();
+    fx_level = fx.level;
+    fx_extra_od = fx.extra_od;
+    fx_extra_max = fx.extra_max;
+    fx_noise = fx.noise;
+    fx_halo = fx.halo;
+    fx_g = fx.g;
+    // Scene luminance above which a pixel counts as a lamp / emitter for the halo (the lit
+    // scene's HDR scale is not decoded; 1.0 = above diffuse white).
+    fx_halo_thr = EnvFloat("BB_FOG_FX_HALO_THRESHOLD", 1.0f, 0.05f, 64.0f);
+    fx_t0 = std::chrono::steady_clock::now();
+    vol_strength = EnvFloat("BB_RT_VOLUMETRIC_STRENGTH", fx.strength, 0.0f, 10.0f);
     dbg_view = u32(EnvFloat("BB_RT_DEBUG_VIEW", 0.0f, 0.0f, 4.0f));
     vol_density = EnvFloat("BB_RT_VOLUMETRIC_DENSITY", 0.02f, 0.0001f, 1.0f);
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DENSITY"); e && e[0]) density_env = true;
-    vol_dist = EnvFloat("BB_RT_VOLUMETRIC_DIST", 60.0f, 2.0f, 1000.0f);
-    vol_steps = u32(EnvFloat("BB_RT_VOLUMETRIC_STEPS", 12.0f, 2.0f, 64.0f));
+    vol_dist = EnvFloat("BB_RT_VOLUMETRIC_DIST", fx.march, 2.0f, 1000.0f);
+    vol_steps = u32(EnvFloat("BB_RT_VOLUMETRIC_STEPS", float(fx.steps), 2.0f, 64.0f));
     if (const char* e = std::getenv("BB_RT_VOLUMETRIC_DIR"); e && e[0]) {
         float v[3]{};
         if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) == 3) {
@@ -1109,6 +1127,16 @@ bool RtReflect::InitVolumetric() {
     });
     if (qr == vk::Result::eSuccess) vol_queries = qp;
     vol_ok = true;
+    LOG_INFO(Render_Vulkan,
+             "[fog-fx] BB_FOG_FX={} ({}{}): extra height / distance fog = {:.2f} x the game's "
+             "optical depth (fog CB slot 6, FUN_02651f10; opacity cap {:.2f}), shafts strength "
+             "{:.2f} (light-set CB slot 5, FUN_026deeb0; HG g {:.2f}), lamp / moon halo {:.2f}, "
+             "drifting noise {:.2f}; {} steps over {:.0f} units at half res; also runs without a "
+             "validated light (fog + halos only)",
+             fx.level, fx.name,
+             std::getenv("BB_FOG_FX") ? "" : fx.level > 0 ? ", from BB_VOL=1" : "",
+             fx.extra_od, fx.extra_max, vol_strength, fx.g, fx.halo, fx.noise, vol_steps,
+             vol_dist);
     LOG_INFO(Render_Vulkan,
              "[rt-vol] ray-traced volumetric light ON: half res (depth size) trace, {} steps, "
              "march {:.0f} units, density {:.4f}, strength {:.2f}, colour ({:.2f}, {:.2f}, {:.2f}), "
@@ -1206,6 +1234,9 @@ void RtReflect::GameFog() {
     }
     if (!have) {
         // No fog CB: no in-scattering unless the density is forced (BB_RT_VOLUMETRIC_DENSITY).
+        fog_game = density_env;
+        fog_log2_cam = density_env ? std::log2(vol_density) : -126.0f;
+        for (float& c : fog_rgb) c = 0.0f;
         fog_density = density_env ? vol_density : 0.0f;
         fog_src = density_env ? "BB_RT_VOLUMETRIC_DENSITY (no fog CB seen)"
                               : "no fog CB seen (slot 6 not recognised in 120 frames)";
@@ -1216,6 +1247,13 @@ void RtReflect::GameFog() {
     const double id = f[1], ih = f[3], cam_y = f[15];
     const double e = std::clamp(-cam_y * ih, -1000.0, 1000.0);
     const double dens = id > 0.0 ? id * std::exp2(e) : 0.0;
+    // bb-fogfx: the same density as a log2 (no float underflow above the fog layer) and the
+    // game's fog colour, for the extra fog of BB_FOG_FX.
+    fog_game = id > 0.0 || density_env;
+    fog_log2_cam = density_env ? std::log2(vol_density)
+                   : id > 0.0  ? static_cast<float>(std::clamp(std::log2(id) + e, -126.0, 0.0))
+                               : -126.0f;
+    for (int i = 0; i < 3; ++i) fog_rgb[i] = std::isfinite(f[4 + i]) ? std::clamp(f[4 + i], 0.0f, 4.0f) : 0.0f;
     fog_height = std::clamp(f[3], -10.0f, 10.0f);
     const float m = std::max({f[4], f[5], f[6]});
     for (int i = 0; i < 3; ++i) fog_tint[i] = m > 1e-6f ? f[4 + i] / m : 1.0f;
@@ -1345,10 +1383,18 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
                            const vk::DescriptorImageInfo& depth_info) {
     const u32 w = lw_, h = lh_;
     float lv[3];
-    if (!LightDir(view, lv)) {
-        VolSkip("no validated game light");
-        LogVolumetric();
-        return;
+    if (vol_no_light || !LightDir(view, lv)) {
+        if (fx_level == 0) {
+            VolSkip("no validated game light");
+            LogVolumetric();
+            return;
+        }
+        // BB_FOG_FX without a light: fog and halos only (shaft strength 0, no ray queries).
+        vol_no_light = true;
+        ++vol_no_light_runs;
+        lv[0] = static_cast<float>(view[1]);
+        lv[1] = static_cast<float>(view[5]);
+        lv[2] = static_cast<float>(view[9]);
     }
     if (vol_w != w || vol_h != h || !vraw.image) {
         FreeImage(vraw);
@@ -1390,9 +1436,10 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
     vp.color[0] = used_color[0];
     vp.color[1] = used_color[1];
     vp.color[2] = used_color[2];
-    vp.color[3] = vol_strength;
+    vp.color[3] = vol_no_light ? 0.0f : vol_strength;
     vp.misc[0] = fog_density;
     vp.dbg[0] = float(dbg_view);
+    vp.dbg[1] = fx_halo_thr;
     vp.fog[0] = static_cast<float>(view[1]); // world +y in view space (column 1 of the 3x4 view)
     vp.fog[1] = static_cast<float>(view[5]);
     vp.fog[2] = static_cast<float>(view[9]);
@@ -1409,6 +1456,27 @@ void RtReflect::Volumetric(vk::CommandBuffer cmd, vk::ImageView scene_view, u32 
     }
     vp.misc2[2] = far_dist;
     vp.misc2[3] = 1.0f;
+    // bb-fogfx (BB_FOG_FX): game fog scaled, noise, halos; level 0 leaves the pass as it was.
+    vp.fx[0] = float(fx_level);
+    vp.fx[1] = fx_extra_od;
+    vp.fx[2] = fx_noise;
+    vp.fx[3] = fx_halo;
+    vp.fx2[0] = fog_log2_cam;
+    vp.fx2[1] = fog_height;
+    vp.fx2[2] = static_cast<float>(
+        std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now() - fx_t0).count(),
+                  4096.0));
+    vp.fx2[3] = fx_extra_max;
+    for (int i = 0; i < 3; ++i) vp.fx3[i] = fog_rgb[i];
+    vp.fx3[3] = fx_level > 0 ? fx_g : 0.55f;
+    {
+        double iv[16];
+        if (Invert4(view, iv)) {
+            ToGlsl(iv, vp.inv_view);
+        } else {
+            for (int i = 0; i < 4; ++i) vp.inv_view[i * 5] = 1.0f;
+        }
+    }
     std::memcpy(static_cast<u8*>(vol_params.mapped) + slot * ParamSize, &vp, sizeof(vp));
 
     ReadTimer(vol_queries, vol_query_used, slot, vol_ms_sum, vol_ms_n);
@@ -1540,6 +1608,17 @@ void RtReflect::LogVolumetric() {
              vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0, vol_strength, used_dir[0], used_dir[1],
              used_dir[2], light_src, used_color[0], used_color[1], used_color[2], color_src,
              fog_tint[0], fog_tint[1], fog_tint[2], fog_density, fog_height, fog_src);
+    if (fx_level > 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[fog-fx] 5 s: level {} ran {} passes ({} without a validated light: fog + halos "
+                 "only), GPU {:.3f} ms per pass; game fog log2 density at camera {:.2f}, 1/H "
+                 "{:.4f}, colour ({:.3f}, {:.3f}, {:.3f}); extra fog {:.2f}x (cap {:.2f}), halo "
+                 "{:.2f}, noise {:.2f}",
+                 fx_level, runs, vol_no_light_runs, vol_ms_n ? vol_ms_sum / vol_ms_n : 0.0,
+                 fog_log2_cam, fog_height, fog_rgb[0], fog_rgb[1], fog_rgb[2], fx_extra_od,
+                 fx_extra_max, fx_halo, fx_noise);
+        vol_no_light_runs = 0;
+    }
     vol_ms_sum = 0.0;
     vol_ms_n = 0;
 }
@@ -1587,10 +1666,13 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     }
     // A validated game light, or nothing (never a guessed direction).
     float lv_check[3];
-    if (!LightDir(vd, lv_check)) {
+    const bool have_light = LightDir(vd, lv_check);
+    // bb-fogfx: the extra fog and the halos need no light; only the shafts / shadows do.
+    if (!have_light && !(vol_on && vol_ok && fx_level > 0)) {
         l_skip = LightSkip::NoLight;
         return false;
     }
+    vol_no_light = !have_light;
     // Trace (and depth-mesh) size: the depth, halved when it is the full render size.
     const u32 ds = in.depth_width > 1100 ? 2u : 1u;
     const u32 new_lw = std::max(1u, in.depth_width / ds);
@@ -1616,13 +1698,15 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
                            vd[10] * l_prev_view[10];
         if (!(dt < 8.0) || !(fwd > 0.94)) ResetLightHistory("camera cut");
     }
-    if (l_have_light && !l_hist_restarted) {
+    if (have_light && l_have_light && !l_hist_restarted) {
         const float d = used_dir[0] * l_prev_light[0] + used_dir[1] * l_prev_light[1] +
                         used_dir[2] * l_prev_light[2];
         if (!(d > 0.995f)) ResetLightHistory("light changed");
     }
-    for (int i = 0; i < 3; ++i) l_prev_light[i] = used_dir[i];
-    l_have_light = true;
+    if (have_light) {
+        for (int i = 0; i < 3; ++i) l_prev_light[i] = used_dir[i];
+        l_have_light = true;
+    }
     if (l_hist_restarted) {
         static u64 n_logged = 0;
         if (n_logged++ < 8) {
@@ -1785,10 +1869,13 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     if (vol_on && vol_ok) {
         GameFog();
     }
-    const bool sh_run = sh_on && sh_ok && dbg_view != 2;
+    const bool sh_run = sh_on && sh_ok && dbg_view != 2 && have_light;
     const bool vol_view = dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run);
-    const bool vol_run =
-        vol_on && vol_ok && vol_view && (fog_density > 0.0f || dbg_view == 2 || dbg_view == 3);
+    // BB_FOG_FX: wherever the game has fog (v0.y = 1/dist > 0), also when the density at the
+    // camera height underflows (camera above the fog layer); level 0: density at the camera > 0.
+    const bool vol_run = vol_on && vol_ok && vol_view &&
+                         ((fx_level > 0 ? fog_game : fog_density > 0.0f) || dbg_view == 2 ||
+                          dbg_view == 3);
     if (vol_on && !vol_run) {
         VolSkip(!vol_ok ? "volumetric images failed"
                 : !vol_view ? "BB_RT_DEBUG_VIEW shows another pass"

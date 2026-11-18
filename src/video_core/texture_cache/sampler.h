@@ -18,7 +18,7 @@ class Sampler : public Common::LRUNode<> {
 public:
     explicit Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sampler,
                      const AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
-                     float extra_lod_bias = 0.0f);
+                     float extra_lod_bias = 0.0f, u32 bb_filter = 0);
     ~Sampler();
 
     Sampler(const Sampler&) = delete;
