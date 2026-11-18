@@ -60,6 +60,13 @@ void OnConstants(const u32* data, size_t count);
 // the projection (floats 52-67, row-major, column vectors) and the view (floats 8-19, 3x4 rows)
 // and the far distance (float 0). False until one was seen.
 bool RtCamera(float proj[16], float view[12], float& far_dist);
+// bb-pathtracing: this frame's main camera (the frame's first scene block): view to world (3x4
+// rows, floats 180-191) and the projection (x scale, y scale, z scale, z offset: floats 52, 57,
+// 62, 63). False until one was seen this frame or the last.
+bool PtCamera(float inv_view[12], float proj[4]);
+// bb-pathtracing without an upscaler (no EndFrame at the flip): the next scene block starts the
+// next frame's camera. No effect while the upscaler captures (EndFrame does it).
+void PtFrameStart();
 // bb-rt-vol: the same block's first 216 floats (light direction search).
 bool RtSceneBlock(float out[216]);
 // bb-rt-vol (Ghidra, eboot 1.09): the game's per-frame light-set and fog constant buffers.

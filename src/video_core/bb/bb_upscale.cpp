@@ -677,6 +677,29 @@ bool RtCamera(float proj[16], float view[12], float& far_dist) {
     far_dist = g_rt_cam.far_dist;
     return true;
 }
+bool PtCamera(float inv_view[12], float proj[4]) {
+    std::scoped_lock lk{g_cam_mutex};
+    if (!g_cam_cur.valid) {
+        return false;
+    }
+    std::memcpy(inv_view, g_cam_cur.inv_view, sizeof(g_cam_cur.inv_view));
+    std::memcpy(proj, g_cam_cur.proj, sizeof(g_cam_cur.proj));
+    for (int i = 0; i < 12; ++i) {
+        if (!std::isfinite(inv_view[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void PtFrameStart() {
+    if (Capture()) {
+        return;
+    }
+    std::scoped_lock lk{g_cam_mutex};
+    g_frame_has_camera = false;
+}
+
 bool RtSceneBlock(float out[216]) {
     std::scoped_lock lk{g_cam_mutex};
     if (!g_rt_cam.valid) {

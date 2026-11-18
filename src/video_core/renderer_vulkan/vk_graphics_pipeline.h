@@ -101,6 +101,11 @@ public:
         return key;
     }
 
+    /// bb-pathtracing: the vertex shader stores the path tracer's geometry (PushData::Pt*).
+    bool PtStore() const noexcept {
+        return pt_store;
+    }
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -114,6 +119,7 @@ private:
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    bool pt_store{};
 };
 
 struct ClipDistanceShaderKey {

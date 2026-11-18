@@ -114,6 +114,22 @@ struct Info : InfoPersistent {
     VAddr pgm_base;
     bool has_storage_images{};
     bool has_discard{};
+    // bb-pathtracing (shader_info_collection_pass.cpp FindAlbedo / FindAlphaSource /
+    // FindNormalMap, from Joao Vitor Alves' path tracing mod): which image resource and pixel
+    // shader input give a G-buffer draw its albedo, alpha-test mask and normal map, so the
+    // tracer can texture its hits. Saved after the persistent block of the shader cache meta
+    // (an optional trailing record: older caches load with "unknown", -1); no version bump.
+    s32 rt_albedo_image{-1};
+    s32 rt_albedo_input{-1};
+    u8 rt_albedo_components{};
+    s32 rt_alpha_image{-1};
+    s32 rt_alpha_input{-1};
+    u8 rt_alpha_components{};
+    u8 rt_alpha_channel{3};
+    s32 rt_normal_image{-1};
+    std::array<s32, 2> rt_normal_inputs{-1, -1};
+    bool rt_info_known{}; // collected (fresh compile) or loaded with the trailing record
+    static constexpr u32 RtInfoMagic = 0x54504242u; // "BBPT"
     bool has_image_gather{};
     bool has_image_query{};
     bool has_flatbuf{};

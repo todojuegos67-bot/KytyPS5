@@ -99,6 +99,10 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// BB object motion vectors v2 (bb_objmv2.h): previous-frame clip position varying.
     bool bb_objmv{};
+    /// bb-pathtracing (BB_PATHTRACING=1): the vertex shader also stores its clip position, UV and
+    /// normals per vertex into the path tracer's geometry store (PushData::Pt*, emit_spirv_bb_pt.cpp).
+    /// Lives in what was padding: sizeof and the shader cache layout are unchanged (zero = off).
+    bool bb_pt_store{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };

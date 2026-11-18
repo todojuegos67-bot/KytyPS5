@@ -16,6 +16,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/renderer_vulkan/rt/pt_capture.h"
 #include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_precompile.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -28,6 +29,10 @@ namespace Vulkan {
 
 // BB object motion vectors v2 (bb_objmv2.h): the motion variant this draw takes.
 static BB::ObjMv2::Kind g_bb_objmv2 = BB::ObjMv2::Kind::None;
+// bb-pathtracing (BB_PATHTRACING=1): this draw's vertex shader stores its geometry for the path
+// tracer (emit_spirv_bb_pt.cpp): opaque G-buffer draws only (triangle lists into 5+ colour
+// targets with depth), the BVH's input. Always false with path tracing off.
+static bool g_bb_pt_store = false;
 
 using Shader::HwStage;
 using Shader::Output;
@@ -172,6 +177,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.vs.bb_objmv = g_bb_objmv2 == BB::ObjMv2::Kind::Opaque ||
                               g_bb_objmv2 == BB::ObjMv2::Kind::Blend ||
                               g_bb_objmv2 == BB::ObjMv2::Kind::Effect;
+        info.hw.vs.bb_pt_store = g_bb_pt_store && l_stage == Shader::SwStage::Vertex;
         break;
     }
     case HwStage::Fragment: {
@@ -668,6 +674,16 @@ bool PipelineCache::RefreshGraphicsKey() {
 
     // Compile and bind shader stages
     g_bb_objmv2 = skip_cb_binding ? BB::ObjMv2::Kind::None : BB::ObjMv2::Want(regs);
+    g_bb_pt_store = false;
+    if (Vulkan::PtCapture::active && !skip_cb_binding &&
+        regs.primitive_type == AmdGpu::PrimitiveType::TriangleList &&
+        regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) {
+        u32 targets = 0;
+        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            targets += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1u : 0u;
+        }
+        g_bb_pt_store = targets >= Vulkan::PtCapture::GBufferTargets;
+    }
     if (!RefreshGraphicsStages()) {
         return false;
     }

@@ -13,11 +13,9 @@
 //    is always false and these are never reached with a live object; they exist to compile.
 //  - GpuProfiler: none (Get() returns null). The mod's own timestamp queries (BB_PT_GPU_TIME) do
 //    the per-pass GPU timing instead.
-//  - PtCapture: the addresses of the per-vertex stores the mod reads geometry from (SuperMedo's
-//    Shader::MotionVectors::positions/uvs/normals_address). They stay 0 until our shader
-//    recompiler writes clip-space positions per draw (see documents/pathtracing/PATH_TRACING.md,
-//    "Remaining work"); with 0 the engine logs "off (object motion capture is off)" and does
-//    nothing.
+//  - PtCapture (pt_capture.h): the addresses of the per-vertex stores the mod reads geometry from
+//    (SuperMedo's Shader::MotionVectors::positions/uvs/normals_address), written by our own
+//    vertex shader variant (emit_spirv_bb_pt.cpp) for opaque G-buffer draws.
 #pragma once
 
 #include <array>
@@ -25,17 +23,10 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/rt/pt_capture.h"
 #include "video_core/texture_cache/image.h"
 
 namespace Vulkan {
-
-// The geometry store the mod traces against (one vec4 clip position per vertex, half2 UV, two
-// snorm4x8 normals), filled by the vertex shaders of the frame's draws. 0 = not available.
-struct PtCapture {
-    static inline u64 positions_address = 0;
-    static inline u64 uvs_address = 0;
-    static inline u64 normals_address = 0;
-};
 
 class ObjectMotion {
 public:

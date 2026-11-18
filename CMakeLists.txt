@@ -1082,6 +1082,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/backend/spirv/emit_spirv_shared_memory.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_special.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_bb_objmv2.cpp
+                      src/shader_recompiler/backend/spirv/emit_spirv_bb_pt.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_undefined.cpp
                       src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
                       src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
@@ -1450,6 +1451,9 @@ if (ENABLE_PATHTRACING)
         src/video_core/renderer_vulkan/rt/vk_dlss_rr.cpp
         src/video_core/renderer_vulkan/rt/vk_dlss_rr.h
         src/video_core/renderer_vulkan/rt/pt_compat.h
+        src/video_core/renderer_vulkan/rt/pt_capture.cpp
+        src/video_core/renderer_vulkan/vk_rasterizer_pt.cpp
+        src/video_core/renderer_vulkan/rt/pt_capture.h
         src/video_core/renderer_vulkan/rt/pt_config.h
         src/video_core/renderer_vulkan/pt_shim/bbport_stdout.h)
 endif()

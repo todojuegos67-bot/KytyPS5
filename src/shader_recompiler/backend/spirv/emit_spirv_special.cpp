@@ -68,6 +68,7 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
 
 // BB object motion vectors v2 (emit_spirv_bb_objmv2.cpp).
 void EmitBBObjMvVertex(EmitContext& ctx);
+void EmitBBPtStore(EmitContext& ctx); // emit_spirv_bb_pt.cpp
 void EmitBBObjMvFragment(EmitContext& ctx);
 
 void EmitEpilogue(EmitContext& ctx) {
@@ -75,6 +76,9 @@ void EmitEpilogue(EmitContext& ctx) {
         // Previous-frame pass: its position (as the guest wrote it) is all it produces.
         ctx.OpStore(ctx.objmv_prev_pos, ctx.OpLoad(ctx.F32[4], ctx.output_position));
         return;
+    }
+    if (ctx.PtStoreVertex()) {
+        EmitBBPtStore(ctx); // before objmv2 / depth / clip conversions: the guest's clip position
     }
     if (ctx.ObjMvVertex()) {
         EmitBBObjMvVertex(ctx);

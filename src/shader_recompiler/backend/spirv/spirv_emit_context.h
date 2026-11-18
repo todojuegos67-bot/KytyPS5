@@ -257,6 +257,11 @@ public:
     }
     // The vertex shader runs a second time with last frame's buffers (no side effects allowed).
     bool ObjMvPrevPass() const;
+    // bb-pathtracing: per-vertex geometry store (emit_spirv_bb_pt.cpp).
+    bool PtStoreVertex() const {
+        return hw_stage == HwStage::Vertex && sw_stage == SwStage::Vertex &&
+               runtime_info.hw.vs.bb_pt_store && profile.support_bda;
+    }
     bool ObjMvFragment() const {
         return sw_stage == SwStage::Fragment && runtime_info.hw.fs.bb_objmv &&
                !runtime_info.hw.fs.dual_source_blending;

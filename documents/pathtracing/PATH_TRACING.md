@@ -12,15 +12,57 @@ notes are in `PATH_TRACING-upstream.md` next to this file (knob names there are 
 
 ## Status in this build
 
-**The path tracer compiles and starts, but it does not draw yet.** With `BB_PATHTRACING=1` the
-engine is created, picks its preset, enables the Vulkan ray tracing features, and then logs
+**Geometry capture, camera and the rasterizer hooks are wired; not yet run in game.** With
+`BB_PATHTRACING=1` the engine starts, a geometry store is allocated, and opaque G-buffer draws
+feed the BVH every frame; GI is traced after the light composite, direct light at the light
+accumulation hook, shadows / sky / fog / exposure at the post trigger dispatch. Nothing was run on
+hardware from this tree (built and checked only: see "Verification"). With the switch off (the
+default) nothing of it runs: no object, no extension, no shader variant, no memory.
 
-    Path tracing: off (preset low): no geometry capture in this build ...
+### How the capture works here (ours, not the mod's)
 
-because the mod builds its BVH from a per-vertex position store that SuperMedo's renderer writes
-in every vertex shader (his "object motion" instrumentation) and ours does not have. See
-"Remaining work" for the exact list. With the switch off (the default) nothing of it runs: no
-object, no extension, no shader, no memory.
+- **Vertex shader variant** (`emit_spirv_bb_pt.cpp`): `HwVertexRuntimeInfo::bb_pt_store`
+  (in what was padding: no shader cache layout change) makes a vertex shader also write, per
+  vertex, its clip-space position (vec4, as the guest computed it: before the depth-mode / clip
+  conversions and the jitter), and when the pixel shader's albedo / alpha source was found a
+  half2 UV and two snorm4x8 normals (his `EmitVertexMotion` store and `uv_select` layout). The
+  addresses are in the push constants (`PushData::Pt*`, 88..120 bytes, still <= 128), not baked
+  into SPIR-V as upstream (cached SPIR-V stays valid across runs).
+- **Which draws** (`vk_pipeline_cache.cpp`): triangle lists into 5+ colour targets with depth
+  (the mod's `gbuffer_draw`; Ghidra: the eboot's debug target list names the deferred MRT
+  "GBuffer RT0..RT3" + "Glow" + light accumulation, strings at 0x49d4166..0x49d431e, the
+  engine's default emissive target is index 6). Only opaque G-buffer pipelines get the variant.
+- **Store** (`rt/pt_capture.*`): one device buffer, 2 x `BB_PT_STORE_MVERTS` (default 6) M
+  vertices (28 B each: 336 MB at the default), halves alternate per frame; per draw the index
+  range is scanned (cached per index list, re-verified every 32 frames) and range x instances
+  slots allocated. Overflow drops the draw from that frame's BVH (logged).
+- **Surface info** (`shader_info_collection_pass.cpp`, his `FindAlbedo / FindAlphaSource /
+  FindNormalMap`): kept in `Info` and saved as an optional trailing record after the cache meta
+  (`Info::Serialize`), so **`ShaderMetaVersion` is not bumped** and caches stay valid. A pixel
+  shader cached before this record existed is, *only with `BB_PATHTRACING=1`*, skipped at
+  preload and compiled once at first use (a one-time stutter per G-buffer material on the
+  first PT run), then saved with the record.
+- **Camera** (`bb_upscale.cpp PtCamera`): the frame's first 864-byte scene block (inverse view
+  floats 180-191, projection 52/57/62/63), as SuperMedo's `CameraMotion`; captured whenever path
+  tracing is on (also without an upscaler). Jitter: ours (render pixels). Scene depth: the depth
+  of the G-buffer pass.
+- **Rasterizer hooks** (`vk_rasterizer_pt.cpp`): frame start = first draw into a display buffer
+  (`OnDisplayPass`, store flip); `OnGBufferPass`, `OnSceneColor`, `AddDraw` + `OnDrawBound`
+  (albedo / normal / alpha-test views); light accumulation draws (VS 0x8747a367): state,
+  stencil, targets, constants, vertex params, `SkipLightDraw`/`SkipHalfResLight`;
+  `OnLightComposite` before the direct-hook draw; `OnAfterComposite` after the light composite
+  (PS 0x32e47788: GI); `OnAoDraw/OnAoInput` (PS 0x3fe9e964, the draw our tree calls the
+  composite), `OnDirShadowInput`, `OnCompositeInput/Buffer`, `OnDispatch` (post trigger CS
+  0x9a9cf8a9), `OnSkyDome`, `SkipPs`.
+- **F9 / zero cost:** paused, the store base pushed is 0 (the variant only takes a branch per
+  vertex), no index scan, no BVH build, no pass.
+
+### Not wired (all default off in every preset)
+
+Water / fog sheets, smoke / flame / glow particle capture (`BB_PT_FX_*`), alpha inheritance from
+depth-only prepasses (`BB_PT_ALPHA_INHERIT`: depth prepasses are not stored), indirect draws in
+the BVH, the liverpool light-set CB write hook (`OnLightSetWrite`; the light draw constants are
+captured), DLSS Ray Reconstruction (below), device-lost hook.
 
 ## How to enable
 
@@ -37,6 +79,13 @@ takes F9 from shadPS4's `hotkey_pause` while the switch is on (remap that hotkey
 Off costs no GPU time: the passes and, unlike upstream, the BVH build are skipped
 (`BB_PT_PAUSED_BUILD=1` restores upstream's "keep the BVH current while paused" for an instant
 switch back).
+
+**What the log should show** with `BB_PATHTRACING=1`: `[pt] geometry store: 6 M vertices a
+frame x 2 ...`, `[pt] path tracing engine on ...`, once in game `Ray tracing: G-buffer targets:
+0 ... 6 ...` and `Ray tracing: GI albedo target ...`, then every 5 s `[pt] geometry store, last
+5 s: ... draws stored ...` and the GPU line `[pt] preset low, on: path tracing GPU x.xxx
+ms/frame`. "draws over the store" > 0: raise `BB_PT_STORE_MVERTS`. "GI skipped (...)" lines name
+what is missing (scene colour, depth, camera, geometry).
 
 ## Knob names (clash with our older RT features)
 
@@ -85,7 +134,7 @@ refits), with per-frame refit/rebuild budgets above; the TLAS is rebuilt from th
 each frame (or partitioned updates with `BB_PT_PTLAS=1` on NVIDIA). Distance culling:
 `BB_PT_KEEP_DIST`, `BB_PT_FAR_START`; small-geometry cull: `BB_PT_MIN_TRIS` (ours).
 
-**Cost estimate by design (not measured — the engine does not run here yet).** Upper bound of
+**Cost estimate by design (not measured yet in game).** Upper bound of
 rays per pixel per frame, ignoring pixels beyond `BB_PT_FAR_START` and sky:
 
 | preset | GI | direct (local lights + moon) | reflections | total, rays/px | 1080p internal | 1440p internal |
@@ -142,7 +191,7 @@ frames where path tracing ran. `nvngx_dlssd.dll` stays user-supplied.
 - Ours: presets (`pt_config.h`), `BB_PT_MIN_TRIS`, zero-cost F9 pause, 5 s `[pt]` GPU line, log
   routed to our logger, `BB_PT_DLSS_RR` refused.
 
-## Remaining work (precise)
+## Remaining work (precise; items 1-3 now done, see "Status")
 
 1. **Geometry capture** (blocking). SuperMedo's shader recompiler, when a pipeline key has
    `motion_vectors` set, appends to every vertex shader a store of the clip-space position
@@ -176,6 +225,16 @@ frames where path tracing ran. `nvngx_dlssd.dll` stays user-supplied.
    our device-lost path does not call it yet), GPU checkpoints (not enabled).
 
 ## Verification done
+
+Capture / hooks commit: every changed or new C++ file `clang++ -std=c++23 -fsyntax-only` clean
+with and without `-DENABLE_PATHTRACING` (vk_rasterizer.cpp, vk_rasterizer_pt.cpp, pt_capture.cpp,
+emit_spirv_bb_pt.cpp, spirv_emit_context.cpp, emit_spirv*.cpp, shader_info_collection_pass.cpp,
+vk_pipeline_cache.cpp, vk_pipeline_serialization.cpp, vk_graphics_pipeline.cpp, bb_upscale.cpp,
+vk_ray_tracing.cpp). No host shader changed. The SPIR-V the new vertex variant emits has not been
+through spirv-val or a driver yet (first run: watch for pipeline creation errors on G-buffer
+draws; `BB_PATHTRACING=0` is the way back).
+
+Port commit:
 
 - All 34 shader variants compile with glslang 15.2 (`--target-env vulkan1.3`), through our real
   `host_shaders/CMakeLists.txt`.

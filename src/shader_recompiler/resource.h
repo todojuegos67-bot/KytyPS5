@@ -235,6 +235,13 @@ struct PushData {
     // was padding (members stay in offset order).
     static constexpr u32 ObjMvFogIndex = 8;
     static constexpr u32 ObjMvEntryIndex = 9;
+    // bb-pathtracing (emit_spirv_bb_pt.cpp, video_core/renderer_vulkan/rt/pt_capture.h): the
+    // geometry store's device address (lo, hi), this draw's slots (store base, first vertex,
+    // vertices per instance, first instance) and (UV select, store capacity in vertices). Read
+    // only by vertex shaders compiled with HwVertexRuntimeInfo::bb_pt_store; store base 0 = off.
+    static constexpr u32 PtAddressIndex = 10;
+    static constexpr u32 PtDrawIndex = 11;
+    static constexpr u32 PtMiscIndex = 12;
 
     float xoffset;
     float yoffset;
@@ -244,6 +251,9 @@ struct PushData {
     u32 objmv_flags;
     u32 objmv_fog;
     std::array<u32, 2> objmv_entry;
+    std::array<u32, 2> pt_address;
+    std::array<u32, 4> pt_draw;
+    std::array<u32, 2> pt_misc;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
@@ -253,6 +263,9 @@ struct PushData {
 static_assert(offsetof(PushData, objmv_flags) == 72);
 static_assert(offsetof(PushData, objmv_fog) == 76);
 static_assert(offsetof(PushData, objmv_entry) == 80);
+static_assert(offsetof(PushData, pt_address) == 88);
+static_assert(offsetof(PushData, pt_draw) == 96);
+static_assert(offsetof(PushData, pt_misc) == 112);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

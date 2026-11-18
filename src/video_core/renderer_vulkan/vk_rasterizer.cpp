@@ -20,6 +20,7 @@
 #ifdef ENABLE_PATHTRACING
 #include "video_core/renderer_vulkan/rt/vk_ray_tracing.h"
 #endif
+#include "video_core/renderer_vulkan/rt/pt_capture.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -91,17 +92,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 #ifdef ENABLE_PATHTRACING
     // Path tracing (BB_PATHTRACING=1, default off: no object, no work). Started here, after the
     // caches it uses; it frees itself before them (declared after them in vk_rasterizer.h).
-    if (RayTracing::Wanted()) {
-        if (BbRtAnyRequested()) {
-            LOG_WARNING(Render_Vulkan, "[pathtracing] BB_RT_REFLECT / BB_RT_VOLUMETRIC / "
-                                       "BB_RT_SHADOWS are also on: both tracers will run");
-        }
-        ray_tracing = std::make_unique<RayTracing>(instance, scheduler, runtime, texture_cache,
-                                                   buffer_cache);
-        LOG_INFO(Render_Vulkan, "[pathtracing] engine {}", ray_tracing->Enabled()
-                     ? "on"
-                     : "off (see the 'Ray tracing:' lines above for the reason)");
+    if (RayTracing::Wanted() && BbRtAnyRequested()) {
+        LOG_WARNING(Render_Vulkan, "[pathtracing] BB_RT_REFLECT / BB_RT_VOLUMETRIC / "
+                                   "BB_RT_SHADOWS are also on: both tracers will run");
     }
+    PtInit(); // vk_rasterizer_pt.cpp
 #endif
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -1021,9 +1016,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     PrepareRenderState(pipeline);
     BbUiDraw(pipeline);
+#ifdef ENABLE_PATHTRACING
+    if (!PtPrepare(pipeline)) { // path tracing hooks (vk_rasterizer_pt.cpp); false: SkipPs
+        ResetBindings(false);
+        return;
+    }
+#endif
     if (!BindResources(pipeline)) {
         return;
     }
+#ifdef ENABLE_PATHTRACING
+    if (pt_skip_light) { // light draw replaced by the traced direct light
+        if (needs_barrier) {
+            runtime.FlushBarriers();
+        }
+        ResetBindings(false);
+        return;
+    }
+#endif
     const auto state = BeginRendering(pipeline);
     if (BB::SsrProbe::Enabled()) {
         BB::SsrProbe::OnDraw(BbSsrDesc(*pipeline, regs,
@@ -1056,6 +1066,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     BbObjMvDraw(pipeline,
                 is_indexed ? regs.index_base_address.Address<VAddr>() + index_offset : 0,
                 regs.num_indices, regs.num_instances.NumInstances());
+#ifdef ENABLE_PATHTRACING
+    PtStoreDraw(pipeline, is_indexed, index_offset); // geometry store slots (push constants)
+    PtAfterBind();
+#endif
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.bb_prof_next_label = bb_prof_label;
@@ -1079,6 +1093,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (bb_rt_ssr_draw) {
         BbRtReflectRun();
     }
+#ifdef ENABLE_PATHTRACING
+    PtAfterDraw(); // GI after the light composite
+#endif
 
     if (BB::UiCut::Active()) {
         bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
@@ -1112,9 +1129,24 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     PrepareRenderState(pipeline);
     BbUiDraw(pipeline);
+#ifdef ENABLE_PATHTRACING
+    if (!PtPrepare(pipeline)) {
+        ResetBindings(false);
+        return;
+    }
+#endif
     if (!BindResources(pipeline)) {
         return;
     }
+#ifdef ENABLE_PATHTRACING
+    if (pt_skip_light) {
+        if (needs_barrier) {
+            runtime.FlushBarriers();
+        }
+        ResetBindings(false);
+        return;
+    }
+#endif
     const auto state = BeginRendering(pipeline);
     if (BbRtReflectRequested()) {
         BbRtReflectProbe(*pipeline);
@@ -1153,6 +1185,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     push_data.yscale *= bb_target_scale[1];
     push_data.yoffset *= bb_target_scale[1];
     BbObjMvDraw(pipeline, arg_address + offset, max_count, 0);
+#ifdef ENABLE_PATHTRACING
+    PtAfterBind(); // (indirect draws stay out of the BVH: store base 0)
+#endif
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.bb_prof_next_label = bb_prof_label;
@@ -1185,6 +1220,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (bb_rt_ssr_draw) {
         BbRtReflectRun();
     }
+#ifdef ENABLE_PATHTRACING
+    PtAfterDraw();
+#endif
 
     if (BB::UiCut::Active()) {
         bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
@@ -1214,6 +1252,9 @@ void Rasterizer::DispatchDirect() {
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return; // (bb-gpu-prof: its copies are timed in the runtime)
     }
+#ifdef ENABLE_PATHTRACING
+    PtDispatch(cs.pgm_hash); // the post trigger: traced shadows, sky, fog, exposure (and GI)
+#endif
 
     if (!BindResources(pipeline)) {
         return;
@@ -1677,7 +1718,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                if (BB::Upscale::Capture() || BbRtAnyRequested()) {
+                if (BB::Upscale::Capture() || BbRtAnyRequested() || PtCapture::active) {
                     BB::Upscale::OnConstants(stage.flattened_ud_buf.data(),
                                              stage.flattened_ud_buf.size());
                 }
@@ -1729,7 +1770,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
                     !desc.is_written && size >= 864 &&
-                    size <= 16384 && (BB::Upscale::Capture() || BbRtAnyRequested()) &&
+                    size <= 16384 &&
+                    (BB::Upscale::Capture() || BbRtAnyRequested() || PtCapture::active) &&
                     memory->IsValidMapping(vsharp.base_address, 272)) {
                     BB::Upscale::OnConstants(reinterpret_cast<const u32*>(vsharp.base_address),
                                              static_cast<size_t>(size / 4));
@@ -1773,6 +1815,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
+#ifdef ENABLE_PATHTRACING
+                PtBufferBound(stage, u32(&desc - stage.buffers.data()), desc.is_formatted,
+                              desc.is_written, vsharp.base_address, u32(size));
+#endif
                 if (desc.is_written) {
                     DmaForget(vsharp.base_address, size); // bb-dma-dedup: a shader writes it
                     // Raw storage-buffer writes can also make an aliased cached image stale.
@@ -1877,6 +1923,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
+#ifdef ENABLE_PATHTRACING
+            PtImageBound(stage, image_id, is_storage);
+#endif
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
@@ -1960,6 +2009,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
 
+#ifdef ENABLE_PATHTRACING
+    if (ray_tracing && stage.sw_stage == Shader::SwStage::Fragment) {
+        PtCaptureTextures(stage, first_image_idx, image_descriptor_array_sizes);
+    }
+#endif
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {

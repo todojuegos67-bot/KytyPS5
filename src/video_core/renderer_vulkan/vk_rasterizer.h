@@ -33,6 +33,7 @@ class GraphicsPipeline;
 class Runtime;
 #ifdef ENABLE_PATHTRACING
 class RayTracing; // path tracing mod (rt/vk_ray_tracing.h)
+class PtStore;    // its geometry store (rt/pt_capture.h)
 #endif
 
 class Rasterizer {
@@ -238,8 +239,40 @@ private:
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
 #ifdef ENABLE_PATHTRACING
     // Path tracing mod by Joao Vitor Alves (BB_PATHTRACING=1; documents/pathtracing). Null unless
-    // the switch is on. Its draw / light / composite hooks are not wired yet (see the docs).
+    // the switch is on (then every hook below is a null test). vk_rasterizer_pt.cpp.
+    std::unique_ptr<PtStore> pt_store; // declared before the engine: freed after it
     std::unique_ptr<RayTracing> ray_tracing;
+    // Per draw (PtPrepare): what the draw is to the tracer.
+    bool pt_gbuffer = false;       // opaque G-buffer draw (BVH input, scene depth)
+    bool pt_light_draw = false;    // light accumulation draw (VS LightAccVertexShader)
+    bool pt_ao_draw = false;       // the deferred AO / lighting pass (PS 0x3fe9e964)
+    bool pt_dir_shadow = false;    // directional shadow mask draw
+    bool pt_skip_light = false;    // light draw replaced by the traced direct light
+    bool pt_composite_draw = false; // direct-light hook draw (Rt::DirectHookDraw)
+    bool pt_composite_ps = false;  // light composite (GI applied after it)
+    bool pt_capture_tex = false;   // capture albedo / normal / alpha views (BindTextures)
+    bool pt_display_pass = false;  // the previous draw went into a display buffer
+    VideoCore::ImageId pt_scene_depth{};
+    struct PtView {
+        vk::ImageView view{};
+        VideoCore::ImageId image{};
+        u64 uid = 0;
+    };
+    PtView pt_albedo{}, pt_normal{}, pt_alpha{}, pt_sky{};
+    u32 pt_alpha_channel = 3;
+    bool pt_draw_added = false;
+    void PtInit();
+    bool PtPrepare(const GraphicsPipeline* pipeline); // false: skip the draw (SkipPs)
+    void PtFrameStart();
+    void PtStoreDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
+    void PtAfterBind();
+    void PtAfterDraw();
+    void PtDispatch(u64 cs_hash);
+    void PtCaptureTextures(const Shader::Info& stage, u32 first_image_idx,
+                           std::span<const u32> sizes);
+    void PtBufferBound(const Shader::Info& stage, u32 index, bool formatted, bool written,
+                       VAddr address, u32 size);
+    void PtImageBound(const Shader::Info& stage, VideoCore::ImageId image_id, bool is_storage);
 #endif
     bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
     // bb-rt-fullres (BB_RT_REFLECT_FULLRES=1): set when the last RT pass produced the full-res

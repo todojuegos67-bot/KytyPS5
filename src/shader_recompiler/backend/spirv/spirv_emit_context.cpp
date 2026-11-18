@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || ObjMvVertex()) {
+    if (info.uses_dma || ObjMvVertex() || PtStoreVertex()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -785,7 +785,7 @@ void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
         Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[1], U32[1],
-                        U32[2]),
+                        U32[2], U32[2], U32[4], U32[2]),
              "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -808,6 +808,12 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::ObjMvEntryIndex, spv::Decoration::Offset, 80U);
     MemberName(struct_type, PushData::ObjMvFogIndex, "bb_objmv_fog");
     MemberDecorate(struct_type, PushData::ObjMvFogIndex, spv::Decoration::Offset, 76U);
+    MemberName(struct_type, PushData::PtAddressIndex, "bb_pt_address");
+    MemberName(struct_type, PushData::PtDrawIndex, "bb_pt_draw");
+    MemberName(struct_type, PushData::PtMiscIndex, "bb_pt_misc");
+    MemberDecorate(struct_type, PushData::PtAddressIndex, spv::Decoration::Offset, 88U);
+    MemberDecorate(struct_type, PushData::PtDrawIndex, spv::Decoration::Offset, 96U);
+    MemberDecorate(struct_type, PushData::PtMiscIndex, spv::Decoration::Offset, 112U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

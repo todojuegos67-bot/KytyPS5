@@ -41,6 +41,12 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    {
+        // bb-pathtracing: the vertex shader writes the path tracer's geometry store.
+        const auto& vs_rt = runtime_infos[u32(Shader::SwStage::Vertex)];
+        pt_store = infos[u32(Shader::SwStage::Vertex)] && vs_rt.hw_stage == Shader::HwStage::Vertex &&
+                   vs_rt.hw.vs.bb_pt_store;
+    }
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 

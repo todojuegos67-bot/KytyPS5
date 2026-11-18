@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -9,6 +10,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/rt/pt_capture.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
@@ -294,6 +296,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
     }
+    // bb-pathtracing: a pixel shader cached before the tracer's surface record existed (info.h
+    // rt_*) is left to compile at runtime once, which saves it with the record.
+    if (PtCapture::Requested() && program->info.sw_stage == Shader::SwStage::Fragment &&
+        !program->info.rt_info_known) {
+        return false;
+    }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
@@ -487,6 +495,20 @@ void Info::Serialize(Serialization::Archive& ar) const {
     info.Write(this, sizeof(InfoPersistent));
     info.Write(flattened_ud_buf);
     srt_info.Serialize(ar);
+    // bb-pathtracing: optional trailing record (info.h rt_*). Readers that predate it stop
+    // before it; caches that predate it load without it (no ShaderMetaVersion bump).
+    info.Write(RtInfoMagic);
+    info.Write(has_discard);
+    info.Write(rt_albedo_image);
+    info.Write(rt_albedo_input);
+    info.Write(rt_albedo_components);
+    info.Write(rt_alpha_image);
+    info.Write(rt_alpha_input);
+    info.Write(rt_alpha_components);
+    info.Write(rt_alpha_channel);
+    info.Write(rt_normal_image);
+    info.Write(rt_normal_inputs[0]);
+    info.Write(rt_normal_inputs[1]);
 }
 
 bool Info::Deserialize(Serialization::Archive& ar) {
@@ -495,7 +517,34 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
 
-    return srt_info.Deserialize(ar);
+    if (!srt_info.Deserialize(ar)) {
+        return false;
+    }
+    rt_info_known = false;
+    // Older caches can end in a few bytes of zero slack (Writer growth): only a whole record
+    // starting with the magic is taken.
+    constexpr size_t RtRecordBytes = sizeof(u32) + sizeof(bool) + 2 * sizeof(s32) + 1 +
+                                     2 * sizeof(s32) + 2 + sizeof(s32) + 2 * sizeof(s32);
+    if (ar.Remaining() >= RtRecordBytes) {
+        u32 magic{};
+        std::memcpy(&magic, ar.CurrPtr(), sizeof(magic));
+        if (magic == RtInfoMagic) {
+            info.Read(magic);
+            info.Read(has_discard);
+            info.Read(rt_albedo_image);
+            info.Read(rt_albedo_input);
+            info.Read(rt_albedo_components);
+            info.Read(rt_alpha_image);
+            info.Read(rt_alpha_input);
+            info.Read(rt_alpha_components);
+            info.Read(rt_alpha_channel);
+            info.Read(rt_normal_image);
+            info.Read(rt_normal_inputs[0]);
+            info.Read(rt_normal_inputs[1]);
+            rt_info_known = true;
+        }
+    }
+    return true;
 }
 
 void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {

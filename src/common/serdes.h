@@ -58,6 +58,10 @@ struct Archive {
         return offset >= container.size();
     }
 
+    [[nodiscard]] size_t Remaining() const {
+        return offset >= container.size() ? 0 : container.size() - offset;
+    }
+
     Archive() = default;
     explicit Archive(std::vector<u8>&& v) : container{v} {}
 
