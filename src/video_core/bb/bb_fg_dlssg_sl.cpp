@@ -132,7 +132,7 @@ std::mutex g_stats_mutex;
 // BB_SL_UNTAGGED=0      untagged presents as before f1c51d984 (no PCL markers, DLSS-G options
 //                       untouched, PresentLastFrame repeats not skipped for Streamline).
 // BB_SL_REFLEX=0        no slReflexSetOptions (Reflex low latency never turned on by us).
-// BB_SL_REFLEX_SLEEP=1  slReflexSleep once per game frame (GPU thread, before SimulationStart).
+// BB_SL_REFLEX_SLEEP=0  no slReflexSleep (default: once per game frame (GPU thread, before SimulationStart).
 bool EnvIs(const char* name, char c) {
     const char* v = std::getenv(name);
     return v != nullptr && v[0] == c;
@@ -142,7 +142,9 @@ bool UntaggedMarkersOn() {
     return on;
 }
 bool ReflexSleepOn() {
-    static const bool on = EnvIs("BB_SL_REFLEX_SLEEP", '1');
+    // bb-sl-reflex-sleep: on by default. Without slReflexSleep the Reflex/driver cap (224 on a
+    // 240 Hz display) acted on every DLSS-G present: the game ran at cap / N^2 (x3: 25 fps).
+    static const bool on = !EnvIs("BB_SL_REFLEX_SLEEP", '0');
     return on;
 }
 constexpr uint32_t kLegacyUntagged = 0xFFFFFFFFu; // BeforePresent ran, no frame / markers
