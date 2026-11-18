@@ -1178,6 +1178,12 @@ add_executable(port_update_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp")
 target_include_directories(port_update_tests PRIVATE ${inc_headers})
 
+# The port's UI translations (plain C++: also on Linux).
+add_executable(port_i18n_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PortI18nTests.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp")
+target_include_directories(port_i18n_tests PRIVATE ${inc_headers})
+
 add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
 target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
@@ -1329,6 +1335,7 @@ if(BUILD_TESTING)
 	add_executable(atrac9_initialization_tests EXCLUDE_FROM_ALL tests/Atrac9InitializationTests.cpp)
 	target_link_libraries(atrac9_initialization_tests PRIVATE LibAtrac9 Threads::Threads)
 	add_test(NAME atrac9_initialization COMMAND $<TARGET_FILE:atrac9_initialization_tests>)
+	add_test(NAME port_i18n COMMAND $<TARGET_FILE:port_i18n_tests>)
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
