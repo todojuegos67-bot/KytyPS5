@@ -24,9 +24,22 @@ namespace {
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_users{0};
 std::atomic<VkDevice> g_device{VK_NULL_HANDLE};
+
+// BB_EXIT_GATE=0: no gate (as before 05e971be9): presents never wait for or count on it, and
+// Stop reports "not idle" so Streamline is not shut down under a present.
+bool GateOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BB_EXIT_GATE");
+        const bool o = v == nullptr || v[0] != '0';
+        if (!o) LOG_INFO(Render_Vulkan, "BB_EXIT_GATE=0: exit gate off");
+        return o;
+    }();
+    return on;
+}
 } // namespace
 
 bool Enter() {
+    if (!GateOn()) return true;
     g_users.fetch_add(1, std::memory_order_acq_rel);
     if (g_stop.load(std::memory_order_acquire)) {
         g_users.fetch_sub(1, std::memory_order_acq_rel);
@@ -36,6 +49,7 @@ bool Enter() {
 }
 
 void Leave() {
+    if (!GateOn()) return;
     g_users.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -45,6 +59,7 @@ bool Stopped() {
 
 bool Stop(std::chrono::milliseconds timeout) {
     g_stop.store(true, std::memory_order_release);
+    if (!GateOn()) return false;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (g_users.load(std::memory_order_acquire) != 0 &&
            std::chrono::steady_clock::now() < deadline) {

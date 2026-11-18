@@ -97,7 +97,7 @@ struct Api {
     PFun_slDLSSGGetState* dlssg_get_state = nullptr;
     PFun_slReflexSetOptions* reflex_set_options = nullptr;
     PFun_slPCLSetMarker* pcl_set_marker = nullptr;
-    PFun_slReflexSleep* reflex_sleep = nullptr; // BB_REFLEX_GAME only
+    PFun_slReflexSleep* reflex_sleep = nullptr; // BB_REFLEX_GAME or BB_SL_REFLEX_SLEEP=1 only
     PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
     PFN_vkDestroySwapchainKHR destroy_swapchain = nullptr;
     PFN_vkGetSwapchainImagesKHR get_swapchain_images = nullptr;
@@ -121,7 +121,42 @@ std::atomic<uint32_t> g_sec_tagged{0}, g_sec_off{0}, g_sec_own_constants{0}, g_s
     g_sec_presents{0};
 std::atomic<uint32_t> g_max_gen{0};
 bool g_reflex_on = false;
+// bb-sl-pace-diag: time inside Streamline's present proxy (present thread) and inside the GPU
+// thread's tag / options calls, per second, for the [dlssg-sl] line.
+std::atomic<uint64_t> g_sec_present_us{0}, g_sec_present_max_us{0}, g_sec_tag_us{0},
+    g_sec_tag_max_us{0}, g_sec_sleep_us{0};
+std::atomic<uint32_t> g_sec_tag_calls{0};
 std::mutex g_stats_mutex;
+
+// Bisect toggles for the DLSS-G (Streamline) 224/N^2 pacing:
+// BB_SL_UNTAGGED=0      untagged presents as before f1c51d984 (no PCL markers, DLSS-G options
+//                       untouched, PresentLastFrame repeats not skipped for Streamline).
+// BB_SL_REFLEX=0        no slReflexSetOptions (Reflex low latency never turned on by us).
+// BB_SL_REFLEX_SLEEP=1  slReflexSleep once per game frame (GPU thread, before SimulationStart).
+bool EnvIs(const char* name, char c) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == c;
+}
+bool UntaggedMarkersOn() {
+    static const bool on = !EnvIs("BB_SL_UNTAGGED", '0');
+    return on;
+}
+bool ReflexSleepOn() {
+    static const bool on = EnvIs("BB_SL_REFLEX_SLEEP", '1');
+    return on;
+}
+constexpr uint32_t kLegacyUntagged = 0xFFFFFFFFu; // BeforePresent ran, no frame / markers
+
+uint64_t UsSince(std::chrono::steady_clock::time_point t0) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - t0)
+                                     .count());
+}
+void AtomicMax(std::atomic<uint64_t>& a, uint64_t v) {
+    uint64_t cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
 SecondStats g_stats{};
 bool g_stats_set = false;
 
@@ -345,13 +380,20 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical, vk::Device dev
         Feature(sl::kFeatureDLSS_G, "slDLSSGGetState", g.dlssg_get_state);
     if (reflex) Feature(sl::kFeatureReflex, "slReflexSetOptions", g.reflex_set_options);
     if (pcl) Feature(sl::kFeaturePCL, "slPCLSetMarker", g.pcl_set_marker);
-    if (reflex && ReflexGame::Requested()) Feature(sl::kFeatureReflex, "slReflexSleep", g.reflex_sleep);
+    if (reflex && (ReflexGame::Requested() || ReflexSleepOn()))
+        Feature(sl::kFeatureReflex, "slReflexSleep", g.reflex_sleep);
     if (!functions) {
         // The swapchain still goes through the proxies (harmless without DLSS-G options).
         BBLogf("DLSS-G (Streamline): DLSS-G not available: off (swapchain through the proxies)");
         return;
     }
-    if (g.reflex_set_options != nullptr) {
+    BBLogf("DLSS-G (Streamline): bisect toggles: BB_SL_UNTAGGED=%d BB_SL_REFLEX=%d "
+           "BB_SL_REFLEX_SLEEP=%d",
+           UntaggedMarkersOn() ? 1 : 0, EnvIs("BB_SL_REFLEX", '0') ? 0 : 1,
+           ReflexSleepOn() && g.reflex_sleep != nullptr ? 1 : 0);
+    if (g.reflex_set_options != nullptr && EnvIs("BB_SL_REFLEX", '0')) {
+        BBLogf("DLSS-G (Streamline): BB_SL_REFLEX=0: slReflexSetOptions not called");
+    } else if (g.reflex_set_options != nullptr) {
         sl::ReflexOptions o{};
         o.mode = sl::ReflexMode::eLowLatency;
         o.useMarkersToOptimize = false;
@@ -415,7 +457,12 @@ vk::Result AcquireNextImage(vk::Device device, vk::SwapchainKHR swapchain, uint6
 
 vk::Result QueuePresent(vk::Queue queue, const vk::PresentInfoKHR& info) {
     const VkPresentInfoKHR& pi = info;
-    return static_cast<vk::Result>(g.queue_present(static_cast<VkQueue>(queue), &pi));
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = static_cast<vk::Result>(g.queue_present(static_cast<VkQueue>(queue), &pi));
+    const uint64_t us = UsSince(t0);
+    g_sec_present_us.fetch_add(us, std::memory_order_relaxed);
+    AtomicMax(g_sec_present_max_us, us);
+    return r;
 }
 
 vk::Result DeviceWaitIdle(vk::Device device) {
@@ -451,6 +498,25 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
         g_sec_errors.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
+    // BB_SL_REFLEX_SLEEP=1 (bisect): the Reflex sleep once per game frame here, unless the
+    // game's frame loop already sleeps (BB_REFLEX_GAME).
+    if (game == 0 && ReflexSleepOn() && g.reflex_sleep != nullptr && g_reflex_on) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (g.reflex_sleep(*token) != sl::Result::eOk) {
+            g_sec_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_sec_sleep_us.fetch_add(UsSince(t0), std::memory_order_relaxed);
+    }
+    const auto tag_t0 = std::chrono::steady_clock::now();
+    struct TagTime {
+        std::chrono::steady_clock::time_point t0;
+        ~TagTime() {
+            const uint64_t us = UsSince(t0);
+            g_sec_tag_us.fetch_add(us, std::memory_order_relaxed);
+            AtomicMax(g_sec_tag_max_us, us);
+            g_sec_tag_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+    } tag_time{tag_t0};
     if (game == 0) {
         Marker(sl::PCLMarker::eSimulationStart, frame);
         Marker(sl::PCLMarker::eSimulationEnd, frame);
@@ -536,6 +602,9 @@ uint32_t BeforePresent(uint32_t frame) {
         g_in_present.fetch_sub(1, std::memory_order_acq_rel);
         return 0;
     }
+    if (frame == 0 && !UntaggedMarkersOn()) {
+        return kLegacyUntagged; // as before f1c51d984: no markers, options untouched
+    }
     if (frame == 0) {
         frame = SR::Dlss::NextFrameIndex();
         {
@@ -560,6 +629,10 @@ uint32_t BeforePresent(uint32_t frame) {
 
 bool PresentAllowed() {
     return !g_shutting_down.load(std::memory_order_acquire);
+}
+
+bool SkipRepeats() {
+    return g_ready.load(std::memory_order_relaxed) && UntaggedMarkersOn();
 }
 
 void Shutdown(bool swapchain_idle) {
@@ -611,8 +684,10 @@ void AfterPresent(uint32_t frame, bool presented) {
         ~Leave() { g_in_present.fetch_sub(1, std::memory_order_acq_rel); }
     } leave;
     if (!g_ready) return;
-    Marker(sl::PCLMarker::ePresentEnd, frame);
-    if (presented) g_sec_presents.fetch_add(1, std::memory_order_relaxed);
+    if (frame != kLegacyUntagged) {
+        Marker(sl::PCLMarker::ePresentEnd, frame);
+        if (presented) g_sec_presents.fetch_add(1, std::memory_order_relaxed);
+    }
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(1)) return;
@@ -637,6 +712,16 @@ void AfterPresent(uint32_t frame, bool presented) {
         std::lock_guard lock{g_stats_mutex};
         g_stats = st;
         g_stats_set = true;
+    }
+    {
+        const uint32_t tags = std::max(1u, g_sec_tag_calls.exchange(0));
+        const uint32_t pres = std::max(1u, sec_presents);
+        BBLogf("[dlssg-sl-time] last s: Streamline present call avg %.2f max %.2f ms (%u presents) "
+               "| GPU thread tag+options avg %.2f max %.2f ms | slReflexSleep avg %.2f ms",
+               g_sec_present_us.exchange(0) / 1000.0 / pres,
+               g_sec_present_max_us.exchange(0) / 1000.0, sec_presents,
+               g_sec_tag_us.exchange(0) / 1000.0 / tags, g_sec_tag_max_us.exchange(0) / 1000.0,
+               g_sec_sleep_us.exchange(0) / 1000.0 / tags);
     }
     BBLogf("[dlssg-sl] state %d status 0x%x presented/frame %u max-gen %u min-size %u vram %.0f MB "
            "| last s: game frames %u tagged %u off %u own-constants %u errors %u | options %s x%u",
@@ -731,6 +816,9 @@ uint32_t BeforePresent(uint32_t) {
 void AfterPresent(uint32_t, bool) {}
 bool PresentAllowed() {
     return true;
+}
+bool SkipRepeats() {
+    return false;
 }
 void Shutdown(bool) {}
 bool GameReady() {

@@ -157,6 +157,8 @@ uint32_t TagFrame(vk::CommandBuffer cmd, const Inputs* inputs, vk::Extent2D back
 uint32_t BeforePresent(uint32_t frame);
 void AfterPresent(uint32_t frame, bool presented);
 bool PresentAllowed();
+// PresentLastFrame skips repeats between game frames (BB_SL_UNTAGGED=0: no, as before f1c51d984).
+bool SkipRepeats();
 // Exit: DLSS-G off, Reflex off, wait for an in-flight present (bounded), slShutdown. Any thread,
 // once; bounded waits only. swapchain_idle false (a present could still be running, or the GPU
 // did not go idle): no slShutdown at all, the process is terminated without it.

@@ -1223,7 +1223,7 @@ void Presenter::PresentLastFrame() {
     // bb-exit-dlssg: Streamline's DLSS-G too: a repeat between its game frames is an untagged
     // present, which turns DLSS-G off for it (and on again on the next game frame).
     if (!repeat_always &&
-        (BB::FG::Dlss::Ready() || BB::FG::DlssSl::Ready() || BB::FG::Fsr3Active()) &&
+        (BB::FG::Dlss::Ready() || BB::FG::DlssSl::SkipRepeats() || BB::FG::Fsr3Active()) &&
         std::chrono::steady_clock::now() - bb_last_game_present < std::chrono::milliseconds(100)) {
         ++bb_menu_sec.repeats_skipped;
         return;
