@@ -134,10 +134,9 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
-    void BbRtReflectProbe(const GraphicsPipeline& pipeline); // bb-rt-reflect
-    void BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr); // bb-rt-fullres
-    void BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect); // bb-rt-reflect
-    void BbRtReflectRun(); // bb-rt-reflect: the ray-query pass after the SSR draw
+    // bb-rt-reflect: G-buffer snapshot at the composite draw, pass before the post-process.
+    void BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt0, VideoCore::Image* rt1);
+    void BbRtReflectPost(const GraphicsPipeline& pipeline);
     void BbRtLightRun(const GraphicsPipeline& pipeline); // bb-rt-light: before the composite
     bool BindResources(const Pipeline* pipeline);
 
@@ -237,12 +236,15 @@ private:
     bool needs_barrier{};
 
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
-    bool bb_rt_ssr_draw = false;                    // this draw is the SSR draw
-    // bb-rt-fullres (BB_RT_REFLECT_FULLRES=1): set when the last RT pass produced the full-res
-    // image; the next draw with the composite PS samples it instead of the SSR target.
-    bool bb_rt_full_pending = false;
-    VAddr bb_rt_ssr_addr = 0;
-    u64 bb_rt_full_subs = 0;
+    // bb-rt-reflect: the composite's HDR target (guest address) and whether this frame's pass
+    // is still to run (snapshot taken, no draw has read the HDR target since); forward draws
+    // into it in between (for the log).
+    VAddr bb_rt_hdr_addr = 0;
+    bool bb_rt_refl_pending = false;
+    u32 bb_rt_refl_fwd = 0;
+    u32 bb_rt_refl_chain_logged = 0;
+    bool bb_rt_reflect_hook_first = false;
+    u32 bb_rt_refl_reads = 0;
     // bb-rt-light: the largest single-sample depth target written (depth write on) since the
     // last composite draw, in command-stream order (no frame counter: the flip counter is bumped
     // on the presenter thread and drifts against the GPU command stream). The composite samples
@@ -263,6 +265,8 @@ private:
         u32 gbuf_draws = 0;
         VideoCore::ImageId rt0_id{};
         u64 rt0_uid = 0;
+        VideoCore::ImageId rt1_id{}; // the MRT's second RGBA8 target (GBuffer RT1: shininess)
+        u64 rt1_uid = 0;
     };
     std::vector<BbRtDepthSeen> bb_rt_depth_seen;
     bool bb_rt_depth_fresh = false;  // a depth target was written since the last composite

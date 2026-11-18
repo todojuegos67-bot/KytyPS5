@@ -1,12 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bb-rt-reflect (BB_RT_REFLECT=1, default off): ray-traced reflections replacing the output of
-// the game's SSR draw (PS 0x6c2323c2) where a ray hits. After that draw, outside the render pass:
-// a depth mesh (bb_rt_mesh.comp) -> BLAS + one-instance TLAS (rebuilt each SSR draw) -> one ray
-// query per SSR pixel (bb_rt_reflect.comp) writing into the SSR target. BB_RT_REFLECT_DEBUG=1
-// tints the pixels a ray hit. Needs Instance::IsRtReflectEnabled() and the game's camera.
+// bb-rt-reflect (BB_RT_REFLECT=1, default off; BB_RT_REFLECT_QUALITY=1..3): ray-traced
+// reflections composited into the game's HDR scene before the post-process / upscaler / HUD.
+//  1. Snapshot (right before the composite draw PS 0x3fe9e964): G-buffer depth, RT0 world normal
+//     and RT1 shininess at the trace size (bb_rt_gsnap.comp).
+//  2. Run (before the first draw that samples the composite's HDR target after the forward pass):
+//     depth mesh of the final depth (bb_rt_mesh.comp) -> BLAS + TLAS, classification (water =
+//     forward surface nearer than the G-buffer depth and facing up; puddles / glossy from RT1),
+//     one ray query per reflective pixel (bb_rt_reflect.comp), temporal + a-trous filter and a
+//     depth-aware upsample blended into the HDR scene (bb_rt_post.comp).
+// Options: BB_RT_REFLECT_STRENGTH (0..2, 1), _WATER_MIN (0..0.9, 0.35), _RIPPLE (0..0.2, 0.02),
+// _PUDDLE (shininess, 0.85), _REFINE=0, _HOOK=first|<n>; BB_RT_DEBUG_VIEW=5/6/7 or F7 (debug).
+// No ray query / acceleration structures: nothing is created, the game renders as before.
 // BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1 (each independent of BB_RT_REFLECT) run in RunLighting,
-// before the composite draw, on their own depth mesh unless the reflections built one this frame.
+// before the composite draw, on their own depth mesh.
 #pragma once
 
 #include <array>
@@ -25,26 +32,32 @@ namespace BB {
 
 class RtReflect {
 public:
-    struct Input {
-        vk::Image target;        // SSR output, RGBA16F
-        vk::ImageView target_view; // storage view
-        vk::ImageLayout target_layout;
-        vk::Image depth;          // D32S8 (depth aspect sampled)
+    // G-buffer images at the composite draw (the scene depth bound with the G-buffer MRT).
+    struct SnapInput {
+        vk::Image depth;
         vk::ImageView depth_view;
         vk::ImageLayout depth_layout;
         bool depth_has_stencil;
-        vk::Image normal;         // RGBA8 G-buffer RT0
-        vk::ImageView normal_view;
-        vk::ImageLayout normal_layout;
-        vk::Image color;          // RGBA16F lit scene
-        vk::ImageView color_view;
-        vk::ImageView color_storage_view; // BB_RT_VOLUMETRIC=1: in-scattering is added here
-        vk::ImageLayout color_layout;
-        vk::Image shine;          // G-buffer RT1 (R: shininess), null when not bound
-        vk::ImageView shine_view;
-        vk::ImageLayout shine_layout;
-        u32 width, height;        // SSR target / depth size
-        u32 color_width, color_height; // lit scene size
+        vk::Image rt0; // GBuffer RT0 (RGB: world normal)
+        vk::ImageView rt0_view;
+        vk::ImageLayout rt0_layout;
+        vk::Image rt1; // GBuffer RT1 (R: shininess), null when not found
+        vk::ImageView rt1_view;
+        vk::ImageLayout rt1_layout;
+        u32 width, height; // depth size
+    };
+    // The HDR scene after the forward pass and the scene depth (same image as the snapshot's).
+    struct PostInput {
+        vk::Image hdr;
+        vk::ImageView hdr_storage_view;
+        vk::ImageView hdr_view;
+        vk::ImageLayout hdr_layout;
+        vk::Image depth;
+        vk::ImageView depth_view;
+        vk::ImageLayout depth_layout;
+        bool depth_has_stencil;
+        u32 hdr_width, hdr_height;
+        u32 depth_width, depth_height;
     };
 
     // bb-rt-light: volumetric light / RT shadows, run before the game's composite draw
@@ -101,16 +114,16 @@ public:
                     vk::Image d32, vk::ImageLayout d32_layout, bool d32_stencil, u32 rw, u32 rh,
                     u32 dw, u32 dh);
 
-    // Records the pass into `cmd` (outside a render pass). Image layouts are restored.
-    // Returns false when it did nothing (not supported, no camera, an allocation failed).
-    bool Run(vk::CommandBuffer cmd, const Input& in);
-
-    // BB_RT_REFLECT_FULLRES=1: the full-res (2x SSR size) RGBA16F result of the last Run, in
-    // GENERAL layout, same alpha semantics as the game's SSR target. Null when off / failed.
-    bool FullRes() const { return scale > 1; }
-    vk::ImageView FullView() const { return full.view; }
-    u32 FullWidth() const { return w * scale; }
-    u32 FullHeight() const { return h * scale; }
+    bool ReflectOn() const { return ok && refl_on; }
+    // Both record into `cmd` outside a render pass and restore the tracked image layouts.
+    // Snapshot: false when it did nothing (no pass this frame then).
+    bool Snapshot(vk::CommandBuffer cmd, const SnapInput& in);
+    // Run: trace, filter and blend into the HDR scene; false when it did nothing (`why` set).
+    bool Run(vk::CommandBuffer cmd, const PostInput& in, const char*& why);
+    // Frames the rasterizer saw without a pass, by reason (for the 5 s line).
+    void NoteSkip(const char* why);
+    // (Log) the forward draws into the HDR target between the snapshot and the run.
+    void NoteForwardDraws(u32 n) { fwd_draws += n; }
 
 private:
     struct Buf {
@@ -120,10 +133,20 @@ private:
         vk::DeviceAddress address = 0;
         vk::DeviceSize size = 0;
     };
+    // A depth mesh and its acceleration structures (one for the reflections, one for the
+    // lighting passes: they run at other points of the frame on other depth sizes).
+    struct Mesh {
+        Buf verts, blas_buf, tlas_buf, scratch, instances;
+        vk::AccelerationStructureKHR blas{}, tlas{};
+        vk::DeviceSize blas_scratch = 0, tlas_scratch = 0;
+        u32 mesh_w = 0, mesh_h = 0, mesh_cell = 0; // grid source size and cell
+        u32 gw = 0, gh = 0, tris = 0;
+    };
     bool EnsureSize(u32 w, u32 h);
-    bool EnsureMesh(u32 mw, u32 mh, u32 cell);
+    bool EnsureMesh(Mesh& m, u32 mw, u32 mh, u32 cell);
+    void FreeMesh(Mesh& m);
     // Depth mesh -> BLAS -> TLAS for the given (sampleable) depth; params slot already written.
-    void BuildMesh(vk::CommandBuffer cmd, const vk::DescriptorImageInfo& depth_info,
+    void BuildMesh(Mesh& m, vk::CommandBuffer cmd, const vk::DescriptorImageInfo& depth_info,
                    const vk::DescriptorBufferInfo& params_info);
     void ReadTimer(vk::QueryPool pool, std::array<bool, 8>& used, u32 slot, double& sum, u32& n);
     bool MakeBuffer(Buf& b, vk::DeviceSize size, vk::BufferUsageFlags usage, bool host,
@@ -165,18 +188,18 @@ private:
     bool tried = false, ok = false;
     bool refl_on = false; // BB_RT_REFLECT=1: reflection pipelines / images
     double ts_period = 1.0;
-    bool debug = false;
     vk::Sampler nearest{}, linear{};
-    vk::DescriptorSetLayout mesh_set{}, ray_set{}, post_set{};
-    vk::PipelineLayout mesh_layout{}, ray_layout{}, post_layout{};
-    vk::Pipeline mesh_pipe{}, ray_pipe{}, post_pipe{};
-    // Quality (BB_RT_REFLECT_QUALITY=1..3, default 2) and BB_RT_REFLECT_MORE.
-    u32 quality = 2, rays = 2;
-    float temporal_blend = 0.1f, filter_strength = 1.0f;
-    bool more = false, use_shine = true;
-    // Own images (RGBA16F, SSR size): raw trace, guide (normal, distance) x2, history x2, temp.
-    Img raw, tmp, full;
-    u32 scale = 1; // trace scale vs. the SSR size (2 with BB_RT_REFLECT_FULLRES=1)
+    vk::DescriptorSetLayout mesh_set{}, ray_set{}, post_set{}, snap_set{};
+    vk::PipelineLayout mesh_layout{}, ray_layout{}, post_layout{}, snap_layout{};
+    vk::Pipeline mesh_pipe{}, ray_pipe{}, post_pipe{}, snap_pipe{};
+    // Quality (BB_RT_REFLECT_QUALITY=1..3, default 2): see Init.
+    u32 quality = 2, rays = 1, trace_div = 2, spatial_passes = 1;
+    float temporal_glossy = 0.15f, temporal_mirror = 0.25f, filter_strength = 1.0f;
+    float shine_lo = 0.6f, shine_hi = 0.9f, shine_puddle = 0.85f, rough_lo = 0.3f;
+    float max_ray = 150.0f, water_min = 0.35f, ripple = 0.02f;
+    // Own images (trace size): snapshot (RGBA32F), raw / temp (RGBA16F), guide x2 (RGBA32F),
+    // history x2 (RGBA16F).
+    Img snap, raw, tmp;
     std::array<Img, 2> guide, hist;
     bool images_fresh = false;
     // Previous camera (row-major 4x4, column vectors) for the temporal reprojection.
@@ -184,14 +207,22 @@ private:
     bool have_prev = false;
     u64 frame = 0;
     vk::QueryPool queries{};
+    // Snapshot -> run pairing: the run uses only this frame's snapshot; a frame without a run
+    // (or a camera cut) restarts the history instead of reprojecting a stale one.
+    bool snap_ready = false;
+    u64 snap_seq = 0, last_run_seq = 0;
+    u32 snap_depth_w = 0, snap_depth_h = 0;
+    std::chrono::steady_clock::time_point t0{};
+    const char* hist_reset_why = "start";
+    u64 hist_resets = 0, skips = 0, fwd_draws = 0;
+    const char* last_skip = "none";
+    Buf rcounters;
 
-    u32 Cell = 4;
     static constexpr u32 Ring = 8;
     static constexpr vk::DeviceSize ParamSize = 512;
-    u32 w = 0, h = 0;                      // reflection (SSR) size
-    u32 mesh_w = 0, mesh_h = 0, mesh_cell = 0; // depth-mesh grid source size and cell
-    u32 gw = 0, gh = 0, tris = 0;
-    bool mesh_from_reflect = false; // the reflection pass built this frame's TLAS
+    u32 w = 0, h = 0;   // trace size
+    u32 Cell = 4;       // reflection depth-mesh cell (render px)
+    Mesh rmesh, lmesh;  // reflections / lighting
     // Lighting pass (composite hook) trace size and camera history.
     u32 lw_ = 0, lh_ = 0;
     double l_prev_view[16]{}, l_prev_proj[16]{};
@@ -204,20 +235,18 @@ private:
     // Restart the temporal accumulation (vol / shadow history) and clear its images.
     void ResetLightHistory(const char* why);
     u32 l_ring = 0;
-    Buf verts, blas_buf, tlas_buf, scratch, instances, params, counters;
-    vk::AccelerationStructureKHR blas{}, tlas{};
-    vk::DeviceSize blas_scratch = 0, tlas_scratch = 0;
+    Buf params, counters;
     u32 ring_pos = 0;
     std::array<bool, Ring> query_used{};
 
     // Stats (logged every 5 s).
     u64 dispatches = 0, last_dispatches = 0;
-    std::array<u32, 8> last_counts{};
+    std::array<u32, 16> last_counts{};
     double gpu_ms_sum = 0.0;
     u32 gpu_ms_n = 0;
-    bool logged_camera = false, logged_shine = false;
-    // Strength (BB_RT_REFLECT_STRENGTH, default 1.5) and hit refinement (BB_RT_REFLECT_REFINE=0 off).
-    float strength = 1.5f;
+    bool logged_camera = false;
+    // Strength (BB_RT_REFLECT_STRENGTH, default 1.0) and hit refinement (BB_RT_REFLECT_REFINE=0 off).
+    float strength = 1.0f;
     bool refine = true;
 
     // bb-rt-vol state.
@@ -276,7 +305,7 @@ private:
     // bb-rt-shadow state (BB_RT_SHADOWS=1).
     bool sh_on = false, sh_ok = false, sh_fresh = true;
     float sh_strength = 0.6f, sh_cone = 0.02f, sh_dist = 80.0f;
-    u32 dbg_view = 0; // BB_RT_DEBUG_VIEW=1..4 (shadow mask, volumetric, depth, N.L)
+    u32 dbg_view = 0; // BB_RT_DEBUG_VIEW=1..4 (shadow mask, volumetric, depth, N.L); 5-7: reflections
     vk::DescriptorSetLayout sh_set{};
     vk::PipelineLayout sh_layout{};
     vk::Pipeline sh_pipe{};
@@ -317,5 +346,9 @@ private:
     bool probe_has_d32 = false;
     u32 probe_rw = 0, probe_rh = 0;
 };
+
+// F7 (BB_RT_REFLECT=1): reflection debug view off -> class mask (5) -> reflection only (6) ->
+// blend weight (7) -> off. Starts at BB_RT_DEBUG_VIEW when that is 5..7.
+void RtReflectCycleDebug();
 
 } // namespace BB

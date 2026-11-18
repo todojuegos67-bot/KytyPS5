@@ -43,6 +43,10 @@
 
 CMRC_DECLARE(res);
 
+namespace BB {
+void RtReflectCycleDebug(); // video_core/renderer_vulkan/bb_rt_reflect.cpp
+}
+
 namespace Frontend {
 
 using namespace Libraries::Pad;
@@ -266,6 +270,20 @@ void WindowSDL::WaitEvent() {
         event.key.key == SDLK_F8) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
             BB::Upscale::ToggleOverlay();
+        }
+        return;
+    }
+
+    // bb-rt-reflect F7 (BB_RT_REFLECT=1 only): reflection debug view off / class mask /
+    // reflection only / blend weight.
+    static const bool rt_reflect = [] {
+        const char* e = std::getenv("BB_RT_REFLECT");
+        return e && e[0] == '1';
+    }();
+    if (rt_reflect && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.key == SDLK_F7) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+            BB::RtReflectCycleDebug();
         }
         return;
     }

@@ -63,6 +63,7 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
 
 namespace {
 bool BbRtAnyRequested();
+bool BbRtReflectRequested();
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
@@ -86,6 +87,10 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (!bb_rt_reflect->Init()) {
             LOG_ERROR(Render_Vulkan, "[rt] init failed: RT features off");
         }
+    } else if (BbRtReflectRequested()) {
+        LOG_WARNING(Render_Vulkan, "[rt-reflect] BB_RT_REFLECT=1 requested but this device has no "
+                                   "ray query / acceleration structures: reflections off (the "
+                                   "game's own reflections are drawn as usual)");
     } else if (BB::FogFx::Level() > 0) {
         LOG_WARNING(Render_Vulkan,
                     "[fog-fx] BB_FOG_FX={} requested but this device has no ray query / "
@@ -327,28 +332,11 @@ std::string BbSsrDesc(const Pipeline& pipeline, const R& regs, std::string kind,
     return d;
 }
 
-// bb-rt-reflect (BB_RT_REFLECT=1, default off): find the game's SSR draw (PS hash 0x6c2323c2)
-// and log, at most once per 5 s, the Vulkan images it renders to and reads, for the ray-query
-// pass of the next step. Diagnostic only: nothing is changed.
+// bb-rt-reflect (BB_RT_REFLECT=1, default off): ray-traced reflections (bb_rt_reflect.h).
 bool BbRtReflectRequested() {
     static const bool on = [] {
         const char* e = std::getenv("BB_RT_REFLECT");
         return e && e[0] == '1';
-    }();
-    return on;
-}
-constexpr u64 BbSsrPsHash = 0x6c2323c2; // fragment shader of the SSR draw (stage 0 in the probe log; 0x5a619b89 is its vertex shader)
-bool BbRtFullresRequested() { // BB_RT_REFLECT_FULLRES=1: full-res trace + composite substitution
-    static const bool on = [] {
-        const char* e = std::getenv("BB_RT_REFLECT_FULLRES");
-        return BbRtReflectRequested() && e && e[0] == '1';
-    }();
-    return on;
-}
-bool BbRtFullresLogRequested() { // BB_RT_REFLECT_FULLRES=log: the draw-chain diagnostic only
-    static const bool on = [] {
-        const char* e = std::getenv("BB_RT_REFLECT_FULLRES");
-        return BbRtReflectRequested() && e && std::string_view{e} == "log";
     }();
     return on;
 }
@@ -374,284 +362,217 @@ bool BbRtAnyRequested() {
 constexpr u64 BbCompositePsHash = 0x3fe9e964;
 } // namespace
 
-// bb-rt-fullres (BB_RT_REFLECT=1 + BB_RT_REFLECT_FULLRES=log, default off): step 1 of full-res
-// reflections. Logs, for the first 2 frames that have an SSR draw, every later draw (up to 400)
-// that samples the SSR target or a target written from it (the downsample chain), with its
-// shaders, targets, blend state and reads, so the game's composite draw can be identified by
-// hash. Diagnostic only: nothing is changed.
-void Rasterizer::BbRtFullresChain(const GraphicsPipeline& pipeline, bool is_ssr) {
-    if (!BbRtFullresLogRequested()) {
-        return;
-    }
-    static std::vector<VAddr> chain;
-    static int since = -1;
-    static int sequences = 0;
-    if (sequences >= 2) {
-        return;
-    }
-    const auto& regs = liverpool->regs;
-    const auto blend = [&] {
-        std::string b;
-        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-            if (!regs.color_buffers[cb] || regs.color_target_mask.GetMask(cb) == 0) {
-                continue;
-            }
-            const auto& bc = regs.blend_control[cb];
-            b += fmt::format(" cb{}:blend={} src={} dst={} func={} asrc={} adst={} mask={:#x}", cb,
-                             u32(bc.enable), u32(bc.color_src_factor), u32(bc.color_dst_factor),
-                             u32(bc.color_func), u32(bc.alpha_src_factor),
-                             u32(bc.alpha_dst_factor), regs.color_target_mask.GetMask(cb));
-        }
-        return b;
-    };
-    if (is_ssr) {
-        if (since >= 0) {
-            ++sequences; // a new SSR draw ends the previous sequence
-            if (sequences >= 2) {
-                return;
-            }
-        }
-        chain.clear();
-        for (const auto& image_id : bound_images) {
-            const auto& img = texture_cache.GetImage(image_id);
-            if (img.binding.is_target) {
-                chain.push_back(img.info.guest_address);
-            }
-        }
-        since = 0;
-        LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} SSR draw: {}{}", sequences,
-                 BbSsrDesc(pipeline, regs, "draw", true), blend());
-        return;
-    }
-    if (since < 0) {
-        return;
-    }
-    if (++since > 400) {
-        LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} end: {} chain targets", sequences,
-                 chain.size());
-        since = -1;
-        ++sequences;
-        return;
-    }
-    bool reads = false;
-    for (const auto& image_id : bound_images) {
-        const auto& img = texture_cache.GetImage(image_id);
-        if (!img.binding.is_target &&
-            std::ranges::find(chain, img.info.guest_address) != chain.end()) {
-            reads = true;
-        }
-    }
-    if (!reads) {
-        return;
-    }
-    for (const auto& image_id : bound_images) {
-        const auto& img = texture_cache.GetImage(image_id);
-        if (img.binding.is_target &&
-            std::ranges::find(chain, img.info.guest_address) == chain.end()) {
-            chain.push_back(img.info.guest_address);
-        }
-    }
-    LOG_INFO(Render_Vulkan, "[rt-fullres] seq {} +{} draws after SSR, reads the SSR chain: {}{}",
-             sequences, since, BbSsrDesc(pipeline, regs, "draw", true), blend());
+namespace {
+VAddr BbAddr(const VideoCore::Image& img) {
+    return img.info.guest_address;
 }
-
-
-void Rasterizer::BbRtReflectProbe(const GraphicsPipeline& pipeline) {
-    bool is_ssr = false;
-    for (const auto* stage : pipeline.GetStages()) {
-        if (stage && stage->sw_stage == Shader::SwStage::Fragment &&
-            stage->pgm_hash == BbSsrPsHash) {
-            is_ssr = true;
-        }
-    }
-    bb_rt_ssr_draw = is_ssr;
-    BbRtFullresChain(pipeline, is_ssr);
-    if (!is_ssr) {
-        return;
-    }
-    static u64 hits = 0;
-    static auto last = std::chrono::steady_clock::time_point{};
-    ++hits;
-    const auto now = std::chrono::steady_clock::now();
-    if (last != std::chrono::steady_clock::time_point{} && now - last < std::chrono::seconds(5)) {
-        return;
-    }
-    last = now;
-    std::string d;
-    for (const auto& image_id : bound_images) {
-        const auto& img = texture_cache.GetImage(image_id);
-        d += fmt::format(" [{} guest={:#x} {}x{} {} vk={:#x}]",
-                         img.binding.is_target ? "target" : "tex", img.info.guest_address,
-                         img.info.size.width, img.info.size.height,
-                         vk::to_string(img.info.pixel_format),
-                         reinterpret_cast<u64>(static_cast<VkImage>(img.GetImage())));
-    }
-    LOG_INFO(Render_Vulkan, "[rt-reflect] SSR draw (PS {:#x}) seen {} times, rtq={}; images:{}",
-             BbSsrPsHash, hits, instance.IsRtReflectEnabled() ? "on" : "off",
-             d.empty() ? " none" : d);
+vk::ImageLayout BbLayoutOf(const VideoCore::Image& img) {
+    return img.backing->subresource_states.empty() ? img.backing->state.layout
+                                                   : img.backing->subresource_states[0].layout;
 }
+// BB_RT_REFLECT_HOOK=first: run before the first draw that reads the HDR target, even one that
+// copies it into a same-size RGBA16F target (default: such a copy is skipped, it can be the
+// refraction source the water draw reads, drawn before the water). BB_RT_REFLECT_HOOK=<n>: before
+// the n-th draw that reads it (the "[rt-reflect] frame N after composite" lines list them).
+bool BbRtReflectHookFirst() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_RT_REFLECT_HOOK");
+        return e && std::string_view{e} == "first";
+    }();
+    return on;
+}
+u32 BbRtReflectHookNth() {
+    static const u32 n = [] {
+        const char* e = std::getenv("BB_RT_REFLECT_HOOK");
+        return e && e[0] >= '1' && e[0] <= '9' ? u32(std::clamp(std::atoi(e), 1, 64)) : 0u;
+    }();
+    return n;
+}
+} // namespace
 
-void Rasterizer::BbRtReflectSeeDraw(const GraphicsPipeline* pipeline, bool indirect) {
-    static u64 n_direct = 0;
-    static u64 n_indirect = 0;
-    static u64 n_null = 0;
-    static std::vector<u64> logged;
-    static auto last = std::chrono::steady_clock::time_point{};
-    if (!pipeline) {
-        ++n_null;
-    } else if (indirect) {
-        ++n_indirect;
+// bb-rt-reflect: at the composite draw (PS 0x3fe9e964, before it is drawn): the G-buffer
+// snapshot (scene depth, RT0, RT1 of the G-buffer MRT) and the composite's colour target, the
+// HDR target the forward pass (water: material draw phase "NormalDraw_Water") draws into next.
+void Rasterizer::BbRtReflectSnapshot(VideoCore::Image* d32, VideoCore::Image* rt0,
+                                     VideoCore::Image* rt1) {
+    if (!d32) {
+        return; // no depth written since the previous composite: the same frame drawn again
+    }
+    static u32 miss_streak = 0;
+    static bool hook_first_auto = false;
+    if (bb_rt_refl_pending) {
+        // The previous frame's pass never found its hook.
+        bb_rt_reflect->NoteSkip("no draw read the HDR target after the forward pass");
+        if (!hook_first_auto && ++miss_streak >= 30) {
+            hook_first_auto = true;
+            LOG_WARNING(Render_Vulkan, "[rt-reflect] 30 frames without the pre-post hook: from "
+                                       "now on the first draw reading the HDR target runs it "
+                                       "(as BB_RT_REFLECT_HOOK=first)");
+        }
     } else {
-        ++n_direct;
+        miss_streak = 0;
     }
-    const auto now = std::chrono::steady_clock::now();
-    if (last == std::chrono::steady_clock::time_point{} || now - last >= std::chrono::seconds(5)) {
-        last = now;
-        LOG_INFO(Render_Vulkan,
-                 "[rt-reflect] graphics draws: Draw {}, DrawIndirect {}, no pipeline {}", n_direct,
-                 n_indirect, n_null);
-    }
-    if (!pipeline || logged.size() >= 3) {
-        return;
-    }
-
-    const auto& regs = liverpool->regs;
-    const Shader::Info* ps = nullptr;
-    for (const auto* stage : pipeline->GetStages()) {
-        if (stage && stage->sw_stage == Shader::SwStage::Fragment) {
-            ps = stage;
-        }
-    }
-    if (!ps || !regs.depth_buffer.DepthValid() ||
-        std::ranges::find(logged, ps->pgm_hash) != logged.end()) {
-        return;
-    }
-    bool sized_target = false;
-    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-        const auto& col = regs.color_buffers[cb];
-        if (!col || regs.color_target_mask.GetMask(cb) == 0) {
-            continue;
-        }
-        const u32 w = col.Pitch();
-        const u32 h = col.Height();
-        sized_target |= (w == 1280 && h == 720) || (w == 1024 && h == 512) ||
-                        (w == 640 && h == 360);
-    }
-    if (!sized_target) {
-        return;
-    }
-    logged.push_back(ps->pgm_hash);
-    LOG_INFO(Render_Vulkan, "[rt-reflect] candidate PS #{} {:#x} after {} draws: {}", logged.size(),
-             ps->pgm_hash, n_direct + n_indirect,
-             BbSsrDesc(*pipeline, regs, indirect ? "DrawIndirect" : "Draw", true));
-}
-
-// bb-rt-reflect: right after the SSR draw, outside the render pass: the ray-query pass writes the
-// hit pixels of the SSR target (bb_rt_reflect.h). The images are the ones the draw bound: the
-// target (RGBA16F colour target), the depth (sampled, depth format), the G-buffer RT0 (RGBA8,
-// twice the target's size) and the lit scene (RGBA16F, twice the target's size). The tracked
-// layouts are left as they were.
-void Rasterizer::BbRtReflectRun() {
-    bb_rt_ssr_draw = false;
-    if (!instance.IsRtReflectEnabled()) {
-        return;
-    }
-    VideoCore::Image* target = nullptr;
-    VideoCore::Image* depth = nullptr;
-    VideoCore::Image* normal = nullptr;
-    VideoCore::Image* color = nullptr;
-    VideoCore::Image* shine = nullptr; // G-buffer RT1 (R: shininess) when the draw samples it
+    bb_rt_refl_pending = false;
+    VideoCore::Image* hdr = nullptr;
     for (const auto& image_id : bound_images) {
         auto& img = texture_cache.GetImage(image_id);
-        const auto f = img.info.pixel_format;
-        const auto area = [](const VideoCore::Image* i) {
-            return i ? u64(i->info.size.width) * i->info.size.height : 0ull;
-        };
-        // The largest sampled RGBA8 / RGBA16F (the full-size G-buffer RT0 and lit scene).
-        if (img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat && !target) {
-            target = &img;
-        } else if (img.info.props.is_depth && !depth) {
-            depth = &img;
-        } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm &&
-                   area(&img) > area(normal)) {
-            normal = &img;
-            shine = nullptr;
-        } else if (!img.binding.is_target && f == vk::Format::eR8G8B8A8Unorm && normal &&
-                   &img != normal && area(&img) == area(normal) && !shine) {
-            // The second full-size RGBA8 the draw samples (after RT0): taken as RT1.
-            shine = &img;
-        } else if (!img.binding.is_target && f == vk::Format::eR16G16B16A16Sfloat &&
-                   area(&img) > area(color)) {
-            color = &img;
+        if (img.binding.is_target && !img.info.props.is_depth &&
+            (!hdr || u64(img.info.size.width) * img.info.size.height >
+                         u64(hdr->info.size.width) * hdr->info.size.height)) {
+            hdr = &img;
         }
     }
-    static bool warned = false;
-    if (!target || !depth || !normal || !color ||
-        depth->info.size.width != target->info.size.width ||
-        depth->info.size.height != target->info.size.height ||
-        target->info.num_samples > 1 || depth->info.num_samples > 1) {
-        if (!warned) {
-            warned = true;
-            LOG_WARNING(Render_Vulkan,
-                        "[rt-reflect] SSR draw without the expected images (target {}, depth {}, "
-                        "normal {}, colour {}): skipped",
-                        target != nullptr, depth != nullptr, normal != nullptr, color != nullptr);
-        }
+    const char* why = !hdr                           ? "composite draw has no colour target"
+                      : !rt0                         ? "no G-buffer RT0"
+                      : d32->info.num_samples > 1    ? "multisampled scene depth"
+                      : rt0->info.props.is_depth     ? "G-buffer RT0 is a depth image"
+                                                     : nullptr;
+    if (why) {
+        bb_rt_reflect->NoteSkip(why);
         return;
     }
-    if (!bb_rt_reflect) {
+    if (rt1 && (rt1->info.size.width != rt0->info.size.width ||
+                rt1->info.size.height != rt0->info.size.height || rt1->info.props.is_depth)) {
+        rt1 = nullptr;
+    }
+    VideoCore::ImageViewInfo dv{};
+    dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
+    VideoCore::ImageViewInfo nv{};
+    nv.format = vk::Format::eR8G8B8A8Unorm;
+    const BB::RtReflect::SnapInput in{
+        .depth = d32->GetImage(),
+        .depth_view = *d32->FindView(dv, false).image_view,
+        .depth_layout = BbLayoutOf(*d32),
+        .depth_has_stencil = bool(d32->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .rt0 = rt0->GetImage(),
+        .rt0_view = *rt0->FindView(nv, false).image_view,
+        .rt0_layout = BbLayoutOf(*rt0),
+        .rt1 = rt1 ? rt1->GetImage() : vk::Image{},
+        .rt1_view = rt1 ? *rt1->FindView(nv, false).image_view : vk::ImageView{},
+        .rt1_layout = rt1 ? BbLayoutOf(*rt1) : vk::ImageLayout::eUndefined,
+        .width = d32->info.size.width,
+        .height = d32->info.size.height,
+    };
+    scheduler.EndRendering();
+    if (!bb_rt_reflect->Snapshot(scheduler.CommandBuffer(), in)) {
+        bb_rt_reflect->NoteSkip("snapshot not taken (allocation / pipelines)");
         return;
     }
     if (static bool logged = false; !logged) {
         logged = true;
         LOG_INFO(Render_Vulkan,
-                 "[rt-reflect] inputs: RT0 guest={:#x} {}x{}, RT1 candidate {}",
-                 normal->info.guest_address, normal->info.size.width, normal->info.size.height,
-                 shine ? fmt::format("guest={:#x} {}x{}", shine->info.guest_address,
-                                     shine->info.size.width, shine->info.size.height)
-                       : std::string("none"));
+                 "[rt-reflect] composite PS {:#x}: HDR target {:#x} {}x{} {}, scene depth {:#x} "
+                 "{}x{}, RT0 {:#x}, RT1 {}",
+                 BbCompositePsHash, BbAddr(*hdr), hdr->info.size.width, hdr->info.size.height,
+                 vk::to_string(hdr->info.pixel_format), BbAddr(*d32), d32->info.size.width,
+                 d32->info.size.height, BbAddr(*rt0),
+                 rt1 ? fmt::format("{:#x}", BbAddr(*rt1)) : std::string("none"));
     }
-    const auto layout_of = [](const VideoCore::Image& img) {
-        return img.backing->subresource_states.empty()
-                   ? img.backing->state.layout
-                   : img.backing->subresource_states[0].layout;
-    };
-    VideoCore::ImageViewInfo tv{};
-    tv.format = vk::Format::eR16G16B16A16Sfloat;
-    tv.is_storage = true;
-    VideoCore::ImageViewInfo dv{};
-    dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
-    VideoCore::ImageViewInfo nv{};
-    nv.format = vk::Format::eR8G8B8A8Unorm;
+    bb_rt_hdr_addr = BbAddr(*hdr);
+    bb_rt_refl_pending = true;
+    bb_rt_refl_fwd = 0;
+    bb_rt_refl_reads = 0;
+    bb_rt_reflect_hook_first = BbRtReflectHookFirst() || hook_first_auto;
+}
+
+// bb-rt-reflect: before the first draw after the composite that samples the HDR target without
+// rendering into it (the post-process chain: the frame's forward pass and its water are done,
+// the HUD and the upscaler come later), the reflections are traced and blended into it.
+void Rasterizer::BbRtReflectPost(const GraphicsPipeline& pipeline) {
+    if (!bb_rt_refl_pending) {
+        return;
+    }
+    const auto& regs = liverpool->regs;
+    VideoCore::Image* hdr = nullptr;
+    bool writes_hdr = false, copy_target = false;
+    for (const auto& image_id : bound_images) {
+        auto& img = texture_cache.GetImage(image_id);
+        if (BbAddr(img) == bb_rt_hdr_addr && !img.info.props.is_depth) {
+            if (img.binding.is_target) {
+                writes_hdr = true;
+            } else {
+                hdr = &img;
+            }
+        }
+    }
+    if (!writes_hdr && !hdr) {
+        return;
+    }
+    for (const auto& image_id : bound_images) {
+        const auto& img = texture_cache.GetImage(image_id);
+        if (hdr && img.binding.is_target && !img.info.props.is_depth &&
+            img.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+            img.info.size.width == hdr->info.size.width &&
+            img.info.size.height == hdr->info.size.height) {
+            copy_target = true;
+        }
+    }
+    bb_rt_refl_reads += writes_hdr ? 0 : 1;
+    const u32 nth = BbRtReflectHookNth();
+    const bool trigger = !writes_hdr && (nth ? bb_rt_refl_reads >= nth
+                                             : (!copy_target || bb_rt_reflect_hook_first));
+    if (bb_rt_refl_chain_logged < 2) {
+        // The draws touching the HDR target between the composite and the hook (2 frames).
+        static u32 lines = 0;
+        if (lines++ < 60) {
+            LOG_INFO(Render_Vulkan, "[rt-reflect] frame {} after composite, HDR read #{}: {} -> {}",
+                     bb_rt_refl_chain_logged, bb_rt_refl_reads,
+                     BbSsrDesc(pipeline, regs, writes_hdr ? "writes HDR" : "reads HDR", true),
+                     trigger ? "PASS RUNS HERE"
+                     : writes_hdr ? (regs.depth_control.depth_enable ? "forward draw" : "draw")
+                     : copy_target ? "same-size RGBA16F copy, skipped"
+                                   : "skipped (BB_RT_REFLECT_HOOK)");
+        }
+        if (trigger) {
+            ++bb_rt_refl_chain_logged;
+        }
+    }
+    if (writes_hdr) {
+        bb_rt_refl_fwd += regs.depth_control.depth_enable ? 1 : 0;
+        return;
+    }
+    if (!trigger) {
+        return;
+    }
+    bb_rt_refl_pending = false;
+    bb_rt_reflect->NoteForwardDraws(bb_rt_refl_fwd);
+    if (hdr->info.pixel_format != vk::Format::eR16G16B16A16Sfloat || hdr->info.num_samples > 1) {
+        bb_rt_reflect->NoteSkip("HDR target not single-sample RGBA16F");
+        return;
+    }
+    VideoCore::Image* d32 = texture_cache.TryGetImage(bb_rt_depth_last_id, bb_rt_depth_last_uid);
+    if (!d32 || u64(d32->info.size.width) * hdr->info.size.height !=
+                    u64(d32->info.size.height) * hdr->info.size.width) {
+        bb_rt_reflect->NoteSkip(d32 ? "scene depth aspect differs from the HDR target"
+                                    : "scene depth image gone");
+        return;
+    }
+    VideoCore::ImageViewInfo sv{};
+    sv.format = vk::Format::eR16G16B16A16Sfloat;
+    sv.is_storage = true;
     VideoCore::ImageViewInfo cv{};
     cv.format = vk::Format::eR16G16B16A16Sfloat;
-    const BB::RtReflect::Input in{
-        .target = target->GetImage(),
-        .target_view = *target->FindView(tv, false).image_view,
-        .target_layout = layout_of(*target),
-        .depth = depth->GetImage(),
-        .depth_view = *depth->FindView(dv, false).image_view,
-        .depth_layout = layout_of(*depth),
-        .depth_has_stencil = bool(depth->aspect_mask & vk::ImageAspectFlagBits::eStencil),
-        .normal = normal->GetImage(),
-        .normal_view = *normal->FindView(nv, false).image_view,
-        .normal_layout = layout_of(*normal),
-        .color = color->GetImage(),
-        .color_view = *color->FindView(cv, false).image_view,
-        .color_storage_view = vk::ImageView{},
-        .color_layout = layout_of(*color),
-        .shine = shine ? shine->GetImage() : vk::Image{},
-        .shine_view = shine ? *shine->FindView(nv, false).image_view : vk::ImageView{},
-        .shine_layout = shine ? layout_of(*shine) : vk::ImageLayout::eUndefined,
-        .width = target->info.size.width,
-        .height = target->info.size.height,
-        .color_width = color->info.size.width,
-        .color_height = color->info.size.height,
+    VideoCore::ImageViewInfo dv{};
+    dv.format = vk::Format::eR32Sfloat;
+    const BB::RtReflect::PostInput in{
+        .hdr = hdr->GetImage(),
+        .hdr_storage_view = *hdr->FindView(sv, false).image_view,
+        .hdr_view = *hdr->FindView(cv, false).image_view,
+        .hdr_layout = BbLayoutOf(*hdr),
+        .depth = d32->GetImage(),
+        .depth_view = *d32->FindView(dv, false).image_view,
+        .depth_layout = BbLayoutOf(*d32),
+        .depth_has_stencil = bool(d32->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .hdr_width = hdr->info.size.width,
+        .hdr_height = hdr->info.size.height,
+        .depth_width = d32->info.size.width,
+        .depth_height = d32->info.size.height,
     };
     scheduler.EndRendering();
-    const bool ran = bb_rt_reflect->Run(scheduler.CommandBuffer(), in);
-    bb_rt_full_pending = ran && bb_rt_reflect->FullRes() && bb_rt_reflect->FullView();
-    bb_rt_ssr_addr = target->info.guest_address;
+    const char* why = nullptr;
+    if (!bb_rt_reflect->Run(scheduler.CommandBuffer(), in, why)) {
+        bb_rt_reflect->NoteSkip(why);
+    }
 }
 
 // bb-rt-light (BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1): right before the game's composite draw
@@ -671,7 +592,8 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
             is_composite = true;
         }
     }
-    if (!is_composite || !bb_rt_reflect->LightingOn()) {
+    const bool light_on = bb_rt_reflect->LightingOn();
+    if (!is_composite || !(light_on || bb_rt_reflect->ReflectOn())) {
         return;
     }
     // Per 5 s status (also when nothing ran, with the reason).
@@ -682,6 +604,9 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     static auto last_status = std::chrono::steady_clock::time_point{};
     ++n_seen;
     const auto status = [&] {
+        if (!light_on) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (last_status != std::chrono::steady_clock::time_point{} &&
             now - last_status < std::chrono::seconds(5)) {
@@ -748,6 +673,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     };
     VideoCore::Image* d32 = nullptr;
     VideoCore::Image* gbuf_rt0 = nullptr;
+    VideoCore::Image* gbuf_rt1 = nullptr;
     bool d32_reused = false;
     const char* d32_how = "none";
     if (depth_fresh) {
@@ -769,6 +695,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
                 best_g = c.gbuf_draws;
                 best_ga = ar;
                 gbuf_rt0 = c.rt0_uid ? texture_cache.TryGetImage(c.rt0_id, c.rt0_uid) : nullptr;
+                gbuf_rt1 = c.rt1_uid ? texture_cache.TryGetImage(c.rt1_id, c.rt1_uid) : nullptr;
                 bb_rt_depth_last_id = c.id;
                 bb_rt_depth_last_uid = c.uid;
                 bb_rt_depth_last_addr = c.addr;
@@ -870,6 +797,12 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
                      BbCompositePsHash, scene_addr, desc);
         }
         status();
+        return;
+    }
+    if (bb_rt_reflect->ReflectOn()) {
+        BbRtReflectSnapshot(d32, gbuf_rt0, gbuf_rt1);
+    }
+    if (!light_on) {
         return;
     }
     // From here on every exit without a run breaks the temporal history.
@@ -997,9 +930,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
-    if (BbRtReflectRequested()) {
-        BbRtReflectSeeDraw(pipeline, false);
-    }
     if (!pipeline) {
         return;
     }
@@ -1016,9 +946,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                                    regs.num_indices),
                                        true));
     }
-    if (BbRtReflectRequested()) {
-        BbRtReflectProbe(*pipeline);
-    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -1028,8 +955,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
-    if (bb_rt_reflect && BbRtLightRequested()) {
+    if (bb_rt_reflect) {
         BbRtLightRun(*pipeline);
+        BbRtReflectPost(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -1061,9 +989,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
-    if (bb_rt_ssr_draw) {
-        BbRtReflectRun();
-    }
 
     if (BB::UiCut::Active()) {
         bb_cut.AfterDraw(bb_scene_depth); // bb-hud-layer: the cut after the HUD composite
@@ -1088,9 +1013,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
-    if (BbRtReflectRequested()) {
-        BbRtReflectSeeDraw(pipeline, true);
-    }
     if (!pipeline) {
         return;
     }
@@ -1101,9 +1023,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
-    if (BbRtReflectRequested()) {
-        BbRtReflectProbe(*pipeline);
-    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -1127,8 +1046,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
-    if (bb_rt_reflect && BbRtLightRequested()) {
+    if (bb_rt_reflect) {
         BbRtLightRun(*pipeline);
+        BbRtReflectPost(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -1166,9 +1086,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
-    }
-    if (bb_rt_ssr_draw) {
-        BbRtReflectRun();
     }
 
     if (BB::UiCut::Active()) {
@@ -1785,14 +1702,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     u32 num_images{};
-    // bb-rt-fullres: per binding, 1 = sampled only (substitutable), 2 = IMAGE_LOAD, 3 = size query.
-    boost::container::small_vector<u8, 16> bb_access;
-    const bool bb_full = bb_rt_full_pending && stage.pgm_hash == BbCompositePsHash;
     for (const auto& image_desc : stage.images) {
-        if (bb_full) {
-            bb_access.resize(num_images + image_desc.NumBindings(stage),
-                             image_desc.is_loaded ? 2 : image_desc.is_queried ? 3 : 1);
-        }
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
@@ -1910,37 +1820,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             } else if (BB::UiCut::Active() && !is_storage) {
                 // bb-hud-layer: the HUD composite pass reads a transparent layer (AfterDraw).
                 bb_cut.SubstituteLayer(image_id, bb_view, bb_layout);
-            }
-            if (bb_full && !is_storage && image.info.guest_address == bb_rt_ssr_addr) {
-                // bb-rt-fullres: the composite samples our full-res RT result instead.
-                const u8 acc = i < bb_access.size() ? bb_access[i] : 0;
-                const bool fmt_ok = image_view.info.format == vk::Format::eR16G16B16A16Sfloat;
-                static bool logged_sub = false, logged_refuse = false;
-                if (acc == 1 && fmt_ok) {
-                    bb_view = bb_rt_reflect->FullView();
-                    bb_layout = vk::ImageLayout::eGeneral;
-                    bb_rt_full_pending = false;
-                    ++bb_rt_full_subs;
-                    if (!logged_sub) {
-                        logged_sub = true;
-                        LOG_INFO(Render_Vulkan,
-                                 "[rt-fullres] PS {:#x}: binding {} (SSR target {:#x} {}x{}) -> "
-                                 "own RT image {}x{} RGBA16F (sampled with a sampler)",
-                                 BbCompositePsHash, i, bb_rt_ssr_addr, image.info.size.width,
-                                 image.info.size.height, bb_rt_reflect->FullWidth(),
-                                 bb_rt_reflect->FullHeight());
-                    }
-                } else if (!logged_refuse) {
-                    logged_refuse = true;
-                    LOG_WARNING(Render_Vulkan,
-                                "[rt-fullres] PS {:#x}: SSR target binding {} NOT substituted: {}",
-                                BbCompositePsHash, i,
-                                !fmt_ok ? fmt::format("view format {}",
-                                                      vk::to_string(image_view.info.format))
-                                : acc == 2 ? std::string("read with IMAGE_LOAD (texel coords)")
-                                : acc == 3 ? std::string("its size is queried (RESINFO)")
-                                           : std::string("unknown access"));
-                }
             }
             image_infos.emplace_back(VK_NULL_HANDLE, bb_view, bb_layout);
         }
@@ -2350,8 +2229,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
             // G-buffer MRT test (see BbRtDepthSeen): colour attachments of the depth's size.
             u32 n_same = 0, n_rgba8 = 0;
-            VideoCore::ImageId rt0{};
-            u64 rt0_uid = 0;
+            VideoCore::ImageId rt0{}, rt1{};
+            u64 rt0_uid = 0, rt1_uid = 0;
             for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
                 const auto cid = cb_descs[cb].image_id;
                 if (!cid || !state.color_attachments[cb].image_view) {
@@ -2365,10 +2244,14 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                 ++n_same;
                 if (ci.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
                     ci.info.pixel_format == vk::Format::eR8G8B8A8Srgb) {
-                    if (n_rgba8++ == 0) {
+                    if (n_rgba8 == 0) {
                         rt0 = cid;
                         rt0_uid = ci.image_uid;
+                    } else if (n_rgba8 == 1) {
+                        rt1 = cid;
+                        rt1_uid = ci.image_uid;
                     }
+                    ++n_rgba8;
                 }
             }
             const bool gbuf = regs.depth_control.depth_enable && n_same >= 2 && n_rgba8 >= 2 &&
@@ -2383,6 +2266,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                         if (!c.rt0_uid) {
                             c.rt0_id = rt0;
                             c.rt0_uid = rt0_uid;
+                            c.rt1_id = rt1;
+                            c.rt1_uid = rt1_uid;
                         }
                     }
                     merged = true;
@@ -2394,7 +2279,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                             image.info.num_samples, image.info.pixel_format,
                                             bool(regs.depth_control.depth_enable), writes,
                                             gbuf ? 1u : 0u, gbuf ? rt0 : VideoCore::ImageId{},
-                                            gbuf ? rt0_uid : 0});
+                                            gbuf ? rt0_uid : 0, gbuf ? rt1 : VideoCore::ImageId{},
+                                            gbuf ? rt1_uid : 0});
             }
             bb_rt_depth_fresh |= writes && image.info.num_samples == 1;
         }

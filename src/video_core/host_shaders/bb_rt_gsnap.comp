@@ -1,0 +1,45 @@
+// SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bb-rt-reflect (BB_RT_REFLECT=1): G-buffer snapshot, recorded right before the game's composite
+// draw (PS 0x3fe9e964), at the reflection trace size. Ghidra (eboot 1.09, FUN_026c67b0 debug view
+// names): "GBuffer RT0(RGB:WS Normal)", "GBuffer RT1(R:Shininess,G:Translucency,B:SnowAmount)".
+// Out (RGBA32F): oct-encoded world normal (2, 2 = none), shininess (-1 = RT1 not bound), device
+// depth of the G-buffer pass (before the forward pass draws the water).
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1) uniform sampler2D rt0_tex;
+layout(binding = 2) uniform sampler2D rt1_tex;
+layout(binding = 3, rgba32f) uniform writeonly image2D snap_out;
+layout(push_constant) uniform Push { uvec4 size; } pc; // trace w, h, depth px per trace px, RT1 bound
+
+vec2 OctEncode(vec3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 o = n.xy;
+    if (n.z < 0.0) {
+        o = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return o;
+}
+
+ivec2 Map(ivec2 dp, ivec2 dsz, ivec2 tsz) {
+    return clamp(ivec2((vec2(dp) + 0.5) * vec2(tsz) / vec2(dsz)), ivec2(0), tsz - 1);
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= int(pc.size.x) || c.y >= int(pc.size.y)) {
+        return;
+    }
+    ivec2 dsz = textureSize(depth_tex, 0);
+    ivec2 dp = min(c * int(pc.size.z), dsz - 1);
+    float d = texelFetch(depth_tex, dp, 0).r;
+    vec3 n = texelFetch(rt0_tex, Map(dp, dsz, textureSize(rt0_tex, 0)), 0).rgb * 2.0 - 1.0;
+    float l = length(n);
+    vec2 o = (l > 0.5 && l < 1.5) ? OctEncode(n / l) : vec2(2.0);
+    float s = -1.0;
+    if (pc.size.w != 0u) {
+        s = texelFetch(rt1_tex, Map(dp, dsz, textureSize(rt1_tex, 0)), 0).r;
+    }
+    imageStore(snap_out, c, vec4(o, s, d));
+}
