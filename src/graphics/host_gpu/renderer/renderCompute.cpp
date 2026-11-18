@@ -1527,12 +1527,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	PipelineCache::ComputePartition partition;
-	DispatchDirectPart(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	DispatchDirectPart(m_translation, submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
 	                   &partition);
 	const auto targets = partition.targets;
 	for (size_t i = 1; i < targets.size(); i++) {
 		partition.target = targets[i];
-		DispatchDirectPart(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+		DispatchDirectPart(m_translation, submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
 		                   &partition);
 	}
 }
@@ -1540,15 +1540,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
 	PipelineCache::ComputePartition partition;
-	DispatchIndirectPart(submit_id, buffer, args_addr, mode, &partition);
+	DispatchIndirectPart(m_translation, submit_id, buffer, args_addr, mode, &partition);
 	const auto targets = partition.targets;
 	for (size_t i = 1; i < targets.size(); i++) {
 		partition.target = targets[i];
-		DispatchIndirectPart(submit_id, buffer, args_addr, mode, &partition);
+		DispatchIndirectPart(m_translation, submit_id, buffer, args_addr, mode, &partition);
 	}
 }
 
-void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffer,
+void RenderExecutor::DispatchDirectPart(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
                                         uint32_t thread_group_x, uint32_t thread_group_y,
                                         uint32_t thread_group_z, uint32_t mode,
                                         PipelineCache::ComputePartition* partition) {
@@ -1798,7 +1798,7 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 		return;
 	}
 	auto& pipeline = *pipeline_found;
-	auto& bindings = m_compute_bindings;
+	auto& bindings = tc.compute;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " groups %ux%ux%u threads %ux%ux%u", program.shader_hash,
 		                thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
@@ -2007,7 +2007,7 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 	ResetBindings();
 }
 
-void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer,
+void RenderExecutor::DispatchIndirectPart(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
                                           uint64_t args_addr, uint32_t mode,
                                           PipelineCache::ComputePartition* partition) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
@@ -2116,7 +2116,7 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 		return;
 	}
 	auto& pipeline = *pipeline_found;
-	auto& bindings = m_compute_bindings;
+	auto& bindings = tc.compute;
 	if (FrameGraph::Logging()) {
 		FrameGraph::Log("  cs %016" PRIx64 " threads %ux%ux%u",
 		                input_info.stage.program->shader_hash, input_info.threads_num[0],

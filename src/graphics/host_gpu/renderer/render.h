@@ -236,6 +236,21 @@ private:
 
 class RenderExecutor {
 public:
+	struct GraphicsBindings {
+		std::array<PreparedBindings, 3> vertex;
+		std::optional<PreparedBindings> pixel;
+	};
+	// MT GPU stage B (gt7-mt-1117): what translating one draw or dispatch writes for itself, out
+	// of the executor so that two contexts can coexist (KYTY_MT_GPU=3 translates the first draw
+	// of each chunk twice and compares). Not in it, because it lives in shared objects: the
+	// images' binding flags (TextureCache::Image::binding, set by BindImage/BindRenderTarget and
+	// cleared by ResetBindings through m_bound_images), the texture memo, the bindless survey
+	// and the descriptor scratch vectors (descriptors.cpp).
+	struct TranslationContext {
+		GraphicsBindings graphics;
+		PreparedBindings compute;
+	};
+
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
@@ -247,11 +262,13 @@ public:
 	// Round 99: one dispatch of a shader whose call is partitioned runs once per partition
 	// (PipelineCache::GetComputeProgram): these run the partition of partition->target (0: the
 	// first), and receive every partition's target.
-	void DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                        uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	void DispatchDirectPart(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
+	                        uint32_t thread_group_x, uint32_t thread_group_y,
+	                        uint32_t thread_group_z, uint32_t mode,
 	                        PipelineCache::ComputePartition* partition);
-	void DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                          uint32_t mode, PipelineCache::ComputePartition* partition);
+	void DispatchIndirectPart(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
+	                          uint64_t args_addr, uint32_t mode,
+	                          PipelineCache::ComputePartition* partition);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
@@ -292,10 +309,6 @@ private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
-	struct GraphicsBindings {
-		std::array<PreparedBindings, 3> vertex;
-		std::optional<PreparedBindings> pixel;
-	};
 
 	// `memo`: a draw's or a dispatch's binding (PrepareBindings), which may be the one the same
 	// descriptor resolved to before (TextureBinding::memo_view) or be kept for that.
@@ -325,7 +338,8 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	void ExecutePreparedDraw(TranslationContext& tc, uint64_t submit_id, CommandBuffer& buffer,
+	                         const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
@@ -375,8 +389,8 @@ private:
 
 	RenderContext&                        m_context;
 	std::vector<MsColorTarget>            m_ms_color_targets;
-	GraphicsBindings                     m_graphics_bindings;
-	PreparedBindings                     m_compute_bindings;
+	// The translation context of the GPU thread (the only one used to draw).
+	TranslationContext                    m_translation;
 	std::vector<ImageId>                  m_bound_images;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;

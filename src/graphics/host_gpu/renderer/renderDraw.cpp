@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -2670,7 +2671,62 @@ static void LogFrameGraphDraw(RenderContext& context, const CommandBuffer& buffe
 	FrameGraph::SetShowBuffers(draw.index_count <= 6 || !state.depth_info.image_id);
 }
 
-void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
+namespace {
+
+// KYTY_MT_GPU=3: what differs between two translations of the same stage, or empty. Buffers
+// uploaded per translation (flattened SRT, shader data) are fresh each time: their sizes only.
+std::string CompareBindings(const PreparedBindings& a, const PreparedBindings& b) {
+	const auto same_buffer = [](const vk::DescriptorBufferInfo& x,
+	                            const vk::DescriptorBufferInfo& y) {
+		return x.buffer == y.buffer && x.offset == y.offset && x.range == y.range;
+	};
+	if (a.runtime != b.runtime) return "runtime";
+	if (a.normalize_unnormalized != b.normalize_unnormalized) return "normalize";
+	if (a.buffer_sources.size() != b.buffer_sources.size()) return "buffer_sources.size";
+	for (size_t i = 0; i < a.buffer_sources.size(); i++) {
+		const auto& x = a.buffer_sources[i];
+		const auto& y = b.buffer_sources[i];
+		if (x.address != y.address || x.size != y.size || !(x.id == y.id)) {
+			return fmt::format("buffer_sources[{}] 0x{:x}+{} / 0x{:x}+{}", i, x.address, x.size,
+			                   y.address, y.size);
+		}
+	}
+	if (a.buffers.size() != b.buffers.size()) return "buffers.size";
+	for (size_t i = 0; i < a.buffers.size(); i++) {
+		if (!same_buffer(a.buffers[i], b.buffers[i])) return fmt::format("buffers[{}]", i);
+	}
+	if (a.images.size() != b.images.size()) return "images.size";
+	for (size_t i = 0; i < a.images.size(); i++) {
+		const auto& x = a.images[i];
+		const auto& y = b.images[i];
+		if (!(x.image_id == y.image_id) || x.image_view != y.image_view || x.layout != y.layout ||
+		    x.mip_views != y.mip_views) {
+			return fmt::format("images[{}]", i);
+		}
+	}
+	if (a.samplers != b.samplers) return "samplers";
+	if (!same_buffer(a.gds, b.gds)) return "gds";
+	if (!same_buffer(a.shared_memory, b.shared_memory)) return "shared_memory";
+	if (a.flattened_srt.range != b.flattened_srt.range) return "flattened_srt.range";
+	if (a.shader_data_buffer.range != b.shader_data_buffer.range) return "shader_data_buffer.range";
+	if (a.shader_data != b.shader_data) return "shader_data";
+	if (a.bindless_patches != b.bindless_patches) return "bindless_patches";
+	if (a.bindless_heaps != b.bindless_heaps) return "bindless_heaps";
+	return {};
+}
+
+void ReportSelfCheck(uint64_t vs_hash, uint64_t ps_hash, const char* stage, const std::string& what) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+		Log::WriteUnmuted(fmt::format("MT GPU stage B: diferencia vs {:016x} ps {:016x} {}: {}\n",
+		                              vs_hash, ps_hash, stage, what));
+	}
+}
+
+} // namespace
+
+void RenderExecutor::ExecutePreparedDraw(TranslationContext& tc, uint64_t submit_id,
+                                         CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
@@ -2850,7 +2906,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
-	auto&                            bindings = m_graphics_bindings;
+	auto&                            bindings = tc.graphics;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
 	{
@@ -2868,6 +2924,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	// KYTY_MT_GPU=3: the same stages again in a second context, before PrepareGraphicsBindings
+	// (which rebinds through the shared images); the pipeline is compared below.
+	const bool self_check = MtGpu::SelfCheckEnabled() && MtGpu::TakeSelfCheckDraw();
+	bool       self_check_same = true;
+	const uint64_t check_vs = vertex_stages.front().stage.program->shader_hash;
+	const uint64_t check_ps = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+	if (self_check) {
+		TranslationContext shadow;
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			shadow.graphics.vertex[i].normalize_unnormalized =
+			    state.programs.vertex[i].normalized_samplers;
+			PrepareBindings(state.vertex_info[i].stage, shadow.graphics.vertex[i]);
+			if (auto what = CompareBindings(bindings.vertex[i], shadow.graphics.vertex[i]);
+			    !what.empty()) {
+				self_check_same = false;
+				ReportSelfCheck(check_vs, check_ps, "vertex", what);
+			}
+		}
+		if (state.ps_active) {
+			shadow.graphics.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *shadow.graphics.pixel);
+			if (auto what = CompareBindings(*bindings.pixel, *shadow.graphics.pixel); !what.empty()) {
+				self_check_same = false;
+				ReportSelfCheck(check_vs, check_ps, "pixel", what);
+			}
+		}
+	}
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
 	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		DumpTessellatedDraw(buffer, draw, state, index_source, bindings.vertex);
@@ -2913,6 +2996,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
 		    primitive_restart_enable, state.programs, defer);
+	}
+	if (self_check) {
+		if (deferred_pipeline != nullptr) {
+			const GpuPhases::Scope phase(GpuPhases::Phase::DrawPipeline);
+			const auto* again = m_context.GetPipelineCache().TryGetGraphicsPipeline(
+			    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages,
+			    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+			    primitive_restart_enable, state.programs, defer);
+			if (again != deferred_pipeline) {
+				self_check_same = false;
+				ReportSelfCheck(check_vs, check_ps, "pipeline", "otro pipeline");
+			}
+		}
+		MtGpu::NoteSelfCheck(self_check_same);
 	}
 	if (deferred_pipeline == nullptr) {
 		OcclusionQueries::SkippedDraw(m_context, buffer.GetRegisters().GetDbCountControl());
@@ -3532,7 +3629,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), args.base_vertex, 0, emit.vertex_offset,
 	               emit.first_instance, indirect);
 
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
+	ExecutePreparedDraw(m_translation, submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
 	ResetBindings();
 }
@@ -3700,7 +3797,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	               static_cast<int32_t>(emit.first_vertex), emit.first_instance, indirect);
 
 	DrawIndexBufferSource index_source {};
-	ExecutePreparedDraw(submit_id, buffer, drawn_info, state, topology, emit, index_source, false);
+	ExecutePreparedDraw(m_translation, submit_id, buffer, drawn_info, state, topology, emit, index_source, false);
 	ResetBindings();
 }
 

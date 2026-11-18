@@ -34,6 +34,14 @@ void NoteDraw();
 // GPU thread (ignored elsewhere and outside a chunk): the current chunk reads this range.
 void NoteRead(uint64_t vaddr, uint64_t size);
 
+// Stage B self-check (KYTY_MT_GPU=3, off by default): the GPU thread translates the first draw
+// of each chained buffer a second time with another RenderExecutor::TranslationContext and
+// compares bindings and pipeline (renderDraw.cpp); differences go to the log at once.
+[[nodiscard]] bool SelfCheckEnabled();
+// GPU thread: true once per chained buffer (its first draw that reaches PrepareBindings).
+[[nodiscard]] bool TakeSelfCheckDraw();
+void NoteSelfCheck(bool same);
+
 // GPU thread, after the "Spec" line: the "MT GPU stage A" line (Log::WriteUnmuted).
 void Report(uint64_t frames, double seconds);
 

@@ -162,6 +162,41 @@ void NoteWrite(WriteKind kind, uint64_t vaddr, uint64_t size) {
 	}
 }
 
+bool SelfCheckEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MT_GPU");
+		const bool  on    = value != nullptr && std::strcmp(value, "3") == 0;
+		if (on) {
+			Log::WriteUnmuted("MT GPU stage B: self-check of the translation context (KYTY_MT_GPU=3)\n");
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+namespace {
+thread_local bool             t_check_pending = false;
+std::atomic<uint64_t>         g_checked {0};
+std::atomic<uint64_t>         g_differ {0};
+uint64_t                      g_checked_last = 0;
+uint64_t                      g_differ_last  = 0;
+} // namespace
+
+bool TakeSelfCheckDraw() {
+	if (!SelfCheckEnabled() || !t_check_pending) {
+		return false;
+	}
+	t_check_pending = false;
+	return true;
+}
+
+void NoteSelfCheck(bool same) {
+	g_checked.fetch_add(1, std::memory_order_relaxed);
+	if (!same) {
+		g_differ.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void NotePrepared(uint64_t address) {
 	if (!StageAEnabled()) {
 		return;
@@ -172,6 +207,9 @@ void NotePrepared(uint64_t address) {
 }
 
 void ChunkBegin(uint64_t address, uint64_t size_bytes) {
+	if (SelfCheckEnabled()) {
+		t_check_pending = true;
+	}
 	if (!StageAEnabled()) {
 		return;
 	}
@@ -225,6 +263,15 @@ void NoteRead(uint64_t vaddr, uint64_t size) {
 }
 
 void Report(uint64_t frames, double seconds) {
+	if (SelfCheckEnabled()) {
+		const uint64_t checked = g_checked.load(std::memory_order_relaxed);
+		const uint64_t differ  = g_differ.load(std::memory_order_relaxed);
+		Log::WriteUnmuted(fmt::format(
+		    "MT GPU stage B ({:.0f} s): draws comprobados {}, con diferencias {} (total {} / {})\n",
+		    seconds, checked - g_checked_last, differ - g_differ_last, checked, differ));
+		g_checked_last = checked;
+		g_differ_last  = differ;
+	}
 	if (!StageAEnabled()) {
 		return;
 	}
