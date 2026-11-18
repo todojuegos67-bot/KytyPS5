@@ -29,6 +29,13 @@ struct Counters {
     std::atomic<u64> fault_around_pages{}; // pages unprotected ahead of a write fault (batched)
     std::atomic<u64> wait_stream_us{};     // of wait_us: staging stream buffer wrap waits
     std::atomic<u64> wait_faultbuf_us{};   // of wait_us: GPU page-fault buffer readback waits
+    // bb-native-texhash / GPU-thread starvation split
+    std::atomic<u64> tex_skips{};      // image refreshes skipped: guest bytes = last upload
+    std::atomic<u64> tex_skip_bytes{}; // their guest size
+    std::atomic<u64> tex_gpu_src{};    // of tex_uploads: refreshed from GPU-written buffer data
+    std::atomic<u64> cp_busy_us{};     // GpuCommandProcessor thread: wake -> idle time
+    std::atomic<u64> cp_guest_wait_us{}; // of cp_busy_us: GFX WAIT_REG_MEM on game memory
+    std::atomic<u64> cp_vo_wait_us{};    // of cp_busy_us: GFX wait on a flip label (sleeps)
 };
 
 inline Counters& Get() {

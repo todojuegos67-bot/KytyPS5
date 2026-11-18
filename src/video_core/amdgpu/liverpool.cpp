@@ -18,6 +18,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/bb/bb_mv_engine.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "core/bb_ssr_probe.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -41,6 +42,14 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
     FIBER_EXIT;                                                                                    \
     co_yield {};                                                                                   \
     FIBER_ENTER(name);
+
+// bb-native: time the GFX ring spends waiting on the game (WAIT_REG_MEM on guest memory) or on
+// a flip (VO label), for the [perf2] "gpu thread busy" split.
+static void BbAddSince(std::atomic<u64>& c, std::chrono::steady_clock::time_point t0) {
+    BBPerf2::Add(c, static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - t0)
+                                         .count()));
+}
 
 #define YIELD_CE() YIELD(ccb_task_name)
 #define YIELD_GFX() YIELD(dcb_task_name)
@@ -143,8 +152,8 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
         const bool bb_busy_log = BB::Upscale::Capture();
-        const auto bb_busy_start =
-            bb_busy_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // (always taken: the [perf2] "gpu thread busy" share, two clock reads per wake)
+        const auto bb_busy_start = std::chrono::steady_clock::now();
 
         VideoCore::StartCapture();
 
@@ -189,6 +198,10 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        BBPerf2::Add(BBPerf2::Get().cp_busy_us,
+                     static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - bb_busy_start)
+                                          .count()));
         if (bb_busy_log) {
             // bb-clean-021-fg: the GPU command thread's busy time (ms per second, wake to idle).
             static std::chrono::steady_clock::time_point window{};
@@ -890,11 +903,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const auto bb_t0 = std::chrono::steady_clock::now();
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    BbAddSince(BBPerf2::Get().cp_vo_wait_us, bb_t0); // waits on the flip
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    const auto bb_t0 = std::chrono::steady_clock::now();
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        YIELD_GFX();
+                    }
+                    BbAddSince(BBPerf2::Get().cp_guest_wait_us, bb_t0); // waits on the game
                 }
                 break;
             }

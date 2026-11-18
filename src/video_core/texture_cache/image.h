@@ -175,6 +175,12 @@ public:
     u64 gpu_hash{};
     u64 head_hash{};
     u64 tail_hash{};
+    // bb-native-texhash (BB_NATIVE_TEXHASH): XXH3 of the guest bytes of this image's last upload
+    // from guest memory (0: unknown, or the image was written another way since), and how many
+    // refreshes in a row found different bytes (hashing backs off for images that really change).
+    u64 bb_up_hash{};
+    u8 bb_up_miss{};
+    u8 bb_up_tick{};
 
     struct {
         u32 texture : 1;

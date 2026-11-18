@@ -1118,16 +1118,27 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     const double tex = take(c.tex_up_bytes) / mib;
     const u64 waits = take(c.waits);
     const double wait_total = take(c.wait_us) / 1000.0;
+    // bb-native-texhash and the GPU command thread's busy share (GPU starvation when ~100 %).
+    const u64 tex_gpu_n = take(c.tex_gpu_src), skip_n = take(c.tex_skips);
+    const double skip_mib = take(c.tex_skip_bytes) / mib;
+    const double cp_busy = take(c.cp_busy_us) / 1000.0 / el; // ms per second
+    const double cp_game = take(c.cp_guest_wait_us) / 1000.0 / el;
+    const double cp_vo = take(c.cp_vo_wait_us) / 1000.0 / el;
     LOG_INFO(Render_Vulkan,
              "[perf2] 10s: fps {:.1f} frame {:.2f} ms (worst {:.1f}, >50ms {}) cpu {:.2f} gpu "
              "{:.2f} fence {:.2f} | compiles {} gfx {} cs {} shaders ({:.0f} ms) | cpu-write "
              "faults {:.0f}/s (fault-around {:.0f} pages/s) | uploads buf {:.1f} tex {:.1f} "
              "MiB/s ({:.0f} img/s) readback {:.2f} MiB/s | sparse binds {} | gpu waits {:.0f}/s {:.1f} ms/s (stream buffer {:.1f}, "
-             "fault buffer {:.1f}) | BB_PERF2={}",
+             "fault buffer {:.1f}) | BB_PERF2={} | tex from GPU data {:.0f} img/s, unchanged "
+             "skipped {:.0f} img/s {:.1f} MiB/s | gpu thread awake {:.0f} ms/s: waits on game {:.0f}, "
+             "on flip {:.0f}, work {:.0f} ms/s ({:.2f} ms/frame)",
              a.frames / el, el * 1000.0 / a.frames, a.worst, a.slow, a.cpu / a.frames,
              a.gpu_n ? a.gpu / a.gpu_n : 0.0, a.wait / a.frames, gp, cp, sh, comp_ms,
              faults / el, fa_pages / el, up, tex, tex_n / el, down, binds, waits / el,
-             wait_total / el, wait_stream / el, wait_fbuf / el, BBPerf2::Enabled() ? 1 : 0);
+             wait_total / el, wait_stream / el, wait_fbuf / el, BBPerf2::Enabled() ? 1 : 0,
+             tex_gpu_n / el, skip_n / el, skip_mib, cp_busy, cp_game, cp_vo,
+             std::max(0.0, cp_busy - cp_game - cp_vo - a.wait / el),
+             std::max(0.0, cp_busy - cp_game - cp_vo - a.wait / el) * el / a.frames);
     a = {};
     a.start = now;
 }

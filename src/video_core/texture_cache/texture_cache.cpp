@@ -50,6 +50,18 @@ static u64 HashBackingMemory(VAddr virtual_addr, u64 size) {
     return hash;
 }
 
+// bb-native-texhash: BB_NATIVE_TEXHASH=0 turns the unchanged-bytes upload skip off.
+static bool TexHashOn() {
+    static const bool on = [] {
+        const bool v = BBPerf2::NativeOn("BB_NATIVE_TEXHASH");
+        LOG_INFO(Render_Vulkan, "[native] texture upload skip for unchanged guest bytes {} "
+                                "(BB_NATIVE_TEXHASH=0 off)",
+                 v ? "on" : "off");
+        return v;
+    }();
+    return on;
+}
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& page_manager_)
@@ -869,6 +881,32 @@ void TextureCache::RefreshImage(Image& image) {
         image.cpu_hash = hash;
     }
 
+    // bb-native-texhash: the refresh reads guest memory (no GPU-written data in the range) and
+    // the image holds exactly the bytes of its last upload (never rendered / stored / copied into
+    // since: GpuModified clear, bb_up_hash kept): same bytes in guest memory now -> nothing to do.
+    // Saves the CP-thread staging memcpy, the detile dispatch, the buffer->image copy with its
+    // barriers and the render-pass break below. Images whose bytes keep changing stop being
+    // hashed after 4 misses in a row (then 1 refresh in 16 is checked again).
+    const bool bb_cpu_src =
+        !buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size);
+    u64 bb_hash = 0;
+    if (bb_cpu_src && TexHashOn() && False(image.flags & ImageFlagBits::GpuModified) &&
+        (image.bb_up_miss < 4 || (++image.bb_up_tick & 15) == 0)) {
+        bb_hash = HashBackingMemory(image.info.guest_address, image.info.guest_size);
+        if (bb_hash != 0 && bb_hash == image.bb_up_hash) {
+            image.bb_up_miss = 0;
+            image.flags &= ~ImageFlagBits::Dirty;
+            BBPerf2::Add(BBPerf2::Get().tex_skips, 1);
+            BBPerf2::Add(BBPerf2::Get().tex_skip_bytes, image.info.guest_size);
+            return;
+        }
+        if (image.bb_up_hash != 0) {
+            image.bb_up_miss = static_cast<u8>(std::min(image.bb_up_miss + 1, 255));
+        } else if (image.bb_up_miss >= 4) {
+            image.bb_up_miss = 3; // periodic re-check: the next refresh compares again
+        }
+    }
+
     image.gpu_hash = 0;
 
     const u32 num_layers = image.info.resources.layers;
@@ -913,8 +951,15 @@ void TextureCache::RefreshImage(Image& image) {
     }
     BBPerf2::Add(BBPerf2::Get().tex_up_bytes, image.info.guest_size);
     BBPerf2::Add(BBPerf2::Get().tex_uploads, 1);
+    if (!bb_cpu_src) {
+        BBPerf2::Add(BBPerf2::Get().tex_gpu_src, 1); // from GPU-written buffer data (no memcpy)
+    }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // The bytes just uploaded (hashed before the copy; a CPU write after TrackImage re-protected
+    // the range faults and marks the image dirty again). 0 when not hashed or not from guest
+    // memory: the next refresh then uploads.
+    image.bb_up_hash = bb_cpu_src ? bb_hash : 0;
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
