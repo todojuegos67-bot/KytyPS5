@@ -61,6 +61,10 @@ enum class Reject : u32 {
     MarkersOnly,   // only primitive restart markers
     Capacity,      // triangle, slot or record capacity of the frame
     NoSun,         // the frame was captured but no validated sun light: no lit view
+    EarlyFilter,   // Draw returned at FilterDraw (fast clear, fmask decompress, ...)
+    NoObject,      // Draw found no graphics pipeline
+    BindFailed,    // Draw returned at BindResources
+    WaterDraw,     // Draw returned at the water identification (BB_RT_REFLECT)
     Count,
 };
 

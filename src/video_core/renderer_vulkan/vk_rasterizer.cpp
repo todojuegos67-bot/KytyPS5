@@ -1410,22 +1410,34 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
+        if (bb_pt) {
+            bb_pt->NoteReject(BB::PathTrace::Reject::EarlyFilter);
+        }
         return;
     }
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
+        if (bb_pt) {
+            bb_pt->NoteReject(BB::PathTrace::Reject::NoObject);
+        }
         return;
     }
 
     PrepareRenderState(pipeline);
     BbUiDraw(pipeline);
     if (!BindResources(pipeline)) {
+        if (bb_pt) {
+            bb_pt->NoteReject(BB::PathTrace::Reject::BindFailed);
+        }
         return;
     }
     if (bb_rt_reflect && BbRtWaterDraw(*pipeline)) {
         ResetBindings(false);
+        if (bb_pt) {
+            bb_pt->NoteReject(BB::PathTrace::Reject::WaterDraw);
+        }
         return; // F6: this forward PS hidden (water identification)
     }
     const auto state = BeginRendering(pipeline);
