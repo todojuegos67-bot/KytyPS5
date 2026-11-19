@@ -1093,7 +1093,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         .history_ok = history_ok,
         .gate_ok = gate_ok,
         .gate_view = gate.view,
-        .gate_far = gate.far,
+        .gate_far = gate.far_m,
         .gate_src = gate_ok ? gate.source : "none",
     };
     if (bb_rt_reflect->RunLighting(cmd, in)) {

@@ -82,7 +82,7 @@ public:
     bool Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& why);
     struct GameShadowGate {
         vk::ImageView view{};
-        float far = 0.0f;
+        float far_m = 0.0f;
         const char* source = "none";
     };
     // The game's cascade visibility of this frame's inject (froxel grid, R16F 3D, 1 = lit), once

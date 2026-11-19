@@ -1149,7 +1149,7 @@ bool VolFog::TakeGameShadowGate(GameShadowGate& g) {
     gate_ready = false;
     if (ready) {
         g.view = vis.view;
-        g.far = far_dist;
+        g.far_m = far_dist;
         g.source = gate_only ? "game cascade (gate-only bb-volfog, BB_VOLFOG off)"
                              : "game cascade (bb-volfog level)";
     }
