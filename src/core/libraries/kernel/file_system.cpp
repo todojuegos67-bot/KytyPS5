@@ -46,6 +46,7 @@
 #include "core/libraries/net/net_kernel.h"
 #include "core/memory.h"
 #include "kernel.h"
+#include "video_core/bb/bb_perf2.h"
 
 #ifdef _WIN32
 #include <io.h>
@@ -484,6 +485,13 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (nbytes == 0) {
         return 0;
     }
+    const auto started = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        auto& perf = BBPerf2::Get();
+        BBPerf2::Add(perf.file_reads, 1);
+        BBPerf2::Add(perf.file_read_bytes, nbytes);
+        BBPerf2::Add(perf.file_read_us, BBPerf2::MicrosSince(started));
+    };
 
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.

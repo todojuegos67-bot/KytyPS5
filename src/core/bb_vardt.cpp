@@ -50,6 +50,7 @@
 #include <mutex>
 #include <string>
 #include "common/logging/log.h"
+#include "video_core/bb/bb_perf2.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -335,6 +336,50 @@ Acc g_measured, g_used, g_flip_iv, g_present_iv, g_havok_acc;
 double g_last_flip = 0, g_last_present = 0, g_last_log = 0, g_frame_period = 0;
 u32 g_mode_vsync = 0, g_mode_imm = 0, g_mode_other = 0, g_bad_dt = 0, g_clamp_hi = 0,
     g_clamp_lo = 0;
+
+// bb-spikes: a guest frame at or over kSpikeSec gets one "[spike]" line with what happened since
+// the previous flip (the counters of bb_perf2.h, as deltas), capped at kSpikeLogMax lines.
+constexpr double kSpikeSec = 0.030;
+constexpr u32 kSpikeLogMax = 300;
+struct SpikeCounts {
+    u64 faults = 0, fault_around = 0, buf_up = 0, tex_up = 0, tex_images = 0;
+    u64 waits = 0, wait_us = 0, compile_us = 0, pipelines = 0;
+    u64 file_reads = 0, file_read_us = 0, file_read_bytes = 0, commit_calls = 0, commit_us = 0;
+};
+SpikeCounts g_spike_prev;
+u32 g_spike_logged = 0;
+
+SpikeCounts ReadSpikeCounts() {
+    const auto& c = BBPerf2::Get();
+    const auto ld = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+    return {ld(c.cpu_writes),   ld(c.fault_around_pages), ld(c.buf_up_bytes),
+            ld(c.tex_up_bytes), ld(c.tex_uploads),        ld(c.waits),
+            ld(c.wait_us),      ld(c.compile_us),         ld(c.gfx_pipelines) + ld(c.cs_pipelines),
+            ld(c.file_reads),   ld(c.file_read_us),       ld(c.file_read_bytes),
+            ld(c.commit_calls), ld(c.commit_us)};
+}
+
+// The 10 s "[perf2]" reader zeroes the counters (exchange), so a counter that went down restarts.
+u64 Since(u64 now, u64 before) {
+    return now >= before ? now - before : now;
+}
+
+SpikeCounts Since(const SpikeCounts& now, const SpikeCounts& before) {
+    return {Since(now.faults, before.faults),
+            Since(now.fault_around, before.fault_around),
+            Since(now.buf_up, before.buf_up),
+            Since(now.tex_up, before.tex_up),
+            Since(now.tex_images, before.tex_images),
+            Since(now.waits, before.waits),
+            Since(now.wait_us, before.wait_us),
+            Since(now.compile_us, before.compile_us),
+            Since(now.pipelines, before.pipelines),
+            Since(now.file_reads, before.file_reads),
+            Since(now.file_read_us, before.file_read_us),
+            Since(now.file_read_bytes, before.file_read_bytes),
+            Since(now.commit_calls, before.commit_calls),
+            Since(now.commit_us, before.commit_us)};
+}
 
 u8* AtV(u64 va) {
     return reinterpret_cast<u8*>(g_base + va);
@@ -790,6 +835,24 @@ void OnGuestFlip(int flip_mode) {
         if (measured < period) ++g_clamp_lo;
     }
     if (frame) g_frame_period = period;
+    const SpikeCounts spike_now = ReadSpikeCounts();
+    const SpikeCounts spike = Since(spike_now, g_spike_prev);
+    g_spike_prev = spike_now;
+    if (frame && std::isfinite(measured) && measured >= kSpikeSec &&
+        g_spike_logged < kSpikeLogMax) {
+        ++g_spike_logged;
+        LOG_INFO(Lib_VideoOut,
+                 "[spike] {:.1f} ms guest frame at {:.3f} s (monotonic): cpu-write faults {} "
+                 "(fault-around {} pages) | buffer upload {:.2f} MiB | texture upload {:.2f} MiB "
+                 "({} images) | pipelines {} ({:.1f} ms) | GPU waits {} ({:.1f} ms) | guest file "
+                 "reads {} ({:.2f} MiB requested, {:.1f} ms) | host commits {} ({:.1f} ms)",
+                 measured * 1e3, now, spike.faults, spike.fault_around,
+                 static_cast<double>(spike.buf_up) / (1 << 20),
+                 static_cast<double>(spike.tex_up) / (1 << 20), spike.tex_images, spike.pipelines,
+                 spike.compile_us / 1e3, spike.waits, spike.wait_us / 1e3, spike.file_reads,
+                 static_cast<double>(spike.file_read_bytes) / (1 << 20), spike.file_read_us / 1e3,
+                 spike.commit_calls, spike.commit_us / 1e3);
+    }
     if (std::isfinite(havok_acc)) g_havok_acc.Add(havok_acc);
     if (g_ragdoll_fix) {
         ++g_ragdoll_frames;

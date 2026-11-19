@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include "common/types.h"
 
@@ -36,6 +37,12 @@ struct Counters {
     std::atomic<u64> cp_busy_us{};     // GpuCommandProcessor thread: wake -> idle time
     std::atomic<u64> cp_guest_wait_us{}; // of cp_busy_us: GFX WAIT_REG_MEM on game memory
     std::atomic<u64> cp_vo_wait_us{};    // of cp_busy_us: GFX wait on a flip label (sleeps)
+    // bb-spikes: guest file reads (whole ReadFile call) and host commits (HostFile::Flush)
+    std::atomic<u64> file_reads{};
+    std::atomic<u64> file_read_us{};
+    std::atomic<u64> file_read_bytes{}; // requested bytes
+    std::atomic<u64> commit_calls{};
+    std::atomic<u64> commit_us{};
 };
 
 inline Counters& Get() {
@@ -45,6 +52,12 @@ inline Counters& Get() {
 
 inline void Add(std::atomic<u64>& c, u64 v) {
     c.fetch_add(v, std::memory_order_relaxed);
+}
+
+inline u64 MicrosSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started)
+                                .count());
 }
 
 // BB_PERF2=1 enables the behavior changes of bb-perf-2 (default off). Counters/logging are always on.

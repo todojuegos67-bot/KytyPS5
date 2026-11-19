@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <fstream>
 #include <system_error>
 
 #include "common/string_util.h"
 #include "core/file_sys/backends/host_fs.h"
 #include "core/file_sys/fs.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Core::FileSys {
 
@@ -80,7 +82,11 @@ bool HostFile::Flush() {
     if (m_read_only) {
         return true;
     }
-    return m_file.Commit();
+    const auto started = std::chrono::steady_clock::now();
+    const bool committed = m_file.Commit();
+    BBPerf2::Add(BBPerf2::Get().commit_calls, 1);
+    BBPerf2::Add(BBPerf2::Get().commit_us, BBPerf2::MicrosSince(started));
+    return committed;
 }
 
 bool HostFile::IsOpen() const {
