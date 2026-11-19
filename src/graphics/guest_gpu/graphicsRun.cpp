@@ -1150,10 +1150,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		CommandProcessor* previous_processor;
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
+	// gt7-replay-1119: the draws of this stream are placed in its chunks (KYTY_REPLAY).
+	const Replay::StreamScope replay_stream(&execution.m_replay);
 
 	ProcessPm4(execution);
 	if (execution.m_buffer_stack.empty()) {
 		MtGpu::StreamEnd();
+		Replay::StreamEnd(execution.m_replay);
 	}
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
@@ -1164,6 +1167,11 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
+	if (chain) {
+		// gt7-replay-1119: a chained buffer is a chunk (KYTY_REPLAY).
+		Replay::ChunkBegin(g_current_execution->m_replay, commands.data(),
+		                   static_cast<uint32_t>(commands.size()));
+	}
 }
 
 void CommandProcessor::SuspendPm4() {
@@ -1233,6 +1241,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		if (DrawPrep::CountsAsDrawOrDispatch(opcode)) {
 			MtGpu::NoteDraw();
+			Replay::NotePacket(execution.m_replay, packet); // gt7-replay-1119
 		}
 		// Draw prep: number the draw and dispatch packets as the scanner does (predicated ones too;
 		// a packet suspended and run again keeps its number).

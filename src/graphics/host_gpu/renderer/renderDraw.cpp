@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawRepeats.h"
+#include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
@@ -3776,6 +3777,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& guest_args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	const Replay::DrawScope replay_draw; // gt7-replay-1119: the draw's place (KYTY_REPLAY)
 	const GpuPhases::OpStats op_stats(false);
 	// KYTY_BISECT's slow:gpu (round 114).
 	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
@@ -3973,6 +3975,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
+	const Replay::DrawScope replay_draw; // gt7-replay-1119: the draw's place (KYTY_REPLAY)
 	const GpuPhases::OpStats op_stats(false);
 	// KYTY_BISECT's slow:gpu (round 114).
 	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());

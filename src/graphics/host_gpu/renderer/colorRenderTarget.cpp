@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -21,7 +22,9 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics {
@@ -54,6 +57,50 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
+// gt7-replay-1119 (KYTY_REPLAY, replay.h): a draw's color target as resolved at its place, from
+// the target's registers (CB_COLORn_*, the slot's mask nibble, the draw's slice offset). The
+// description is a function of those alone (and of KYTY_MSAA_CMASK_CLEARS, fixed for a run, and
+// KYTY_BISECT, under which nothing is kept); the image is still found (FindImage) and bound.
+namespace {
+struct ReplayTarget {
+	bool             kept = false;
+	HW::RenderTarget rt;
+	uint32_t         mask         = 0;
+	uint32_t         slice_offset = 0;
+	RenderColorInfo  info; // as made, before FindImage (image_id empty)
+};
+constexpr size_t ReplayTargetLimit = 1u << 14u;
+std::unordered_map<uint64_t, ReplayTarget>& ReplayTargets() {
+	thread_local std::unordered_map<uint64_t, ReplayTarget> targets;
+	return targets;
+}
+// KYTY_REPLAY=2: the first field in which two descriptions differ, or null.
+const char* DiffTargetInfo(const RenderColorInfo& a, const RenderColorInfo& b) {
+	const auto& x = a.desc.info;
+	const auto& y = b.desc.info;
+	if (x.data.address != y.data.address || x.data.size != y.data.size) return "memoria";
+	if (x.pixel_format != y.pixel_format || x.guest_format != y.guest_format) return "formato";
+	if (x.type != y.type || x.extent != y.extent || x.resources != y.resources) return "extension";
+	if (x.pitch != y.pitch || x.bytes_per_block != y.bytes_per_block || x.samples != y.samples ||
+	    x.tile_mode != y.tile_mode)
+		return "disposicion";
+	if (x.mip_layout != y.mip_layout) return "mips";
+	if (x.metadata.kind != y.metadata.kind || x.metadata.range.address != y.metadata.range.address ||
+	    x.metadata.range.size != y.metadata.range.size ||
+	    x.metadata.clear_word != y.metadata.clear_word ||
+	    x.metadata.clear_word1 != y.metadata.clear_word1 ||
+	    x.metadata.dcc_alpha_msb != y.metadata.dcc_alpha_msb)
+		return "metadatos";
+	if (!(a.desc.view_info == b.desc.view_info) || a.desc.type != b.desc.type) return "vista";
+	if (a.guest_mip_level != b.guest_mip_level || a.guest_array_layer != b.guest_array_layer ||
+	    a.target_slot != b.target_slot)
+		return "nivel/capa";
+	if (std::memcmp(&a.export_mapping, &b.export_mapping, sizeof(a.export_mapping)) != 0)
+		return "export";
+	return nullptr;
+}
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
@@ -85,6 +132,38 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	// gt7-replay-1119 (KYTY_REPLAY): the description kept at this draw's place, for the same
+	// registers.
+	ReplayTarget* replay      = nullptr;
+	bool          replay_same = false;
+	if (const auto draw = !ignore_target_mask && !exact_format ? Replay::DrawKey() : 0;
+	    draw != 0) {
+		if (Bisect::Active() || graphics_debug_dump_enabled()) {
+			Replay::NoteMiss(Replay::Part::Target, Replay::Miss::Ineligible);
+		} else {
+			auto& targets = ReplayTargets();
+			if (targets.size() >= ReplayTargetLimit) {
+				targets.clear();
+				Replay::NoteDropped(Replay::Part::Target);
+			}
+			replay      = &targets[Replay::PartKey(draw, 2u, rt_slot)];
+			replay_same = replay->kept && replay->mask == mask &&
+			              replay->slice_offset == render_target_slice_offset &&
+			              std::memcmp(&replay->rt, &rt, sizeof(rt)) == 0;
+			if (replay_same) {
+				Replay::NoteHit(Replay::Part::Target);
+			} else {
+				Replay::NoteMiss(Replay::Part::Target,
+				                 replay->kept ? Replay::Miss::Words : Replay::Miss::NoEntry);
+			}
+			if (replay_same && Replay::Mode() == 1) {
+				r          = replay->info;
+				r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+				BindRenderTarget(r.image_id);
+				return;
+			}
+		}
 	}
 	// NUM_SAMPLES (coverage) and NUM_FRAGMENTS (stored colors) are both log2. EQAA stores fewer
 	// fragments than it has coverage samples (e.g. 4s/2f) and keeps the sample->fragment map in
@@ -381,8 +460,23 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	if (replay != nullptr) {
+		// The description before FindImage (which may move the view into a larger image).
+		if (replay_same) {
+			Replay::NoteVerified(Replay::Part::Target, DiffTargetInfo(replay->info, r),
+			                     rt.base.addr, rt_slot);
+		} else {
+			std::memcpy(static_cast<void*>(&replay->rt), &rt, sizeof(rt));
+			replay->mask          = mask;
+			replay->slice_offset  = render_target_slice_offset;
+			replay->info          = r;
+			replay->info.image_id = {};
+			replay->kept          = true;
+			Replay::NoteStored(Replay::Part::Target);
+		}
+	}
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 
