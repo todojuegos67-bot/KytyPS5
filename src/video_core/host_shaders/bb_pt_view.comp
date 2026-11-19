@@ -2,14 +2,19 @@
 #extension GL_EXT_ray_query : require
 
 // bb-pathtrace (bb_pt.h): one primary ray per pixel against the frame's view-space triangle
-// acceleration structure. Output is the distance debug view: grey falls off as exp(-t / range)
-// with the hit distance t, misses are dark blue. Ray directions follow the Vulkan NDC convention
-// (y down), mapped back to view space with the projection terms P00, P02, P11, P12.
+// acceleration structure. Lit output (default): the hit surface is shaded with the game's sun
+// (light 0 of the light-set CB, view space) and a shadow ray toward it; neutral albedo, no
+// indirect light yet. BB_PT_DEBUG=1 writes the hit distance instead: grey falls off as
+// exp(-t / range), misses are dark blue. Ray directions follow the Vulkan NDC convention (y
+// down), mapped back to view space with the projection terms P00, P02, P11, P12.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT scene_tlas;
 layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D out_image;
+layout(std430, set = 0, binding = 2) readonly buffer Soup {
+    float soup[];
+};
 
 layout(push_constant) uniform Constants {
     float p00;
@@ -19,7 +24,17 @@ layout(push_constant) uniform Constants {
     float range;
     uint width;
     uint height;
+    uint debug;
+    float sun_x;
+    float sun_y;
+    float sun_z;
+    float sun_r;
+    float sun_g;
+    float sun_b;
 };
+
+const float NeutralAlbedo = 0.8;
+const float ShadowBias = 0.05;
 
 void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -34,11 +49,53 @@ void main() {
                           1.0e4);
     while (rayQueryProceedEXT(rq)) {
     }
+    const bool hit = rayQueryGetIntersectionTypeEXT(rq, true) ==
+                     gl_RayQueryCommittedIntersectionTriangleEXT;
 
-    vec4 color = vec4(0.02, 0.03, 0.08, 1.0);
-    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-        const float t = rayQueryGetIntersectionTEXT(rq, true);
-        color = vec4(vec3(exp(-t / range)), 1.0);
+    if (debug != 0u) {
+        vec4 distance_color = vec4(0.02, 0.03, 0.08, 1.0);
+        if (hit) {
+            const float t = rayQueryGetIntersectionTEXT(rq, true);
+            distance_color = vec4(vec3(exp(-t / range)), 1.0);
+        }
+        imageStore(out_image, px, distance_color);
+        return;
     }
-    imageStore(out_image, px, color);
+    if (!hit) {
+        imageStore(out_image, px, vec4(0.0));
+        return;
+    }
+
+    const float t = rayQueryGetIntersectionTEXT(rq, true);
+    const uint base = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)) * 9u;
+    const vec3 v0 = vec3(soup[base], soup[base + 1u], soup[base + 2u]);
+    const vec3 v1 = vec3(soup[base + 3u], soup[base + 4u], soup[base + 5u]);
+    const vec3 v2 = vec3(soup[base + 6u], soup[base + 7u], soup[base + 8u]);
+    const vec3 face = cross(v1 - v0, v2 - v0);
+    if (dot(face, face) < 1e-20) {
+        imageStore(out_image, px, vec4(0.0));
+        return;
+    }
+    vec3 n = normalize(face);
+    if (dot(n, dir) > 0.0) {
+        n = -n;
+    }
+    const vec3 p = dir * t;
+    const vec3 to_sun = normalize(vec3(sun_x, sun_y, sun_z));
+    const float ndl = max(dot(n, to_sun), 0.0);
+    float visible = 0.0;
+    if (ndl > 0.0) {
+        rayQueryEXT sq;
+        rayQueryInitializeEXT(sq, scene_tlas,
+                              gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFFu,
+                              p + n * ShadowBias, 0.0, to_sun, 1.0e4);
+        while (rayQueryProceedEXT(sq)) {
+        }
+        visible = rayQueryGetIntersectionTypeEXT(sq, true) ==
+                          gl_RayQueryCommittedIntersectionNoneEXT
+                      ? 1.0
+                      : 0.0;
+    }
+    const vec3 radiance = NeutralAlbedo * vec3(sun_r, sun_g, sun_b) * ndl * visible;
+    imageStore(out_image, px, vec4(radiance, 1.0));
 }
