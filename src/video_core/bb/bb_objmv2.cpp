@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -762,8 +763,39 @@ bool Active() {
     return g.ready;
 }
 
+// Diagnostics since the last LogDiag: the scene-depth gate outcomes (NoteSceneGate), the
+// WantImpl reasons (why 0 handled, 1..3 as NoteBlend, 4..10 the early returns) and the kinds.
+std::array<std::atomic<u32>, 5> g_gate{};
+std::array<std::atomic<u32>, 11> g_want_why{};
+std::array<std::atomic<u32>, 5> g_kind{};
+std::atomic<u32> g_last_w{0}, g_last_h{0}, g_last_scene_w{0}, g_last_scene_h{0};
+
 void NoteSceneDepth(u64 depth_address) {
     g.scene_depth = depth_address;
+}
+
+void NoteSceneGate(u32 gate, u32 w, u32 h, u32 scene_w, u32 scene_h) {
+    g_gate[gate].fetch_add(1, std::memory_order_relaxed);
+    g_last_w.store(w, std::memory_order_relaxed);
+    g_last_h.store(h, std::memory_order_relaxed);
+    g_last_scene_w.store(scene_w, std::memory_order_relaxed);
+    g_last_scene_h.store(scene_h, std::memory_order_relaxed);
+}
+
+void LogDiag() {
+    auto take = [](auto& arr, size_t i) { return arr[i].exchange(0, std::memory_order_relaxed); };
+    LOG_INFO(Render_Vulkan,
+             "[objmv2-diag] scene gate: noted {}, not depth {}, size mismatch {}, UI {}, depth "
+             "write off {} (last depth {}x{}, scene {}x{}); want: handled {}, blend-not-handled "
+             "{}, not-depth-target {}, no-depth-test {}, not ready {}, no scene depth {}, stage "
+             "{}, depth invalid {}, color mode {}, attachment 7 bound {}, no colour {}; kinds: "
+             "none {}, opaque {}, blend {}, mask {}, effect {}",
+             take(g_gate, 0), take(g_gate, 1), take(g_gate, 2), take(g_gate, 3), take(g_gate, 4),
+             g_last_w.load(), g_last_h.load(), g_last_scene_w.load(), g_last_scene_h.load(),
+             take(g_want_why, 0), take(g_want_why, 3), take(g_want_why, 1), take(g_want_why, 2),
+             take(g_want_why, 4), take(g_want_why, 5), take(g_want_why, 6), take(g_want_why, 7),
+             take(g_want_why, 8), take(g_want_why, 9), take(g_want_why, 10), take(g_kind, 0),
+             take(g_kind, 1), take(g_kind, 2), take(g_kind, 3), take(g_kind, 4));
 }
 
 void NoteBlend(const AmdGpu::Regs& regs, Kind kind, u32 why) {
@@ -793,6 +825,8 @@ Kind WantImpl(const AmdGpu::Regs& regs, u32& why);
 Kind Want(const AmdGpu::Regs& regs) {
     u32 why = 0;
     const Kind k = WantImpl(regs, why);
+    g_want_why[why].fetch_add(1, std::memory_order_relaxed);
+    g_kind[u32(k)].fetch_add(1, std::memory_order_relaxed);
     if (g.sparks && regs.blend_control[0].enable && regs.color_buffers[0] &&
         regs.color_target_mask.GetMask(0) && (k != Kind::None || why == 1)) {
         NoteBlend(regs, k, why);
@@ -801,22 +835,44 @@ Kind Want(const AmdGpu::Regs& regs) {
 }
 
 Kind WantImpl(const AmdGpu::Regs& regs, u32& why) {
-    if (!g.ready || g.scene_depth == 0) return Kind::None;
-    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) return Kind::None;
-    if (!regs.depth_buffer.DepthValid() || regs.depth_buffer.NumSamples() != 1) return Kind::None;
+    if (!g.ready) {
+        why = 4;
+        return Kind::None;
+    }
+    if (g.scene_depth == 0) {
+        why = 5;
+        return Kind::None;
+    }
+    if (regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+        why = 6;
+        return Kind::None;
+    }
+    if (!regs.depth_buffer.DepthValid() || regs.depth_buffer.NumSamples() != 1) {
+        why = 7;
+        return Kind::None;
+    }
     if (regs.depth_buffer.DepthAddress() != g.scene_depth) {
         why = 1;
         return Kind::None;
     }
-    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) return Kind::None;
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) {
+        why = 8;
+        return Kind::None;
+    }
     u32 bound = 0;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         if (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) {
-            if (cb == Attachment) return Kind::None;
+            if (cb == Attachment) {
+                why = 9;
+                return Kind::None;
+            }
             ++bound;
         }
     }
-    if (bound == 0) return Kind::None;
+    if (bound == 0) {
+        why = 10;
+        return Kind::None;
+    }
     const auto& bc = regs.blend_control[0];
     using F = AmdGpu::BlendControl::BlendFactor;
     using Fn = AmdGpu::BlendControl::BlendFunc;

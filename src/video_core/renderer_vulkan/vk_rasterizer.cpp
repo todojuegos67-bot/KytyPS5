@@ -265,6 +265,11 @@ void Rasterizer::BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, 
 
 void Rasterizer::BbPtFrameEnd() {
     if (bb_pt) {
+        // bb-pathtrace-gi diagnostics: the objmv2 gate counts, at frame 60 and every 600 frames.
+        static u64 frame_no = 0;
+        if (++frame_no == 60 || frame_no % 600 == 0) {
+            BB::ObjMv2::LogDiag();
+        }
         // Without the upscaler the objmv2 pass learns the scene depth here, one frame late.
         if (!BB::Upscale::Capture()) {
             if (const u64 depth = bb_pt->TakeSceneDepth()) {
@@ -3029,6 +3034,13 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             BB::Upscale::NoteJitterDraw(bb_jitter_draw, scene_sized && !bb_jitter_draw,
                                         image.info.size.width,
                                         image.info.size.height);
+            BB::ObjMv2::NoteSceneGate(
+                !regs.depth_control.depth_enable ? 1 : !scene_sized ? 2
+                : !bb_jitter_draw                  ? 3
+                : !regs.depth_control.depth_write_enable ? 4
+                                                         : 0,
+                image.info.size.width, image.info.size.height, BB::Upscale::g_scene_w,
+                BB::Upscale::g_scene_h);
             if (bb_jitter_draw && regs.depth_control.depth_write_enable) {
                 const auto& vp = regs.viewports[0];
                 const auto& vp_ctl = regs.viewport_control;

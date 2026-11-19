@@ -79,6 +79,12 @@ bool Active();
 void NoteSceneDepth(u64 depth_address);
 // Pipeline cache: which motion variant this draw takes (None: the stock pipeline).
 Kind Want(const AmdGpu::Regs& regs);
+// Diagnostics: the rasterizer's scene-depth gate outcome for one draw (0 noted, 1 not a depth
+// draw, 2 depth size not the scene's, 3 UI or native UI, 4 depth write off), with the depth
+// image size and the scene size it was compared with. LogDiag: one line of counts since the
+// last call, then the counts restart.
+void NoteSceneGate(u32 gate, u32 w, u32 h, u32 scene_w, u32 scene_h);
+void LogDiag();
 // Pipeline cache: attachment 7 of a motion pipeline's key.
 void FillKey(Kind kind, u32& mrt_mask, u32& num_color_attachments, Shader::PsColorBuffer& cb7,
              vk::ColorComponentFlags& write_mask7, u32& cb_shader_mask_raw, void* blend7);
