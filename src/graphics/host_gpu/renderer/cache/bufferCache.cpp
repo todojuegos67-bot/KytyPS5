@@ -2051,6 +2051,11 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 	       (m_bitmap_era % WriteBitmapEpochs) * WriteBitmapBytes;
 }
 
+// SSE4.1 (streaming loads) is enabled for this function only, so the build does not need
+// -march=native; every x86-64 CPU able to run the emulator has SSE4.1.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("sse4.1")))
+#endif
 void BufferCache::LoadWrittenWords(uint64_t word_begin, uint64_t word_end,
                                    std::vector<uint32_t>& out, int only_epoch) const {
 	// The bitmap lives in write-combined device memory (ReBAR): every scalar CPU read there is
