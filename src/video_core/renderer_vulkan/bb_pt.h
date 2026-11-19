@@ -74,6 +74,11 @@ public:
     vk::ImageView Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const float proj[16],
                         const float sun_view[3], const float sun_color[3], bool have_sun);
 
+    // bb-pathtrace GI (bb_pt_gi.h), after Trace: the scene acceleration structure and the view-space
+    // triangle soup Trace built this frame.
+    vk::AccelerationStructureKHR SceneTlas() const { return tlas; }
+    vk::Buffer SoupBuffer() const { return soup.buffer; }
+
     // Once per guest frame, after its draws: logs the counters every 600 frames and moves the
     // tables on to the next frame in flight.
     void EndFrame();
