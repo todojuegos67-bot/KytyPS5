@@ -117,6 +117,7 @@ private:
     float far_dist = 100.0f;
     double ts_period = 1.0;
     // Medium / lighting knobs (preset x BB_VOLFOG_* overrides).
+    float high_dens = 0.0f, high_h = 40.0f, high_thick = 8.0f, edge_k = 1.0f;
     float haze = 0.008f, haze_h = 30.0f, mist = 0.04f, mist_h = 1.2f, noise_amp = 0.6f,
           noise_freq = 0.12f, scatter = 0.8f, albedo = 0.85f, g_moon = 0.6f, g_lights = 0.3f,
           temporal = 0.12f, ground_below = 1.8f, unshadowed_moon = 0.35f, lights_scale = 3.0f;

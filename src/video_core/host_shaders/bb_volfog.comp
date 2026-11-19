@@ -46,6 +46,9 @@ layout(std140, binding = 0) uniform Params {
     vec4 gfog;       // game fog: amount A, rate (exp2 per m), start (m), weight (0: none)
     vec4 gfog_col;   // moon light inside the game fog (its colour, luma-mixed), w: shaft scale
     vec4 expo;       // S cap x scene log-avg luminance, light cap x luminance, froxel angle, 0
+    vec4 layer[4];   // [0].x ground drift share, [1].x mid drift share, [2] high band: density (1/m,
+                     // own, 0: off), centre (m above the ground ref), half thickness (m), drift share;
+                     // [3].x shaft edge sharpness (1: off)
 } p;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -136,7 +139,9 @@ float CascadeVis(vec3 w, float vdepth, out bool tested) {
         float b = Lit(texelFetch(atlas, ivec2(a1.x, a0.y), 0).r, s.z);
         float c = Lit(texelFetch(atlas, ivec2(a0.x, a1.y), 0).r, s.z);
         float d = Lit(texelFetch(atlas, ivec2(a1.x, a1.y), 0).r, s.z);
-        return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+        float v = mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+        const float k = p.layer[3].x;
+        return k > 1.0 ? clamp((v - 0.5) * k + 0.5, 0.0, 1.0) : v;
     }
     return 1.0;
 }
@@ -202,14 +207,37 @@ float Noise(vec3 w) {
     return 0.62 * VNoise(q) + 0.38 * VNoise(q2 + vec3(11.7, 3.9, 7.3));
 }
 
-// Own medium (where the game has no fog): height haze + low ground mist, noise-modulated.
-float OwnSigma(vec3 w, float n) {
+// Noise of one atmosphere layer: its own offset (no shared pattern between layers) and its own
+// drift (share x the wind), so the layers move apart and read as depth.
+float LayerNoise(vec3 w, float share, float off) {
+    float tm = p.fog2.w;
+    vec3 o = vec3(off, 0.7 * off, 1.3 * off);
+    vec3 q = (w + o - p.wind.xyz * (share * tm)) * p.fog2.z;
+    vec3 q2 = (w + o - p.wind.xyz * (share * tm * 1.6) + vec3(0.0, 0.08 * tm, 0.0)) * (p.fog2.z * 2.7);
+    return 0.62 * VNoise(q) + 0.38 * VNoise(q2 + vec3(11.7, 3.9, 7.3));
+}
+
+// Own medium (where the game has no fog): three height layers, each with its own noise and drift,
+// summed here and integrated front to back in the integrate pass. Ground mist (fog.z), mid-height
+// haze (fog.x) and a high thin band (layer[2]).
+float OwnSigma(vec3 w) {
     float h = max(w.y - p.fog2.x, 0.0);
-    float haze = p.fog.x * exp(-h / max(p.fog.y, 0.1));
-    float mist = p.fog.z * exp(-h / max(p.fog.w, 0.05));
     float a = p.fog2.y;
-    return haze * max(1.0 + a * (2.0 * n - 1.0), 0.0) +
-           mist * mix(1.0, 2.0 * smoothstep(0.3, 0.7, n), a);
+    float sig = 0.0;
+    if (p.fog.x > 0.0) {
+        float n1 = LayerNoise(w, p.layer[1].x, 37.0);
+        sig += p.fog.x * exp(-h / max(p.fog.y, 0.1)) * max(1.0 + a * (2.0 * n1 - 1.0), 0.0);
+    }
+    if (p.fog.z > 0.0) {
+        float n0 = LayerNoise(w, p.layer[0].x, 0.0);
+        sig += p.fog.z * exp(-h / max(p.fog.w, 0.05)) * mix(1.0, 2.0 * smoothstep(0.3, 0.7, n0), a);
+    }
+    if (p.layer[2].x > 0.0) {
+        float hb = (h - p.layer[2].y) / max(p.layer[2].z, 0.5);
+        float n2 = LayerNoise(w, p.layer[2].w, 81.0);
+        sig += p.layer[2].x * exp(-hb * hb) * max(1.0 + a * (2.0 * n2 - 1.0), 0.0);
+    }
+    return sig;
 }
 
 float HG(float g, float ct) {
@@ -227,7 +255,7 @@ void main() {
     vec3 wdir = normalize(w - p.cam.xyz);
     int dbg = int(p.misc2.y);
     float n = Noise(w);
-    float sig_o = OwnSigma(w, n);
+    float sig_o = OwnSigma(w);
     // The game's fog density, its wisps broken up by the same noise (mean preserved).
     float sig_g = GameSigma(t, length(wdir.xz)) * max(1.0 + p.fog2.y * (2.0 * n - 1.0), 0.0);
     float Ls = SceneLum();

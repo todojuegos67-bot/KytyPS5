@@ -134,6 +134,7 @@ struct alignas(16) VfParams {
     float gfog[4];
     float gfog_col[4];
     float expo[4];
+    float layer[4][4];
 };
 static_assert(sizeof(VfParams) <= 1024);
 
@@ -191,16 +192,17 @@ int DebugEnv() {
 // haze / mist: own medium, only where the game has no fog of its own; shaft: moon light inside
 // the game's fog; cap: added light <= cap x the scene's log-average luminance; lcap: point-light
 // light at a froxel <= lcap x that luminance.
+// high: density of the high thin band (1/m); edge: shaft edge sharpness (1: off).
 struct Preset {
     const char* name;
     u32 w, h, d;
-    float haze, mist, noise, scatter, lights, shaft, cap, lcap;
+    float haze, mist, noise, scatter, lights, shaft, cap, lcap, high, edge;
 };
 constexpr std::array<Preset, 4> Presets{{
-    {"off", 0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-    {"sutil", 128, 72, 64, 0.0f, 0.0f, 0.40f, 1.0f, 0.30f, 0.6f, 0.15f, 2.0f},
-    {"normal", 160, 90, 64, 0.0012f, 0.004f, 0.50f, 1.0f, 0.50f, 1.0f, 0.25f, 3.0f},
-    {"denso", 160, 90, 80, 0.0025f, 0.010f, 0.60f, 1.0f, 0.80f, 1.5f, 0.40f, 4.0f},
+    {"off", 0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+    {"sutil", 128, 72, 64, 0.0f, 0.0f, 0.40f, 1.0f, 0.30f, 0.6f, 0.15f, 2.0f, 0.0f, 1.0f},
+    {"normal", 160, 90, 80, 0.0012f, 0.004f, 0.50f, 1.0f, 0.50f, 1.0f, 0.25f, 3.0f, 0.0006f, 1.5f},
+    {"denso", 192, 108, 96, 0.0025f, 0.010f, 0.60f, 1.0f, 0.80f, 1.5f, 0.40f, 4.0f, 0.0012f, 2.0f},
 }};
 
 // FUN_02651f10's fog CB (slot 6 of the forward-lit draws; layout in bb_upscale.h): v2.x / .z / .w
@@ -445,6 +447,19 @@ bool VolFog::Init() {
     game_fog_mul = EnvFloat("BB_VOLFOG_GAMEFOG_SCALE", 1.0f, 0.0f, 10.0f);
     g_moon = EnvFloat("BB_VOLFOG_G", 0.5f, 0.0f, 0.9f);
     mist_h = EnvFloat("BB_VOLFOG_MIST_HEIGHT", 1.2f, 0.1f, 20.0f);
+    // Layers: ground mist, mid haze (above) and a high thin band; BB_VOLFOG_LAYERS=0 drops the band.
+    high_dens = pr.high * dens * EnvFloat("BB_VOLFOG_HIGH", 1.0f, 0.0f, 20.0f);
+    if (const char* e = std::getenv("BB_VOLFOG_LAYERS"); e && e[0] == '0')
+        high_dens = 0.0f;
+    high_h = EnvFloat("BB_VOLFOG_HIGH_HEIGHT", 40.0f, 5.0f, 400.0f);
+    high_thick = EnvFloat("BB_VOLFOG_HIGH_THICK", 8.0f, 1.0f, 100.0f);
+    edge_k = EnvFloat("BB_VOLFOG_EDGE", pr.edge, 1.0f, 4.0f);
+    if (high_dens > 0.0f) {
+        LOG_INFO(Render_Vulkan,
+                 "[volfog] layers: ground mist (drift x1.0), mid haze (drift x0.6), high band "
+                 "{:.5f}/m at {:.0f} m +- {:.0f} m above the ground (drift x-0.4); shaft edge x{:.2f}",
+                 high_dens, high_h, high_thick, edge_k);
+    }
     haze_h = EnvFloat("BB_VOLFOG_HAZE_HEIGHT", 30.0f, 1.0f, 1000.0f);
     ground_below = EnvFloat("BB_VOLFOG_GROUND", 1.8f, -50.0f, 50.0f);
     if (const char* e = std::getenv("BB_VOLFOG_WIND"); e && e[0]) {
@@ -1376,6 +1391,14 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
     prm.expo[0] = cap_rel;
     prm.expo[1] = light_cap_rel;
     prm.expo[2] = std::fabs(P[0]) > 1e-6 ? float(2.0 / (std::fabs(P[0]) * gw)) : 0.01f;
+    // Layer drift shares (ground 1, mid 0.6) and the high band; the band is own medium only.
+    prm.layer[0][0] = 1.0f;
+    prm.layer[1][0] = 0.6f;
+    prm.layer[2][0] = high_dens * own;
+    prm.layer[2][1] = high_h;
+    prm.layer[2][2] = high_thick;
+    prm.layer[2][3] = -0.4f;
+    prm.layer[3][0] = edge_k;
     std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
     app_slot_hist[app_hist_pos++ % app_slot_hist.size()] = slot;
 
