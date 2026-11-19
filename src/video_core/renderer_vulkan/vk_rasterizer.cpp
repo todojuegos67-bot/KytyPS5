@@ -318,6 +318,9 @@ vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent,
             }
         }
     }
+    if (!have_sun) {
+        bb_pt->NoteReject(BB::PathTrace::Reject::NoSun);
+    }
     const auto lit = bb_pt->Trace(cmd, extent, proj, sun_view, sun_color, have_sun);
     if (!lit) {
         if (bb_gi) {

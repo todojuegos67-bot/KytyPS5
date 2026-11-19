@@ -681,7 +681,7 @@ void Tracer::EndFrame() {
                  "[pt] {} frames ({} traced): draws seen {}, captured {} ({} triangles per frame), "
                  "rejected {} (no capture pipeline {}, not triangles {}, indirect {}, not ready {}, "
                  "no indices {}, index size {}, index capacity {}, index range {}, markers only {}, "
-                 "capacity {}), scene depth candidates {}",
+                 "capacity {}, no sun {}), scene depth candidates {}",
                  stat_frames, stat_traced, stat_seen, stat_draws, stat_triangles,
                  stat_triangles / stat_frames, rejected,
                  stat_reject[u32(Reject::NoPipeline)], stat_reject[u32(Reject::NotTriangles)],
@@ -689,7 +689,7 @@ void Tracer::EndFrame() {
                  stat_reject[u32(Reject::NoIndices)], stat_reject[u32(Reject::IndexSize)],
                  stat_reject[u32(Reject::IndexCapacity)], stat_reject[u32(Reject::IndexRange)],
                  stat_reject[u32(Reject::MarkersOnly)], stat_reject[u32(Reject::Capacity)],
-                 depth_votes.size());
+                 stat_reject[u32(Reject::NoSun)], depth_votes.size());
     }
     frame_slot = (frame_slot + 1) % FrameSlots;
     position_slots = 0;

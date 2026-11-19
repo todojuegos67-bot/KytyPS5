@@ -60,6 +60,7 @@ enum class Reject : u32 {
     IndexRange,    // the index bytes are not mapped in guest memory
     MarkersOnly,   // only primitive restart markers
     Capacity,      // triangle, slot or record capacity of the frame
+    NoSun,         // the frame was captured but no validated sun light: no lit view
     Count,
 };
 
