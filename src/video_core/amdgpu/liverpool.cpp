@@ -192,8 +192,10 @@ void Liverpool::Process(std::stop_token stoken) {
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
+                const auto submit_start = std::chrono::steady_clock::now();
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
+                BBPerf2::Add(BBPerf2::Get().cp_submit_us, BBPerf2::MicrosSince(submit_start));
             }
             submit_done = false;
         }

@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -27,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/bb/bb_fg_internal.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_upscale.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
@@ -1841,6 +1843,10 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    const auto present_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        BBPerf2::Add(BBPerf2::Get().present_us, BBPerf2::MicrosSince(present_start));
+    };
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

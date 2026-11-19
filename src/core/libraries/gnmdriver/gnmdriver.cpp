@@ -25,6 +25,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/bb/bb_native_mv.h"
 #include "video_core/bb/bb_reflex.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_reflex_game.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -90,8 +91,10 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    const auto started = std::chrono::steady_clock::now();
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    BBPerf2::Add(BBPerf2::Get().gnm_wait_us, BBPerf2::MicrosSince(started));
 }
 
 // Write a special NOP packet with N DWs data block
