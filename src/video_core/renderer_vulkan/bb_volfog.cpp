@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <tuple>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -519,9 +520,12 @@ bool VolFog::Init() {
     if (pr2 != vk::Result::eSuccess)
         return false;
     layout = pl;
-    const std::array<std::span<const u32>, 5> code{BB_VOLFOG_INJECT_COMP, BB_VOLFOG_LIGHT_COMP,
-                                                   BB_VOLFOG_INTEGRATE_COMP, BB_VOLFOG_APPLY_COMP,
-                                                   BB_VOLFOG_APPLY_R11_COMP};
+    // Order matches pipes[]: inject, light, integrate, apply, apply R11, measure, measure R11.
+    const std::array<std::span<const u32>, 7> code{
+        BB_VOLFOG_INJECT_COMP,  BB_VOLFOG_LIGHT_COMP,   BB_VOLFOG_INTEGRATE_COMP,
+        BB_VOLFOG_APPLY_COMP,   BB_VOLFOG_APPLY_R11_COMP, BB_VOLFOG_MEASURE_COMP,
+        BB_VOLFOG_MEASURE_R11_COMP};
+    static_assert(code.size() == std::tuple_size_v<decltype(pipes)>);
     for (size_t i = 0; i < code.size(); ++i) {
         const auto module = Vulkan::CompileSPV(code[i], device);
         if (!module) {
@@ -1217,6 +1221,12 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
     if (!Init()) {
         why = "off";
         return false;
+    }
+    for (const auto& pl : pipes) {
+        if (!pl) {
+            why = "pipeline missing";
+            return false;
+        }
     }
     const bool injected = in.injected && frame_has_jitter && casc_ok && !fresh;
     // No shadow-mask pass this frame: the game draws no moon shadow (interiors), no moon fog.
