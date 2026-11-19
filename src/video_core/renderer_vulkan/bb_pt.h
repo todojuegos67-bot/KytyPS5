@@ -25,6 +25,7 @@ struct PushData;
 }
 namespace Vulkan {
 class Instance;
+class Scheduler;
 }
 
 namespace BB::PathTrace {
@@ -49,7 +50,8 @@ struct DrawCapture {
 
 class Tracer {
 public:
-    Tracer(const Vulkan::Instance& instance, Core::MemoryManager& memory);
+    Tracer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+           Core::MemoryManager& memory);
     ~Tracer();
 
     Tracer(const Tracer&) = delete;
@@ -111,12 +113,14 @@ private:
     static constexpr u32 FrameSlots = 4;
 
     const Vulkan::Instance& instance;
+    Vulkan::Scheduler& scheduler;
     Core::MemoryManager& memory;
     bool ready = false;
 
     Buf positions;                          // device: vec4 clip position per slot
     std::array<Buf, FrameSlots> indices;    // host: the frame's copied index data
     std::array<Buf, FrameSlots> records;    // host: the frame's records
+    std::array<u64, FrameSlots> slot_ticks{}; // scheduler tick whose commands read the slot
 
     Buf soup;                               // device: view-space triangles of the frame
     Buf blas_buf, tlas_buf, scratch, instance_buf;

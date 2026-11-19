@@ -14,6 +14,7 @@
 #include "video_core/host_shaders/bb_pt_view_comp.h"
 #include "video_core/renderer_vulkan/bb_pt.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace BB::PathTrace {
@@ -94,8 +95,9 @@ bool DebugRequested() {
     return on;
 }
 
-Tracer::Tracer(const Vulkan::Instance& instance_, Core::MemoryManager& memory_)
-    : instance{instance_}, memory{memory_} {}
+Tracer::Tracer(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
+               Core::MemoryManager& memory_)
+    : instance{instance_}, scheduler{scheduler_}, memory{memory_} {}
 
 Tracer::~Tracer() {
     const auto device = instance.GetDevice();
@@ -498,6 +500,7 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
         return {};
     }
     ++stat_traced;
+    slot_ticks[frame_slot] = scheduler.CurrentTick();
     const u32 tris = triangles_used;
     const vk::DescriptorBufferInfo records_info{records[frame_slot].buffer, 0,
                                                 records[frame_slot].size};
@@ -508,7 +511,9 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
 
     const vk::MemoryBarrier2 inputs_ready{
         .srcStageMask = vk::PipelineStageFlagBits2::eHost | vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eMemoryWrite,
+        .srcAccessMask = vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eAccelerationStructureReadKHR,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
     };
@@ -530,6 +535,15 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
     cmd.pushConstants(gather_pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(gather),
                       &gather);
     cmd.dispatch((tris + 63) / 64, 1, 1);
+
+    const vk::MemoryBarrier2 positions_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eVertexShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+    };
+    cmd.pipelineBarrier2(
+        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &positions_read});
 
     const vk::MemoryBarrier2 soup_done{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -663,6 +677,9 @@ void Tracer::EndFrame() {
                  stat_skipped);
     }
     frame_slot = (frame_slot + 1) % FrameSlots;
+    if (!scheduler.IsFree(slot_ticks[frame_slot])) {
+        scheduler.Wait(slot_ticks[frame_slot]);
+    }
     position_slots = 0;
     index_bytes_used = 0;
     triangles_used = 0;

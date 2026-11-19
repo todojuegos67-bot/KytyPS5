@@ -104,7 +104,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // bb-pathtrace (BB_PT=1, bb_pt.h): capture buffers at start, never lazily during play.
     if (BB::PathTrace::Requested()) {
         if (instance.IsRtReflectEnabled()) {
-            bb_pt = std::make_unique<BB::PathTrace::Tracer>(instance, *memory);
+            bb_pt = std::make_unique<BB::PathTrace::Tracer>(instance, scheduler, *memory);
             if (!bb_pt->Init()) {
                 LOG_ERROR(Render_Vulkan, "[pt] init failed: path tracer off");
                 bb_pt.reset();
