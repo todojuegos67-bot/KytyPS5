@@ -173,6 +173,7 @@ private:
     void BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset);
 public:
     void BbPtFrameEnd(); // bb-pathtrace: the presenter, once per guest frame
+    vk::ImageView BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent); // bb-pathtrace: presenter
 private:
 
     bool IsComputeMetaClear(const Pipeline* pipeline);

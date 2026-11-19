@@ -267,6 +267,14 @@ void Rasterizer::BbPtFrameEnd() {
     }
 }
 
+vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent) {
+    float proj[16]{}, view[12]{}, far_dist = 0.0f;
+    if (!bb_pt || !BB::Upscale::RtCamera(proj, view, far_dist)) {
+        return {};
+    }
+    return bb_pt->Trace(cmd, extent, proj);
+}
+
 void Rasterizer::EliminateFastClear() {
     auto& col_buf = liverpool->regs.color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
