@@ -24,4 +24,9 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size);
 void OnGuestFlip(int flip_mode);
 // Present thread, after a guest frame was presented.
 void OnPresent();
+// (bb-cheats) F1 > Trucos "Velocidad del juego": the game dt is multiplied by this (0.25..2.0,
+// default 1.0) in the dt hook. Only with BB_VARIABLE_DT installed.
+bool SpeedAvailable();
+float GameSpeed();
+void SetGameSpeed(float speed);
 } // namespace BB::VarDt

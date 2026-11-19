@@ -17,6 +17,7 @@
 #include "core/bb_ssr_probe.h"
 #include "core/bb_objcol.h"
 #include "core/bb_respatch.h"
+#include "core/bb_cheats.h"
 #include "core/bb_vardt.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
@@ -390,6 +391,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             BB::KbmCam::OnEbootLoaded(base_virtual_addr, base_size);
             BB::VarDt::OnEbootLoaded(base_virtual_addr, base_size); // BB_VARIABLE_DT=1
             BB::Reflex::OnEbootLoaded(base_virtual_addr, base_size); // after VarDt: its cap
+            BB::Cheats::OnEbootLoaded(base_virtual_addr, base_size); // F1 > Trucos
         }
     }
 

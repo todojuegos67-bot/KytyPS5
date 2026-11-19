@@ -179,6 +179,10 @@ struct alignas(16) RunStats {
 };
 RunStats* g_run = nullptr;   // host memory, written by the guest through the cave
 bool g_run_fix = false, g_run_factors = false;
+// (bb-cheats) game speed multiplier read by the dt hook (bss slack after RunCavePtrVa)
+constexpr u32 SpeedVa = 0x56D3FD8;
+bool g_speed_ok = false;
+std::atomic<float> g_speed{1.0f};
 double g_run_last_log = 0;
 u32 g_run_frames = 0;
 const char* g_run_how = "";
@@ -653,6 +657,26 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
 
     // 2) Code groups (same bytes as the XML lines; written only where still original).
     if (st_dt == St::Orig) Apply(kDtHook, true);
+    // (bb-cheats) Game speed: the dt hook's 8 NOP bytes become "vmulss xmm0, [SpeedVa]" before
+    // the two stores (dt and LiveDt), SpeedVa = 1.0 (x * 1.0f == x: no change until the F1 menu
+    // sets another speed).
+    if (std::memcmp(AtV(kDtHook[0].va), kDtHook[0].neu, kDtHook[0].len) == 0 &&
+        InsideV(SpeedVa, 4)) {
+        u8 b[46];
+        std::memcpy(b, kDtHook[0].neu, 18); // load, vmaxss period, vminss max dt
+        const u32 va = kDtHook[0].va;
+        const s32 dmul = static_cast<s32>(static_cast<s64>(SpeedVa) - (va + 26));
+        const s32 dlive = static_cast<s32>(static_cast<s64>(LiveDtVa) - (va + 39));
+        const u8 mul[4] = {0xC5, 0xFA, 0x59, 0x05}, st_rbp[5] = {0xC5, 0xFA, 0x11, 0x45, 0xC8},
+                 st_rip[4] = {0xC5, 0xFA, 0x11, 0x05};
+        std::memcpy(b + 18, mul, 4), std::memcpy(b + 22, &dmul, 4);
+        std::memcpy(b + 26, st_rbp, 5);
+        std::memcpy(b + 31, st_rip, 4), std::memcpy(b + 35, &dlive, 4);
+        std::memcpy(b + 39, kDtHook[0].neu + 39, 7); // the lea that follows, same place
+        Write32(SpeedVa, Bits(1.0f));
+        std::memcpy(AtV(va), b, sizeof(b));
+        g_speed_ok = true;
+    }
     if (st_lim == St::Orig) Apply(kLimiter, true);
     if (st_flip == St::Orig) Apply(kFlip, true);
     // LiveDt is bss slack (0 at load); the redirected readers must not see dt = 0 before the
@@ -808,7 +832,8 @@ void OnGuestFlip(int flip_mode) {
     }
     float dt = 0;
     std::memcpy(&dt, AtV(LiveDtVa), 4);
-    const bool good = std::isfinite(dt) && dt > 0.0001f && dt <= g_max_dt + 0.0001f;
+    const float speed = g_speed_ok ? g_speed.load() : 1.0f;
+    const bool good = std::isfinite(dt) && dt > 0.0001f && dt <= g_max_dt * speed + 0.0001f;
     if (good) {
         for (size_t i = 0; i < NumSites; ++i) {
             if (g_site_live[i]) Write32(Sites[i].va, Bits(Value(Sites[i], dt)));
@@ -933,6 +958,20 @@ void OnPresent() {
     std::scoped_lock lk{g_mutex};
     if (g_last_present > 0) g_present_iv.Add(now - g_last_present);
     g_last_present = now;
+}
+
+bool SpeedAvailable() {
+    return g_installed && g_speed_ok;
+}
+float GameSpeed() {
+    return SpeedAvailable() ? g_speed.load() : 1.0f;
+}
+void SetGameSpeed(float speed) {
+    if (!SpeedAvailable() || !std::isfinite(speed)) return;
+    speed = std::clamp(speed, 0.25f, 2.0f);
+    g_speed = speed;
+    Write32(SpeedVa, Bits(speed));
+    LOG_INFO(Lib_VideoOut, "[vardt] game speed x{:.2f}", speed);
 }
 
 } // namespace BB::VarDt
