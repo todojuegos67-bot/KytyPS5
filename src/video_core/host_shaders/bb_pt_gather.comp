@@ -1,0 +1,104 @@
+#version 460
+
+// bb-pathtrace (bb_pt.h): one thread per triangle of the frame's captured draws. The triangle's
+// three vertices are read from the clip positions the vertex variant stored, mapped to view space
+// (clip.w = -z_view: x = (clip.x + p02 w) / p00, y = (clip.y + p12 w) / p11, z = -w) and written
+// to the soup that the frame's acceleration structure is built from. Invalid triangles become
+// zero (never hit).
+
+layout(local_size_x = 64) in;
+
+struct Record {
+    uint tri_base;
+    uint tri_count;
+    uint prims;
+    uint index_offset;
+    uint index_min;
+    uint index16;
+    uint indexed;
+    uint slot_base;
+    uint span;
+    uint instances;
+    uint pad0;
+    uint pad1;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Records {
+    Record records[];
+};
+layout(std430, set = 0, binding = 1) readonly buffer Indices {
+    uint index_words[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer Positions {
+    vec4 clip[];
+};
+layout(std430, set = 0, binding = 3) writeonly buffer Soup {
+    float soup[];
+};
+
+layout(push_constant) uniform Constants {
+    uint tri_total;
+    uint record_count;
+    float p00;
+    float p11;
+    float p02;
+    float p12;
+};
+
+uint IndexAt(Record r, uint i) {
+    if (r.index16 != 0u) {
+        const uint byte_ofs = r.index_offset + i * 2u;
+        return (index_words[byte_ofs >> 2u] >> ((byte_ofs & 2u) * 8u)) & 0xFFFFu;
+    }
+    return index_words[(r.index_offset >> 2u) + i];
+}
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (t >= tri_total) {
+        return;
+    }
+    uint lo = 0u;
+    uint hi = record_count;
+    while (hi - lo > 1u) {
+        const uint mid = (lo + hi) >> 1u;
+        if (records[mid].tri_base <= t) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    const Record r = records[lo];
+    const uint local = t - r.tri_base;
+    const uint inst = local / r.prims;
+    const uint prim = local - inst * r.prims;
+    const uint marker = r.index16 != 0u ? 0xFFFFu : 0xFFFFFFFFu;
+    bool ok = inst < r.instances;
+    vec3 v[3] = vec3[3](vec3(0.0), vec3(0.0), vec3(0.0));
+    for (uint k = 0u; k < 3u && ok; ++k) {
+        uint raw = prim * 3u + k;
+        if (r.indexed != 0u) {
+            const uint idx = IndexAt(r, raw);
+            if (idx == marker || idx < r.index_min) {
+                ok = false;
+                break;
+            }
+            raw = idx - r.index_min;
+        }
+        if (raw >= r.span) {
+            ok = false;
+            break;
+        }
+        const vec4 c = clip[r.slot_base + inst * r.span + raw];
+        v[k] = vec3((c.x + p02 * c.w) / p00, (c.y + p12 * c.w) / p11, -c.w);
+        if (any(isnan(v[k])) || any(isinf(v[k]))) {
+            ok = false;
+        }
+    }
+    const uint base = t * 9u;
+    for (uint k = 0u; k < 3u; ++k) {
+        for (uint j = 0u; j < 3u; ++j) {
+            soup[base + k * 3u + j] = ok ? v[k][j] : 0.0;
+        }
+    }
+}

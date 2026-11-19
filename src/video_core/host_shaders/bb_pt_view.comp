@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// bb-pathtrace (bb_pt.h): one primary ray per pixel against the frame's view-space triangle
+// acceleration structure. Output is the distance debug view: grey falls off as exp(-t / range)
+// with the hit distance t, misses are dark blue. Ray directions follow the Vulkan NDC convention
+// (y down), mapped back to view space with the projection terms P00, P02, P11, P12.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene_tlas;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D out_image;
+
+layout(push_constant) uniform Constants {
+    float p00;
+    float p11;
+    float p02;
+    float p12;
+    float range;
+    uint width;
+    uint height;
+};
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(width) || px.y >= int(height)) {
+        return;
+    }
+    const vec2 ndc = (vec2(px) + 0.5) / vec2(float(width), float(height)) * 2.0 - 1.0;
+    const vec3 dir = normalize(vec3((ndc.x + p02) / p00, (ndc.y + p12) / p11, -1.0));
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene_tlas, gl_RayFlagsOpaqueEXT, 0xFFu, vec3(0.0), 0.001, dir,
+                          1.0e4);
+    while (rayQueryProceedEXT(rq)) {
+    }
+
+    vec4 color = vec4(0.02, 0.03, 0.08, 1.0);
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        const float t = rayQueryGetIntersectionTEXT(rq, true);
+        color = vec4(vec3(exp(-t / range)), 1.0);
+    }
+    imageStore(out_image, px, color);
+}
