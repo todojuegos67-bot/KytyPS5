@@ -255,6 +255,10 @@ public:
         return hw_stage == HwStage::Vertex && sw_stage == SwStage::Vertex &&
                runtime_info.hw.vs.bb_objmv && profile.support_bda;
     }
+    // bb-pathtrace: the motion vertex variant also stores each clip position (bb_pt.h).
+    bool PtCapture() const {
+        return ObjMvVertex() && runtime_info.hw.vs.bb_pt_capture;
+    }
     // The vertex shader runs a second time with last frame's buffers (no side effects allowed).
     bool ObjMvPrevPass() const;
     bool ObjMvFragment() const {

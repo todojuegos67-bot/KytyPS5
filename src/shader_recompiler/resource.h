@@ -235,6 +235,15 @@ struct PushData {
     // was padding (members stay in offset order).
     static constexpr u32 ObjMvFogIndex = 8;
     static constexpr u32 ObjMvEntryIndex = 9;
+    // bb-pathtrace capture (bb_pt.h): first slot of this draw's clip positions, slots per
+    // instance, vertex index (gl_VertexIndex) that is index 0 of the draw, first instance,
+    // device address of the position buffer (lo, hi) and instance count.
+    static constexpr u32 PtSlotIndex = 10;
+    static constexpr u32 PtSpanIndex = 11;
+    static constexpr u32 PtBaseIndex = 12;
+    static constexpr u32 PtInstBaseIndex = 13;
+    static constexpr u32 PtStoreIndex = 14;
+    static constexpr u32 PtInstCountIndex = 15;
 
     float xoffset;
     float yoffset;
@@ -244,6 +253,12 @@ struct PushData {
     u32 objmv_flags;
     u32 objmv_fog;
     std::array<u32, 2> objmv_entry;
+    u32 pt_slot;
+    u32 pt_span;
+    u32 pt_base;
+    u32 pt_inst_base;
+    std::array<u32, 2> pt_store;
+    u32 pt_inst_count;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
@@ -253,6 +268,9 @@ struct PushData {
 static_assert(offsetof(PushData, objmv_flags) == 72);
 static_assert(offsetof(PushData, objmv_fog) == 76);
 static_assert(offsetof(PushData, objmv_entry) == 80);
+static_assert(offsetof(PushData, pt_slot) == 88);
+static_assert(offsetof(PushData, pt_store) == 104);
+static_assert(offsetof(PushData, pt_inst_count) == 112);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

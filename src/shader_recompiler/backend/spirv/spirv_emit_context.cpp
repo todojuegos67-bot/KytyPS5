@@ -785,7 +785,7 @@ void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
         Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[1], U32[1],
-                        U32[2]),
+                        U32[2], U32[1], U32[1], U32[1], U32[1], U32[2], U32[1]),
              "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -808,6 +808,18 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::ObjMvEntryIndex, spv::Decoration::Offset, 80U);
     MemberName(struct_type, PushData::ObjMvFogIndex, "bb_objmv_fog");
     MemberDecorate(struct_type, PushData::ObjMvFogIndex, spv::Decoration::Offset, 76U);
+    MemberName(struct_type, PushData::PtSlotIndex, "bb_pt_slot");
+    MemberName(struct_type, PushData::PtSpanIndex, "bb_pt_span");
+    MemberName(struct_type, PushData::PtBaseIndex, "bb_pt_base");
+    MemberName(struct_type, PushData::PtInstBaseIndex, "bb_pt_inst_base");
+    MemberName(struct_type, PushData::PtStoreIndex, "bb_pt_store");
+    MemberName(struct_type, PushData::PtInstCountIndex, "bb_pt_inst_count");
+    MemberDecorate(struct_type, PushData::PtSlotIndex, spv::Decoration::Offset, 88U);
+    MemberDecorate(struct_type, PushData::PtSpanIndex, spv::Decoration::Offset, 92U);
+    MemberDecorate(struct_type, PushData::PtBaseIndex, spv::Decoration::Offset, 96U);
+    MemberDecorate(struct_type, PushData::PtInstBaseIndex, spv::Decoration::Offset, 100U);
+    MemberDecorate(struct_type, PushData::PtStoreIndex, spv::Decoration::Offset, 104U);
+    MemberDecorate(struct_type, PushData::PtInstCountIndex, spv::Decoration::Offset, 112U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);

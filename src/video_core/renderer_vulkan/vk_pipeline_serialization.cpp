@@ -13,9 +13,9 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 14u; // bb-mv-candles: blended objmv fragment (class)
-static constexpr u32 ShaderMetaVersion = 7u; // bb-rt-fullres: ImageResource::is_loaded/is_queried
-static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr u32 ShaderBinaryVersion = 15u; // bb-pathtrace: objmv vertex position capture
+static constexpr u32 ShaderMetaVersion = 8u; // bb-pathtrace: HwVertexRuntimeInfo::bb_pt_capture
+static constexpr u32 PipelineKeyVersion = 4u; // bb-pathtrace: runtime info layout
 } // namespace Serialization
 
 namespace Vulkan {

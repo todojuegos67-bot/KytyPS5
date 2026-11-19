@@ -99,6 +99,9 @@ struct HwVertexRuntimeInfo {
     u32 user_clip_plane_mask{};
     /// BB object motion vectors v2 (bb_objmv2.h): previous-frame clip position varying.
     bool bb_objmv{};
+    /// bb-pathtrace (bb_pt.h): also store this vertex's clip position per (index, instance) slot
+    /// in the path tracer's capture buffer (PushData::PtSlotIndex and following).
+    bool bb_pt_capture{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };

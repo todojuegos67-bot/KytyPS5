@@ -16,6 +16,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/bb/bb_objmv2.h"
+#include "video_core/renderer_vulkan/bb_pt.h"
 #include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_precompile.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -172,6 +173,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.vs.bb_objmv = g_bb_objmv2 == BB::ObjMv2::Kind::Opaque ||
                               g_bb_objmv2 == BB::ObjMv2::Kind::Blend ||
                               g_bb_objmv2 == BB::ObjMv2::Kind::Effect;
+        // bb-pathtrace (bb_pt.h): the opaque scene draws also store their clip positions.
+        info.hw.vs.bb_pt_capture = g_bb_objmv2 == BB::ObjMv2::Kind::Opaque &&
+                                   BB::PathTrace::Requested() && instance.IsRtReflectEnabled();
         break;
     }
     case HwStage::Fragment: {

@@ -105,6 +105,36 @@ void ScreenBounds(EmitContext& ctx, Id position) {
     ctx.OpBranch(merge_label);
     ctx.AddLabel(merge_label);
 }
+
+// bb-pathtrace (bb_pt.h): this vertex's clip position goes to slot
+// pt_slot + instance * pt_span + (vertex index - pt_base), when both lie inside the draw.
+void PtCapture(EmitContext& ctx, Id position) {
+    const Id u32_type = ctx.U32[1];
+    const Id bool_type = ctx.U1[1];
+    const Id span = PushU32(ctx, PushData::PtSpanIndex);
+    const Id raw = ctx.OpISub(u32_type, ctx.OpLoad(u32_type, ctx.vertex_index),
+                              PushU32(ctx, PushData::PtBaseIndex));
+    const Id inst = ctx.OpISub(u32_type, ctx.OpLoad(u32_type, ctx.instance_id),
+                               PushU32(ctx, PushData::PtInstBaseIndex));
+    const Id in_range = ctx.OpLogicalAnd(
+        bool_type, ctx.OpULessThan(bool_type, raw, span),
+        ctx.OpULessThan(bool_type, inst, PushU32(ctx, PushData::PtInstCountIndex)));
+    const Id slot = ctx.OpIAdd(u32_type, PushU32(ctx, PushData::PtSlotIndex),
+                               ctx.OpIAdd(u32_type, ctx.OpIMul(u32_type, inst, span), raw));
+    const Id address = ctx.OpIAdd(
+        ctx.U64, PushAddress(ctx, PushData::PtStoreIndex),
+        ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, slot), ctx.Constant(ctx.U64, u64(16))));
+    const Id vec4_ptr = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.F32[4]);
+    const Id store_label = ctx.OpLabel();
+    const Id merge_label = ctx.OpLabel();
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(in_range, store_label, merge_label);
+    ctx.AddLabel(store_label);
+    ctx.OpStore(ctx.OpConvertUToPtr(vec4_ptr, address), position, spv::MemoryAccessMask::Aligned,
+                16u);
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
 } // namespace
 
 bool EmitContext::ObjMvPrevPass() const {
@@ -178,6 +208,9 @@ void EmitBBObjMvVertex(EmitContext& ctx) {
     ScreenBounds(ctx, position);
     ctx.OpStore(ctx.objmv_out_cur, position);
     ctx.OpStore(ctx.objmv_out_prev, previous);
+    if (ctx.PtCapture()) {
+        PtCapture(ctx, position);
+    }
 }
 
 // Fragment epilogue: (previous - current) in render pixels, class, weight.
