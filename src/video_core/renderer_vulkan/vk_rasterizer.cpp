@@ -101,7 +101,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
 
     // bb-volfog: froxel volumetric fog (no ray tracing: works on any device).
-    if (BB::VolFog::Level() > 0) {
+    if (BB::VolFog::Level() > 0 || BB::VolFog::GateOnly()) {
         bb_volfog = std::make_unique<BB::VolFog>(instance);
         if (!bb_volfog->Init()) {
             LOG_ERROR(Render_Vulkan, "[volfog] init failed: volumetric fog off");
@@ -1094,6 +1094,7 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         .gate_ok = gate_ok,
         .gate_view = gate.view,
         .gate_far = gate.far,
+        .gate_src = gate_ok ? gate.source : "none",
     };
     if (bb_rt_reflect->RunLighting(cmd, in)) {
         last_scene = scene_addr;

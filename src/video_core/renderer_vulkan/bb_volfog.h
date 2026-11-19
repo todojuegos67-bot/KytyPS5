@@ -40,6 +40,8 @@ class VolFog {
 public:
     // BB_VOLFOG (0..3); 0 when unset.
     static int Level();
+    // BB_RT_SHADOWS=1 with BB_VOLFOG off: the cascade grid only (no fog, no shafts, no Apply).
+    static bool GateOnly();
     // A GXLightAcc point-light pixel shader (its buffers carry the frame's lamps).
     static bool IsPointLightPs(u64 hash);
 
@@ -81,6 +83,7 @@ public:
     struct GameShadowGate {
         vk::ImageView view{};
         float far = 0.0f;
+        const char* source = "none";
     };
     // The game's cascade visibility of this frame's inject (froxel grid, R16F 3D, 1 = lit), once
     // per inject that resolved the cascades; false when there is none (no mask pass, interiors).
@@ -146,6 +149,7 @@ private:
     Img integ;
     bool fresh = true;
     bool gate_ready = false;
+    bool gate_only = false;
 
     static constexpr u32 Ring = 8;
     static constexpr vk::DeviceSize ParamSize = 1024;

@@ -21,7 +21,6 @@
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
 #include "video_core/host_shaders/bb_rt_shadow_comp.h"
 #include "video_core/host_shaders/bb_rt_vol_comp.h"
-#include "video_core/renderer_vulkan/bb_volfog.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -453,11 +452,11 @@ bool RtReflect::Init() {
     }
     using U = vk::BufferUsageFlagBits;
     if (!MakeBuffer(params, ParamSize * Ring, U::eUniformBuffer, true) ||
-        !MakeBuffer(counters, 64, U::eStorageBuffer, true) ||
+        !MakeBuffer(counters, 128, U::eStorageBuffer, true) ||
         !MakeBuffer(rcounters, 128, U::eStorageBuffer, true)) {
         return false;
     }
-    std::memset(counters.mapped, 0, 64);
+    std::memset(counters.mapped, 0, 128);
     std::memset(rcounters.mapped, 0, 128);
     auto [qr, qp] = device.createQueryPool({
         .queryType = vk::QueryType::eTimestamp,
@@ -2155,6 +2154,7 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
         ++sh_nogate;
     }
     const bool sh_run = sh_on && sh_ok && dbg_view != 2 && have_light && in.gate_ok;
+    sh_gate_src = in.gate_src;
     const bool vol_view = dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run);
     // BB_FOG_FX: wherever the game has fog (v0.y = 1/dist > 0), also when the density at the
     // camera height underflows (camera above the fog layer); level 0: density at the camera > 0.
@@ -2461,10 +2461,6 @@ bool RtReflect::InitShadows() {
     });
     if (qr == vk::Result::eSuccess) sh_queries = qp;
     sh_ok = true;
-    if (BB::VolFog::Level() == 0) {
-        LOG_WARNING(Render_Vulkan, "[rt-shadow] needs BB_VOLFOG=1..3 for the game's cascade gate: "
-                                   "without it the shadows never run");
-    }
     LOG_INFO(Render_Vulkan,
              "[rt-shadow] ray-traced shadows ON: quality {} = {} ray(s)/px toward the main "
              "directional light at half the render size, angular radius {:.4f} rad, max {:.0f} "
@@ -2646,14 +2642,14 @@ void RtReflect::LogShadows() {
         return;
     }
     sh_last_log = now;
-    u32 c[6];
+    u32 c[9];
     std::memcpy(c, static_cast<const u32*>(counters.mapped) + 10, sizeof(c));
-    u32 d[6];
-    for (u32 i = 0; i < 6; ++i) {
+    u32 d[9];
+    for (u32 i = 0; i < 9; ++i) {
         d[i] = c[i] - sh_last_counts[i];
         sh_last_counts[i] = c[i];
     }
-    const u32 rays = d[0], shadowed = d[1], traced = d[2];
+    const u32 rays = d[0], shadowed = d[1], traced = d[2], lit = d[6];
     const u64 nogate = sh_nogate - sh_nogate_last;
     sh_nogate_last = sh_nogate;
     const double px = double(sh_w) * sh_h * double(sh_dispatches - sh_last_dispatches);
@@ -2661,18 +2657,19 @@ void RtReflect::LogShadows() {
     size_t lbytes = 0;
     BB::Upscale::RtLightSource(lhash, lbytes);
     LOG_INFO(Render_Vulkan,
-             "[rt-shadow] 5 s: quality {}, {} dispatches, {}x{} trace, {:.2f} rays/px ({} rays), "
-             "shadow term mean {:.3f} over {} facing px ({:.1f}% of px lit by the game), RT "
-             "occluded {:.1f}% of rays, double-shadow count {} (RT applied on game-shadowed px, "
-             "should be 0), gate missing {} frames, GPU {:.3f} ms per pass (lighting hook incl. "
-             "mesh/AS build: {:.3f} ms), radius {:.4f} rad, denoise {}, strength {:.2f}, "
-             "normals {}; light dir world ({:.3f}, {:.3f}, {:.3f}) from {} (light CB last seen: "
-             "shader {:#x}, {} B)",
+             "[rt-shadow] 5 s: RT darkens {:.2f}% of lit scene px (mean darkening {:.2f}% over "
+             "{} lit px), quality {}, {} dispatches, {}x{} trace, {:.2f} rays/px, shadow term mean "
+             "{:.3f} over {} facing px, RT occluded {:.1f}% of rays, double-shadow count {} (RT "
+             "applied on game-shadowed px, should be 0), gate '{}' missing {} frames, GPU "
+             "{:.3f} ms per pass (hook incl. mesh/AS: {:.3f} ms), radius {:.4f} rad, "
+             "denoise "
+             "{}, strength {:.2f}, normals {}; light dir world ({:.3f}, {:.3f}, {:.3f}) from {} "
+             "(light CB last seen: shader {:#x}, {} B)",
+             lit ? 100.0 * d[7] / lit : 0.0, lit ? 100.0 * d[8] / (1000.0 * lit) : 0.0, lit,
              sh_quality, sh_dispatches - sh_last_dispatches, sh_w, sh_h,
-             px > 0.0 ? rays / px : 0.0, rays,
+             px > 0.0 ? rays / px : 0.0,
              traced ? double(d[3]) / (1000.0 * traced) : 0.0, traced,
-             traced ? 100.0 * (traced - d[4]) / traced : 0.0,
-             rays ? 100.0 * shadowed / rays : 0.0, d[5], nogate,
+             rays ? 100.0 * shadowed / rays : 0.0, d[5], sh_gate_src, nogate,
              sh_ms_n ? sh_ms_sum / sh_ms_n : 0.0, l_ms_n ? l_ms_sum / l_ms_n : 0.0, sh_radius,
              sh_denoise, sh_strength, sh_normal ? "G-buffer RT0" : "depth derivatives",
              sh_used_dir[0], sh_used_dir[1], sh_used_dir[2], light_src, lhash, lbytes);

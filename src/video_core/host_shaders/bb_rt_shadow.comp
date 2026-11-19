@@ -35,12 +35,12 @@ layout(binding = 3) uniform sampler2D src_tex;
 layout(binding = 4) uniform sampler2D hist_tex;
 layout(binding = 5, rgba16f) uniform writeonly image2D dst;
 layout(binding = 6, rgba16f) uniform image2D scene;
-layout(std430, binding = 7) buffer Counters { uint n[16]; } cnt; // [10..14] stats, [15] double
+layout(std430, binding = 7) buffer Counters { uint n[32]; } cnt; // [10..18], see main()
 layout(binding = 8) uniform sampler2D normal_tex;
 layout(binding = 9) uniform sampler3D gate_tex;
 layout(push_constant) uniform Push { uint mode; } pc;
 
-shared uint s_n[5];
+shared uint s_n[9];
 
 ivec2 DepthPx(ivec2 px) {
     ivec2 dsz = textureSize(depth_tex, 0);
@@ -77,12 +77,13 @@ uint Hash(uint x) {
 }
 
 void main() {
-    if (gl_LocalInvocationIndex < 5u) {
+    if (gl_LocalInvocationIndex < 9u) {
         s_n[gl_LocalInvocationIndex] = 0u;
     }
     barrier();
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     uint nr = 0u, nsh = 0u, ntr = 0u, nsum = 0u, ndark = 0u;
+    uint ndbl = 0u, nlit = 0u, nlitdark = 0u, nlitk = 0u;
     if (pc.mode == 0u && all(lessThan(c, ivec2(p.size.xy)))) {
         float dist;
         vec3 P = Unproject(c, dist);
@@ -234,12 +235,17 @@ void main() {
             float facing = ws > 1e-5 ? fsum / ws : ref.g;
             float k = p.misc.x * (1.0 - clamp(vis, 0.0, 1.0)) * clamp(facing, 0.0, 1.0);
             k = (isnan(k) || isinf(k)) ? 0.0 : clamp(k, 0.0, p.misc.x);
+            if (ref.b >= 0.5) {
+                nlit = 1u;
+                nlitdark = k > 0.02 ? 1u : 0u;
+                nlitk = uint(1000.0 * k);
+            }
             if (dv == 1) {
                 // Shadow mask: the multiplier the scene would get (white lit, dark shadowed).
                 imageStore(scene, c, vec4(vec3(1.0 - k), 1.0));
             } else if (k > 0.0) {
                 if (ref.b < 0.5) {
-                    atomicAdd(cnt.n[15], 1u);
+                    ndbl = 1u;
                 }
                 vec4 sc = imageLoad(scene, c);
                 imageStore(scene, c, vec4(sc.rgb * (1.0 - k), sc.a));
@@ -257,8 +263,16 @@ void main() {
         atomicAdd(s_n[3], nsum);
         atomicAdd(s_n[4], ndark);
     }
+    if (ndbl != 0u) {
+        atomicAdd(s_n[5], ndbl);
+    }
+    if (nlit != 0u) {
+        atomicAdd(s_n[6], nlit);
+        atomicAdd(s_n[7], nlitdark);
+        atomicAdd(s_n[8], nlitk);
+    }
     barrier();
-    if (gl_LocalInvocationIndex < 5u && pc.mode == 0u) {
+    if (gl_LocalInvocationIndex < 9u) {
         atomicAdd(cnt.n[10 + gl_LocalInvocationIndex], s_n[gl_LocalInvocationIndex]);
     }
 }

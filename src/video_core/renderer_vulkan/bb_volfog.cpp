@@ -303,6 +303,11 @@ bool VolFog::IsPointLightPs(u64 hash) {
     return FindPointShader(hash) != nullptr;
 }
 
+bool VolFog::GateOnly() {
+    const char* e = std::getenv("BB_RT_SHADOWS");
+    return e && e[0] == '1';
+}
+
 int VolFog::Level() {
     static const int lv = [] {
         const char* e = std::getenv("BB_VOLFOG");
@@ -416,10 +421,13 @@ bool VolFog::Init() {
         return ok;
     tried = true;
     level = Level();
-    if (level <= 0)
+    gate_only = level <= 0 && GateOnly();
+    if (level <= 0 && !gate_only)
         return false;
-    const Preset& pr = Presets[level];
-    level_name = pr.name;
+    if (gate_only)
+        level = 1;
+    const Preset& pr = Presets[gate_only ? 1 : level];
+    level_name = gate_only ? "gate-only" : pr.name;
     gw = pr.w;
     gh = pr.h;
     gd = pr.d;
@@ -1142,6 +1150,8 @@ bool VolFog::TakeGameShadowGate(GameShadowGate& g) {
     if (ready) {
         g.view = vis.view;
         g.far = far_dist;
+        g.source = gate_only ? "game cascade (gate-only bb-volfog, BB_VOLFOG off)"
+                             : "game cascade (bb-volfog level)";
     }
     return ready;
 }
@@ -1245,6 +1255,10 @@ bool VolFog::Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& w
 
 bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why) {
     why = "none";
+    if (gate_only) {
+        why = "gate-only (BB_VOLFOG off): no fog pass";
+        return false;
+    }
     if (!Init()) {
         why = "off";
         return false;
