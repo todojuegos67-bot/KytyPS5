@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -439,12 +440,16 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
+            const auto started = std::chrono::steady_clock::now();
             if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
                 return false;
             }
             if (!is_gpu_thread) {
                 // bb-native-hot: unprotect the rest of the written block in one batch.
                 rasterizer->FaultAround(addr);
+                const u64 us = BBPerf2::MicrosSince(started);
+                BBPerf2::Add(BBPerf2::Get().fault_us, us);
+                BBPerf2::Max(BBPerf2::Get().fault_max_us, us);
             }
             return true;
         } else {

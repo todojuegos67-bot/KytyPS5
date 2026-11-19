@@ -50,6 +50,7 @@
 #include <mutex>
 #include <string>
 #include "common/logging/log.h"
+#include "imgui/bb_menu.h"
 #include "video_core/bb/bb_perf2.h"
 
 #ifdef _WIN32
@@ -349,9 +350,11 @@ struct SpikeCounts {
     u64 faults = 0, fault_around = 0, buf_up = 0, tex_up = 0, tex_images = 0;
     u64 waits = 0, wait_us = 0, compile_us = 0, pipelines = 0;
     u64 file_reads = 0, file_read_us = 0, file_read_bytes = 0, commit_calls = 0, commit_us = 0;
+    u64 gnm_wait_us = 0, fault_us = 0, cp_busy_us = 0, cp_submit_us = 0, present_us = 0;
 };
 SpikeCounts g_spike_prev;
 u32 g_spike_logged = 0;
+bool g_spike_menu = false; // F1 menu open (game paused): those frames are not spikes
 
 SpikeCounts ReadSpikeCounts() {
     const auto& c = BBPerf2::Get();
@@ -360,7 +363,9 @@ SpikeCounts ReadSpikeCounts() {
             ld(c.tex_up_bytes), ld(c.tex_uploads),        ld(c.waits),
             ld(c.wait_us),      ld(c.compile_us),         ld(c.gfx_pipelines) + ld(c.cs_pipelines),
             ld(c.file_reads),   ld(c.file_read_us),       ld(c.file_read_bytes),
-            ld(c.commit_calls), ld(c.commit_us)};
+            ld(c.commit_calls), ld(c.commit_us),          ld(c.gnm_wait_us),
+            ld(c.fault_us),     ld(c.cp_busy_us),         ld(c.cp_submit_us),
+            ld(c.present_us)};
 }
 
 // The 10 s "[perf2]" reader zeroes the counters (exchange), so a counter that went down restarts.
@@ -382,7 +387,12 @@ SpikeCounts Since(const SpikeCounts& now, const SpikeCounts& before) {
             Since(now.file_read_us, before.file_read_us),
             Since(now.file_read_bytes, before.file_read_bytes),
             Since(now.commit_calls, before.commit_calls),
-            Since(now.commit_us, before.commit_us)};
+            Since(now.commit_us, before.commit_us),
+            Since(now.gnm_wait_us, before.gnm_wait_us),
+            Since(now.fault_us, before.fault_us),
+            Since(now.cp_busy_us, before.cp_busy_us),
+            Since(now.cp_submit_us, before.cp_submit_us),
+            Since(now.present_us, before.present_us)};
 }
 
 u8* AtV(u64 va) {
@@ -863,20 +873,31 @@ void OnGuestFlip(int flip_mode) {
     const SpikeCounts spike_now = ReadSpikeCounts();
     const SpikeCounts spike = Since(spike_now, g_spike_prev);
     g_spike_prev = spike_now;
-    if (frame && std::isfinite(measured) && measured >= kSpikeSec &&
-        g_spike_logged < kSpikeLogMax) {
+    const u64 fault_max_us = BBPerf2::Get().fault_max_us.exchange(0, std::memory_order_relaxed);
+    const bool menu_open = BbMenu::IsOpen();
+    if (menu_open) {
+        g_spike_menu = true;
+    } else if (g_spike_menu) {
+        g_spike_menu = false; // the frame that closed the menu spans the pause
+    } else if (frame && std::isfinite(measured) && measured >= kSpikeSec &&
+               g_spike_logged < kSpikeLogMax) {
         ++g_spike_logged;
         LOG_INFO(Lib_VideoOut,
                  "[spike] {:.1f} ms guest frame at {:.3f} s (monotonic): cpu-write faults {} "
                  "(fault-around {} pages) | buffer upload {:.2f} MiB | texture upload {:.2f} MiB "
                  "({} images) | pipelines {} ({:.1f} ms) | GPU waits {} ({:.1f} ms) | guest file "
-                 "reads {} ({:.2f} MiB requested, {:.1f} ms) | host commits {} ({:.1f} ms)",
+                 "reads {} ({:.2f} MiB requested, {:.1f} ms) | host commits {} ({:.1f} ms) | "
+                 "guest blocked in gnm submit/flip {:.1f} ms | guest fault handlers {:.1f} ms "
+                 "(longest {:.1f} ms) | GPU thread busy {:.1f} ms (Vulkan submit {:.1f} ms) | "
+                 "presenter {:.1f} ms",
                  measured * 1e3, now, spike.faults, spike.fault_around,
                  static_cast<double>(spike.buf_up) / (1 << 20),
                  static_cast<double>(spike.tex_up) / (1 << 20), spike.tex_images, spike.pipelines,
                  spike.compile_us / 1e3, spike.waits, spike.wait_us / 1e3, spike.file_reads,
                  static_cast<double>(spike.file_read_bytes) / (1 << 20), spike.file_read_us / 1e3,
-                 spike.commit_calls, spike.commit_us / 1e3);
+                 spike.commit_calls, spike.commit_us / 1e3, spike.gnm_wait_us / 1e3,
+                 spike.fault_us / 1e3, fault_max_us / 1e3, spike.cp_busy_us / 1e3,
+                 spike.cp_submit_us / 1e3, spike.present_us / 1e3);
     }
     if (std::isfinite(havok_acc)) g_havok_acc.Add(havok_acc);
     if (g_ragdoll_fix) {

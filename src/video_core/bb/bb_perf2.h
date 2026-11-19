@@ -43,6 +43,15 @@ struct Counters {
     std::atomic<u64> file_read_bytes{}; // requested bytes
     std::atomic<u64> commit_calls{};
     std::atomic<u64> commit_us{};
+    // bb-spikes phases: guest thread blocked in sceGnm submit/flip until the GPU thread took the
+    // previous submission (WaitGpuIdle), guest write-fault handler time (and the longest one since
+    // the last flip), the GPU thread's end-of-submit work (OnSubmit + Flush: Vulkan submit) and
+    // the presenter (Present: acquire, compose, queue present).
+    std::atomic<u64> gnm_wait_us{};
+    std::atomic<u64> fault_us{};
+    std::atomic<u64> fault_max_us{};
+    std::atomic<u64> cp_submit_us{};
+    std::atomic<u64> present_us{};
 };
 
 inline Counters& Get() {
@@ -52,6 +61,12 @@ inline Counters& Get() {
 
 inline void Add(std::atomic<u64>& c, u64 v) {
     c.fetch_add(v, std::memory_order_relaxed);
+}
+
+inline void Max(std::atomic<u64>& c, u64 v) {
+    u64 cur = c.load(std::memory_order_relaxed);
+    while (v > cur && !c.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
 }
 
 inline u64 MicrosSince(std::chrono::steady_clock::time_point started) {
