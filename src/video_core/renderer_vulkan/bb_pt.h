@@ -148,6 +148,7 @@ private:
     u64 stat_traced = 0;
     u64 stat_blas_full = 0;
     u64 stat_blas_refits = 0;
+    u64 stat_index_bytes = 0;
 };
 
 } // namespace BB::PathTrace

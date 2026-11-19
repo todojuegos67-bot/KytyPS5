@@ -62,6 +62,26 @@ struct ViewPush {
 };
 static_assert(sizeof(ViewPush) == 56);
 
+// Widens lo and hi to the smallest and largest index of the copied indices, the restart markers
+// left out. The markers take the neutral element of each reduction.
+template <typename Index>
+void ScanIndices(const u8* data, u32 count, u32& lo, u32& hi) {
+    constexpr Index marker = static_cast<Index>(~Index{0});
+    Index smallest = marker;
+    Index largest = 0;
+    for (u32 i = 0; i < count; ++i) {
+        Index index{};
+        std::memcpy(&index, data + u64(i) * sizeof(Index), sizeof(Index));
+        const bool restart = index == marker;
+        smallest = std::min<Index>(smallest, restart ? marker : index);
+        largest = std::max<Index>(largest, restart ? Index{0} : index);
+    }
+    if (smallest != marker || largest != 0) {
+        lo = std::min(lo, static_cast<u32>(smallest));
+        hi = std::max(hi, static_cast<u32>(largest));
+    }
+}
+
 float EnvFloat(const char* name, float def, float lo, float hi) {
     const char* e = std::getenv(name);
     if (!e || !e[0]) {
@@ -431,24 +451,13 @@ bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
         }
         index_out = static_cast<u8*>(indices[frame_slot].mapped) + index_bytes_used;
         memory.CopySparseMemory(draw.index_address, index_out, bytes);
-        // The primitive restart marker is not a vertex: it is left out of the range.
-        const u32 marker = draw.index_size == 2 ? 0xFFFFu : 0xFFFFFFFFu;
         u32 lo = ~0u, hi = 0;
-        for (u32 i = 0; i < vertices; ++i) {
-            u32 v = 0;
-            if (draw.index_size == 2) {
-                u16 v16{};
-                std::memcpy(&v16, index_out + u64(i) * 2, 2);
-                v = v16;
-            } else {
-                std::memcpy(&v, index_out + u64(i) * 4, 4);
-            }
-            if (v == marker) {
-                continue;
-            }
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
+        if (draw.index_size == 2) {
+            ScanIndices<u16>(index_out, vertices, lo, hi);
+        } else {
+            ScanIndices<u32>(index_out, vertices, lo, hi);
         }
+        stat_index_bytes += bytes;
         if (lo > hi) {
             ++stat_skipped;
             return false; // only restart markers
@@ -689,9 +698,10 @@ void Tracer::EndFrame() {
         LOG_INFO(Render_Vulkan,
                  "[pt] {} frames ({} traced): {} draws captured, {} triangles ({} per frame), {} "
                  "draws skipped (capacity, unmapped or unusable indices), BLAS {} full builds, "
-                 "{} refits",
+                 "{} refits, {} KiB of indices copied and scanned per frame",
                  stat_frames, stat_traced, stat_draws, stat_triangles, stat_triangles / stat_frames,
-                 stat_skipped, stat_blas_full, stat_blas_refits);
+                 stat_skipped, stat_blas_full, stat_blas_refits,
+                 stat_index_bytes / stat_frames / 1024);
     }
     frame_slot = (frame_slot + 1) % FrameSlots;
     if (!scheduler.IsFree(slot_ticks[frame_slot])) {
