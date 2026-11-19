@@ -24,6 +24,7 @@ class RtReflect; // bb-rt-reflect
 class VolFog;    // bb-volfog
 namespace PathTrace {
 class Tracer; // bb-pathtrace (bb_pt.h)
+class Gi; // bb-pathtrace GI (bb_pt_gi.h)
 }
 }
 
@@ -173,7 +174,9 @@ private:
     void BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset);
 public:
     void BbPtFrameEnd(); // bb-pathtrace: the presenter, once per guest frame
-    vk::ImageView BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent); // bb-pathtrace: presenter
+    // bb-pathtrace: presenter. game is the presented frame before the trace (shader-read).
+    vk::ImageView BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent, vk::ImageView game,
+                            bool game_srgb);
 private:
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
@@ -257,6 +260,7 @@ private:
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
     std::unique_ptr<BB::VolFog> bb_volfog;        // bb-volfog (no ray tracing needed)
     std::unique_ptr<BB::PathTrace::Tracer> bb_pt; // bb-pathtrace: BB_PT=1 (bb_pt.h)
+    std::unique_ptr<BB::PathTrace::Gi> bb_gi;     // bb-pathtrace: BB_PT_GI, created on first use
     // bb-volfog state: the composite's HDR target and whether the apply is pending; a G-buffer
     // pass (its depth = the scene depth) since the last composite; the frame sequence (composites)
     // and the sequence the last inject belongs to.

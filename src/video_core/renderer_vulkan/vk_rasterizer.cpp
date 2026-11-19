@@ -20,6 +20,7 @@
 #include "core/bb_ssr_probe.h"
 #include "video_core/renderer_vulkan/bb_rt_reflect.h"
 #include "video_core/renderer_vulkan/bb_pt.h"
+#include "video_core/renderer_vulkan/bb_pt_gi.h"
 #include "video_core/renderer_vulkan/bb_volfog.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -267,7 +268,8 @@ void Rasterizer::BbPtFrameEnd() {
     }
 }
 
-vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent) {
+vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent,
+                                    vk::ImageView game, bool game_srgb) {
     float proj[16]{}, view[12]{}, far_dist = 0.0f;
     if (!bb_pt || !BB::Upscale::RtCamera(proj, view, far_dist)) {
         return {};
@@ -309,7 +311,34 @@ vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent) 
             }
         }
     }
-    return bb_pt->Trace(cmd, extent, proj, sun_view, sun_color, have_sun);
+    const auto lit = bb_pt->Trace(cmd, extent, proj, sun_view, sun_color, have_sun);
+    if (!lit) {
+        if (bb_gi) {
+            bb_gi->Reset();
+        }
+        return {};
+    }
+    if (!BB::PathTrace::GiRequested()) {
+        return lit;
+    }
+    if (!bb_gi) {
+        bb_gi = std::make_unique<BB::PathTrace::Gi>(instance);
+        if (!bb_gi->Init()) {
+            LOG_ERROR(Render_Vulkan, "[pt-gi] could not start: the lit view is shown alone");
+        }
+    }
+    BB::PathTrace::GiInput in{
+        .tlas = bb_pt->SceneTlas(),
+        .soup = bb_pt->SoupBuffer(),
+        .game = game,
+        .lit = lit,
+        .extent = extent,
+        .proj = proj,
+        .view = view,
+        .game_srgb = game_srgb,
+    };
+    const auto final_view = bb_gi->Run(cmd, in);
+    return final_view ? final_view : lit;
 }
 
 void Rasterizer::EliminateFastClear() {

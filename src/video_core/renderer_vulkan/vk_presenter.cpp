@@ -1445,9 +1445,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
-    // bb-pathtrace (bb_pt.h): BB_PT=1 and captured geometry this frame: the distance view
-    // replaces the picture (linear RGBA16F, like the SR output, so it is not sRGB-decoded).
-    if (const auto v = rasterizer->BbPtTrace(cmdbuf, image_size)) {
+    // bb-pathtrace (bb_pt.h, bb_pt_gi.h): BB_PT=1 and captured geometry this frame: the lit view
+    // (with GI) replaces the picture (linear RGBA16F, like the SR output, so not sRGB-decoded).
+    if (const auto v = rasterizer->BbPtTrace(cmdbuf, image_size, image_view,
+                                             srgb10 && (!bb_upscaled || bb_cut_frame))) {
         image_view = v;
         bb_upscaled = true;
     }
