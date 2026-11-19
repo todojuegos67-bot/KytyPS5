@@ -3521,6 +3521,7 @@ struct Counters {
 	uint64_t samplers    = 0; // samplers given by the memo
 	uint64_t verified    = 0; // =2: stages compared
 	uint64_t differences = 0; // =2: stages whose memo answer differs from the normal path
+	uint64_t unchanged   = 0; // a slot that held this stage's answer already: not stored again
 };
 Counters g_counters;
 
@@ -3657,6 +3658,7 @@ std::string TakeReport(double /*cycles_per_us*/) {
 		text += fmt::format("; verificador: comparadas {}, diferencias {}", c.verified,
 		                    c.differences);
 	}
+	text += fmt::format("; sin guardar de nuevo (ya igual) {}", c.unchanged);
 	c = {};
 	return text;
 }
@@ -3982,6 +3984,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		    samples_big_depth(i), prepared.normalize_unnormalized));
 	}
 	step.reset();
+	// gt7-drawmemo-1118: the verifier and the store are the memo's work, timed with it (they
+	// were in the line's "resto").
+	std::optional<GpuPhases::Scope> memo_phase;
+	if (memo_mode != 0 && memo_eligible) {
+		memo_phase.emplace(GpuPhases::Phase::DrawMemoCheck);
+	}
+	bool memo_differs = false;
 	if (memo_mode == 2 && memo_slot != nullptr) {
 		// The verifier: what the memo would have given against what the normal path gave.
 		DrawMemo::g_counters.verified++;
@@ -3996,6 +4005,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			what = "samplers";
 		}
 		if (what != nullptr) {
+			memo_differs = true;
 			DrawMemo::g_counters.differences++;
 			static uint32_t logged = 0;
 			if (logged++ < 16) {
@@ -4006,7 +4016,26 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 	}
 	if (memo_mode != 0 && memo_eligible) {
-		if (keep && hit_entries.size() == program.info.images.size()) {
+		// A slot the memo found (same program, words and generation) whose entries and their
+		// memos are what this resolve gave, and whose samplers the verifier found the same,
+		// holds this stage's answer already: storing it again only copied five vectors (=2
+		// stored again at every hit).
+		const auto unchanged = [&] {
+			if (memo_slot == nullptr || memo_differs ||
+			    memo_slot->front_generation != GetTextureDescFront().generation ||
+			    memo_slot->entries != hit_entries) {
+				return false;
+			}
+			for (size_t i = 0; i < hit_entries.size(); i++) {
+				if (!DrawMemo::SameMemo(hit_entries[i]->memo, memo_slot->memos[i])) {
+					return false;
+				}
+			}
+			return true;
+		};
+		if (keep && hit_entries.size() == program.info.images.size() && unchanged()) {
+			DrawMemo::g_counters.unchanged++;
+		} else if (keep && hit_entries.size() == program.info.images.size()) {
 			// Kept for the next draw of this program with these words.
 			auto& slot            = DrawMemo::Table().slots[memo_hash & (DrawMemo::StageTable::Slots - 1u)];
 			slot.program          = &program;
