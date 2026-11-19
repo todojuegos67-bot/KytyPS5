@@ -136,6 +136,8 @@ private:
     u32 index_bytes_used = 0;
     u32 triangles_used = 0;
     u32 record_count = 0;
+    u32 blas_triangles = 0;        // triangles of the last full build of blas (0: none)
+    u32 blas_refits = 0;           // refits since that build
     u32 max_records = 0;
     u32 position_capacity = 0;     // slots
     u32 index_capacity = 0;        // bytes
@@ -144,6 +146,8 @@ private:
     u64 stat_triangles = 0;
     u64 stat_skipped = 0;
     u64 stat_traced = 0;
+    u64 stat_blas_full = 0;
+    u64 stat_blas_refits = 0;
 };
 
 } // namespace BB::PathTrace

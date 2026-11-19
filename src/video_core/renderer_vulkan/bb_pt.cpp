@@ -22,6 +22,11 @@ namespace BB::PathTrace {
 namespace {
 
 constexpr u32 MaxRecords = 16384;
+// Refits of the scene acceleration structure between two full builds: the BVH keeps its topology
+// while the view-space triangles move, and a full build restores its quality.
+constexpr u32 RefitLimit = 16;
+constexpr auto BlasFlags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild |
+                           vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
 
 // One captured draw, read by the gather shader (bb_pt_gather.comp, std430, 48 bytes).
 struct Record {
@@ -204,7 +209,7 @@ bool Tracer::MakeScene() {
     };
     const vk::AccelerationStructureBuildGeometryInfoKHR binfo{
         .type = vk::AccelerationStructureTypeKHR::eBottomLevel,
-        .flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild,
+        .flags = BlasFlags,
         .mode = vk::BuildAccelerationStructureModeKHR::eBuild,
         .geometryCount = 1,
         .pGeometries = &geom,
@@ -233,7 +238,7 @@ bool Tracer::MakeScene() {
         pc.get<vk::PhysicalDeviceAccelerationStructurePropertiesKHR>()
             .minAccelerationStructureScratchOffsetAlignment,
         256);
-    tlas_scratch = (bsz.buildScratchSize + align - 1) / align * align;
+    tlas_scratch = (std::max(bsz.buildScratchSize, bsz.updateScratchSize) + align - 1) / align * align;
     if (!MakeBuffer(blas_buf, bsz.accelerationStructureSize, U::eAccelerationStructureStorageKHR,
                     false) ||
         !MakeBuffer(tlas_buf, tsz.accelerationStructureSize, U::eAccelerationStructureStorageKHR,
@@ -565,10 +570,21 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
                   }},
         .flags = vk::GeometryFlagBitsKHR::eOpaque,
     };
+    const bool refit = blas_triangles == tris && blas_refits < RefitLimit;
+    if (refit) {
+        ++blas_refits;
+        ++stat_blas_refits;
+    } else {
+        blas_refits = 0;
+        blas_triangles = tris;
+        ++stat_blas_full;
+    }
     const vk::AccelerationStructureBuildGeometryInfoKHR binfo{
         .type = vk::AccelerationStructureTypeKHR::eBottomLevel,
-        .flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild,
-        .mode = vk::BuildAccelerationStructureModeKHR::eBuild,
+        .flags = BlasFlags,
+        .mode = refit ? vk::BuildAccelerationStructureModeKHR::eUpdate
+                      : vk::BuildAccelerationStructureModeKHR::eBuild,
+        .srcAccelerationStructure = refit ? blas : vk::AccelerationStructureKHR{},
         .dstAccelerationStructure = blas,
         .geometryCount = 1,
         .pGeometries = &geom,
@@ -672,9 +688,10 @@ void Tracer::EndFrame() {
     if (stat_frames % 600 == 0) {
         LOG_INFO(Render_Vulkan,
                  "[pt] {} frames ({} traced): {} draws captured, {} triangles ({} per frame), {} "
-                 "draws skipped (capacity, unmapped or unusable indices)",
+                 "draws skipped (capacity, unmapped or unusable indices), BLAS {} full builds, "
+                 "{} refits",
                  stat_frames, stat_traced, stat_draws, stat_triangles, stat_triangles / stat_frames,
-                 stat_skipped);
+                 stat_skipped, stat_blas_full, stat_blas_refits);
     }
     frame_slot = (frame_slot + 1) % FrameSlots;
     if (!scheduler.IsFree(slot_ticks[frame_slot])) {
