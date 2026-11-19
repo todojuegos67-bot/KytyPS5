@@ -272,7 +272,44 @@ vk::ImageView Rasterizer::BbPtTrace(vk::CommandBuffer cmd, vk::Extent2D extent) 
     if (!bb_pt || !BB::Upscale::RtCamera(proj, view, far_dist)) {
         return {};
     }
-    return bb_pt->Trace(cmd, extent, proj);
+    // The game's sun: light 0 of the light-set CB, as bb_rt_reflect GameLight() reads it. Its
+    // direction sign is not decoded (see bb_rt_reflect LightDir): y up is assumed.
+    float block[72]{};
+    u64 age = 0;
+    float sun_view[3]{}, sun_color[3]{};
+    bool have_sun = false;
+    if (BB::Upscale::RtLightBlock(block, age) && age <= 120) {
+        const float* dir = block;
+        const float* diffuse = block + 16;
+        const float dl = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+        if (dl > 0.5f && diffuse[0] + diffuse[1] + diffuse[2] > 1e-5f) {
+            float world[3]{};
+            for (int i = 0; i < 3; ++i) {
+                world[i] = dir[i] / dl;
+            }
+            if (world[1] < 0.0f) {
+                for (float& v : world) {
+                    v = -v;
+                }
+            }
+            float v[3]{};
+            for (int r = 0; r < 3; ++r) {
+                v[r] = view[r * 4] * world[0] + view[r * 4 + 1] * world[1] +
+                       view[r * 4 + 2] * world[2];
+            }
+            const float vl = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            if (vl > 1e-6f) {
+                const float m = std::max({diffuse[0], diffuse[1], diffuse[2]});
+                const float k = m > 4.0f ? 4.0f / m : 1.0f;
+                for (int i = 0; i < 3; ++i) {
+                    sun_view[i] = v[i] / vl;
+                    sun_color[i] = diffuse[i] * k;
+                }
+                have_sun = true;
+            }
+        }
+    }
+    return bb_pt->Trace(cmd, extent, proj, sun_view, sun_color, have_sun);
 }
 
 void Rasterizer::EliminateFastClear() {

@@ -67,9 +67,12 @@ public:
 
     // Presenter, after the upscaler and before the post-process: gathers this frame's captured
     // triangles, builds the scene acceleration structure and traces one primary ray per pixel.
-    // Returns the distance view (linear RGBA16F, shader-read layout) or a null view when this
-    // frame captured nothing. proj is the scene projection, row-major (BB::Upscale::RtCamera).
-    vk::ImageView Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const float proj[16]);
+    // Returns the lit view (linear RGBA16F, shader-read layout), or the distance view with
+    // BB_PT_DEBUG=1, or a null view when this frame captured nothing or there is no validated
+    // sun (have_sun false: the frame is left as it is). proj is the scene projection, row-major
+    // (BB::Upscale::RtCamera); sun_view is the sun direction toward the light, view space.
+    vk::ImageView Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const float proj[16],
+                        const float sun_view[3], const float sun_color[3], bool have_sun);
 
     // Once per guest frame, after its draws: logs the counters every 600 frames and moves the
     // tables on to the next frame in flight.

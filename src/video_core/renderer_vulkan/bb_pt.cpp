@@ -50,8 +50,11 @@ struct ViewPush {
     float range;
     u32 width;
     u32 height;
+    u32 debug;
+    float sun_x, sun_y, sun_z;
+    float sun_r, sun_g, sun_b;
 };
-static_assert(sizeof(ViewPush) == 28);
+static_assert(sizeof(ViewPush) == 56);
 
 float EnvFloat(const char* name, float def, float lo, float hi) {
     const char* e = std::getenv(name);
@@ -81,6 +84,14 @@ u32 TriangleCapacity() {
 float ViewRange() {
     static const float range = EnvFloat("BB_PT_RANGE", 50.0f, 1.0f, 1000.0f);
     return range;
+}
+
+bool DebugRequested() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_PT_DEBUG");
+        return e && e[0] == '1';
+    }();
+    return on;
 }
 
 Tracer::Tracer(const Vulkan::Instance& instance_, Core::MemoryManager& memory_)
@@ -368,9 +379,10 @@ bool Tracer::Init() {
         {2, vk::DescriptorType::eStorageBuffer, 1, C},
         {3, vk::DescriptorType::eStorageBuffer, 1, C},
     }};
-    const std::array<vk::DescriptorSetLayoutBinding, 2> view_bindings{{
+    const std::array<vk::DescriptorSetLayoutBinding, 3> view_bindings{{
         {0, vk::DescriptorType::eAccelerationStructureKHR, 1, C},
         {1, vk::DescriptorType::eStorageImage, 1, C},
+        {2, vk::DescriptorType::eStorageBuffer, 1, C},
     }};
     if (!MakeScene() ||
         !MakePass(gather_bindings, sizeof(GatherPush), BB_PT_GATHER_COMP, gather_pass) ||
@@ -478,8 +490,11 @@ bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
     return true;
 }
 
-vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const float proj[16]) {
-    if (!ready || triangles_used == 0 || record_count == 0 || !MakeOutput(extent)) {
+vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const float proj[16],
+                            const float sun_view[3], const float sun_color[3], bool have_sun) {
+    const bool debug = DebugRequested();
+    if (!ready || triangles_used == 0 || record_count == 0 || (!debug && !have_sun) ||
+        !MakeOutput(extent)) {
         return {};
     }
     ++stat_traced;
@@ -602,14 +617,18 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
         .accelerationStructureCount = 1,
         .pAccelerationStructures = &tlas,
     };
-    const std::array<vk::WriteDescriptorSet, 2> view_writes{{
+    const std::array<vk::WriteDescriptorSet, 3> view_writes{{
         {.pNext = &as_info, .dstBinding = 0, .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eAccelerationStructureKHR},
         {.dstBinding = 1, .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &out_info},
+        {.dstBinding = 2, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &soup_info},
     }};
-    const ViewPush view{proj[0], proj[5], proj[2], proj[6], ViewRange(), extent.width,
-                        extent.height};
+    const ViewPush view{proj[0],    proj[5],       proj[2],       proj[6],
+                        ViewRange(), extent.width, extent.height, debug ? 1u : 0u,
+                        sun_view[0], sun_view[1],  sun_view[2],   sun_color[0],
+                        sun_color[1], sun_color[2]};
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, view_pass.pipe);
     cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, view_pass.layout, 0, view_writes);
     cmd.pushConstants(view_pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(view), &view);
