@@ -26,6 +26,8 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageDump.h"
@@ -3665,6 +3667,65 @@ std::string TakeReport(double /*cycles_per_us*/) {
 
 } // namespace DrawMemo
 
+// gt7-replay-1119 (KYTY_REPLAY, replay.h): a draw stage's images and samplers kept by its place
+// (the draw's place in its chunk, and the stage's type). An image is taken again when its
+// program, its descriptor words and the texture description cache are what they were, and the
+// texture memo of the description kept would answer as ResolveTexture's memo does (its stamp
+// current, its image registered, no depth alias, nothing to bind again): the same answer,
+// without the key and its lookup. Samplers: the same program, normalization and S# words.
+namespace ReplayStages {
+namespace {
+
+struct Stage {
+	const ShaderRecompiler::IR::CompiledShaderInfo*    program          = nullptr;
+	bool                                               normalize        = false;
+	uint64_t                                           front_generation = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> images;  // the words of each program image
+	std::vector<TextureDescEntry*>                     entries; // its memo's entry, or null
+	bool                                               samplers_kept = false;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> samplers; // the snapshot's S# words
+	std::vector<vk::Sampler>                           sampler_out;
+};
+
+constexpr size_t TableLimit = 1u << 16u;
+
+std::unordered_map<uint64_t, Stage>& Table() {
+	thread_local std::unordered_map<uint64_t, Stage> table;
+	return table;
+}
+
+// Why image `i` of a kept stage (same program) cannot be taken again; Miss::Count when it can.
+// `image_ok(id)`: registered, not a depth alias, not to be bound again.
+template <typename ImageOk>
+Replay::Miss ImageMiss(const Stage& stage, uint32_t i,
+                       const ShaderRecompiler::IR::DescriptorValue& words,
+                       const TextureCache& texture_cache, const ImageOk& image_ok) {
+	if (i >= stage.entries.size()) {
+		return Replay::Miss::NoEntry;
+	}
+	if (std::memcmp(&stage.images[i], &words, sizeof(words)) != 0) {
+		return Replay::Miss::Words;
+	}
+	if (stage.entries[i] == nullptr) {
+		return Replay::Miss::NotKept;
+	}
+	// Before the entry is read: it is only there while the description cache was not cleared.
+	if (stage.front_generation != GetTextureDescFront().generation) {
+		return Replay::Miss::MemoStale;
+	}
+	const auto& entry = *stage.entries[i];
+	if (!MemoCurrent(entry.memo, entry.desc, texture_cache)) {
+		return Replay::Miss::Stamp;
+	}
+	if (!image_ok(entry.memo.id)) {
+		return Replay::Miss::Image;
+	}
+	return Replay::Miss::Count;
+}
+
+} // namespace
+} // namespace ReplayStages
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	// gt7-drawmemo-1118: a draw stage on the GPU thread is timed by step ("Desglose draw").
@@ -3840,7 +3901,55 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// gt7-drawmemo-1118 (KYTY_DRAW_MEMO): the stage's images and samplers of last time, when its
 	// program and descriptor words are the same and every image's texture memo still holds what
 	// it held then (DrawMemo::Find).
-	const int  memo_mode     = in_draw ? DrawMemo::Mode() : 0;
+	// gt7-replay-1119 (KYTY_REPLAY): the stage kept at this draw's place (made when new).
+	const int             replay_mode    = in_draw ? Replay::Mode() : 0;
+	const uint64_t        replay_draw    = replay_mode != 0 ? Replay::DrawKey() : 0;
+	ReplayStages::Stage*  replay         = nullptr;
+	bool                  replay_program = false; // kept for this program and normalization
+	Replay::Miss          replay_stage_miss = Replay::Miss::Count;
+	// A stage resolved inside another's resolution (none is known to be) keeps nothing: the
+	// outer one holds a pointer into the table.
+	thread_local bool t_replay_stage = false;
+	struct ReplayStageScope {
+		bool previous;
+		explicit ReplayStageScope(bool active): previous(t_replay_stage) {
+			t_replay_stage = previous || active;
+		}
+		~ReplayStageScope() { t_replay_stage = previous; }
+	};
+	const bool             replay_nested = t_replay_stage;
+	const ReplayStageScope replay_stage_scope(replay_draw != 0);
+	// What each image's resolution answered (its texture memo entry, or null), for the store.
+	constexpr uint32_t                          ReplayMaxImages = 64;
+	std::array<TextureDescEntry*, ReplayMaxImages> replay_entries {};
+	uint32_t                                    replay_count = 0;
+	if (replay_draw != 0) {
+		const bool eligible =
+		    !replay_nested && program.info.images.size() <= ReplayMaxImages &&
+		    watched_use == UINT32_MAX && !Bisect::Active() && TextureDescCacheEnabled() &&
+		    TextureMemoEnabled() && !FrameGraph::Active() && !FrameGraph::Logging() &&
+		    !(pixel && GpuTiming::ProbesGridsOf(program.shader_hash)) &&
+		    snapshot.images.size() >= program.info.images.size();
+		if (!eligible) {
+			replay_stage_miss = Replay::Miss::Ineligible;
+		} else {
+			auto& table = ReplayStages::Table();
+			if (table.size() >= ReplayStages::TableLimit) {
+				table.clear();
+				Replay::NoteDropped(Replay::Part::Image);
+			}
+			auto [it, created] = table.try_emplace(
+			    Replay::PartKey(replay_draw, 1u, static_cast<uint32_t>(program.stage)));
+			replay         = &it->second;
+			replay_program = replay->program == &program &&
+			                 replay->normalize == prepared.normalize_unnormalized;
+			if (!replay_program) {
+				replay_stage_miss =
+				    replay->program == nullptr ? Replay::Miss::NoEntry : Replay::Miss::Program;
+			}
+		}
+	}
+	const int  memo_mode     = in_draw && replay == nullptr ? DrawMemo::Mode() : 0;
 	bool       memo_eligible = false;
 	uint64_t   memo_hash     = 0;
 	DrawMemo::StageSlot* memo_slot = nullptr;
@@ -3897,7 +4006,46 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		GpuPhases::Count(GpuPhases::Phase::DrawTexImageCount, program.info.images.size());
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// gt7-replay-1119: whether the image kept at this place answers (as the texture memo).
+		bool replay_hit = false;
+		if (replay_draw != 0) {
+			auto why = replay_stage_miss;
+			if (why == Replay::Miss::Count) {
+				if (!TextureMemoEligible(program.info.images[i]) || program.info.images[i].runtime) {
+					why = Replay::Miss::Ineligible;
+				} else {
+					auto& textures = m_context.GetTextureCache();
+					why = ReplayStages::ImageMiss(*replay, i, snapshot.images[i], textures,
+					                              [&](ImageId id) {
+						                              const auto* image =
+						                                  textures.m_slot_images.try_get(id);
+						                              return image != nullptr && image->registered &&
+						                                     !image->depth_id &&
+						                                     !image->binding.needs_rebind;
+					                              });
+				}
+			}
+			replay_hit = why == Replay::Miss::Count;
+			if (replay_hit) {
+				Replay::NoteHit(Replay::Part::Image);
+			} else {
+				Replay::NoteMiss(Replay::Part::Image, why);
+			}
+		}
+		if (replay_hit && replay_mode == 1) {
+			// ResolveTexture's texture memo answer, without its key and lookup.
+			g_texture_memo_counts.lookups++;
+			g_texture_memo_counts.found++;
+			auto binding = DrawMemo::MemoBinding(*replay->entries[i]);
+			replay_entries[replay_count++] = replay->entries[i];
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			binding.mip_views.swap(prepared.images[i].mip_views);
+			binding.mip_views.clear();
+			prepared.images[i] = std::move(binding);
+			continue;
+		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i], true);
+		TextureDescEntry* const answered = t_memo_hit_entry;
 		if (keep) {
 			if (t_memo_hit_entry == nullptr) {
 				keep = false;
@@ -3935,6 +4083,17 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		if (on_worker && MtGpu::SpeculationFailed()) {
 			return;
+		}
+		if (replay_hit) {
+			// KYTY_REPLAY=2: what the replay would have given against the normal path.
+			Replay::NoteVerified(Replay::Part::Image,
+			                     DrawMemo::DiffBinding(DrawMemo::MemoBinding(*replay->entries[i]),
+			                                           binding),
+			                     program.shader_hash, i);
+		}
+		if (replay != nullptr) {
+			// Kept: a texture memo answer that is not a light grid.
+			replay_entries[replay_count++] = grid ? nullptr : answered;
 		}
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
@@ -3978,10 +4137,70 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		return big;
 	};
-	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
-		    samples_big_depth(i), prepared.normalize_unnormalized));
+	// gt7-replay-1119: the samplers kept at this place, for the same program, normalization and
+	// S# words (the samplers of a stage depend on nothing else outside KYTY_BISECT).
+	bool replay_samplers = false;
+	if (replay_draw != 0 && !program.info.samplers.empty()) {
+		auto why = replay_stage_miss;
+		if (why == Replay::Miss::Count) {
+			why = !replay->samplers_kept                               ? Replay::Miss::NotKept
+			      : !DrawMemo::SameWords(replay->samplers, snapshot.samplers) ? Replay::Miss::Words
+			                                                            : Replay::Miss::Count;
+		}
+		replay_samplers = why == Replay::Miss::Count;
+		if (replay_samplers) {
+			Replay::NoteHit(Replay::Part::Samplers);
+		} else {
+			Replay::NoteMiss(Replay::Part::Samplers, why);
+		}
+	}
+	if (replay_samplers && replay_mode == 1) {
+		prepared.samplers.assign(replay->sampler_out.begin(), replay->sampler_out.end());
+	} else {
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			prepared.samplers.push_back(NativeSampler(
+			    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index],
+			    samples_big_depth(i), prepared.normalize_unnormalized));
+		}
+		if (replay_samplers) {
+			Replay::NoteVerified(Replay::Part::Samplers,
+			                     replay->sampler_out != prepared.samplers ? "samplers" : nullptr,
+			                     program.shader_hash, 0);
+		}
+	}
+	if (replay != nullptr) {
+		// What this place holds now (stored again only when it changed).
+		const auto front   = GetTextureDescFront().generation;
+		const bool changed = !replay_program || replay->front_generation != front ||
+		                     replay_count != program.info.images.size() ||
+		                     !std::equal(replay->entries.begin(), replay->entries.end(),
+		                                 replay_entries.begin(), replay_entries.begin() + replay_count) ||
+		                     !std::equal(replay->images.begin(), replay->images.end(),
+		                                 snapshot.images.begin(),
+		                                 snapshot.images.begin() +
+		                                     static_cast<std::ptrdiff_t>(std::min(
+		                                         replay->images.size(), snapshot.images.size())),
+		                                 [](const auto& a, const auto& b) {
+			                                 return std::memcmp(&a, &b, sizeof(a)) == 0;
+		                                 }) ||
+		                     replay->images.size() != program.info.images.size();
+		if (changed) {
+			replay->program          = &program;
+			replay->normalize        = prepared.normalize_unnormalized;
+			replay->front_generation = front;
+			replay->images.assign(snapshot.images.begin(),
+			                      snapshot.images.begin() +
+			                          static_cast<std::ptrdiff_t>(program.info.images.size()));
+			replay->entries.assign(replay_entries.begin(), replay_entries.begin() + replay_count);
+			Replay::NoteStored(Replay::Part::Image);
+		}
+		if (!program.info.samplers.empty() &&
+		    (changed || !replay_samplers || !replay->samplers_kept)) {
+			replay->samplers      = snapshot.samplers;
+			replay->sampler_out   = prepared.samplers;
+			replay->samplers_kept = true;
+			Replay::NoteStored(Replay::Part::Samplers);
+		}
 	}
 	step.reset();
 	// gt7-drawmemo-1118: the verifier and the store are the memo's work, timed with it (they
@@ -5015,16 +5234,95 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	// gt7-replay-1119 (KYTY_REPLAY): a draw's push constants and set 0 that the command buffer
+	// holds already (the draw before pushed the same with the same layout) are left out (=1) or
+	// counted (=2). The flattened writes: binding, type, count, then each info's handles,
+	// offsets and ranges.
+	DynamicStateShadow* const replay_shadow =
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && Replay::Mode() != 0 &&
+	            Replay::DrawKey() != 0
+	        ? vk_buffer.StateShadow()
+	        : nullptr;
+	const bool replay_leave_out = Replay::Mode() == 1;
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		bool same = false;
+		if (replay_shadow != nullptr) {
+			same = replay_shadow->replay_constants_valid &&
+			       replay_shadow->replay_constants_layout == pipeline.pipeline_layout &&
+			       replay_shadow->replay_constants_stages ==
+			           static_cast<uint32_t>(push_stages) &&
+			       replay_shadow->replay_constants == push_data.dwords;
+			if (same) {
+				Replay::NoteHit(Replay::Part::Constants);
+			} else {
+				Replay::NoteMiss(Replay::Part::Constants, Replay::Miss::Words);
+			}
+		}
+		if (!same || !replay_leave_out) {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
+			                        push_data.dwords.data());
+			if (replay_shadow != nullptr) {
+				replay_shadow->replay_constants_valid  = true;
+				replay_shadow->replay_constants_layout = pipeline.pipeline_layout;
+				replay_shadow->replay_constants_stages = static_cast<uint32_t>(push_stages);
+				replay_shadow->replay_constants        = push_data.dwords;
+			}
+		}
 	}
 
-	if (!ActivePtr()->descriptor_writes.empty()) {
+	thread_local std::vector<uint64_t> replay_words;
+	bool                               replay_same_set = false;
+	if (replay_shadow != nullptr && !ActivePtr()->descriptor_writes.empty()) {
+		replay_words.clear();
+		for (const auto& write: ActivePtr()->descriptor_writes) {
+			replay_words.push_back(static_cast<uint64_t>(write.dstBinding) |
+			                       static_cast<uint64_t>(write.descriptorType) << 32u);
+			replay_words.push_back(write.descriptorCount);
+			for (uint32_t k = 0; k < write.descriptorCount; k++) {
+				if (write.pImageInfo != nullptr) {
+					const auto& info = write.pImageInfo[k];
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkSampler>(info.sampler)));
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkImageView>(info.imageView)));
+					replay_words.push_back(static_cast<uint64_t>(info.imageLayout));
+				}
+				if (write.pBufferInfo != nullptr) {
+					const auto& info = write.pBufferInfo[k];
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkBuffer>(info.buffer)));
+					replay_words.push_back(info.offset);
+					replay_words.push_back(info.range);
+				}
+			}
+		}
+		replay_same_set = replay_shadow->replay_set_valid &&
+		                  replay_shadow->replay_set_layout == pipeline.pipeline_layout &&
+		                  replay_shadow->replay_set_words == replay_words;
+		if (replay_same_set) {
+			Replay::NoteHit(Replay::Part::Descriptors);
+		} else {
+			Replay::NoteMiss(Replay::Part::Descriptors, Replay::Miss::Words);
+		}
+	}
+	if (!ActivePtr()->descriptor_writes.empty() && replay_same_set && replay_leave_out) {
+		// The command buffer holds this set 0 already.
+	} else if (!ActivePtr()->descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		ScrubDeadDescriptorViews(ActivePtr()->descriptor_writes.data(),
 		                         static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),
 		                         "a draw's descriptors");
+		struct StoreSet {
+			DynamicStateShadow* shadow;
+			vk::PipelineLayout  layout;
+			~StoreSet() {
+				if (shadow != nullptr) {
+					shadow->replay_set_valid  = true;
+					shadow->replay_set_layout = layout;
+					shadow->replay_set_words.assign(replay_words.begin(), replay_words.end());
+				}
+			}
+		} const store_set {replay_shadow, pipeline.pipeline_layout};
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),

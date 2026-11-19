@@ -144,6 +144,8 @@ public:
 	    : m_scheduler(&scheduler), m_direct(direct) {}
 
 	[[nodiscard]] bool Threaded() const noexcept { return m_direct == nullptr; }
+	// gt7-replay-1119: the state shadow of the command buffer being recorded (null: a raw one).
+	[[nodiscard]] DynamicStateShadow* StateShadow() const noexcept { return Shadow(); }
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_direct == nullptr && m_scheduler == nullptr;
 	}
@@ -254,6 +256,9 @@ public:
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* values) const {
+		if (auto* shadow = Shadow(); shadow != nullptr) {
+			shadow->replay_constants_valid = false; // gt7-replay-1119
+		}
 		if (!Threaded()) {
 			m_direct.pushConstants(layout, stages, offset, size, values);
 			return;
@@ -266,6 +271,10 @@ public:
 	void bindDescriptorSets(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                        uint32_t first, uint32_t count, const vk::DescriptorSet* sets,
 	                        uint32_t dynamic_count, const uint32_t* dynamic_offsets) const {
+		if (auto* shadow = Shadow();
+		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics && first == 0) {
+			shadow->replay_set_valid = false; // gt7-replay-1119
+		}
 		if (!Threaded()) {
 			m_direct.bindDescriptorSets(bind_point, layout, first, count, sets, dynamic_count,
 			                            dynamic_offsets);
@@ -280,6 +289,10 @@ public:
 	void pushDescriptorSetKHR(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                          uint32_t set, uint32_t count,
 	                          const vk::WriteDescriptorSet* writes) const {
+		if (auto* shadow = Shadow();
+		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics && set == 0) {
+			shadow->replay_set_valid = false; // gt7-replay-1119
+		}
 		if (!Threaded()) {
 			m_direct.pushDescriptorSetKHR(bind_point, layout, set, count, writes);
 			return;
@@ -295,6 +308,10 @@ public:
 	void updateAndBindDescriptorSet(vk::Device device, vk::PipelineBindPoint bind_point,
 	                                vk::PipelineLayout layout, vk::DescriptorSet set,
 	                                uint32_t count, const vk::WriteDescriptorSet* writes) const {
+		if (auto* shadow = Shadow();
+		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics) {
+			shadow->replay_set_valid = false; // gt7-replay-1119
+		}
 		if (!Threaded()) {
 			device.updateDescriptorSets(count, writes, 0, nullptr);
 			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);

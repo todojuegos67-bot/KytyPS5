@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
@@ -650,6 +651,7 @@ void ReportIfDue(uint64_t frames) {
 	// gt7-spec-1112: KYTY_SPECULATE's counters, on a line of their own.
 	Speculation::Report(cycles_per_us, seconds);
 	MtGpu::Report(new_frames, seconds);
+	Replay::Report(seconds); // gt7-replay-1119 (KYTY_REPLAY; nothing while off)
 	{
 		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
 		namespace RC = RecordedCommands;

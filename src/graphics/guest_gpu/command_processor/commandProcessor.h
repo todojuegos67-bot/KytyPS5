@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
+#include "graphics/host_gpu/renderer/replay.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -69,6 +70,7 @@ private:
 	uint32_t                  m_prep_queue    = 0;
 	uint32_t                  m_prep_ordinal  = 0;
 	const uint32_t*           m_prep_packet   = nullptr; // the last numbered packet
+	Replay::StreamState       m_replay;                  // gt7-replay-1119 (KYTY_REPLAY)
 	uint32_t                              m_yield_us      = 0;
 	bool                                  m_yielded       = false;
 	std::chrono::steady_clock::time_point m_yield_start {};
