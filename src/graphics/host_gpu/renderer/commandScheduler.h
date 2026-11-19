@@ -110,11 +110,27 @@ struct DynamicStateShadow {
 		return false;
 	}
 	void Invalidate(Kind kind) noexcept { entries[kind].valid = false; }
+	// gt7-replay-1119 (KYTY_REPLAY): the graphics descriptor set 0 and the push constants a
+	// draw last recorded (RenderExecutor::CommitBindings), flattened, for the next draw to leave
+	// out the same again. Any other set-0 update or push constant call, an emulator pipeline
+	// bind and a new command buffer forget them.
+	bool                     replay_set_valid = false;
+	vk::PipelineLayout       replay_set_layout;
+	std::vector<uint64_t>    replay_set_words;
+	bool                     replay_constants_valid = false;
+	vk::PipelineLayout       replay_constants_layout;
+	uint32_t                 replay_constants_stages = 0;
+	std::array<uint32_t, 32> replay_constants {};
+	void InvalidateReplay() noexcept {
+		replay_set_valid       = false;
+		replay_constants_valid = false;
+	}
 	void InvalidateGraphics() noexcept {
 		for (auto& entry: entries) {
 			entry.valid = false;
 		}
 		graphics_pipeline = nullptr;
+		InvalidateReplay();
 	}
 	void InvalidateAll() noexcept {
 		InvalidateGraphics();

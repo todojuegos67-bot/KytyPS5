@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 
 #include "common/assert.h"
@@ -19,6 +20,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 
+#include <cstring>
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -281,6 +284,43 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// gt7-replay-1119 (KYTY_REPLAY, replay.h): a draw's depth target description at its place, for
+// the same DB_* target registers (MakeDepthTargetDesc reads those and the device's formats,
+// fixed for a run). The image is still found and bound; the rest of the state is read as ever.
+namespace {
+struct ReplayDepth {
+	bool                    kept = false;
+	HW::DepthRenderTarget   z;
+	TextureCache::ImageDesc desc;
+};
+constexpr size_t ReplayDepthLimit = 1u << 14u;
+std::unordered_map<uint64_t, ReplayDepth>& ReplayDepths() {
+	thread_local std::unordered_map<uint64_t, ReplayDepth> depths;
+	return depths;
+}
+// KYTY_REPLAY=2: the first field in which two descriptions differ, or null.
+const char* DiffDepthDesc(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b) {
+	const auto& x = a.info;
+	const auto& y = b.info;
+	if (x.data.address != y.data.address || x.data.size != y.data.size ||
+	    x.stencil.address != y.stencil.address || x.stencil.size != y.stencil.size)
+		return "memoria";
+	if (x.pixel_format != y.pixel_format || x.guest_format != y.guest_format) return "formato";
+	if (x.type != y.type || x.extent != y.extent || x.resources != y.resources) return "extension";
+	if (x.pitch != y.pitch || x.bytes_per_block != y.bytes_per_block || x.samples != y.samples ||
+	    x.tile_mode != y.tile_mode || x.htile_clear_mask != y.htile_clear_mask)
+		return "disposicion";
+	if (x.mip_layout != y.mip_layout) return "mips";
+	if (x.metadata.kind != y.metadata.kind || x.metadata.range.address != y.metadata.range.address ||
+	    x.metadata.range.size != y.metadata.range.size || x.metadata.control != y.metadata.control ||
+	    x.metadata.clear_word != y.metadata.clear_word ||
+	    x.metadata.stencil_compressed != y.metadata.stencil_compressed)
+		return "metadatos";
+	if (!(a.view_info == b.view_info) || a.type != b.type) return "vista";
+	return nullptr;
+}
+} // namespace
+
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	r.unsupported            = false;
@@ -341,7 +381,38 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.unsupported = true;
 		return;
 	}
-	r.desc                    = MakeDepthTargetDesc(buffer, z);
+	// gt7-replay-1119 (KYTY_REPLAY): the description kept at this draw's place.
+	if (const auto draw = Replay::DrawKey(); draw != 0 && !Bisect::Active()) {
+		auto& depths = ReplayDepths();
+		if (depths.size() >= ReplayDepthLimit) {
+			depths.clear();
+			Replay::NoteDropped(Replay::Part::Depth);
+		}
+		auto&      kept = depths[Replay::PartKey(draw, 3u, 0u)];
+		const bool same = kept.kept && std::memcmp(&kept.z, &z, sizeof(z)) == 0;
+		if (same) {
+			Replay::NoteHit(Replay::Part::Depth);
+		} else {
+			Replay::NoteMiss(Replay::Part::Depth,
+			                 kept.kept ? Replay::Miss::Words : Replay::Miss::NoEntry);
+		}
+		if (same && Replay::Mode() == 1) {
+			r.desc = kept.desc;
+		} else {
+			r.desc = MakeDepthTargetDesc(buffer, z);
+			if (same) {
+				Replay::NoteVerified(Replay::Part::Depth, DiffDepthDesc(kept.desc, r.desc),
+				                     z.z_read_base_addr, 0);
+			} else {
+				std::memcpy(static_cast<void*>(&kept.z), &z, sizeof(z));
+				kept.desc = r.desc;
+				kept.kept = true;
+				Replay::NoteStored(Replay::Part::Depth);
+			}
+		}
+	} else {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
 	r.guest_array_layer       = r.desc.view_info.base_layer;
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_load_clear_enable = r.depth_clear_enable;

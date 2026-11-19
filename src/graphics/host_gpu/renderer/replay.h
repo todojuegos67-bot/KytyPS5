@@ -85,8 +85,10 @@ private:
 // `DrawKey` mixed with a part's own number (a stage's type, a target slot).
 [[nodiscard]] uint64_t PartKey(uint64_t draw_key, uint32_t kind, uint32_t index);
 
-// What a part of a draw found. Images and samplers are a stage's; targets are color targets.
-enum class Part : uint32_t { Image, Samplers, Target, Count };
+// What a part of a draw found. Images and samplers are a stage's; targets are color targets;
+// depth is the depth target's description; descriptors and constants are the draw's push of its
+// descriptor set and push constants, left out when the command buffer holds them already.
+enum class Part : uint32_t { Image, Samplers, Target, Depth, Descriptors, Constants, Count };
 enum class Miss : uint32_t {
 	Ineligible, // the stage or image cannot be kept (bindless, storage, diagnostics, ...)
 	NoEntry,    // nothing kept at this place

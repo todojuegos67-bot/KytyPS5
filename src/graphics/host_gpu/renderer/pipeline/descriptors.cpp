@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/replay.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
@@ -5233,16 +5234,95 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	// gt7-replay-1119 (KYTY_REPLAY): a draw's push constants and set 0 that the command buffer
+	// holds already (the draw before pushed the same with the same layout) are left out (=1) or
+	// counted (=2). The flattened writes: binding, type, count, then each info's handles,
+	// offsets and ranges.
+	DynamicStateShadow* const replay_shadow =
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && Replay::Mode() != 0 &&
+	            Replay::DrawKey() != 0
+	        ? vk_buffer.StateShadow()
+	        : nullptr;
+	const bool replay_leave_out = Replay::Mode() == 1;
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		bool same = false;
+		if (replay_shadow != nullptr) {
+			same = replay_shadow->replay_constants_valid &&
+			       replay_shadow->replay_constants_layout == pipeline.pipeline_layout &&
+			       replay_shadow->replay_constants_stages ==
+			           static_cast<uint32_t>(push_stages) &&
+			       replay_shadow->replay_constants == push_data.dwords;
+			if (same) {
+				Replay::NoteHit(Replay::Part::Constants);
+			} else {
+				Replay::NoteMiss(Replay::Part::Constants, Replay::Miss::Words);
+			}
+		}
+		if (!same || !replay_leave_out) {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
+			                        push_data.dwords.data());
+			if (replay_shadow != nullptr) {
+				replay_shadow->replay_constants_valid  = true;
+				replay_shadow->replay_constants_layout = pipeline.pipeline_layout;
+				replay_shadow->replay_constants_stages = static_cast<uint32_t>(push_stages);
+				replay_shadow->replay_constants        = push_data.dwords;
+			}
+		}
 	}
 
-	if (!ActivePtr()->descriptor_writes.empty()) {
+	thread_local std::vector<uint64_t> replay_words;
+	bool                               replay_same_set = false;
+	if (replay_shadow != nullptr && !ActivePtr()->descriptor_writes.empty()) {
+		replay_words.clear();
+		for (const auto& write: ActivePtr()->descriptor_writes) {
+			replay_words.push_back(static_cast<uint64_t>(write.dstBinding) |
+			                       static_cast<uint64_t>(write.descriptorType) << 32u);
+			replay_words.push_back(write.descriptorCount);
+			for (uint32_t k = 0; k < write.descriptorCount; k++) {
+				if (write.pImageInfo != nullptr) {
+					const auto& info = write.pImageInfo[k];
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkSampler>(info.sampler)));
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkImageView>(info.imageView)));
+					replay_words.push_back(static_cast<uint64_t>(info.imageLayout));
+				}
+				if (write.pBufferInfo != nullptr) {
+					const auto& info = write.pBufferInfo[k];
+					replay_words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkBuffer>(info.buffer)));
+					replay_words.push_back(info.offset);
+					replay_words.push_back(info.range);
+				}
+			}
+		}
+		replay_same_set = replay_shadow->replay_set_valid &&
+		                  replay_shadow->replay_set_layout == pipeline.pipeline_layout &&
+		                  replay_shadow->replay_set_words == replay_words;
+		if (replay_same_set) {
+			Replay::NoteHit(Replay::Part::Descriptors);
+		} else {
+			Replay::NoteMiss(Replay::Part::Descriptors, Replay::Miss::Words);
+		}
+	}
+	if (!ActivePtr()->descriptor_writes.empty() && replay_same_set && replay_leave_out) {
+		// The command buffer holds this set 0 already.
+	} else if (!ActivePtr()->descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		ScrubDeadDescriptorViews(ActivePtr()->descriptor_writes.data(),
 		                         static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),
 		                         "a draw's descriptors");
+		struct StoreSet {
+			DynamicStateShadow* shadow;
+			vk::PipelineLayout  layout;
+			~StoreSet() {
+				if (shadow != nullptr) {
+					shadow->replay_set_valid  = true;
+					shadow->replay_set_layout = layout;
+					shadow->replay_set_words.assign(replay_words.begin(), replay_words.end());
+				}
+			}
+		} const store_set {replay_shadow, pipeline.pipeline_layout};
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()),

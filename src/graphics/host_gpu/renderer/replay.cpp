@@ -244,17 +244,27 @@ uint64_t PartKey(uint64_t draw_key, uint32_t kind, uint32_t index) {
 	return (draw_key ^ ((static_cast<uint64_t>(kind) << 8u | index) + 1u) * Golden) | 1u;
 }
 
+// The parts of a draw's translation (the emission's push dedup is not one: its misses are
+// draws whose descriptors differ from the draw before, not translations done again).
+bool TranslationPart(Part part) {
+	return part < Part::Descriptors;
+}
+
 void NoteHit(Part part) {
 	g_counters.asked[static_cast<size_t>(part)]++;
 	g_counters.hits[static_cast<size_t>(part)]++;
-	t_parts++;
+	if (TranslationPart(part)) {
+		t_parts++;
+	}
 }
 
 void NoteMiss(Part part, Miss why) {
 	g_counters.asked[static_cast<size_t>(part)]++;
 	g_counters.misses[static_cast<size_t>(part)][static_cast<size_t>(why)]++;
-	t_parts++;
-	t_missed++;
+	if (TranslationPart(part)) {
+		t_parts++;
+		t_missed++;
+	}
 }
 
 void NoteVerified(Part part, const char* what, uint64_t shader_hash, uint32_t index) {
@@ -265,7 +275,8 @@ void NoteVerified(Part part, const char* what, uint64_t shader_hash, uint32_t in
 	g_counters.differences[static_cast<size_t>(part)]++;
 	static uint32_t logged = 0;
 	if (logged++ < 16) {
-		static constexpr std::array names {"imagen", "samplers", "target"};
+		static constexpr std::array names {"imagen",      "samplers",  "target",
+		                                   "profundidad", "descriptores", "constantes"};
 		Log::WriteUnmuted(fmt::format(
 		    "Replay verificador: diferencia en {} ({}) shader {:016x} indice {}\n",
 		    names[static_cast<size_t>(part)], what, shader_hash, index));
@@ -291,7 +302,8 @@ void Report(double seconds) {
 	const auto us_each = [](int64_t ticks, uint64_t n) {
 		return n != 0 ? static_cast<double>(ticks) / 1000.0 / static_cast<double>(n) : 0.0;
 	};
-	static constexpr std::array part_names {"imagenes", "samplers", "targets"};
+	static constexpr std::array part_names {"imagenes", "samplers",     "targets",
+	                                        "profundidad", "descriptores", "constantes"};
 	static constexpr std::array miss_names {"no apta",          "sin entrada",
 	                                        "otro programa",    "otras palabras/registros",
 	                                        "no guardable",     "memo de textura cambiado",
