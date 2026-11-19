@@ -1,21 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2026 bb-port contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bb-volfog (BB_VOLFOG=1..3): froxel volumetric fog. A camera-space grid (W x H screen tiles x D
-// radial slices, slice s at distance far * s^2) holds the medium; it is lit per froxel, filtered
-// over time, integrated front to back and applied to the game's HDR scene before the
-// post-process / upscaler / HUD. One source, one pass per VF_PASS:
-//   0 inject     (right before the game's deferred shadow-mask pass, while the 4096^2 cascade
-//                atlas is complete): moon visibility of every froxel from the game's own cascade
-//                shadow map -> vis (R16F 3D).
-//   1 light      (at the first draw that reads the HDR scene after the forward pass): density
-//                (height haze + ground mist + 3D noise advected by the wind), in-scattering from
-//                the moon (x vis, Henyey-Greenstein), ambient and the frame's point lights
-//                (lamps, fires, torches: the game's deferred light draws), blended with the
-//                reprojected previous frame -> scat (RGBA16F 3D: rgb sigma_s * L, a sigma_t).
-//   2 integrate  per column, front to back (energy-conserving step) -> integ (rgb in-scatter,
-//                a transmittance).
-//   3 apply      per HDR pixel: scene = scene * T + S at the pixel's distance (HDR_R11: the
-//                B10G11R11 target through an R32UI view, as bb_rt_post.comp).
+// bb-volfog (BB_VOLFOG=1..3): froxel volumetric light inside the game's own fog. A camera-space
+// grid (W x H screen tiles x D radial slices, slice s at distance far * s^2) is lit per froxel,
+// filtered over time, integrated front to back and added to the game's HDR scene before the
+// post-process / upscaler / HUD.
+// The medium is the game's distance fog itself (GXLightComposite: opacity
+// a1 = A - A * exp2(-(horizontal distance - start) * rate), FC_FogParam v2 = (A, start, rate),
+// colour v1): its density along a view ray is d a1 / dt. The game already applied that fog's
+// extinction and flat colour, so only light the game lacks is added: moon shafts (the game's
+// cascade shadow map) and lamp halos, tinted by the fog colour and attenuated by the fog between
+// the froxel and the camera. Where the game has no fog, an own thin haze / ground mist (its own
+// extinction) can carry the same light (levels 2 and 3).
+//   0 inject     before the shadow-mask pass: moon visibility per froxel -> vis (R16F 3D).
+//   1 light      in-scatter per froxel, temporal reprojection -> scat (rgb in-scatter
+//                coefficient x light, a own extinction).
+//   2 integrate  per column, 3x3 spatial filter, front to back -> integ (rgb added light,
+//                a own transmittance).
+//   3 apply      scene = scene * T + S (S capped against the scene's log-average luminance).
+//   4 measure    log-average luminance of the HDR scene before the fog (64 x 40 samples).
+// HDR_R11: the B10G11R11 target through an R32UI view, as bb_rt_post.comp.
 #version 460
 
 layout(std140, binding = 0) uniform Params {
@@ -23,27 +26,33 @@ layout(std140, binding = 0) uniform Params {
     mat4 inv_view;   // view -> world
     mat4 prev_view;  // world -> previous view
     mat4 prev_proj;  // previous view -> clip
-    mat4 shadow[4];  // world -> cascade i (homogeneous; x y = cascade coords, z = depth)
-    vec4 tile[4];    // cascade coords -> atlas uv: xy scale, zw offset
-    vec4 rmap;       // cascade coords -> unit square of that cascade (range test): xy scale, zw ofs
-    vec4 cdist;      // cascade select distances (view depth), x < 0: select by range only
+    mat4 shadow[4];  // world -> cascade i (homogeneous; x y atlas uv after tile, z depth)
+    vec4 tile[4];    // cascade output -> atlas uv: xy scale, zw offset
+    vec4 tbound[4];  // atlas uv bounds of cascade i: xy min, zw max
+    vec4 cdist;      // cascade select view depths 0->1, 1->2, 2->3, end (<= 0: none); x <= 0:
+                     // select by bounds only
     uvec4 grid;      // W, H, D, frame
     uvec4 sizes;     // HDR w, h, depth w, h
     vec4 cam;        // world camera position, volume end distance (m)
     vec4 moon_dir;   // world, toward the moon; w: 0 no moon, 1 unshadowed, 2 cascade shadows
     vec4 moon_col;   // rgb, w: Henyey-Greenstein g (moon)
-    vec4 amb_col;    // rgb ambient in-scatter, w: Henyey-Greenstein g (point lights)
-    vec4 fog;        // haze density (1/m), haze height falloff (m), mist density, mist height (m)
+    vec4 amb_col;    // rgb ambient (own medium only), w: Henyey-Greenstein g (point lights)
+    vec4 fog;        // own haze density (1/m), haze height falloff (m), mist density, mist height
     vec4 fog2;       // ground reference height (world y), noise amplitude, noise freq (1/m), time
     vec4 wind;       // world wind velocity (m/s), w: albedo
     vec4 misc;       // new-sample weight, history valid, y sign (+1: ndc.y = 1 - 2v), slice jitter
     vec4 misc2;      // scatter strength, debug view, light count, shadow compare (1: lit if z >= d)
-    vec4 misc3;      // shadow bias, point-light in-scatter scale, 0, 0
+    vec4 misc3;      // shadow bias, point-light scale, slice thickness factor (2 far / D), 0
+    vec4 gfog;       // game fog: amount A, rate (exp2 per m), start (m), weight (0: none)
+    vec4 gfog_col;   // moon light inside the game fog (its colour, luma-mixed), w: shaft scale
+    vec4 expo;       // S cap x scene log-avg luminance, light cap x luminance, froxel angle, 0
 } p;
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-const float Pi4 = 12.566370614;
+layout(std430, binding = 6) buffer Counters { uint n[16]; } cnt; // [0..2] inject, [8..9] measure
+
+const vec3 Luma = vec3(0.2126, 0.7152, 0.0722);
 
 uint Hash(uint x) {
     x ^= x >> 16; x *= 0x7feb352du;
@@ -52,11 +61,9 @@ uint Hash(uint x) {
     return x;
 }
 
-// Slice coordinate s (0..1) <-> distance along the view ray.
 float SliceDist(float s) { return p.cam.w * s * s; }
 
-// Per-froxel slice jitter (interleaved gradient noise rotated by the frame's golden-ratio step):
-// the temporal filter integrates it, so the slices do not show as bands.
+// Per-froxel slice jitter (interleaved gradient noise rotated by the frame's golden-ratio step).
 float Jitter(uvec2 xy) {
     float ign = fract(52.9829189 * fract(0.06711056 * float(xy.x) + 0.00583715 * float(xy.y)));
     return fract(ign + p.misc.w);
@@ -69,18 +76,30 @@ vec3 ViewRay(vec2 uv) {
     return normalize(v.xyz / v.w);
 }
 
-// Froxel (integer cell) -> view-space ray, jittered distance.
 void Froxel(uvec3 c, out vec3 vdir, out float t) {
     vec2 uv = (vec2(c.xy) + 0.5) / vec2(p.grid.xy);
     vdir = ViewRay(uv);
     t = SliceDist((float(c.z) + Jitter(c.xy)) / float(p.grid.z));
 }
 
+// Scene log-average luminance measured this frame (pass 4), 0.02 when not measured.
+float SceneLum() {
+    float n = float(cnt.n[9]);
+    return n > 0.0 ? exp2(float(int(cnt.n[8])) / (256.0 * n)) : 0.02;
+}
+
+// The game's distance fog density along a view ray (d a1 / dt): h = horizontal share of the ray.
+float GameSigma(float t, float h) {
+    if (p.gfog.w <= 0.0) return 0.0;
+    float dh = t * h - p.gfog.z;
+    if (dh <= 0.0) return 0.0;
+    return p.gfog.w * p.gfog.x * p.gfog.y * 0.6931472 * h * exp2(-dh * p.gfog.y);
+}
+
 #if VF_PASS == 0
 // ---------------------------------------------------------------- inject: moon visibility
-layout(binding = 1) uniform sampler2D atlas;            // the game's cascade shadow atlas
+layout(binding = 1) uniform sampler2D atlas;
 layout(binding = 2, r16f) uniform writeonly image3D vis;
-layout(std430, binding = 6) buffer Counters { uint n[16]; } cnt; // [0] tested, [1] lit, [2] out
 
 float Lit(float d, float z) {
     return p.misc2.w > 0.5 ? (z >= d - p.misc3.x ? 1.0 : 0.0) : (z <= d + p.misc3.x ? 1.0 : 0.0);
@@ -88,37 +107,38 @@ float Lit(float d, float z) {
 
 float CascadeVis(vec3 w, float vdepth, out bool tested) {
     tested = false;
+    const bool by_dist = p.cdist.x > 0.0;
+    if (by_dist && p.cdist.w > 0.0 && vdepth >= p.cdist.w) {
+        return 1.0;
+    }
     for (int i = 0; i < 4; ++i) {
-        if (p.cdist.x > 0.0 && !(vdepth < p.cdist[i])) {
+        if (by_dist && i < 3 && !(vdepth < p.cdist[i])) {
             continue;
         }
         vec4 s = p.shadow[i] * vec4(w, 1.0);
-        if (abs(s.w) < 1e-8) {
-            return 1.0;
-        }
+        if (abs(s.w) < 1e-8) return 1.0;
         s.xyz /= s.w;
-        vec2 unit = s.xy * p.rmap.xy + p.rmap.zw;
-        bool inside = all(greaterThanEqual(unit, vec2(0.0))) && all(lessThanEqual(unit, vec2(1.0)));
-        if (!inside || s.z < -0.01 || s.z > 1.01) {
-            if (p.cdist.x > 0.0) {
-                return 1.0; // the selected cascade does not cover it: unshadowed, as the game
-            }
+        vec2 uv = s.xy * p.tile[i].xy + p.tile[i].zw;
+        bool inside = all(greaterThanEqual(uv, p.tbound[i].xy)) &&
+                      all(lessThanEqual(uv, p.tbound[i].zw)) && s.z >= -0.01 && s.z <= 1.01;
+        if (!inside) {
+            if (by_dist) return 1.0; // outside the selected cascade: unshadowed, as the game
             continue;
         }
         tested = true;
-        // 2x2 bilinear PCF of the binary test (smooth shaft edges at froxel scale).
         vec2 ts = vec2(textureSize(atlas, 0));
-        vec2 f = (s.xy * p.tile[i].xy + p.tile[i].zw) * ts - 0.5;
+        vec2 lo = p.tbound[i].xy * ts, hi = p.tbound[i].zw * ts - 1.0;
+        vec2 f = uv * ts - 0.5;
         ivec2 i0 = ivec2(floor(f));
         vec2 fr = f - vec2(i0);
-        ivec2 mx = ivec2(ts) - 1;
-        float a = Lit(texelFetch(atlas, clamp(i0, ivec2(0), mx), 0).r, s.z);
-        float b = Lit(texelFetch(atlas, clamp(i0 + ivec2(1, 0), ivec2(0), mx), 0).r, s.z);
-        float c = Lit(texelFetch(atlas, clamp(i0 + ivec2(0, 1), ivec2(0), mx), 0).r, s.z);
-        float d = Lit(texelFetch(atlas, clamp(i0 + ivec2(1, 1), ivec2(0), mx), 0).r, s.z);
+        ivec2 a0 = ivec2(clamp(vec2(i0), lo, hi)), a1 = ivec2(clamp(vec2(i0 + 1), lo, hi));
+        float a = Lit(texelFetch(atlas, ivec2(a0.x, a0.y), 0).r, s.z);
+        float b = Lit(texelFetch(atlas, ivec2(a1.x, a0.y), 0).r, s.z);
+        float c = Lit(texelFetch(atlas, ivec2(a0.x, a1.y), 0).r, s.z);
+        float d = Lit(texelFetch(atlas, ivec2(a1.x, a1.y), 0).r, s.z);
         return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
     }
-    return 1.0; // beyond the last cascade: unshadowed, as the game
+    return 1.0;
 }
 
 shared uint s_n[3];
@@ -154,8 +174,8 @@ layout(binding = 3) uniform sampler3D vis_tex;  // nearest
 layout(binding = 4) uniform sampler3D hist_tex; // previous scat, linear
 layout(binding = 5, rgba16f) uniform writeonly image3D scat;
 struct Light {
-    vec4 pos_r;  // world position, radius
-    vec4 col;    // diffuse colour (the game's), 0
+    vec4 pos_r; // world position, radius
+    vec4 col;   // diffuse colour (the game's), 0
 };
 layout(std430, binding = 7) readonly buffer Lights { Light l[]; } lights;
 
@@ -174,21 +194,22 @@ float VNoise(vec3 x) {
     return mix(mix(a, b, f.y), mix(c, d, f.y), f.z);
 }
 
-// Medium density (1/m) at a world point: exponential height haze + low ground mist, both above a
-// ground reference that follows the camera, broken up by two octaves of value noise carried by
-// the wind (the finer octave drifts at another speed, so the mist clumps and flows).
-float Density(vec3 w) {
-    float h = max(w.y - p.fog2.x, 0.0);
-    float haze = p.fog.x * exp(-h / max(p.fog.y, 0.1));
-    float mist = p.fog.z * exp(-h / max(p.fog.w, 0.05));
+// Wind-advected noise (two octaves at different speeds: clumping, flowing wisps), 0..1.
+float Noise(vec3 w) {
     float tm = p.fog2.w;
     vec3 q = (w - p.wind.xyz * tm) * p.fog2.z;
     vec3 q2 = (w - p.wind.xyz * (tm * 1.6) + vec3(0.0, 0.08 * tm, 0.0)) * (p.fog2.z * 2.7);
-    float n = 0.62 * VNoise(q) + 0.38 * VNoise(q2 + vec3(11.7, 3.9, 7.3));
+    return 0.62 * VNoise(q) + 0.38 * VNoise(q2 + vec3(11.7, 3.9, 7.3));
+}
+
+// Own medium (where the game has no fog): height haze + low ground mist, noise-modulated.
+float OwnSigma(vec3 w, float n) {
+    float h = max(w.y - p.fog2.x, 0.0);
+    float haze = p.fog.x * exp(-h / max(p.fog.y, 0.1));
+    float mist = p.fog.z * exp(-h / max(p.fog.w, 0.05));
     float a = p.fog2.y;
-    float haze_m = max(1.0 + a * (2.0 * n - 1.0) * 1.2, 0.0);
-    float mist_m = mix(1.0, 2.0 * smoothstep(0.3, 0.7, n), a); // wisps: clumped mist
-    return haze * haze_m + mist * mist_m;
+    return haze * max(1.0 + a * (2.0 * n - 1.0), 0.0) +
+           mist * mix(1.0, 2.0 * smoothstep(0.3, 0.7, n), a);
 }
 
 float HG(float g, float ct) {
@@ -203,30 +224,49 @@ void main() {
     float t;
     Froxel(c, vdir, t);
     vec3 w = (p.inv_view * vec4(vdir * t, 1.0)).xyz;
-    vec3 wdir = normalize(w - p.cam.xyz); // view ray in world space (camera -> point)
-    float sigma_t = Density(w);
-    vec3 L = p.amb_col.rgb;
-    if (p.moon_dir.w > 0.5) {
-        float v = p.moon_dir.w > 1.5 ? texelFetch(vis_tex, ivec3(c), 0).r : 1.0;
-        L += p.moon_col.rgb * (v * HG(p.moon_col.w, dot(wdir, p.moon_dir.xyz)));
+    vec3 wdir = normalize(w - p.cam.xyz);
+    int dbg = int(p.misc2.y);
+    float n = Noise(w);
+    float sig_o = OwnSigma(w, n);
+    // The game's fog density, its wisps broken up by the same noise (mean preserved).
+    float sig_g = GameSigma(t, length(wdir.xz)) * max(1.0 + p.fog2.y * (2.0 * n - 1.0), 0.0);
+    float Ls = SceneLum();
+
+    // Moon: in the own medium with the moon's colour; inside the game's fog only with the cascade
+    // shadows (shafts, nothing flat on top of the game's own fog colour) and in the game fog's
+    // own radiance units (its colour, luma-mixed as GXLightComposite does).
+    vec3 Lm = vec3(0.0), Lmg = vec3(0.0);
+    if (p.moon_dir.w > 0.5 && dbg != 4) {
+        float shadowed = p.moon_dir.w > 1.5 ? 1.0 : 0.0;
+        float v = shadowed > 0.0 ? texelFetch(vis_tex, ivec3(c), 0).r : 1.0;
+        float ph = v * HG(p.moon_col.w, dot(wdir, p.moon_dir.xyz));
+        Lm = p.moon_col.rgb * ph;
+        Lmg = p.gfog_col.rgb * (p.gfog_col.w * ph * shadowed);
     }
+    // Point lights: halos only. The game's falloff max(0, 1/d^2 - 1/r^2) (0 at the radius),
+    // its near field spread over the froxel's own size (no hot froxel next to a small light),
+    // windowed, and the sum capped against the scene's luminance.
+    vec3 Ll = vec3(0.0);
     int nl = int(p.misc2.z);
+    float fsz = max(t * p.expo.z, p.misc3.z * sqrt(t / p.cam.w));
+    float rs2 = max(0.25, 0.25 * fsz * fsz);
     for (int i = 0; i < nl; ++i) {
         vec4 pr = lights.l[i].pos_r;
         vec3 d = pr.xyz - w;
         float d2 = dot(d, d);
         float r2 = pr.w * pr.w;
         if (d2 >= r2) continue;
-        // The game's falloff max(0, 1/d^2 - 1/r^2) (GXLightAcc point light), its near-field
-        // spike clamped (a froxel is not a surface) and a smooth window at the radius.
-        float win = 1.0 - d2 / r2;
-        float att = max(1.0 / max(d2, 0.5) - 1.0 / r2, 0.0) * win;
-        L += lights.l[i].col.rgb *
-             (att * p.misc3.y * HG(p.amb_col.w, dot(wdir, d * inversesqrt(max(d2, 1e-6)))));
+        float att = max(1.0 / (d2 + rs2) - 1.0 / (r2 + rs2), 0.0) * (1.0 - d2 / r2);
+        Ll += lights.l[i].col.rgb * (att * HG(p.amb_col.w, dot(wdir, d * inversesqrt(max(d2, 1e-6)))));
     }
-    float albedo = p.wind.w;
-    vec4 cur = vec4(L * (sigma_t * albedo * p.misc2.x), sigma_t);
-    // Temporal: the same world point in the previous frame's grid.
+    Ll *= p.misc3.y;
+    float ll = dot(Ll, Luma), cap = p.expo.y * Ls;
+    if (ll > cap) Ll *= cap / ll;
+    if (dbg == 5) Ll = vec3(0.0);
+
+    vec3 game = sig_g * (Lmg + Ll);
+    vec3 own = sig_o * (Lm + Ll + (dbg == 4 ? vec3(0.0) : p.amb_col.rgb));
+    vec4 cur = vec4((game + own) * (p.wind.w * p.misc2.x), sig_o);
     if (p.misc.y > 0.5) {
         vec3 pv = (p.prev_view * vec4(w, 1.0)).xyz;
         vec4 clip = p.prev_proj * vec4(pv, 1.0);
@@ -253,30 +293,45 @@ layout(binding = 8) uniform sampler3D scat_tex; // nearest
 layout(binding = 9, rgba16f) uniform writeonly image3D integ;
 
 void main() {
-    uvec2 c = gl_GlobalInvocationID.xy;
-    if (any(greaterThanEqual(c, p.grid.xy))) return;
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(c), p.grid.xy))) return;
+    vec3 wdir = normalize((p.inv_view * vec4(ViewRay((vec2(c) + 0.5) / vec2(p.grid.xy)), 0.0)).xyz);
+    float hfrac = length(wdir.xz);
+    ivec2 mx = ivec2(p.grid.xy) - 1;
     vec3 acc = vec3(0.0);
-    float T = 1.0;
-    float prev_t = 0.0;
+    float Tall = 1.0, Town = 1.0, prev_t = 0.0;
     int D = int(p.grid.z);
     for (int k = 0; k < D; ++k) {
         float t1 = SliceDist(float(k + 1) / float(D));
         float dt = t1 - prev_t;
+        float tm = 0.5 * (t1 + prev_t);
         prev_t = t1;
-        vec4 s = texelFetch(scat_tex, ivec3(ivec2(c), k), 0);
-        float st = max(s.a, 1e-7);
+        // 3x3 tent filter in the slice: no froxel-sized blocks / dots.
+        vec4 s = vec4(0.0);
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                float wgt = float((2 - abs(x)) * (2 - abs(y)));
+                s += wgt * texelFetch(scat_tex, ivec3(clamp(c + ivec2(x, y), ivec2(0), mx), k), 0);
+            }
+        }
+        s /= 16.0;
+        float so = max(s.a, 0.0);
+        float st = max(so + GameSigma(tm, hfrac), 1e-7);
         float tr = exp(-st * dt);
-        // Energy-conserving step (Hillaire 2015): in-scatter integrated over the slice.
-        acc += T * (s.rgb * (1.0 - tr) / st);
-        T *= tr;
-        imageStore(integ, ivec3(ivec2(c), k), vec4(acc, T));
+        acc += Tall * (s.rgb * (1.0 - tr) / st);
+        Tall *= tr;
+        Town *= exp(-so * dt);
+        imageStore(integ, ivec3(c, k), vec4(acc, Town));
     }
 }
 
-#else
+#elif VF_PASS == 3
 // ---------------------------------------------------------------- apply
-layout(binding = 10) uniform sampler2D depth_tex; // scene depth (device z), nearest
-layout(binding = 11) uniform sampler3D integ_tex; // linear
+layout(binding = 10) uniform sampler2D depth_tex;
+layout(binding = 11) uniform sampler3D integ_tex;
+#endif
+
+#if VF_PASS >= 3
 #ifdef HDR_R11
 layout(binding = 12, r32ui) uniform uimage2D hdr;
 vec3 UnpackR11(uint v) {
@@ -300,7 +355,9 @@ layout(binding = 12, rgba16f) uniform image2D hdr;
 vec3 LoadHdr(ivec2 c) { return imageLoad(hdr, c).rgb; }
 void StoreHdr(ivec2 c, vec3 v) { imageStore(hdr, c, vec4(v, imageLoad(hdr, c).a)); }
 #endif
+#endif
 
+#if VF_PASS == 3
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(uvec2(c), p.sizes.xy))) return;
@@ -313,14 +370,43 @@ void main() {
     if (isnan(dist) || isinf(dist)) dist = p.cam.w;
     float s = sqrt(clamp(dist / p.cam.w, 0.0, 1.0));
     float D = float(p.grid.z);
-    // integ slice k holds the medium up to the far end of slice k: texel centre (k + 0.5) / D.
     vec4 f = textureLod(integ_tex, vec3(uv, s - 0.5 / D), 0.0);
     if (any(isnan(f)) || any(isinf(f))) return;
-    vec3 S = clamp(f.rgb, vec3(0.0), vec3(64.0));
+    vec3 S = max(f.rgb, vec3(0.0));
+    // The added light never exceeds a fraction of the scene's own brightness: no whiteout.
+    float sl = dot(S, Luma), cap = p.expo.x * SceneLum();
+    if (sl > cap) S *= cap / sl;
     float T = clamp(f.a, 0.0, 1.0);
     vec3 col = LoadHdr(c);
     int dbg = int(p.misc2.y);
-    vec3 o = dbg == 1 ? S : dbg == 3 ? vec3(T) : col * T + S;
+    vec3 o = (dbg == 1 || dbg == 4 || dbg == 5) ? S : dbg == 3 ? vec3(T) : col * T + S;
     StoreHdr(c, o);
+}
+
+#elif VF_PASS == 4
+// ---------------------------------------------------------------- measure (before the apply)
+shared int s_sum;
+shared uint s_cnt;
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        s_sum = 0;
+        s_cnt = 0u;
+    }
+    barrier();
+    uvec2 g = gl_GlobalInvocationID.xy; // 64 x 40 samples
+    if (g.x < 64u && g.y < 40u) {
+        ivec2 px = ivec2((vec2(g) + 0.5) / vec2(64.0, 40.0) * vec2(p.sizes.xy));
+        vec3 col = LoadHdr(px);
+        float l = dot(col, Luma);
+        if (!isnan(l) && !isinf(l)) {
+            atomicAdd(s_sum, int(round(clamp(log2(max(l, 1e-4)), -14.0, 8.0) * 256.0)));
+            atomicAdd(s_cnt, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        atomicAdd(cnt.n[8], uint(s_sum));
+        atomicAdd(cnt.n[9], s_cnt);
+    }
 }
 #endif

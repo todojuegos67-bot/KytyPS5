@@ -2011,11 +2011,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // 84 B of data) constant buffers, layouts from Ghidra (FUN_026deeb0,
                 // FUN_02651f10); bound to the forward-lit object draws (any VS / PS). Collected
                 // for the whole draw, see OnDrawConstants (after the stage loop).
-                // bb-volfog alone: only the light-set CB sizes and the point-light draws' PS.
+                // bb-volfog alone: the light-set CB sizes, the point-light draws' PS and the PS
+                // buffers that can hold the fog CB (FUN_02651f10, 224 B V# in the logs).
                 const bool vf_want =
                     bb_volfog && ((size >= 288 && size <= 320) ||
                                   (stage.sw_stage == Shader::SwStage::Fragment &&
-                                   BB::VolFog::IsPointLightPs(stage.pgm_hash)));
+                                   ((size >= 84 && size <= 256) ||
+                                    BB::VolFog::IsPointLightPs(stage.pgm_hash))));
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
                     !desc.is_written && size >= 64 && size <= (bb_volfog ? 2048u : 1024u) &&

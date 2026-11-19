@@ -120,6 +120,9 @@ private:
     float haze = 0.008f, haze_h = 30.0f, mist = 0.04f, mist_h = 1.2f, noise_amp = 0.6f,
           noise_freq = 0.12f, scatter = 0.8f, albedo = 0.85f, g_moon = 0.6f, g_lights = 0.3f,
           temporal = 0.12f, ground_below = 1.8f, unshadowed_moon = 0.35f, lights_scale = 3.0f;
+    float shaft_scale = 1.0f, cap_rel = 0.25f, light_cap_rel = 3.0f, light_max_r = 12.0f,
+          game_fog_mul = 1.0f;
+    bool lights_all = false;
     float wind[3]{0.55f, 0.0f, 0.25f};
     const char* wind_src = "default (no game wind decoded: fixed 0.6 m/s drift)";
     int shadow_cmp_env = -1; // BB_VOLFOG_SHADOW_CMP
@@ -129,7 +132,7 @@ private:
     vk::Sampler nearest{}, linear{};
     vk::DescriptorSetLayout set_layout{};
     vk::PipelineLayout layout{};
-    std::array<vk::Pipeline, 5> pipes{}; // inject, light, integrate, apply, apply (B10G11R11)
+    std::array<vk::Pipeline, 7> pipes{}; // inject, light, integrate, apply, apply R11, measure x2
     Img vis;
     std::array<Img, 2> scat;
     Img integ;
@@ -166,6 +169,7 @@ private:
     float shadow_w2s[4][16]{};
     float tile[4][4]{};
     float rmap[4]{1.0f, 1.0f, 0.0f, 0.0f};
+    float tbound[4][4]{};
     float cdist[4]{};
     int shadow_cmp = 0;
     bool moon_from_casc = false;
@@ -193,6 +197,29 @@ private:
         float lum;
     };
     std::vector<Light> acc_lights, frame_lights;
+    u32 acc_rej_big = 0, acc_rej_cold = 0, frame_rej_big = 0, frame_rej_cold = 0;
+    // The game's fog (FUN_02651f10 CB of the forward-lit draws): the most used set with fog of
+    // this frame, held while frames show none (sky / effects bind a fog-off set).
+    struct GameFogSet {
+        float amount = 0.0f, rate = 0.0f, start = 0.0f, inv_h = 0.0f;
+        float col[3]{};
+        float mix = 0.0f;
+        float h_amount = 0.0f, h_base = 0.0f, h_scale = 0.0f;
+        u32 count = 0;
+    };
+    std::vector<GameFogSet> acc_fog;
+    u32 acc_fog_off = 0, acc_fog_cbs = 0;
+    GameFogSet game_fog{};
+    bool game_fog_have = false;
+    std::chrono::steady_clock::time_point game_fog_seen{};
+    float game_fog_weight = 0.0f;
+    u32 frame_fog_sets = 0, frame_fog_off = 0, frame_fog_cbs = 0;
+    u64 n_fog_frames = 0, n_nofog_frames = 0;
+    // Scene log-average luminance (measure pass), read back a few applies later for the log.
+    std::array<u32, 4> app_slot_hist{}, inj_slot_hist{};
+    u32 inj_hist_pos = 0;
+    u32 app_hist_pos = 0;
+    float scene_lum_log = 0.0f;
     u32 acc_draws = 0, frame_draws = 0, acc_parsed = 0, frame_parsed = 0;
     u32 acc_cam_cb = 0, frame_cam_cb = 0;
 

@@ -30,6 +30,8 @@
 #include "video_core/host_shaders/bb_volfog_inject_comp.h"
 #include "video_core/host_shaders/bb_volfog_integrate_comp.h"
 #include "video_core/host_shaders/bb_volfog_light_comp.h"
+#include "video_core/host_shaders/bb_volfog_measure_comp.h"
+#include "video_core/host_shaders/bb_volfog_measure_r11_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -114,7 +116,7 @@ struct alignas(16) VfParams {
     float prev_proj[16];
     float shadow[4][16];
     float tile[4][4];
-    float rmap[4];
+    float tbound[4][4];
     float cdist[4];
     u32 grid[4];
     u32 sizes[4];
@@ -128,6 +130,9 @@ struct alignas(16) VfParams {
     float misc[4];
     float misc2[4];
     float misc3[4];
+    float gfog[4];
+    float gfog_col[4];
+    float expo[4];
 };
 static_assert(sizeof(VfParams) <= 1024);
 
@@ -177,22 +182,40 @@ const PointShader* FindPointShader(u64 hash) {
 
 std::atomic<int> g_debug{-1};
 int DebugEnv() {
-    static const int v = int(EnvFloat("BB_VOLFOG_DEBUG", 0.0f, 0.0f, 3.0f));
+    static const int v = int(EnvFloat("BB_VOLFOG_DEBUG", 0.0f, 0.0f, 5.0f));
     return v;
 }
 
 // Starting values (HIPOTESIS: not tuned against the game's look yet; every one has an override).
+// haze / mist: own medium, only where the game has no fog of its own; shaft: moon light inside
+// the game's fog; cap: added light <= cap x the scene's log-average luminance; lcap: point-light
+// light at a froxel <= lcap x that luminance.
 struct Preset {
     const char* name;
     u32 w, h, d;
-    float haze, mist, noise, scatter, lights;
+    float haze, mist, noise, scatter, lights, shaft, cap, lcap;
 };
 constexpr std::array<Preset, 4> Presets{{
-    {"off", 0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
-    {"sutil", 128, 72, 64, 0.004f, 0.020f, 0.50f, 0.65f, 2.0f},
-    {"normal", 160, 90, 64, 0.008f, 0.040f, 0.60f, 0.85f, 3.0f},
-    {"denso", 160, 90, 80, 0.016f, 0.080f, 0.70f, 1.00f, 4.0f},
+    {"off", 0, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {"sutil", 128, 72, 64, 0.0f, 0.0f, 0.40f, 1.0f, 0.30f, 0.6f, 0.15f, 2.0f},
+    {"normal", 160, 90, 64, 0.0012f, 0.004f, 0.50f, 1.0f, 0.50f, 1.0f, 0.25f, 3.0f},
+    {"denso", 160, 90, 80, 0.0025f, 0.010f, 0.60f, 1.0f, 0.80f, 1.5f, 0.40f, 4.0f},
 }};
+
+// FUN_02651f10's fog CB (slot 6 of the forward-lit draws; layout in bb_upscale.h): v2.x / .z / .w
+// and v4.w are register copies of v0.x / .y / .w and v1.w.
+bool IsFogCb(const u32* d, size_t bytes) {
+    if (bytes < 84 || d[8] != d[0] || d[10] != d[1] || d[11] != d[3] || d[19] != d[7])
+        return false;
+    const float* f = reinterpret_cast<const float*>(d);
+    if (!(std::fabs(f[3]) <= 10.001f) || f[3] == 0.0f)
+        return false;
+    for (int i : {0, 1, 4, 5, 6, 7, 9}) {
+        if (!std::isfinite(f[i]) || (i != 9 && f[i] < 0.0f))
+            return false;
+    }
+    return true;
+}
 
 constexpr vk::MemoryBarrier2 AllBefore{
     .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -262,12 +285,14 @@ void VolFogCycleDebug() {
     int v = g_debug.load();
     if (v < 0)
         v = DebugEnv();
-    v = (v + 1) % 4;
+    v = (v + 1) % 6;
     g_debug.store(v);
     LOG_INFO(Render_Vulkan, "[volfog] Shift+F7 debug view: {}",
              v == 1   ? "1 fog only (in-scattered light)"
              : v == 2 ? "2 fog off (A/B)"
              : v == 3 ? "3 transmittance (white = clear)"
+             : v == 4 ? "4 point lights only (added light)"
+             : v == 5 ? "5 moon only (added light, no point lights)"
                       : "off (fog applied)");
 }
 
@@ -410,6 +435,13 @@ bool VolFog::Init() {
     noise_amp = pr.noise;
     scatter = pr.scatter * EnvFloat("BB_VOLFOG_STRENGTH", 1.0f, 0.0f, 10.0f);
     lights_scale = pr.lights * EnvFloat("BB_VOLFOG_LIGHTS", 1.0f, 0.0f, 20.0f);
+    shaft_scale = pr.shaft * EnvFloat("BB_VOLFOG_SHAFTS", 1.0f, 0.0f, 10.0f);
+    cap_rel = EnvFloat("BB_VOLFOG_CAP", pr.cap, 0.0f, 10.0f);
+    light_cap_rel = EnvFloat("BB_VOLFOG_LIGHT_CAP", pr.lcap, 0.0f, 100.0f);
+    light_max_r = EnvFloat("BB_VOLFOG_LIGHT_MAXR", 12.0f, 0.5f, 200.0f);
+    if (const char* e = std::getenv("BB_VOLFOG_LIGHTS_ALL"); e && e[0] == '1')
+        lights_all = true;
+    game_fog_mul = EnvFloat("BB_VOLFOG_GAMEFOG_SCALE", 1.0f, 0.0f, 10.0f);
     g_moon = EnvFloat("BB_VOLFOG_G", 0.5f, 0.0f, 0.9f);
     mist_h = EnvFloat("BB_VOLFOG_MIST_HEIGHT", 1.2f, 0.1f, 20.0f);
     haze_h = EnvFloat("BB_VOLFOG_HAZE_HEIGHT", 30.0f, 1.0f, 1000.0f);
@@ -531,18 +563,22 @@ bool VolFog::Init() {
         queries = qp;
     ok = true;
     const double mb = double(gw) * gh * gd * (2.0 + 8.0 * 3.0) / (1024.0 * 1024.0);
-    LOG_INFO(Render_Vulkan,
-             "[volfog] BB_VOLFOG={} ({}): froxels {}x{}x{} to {:.0f} m ({:.1f} MB), haze {:.4f}/m "
-             "(H {:.0f} m), ground mist {:.4f}/m (h {:.1f} m, {:.1f} m below the camera), noise "
-             "{:.2f}, scatter x{:.2f}, point lights x{:.1f}, moon HG g {:.2f}, wind ({:.2f}, "
-             "{:.2f}, {:.2f}) m/s [{}], game fog CB tint {}, "
-             "debug {} (Shift+F7 cycles){}",
-             level, level_name, gw, gh, gd, far_dist, mb, haze, haze_h, mist, mist_h, ground_below,
-             noise_amp, scatter, lights_scale, g_moon, wind[0], wind[1], wind[2], wind_src,
-             game_fog_tint ? "on" : "off", DebugEnv(),
-             std::getenv("BB_VOLFOG_WISPS") && std::getenv("BB_VOLFOG_WISPS")[0] == '1'
-                 ? "; BB_VOLFOG_WISPS=1 ignored (sprite-to-puff not implemented)"
-                 : "");
+    LOG_INFO(
+        Render_Vulkan,
+        "[volfog] BB_VOLFOG={} ({}): froxels {}x{}x{} to {:.0f} m ({:.1f} MB); medium = the "
+        "game's own distance fog (FUN_02651f10 CB) x{:.2f}, moon shafts in it x{:.2f}; own "
+        "haze where the game has none {:.4f}/m (H {:.0f} m), ground mist {:.4f}/m (h {:.1f} "
+        "m, {:.1f} m below the camera); noise {:.2f}, scatter x{:.2f}, added light cap x{:.2f} "
+        "scene log-avg luminance, point lights (lamp-like, radius <= {:.0f} m{}) x{:.2f} "
+        "capped x{:.1f}, moon HG g {:.2f}, wind ({:.2f}, {:.2f}, {:.2f}) m/s [{}], game fog "
+        "tint {}, debug {} (Shift+F7 cycles){}",
+        level, level_name, gw, gh, gd, far_dist, mb, game_fog_mul, shaft_scale, haze, haze_h, mist,
+        mist_h, ground_below, noise_amp, scatter, cap_rel, light_max_r,
+        lights_all ? ", BB_VOLFOG_LIGHTS_ALL: all" : "", lights_scale, light_cap_rel, g_moon,
+        wind[0], wind[1], wind[2], wind_src, game_fog_tint ? "on" : "off", DebugEnv(),
+        std::getenv("BB_VOLFOG_WISPS") && std::getenv("BB_VOLFOG_WISPS")[0] == '1'
+            ? "; BB_VOLFOG_WISPS=1 ignored (sprite-to-puff not implemented)"
+            : "");
     return true;
 }
 
@@ -568,40 +604,41 @@ bool VolFog::Camera() {
 }
 
 // FC_ProjSpaceToShadowMatrix[4] (scene block floats 112..175) and FC_CascadeSelectDist (176..179),
-// from the path-tracing mod's reflection of the game's shaders. Neither the input space nor the
-// atlas layout is documented, so every inject checks the candidates on sample points of this
-// frame's view frustum: input = projection space (matrix x proj x view) or view space, rows or
-// columns; output = cascade uv in [0,1] or shadow NDC in [-1,1]. The right one maps the points of
-// every cascade's distance range inside that cascade, and with projection-space input the product
-// with proj x view must be affine (an orthographic light): both are checked. The cascade tiles in
-// the atlas: if each cascade covers at most a quarter of [0,1]^2 the matrices include the atlas
-// offset; otherwise a 2x2 quadrant layout is assumed (logged as HIPOTESIS).
+// from the path-tracing mod's reflection of the game's shaders. Checked offline on a scene block
+// of this port's own log (run_native1, BB_RT_VOLUMETRIC block dump): matrix rows x the camera's
+// clip position give atlas uv with the 2x2 quadrant offsets included (cascade 0 top-left, 1
+// top-right, 2 bottom-left, 3 bottom-right), the product with proj x view is affine, and
+// FC_CascadeSelectDist holds THREE transition distances (x, y, z; w = 0): cascade 3 covers
+// everything beyond z. Light direction = null space of the matrix rows 0/1 (that block: (0,
+// 0.707, -0.707), equal to scene block floats 80-82). The resolver still tries every convention
+// on sample points of this frame's frustum, scores each, and keeps the last good one when a frame
+// scores lower (sticky), so a passing outlier never drops the shadows.
 void VolFog::ResolveCascades() {
     casc_ok = false;
     moon_from_casc = false;
     const float* M = block + 112;
     const float* cd = block + 176;
-    casc_dist_ok = true;
-    for (int i = 0; i < 4; ++i) {
-        casc_dist_ok = casc_dist_ok && std::isfinite(cd[i]) && cd[i] > 0.05f && cd[i] < 1e5f &&
-                       (i == 0 || cd[i] > cd[i - 1]);
-    }
     for (int i = 0; i < 64; ++i) {
         if (!std::isfinite(M[i])) {
             casc_why = "FC_ProjSpaceToShadowMatrix not finite";
             return;
         }
     }
+    casc_dist_ok = std::isfinite(cd[0]) && std::isfinite(cd[1]) && std::isfinite(cd[2]) &&
+                   cd[0] > 0.05f && cd[1] > cd[0] && cd[2] > cd[1] && cd[2] < 1e5f;
+    const bool cd_end = casc_dist_ok && std::isfinite(cd[3]) && cd[3] > cd[2];
     double lo[4], hi[4];
     if (casc_dist_ok) {
-        for (int i = 0; i < 4; ++i) {
-            lo[i] = i == 0 ? 0.5 : cd[i - 1];
-            hi[i] = std::min<double>(cd[i], 400.0);
-            if (hi[i] <= lo[i])
-                hi[i] = lo[i] + 1.0;
+        lo[0] = 0.3;
+        hi[0] = cd[0];
+        for (int i = 1; i < 3; ++i) {
+            lo[i] = cd[i - 1];
+            hi[i] = cd[i];
         }
+        lo[3] = cd[2];
+        hi[3] = cd_end ? cd[3] : cd[2] * 1.4;
     } else {
-        const double l[4] = {0.5, 4, 12, 35}, h[4] = {4, 12, 35, 100};
+        const double l[4] = {0.3, 3, 8, 20}, h[4] = {3, 8, 20, 30};
         std::copy(l, l + 4, lo);
         std::copy(h, h + 4, hi);
     }
@@ -612,7 +649,7 @@ void VolFog::ResolveCascades() {
     std::vector<Pt> pts;
     pts.reserve(4 * 3 * 9);
     for (int ci = 0; ci < 4; ++ci) {
-        for (double fz : {0.15, 0.5, 0.85}) {
+        for (double fz : {0.1, 0.5, 0.9}) {
             const double depth = lo[ci] + (hi[ci] - lo[ci]) * fz;
             for (double u : {0.1, 0.5, 0.9}) {
                 for (double vv : {0.1, 0.5, 0.9}) {
@@ -638,83 +675,93 @@ void VolFog::ResolveCascades() {
         casc_why = "no sample points (projection)";
         return;
     }
-    double best_W[4][16]{};
-    float best = -1.0f;
-    int best_combo = -1;
-    bool best_ndc = false;
-    for (int combo = 0; combo < 4; ++combo) {
+    struct Fit {
         double W[4][16];
+        float score = -1.0f;
+        bool ndc = false;
+    };
+    std::array<Fit, 4> fits{};
+    for (int combo = 0; combo < 4; ++combo) {
+        Fit& f = fits[combo];
         for (int i = 0; i < 4; ++i) {
             double m[16];
             for (int r = 0; r < 4; ++r)
                 for (int c = 0; c < 4; ++c)
                     m[r * 4 + c] = (combo & 1) ? M[i * 16 + c * 4 + r] : M[i * 16 + r * 4 + c];
-            Mul4(m, combo < 2 ? PV : V, W[i]);
+            Mul4(m, combo < 2 ? PV : V, f.W[i]);
         }
         u32 in_uv = 0, in_ndc = 0, n = 0;
-        bool affine = true;
-        double w_ref[4]{};
-        bool w_set[4]{};
+        double wmin[4] = {1e30, 1e30, 1e30, 1e30}, wmax[4] = {-1e30, -1e30, -1e30, -1e30};
         for (const auto& pt : pts) {
             double s[4];
-            Xform(W[pt.c], pt.w, s);
-            if (!(std::fabs(s[3]) > 1e-9)) {
-                affine = false;
+            Xform(f.W[pt.c], pt.w, s);
+            if (!(std::fabs(s[3]) > 1e-12))
                 continue;
-            }
-            if (!w_set[pt.c]) {
-                w_ref[pt.c] = s[3];
-                w_set[pt.c] = true;
-            } else if (std::fabs(s[3] - w_ref[pt.c]) > 1e-3 * std::fabs(w_ref[pt.c])) {
-                affine = false;
-            }
+            wmin[pt.c] = std::min(wmin[pt.c], s[3]);
+            wmax[pt.c] = std::max(wmax[pt.c], s[3]);
             const double x = s[0] / s[3], y = s[1] / s[3], z = s[2] / s[3];
             ++n;
             in_uv +=
-                (x >= -0.001 && x <= 1.001 && y >= -0.001 && y <= 1.001 && z >= -0.01 && z <= 1.01)
-                    ? 1
-                    : 0;
+                x >= -0.001 && x <= 1.001 && y >= -0.001 && y <= 1.001 && z >= -0.01 && z <= 1.01;
             in_ndc +=
-                (x >= -1.001 && x <= 1.001 && y >= -1.001 && y <= 1.001 && z >= -1.01 && z <= 1.01)
-                    ? 1
-                    : 0;
+                x >= -1.001 && x <= 1.001 && y >= -1.001 && y <= 1.001 && z >= -1.01 && z <= 1.01;
         }
         if (n == 0)
             continue;
-        // A [0,1] point is also inside [-1,1]: NDC only when clearly more points fit it.
-        const bool ndc = in_ndc > in_uv + n / 10;
-        float score = float(ndc ? in_ndc : in_uv) / float(pts.size());
-        if (!affine)
-            score *= 0.5f;
-        if (score > best) {
-            best = score;
-            best_combo = combo;
-            best_ndc = ndc;
-            std::memcpy(best_W, W, sizeof(W));
+        // Orthographic light: w (nearly) constant per cascade (the block's own matrices vary
+        // by ~0.3% over 20 m, float precision of the game's product).
+        bool affine = true;
+        for (int i = 0; i < 4; ++i) {
+            if (wmax[i] >= wmin[i] &&
+                (wmax[i] - wmin[i]) > 0.02 * std::max(std::fabs(wmax[i]), std::fabs(wmin[i]))) {
+                affine = false;
+            }
         }
+        f.ndc = in_ndc > in_uv + n / 10;
+        f.score = float(f.ndc ? in_ndc : in_uv) / float(pts.size());
+        if (!affine)
+            f.score *= 0.5f;
     }
-    casc_score = best;
-    if (best < 0.85f) {
-        casc_why = fmt::format("cascade matrices not recognised (best fit {:.0f}% of the sample "
-                               "points, combo {})",
-                               best * 100.0f, best_combo);
+    int best = 0;
+    for (int c = 1; c < 4; ++c) {
+        if (fits[c].score > fits[best].score)
+            best = c;
+    }
+    // Sticky: the convention found earlier is kept while it still fits most points.
+    if (casc_combo >= 0 && fits[casc_combo].score >= 0.6f &&
+        fits[casc_combo].score + 0.15f >= fits[best].score) {
+        best = casc_combo;
+    }
+    casc_score = fits[best].score;
+    if (casc_score < 0.6f) {
+        casc_why = fmt::format("cascade matrices not recognised (best fit {:.0f}%, combo {}; "
+                               "select {:.1f}/{:.1f}/{:.1f}/{:.1f})",
+                               casc_score * 100.0f, best, cd[0], cd[1], cd[2], cd[3]);
         return;
     }
-    casc_combo = best_combo;
-    casc_ndc = best_ndc;
+    if (casc_combo != best && casc_score >= 0.85f) {
+        casc_combo = best;
+    } else if (casc_combo < 0) {
+        casc_why = fmt::format("cascade fit {:.0f}% < 85% (combo {})", casc_score * 100.0f, best);
+        return;
+    }
+    const Fit& F = fits[best];
+    casc_ndc = F.ndc;
     rmap[0] = casc_ndc ? 0.5f : 1.0f;
     rmap[1] = casc_ndc ? -0.5f : 1.0f; // GNM: image row 0 = NDC y +1 (as the bb-rt passes)
     rmap[2] = casc_ndc ? 0.5f : 0.0f;
     rmap[3] = casc_ndc ? 0.5f : 0.0f;
-    // Atlas tiles: the extent each cascade's points cover (unit square coordinates).
+    // Tiles: each cascade's points covering at most a quarter of the atlas = offsets included;
+    // its quadrant (from the centre) bounds the PCF and the range test.
     bool baked = true;
+    double cu[4]{}, cv[4]{};
     for (int ci = 0; ci < 4; ++ci) {
         double mn[2] = {1e9, 1e9}, mx[2] = {-1e9, -1e9};
         for (const auto& pt : pts) {
             if (pt.c != ci)
                 continue;
             double s[4];
-            Xform(best_W[ci], pt.w, s);
+            Xform(F.W[ci], pt.w, s);
             const double u = s[0] / s[3] * rmap[0] + rmap[2];
             const double v = s[1] / s[3] * rmap[1] + rmap[3];
             mn[0] = std::min(mn[0], u);
@@ -723,22 +770,32 @@ void VolFog::ResolveCascades() {
             mx[1] = std::max(mx[1], v);
         }
         baked = baked && (mx[0] - mn[0]) <= 0.55 && (mx[1] - mn[1]) <= 0.55;
+        cu[ci] = 0.5 * (mn[0] + mx[0]);
+        cv[ci] = 0.5 * (mn[1] + mx[1]);
     }
     casc_baked = baked;
     for (int i = 0; i < 4; ++i) {
-        ToGlsl(best_W[i], shadow_w2s[i]);
+        ToGlsl(F.W[i], shadow_w2s[i]);
+        float qx, qy;
         if (baked) {
             std::memcpy(tile[i], rmap, sizeof(rmap));
+            qx = cu[i] >= 0.5 ? 0.5f : 0.0f;
+            qy = cv[i] >= 0.5 ? 0.5f : 0.0f;
         } else {
             tile[i][0] = rmap[0] * 0.5f;
             tile[i][1] = rmap[1] * 0.5f;
             tile[i][2] = rmap[2] * 0.5f + float(i & 1) * 0.5f;
             tile[i][3] = rmap[3] * 0.5f + float(i >> 1) * 0.5f;
+            qx = float(i & 1) * 0.5f;
+            qy = float(i >> 1) * 0.5f;
         }
-        cdist[i] = casc_dist_ok ? cd[i] : -1.0f;
+        tbound[i][0] = qx;
+        tbound[i][1] = qy;
+        tbound[i][2] = qx + 0.5f;
+        tbound[i][3] = qy + 0.5f;
+        cdist[i] = casc_dist_ok ? (i < 3 ? cd[i] : (cd_end ? cd[3] : 0.0f)) : -1.0f;
     }
-    // The light direction: shadow rows 0 and 1 (x, y) are constant along it.
-    const double* W0 = best_W[0];
+    const double* W0 = F.W[0];
     const double r0[3] = {W0[0], W0[1], W0[2]}, r1[3] = {W0[4], W0[5], W0[6]};
     double d[3] = {r0[1] * r1[2] - r0[2] * r1[1], r0[2] * r1[0] - r0[0] * r1[2],
                    r0[0] * r1[1] - r0[1] * r1[0]};
@@ -749,7 +806,6 @@ void VolFog::ResolveCascades() {
     }
     for (double& x : d)
         x /= dl;
-    // Toward the moon: above the horizon (the light-set CB direction decides when it is close).
     float lb[72];
     u64 age = 0;
     double sign = d[1] >= 0.0 ? 1.0 : -1.0;
@@ -759,8 +815,6 @@ void VolFog::ResolveCascades() {
     }
     for (int i = 0; i < 3; ++i)
         casc_dir[i] = float(d[i] * sign);
-    // Depth along the direction toward the moon: decreasing = the light is at depth 0 (lit when
-    // z <= stored depth), increasing = reversed.
     const double dz = (W0[8] * casc_dir[0] + W0[9] * casc_dir[1] + W0[10] * casc_dir[2]) /
                       (std::fabs(W0[15]) > 1e-12 ? W0[15] : 1.0);
     shadow_cmp = shadow_cmp_env >= 0 ? shadow_cmp_env : (dz < 0.0 ? 0 : 1);
@@ -819,19 +873,17 @@ void VolFog::MoonAndAmbient() {
     for (int i = 0; i < 3; ++i)
         amb[i] = base[i] * k;
     amb_src = "cold sky x moon";
-    float f[24];
-    if (game_fog_tint && BB::Upscale::RtFogBlock(f, age) && age <= 120) {
-        const float m = std::max({f[4], f[5], f[6]});
-        if (std::isfinite(m) && m > 1e-4f) {
+    if (game_fog_tint && game_fog_weight > 0.0f) {
+        const float m = std::max({game_fog.col[0], game_fog.col[1], game_fog.col[2]});
+        if (m > 1e-5f) {
             const float l = Lum(amb);
             float t[3];
             for (int i = 0; i < 3; ++i)
-                t[i] = std::clamp(f[4 + i] / m, 0.0f, 1.0f);
+                t[i] = game_fog.col[i] / m;
             const float lt = std::max(Lum(t), 1e-3f), lb2 = std::max(Lum(base), 1e-3f);
             for (int i = 0; i < 3; ++i)
                 amb[i] = l * (0.5f * base[i] / lb2 + 0.5f * t[i] / lt);
-            amb_src = fmt::format("cold sky x moon, 50% game fog CB colour ({:.2f} {:.2f} {:.2f})",
-                                  f[4], f[5], f[6]);
+            amb_src = "cold sky x moon, 50% game fog colour";
         }
     }
 }
@@ -839,6 +891,43 @@ void VolFog::MoonAndAmbient() {
 void VolFog::OnDrawCbs(const Upscale::DrawCb* cbs, size_t n) {
     if (!ok)
         return;
+    for (size_t i = 0; i < n; ++i) {
+        if (cbs[i].stage != 1 || cbs[i].bytes < 84 || cbs[i].bytes > 320 ||
+            !IsFogCb(cbs[i].data, cbs[i].bytes)) {
+            continue;
+        }
+        ++acc_fog_cbs;
+        const float* f = reinterpret_cast<const float*>(cbs[i].data);
+        // v0.y = 1 / Fog-Dist = 0: this draw's part has no distance fog (sky, effects).
+        if (!(f[1] > 0.0f) || !(f[0] > 0.0f)) {
+            ++acc_fog_off;
+            break;
+        }
+        bool found = false;
+        for (auto& g : acc_fog) {
+            if (g.amount == f[0] && g.rate == f[1] && g.start == f[9]) {
+                ++g.count;
+                found = true;
+                break;
+            }
+        }
+        if (!found && acc_fog.size() < 16) {
+            GameFogSet g{};
+            g.amount = f[0];
+            g.rate = f[1];
+            g.start = f[9];
+            g.inv_h = f[3];
+            for (int k = 0; k < 3; ++k)
+                g.col[k] = f[4 + k];
+            g.mix = f[7];
+            g.h_amount = f[12];
+            g.h_base = f[13];
+            g.h_scale = f[14];
+            g.count = 1;
+            acc_fog.push_back(g);
+        }
+        break;
+    }
     const PointShader* ps = nullptr;
     for (size_t i = 0; i < n && !ps; ++i) {
         if (cbs[i].stage == 1)
@@ -885,6 +974,18 @@ void VolFog::OnDrawCbs(const Upscale::DrawCb* cbs, size_t n) {
         const float lum = Lum(col);
         if (!(lum > 1e-3f))
             continue; // specular-only (the player's blue fill light) / off
+        // Halos only for lamp-like sources: small radius and warm (fires, lamps, torches, the
+        // player's lantern). Large or cold lights are the artists' fill / bounce lights.
+        if (!lights_all) {
+            if (r > light_max_r) {
+                ++acc_rej_big;
+                continue;
+            }
+            if (!(col[0] >= 1.1f * col[2] && col[0] >= 0.75f * col[1])) {
+                ++acc_rej_cold;
+                continue;
+            }
+        }
         double w[3];
         if (cam) {
             for (int i = 0; i < 3; ++i) {
@@ -923,6 +1024,34 @@ void VolFog::OnDrawCbs(const Upscale::DrawCb* cbs, size_t n) {
 void VolFog::FrameLightsDone() {
     frame_lights.swap(acc_lights);
     acc_lights.clear();
+    frame_rej_big = acc_rej_big;
+    frame_rej_cold = acc_rej_cold;
+    acc_rej_big = acc_rej_cold = 0;
+    // The frame's game fog: the set most forward-lit draws used.
+    const GameFogSet* best = nullptr;
+    for (const auto& g : acc_fog) {
+        if (!best || g.count > best->count)
+            best = &g;
+    }
+    frame_fog_sets = u32(acc_fog.size());
+    frame_fog_off = acc_fog_off;
+    frame_fog_cbs = acc_fog_cbs;
+    const auto now = std::chrono::steady_clock::now();
+    if (best) {
+        game_fog = *best;
+        game_fog_have = true;
+        game_fog_seen = now;
+        ++n_fog_frames;
+    } else {
+        ++n_nofog_frames;
+    }
+    acc_fog.clear();
+    acc_fog_off = acc_fog_cbs = 0;
+    // Held 3 s after the last frame that showed it, then faded out over 2 s (an area without
+    // fog binds only fog-off sets).
+    const double age =
+        game_fog_have ? std::chrono::duration<double>(now - game_fog_seen).count() : 1e9;
+    game_fog_weight = float(std::clamp(1.0 - (age - 3.0) / 2.0, 0.0, 1.0));
     frame_draws = acc_draws;
     frame_parsed = acc_parsed;
     frame_cam_cb = acc_cam_cb;
@@ -1017,7 +1146,7 @@ bool VolFog::Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& w
     ToGlsl(invV, prm.inv_view);
     std::memcpy(prm.shadow, shadow_w2s, sizeof(prm.shadow));
     std::memcpy(prm.tile, tile, sizeof(prm.tile));
-    std::memcpy(prm.rmap, rmap, sizeof(rmap));
+    std::memcpy(prm.tbound, tbound, sizeof(tbound));
     std::memcpy(prm.cdist, cdist, sizeof(cdist));
     prm.grid[0] = gw;
     prm.grid[1] = gh;
@@ -1030,6 +1159,7 @@ bool VolFog::Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& w
     prm.misc3[0] = 0.0015f;
     std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
     inj_slot_last = slot;
+    inj_slot_hist[inj_hist_pos++ % inj_slot_hist.size()] = slot;
 
     if (queries) {
         cmd.resetQueryPool(queries, slot * 4, 2);
@@ -1193,9 +1323,11 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
     prm.moon_dir[3] = !moon_lit || !shadow_pass ? 0.0f : injected ? 2.0f : 1.0f;
     prm.moon_col[3] = g_moon;
     prm.amb_col[3] = g_lights;
-    prm.fog[0] = haze;
+    // The own medium only where the game has no fog of its own.
+    const float own = game_fog_have ? 1.0f - game_fog_weight : 1.0f;
+    prm.fog[0] = haze * own;
     prm.fog[1] = haze_h;
-    prm.fog[2] = mist;
+    prm.fog[2] = mist * own;
     prm.fog[3] = mist_h;
     prm.fog2[0] = cam_y_smooth - ground_below;
     prm.fog2[1] = noise_amp;
@@ -1211,7 +1343,31 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
     prm.misc2[2] = float(nl);
     prm.misc2[3] = float(shadow_cmp);
     prm.misc3[1] = lights_scale;
+    prm.misc3[2] = 2.0f * far_dist / float(gd);
+    if (game_fog_have && game_fog_weight > 0.0f) {
+        prm.gfog[0] = std::clamp(game_fog.amount, 0.0f, 1.0f) * game_fog_mul;
+        prm.gfog[1] = std::clamp(game_fog.rate, 0.0f, 10.0f);
+        prm.gfog[2] = std::clamp(game_fog.start, -1000.0f, 10000.0f);
+        prm.gfog[3] = game_fog_weight;
+    }
+    {
+        // Moon light inside the game's fog, in its own units: the fog colour (v1.rgb, rgb^2) as
+        // GXLightComposite mixes it with the scene luma (v1.w), half way to the moon's hue.
+        const float fl = Lum(game_fog.col);
+        const float ls = scene_lum_log > 0.0f ? scene_lum_log : 0.05f;
+        const float base = fl * std::max(1.0f + game_fog.mix * (ls - 1.0f), 0.05f);
+        const float ml = std::max(Lum(moon_col), 1e-4f);
+        for (int i = 0; i < 3; ++i) {
+            const float hue = game_fog_have && fl > 1e-6f ? game_fog.col[i] / fl : 1.0f;
+            prm.gfog_col[i] = base * (0.5f * hue + 0.5f * moon_col[i] / ml);
+        }
+        prm.gfog_col[3] = shaft_scale;
+    }
+    prm.expo[0] = cap_rel;
+    prm.expo[1] = light_cap_rel;
+    prm.expo[2] = std::fabs(P[0]) > 1e-6 ? float(2.0 / (std::fabs(P[0]) * gw)) : 0.01f;
     std::memcpy(static_cast<u8*>(params.mapped) + slot * ParamSize, &prm, sizeof(prm));
+    app_slot_hist[app_hist_pos++ % app_slot_hist.size()] = slot;
 
     if (queries) {
         cmd.resetQueryPool(queries, slot * 4 + 2, 2);
@@ -1223,6 +1379,10 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
     tr.Add(in.depth, in.depth_layout, DepthAspect(in.depth_stencil), false);
     tr.Record(cmd, true);
     InitImages(cmd);
+    cmd.fillBuffer(counters.buffer, slot * 64, 64, 0);
+    cmd.pipelineBarrier2(
+        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &AllBefore});
+    const vk::DescriptorBufferInfo cnt_info{counters.buffer, slot * 64, 64};
     const u32 cur = u32(frame & 1), prv = cur ^ 1u;
     const vk::DescriptorBufferInfo prm_info{params.buffer, slot * ParamSize, ParamSize};
     const vk::DescriptorBufferInfo light_info{
@@ -1242,10 +1402,28 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
                                             .descriptorCount = 1,
                                             .descriptorType = DT::eUniformBuffer,
                                             .pBufferInfo = &prm_info};
+    const auto cnt_w = vk::WriteDescriptorSet{.dstBinding = 6,
+                                              .descriptorCount = 1,
+                                              .descriptorType = DT::eStorageBuffer,
+                                              .pBufferInfo = &cnt_info};
+    const auto hdr_w = vk::WriteDescriptorSet{.dstBinding = 12,
+                                              .descriptorCount = 1,
+                                              .descriptorType = DT::eStorageImage,
+                                              .pImageInfo = &hdr_img};
+    // 0. The scene's log-average luminance before the fog (caps the added light).
+    {
+        const std::array<vk::WriteDescriptorSet, 3> wr{{ubo, cnt_w, hdr_w}};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, in.hdr_r11 ? pipes[6] : pipes[5]);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, wr);
+        cmd.dispatch(8, 5, 1);
+    }
+    cmd.pipelineBarrier2(
+        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &ComputeToCompute});
     // 1. Light.
     {
-        const std::array<vk::WriteDescriptorSet, 5> wr{{
+        const std::array<vk::WriteDescriptorSet, 6> wr{{
             ubo,
+            cnt_w,
             {.dstBinding = 3,
              .descriptorCount = 1,
              .descriptorType = DT::eCombinedImageSampler,
@@ -1290,7 +1468,8 @@ bool VolFog::Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why
         vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &ComputeToCompute});
     // 3. Apply (debug 2: the fog is computed but not applied, for an A/B).
     if (dbg != 2) {
-        const std::array<vk::WriteDescriptorSet, 4> wr{{
+        const std::array<vk::WriteDescriptorSet, 5> wr{{
+            cnt_w,
             ubo,
             {.dstBinding = 10,
              .descriptorCount = 1,
@@ -1397,9 +1576,29 @@ void VolFog::Log(bool force) {
                             : std::chrono::duration<double>(now - last_log).count();
     last_log = now;
     // Counters of the inject from a few runs ago (finished on the GPU).
-    const u32* cn = reinterpret_cast<const u32*>(static_cast<const u8*>(counters.mapped) +
-                                                 ((inj_slot_last + Ring - 3) % Ring) * 64);
+    const auto* cmap = static_cast<const u8*>(counters.mapped);
+    const u32* cn = reinterpret_cast<const u32*>(
+        cmap + inj_slot_hist[inj_hist_pos % inj_slot_hist.size()] * 64);
     const u32 tested = cn[0], lit = cn[1], outside = cn[2];
+    const u32* ca = reinterpret_cast<const u32*>(
+        cmap + app_slot_hist[app_hist_pos % app_slot_hist.size()] * 64);
+    if (ca[9] > 0) {
+        scene_lum_log = std::exp2(float(int(ca[8])) / (256.0f * float(ca[9])));
+    }
+    const std::string gfog =
+        game_fog_have
+            ? fmt::format("amount {:.3f}, 1/dist {:.4f} (dist {:.1f} m), start {:.1f} m, colour "
+                          "({:.4f}, {:.4f}, {:.4f}) luma-mix {:.2f}, height fog amount {:.3f} base "
+                          "{:.1f} scale {:.4f}; weight {:.2f}; frames with fog {} / without {}; "
+                          "this frame: {} fog CBs, {} sets, {} fog-off",
+                          game_fog.amount, game_fog.rate,
+                          game_fog.rate > 0.0f ? 1.0f / game_fog.rate : 0.0f, game_fog.start,
+                          game_fog.col[0], game_fog.col[1], game_fog.col[2], game_fog.mix,
+                          game_fog.h_amount, game_fog.h_base, game_fog.h_scale, game_fog_weight,
+                          n_fog_frames, n_nofog_frames, frame_fog_cbs, frame_fog_sets,
+                          frame_fog_off)
+            : fmt::format("none seen (frames without {}; this frame {} fog CBs, {} fog-off)",
+                          n_nofog_frames, frame_fog_cbs, frame_fog_off);
     std::string shadow;
     if (casc_ok) {
         shadow = fmt::format(
@@ -1422,8 +1621,10 @@ void VolFog::Log(bool force) {
              "[volfog] {}{}: BB_VOLFOG={} ({}), froxels {}x{}x{} to {:.0f} m; fog applied {} "
              "(inject {}, frames without inject {}), skipped {} (last: {}); GPU {:.3f} ms "
              "(inject {:.3f} + light/integrate/apply {:.3f}); moon {} dir ({:.2f}, {:.2f}, {:.2f}) "
-             "[{}] colour ({:.2f}, {:.2f}, {:.2f}) [{}]; shadow: {}; point lights {} (max {}, "
-             "avg {:.1f}; light draws {}, parsed {}, with cbLightAccParam {}); ambient [{}]; wind "
+             "[{}] colour ({:.2f}, {:.2f}, {:.2f}) [{}]; shadow: {}; game fog: {}; scene log-avg "
+             "luminance {:.4f} (added light cap x{:.2f}); point lights {} lamp-like (max {}, avg "
+             "{:.1f}; rejected: radius > {:.0f} m {}, cold / fill {}; light draws {}, parsed {}, "
+             "with cbLightAccParam {}; x{:.2f}); ambient [{}]; wind "
              "({:.2f}, {:.2f}, {:.2f}) m/s [{}]; history restarts {} (last: {}); HDR reader ps "
              "{:#x}{}{}",
              force ? "start" : "5 s", force ? "" : fmt::format(" ({:.1f} s)", secs), level,
@@ -1433,11 +1634,13 @@ void VolFog::Log(bool force) {
              : !shadow_pass ? "no (no shadow-mask pass this frame: interior)"
                             : "yes",
              moon_dir[0], moon_dir[1], moon_dir[2], moon_src, moon_col[0], moon_col[1], moon_col[2],
-             col_src, shadow, frame_lights.size(), lights_max,
-             n_apply ? double(lights_sum) / double(n_apply) : 0.0, frame_draws, frame_parsed,
-             frame_cam_cb, amb_src, wind[0], wind[1], wind[2], wind_src, hist_resets, hist_why,
-             last_hook_ps, wind_probe ? "; wind probe: " : "", wind_probe ? WindProbe() : "");
+             col_src, shadow, gfog, scene_lum_log, cap_rel, frame_lights.size(), lights_max,
+             n_apply ? double(lights_sum) / double(n_apply) : 0.0, light_max_r, frame_rej_big,
+             frame_rej_cold, frame_draws, frame_parsed, frame_cam_cb, lights_scale, amb_src,
+             wind[0], wind[1], wind[2], wind_src, hist_resets, hist_why, last_hook_ps,
+             wind_probe ? "; wind probe: " : "", wind_probe ? WindProbe() : "");
     n_apply = n_inject = n_noinject = n_skip = 0;
+    n_fog_frames = n_nofog_frames = 0;
     inj_ms = app_ms = 0.0;
     inj_n = app_n = 0;
     lights_max = 0;
