@@ -26,6 +26,11 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// KYTY_SCAN_STAMP (kernel/scanStamp.h), any thread, lock-free: every page of the range has
+	// been given a host protection without write access by the tracker, made already (not only
+	// deferred), and none has been made writable since. False when the switch is off.
+	[[nodiscard]] static bool HostWriteProtected(uint64_t vaddr, uint64_t size) noexcept;
+
 	// Whether the page holding vaddr is read-protected for tracking. Unlocked: a hint that can
 	// be stale by the time the caller acts on it.
 	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
@@ -76,8 +81,9 @@ public:
 		}
 	}
 
-private:
 	struct Impl;
+
+private:
 	std::unique_ptr<Impl> m_impl;
 };
 

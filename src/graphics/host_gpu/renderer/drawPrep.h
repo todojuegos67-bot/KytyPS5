@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 // Draw preparation ahead of the GPU thread (on by default; KYTY_DRAW_PREP=0 turns it off;
@@ -56,6 +57,7 @@ public:
 	void Clear() {
 		m_ranges.clear();
 		m_bytes.clear();
+		m_stamped = false;
 	}
 	void Add(uint64_t address, const void* data, uint32_t size);
 	// GPU thread: every range is still clean for a backing read and holds the recorded bytes.
@@ -63,15 +65,38 @@ public:
 	[[nodiscard]] size_t RangeCount() const { return m_ranges.size(); }
 	[[nodiscard]] size_t ByteCount() const { return m_bytes.size(); }
 
+	// gt7-drawmemo-1118, KYTY_SCAN_STAMP (kernel/scanStamp.h). Scanner: BeginStamp before the
+	// walk reads anything (the epochs), SealStamp after it (each range's backing and whether all
+	// its pages were write-protected by the tracker, with no live stack over it).
+	void BeginStamp();
+	void SealStamp();
+	// GPU thread: Validate's answer from the stamps where they can give it. KYTY_SCAN_STAMP=2
+	// runs both and counts a stamp verdict the bytes contradict. `compared`: the bytes compared.
+	[[nodiscard]] bool ValidateStamped(uint64_t& compared) const;
+
 private:
 	struct Range {
-		uint64_t address;
-		uint32_t offset; // into m_bytes
-		uint32_t size;
+		uint64_t       address;
+		uint32_t       offset; // into m_bytes
+		uint32_t       size;
+		const uint8_t* backing = nullptr; // SealStamp: the range's backing bytes, or null
+		bool           watched = false;   // SealStamp: no store without a fault or a stamp
 	};
+	// The stamps' verdict: accepted (no byte compared where the pages were watched), rejected
+	// (unwatched bytes differ), or unknown (written since, or the layout moved: Validate).
+	enum class Verdict { Accepted, Rejected, Unknown };
+	[[nodiscard]] Verdict StampVerdict(uint64_t& compared, bool& bytes) const;
+
 	std::vector<Range>   m_ranges;
 	std::vector<uint8_t> m_bytes;
+	bool                 m_stamped      = false;
+	uint64_t             m_stamp_epoch  = 0;
+	uint64_t             m_layout_epoch = 0;
 };
+
+// KYTY_SCAN_STAMP's counters since the last call, as text for the "Desglose draw" line (and
+// reset); empty while the switch is off.
+[[nodiscard]] std::string TakeStampReport();
 
 // One stage's prepared refresh.
 struct StageResult {

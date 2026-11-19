@@ -1,10 +1,13 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
 #include "kernel/memory.h"
+#include "kernel/scanStamp.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,6 +19,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics::DrawPrep {
 
@@ -194,6 +199,169 @@ bool ReadSet::Validate() const {
 		}
 	}
 	return true;
+}
+
+// gt7-drawmemo-1118, KYTY_SCAN_STAMP (kernel/scanStamp.h).
+namespace {
+
+struct StampCounters {
+	std::atomic<uint64_t> checks {0};          // validations asked for
+	std::atomic<uint64_t> unsealed {0};        // results prepared without stamps
+	std::atomic<uint64_t> accepted {0};        // the stamps accepted
+	std::atomic<uint64_t> accepted_bytes {0};  // ... comparing some bytes of unwatched pages
+	std::atomic<uint64_t> rejected {0};        // unwatched bytes differ
+	std::atomic<uint64_t> written {0};         // a page read was stamped since: Validate
+	std::atomic<uint64_t> layout {0};          // the mappings changed since: Validate
+	std::atomic<uint64_t> ranges {0};          // ranges the stamps looked at
+	std::atomic<uint64_t> ranges_watched {0};  // ... on write-protected pages
+	std::atomic<uint64_t> false_accepts {0};   // KYTY_SCAN_STAMP=2: accepted, the bytes differ
+	std::atomic<uint64_t> false_rejects {0};   // KYTY_SCAN_STAMP=2: rejected, the bytes agree
+};
+StampCounters g_stamp;
+
+void Bump(std::atomic<uint64_t>& counter, uint64_t value = 1) {
+	counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+} // namespace
+
+void ReadSet::BeginStamp() {
+	m_stamped      = false;
+	m_layout_epoch = ScanStamp::LayoutEpoch();
+	m_stamp_epoch  = ScanStamp::Epoch();
+}
+
+void ReadSet::SealStamp() {
+	for (auto& range: m_ranges) {
+		range.backing = LibKernel::Memory::FindBackingAny(range.address, range.size);
+		range.watched = range.backing != nullptr &&
+		                PageManager::HostWriteProtected(range.address, range.size) &&
+		                !ScanStamp::OverlapsLiveStack(range.address, range.size);
+	}
+	m_stamped = true;
+}
+
+ReadSet::Verdict ReadSet::StampVerdict(uint64_t& compared, bool& bytes) const {
+	if (ScanStamp::LayoutEpoch() != m_layout_epoch) {
+		Bump(g_stamp.layout);
+		return Verdict::Unknown;
+	}
+	for (const auto& range: m_ranges) {
+		if (range.backing == nullptr ||
+		    ScanStamp::WrittenSince(range.address, range.size, m_stamp_epoch)) {
+			Bump(g_stamp.written);
+			return Verdict::Unknown;
+		}
+	}
+	// Nothing stamped the pages since the read, and the mappings are the same: they are still
+	// GPU-clean and their backing is where it was. A write-protected page cannot have changed;
+	// another one is compared there.
+	uint64_t watched = 0;
+	for (const auto& range: m_ranges) {
+		if (range.watched) {
+			watched++;
+			continue;
+		}
+		bytes = true;
+		compared += range.size;
+		if (std::memcmp(range.backing, m_bytes.data() + range.offset, range.size) != 0) {
+			Bump(g_stamp.ranges, m_ranges.size());
+			Bump(g_stamp.ranges_watched, watched);
+			return Verdict::Rejected;
+		}
+	}
+	Bump(g_stamp.ranges, m_ranges.size());
+	Bump(g_stamp.ranges_watched, watched);
+	return Verdict::Accepted;
+}
+
+bool ReadSet::ValidateStamped(uint64_t& compared) const {
+	const int mode = ScanStamp::Mode();
+	if (mode == 0) {
+		compared = ByteCount();
+		return Validate();
+	}
+	Bump(g_stamp.checks);
+	if (!m_stamped) {
+		Bump(g_stamp.unsealed);
+		compared = ByteCount();
+		return Validate();
+	}
+	uint64_t   stamp_bytes = 0;
+	bool       bytes       = false;
+	const auto verdict     = StampVerdict(stamp_bytes, bytes);
+	if (verdict == Verdict::Accepted) {
+		Bump(g_stamp.accepted);
+		if (bytes) {
+			Bump(g_stamp.accepted_bytes);
+		}
+	} else if (verdict == Verdict::Rejected) {
+		Bump(g_stamp.rejected);
+	}
+	if (mode == 1) {
+		if (verdict != Verdict::Unknown) {
+			compared = stamp_bytes;
+			return verdict == Verdict::Accepted;
+		}
+		compared = ByteCount();
+		return Validate();
+	}
+	// KYTY_SCAN_STAMP=2: the bytes decide; the stamps' verdict is checked against them.
+	const bool ok = Validate();
+	compared      = ByteCount() + stamp_bytes;
+	if (verdict == Verdict::Accepted && !ok) {
+		Bump(g_stamp.false_accepts);
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::string where;
+			for (const auto& range: m_ranges) {
+				where += fmt::format(" 0x{:x}+{}{}", range.address, range.size,
+				                     range.watched ? "(vigilada)" : "");
+			}
+			Log::WriteUnmuted(fmt::format(
+			    "Sello del escaner: FALSO aceptado (los bytes difieren), rangos:{}\n", where));
+		}
+	} else if (verdict == Verdict::Rejected && ok) {
+		Bump(g_stamp.false_rejects);
+	}
+	return ok;
+}
+
+std::string TakeStampReport() {
+	const int mode = ScanStamp::Mode();
+	if (mode == 0) {
+		return {};
+	}
+	const auto take = [](std::atomic<uint64_t>& counter) {
+		return counter.exchange(0, std::memory_order_relaxed);
+	};
+	const auto checks         = take(g_stamp.checks);
+	const auto unsealed       = take(g_stamp.unsealed);
+	const auto accepted       = take(g_stamp.accepted);
+	const auto accepted_bytes = take(g_stamp.accepted_bytes);
+	const auto rejected       = take(g_stamp.rejected);
+	const auto written        = take(g_stamp.written);
+	const auto layout         = take(g_stamp.layout);
+	const auto ranges         = take(g_stamp.ranges);
+	const auto ranges_watched = take(g_stamp.ranges_watched);
+	const auto false_accepts  = take(g_stamp.false_accepts);
+	const auto false_rejects  = take(g_stamp.false_rejects);
+	const auto percent        = [](uint64_t n, uint64_t of) {
+        return of != 0 ? 100.0 * static_cast<double>(n) / static_cast<double>(of) : 0.0;
+	};
+	std::string text = fmt::format(
+	    " | sello (KYTY_SCAN_STAMP={}): validaciones {}, aceptadas por sello {} ({:.1f}%; {} "
+	    "comparando bytes de paginas no vigiladas), rechazadas por bytes {}, a la comparacion "
+	    "completa {} (escritas desde la preparacion {}, mapas cambiados {}, sin sello {}), rangos "
+	    "en paginas vigiladas {:.1f}%",
+	    mode, checks, accepted, percent(accepted, checks), accepted_bytes, rejected,
+	    written + layout + unsealed, written, layout, unsealed, percent(ranges_watched, ranges));
+	if (mode == 2) {
+		text += fmt::format("; verificador: falsos aceptados {} (tienen que ser 0), rechazos que "
+		                    "los bytes aceptan {}",
+		                    false_accepts, false_rejects);
+	}
+	return text;
 }
 
 void SetCurrent(const Key& key) {

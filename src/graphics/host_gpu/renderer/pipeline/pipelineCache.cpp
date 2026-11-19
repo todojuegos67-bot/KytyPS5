@@ -34,6 +34,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "kernel/scanStamp.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
@@ -4725,6 +4726,10 @@ struct PipelineCache::ProgramCache {
 		result.shader_base = params.Base();
 		result.user_data.assign(user_data.begin(), user_data.end());
 		result.reads.Clear();
+		if (ScanStamp::On()) {
+			// gt7-drawmemo-1118 (KYTY_SCAN_STAMP): the epochs before any byte is read.
+			result.reads.BeginStamp();
+		}
 		RecordingReader                  reader {.reads = &result.reads};
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = user_data,
@@ -4765,6 +4770,10 @@ struct PipelineCache::ProgramCache {
 		if (!ok || reader.failed) {
 			DrawPrep::Add(DrawPrep::Counter::FailWalk);
 			return false;
+		}
+		if (ScanStamp::On()) {
+			// After every read: which ranges lie on write-protected pages.
+			result.reads.SealStamp();
 		}
 		result.specialization_hash = SpecializationHash(result.specialization);
 		static std::atomic<uint64_t> serials {0};
@@ -4869,10 +4878,13 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		{
-			// gt7-drawmemo-1118: the byte check timed apart ("Desglose draw").
+			// gt7-drawmemo-1118: the byte check timed apart ("Desglose draw"). KYTY_SCAN_STAMP:
+			// by write stamps where they answer (ReadSet::ValidateStamped); off, Validate.
 			const GpuPhases::Scope validate_phase(GpuPhases::Phase::ScanValidate);
-			GpuPhases::Count(GpuPhases::Phase::ScanValidateBytes, result->reads.ByteCount());
-			if (!result->reads.Validate()) {
+			uint64_t               compared = 0;
+			const bool             valid    = result->reads.ValidateStamped(compared);
+			GpuPhases::Count(GpuPhases::Phase::ScanValidateBytes, compared);
+			if (!valid) {
 				DrawPrep::Add(DrawPrep::Counter::MissReads);
 				return false;
 			}

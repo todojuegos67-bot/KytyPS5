@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
+#include "kernel/scanStamp.h"
 
 #include <algorithm>
 #include <array>
@@ -150,6 +151,10 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// KYTY_SCAN_STAMP (kernel/scanStamp.h): 1 while the host protection the tracker last gave
+		// the page takes write access away (made, not only asked for: a deferred protection sets
+		// it when the worker makes it). Cleared before a page becomes writable.
+		std::array<std::atomic<uint8_t>, REGION_PAGES> host_ro {};
 	};
 
 	Impl() {
@@ -207,15 +212,38 @@ struct PageManager::Impl {
 		return ptr;
 	}
 
+	// KYTY_SCAN_STAMP: the pages' host_ro bits (lock-free; the caller holds the region's lock).
+	void SetHostRo(uint64_t vaddr, uint64_t size, bool value) noexcept {
+		for (auto page = Common::AlignDown(vaddr, PAGE_SIZE); page < vaddr + size;
+		     page += PAGE_SIZE) {
+			if (auto* region = FindRegion(page); region != nullptr) {
+				region->host_ro[(page % REGION_SIZE) / PAGE_SIZE].store(value ? 1u : 0u,
+				                                                       std::memory_order_seq_cst);
+			}
+		}
+	}
+
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		const GpuPhases::Scope phase(GpuPhases::Phase::Protect);
 		GpuPhases::NoteProtect(vaddr, size,
 		                       mode == Common::VirtualMemory::Mode::NoAccess ? 0u
 		                       : mode == Common::VirtualMemory::Mode::Read   ? 1u
 		                                                                     : 2u);
+		// KYTY_SCAN_STAMP: a page about to be writable is stamped before (a write after it then
+		// has a larger stamp); one write-protected, after (the writes before it, a smaller one).
+		const bool stamps   = ScanStamp::On();
+		const bool writable = mode == Common::VirtualMemory::Mode::ReadWrite;
+		if (stamps && writable) {
+			SetHostRo(vaddr, size, false);
+			ScanStamp::Note(vaddr, size);
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
+		}
+		if (stamps && !writable) {
+			ScanStamp::Note(vaddr, size);
+			SetHostRo(vaddr, size, true);
 		}
 	}
 
@@ -423,6 +451,17 @@ struct PageManager::Impl {
 						      region_base + page * PAGE_SIZE, (run - page) * PAGE_SIZE,
 						      static_cast<uint32_t>(mode));
 					}
+					if (ScanStamp::On()) {
+						// KYTY_SCAN_STAMP: the pages write-protected only now, stamped after it
+						// (those protected already keep their stamp).
+						for (size_t p = page; p < run; p++) {
+							auto& ro = region->host_ro[p];
+							if (ro.load(std::memory_order_relaxed) == 0) {
+								ScanStamp::Note(region_base + p * PAGE_SIZE, PAGE_SIZE);
+								ro.store(1, std::memory_order_seq_cst);
+							}
+						}
+					}
 				}
 				page = run;
 			}
@@ -564,9 +603,36 @@ struct PageManager::Impl {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+namespace {
+// KYTY_SCAN_STAMP: the manager HostWriteProtected asks (the renderer's; the last one made).
+std::atomic<const PageManager::Impl*> g_stamp_manager {nullptr};
+} // namespace
 
-PageManager::~PageManager() = default;
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
+	(void)ScanStamp::Mode(); // read (and logged) here, not first in a fault handler
+	g_stamp_manager.store(m_impl.get(), std::memory_order_release);
+}
+
+PageManager::~PageManager() {
+	const Impl* self = m_impl.get();
+	g_stamp_manager.compare_exchange_strong(self, nullptr, std::memory_order_acq_rel);
+}
+
+bool PageManager::HostWriteProtected(uint64_t vaddr, uint64_t size) noexcept {
+	const auto* impl = g_stamp_manager.load(std::memory_order_acquire);
+	if (impl == nullptr || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	for (auto page = Common::AlignDown(vaddr, PAGE_SIZE); page < vaddr + size; page += PAGE_SIZE) {
+		const auto* region = impl->FindRegion(page);
+		if (region == nullptr ||
+		    region->host_ro[(page % REGION_SIZE) / PAGE_SIZE].load(std::memory_order_seq_cst) ==
+		        0) {
+			return false;
+		}
+	}
+	return true;
+}
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;

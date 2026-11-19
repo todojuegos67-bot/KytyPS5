@@ -916,6 +916,7 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		return m_backing->ZeroRange(backing_offset, size);
 	}
 
@@ -972,6 +973,7 @@ public:
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -1016,6 +1018,8 @@ public:
 		}
 		const auto      start = AlignDown(vaddr, HostPageSize());
 		const auto      end   = AlignUp(vaddr + size, HostPageSize());
+		// KYTY_SCAN_STAMP: known as a live stack (never watched) before it becomes writable.
+		ScanStamp::AddLiveStack(start, end);
 		std::lock_guard lock(m_mutex);
 		m_live_stacks.emplace(start, end);
 		auto it = m_mapped.upper_bound(start);
@@ -1045,6 +1049,7 @@ public:
 		for (auto it = first; it != last; ++it) {
 			if (it->second == end) {
 				m_live_stacks.erase(it);
+				ScanStamp::RemoveLiveStack(start, end);
 				return true;
 			}
 		}
@@ -1054,6 +1059,7 @@ public:
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		std::lock_guard lock(m_mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
@@ -1082,6 +1088,7 @@ public:
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		bool unmapped = false;
 		{
 			std::lock_guard lock(m_mutex);
@@ -1125,6 +1132,7 @@ public:
 	}
 
 	bool ReserveFixed(uint64_t vaddr, uint64_t size) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}
@@ -1140,11 +1148,13 @@ public:
 #endif
 
 	bool ReleaseFree(uint64_t vaddr, uint64_t size) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		std::lock_guard lock(m_mutex);
 		if (!ConsumeUnlocked(vaddr, size)) {
 			return false;
@@ -1177,6 +1187,7 @@ public:
 	}
 
 	bool ReleaseCommitted(uint64_t vaddr, uint64_t size) {
+		ScanStamp::LayoutChanging(); // KYTY_SCAN_STAMP: before the change
 		if (vaddr == 0 || size == 0 || !IsPageAligned(vaddr) || !IsPageAligned(size)) {
 			return false;
 		}

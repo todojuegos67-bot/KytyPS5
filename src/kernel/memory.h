@@ -183,6 +183,9 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Any thread (KYTY_SCAN_STAMP): the backing bytes of [vaddr, vaddr + size) when one mapping holds
+// them, GPU-written or not, else nullptr. Current until the guest's mappings change.
+[[nodiscard]] const uint8_t* FindBackingAny(uint64_t vaddr, uint64_t size);
 // Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
 // TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
 // queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).

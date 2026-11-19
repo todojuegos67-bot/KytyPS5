@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
+#include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
@@ -643,6 +644,7 @@ void ReportIfDue(uint64_t frames) {
             samples, per(Phase::DrawTexSamplerCount, Phase::Draw), tail, check,
             tex - lock - images - samples - tail - check);
 		desglose += DrawMemo::TakeReport(cycles_per_us);
+		desglose += DrawPrep::TakeStampReport(); // KYTY_SCAN_STAMP (empty while off)
 		Log::WriteUnmuted(desglose + "\n");
 	}
 	// gt7-spec-1112: KYTY_SPECULATE's counters, on a line of their own.

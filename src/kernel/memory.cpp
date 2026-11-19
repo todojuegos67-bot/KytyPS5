@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "kernel/scanStamp.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
@@ -1393,6 +1394,8 @@ void JournalWrite(uint64_t vaddr, uint64_t size, WriteSource source) noexcept {
 	if (size == 0) {
 		return;
 	}
+	// KYTY_SCAN_STAMP (scanStamp.h): after the write, which the stamp covers.
+	ScanStamp::Note(vaddr, size);
 	const auto now = JournalNowNs();
 	if (source == WriteSource::CpuWriteFault) {
 		if (auto* ring = g_fault_journal; ring != nullptr) {
@@ -1516,6 +1519,11 @@ static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
 	auto& buffers = GetGpuResources().GetBufferCache();
 	buffers.FinishFastReadbacks(vaddr, size);
 	return buffers.HasGpuDirtyBytes(vaddr, size);
+}
+
+const uint8_t* FindBackingAny(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->FindBacking(vaddr, size)
+	                                        : nullptr;
 }
 
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {

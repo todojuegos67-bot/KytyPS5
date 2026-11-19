@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
+#include "kernel/scanStamp.h"
 
 #include <algorithm>
 #include <array>
@@ -3205,6 +3206,9 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 		ForgetFills(vaddr, size);
 		NoteMetadataWrite(vaddr, size);
 	}
+	// KYTY_SCAN_STAMP (kernel/scanStamp.h): after the mark, so a scanner that read before this
+	// stamp sees these bytes GPU-written or has its result checked again.
+	Libs::ScanStamp::Note(vaddr, size);
 	RecordGpuWriter(vaddr, size, s_diag_shader_hash, m_scheduler.CurrentTick());
 	QueueReadahead(vaddr, size);
 	if (Libs::LibKernel::Memory::TracesMemory(vaddr, size)) {
