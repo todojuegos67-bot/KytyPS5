@@ -30,6 +30,8 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_cheats.h"
+#include "core/bb_vardt.h"
 #include "core/emulator_settings.h"
 #include "imgui/bb_menu.h"
 #include "imgui/imgui_layer.h"
@@ -2537,8 +2539,12 @@ bool WriteDirect(bool on) {
 // ---------------------------------------------------------------- the layer
 // (bb-menu-121) F1 opens a full-screen hub (Mando, Teclado y ratón, Trofeos, Opciones, Salir
 // del juego); a card opens only its own screen, Volver (Circle / Esc) goes back to the hub.
-enum class Screen { Hub = -1, Pad = 0, Kbm = 1, Trophies = 2, Options = 3, Exit = 4 };
-constexpr int kCards = 5;
+// (bb-cheats) Trucos (core/bb_cheats.h) between Opciones and Salir.
+enum class Screen { Hub = -1, Pad = 0, Kbm = 1, Trophies = 2, Options = 3, Cheats = 4, Exit = 5 };
+constexpr int kCards = 6;
+// (bb-cheats) Trucos rows: 4 toggles, game speed, echoes +10k / +100k, insight +1 / +10
+constexpr int kCheatRows = 9;
+constexpr float kSpeeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
 
 // hub icons, gold line art
 void IconPad(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
@@ -2585,6 +2591,18 @@ void IconGear(ImDrawList* dl, ImVec2 c, float s, ImU32 col, float rot) {
                           {p1.x + sa * w * 0.8f, p1.y - ca * w * 0.8f}, {p0.x + sa * w, p0.y - ca * w},
                           col);
     }
+}
+// (bb-cheats) a blood vial
+void IconVial(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    const ImVec2 b{c.x, c.y + 0.12f * s};
+    dl->AddCircle(b, 0.20f * s, col, 32, th);
+    dl->AddRect({c.x - 0.06f * s, c.y - 0.30f * s}, {c.x + 0.06f * s, c.y - 0.07f * s}, col,
+                0.02f * s, 0, th);
+    dl->AddRectFilled({c.x - 0.09f * s, c.y - 0.36f * s}, {c.x + 0.09f * s, c.y - 0.30f * s}, col,
+                      0.02f * s);
+    dl->PathArcTo(b, 0.15f * s, 0.25f, 3.14159f - 0.25f, 20);
+    dl->PathFillConvex(col);
 }
 void IconDoor(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     const float th = std::max(1.5f, s * 0.035f);
@@ -2688,6 +2706,8 @@ public:
     bool kbm_scroll_to = false;
     int exit_focus = 0;
     float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0, tog_vib = 0;
+    int cheat_focus = 0; // (bb-cheats) kCheatRows index
+    float tog_cheat[4] = {};
     int opt_focus = 0; // (bb-input-135) 0 direct start, 1 vibration, 2 intensity
     double test_hold_since = -1; // (bb-mapwiz-136) OPTIONS held in the wizard
     // (bb-mapwiz-136) Mando > "Mapear controles": countdown -> one PS4 button at a time ->
@@ -2725,6 +2745,9 @@ public:
         }
         if (s == Screen::Exit) {
             exit_focus = 0;
+        }
+        if (s == Screen::Cheats) {
+            cheat_focus = 0;
         }
         screen = s;
         scr_t = ImGui::GetTime();
@@ -2864,6 +2887,12 @@ public:
                     SaveMenuSettings(), Input::TestRumble();
                 }
                 break;
+            case Screen::Cheats:
+                if (n == Nav::Up) cheat_focus = (cheat_focus + kCheatRows - 1) % kCheatRows;
+                if (n == Nav::Down) cheat_focus = (cheat_focus + 1) % kCheatRows;
+                if (n == Nav::Left || n == Nav::Right) CheatStep(n == Nav::Left ? -1 : 1);
+                if (n == Nav::Accept) CheatAccept(cheat_focus);
+                break;
             case Screen::Exit:
                 if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down) {
                     exit_focus ^= 1;
@@ -2940,7 +2969,7 @@ public:
             OrnLine(dl, disp.x * 0.5f, 228 * u, 420 * u, 0.9f, u);
         } else {
             static const char* titles[] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
-                                           "SALIR DEL JUEGO"};
+                                           "TRUCOS", "SALIR DEL JUEGO"};
             TxtSpaced(dl, g_ft_title, 22 * u, {disp.x * 0.5f, 38 * u}, Bronze(), "BLOODBORNE", 6 * u,
                       true);
             TxtSpaced(dl, g_ft_title, 50 * u, {disp.x * 0.5f, 66 * u}, Gold(),
@@ -2986,6 +3015,9 @@ public:
             break;
         case Screen::Trophies:
             hints = {{"pad", "Moverse"}, {"l1", "Filtro"}, {"circle", "Volver"}};
+            break;
+        case Screen::Cheats:
+            hints = {{"pad", "Elegir / velocidad"}, {"cross", "Activar"}, {"circle", "Volver"}};
             break;
         default:
             hints = {{"cross", "Aceptar"}, {"circle", "Volver"}};
@@ -3086,6 +3118,7 @@ public:
             case Screen::Kbm: KbmScreen(a, b, u); break;
             case Screen::Trophies: TrophyScreen(a, b, u); break;
             case Screen::Options: OptionsScreen(a, b, u); break;
+            case Screen::Cheats: CheatsScreen(a, b, u); break;
             case Screen::Exit: ExitScreen(disp, u); break;
             }
             g_a = e;
@@ -3103,13 +3136,14 @@ public:
     // ------------------------------------------------------------ hub
     void HubScreen(ImVec2 disp, float u) {
         static const char* titles[kCards] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
-                                             "SALIR"};
+                                             "TRUCOS", "SALIR"};
         int earned = 0;
         for (const auto& tr : g_trophies) earned += tr.earned;
         const std::string tsub = fmt::format("{} de {} conseguidos", earned, g_trophies.size());
         const char* subs[kCards] = {"Reasigna los botones de tu mando",
                                     "Teclas, ratón y cámara", tsub.c_str(),
-                                    "Inicio directo y ajustes", "Cierra el juego con seguridad"};
+                                    "Inicio directo y ajustes", "Vida, ecos, percepción y más",
+                                    "Cierra el juego con seguridad"};
         const float gap = 30 * u;
         const float cw = std::min(330 * u, (disp.x - 240 * u - gap * (kCards - 1)) / kCards);
         const float ch = std::min(cw * 1.6f, disp.y * 0.50f);
@@ -3171,6 +3205,7 @@ public:
             case 1: IconKbm(dl, m, is, ic); break;
             case 2: DrawCup(dl, m.x - is * 0.32f, m.y - is * 0.34f, is * 0.64f, ic, g_a); break;
             case 3: IconGear(dl, m, is, ic, t * 0.4f * h); break;
+            case 4: IconVial(dl, m, is, ic); break;
             default: IconDoor(dl, m, is, ic); break;
             }
             // title, rule, subtitle
@@ -3709,6 +3744,127 @@ public:
                    opt_focus == 2)) {
             SaveMenuSettings(), Input::TestRumble();
         }
+    }
+
+    // ------------------------------------------------------------ Trucos (bb-cheats)
+    static int SpeedIndex() {
+        const float cur = BB::VarDt::GameSpeed();
+        int best = 2;
+        for (int i = 0; i < static_cast<int>(std::size(kSpeeds)); i++) {
+            if (std::fabs(kSpeeds[i] - cur) < std::fabs(kSpeeds[best] - cur)) best = i;
+        }
+        return best;
+    }
+    static void CheatStep(int d) {
+        if (!BB::VarDt::SpeedAvailable()) return;
+        const int n = static_cast<int>(std::size(kSpeeds));
+        BB::VarDt::SetGameSpeed(kSpeeds[std::clamp(SpeedIndex() + d, 0, n - 1)]);
+    }
+    void CheatAccept(int row) {
+        using BB::Cheats::Cheat;
+        if (!BB::Cheats::Available()) return;
+        static constexpr Cheat toggles[] = {Cheat::InfiniteHp, Cheat::InfiniteStamina,
+                                            Cheat::InfiniteItems, Cheat::OneHitKill};
+        if (row < 4) {
+            BB::Cheats::Set(toggles[row], !BB::Cheats::Get(toggles[row]));
+            return;
+        }
+        if (row == 4) {
+            if (BB::VarDt::SpeedAvailable()) {
+                const int n = static_cast<int>(std::size(kSpeeds));
+                BB::VarDt::SetGameSpeed(kSpeeds[(SpeedIndex() + 1) % n]);
+            }
+            return;
+        }
+        if (!BB::Cheats::Read().in_game) return;
+        if (row == 5) BB::Cheats::AddEchoes(10000);
+        if (row == 6) BB::Cheats::AddEchoes(100000);
+        if (row == 7) BB::Cheats::AddInsight(1);
+        if (row == 8) BB::Cheats::AddInsight(10);
+    }
+    void CheatsScreen(ImVec2 a, ImVec2 b, float u) {
+        using BB::Cheats::Cheat;
+        auto* dl = ImGui::GetWindowDrawList();
+        const bool ok = BB::Cheats::Available();
+        const BB::Cheats::Stats st = BB::Cheats::Read();
+        const float w = std::min(1300 * u, b.x - a.x);
+        const ImVec2 p0{(a.x + b.x - w) * 0.5f, a.y + 10 * u}, p1{p0.x + w, b.y - 20 * u};
+        Panel(dl, p0, p1, u, 0.2f);
+        Txt(dl, g_ft_title, 30 * u, {p0.x + 40 * u, p0.y + 24 * u}, Gold(), "Trucos");
+        const std::string live =
+            !ok ? std::string("No disponibles: este ejecutable no es Bloodborne 1.09")
+            : st.in_game
+                ? fmt::format("Vida {}/{}  ·  Resistencia {}/{}  ·  Ecos {}  ·  Percepción {}",
+                              st.hp, st.hp_max, st.stamina, st.stamina_max, st.echoes,
+                              st.insight)
+                : std::string("Carga una partida para ver y cambiar los valores");
+        Txt(dl, g_ft_ui, 21 * u, {p0.x + 40 * u, p0.y + 72 * u},
+            ok ? Muted() : Col(232, 170, 90), live.c_str());
+        static const char* names[4] = {"Vida infinita", "Resistencia infinita",
+                                       "Objetos infinitos (viales, balas, consumibles)",
+                                       "Muerte de un golpe (enemigos)"};
+        static constexpr Cheat toggles[4] = {Cheat::InfiniteHp, Cheat::InfiniteStamina,
+                                             Cheat::InfiniteItems, Cheat::OneHitKill};
+        const float row_h = 64 * u;
+        float y = p0.y + 120 * u;
+        ImGui::BeginDisabled(!ok);
+        for (int i = 0; i < 4; i++) {
+            const ImVec2 tg{p0.x + 40 * u, y};
+            const std::string id = "##cheat" + std::to_string(i);
+            if (Toggle(id.c_str(), tg, BB::Cheats::Get(toggles[i]), tog_cheat[i], u,
+                       cheat_focus == i)) {
+                cheat_focus = i;
+                CheatAccept(i);
+            }
+            Txt(dl, g_ft_text, 28 * u, {tg.x + 90 * u, tg.y}, Parch(), names[i]);
+            y += row_h;
+        }
+        ImGui::EndDisabled();
+        // game speed (BB_VARIABLE_DT only)
+        {
+            const bool sp = BB::VarDt::SpeedAvailable();
+            const ImVec2 r0{p0.x + 40 * u, y}, r1{p0.x + 40 * u + 68 * u, y + 34 * u};
+            bool hov = false;
+            if (Hit("##speed", r0, r1, &hov) && sp) {
+                cheat_focus = 4;
+                CheatAccept(4);
+            }
+            if (cheat_focus == 4 || hov) {
+                dl->AddRect({r0.x - 4 * u, r0.y - 4 * u}, {r1.x + 4 * u, r1.y + 4 * u}, Gold(0.5f),
+                            8 * u, 0, 2 * u);
+            }
+            dl->AddRect(r0, r1, Bronze(0.9f), 6 * u, 0, std::max(1.0f, u));
+            const std::string v = fmt::format("x{:.2f}", BB::VarDt::GameSpeed());
+            const ImVec2 ts = TextSize(g_ft_ui, 20 * u, v.c_str());
+            Txt(dl, g_ft_ui, 20 * u, {(r0.x + r1.x - ts.x) * 0.5f, (r0.y + r1.y - ts.y) * 0.5f},
+                sp ? Parch() : Muted(0.6f), v.c_str());
+            Txt(dl, g_ft_text, 28 * u, {r0.x + 90 * u, y}, sp ? Parch() : Muted(0.6f),
+                sp ? "Velocidad del juego (izquierda / derecha)"
+                   : "Velocidad del juego: requiere BB_VARIABLE_DT=1");
+            y += row_h + 16 * u;
+        }
+        // echoes / insight
+        const bool can_add = ok && st.in_game;
+        const float bw = 230 * u, bh = 58 * u;
+        static const char* labels[4] = {"+10.000", "+100.000", "+1", "+10"};
+        for (int r = 0; r < 2; r++) {
+            Txt(dl, g_ft_text, 28 * u, {p0.x + 40 * u, y + 12 * u}, can_add ? Parch() : Muted(0.6f),
+                r == 0 ? "Ecos de sangre" : "Percepción");
+            for (int k = 0; k < 2; k++) {
+                const int row = 5 + r * 2 + k;
+                const float x = p0.x + 420 * u + k * (bw + 24 * u);
+                const std::string id = std::string("##add") + std::to_string(row);
+                if (CardButton(id.c_str(), {x, y}, {x + bw, y + bh}, labels[r * 2 + k], u,
+                               cheat_focus == row) &&
+                    can_add) {
+                    cheat_focus = row;
+                    CheatAccept(row);
+                }
+            }
+            y += bh + 18 * u;
+        }
+        Txt(dl, g_ft_italic, 22 * u, {p0.x + 40 * u, y + 6 * u}, Muted(0.85f),
+            "Todo se aplica al momento y se desactiva al cerrar el emulador.");
     }
 
     // ------------------------------------------------------------ Salir

@@ -13,6 +13,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
+#include "core/bb_cheats.h"
 #include "core/bb_vardt.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -168,6 +169,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
         LOG_WARNING(Lib_VideoOut, "flipmode = {}", flipMode);
     }
     BB::VarDt::OnGuestFlip(flipMode);
+    BB::Cheats::OnGuestFlip();
 
     if (bufferIndex < -1 || bufferIndex > 15) {
         LOG_ERROR(Lib_VideoOut, "Invalid bufferIndex = {}", bufferIndex);

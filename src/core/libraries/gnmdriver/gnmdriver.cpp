@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
+#include "core/bb_cheats.h"
 #include "core/bb_vardt.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -2382,6 +2383,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
     BB::NativeMv::OnGuestFlip();
     BB::VarDt::OnGuestFlip(static_cast<int>(flip_mode));
+    BB::Cheats::OnGuestFlip();
 
     if (count != 0) {
         if (!dcb_gpu_addrs) {
