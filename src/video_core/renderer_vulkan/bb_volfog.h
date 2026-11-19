@@ -78,6 +78,13 @@ public:
     // The composite draw: the frame's light draws are over.
     void FrameLightsDone();
     bool Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& why);
+    struct GameShadowGate {
+        vk::ImageView view{};
+        float far = 0.0f;
+    };
+    // The game's cascade visibility of this frame's inject (froxel grid, R16F 3D, 1 = lit), once
+    // per inject that resolved the cascades; false when there is none (no mask pass, interiors).
+    bool TakeGameShadowGate(GameShadowGate& g);
     bool Apply(vk::CommandBuffer cmd, const ApplyInput& in, const char*& why);
     void NoteSkip(const char* why);
     void NoteHdrReader(u64 ps_hash) {
@@ -138,6 +145,7 @@ private:
     std::array<Img, 2> scat;
     Img integ;
     bool fresh = true;
+    bool gate_ready = false;
 
     static constexpr u32 Ring = 8;
     static constexpr vk::DeviceSize ParamSize = 1024;

@@ -14,7 +14,8 @@
 // _PUDDLE (shininess, 0.85), _REFINE=0, _HOOK=<n>; BB_RT_DEBUG_VIEW=5/6/7 or F7 (debug).
 // No ray query / acceleration structures: nothing is created, the game renders as before.
 // BB_RT_VOLUMETRIC=1 / BB_RT_SHADOWS=1 (each independent of BB_RT_REFLECT) run in RunLighting,
-// before the composite draw, on their own depth mesh.
+// before the composite draw, on their own depth mesh. BB_RT_SHADOWS also needs BB_VOLFOG=1..3:
+// its occlusion is cancelled where the game's cascade shadow (the volfog froxel grid) is dark.
 #pragma once
 
 #include <array>
@@ -80,6 +81,10 @@ public:
         u32 scene_width, scene_height;
         // The previous scene render ran this pass too (no skipped frame): temporal history usable.
         bool history_ok;
+        // The game's cascade visibility grid of this frame (bb-volfog, TakeGameShadowGate).
+        bool gate_ok;
+        vk::ImageView gate_view;
+        float gate_far;
     };
     // Why RunLighting returned false (per-5 s counters in the rasterizer).
     enum class LightSkip : u8 {
@@ -320,7 +325,9 @@ private:
 
     // bb-rt-shadow state (BB_RT_SHADOWS=1).
     bool sh_on = false, sh_ok = false, sh_fresh = true;
-    float sh_strength = 0.6f, sh_cone = 0.02f, sh_dist = 80.0f;
+    float sh_strength = 0.6f, sh_radius = 0.0047f, sh_dist = 80.0f, sh_amb = 0.5f;
+    u32 sh_quality = 2, sh_rays = 2, sh_denoise = 2;
+    u64 sh_nogate = 0, sh_nogate_last = 0;
     u32 dbg_view = 0; // BB_RT_DEBUG_VIEW=1..4 (shadow mask, volumetric, depth, N.L); 5-7: reflections
     vk::DescriptorSetLayout sh_set{};
     vk::PipelineLayout sh_layout{};
@@ -334,7 +341,7 @@ private:
     u64 sh_dispatches = 0, sh_last_dispatches = 0;
     double sh_ms_sum = 0.0;
     u32 sh_ms_n = 0;
-    u32 sh_last_counts[2]{};
+    u32 sh_last_counts[6]{};
     bool sh_normal = false;
     float sh_used_dir[3]{};
     std::chrono::steady_clock::time_point sh_last_log{};

@@ -21,6 +21,7 @@
 #include "video_core/host_shaders/bb_rt_reflect_comp.h"
 #include "video_core/host_shaders/bb_rt_shadow_comp.h"
 #include "video_core/host_shaders/bb_rt_vol_comp.h"
+#include "video_core/renderer_vulkan/bb_volfog.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -124,6 +125,8 @@ struct alignas(16) ShParams {
     float misc2[4]; // temporal blend, far distance, y sign, G-buffer normals
     float view[16];
     float dbg[4];   // BB_RT_DEBUG_VIEW (x), 0: off
+    float rq[4];    // rays per pixel, denoise level, ambient / sun luminance ratio
+    float gate[4];  // end distance of the game's cascade-visibility grid (m)
 };
 static_assert(sizeof(ShParams) <= 512);
 
@@ -2148,7 +2151,10 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     if (vol_on && vol_ok) {
         GameFog();
     }
-    const bool sh_run = sh_on && sh_ok && dbg_view != 2 && have_light;
+    if (sh_on && sh_ok && dbg_view != 2 && have_light && !in.gate_ok) {
+        ++sh_nogate;
+    }
+    const bool sh_run = sh_on && sh_ok && dbg_view != 2 && have_light && in.gate_ok;
     const bool vol_view = dbg_view == 0 || dbg_view == 2 || (dbg_view == 3 && !sh_run);
     // BB_FOG_FX: wherever the game has fog (v0.y = 1/dist > 0), also when the density at the
     // camera height underflows (camera above the fog layer); level 0: density at the camera > 0.
@@ -2163,6 +2169,8 @@ bool RtReflect::RunLighting(vk::CommandBuffer cmd, const LightInput& in) {
     }
     if (sh_run) {
         Shadows(cmd, in, proj, inv, vd, rp, prev_p, cam_prev_ok, depth_info, normal_info);
+    } else if (sh_on && sh_ok) {
+        LogShadows();
     }
     if (vol_run) {
         const vk::MemoryBarrier2 cc{
@@ -2397,10 +2405,16 @@ bool RtReflect::InitShadows() {
     const auto device = instance.GetDevice();
     sh_strength = EnvFloat("BB_RT_SHADOWS_STRENGTH", 0.6f, 0.0f, 1.0f);
     dbg_view = DebugViewEnv() <= 4 ? DebugViewEnv() : 0u;
-    sh_cone = EnvFloat("BB_RT_SHADOWS_CONE", 0.02f, 0.0f, 0.2f);
+    sh_quality = u32(EnvFloat("BB_RT_SHADOWS_QUALITY", 2.0f, 1.0f, 3.0f) + 0.5f);
+    const float rays_def = sh_quality == 1 ? 1.0f : sh_quality == 2 ? 2.0f : 4.0f;
+    sh_rays = u32(EnvFloat("BB_RT_SHADOWS_RAYS", rays_def, 1.0f, 8.0f) + 0.5f);
+    sh_denoise = u32(EnvFloat("BB_RT_SHADOWS_DENOISE", 2.0f, 0.0f, 2.0f) + 0.5f);
+    const float radius_cone = EnvFloat("BB_RT_SHADOWS_CONE", 0.0047f, 0.0f, 0.1f);
+    sh_radius = EnvFloat("BB_RT_SHADOWS_RADIUS", radius_cone, 0.0f, 0.1f);
+    sh_amb = EnvFloat("BB_RT_SHADOWS_AMB", 0.5f, 0.0f, 4.0f);
     sh_dist = EnvFloat("BB_RT_SHADOWS_DIST", 80.0f, 2.0f, 1000.0f);
     constexpr auto C = vk::ShaderStageFlagBits::eCompute;
-    const std::array<vk::DescriptorSetLayoutBinding, 9> sb{{
+    const std::array<vk::DescriptorSetLayoutBinding, 10> sb{{
         {0, vk::DescriptorType::eCombinedImageSampler, 1, C},
         {1, vk::DescriptorType::eAccelerationStructureKHR, 1, C},
         {2, vk::DescriptorType::eUniformBuffer, 1, C},
@@ -2410,6 +2424,7 @@ bool RtReflect::InitShadows() {
         {6, vk::DescriptorType::eStorageImage, 1, C},
         {7, vk::DescriptorType::eStorageBuffer, 1, C},
         {8, vk::DescriptorType::eCombinedImageSampler, 1, C},
+        {9, vk::DescriptorType::eCombinedImageSampler, 1, C},
     }};
     auto [lr, l] = device.createDescriptorSetLayout({
         .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
@@ -2446,13 +2461,18 @@ bool RtReflect::InitShadows() {
     });
     if (qr == vk::Result::eSuccess) sh_queries = qp;
     sh_ok = true;
+    if (BB::VolFog::Level() == 0) {
+        LOG_WARNING(Render_Vulkan, "[rt-shadow] needs BB_VOLFOG=1..3 for the game's cascade gate: "
+                                   "without it the shadows never run");
+    }
     LOG_INFO(Render_Vulkan,
-             "[rt-shadow] ray-traced shadows ON: 1 ray/px toward the main directional light at "
-             "half the render size, cone {:.3f} rad, max {:.0f} units, temporal + 5x5 "
-             "depth-bilateral denoise; the lit scene sampled by the composite PS 0x3fe9e964 is "
-             "multiplied by 1 - {:.2f} x occlusion x saturate(4 N.L) (BB_RT_SHADOWS_STRENGTH). "
-             "Occluders: screen-space depth mesh only (off-screen / hidden geometry casts none)",
-             sh_cone, sh_dist, sh_strength);
+             "[rt-shadow] ray-traced shadows ON: quality {} = {} ray(s)/px toward the main "
+             "directional light at half the render size, angular radius {:.4f} rad, max {:.0f} "
+             "units, denoise {} (0 none, 1 temporal, 2 temporal + 5x5 bilateral), ambient / sun "
+             "{:.2f}; gated by the game's cascade visibility (bb-volfog). The lit scene sampled by "
+             "the composite PS 0x3fe9e964 is multiplied by 1 - {:.2f} x occlusion x facing x "
+             "direct share (BB_RT_SHADOWS_STRENGTH). Occluders: screen-space depth mesh only.",
+             sh_quality, sh_rays, sh_radius, sh_dist, sh_denoise, sh_amb, sh_strength);
     return true;
 }
 
@@ -2504,7 +2524,11 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
     sp.light[0] = lv[0];
     sp.light[1] = lv[1];
     sp.light[2] = lv[2];
-    sp.light[3] = sh_cone;
+    sp.light[3] = sh_radius;
+    sp.rq[0] = float(sh_rays);
+    sp.rq[1] = float(sh_denoise);
+    sp.rq[2] = sh_amb;
+    sp.gate[0] = in.gate_far;
     sp.misc[0] = sh_strength;
     sp.misc[1] = sh_dist;
     sp.misc[2] = float(sh_dispatches & 0xffff);
@@ -2573,7 +2597,8 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
         const vk::DescriptorImageInfo src_i{nearest, src.view, vk::ImageLayout::eGeneral};
         const vk::DescriptorImageInfo hist_i{linear, hst.view, vk::ImageLayout::eGeneral};
         const vk::DescriptorImageInfo dst_i{{}, dst.view, vk::ImageLayout::eGeneral};
-        const std::array<vk::WriteDescriptorSet, 9> wr{{
+        const vk::DescriptorImageInfo gate_i{linear, in.gate_view, vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 10> wr{{
             {.dstBinding = 0, .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &depth_info},
             {.pNext = &as_info, .dstBinding = 1, .descriptorCount = 1,
@@ -2593,14 +2618,20 @@ void RtReflect::Shadows(vk::CommandBuffer cmd, const LightInput& in, const float
             {.dstBinding = 8, .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eCombinedImageSampler,
              .pImageInfo = &normal_info},
+            {.dstBinding = 9, .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+             .pImageInfo = &gate_i},
         }};
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, sh_layout, 0, wr);
         cmd.pushConstants(sh_layout, vk::ShaderStageFlagBits::eCompute, 0, 4, &mode);
         cmd.dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
     };
-    pass(0, sacc[prv], sacc[prv], sraw, w, h);                               // trace
-    pass(1, sraw, sacc[prv], sacc[cur], w, h);                               // temporal
-    pass(2, sacc[cur], sacc[prv], sraw, in.scene_width, in.scene_height);    // denoise + apply
+    pass(0, sacc[prv], sacc[prv], sraw, w, h); // trace
+    if (sh_denoise >= 1) {
+        pass(1, sraw, sacc[prv], sacc[cur], w, h); // temporal
+    }
+    pass(2, sh_denoise >= 1 ? sacc[cur] : sraw, sacc[prv], sraw, in.scene_width,
+         in.scene_height); // denoise + apply
     if (sh_queries) {
         cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eComputeShader, sh_queries, slot * 2 + 1);
     }
@@ -2615,24 +2646,36 @@ void RtReflect::LogShadows() {
         return;
     }
     sh_last_log = now;
-    u32 c[2];
+    u32 c[6];
     std::memcpy(c, static_cast<const u32*>(counters.mapped) + 10, sizeof(c));
-    const u32 rays = c[0] - sh_last_counts[0], shadowed = c[1] - sh_last_counts[1];
-    sh_last_counts[0] = c[0];
-    sh_last_counts[1] = c[1];
+    u32 d[6];
+    for (u32 i = 0; i < 6; ++i) {
+        d[i] = c[i] - sh_last_counts[i];
+        sh_last_counts[i] = c[i];
+    }
+    const u32 rays = d[0], shadowed = d[1], traced = d[2];
+    const u64 nogate = sh_nogate - sh_nogate_last;
+    sh_nogate_last = sh_nogate;
+    const double px = double(sh_w) * sh_h * double(sh_dispatches - sh_last_dispatches);
     u64 lhash = 0;
     size_t lbytes = 0;
     BB::Upscale::RtLightSource(lhash, lbytes);
     LOG_INFO(Render_Vulkan,
-             "[rt-shadow] 5 s: {} dispatches, {}x{} trace, {} rays, {:.1f}% shadowed, GPU {:.3f} "
-             "ms per pass (whole lighting hook incl. mesh/AS build: {:.3f} ms), strength {:.2f}, "
+             "[rt-shadow] 5 s: quality {}, {} dispatches, {}x{} trace, {:.2f} rays/px ({} rays), "
+             "shadow term mean {:.3f} over {} facing px ({:.1f}% of px lit by the game), RT "
+             "occluded {:.1f}% of rays, double-shadow count {} (RT applied on game-shadowed px, "
+             "should be 0), gate missing {} frames, GPU {:.3f} ms per pass (lighting hook incl. "
+             "mesh/AS build: {:.3f} ms), radius {:.4f} rad, denoise {}, strength {:.2f}, "
              "normals {}; light dir world ({:.3f}, {:.3f}, {:.3f}) from {} (light CB last seen: "
              "shader {:#x}, {} B)",
-             sh_dispatches - sh_last_dispatches, sh_w, sh_h, rays,
-             rays ? 100.0 * shadowed / rays : 0.0, sh_ms_n ? sh_ms_sum / sh_ms_n : 0.0,
-             l_ms_n ? l_ms_sum / l_ms_n : 0.0, sh_strength,
-             sh_normal ? "G-buffer RT0" : "depth derivatives", sh_used_dir[0], sh_used_dir[1],
-             sh_used_dir[2], light_src, lhash, lbytes);
+             sh_quality, sh_dispatches - sh_last_dispatches, sh_w, sh_h,
+             px > 0.0 ? rays / px : 0.0, rays,
+             traced ? double(d[3]) / (1000.0 * traced) : 0.0, traced,
+             traced ? 100.0 * (traced - d[4]) / traced : 0.0,
+             rays ? 100.0 * shadowed / rays : 0.0, d[5], nogate,
+             sh_ms_n ? sh_ms_sum / sh_ms_n : 0.0, l_ms_n ? l_ms_sum / l_ms_n : 0.0, sh_radius,
+             sh_denoise, sh_strength, sh_normal ? "G-buffer RT0" : "depth derivatives",
+             sh_used_dir[0], sh_used_dir[1], sh_used_dir[2], light_src, lhash, lbytes);
     sh_last_dispatches = sh_dispatches;
     sh_ms_sum = 0.0;
     sh_ms_n = 0;

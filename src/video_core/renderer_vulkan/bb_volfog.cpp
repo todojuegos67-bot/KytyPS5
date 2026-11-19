@@ -1136,8 +1136,19 @@ void VolFog::InitImages(vk::CommandBuffer cmd) {
     hist_why = "start";
 }
 
+bool VolFog::TakeGameShadowGate(GameShadowGate& g) {
+    const bool ready = gate_ready && ok && vis.view;
+    gate_ready = false;
+    if (ready) {
+        g.view = vis.view;
+        g.far = far_dist;
+    }
+    return ready;
+}
+
 bool VolFog::Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& why) {
     why = "none";
+    gate_ready = false;
     if (!Init()) {
         why = "off";
         return false;
@@ -1227,6 +1238,7 @@ bool VolFog::Inject(vk::CommandBuffer cmd, const InjectInput& in, const char*& w
         cmd.pipelineBarrier2(
             vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &AllBefore});
     }
+    gate_ready = true;
     ++n_inject;
     return true;
 }

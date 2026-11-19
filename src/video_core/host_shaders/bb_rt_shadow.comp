@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bb-rt-shadow (BB_RT_SHADOWS=1): ray-traced shadows of the main directional light against the
 // screen-space depth-mesh TLAS, applied to the lit scene before the game's composite.
-//   mode 0  trace at the trace size: one ray per pixel from the depth-reconstructed position
-//           toward the light, direction jittered inside a small cone (per pixel and frame).
-//           Output (visibility 0..1, facing = saturate(N.L * 4), -, view distance).
+//   mode 0  trace at the trace size: BB_RT_SHADOWS_RAYS rays per pixel from the depth-reconstructed
+//           position toward the light, each in a disc of the light's angular radius. The game's
+//           own cascade visibility (bb-volfog froxel grid, gate_tex) cancels the occlusion where
+//           the game is already in shadow; facing x direct share limits it to the sun's part.
+//           Output: r visibility after the gate, g facing x direct share, b game lit, a distance.
 //   mode 1  temporal: reprojected history (previous camera, distance-checked), else current.
-//   mode 2  joint-bilateral 5x5 denoise + upsample to the scene size; the lit scene is
-//           multiplied by 1 - strength * (1 - visibility) * facing.
+//   mode 2  joint-bilateral denoise (5x5 with denoise 2, none below) + upsample to the scene size.
+//           Neighbours of another game-lit state get no weight. The lit scene is multiplied by
+//           1 - strength * (1 - visibility) * facing.
 #version 460
 #extension GL_EXT_ray_query : require
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -19,21 +22,25 @@ layout(std140, binding = 2) uniform Params {
     mat4 reproj;     // current view -> previous view
     mat4 prev_proj;
     uvec4 size;      // trace w, h, scene w, h
-    vec4 light;      // view-space direction toward the light, cone half-angle (rad)
+    vec4 light;      // view-space direction toward the light, angular radius (rad)
     vec4 misc;       // strength, max ray length, frame, history valid
     vec4 misc2;      // temporal blend, far distance, y sign, normal source (1: G-buffer)
     mat4 view;       // world -> view (G-buffer normals)
     vec4 dbg;        // x: BB_RT_DEBUG_VIEW (1 shadow mask, 3 chosen depth, 4 N.L facing), 0 off
+    vec4 rq;         // x rays per pixel, y denoise (0 none, 1 temporal, 2 + bilateral),
+                     // z ambient / sun luminance ratio (direct share)
+    vec4 gate;       // x end distance (m) of the game's cascade-visibility grid
 } p;
 layout(binding = 3) uniform sampler2D src_tex;
 layout(binding = 4) uniform sampler2D hist_tex;
 layout(binding = 5, rgba16f) uniform writeonly image2D dst;
 layout(binding = 6, rgba16f) uniform image2D scene;
-layout(std430, binding = 7) buffer Counters { uint n[16]; } cnt; // [10] rays, [11] shadowed
+layout(std430, binding = 7) buffer Counters { uint n[16]; } cnt; // [10..14] stats, [15] double
 layout(binding = 8) uniform sampler2D normal_tex;
+layout(binding = 9) uniform sampler3D gate_tex;
 layout(push_constant) uniform Push { uint mode; } pc;
 
-shared uint s_n[2];
+shared uint s_n[5];
 
 ivec2 DepthPx(ivec2 px) {
     ivec2 dsz = textureSize(depth_tex, 0);
@@ -54,6 +61,14 @@ vec3 Unproject(ivec2 px, out float dist) {
     return r;
 }
 
+float GameLit(ivec2 px, float dist) {
+    if (dist <= 0.0 || dist > p.gate.x) {
+        return 1.0;
+    }
+    vec3 uvw = vec3((vec2(px) + 0.5) / vec2(p.size.xy), sqrt(dist / p.gate.x));
+    return clamp(textureLod(gate_tex, uvw, 0.0).r, 0.0, 1.0);
+}
+
 uint Hash(uint x) {
     x ^= x >> 16; x *= 0x7feb352du;
     x ^= x >> 15; x *= 0x846ca68bu;
@@ -62,16 +77,16 @@ uint Hash(uint x) {
 }
 
 void main() {
-    if (gl_LocalInvocationIndex < 2u) {
+    if (gl_LocalInvocationIndex < 5u) {
         s_n[gl_LocalInvocationIndex] = 0u;
     }
     barrier();
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    uint nr = 0u, nsh = 0u;
+    uint nr = 0u, nsh = 0u, ntr = 0u, nsum = 0u, ndark = 0u;
     if (pc.mode == 0u && all(lessThan(c, ivec2(p.size.xy)))) {
         float dist;
         vec3 P = Unproject(c, dist);
-        vec4 o = vec4(1.0, 0.0, 0.0, -1.0);
+        vec4 o = vec4(1.0, 0.0, 1.0, -1.0);
         if (dist > 0.0) {
             float d1, d2, d3, d4;
             vec3 px1 = Unproject(c + ivec2(1, 0), d1);
@@ -103,37 +118,47 @@ void main() {
             vec3 L = p.light.xyz;
             float ndl = dot(N, L);
             float facing = clamp(ndl * 4.0, 0.0, 1.0);
+            float lit = GameLit(c, dist);
             float vis = 1.0;
-            if (facing > 0.0) {
-                // Cone jitter: interleaved gradient noise + per-frame rotation.
-                uint h = Hash(uint(c.x) * 1973u + uint(c.y) * 9277u + uint(p.misc.z) * 26699u);
-                float u1 = float(h & 0xffffu) / 65536.0;
-                float u2 = float(h >> 16) / 65536.0;
+            if (facing > 0.0 && lit > 0.0) {
                 vec3 t = normalize(abs(L.y) < 0.99 ? cross(L, vec3(0.0, 1.0, 0.0))
                                                    : cross(L, vec3(1.0, 0.0, 0.0)));
                 vec3 b = cross(L, t);
-                float r = p.light.w * sqrt(u1);
-                float a = 6.2831853 * u2;
-                vec3 D = normalize(L + (t * cos(a) + b * sin(a)) * r);
                 // The mesh is coarse (cells of a few pixels): offset along the normal and
                 // start a distance-proportional bit away to avoid self-shadowing.
                 vec3 O = P + N * (0.03 + 0.004 * dist);
-                rayQueryEXT rq;
-                rayQueryInitializeEXT(rq, tlas,
-                                      gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                                      0xFF, O, 0.05 + 0.01 * dist, D, p.misc.y);
-                while (rayQueryProceedEXT(rq)) {
+                uint occ = 0u;
+                const int rays = clamp(int(p.rq.x + 0.5), 1, 8);
+                for (int r = 0; r < rays; ++r) {
+                    uint h = Hash(uint(c.x) * 1973u + uint(c.y) * 9277u +
+                                  uint(p.misc.z) * 26699u + uint(r) * 7919u);
+                    float u1 = float(h & 0xffffu) / 65536.0;
+                    float u2 = float(h >> 16) / 65536.0;
+                    float a = 6.2831853 * u2;
+                    vec3 D = normalize(L + (t * cos(a) + b * sin(a)) * (p.light.w * sqrt(u1)));
+                    rayQueryEXT rq;
+                    rayQueryInitializeEXT(rq, tlas,
+                                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                          0xFF, O, 0.05 + 0.01 * dist, D, p.misc.y);
+                    while (rayQueryProceedEXT(rq)) {
+                    }
+                    if (rayQueryGetIntersectionTypeEXT(rq, true) !=
+                        gl_RayQueryCommittedIntersectionNoneEXT) {
+                        ++occ;
+                    }
+                    ++nr;
                 }
-                vis = rayQueryGetIntersectionTypeEXT(rq, true) ==
-                              gl_RayQueryCommittedIntersectionNoneEXT
-                          ? 1.0
-                          : 0.0;
-                ++nr;
-                if (vis < 0.5) {
-                    ++nsh;
-                }
+                nsh += occ;
+                vis = 1.0 - float(occ) / float(rays);
             }
-            o = vec4(vis, facing, 0.0, dist);
+            float vis_eff = 1.0 - lit * (1.0 - vis);
+            float share = ndl > 0.0 ? ndl * (1.0 + p.rq.z) / (ndl + p.rq.z) : 0.0;
+            if (facing > 0.0) {
+                ntr = 1u;
+                nsum = uint(1000.0 * (1.0 - vis_eff));
+                ndark = lit < 0.5 ? 1u : 0u;
+            }
+            o = vec4(vis_eff, facing * share, lit, dist);
         }
         imageStore(dst, c, o);
     } else if (pc.mode == 1u && all(lessThan(c, ivec2(p.size.xy)))) {
@@ -187,9 +212,10 @@ void main() {
             imageStore(scene, c, vec4(vec3(ref.a > 0.0 ? clamp(ref.g, 0.0, 1.0) : 0.0), 1.0));
         }
         if (ref.a > 0.0 && dv != 3 && dv != 4) {
+            const int rad = p.rq.y >= 1.5 ? 2 : 0;
             float sum = 0.0, ws = 0.0, fsum = 0.0;
-            for (int y = -2; y <= 2; ++y) {
-                for (int x = -2; x <= 2; ++x) {
+            for (int y = -rad; y <= rad; ++y) {
+                for (int x = -rad; x <= rad; ++x) {
                     ivec2 q = clamp(hc + ivec2(x, y), ivec2(0), ivec2(p.size.xy) - 1);
                     vec4 s = texelFetch(src_tex, q, 0);
                     if (s.a <= 0.0) {
@@ -197,7 +223,8 @@ void main() {
                     }
                     vec2 dd = vec2(q) + 0.5 - hp;
                     float w = exp(-dot(dd, dd) * 0.25) *
-                              exp(-abs(s.a - ref.a) / (0.01 * ref.a + 0.03));
+                              exp(-abs(s.a - ref.a) / (0.01 * ref.a + 0.03)) *
+                              exp(-abs(s.b - ref.b) * 8.0);
                     sum += s.r * w;
                     fsum += s.g * w;
                     ws += w;
@@ -211,6 +238,9 @@ void main() {
                 // Shadow mask: the multiplier the scene would get (white lit, dark shadowed).
                 imageStore(scene, c, vec4(vec3(1.0 - k), 1.0));
             } else if (k > 0.0) {
+                if (ref.b < 0.5) {
+                    atomicAdd(cnt.n[15], 1u);
+                }
                 vec4 sc = imageLoad(scene, c);
                 imageStore(scene, c, vec4(sc.rgb * (1.0 - k), sc.a));
             }
@@ -222,8 +252,13 @@ void main() {
         atomicAdd(s_n[0], nr);
         atomicAdd(s_n[1], nsh);
     }
+    if (ntr != 0u) {
+        atomicAdd(s_n[2], ntr);
+        atomicAdd(s_n[3], nsum);
+        atomicAdd(s_n[4], ndark);
+    }
     barrier();
-    if (gl_LocalInvocationIndex < 2u && pc.mode == 0u) {
+    if (gl_LocalInvocationIndex < 5u && pc.mode == 0u) {
         atomicAdd(cnt.n[10 + gl_LocalInvocationIndex], s_n[gl_LocalInvocationIndex]);
     }
 }

@@ -1071,6 +1071,8 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     VideoCore::Image* dimg = use_copy ? zcopy : depth;
     VideoCore::ImageViewInfo cvv{};
     cvv.format = vk::Format::eR32Sfloat;
+    BB::VolFog::GameShadowGate gate{};
+    const bool gate_ok = bb_volfog && bb_volfog->TakeGameShadowGate(gate);
     const BB::RtReflect::LightInput in{
         .depth = dimg->GetImage(),
         .depth_view = *dimg->FindView(use_copy ? cvv : dv, false).image_view,
@@ -1089,6 +1091,9 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
         .scene_width = scene->info.size.width,
         .scene_height = scene->info.size.height,
         .history_ok = history_ok,
+        .gate_ok = gate_ok,
+        .gate_view = gate.view,
+        .gate_far = gate.far,
     };
     if (bb_rt_reflect->RunLighting(cmd, in)) {
         last_scene = scene_addr;
