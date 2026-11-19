@@ -74,6 +74,8 @@ add_host_shader(bb_volfog.comp bb_volfog_measure_comp VF_PASS=4)
 add_host_shader(bb_volfog.comp bb_volfog_measure_r11_comp VF_PASS=4 HDR_R11=1)
 add_host_shader(bb_pt_gather.comp bb_pt_gather_comp)
 add_host_shader(bb_pt_view.comp bb_pt_view_comp)
+add_host_shader(bb_pt_gi_trace.comp bb_pt_gi_trace_comp)
+add_host_shader(bb_pt_gi_accum.comp bb_pt_gi_accum_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)

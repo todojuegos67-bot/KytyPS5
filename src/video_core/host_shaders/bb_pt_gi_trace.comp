@@ -1,0 +1,163 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// bb-pathtrace GI (bb_pt_gi.h), pass 1 of 2: per pixel, the primary hit of the frame's view-space
+// triangles, then BB_PT_GI_SPP cosine-weighted paths of up to BB_PT_GI_BOUNCES segments. A segment
+// hit that the camera sees (no triangle between the camera and the hit) and that lies on screen
+// returns the presented game frame at its projection as radiance (the screen radiance cache). A
+// hit that is occluded or off screen continues the path with the neutral albedo as throughput.
+// A miss (no sky in this port) contributes nothing. Writes the raw radiance and the primary hit's
+// view z for the accumulation pass.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene_tlas;
+layout(std430, set = 0, binding = 1) readonly buffer Soup {
+    float soup[];
+};
+layout(set = 0, binding = 2) uniform sampler2D game;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D raw_out;
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D z_out;
+
+layout(push_constant) uniform Constants {
+    float p00;
+    float p11;
+    float p02;
+    float p12;
+    uint width;
+    uint height;
+    uint spp;
+    uint bounces;
+    uint seed;
+    float radiance_clamp;
+    float bias;
+    uint game_srgb;
+};
+
+const float NeutralAlbedo = 0.8;
+
+uint Hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float Rand(inout uint state) {
+    state = Hash(state);
+    return float(state) * (1.0 / 4294967296.0);
+}
+
+vec3 TriangleNormal(uint prim) {
+    const uint base = prim * 9u;
+    const vec3 v0 = vec3(soup[base], soup[base + 1u], soup[base + 2u]);
+    const vec3 v1 = vec3(soup[base + 3u], soup[base + 4u], soup[base + 5u]);
+    const vec3 v2 = vec3(soup[base + 6u], soup[base + 7u], soup[base + 8u]);
+    const vec3 face = cross(v1 - v0, v2 - v0);
+    return dot(face, face) < 1e-20 ? vec3(0.0) : normalize(face);
+}
+
+vec3 CosineDirection(vec3 n, inout uint state) {
+    const float u1 = Rand(state);
+    const float u2 = Rand(state);
+    const float r = sqrt(u1);
+    const float phi = 6.2831853 * u2;
+    const vec3 helper = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    const vec3 t = normalize(cross(n, helper));
+    const vec3 b = cross(n, t);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+}
+
+float SrgbToLinear(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// True when the camera sees h: no triangle between the camera (the origin) and h.
+bool CameraSees(vec3 h) {
+    const float d = length(h);
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene_tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                          0xFFu, vec3(0.0), 0.0, h / d, d * 0.99);
+    while (rayQueryProceedEXT(rq)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// The presented frame at h's projection; false when h is behind the camera or off screen.
+bool GameRadiance(vec3 h, out vec3 rad) {
+    if (h.z >= -1e-4) {
+        return false;
+    }
+    const vec2 ndc = vec2((p00 * h.x + p02 * h.z) / -h.z, (p11 * h.y + p12 * h.z) / -h.z);
+    if (any(greaterThan(abs(ndc), vec2(1.0)))) {
+        return false;
+    }
+    const ivec2 size = textureSize(game, 0);
+    const ivec2 texel = clamp(ivec2((ndc * 0.5 + 0.5) * vec2(size)), ivec2(0), size - 1);
+    rad = texelFetch(game, texel, 0).rgb;
+    if (game_srgb != 0u) {
+        rad = vec3(SrgbToLinear(rad.r), SrgbToLinear(rad.g), SrgbToLinear(rad.b));
+    }
+    return all(greaterThanEqual(rad, vec3(0.0))) && all(lessThan(rad, vec3(1e30)));
+}
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(width) || px.y >= int(height)) {
+        return;
+    }
+    const vec2 ndc = (vec2(px) + 0.5) / vec2(float(width), float(height)) * 2.0 - 1.0;
+    const vec3 dir = normalize(vec3((ndc.x + p02) / p00, (ndc.y + p12) / p11, -1.0));
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, scene_tlas, gl_RayFlagsOpaqueEXT, 0xFFu, vec3(0.0), 0.001, dir,
+                          1.0e4);
+    while (rayQueryProceedEXT(rq)) {
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        imageStore(raw_out, px, vec4(0.0));
+        imageStore(z_out, px, vec4(0.0));
+        return;
+    }
+    const vec3 p = dir * rayQueryGetIntersectionTEXT(rq, true);
+    vec3 n = TriangleNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true)));
+    if (dot(n, dir) > 0.0) {
+        n = -n;
+    }
+
+    uint state = (uint(px.x) * 1973u + uint(px.y) * 9277u + seed * 26699u) | 1u;
+    vec3 sum = vec3(0.0);
+    for (uint s = 0u; s < spp; ++s) {
+        vec3 origin = p + n * bias;
+        vec3 ray_dir = CosineDirection(n, state);
+        vec3 throughput = vec3(1.0);
+        for (uint b = 0u; b < bounces; ++b) {
+            rayQueryEXT pq;
+            rayQueryInitializeEXT(pq, scene_tlas, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 0.0,
+                                  ray_dir, 1.0e4);
+            while (rayQueryProceedEXT(pq)) {
+            }
+            if (rayQueryGetIntersectionTypeEXT(pq, true) !=
+                gl_RayQueryCommittedIntersectionTriangleEXT) {
+                break;
+            }
+            const vec3 h = origin + ray_dir * rayQueryGetIntersectionTEXT(pq, true);
+            vec3 hn = TriangleNormal(uint(rayQueryGetIntersectionPrimitiveIndexEXT(pq, true)));
+            if (dot(hn, ray_dir) > 0.0) {
+                hn = -hn;
+            }
+            vec3 rad;
+            if (GameRadiance(h, rad) && CameraSees(h)) {
+                sum += throughput * clamp(rad, vec3(0.0), vec3(radiance_clamp));
+                break;
+            }
+            throughput *= NeutralAlbedo;
+            origin = h + hn * bias;
+            ray_dir = CosineDirection(hn, state);
+        }
+    }
+    imageStore(raw_out, px, vec4(sum / float(spp), 1.0));
+    imageStore(z_out, px, vec4(p.z));
+}

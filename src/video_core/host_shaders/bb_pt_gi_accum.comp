@@ -1,0 +1,120 @@
+#version 460
+
+// bb-pathtrace GI (bb_pt_gi.h), pass 2 of 2: temporal accumulation and apply. Each pixel's
+// primary point is reprojected into the previous frame with the transform m (previous view times
+// the inverse of the current view). Four bilinear taps of the previous history are accepted when
+// their stored view z agrees (5 % + 0.02) with the reprojected z. The new history is
+// mix(history, raw, 1 / (min(count, max) + 1)), count = min(count + 1, max). The output is the lit
+// view plus the albedo times the accumulated indirect term, scaled by the strength.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D raw_tex;
+layout(set = 0, binding = 1) uniform sampler2D z_tex;
+layout(set = 0, binding = 2) uniform sampler2D hist_prev;
+layout(set = 0, binding = 3) uniform sampler2D z_prev;
+layout(set = 0, binding = 4) uniform sampler2D lit_tex;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D hist_out;
+layout(set = 0, binding = 6, r32f) uniform writeonly image2D z_out;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D final_out;
+
+layout(push_constant) uniform Constants {
+    vec4 m0;
+    vec4 m1;
+    vec4 m2;
+    float p00p;
+    float p11p;
+    float p02p;
+    float p12p;
+    float p00;
+    float p11;
+    float p02;
+    float p12;
+    uint width;
+    uint height;
+    float max_history;
+    uint cut;
+    float strength;
+};
+
+const float NeutralAlbedo = 0.8;
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(width) || px.y >= int(height)) {
+        return;
+    }
+    const vec4 lit = texelFetch(lit_tex, px, 0);
+    const float z = texelFetch(z_tex, px, 0).r;
+    if (!(z < 0.0)) {
+        imageStore(hist_out, px, vec4(0.0));
+        imageStore(z_out, px, vec4(0.0));
+        imageStore(final_out, px, lit);
+        return;
+    }
+    const vec2 ndc = (vec2(px) + 0.5) / vec2(float(width), float(height)) * 2.0 - 1.0;
+    const vec3 p = vec3(-z * (ndc.x + p02) / p00, -z * (ndc.y + p12) / p11, z);
+    const vec3 raw = texelFetch(raw_tex, px, 0).rgb;
+
+    vec3 hist_rgb = vec3(0.0);
+    float hist_count = 0.0;
+    bool have = cut == 0u;
+    if (have) {
+        const vec3 q = vec3(dot(m0.xyz, p) + m0.w, dot(m1.xyz, p) + m1.w, dot(m2.xyz, p) + m2.w);
+        if (q.z < 0.0) {
+            const vec2 pn = vec2((p00p * q.x + p02p * q.z) / -q.z,
+                                 (p11p * q.y + p12p * q.z) / -q.z);
+            const vec2 f = (pn * 0.5 + 0.5) * vec2(float(width), float(height)) - 0.5;
+            const ivec2 base = ivec2(floor(f));
+            const vec2 t = f - vec2(base);
+            const ivec2 limit = ivec2(width, height);
+            vec3 sum = vec3(0.0);
+            float csum = 0.0;
+            float wsum = 0.0;
+            for (int j = 0; j < 2; ++j) {
+                for (int i = 0; i < 2; ++i) {
+                    const ivec2 tap = base + ivec2(i, j);
+                    if (any(lessThan(tap, ivec2(0))) || any(greaterThanEqual(tap, limit))) {
+                        continue;
+                    }
+                    const float zp = texelFetch(z_prev, tap, 0).r;
+                    const vec4 hp = texelFetch(hist_prev, tap, 0);
+                    if (!(hp.a > 0.0) || !(zp < 0.0) || zp < -1e30) {
+                        continue;
+                    }
+                    if (abs(zp - q.z) > 0.05 * abs(q.z) + 0.02) {
+                        continue;
+                    }
+                    const float w = (i == 0 ? 1.0 - t.x : t.x) * (j == 0 ? 1.0 - t.y : t.y);
+                    sum += hp.rgb * w;
+                    csum += hp.a * w;
+                    wsum += w;
+                }
+            }
+            if (wsum > 1e-4) {
+                hist_rgb = sum / wsum;
+                hist_count = csum / wsum;
+                have = true;
+            } else {
+                have = false;
+            }
+        } else {
+            have = false;
+        }
+    }
+
+    vec3 accumulated = raw;
+    float count = 1.0;
+    if (have) {
+        const float w = 1.0 / (min(hist_count, max_history) + 1.0);
+        accumulated = mix(hist_rgb, raw, w);
+        count = min(hist_count + 1.0, max_history);
+    }
+    imageStore(hist_out, px, vec4(accumulated, count));
+    imageStore(z_out, px, vec4(z));
+    if (any(isnan(accumulated)) || any(isinf(accumulated))) {
+        imageStore(final_out, px, lit);
+        return;
+    }
+    imageStore(final_out, px, vec4(lit.rgb + NeutralAlbedo * strength * accumulated, 1.0));
+}
