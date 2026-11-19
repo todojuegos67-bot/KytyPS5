@@ -258,7 +258,8 @@ bool Tracer::MakeScene() {
         pc.get<vk::PhysicalDeviceAccelerationStructurePropertiesKHR>()
             .minAccelerationStructureScratchOffsetAlignment,
         256);
-    tlas_scratch = (std::max(bsz.buildScratchSize, bsz.updateScratchSize) + align - 1) / align * align;
+    const vk::DeviceSize blas_scratch = std::max(bsz.buildScratchSize, bsz.updateScratchSize);
+    tlas_scratch = (blas_scratch + align - 1) / align * align;
     if (!MakeBuffer(blas_buf, bsz.accelerationStructureSize, U::eAccelerationStructureStorageKHR,
                     false) ||
         !MakeBuffer(tlas_buf, tsz.accelerationStructureSize, U::eAccelerationStructureStorageKHR,
