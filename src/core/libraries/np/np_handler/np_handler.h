@@ -73,6 +73,25 @@ public:
 
     static NpHandler& GetInstance();
 
+    // Read-only view for the F1 menu's MULTIJUGADOR card (Bloodborne co-op). Only data the
+    // network code really has; unknown values are left at -1 / empty.
+    enum class CoopServerState { Off, Connecting, Connected, Error };
+    struct CoopPeer {
+        std::string name;    // online id
+        bool is_owner = false;
+        bool active = false; // matching2 signaling connection established
+        s32 ping_ms = -1;
+    };
+    struct CoopSnapshot {
+        CoopServerState server = CoopServerState::Off;
+        s32 error_code = 0; // ShadNet::ShadNetState of the last failure
+        std::string npid;
+        bool in_room = false;
+        bool is_owner = false;
+        std::vector<CoopPeer> peers;
+    };
+    CoopSnapshot GetCoopSnapshot() const;
+
     NpHandler(const NpHandler&) = delete;
     NpHandler& operator=(const NpHandler&) = delete;
 
@@ -526,6 +545,8 @@ private:
 
     // Worker thread
     std::atomic<bool> m_initialized{false};
+    std::atomic<int> m_coop_server_state{0}; // CoopServerState
+    std::atomic<s32> m_coop_error{0};
     std::atomic<bool> m_worker_running{false};
     std::thread m_worker_thread;
 

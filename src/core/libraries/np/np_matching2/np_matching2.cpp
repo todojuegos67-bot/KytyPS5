@@ -6,7 +6,9 @@
 #include <cstring>
 #include <memory>
 #include <fmt/format.h>
+#include "common/arch.h"
 #include "common/logging/log.h"
+#include "core/bloodborne_re.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -414,6 +416,13 @@ int PS4_SYSV_ABI sceNpMatching2LeaveRoom(OrbisNpMatching2ContextId ctxId,
         LOG_ERROR(Lib_NpMatching2, "request or requestId null");
         return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     }
+
+#if defined(ARCH_X86_64) && (defined(__clang__) || defined(__GNUC__))
+    // Bloodborne co-op RE trace (shadp2p); returns at once unless its hooks are installed.
+    const auto return_address = reinterpret_cast<std::uintptr_t>(
+        __builtin_extract_return_addr(__builtin_return_address(0)));
+    Core::Bloodborne::TraceMatching2LeaveRoom(return_address, request->roomId);
+#endif
     auto ctx = NpHandler::GetInstance().GetMatching2ContextManager().Get(ctxId);
     if (!ctx) {
         LOG_ERROR(Lib_NpMatching2, "invalid context id");

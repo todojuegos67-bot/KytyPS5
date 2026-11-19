@@ -238,6 +238,7 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
     LOG_INFO(NpHandler, "Connecting user_id={} npid='{}' to {}:{} (timeout {}s)", user_id, npid,
              host, port, ShadNet::SHAD_CONNECT_TIMEOUT_MS / 1000);
 
+    m_coop_server_state = static_cast<int>(CoopServerState::Connecting);
     auto client = std::make_shared<ShadNet::ShadNetClient>();
 
     // Wire per-user notification callbacks
@@ -310,6 +311,8 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
                   static_cast<int>(conn_state));
         handle_protocol_mismatch(conn_state);
         client->Stop();
+        m_coop_error = static_cast<s32>(conn_state);
+        m_coop_server_state = static_cast<int>(CoopServerState::Error);
         return false;
     }
 
@@ -319,6 +322,8 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
                   static_cast<int>(auth_state));
         handle_protocol_mismatch(auth_state);
         client->Stop();
+        m_coop_error = static_cast<s32>(auth_state);
+        m_coop_server_state = static_cast<int>(CoopServerState::Error);
         return false;
     }
 
@@ -341,6 +346,7 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
         m_clients[user_id] = std::move(client);
     }
 
+    m_coop_server_state = static_cast<int>(CoopServerState::Connected);
     FireStateCallback(user_id, NpManager::OrbisNpState::SignedIn);
     return true;
 }
@@ -427,6 +433,9 @@ void NpHandler::DisconnectUser(s32 user_id) {
             return;
         client = std::move(it->second);
         m_clients.erase(it);
+        if (m_clients.empty()) {
+            m_coop_server_state = static_cast<int>(CoopServerState::Off);
+        }
     }
     {
         std::lock_guard lock(m_mutex_friend_state);
@@ -485,6 +494,7 @@ void NpHandler::MarkForReconnect(s32 user_id) {
     constexpr auto kInitialBackoff = std::chrono::milliseconds(2000);
     std::lock_guard lock(m_mutex_clients);
     auto& st = m_reconnect[user_id];
+    m_coop_server_state = static_cast<int>(CoopServerState::Connecting);
     st.backoff = kInitialBackoff;
     st.next_attempt = std::chrono::steady_clock::now() + st.backoff;
 }

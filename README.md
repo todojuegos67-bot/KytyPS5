@@ -209,3 +209,11 @@ A few noteworthy teams/projects who've helped us along the way are:
 # License
 
 - [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+
+## Credits: Bloodborne co-op
+
+The Bloodborne co-op networking (seamless co-op guest patches and RE trace in
+`src/core/bloodborne_re.*`, the guest code hook in `src/core/cpu_patches.cpp`, the
+summon-route and path-prefix host overrides in `libSceHttp`, and the `--user-id` /
+`--cache-dir` options) is ported from [shadp2p](https://github.com/Wozzardman/shadp2p)
+by Wozzardman, a shadPS4 fork, GPL-2.0-or-later (see `LICENSES/GPL-2.0-or-later.txt`).

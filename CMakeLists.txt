@@ -663,6 +663,7 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_partner.h
             src/core/libraries/np/object_manager.h
             src/core/libraries/np/np_handler/np_handler.cpp
+            src/core/libraries/np/np_handler/np_handler_coop.cpp
             src/core/libraries/np/np_handler/np_handler.h
             src/core/libraries/np/np_handler/np_handler_friends.cpp
             src/core/libraries/np/np_handler/np_handler_auth.cpp
@@ -1021,6 +1022,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/bb_kbmcam.h
          src/core/bb_respatch.h
          src/core/bb_cheats.cpp
+         src/core/bb_coop_config.cpp
+         src/core/bb_coop_config.h
          src/core/bb_cheats.h
          src/core/bb_vardt.cpp
          src/core/bb_vardt.h
@@ -1046,6 +1049,8 @@ set(CORE src/core/aerolib/stubs.cpp
 
 if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
+             src/core/bloodborne_re.cpp
+             src/core/bloodborne_re.h
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
              ${FIBER_LIB})

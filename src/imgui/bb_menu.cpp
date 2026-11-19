@@ -7,6 +7,7 @@
 // and raton.png with clickable spots; trophy page; trophy popup card and chime of trophy.cpp).
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -30,7 +31,11 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/arch.h"
 #include "core/bb_cheats.h"
+#include "core/bb_coop_config.h"
+#include "core/bloodborne_re.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/bb_vardt.h"
 #include "core/emulator_settings.h"
 #include "imgui/bb_menu.h"
@@ -2540,8 +2545,17 @@ bool WriteDirect(bool on) {
 // (bb-menu-121) F1 opens a full-screen hub (Mando, Teclado y ratón, Trofeos, Opciones, Salir
 // del juego); a card opens only its own screen, Volver (Circle / Esc) goes back to the hub.
 // (bb-cheats) Trucos (core/bb_cheats.h) between Opciones and Salir.
-enum class Screen { Hub = -1, Pad = 0, Kbm = 1, Trophies = 2, Options = 3, Cheats = 4, Exit = 5 };
-constexpr int kCards = 6;
+enum class Screen {
+    Hub = -1,
+    Pad = 0,
+    Kbm = 1,
+    Trophies = 2,
+    Options = 3,
+    Cheats = 4,
+    Coop = 5,
+    Exit = 6
+};
+constexpr int kCards = 7;
 // (bb-cheats) Trucos rows: 4 toggles, game speed, echoes +10k / +100k, insight +1 / +10
 constexpr int kCheatRows = 9;
 constexpr float kSpeeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
@@ -2603,6 +2617,20 @@ void IconVial(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
                       0.02f * s);
     dl->PathArcTo(b, 0.15f * s, 0.25f, 3.14159f - 0.25f, 20);
     dl->PathFillConvex(col);
+}
+// (bb-coop) two hunters joined by a bell's ring
+void IconCoop(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    for (const float side : {-1.0f, 1.0f}) {
+        const ImVec2 h{c.x + side * 0.17f * s, c.y - 0.10f * s};
+        dl->AddCircle(h, 0.075f * s, col, 24, th);
+        dl->PathArcTo({h.x, c.y + 0.22f * s}, 0.14f * s, 3.14159f, 2 * 3.14159f, 20);
+        dl->PathStroke(col, 0, th);
+    }
+    dl->PathArcTo({c.x, c.y - 0.06f * s}, 0.09f * s, 3.14159f * 1.15f, 3.14159f * 1.85f, 16);
+    dl->PathStroke(col, 0, th * 0.8f);
+    dl->PathArcTo({c.x, c.y - 0.06f * s}, 0.16f * s, 3.14159f * 1.20f, 3.14159f * 1.80f, 16);
+    dl->PathStroke(col, 0, th * 0.6f);
 }
 void IconDoor(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     const float th = std::max(1.5f, s * 0.035f);
@@ -2708,6 +2736,21 @@ public:
     float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0, tog_vib = 0;
     int cheat_focus = 0; // (bb-cheats) kCheatRows index
     float tog_cheat[4] = {};
+    // (bb-coop) MULTIJUGADOR: a network snapshot polled twice a second while the card is open
+    using CoopSnap = Libraries::Np::NpHandler::CoopSnapshot;
+    struct CoopRow {
+        Libraries::Np::NpHandler::CoopPeer peer;
+        double since = 0;    // joined (slide in)
+        double gone = -1;    // left (slide out), -1 while present
+        float ping_shown = -1;
+    };
+    CoopSnap coop{};
+    std::vector<CoopRow> coop_rows;
+    double coop_poll_t = -1.0;
+    float tog_offline = 0;
+    float coop_dot = 1; // colour blend for the status dot
+    int coop_dot_state = 0;
+    std::array<float, 3> coop_dot_from{130, 126, 120}, coop_dot_now{130, 126, 120};
     int opt_focus = 0; // (bb-input-135) 0 direct start, 1 vibration, 2 intensity
     double test_hold_since = -1; // (bb-mapwiz-136) OPTIONS held in the wizard
     // (bb-mapwiz-136) Mando > "Mapear controles": countdown -> one PS4 button at a time ->
@@ -2748,6 +2791,9 @@ public:
         }
         if (s == Screen::Cheats) {
             cheat_focus = 0;
+        }
+        if (s == Screen::Coop) {
+            coop_poll_t = -1.0; // read the network state right away
         }
         screen = s;
         scr_t = ImGui::GetTime();
@@ -2893,6 +2939,9 @@ public:
                 if (n == Nav::Left || n == Nav::Right) CheatStep(n == Nav::Left ? -1 : 1);
                 if (n == Nav::Accept) CheatAccept(cheat_focus);
                 break;
+            case Screen::Coop:
+                if (n == Nav::Accept) CoopToggleOffline();
+                break;
             case Screen::Exit:
                 if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down) {
                     exit_focus ^= 1;
@@ -2968,8 +3017,9 @@ public:
             TxtC(dl, g_ft_italic, 28 * u, disp.x * 0.5f, 180 * u, Muted(), "El Sueño del Cazador");
             OrnLine(dl, disp.x * 0.5f, 228 * u, 420 * u, 0.9f, u);
         } else {
-            static const char* titles[] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
-                                           "TRUCOS", "SALIR DEL JUEGO"};
+            static const char* titles[] = {"MANDO",  "TECLADO Y RATÓN", "TROFEOS",
+                                           "OPCIONES", "TRUCOS", "MULTIJUGADOR",
+                                           "SALIR DEL JUEGO"};
             TxtSpaced(dl, g_ft_title, 22 * u, {disp.x * 0.5f, 38 * u}, Bronze(), "BLOODBORNE", 6 * u,
                       true);
             TxtSpaced(dl, g_ft_title, 50 * u, {disp.x * 0.5f, 66 * u}, Gold(),
@@ -3018,6 +3068,9 @@ public:
             break;
         case Screen::Cheats:
             hints = {{"pad", "Elegir / velocidad"}, {"cross", "Activar"}, {"circle", "Volver"}};
+            break;
+        case Screen::Coop:
+            hints = {{"cross", "Cambiar"}, {"circle", "Volver"}};
             break;
         default:
             hints = {{"cross", "Aceptar"}, {"circle", "Volver"}};
@@ -3119,6 +3172,7 @@ public:
             case Screen::Trophies: TrophyScreen(a, b, u); break;
             case Screen::Options: OptionsScreen(a, b, u); break;
             case Screen::Cheats: CheatsScreen(a, b, u); break;
+            case Screen::Coop: CoopScreen(a, b, u); break;
             case Screen::Exit: ExitScreen(disp, u); break;
             }
             g_a = e;
@@ -3135,14 +3189,15 @@ public:
 
     // ------------------------------------------------------------ hub
     void HubScreen(ImVec2 disp, float u) {
-        static const char* titles[kCards] = {"MANDO", "TECLADO Y RATÓN", "TROFEOS", "OPCIONES",
-                                             "TRUCOS", "SALIR"};
+        static const char* titles[kCards] = {"MANDO",  "TECLADO Y RATÓN", "TROFEOS",
+                                             "OPCIONES", "TRUCOS", "MULTIJUGADOR", "SALIR"};
         int earned = 0;
         for (const auto& tr : g_trophies) earned += tr.earned;
         const std::string tsub = fmt::format("{} de {} conseguidos", earned, g_trophies.size());
         const char* subs[kCards] = {"Reasigna los botones de tu mando",
                                     "Teclas, ratón y cámara", tsub.c_str(),
                                     "Inicio directo y ajustes", "Vida, ecos, percepción y más",
+                                    "Servidor, sesión y cazadores conectados",
                                     "Cierra el juego con seguridad"};
         const float gap = 30 * u;
         const float cw = std::min(330 * u, (disp.x - 240 * u - gap * (kCards - 1)) / kCards);
@@ -3206,6 +3261,7 @@ public:
             case 2: DrawCup(dl, m.x - is * 0.32f, m.y - is * 0.34f, is * 0.64f, ic, g_a); break;
             case 3: IconGear(dl, m, is, ic, t * 0.4f * h); break;
             case 4: IconVial(dl, m, is, ic); break;
+            case 5: IconCoop(dl, m, is, ic); break;
             default: IconDoor(dl, m, is, ic); break;
             }
             // title, rule, subtitle
@@ -3865,6 +3921,160 @@ public:
         }
         Txt(dl, g_ft_italic, 22 * u, {p0.x + 40 * u, y + 6 * u}, Muted(0.85f),
             "Todo se aplica al momento y se desactiva al cerrar el emulador.");
+    }
+
+    // ------------------------------------------------------------ Multijugador (bb-coop)
+    static void CoopToggleOffline() {
+        auto& np = Libraries::Np::NpHandler::GetInstance();
+        if (EmulatorSettings.IsShadNetEnabled()) np.SetAppearOffline(!np.IsAppearOffline());
+    }
+    void CoopPoll() {
+        const double now = ImGui::GetTime();
+        if (coop_poll_t >= 0 && now - coop_poll_t < 0.5) return;
+        coop_poll_t = now;
+        coop = EmulatorSettings.IsShadNetEnabled()
+                   ? Libraries::Np::NpHandler::GetInstance().GetCoopSnapshot()
+                   : CoopSnap{};
+        for (auto& r : coop_rows) {
+            const bool present = std::ranges::any_of(
+                coop.peers, [&r](const auto& p) { return p.name == r.peer.name; });
+            if (!present && r.gone < 0) r.gone = now;
+            if (present) r.gone = -1;
+        }
+        for (const auto& p : coop.peers) {
+            auto it = std::ranges::find_if(coop_rows,
+                                           [&p](const CoopRow& r) { return r.peer.name == p.name; });
+            if (it == coop_rows.end()) {
+                coop_rows.push_back({p, now, -1, static_cast<float>(p.ping_ms)});
+            } else {
+                it->peer = p;
+            }
+        }
+        std::erase_if(coop_rows, [now](const CoopRow& r) { return r.gone >= 0 && now - r.gone > 0.4; });
+    }
+    void CoopScreen(ImVec2 a, ImVec2 b, float u) {
+        using State = Libraries::Np::NpHandler::CoopServerState;
+        auto* dl = ImGui::GetWindowDrawList();
+        const double now = ImGui::GetTime();
+        const float dt = ImGui::GetIO().DeltaTime;
+        const float w = std::min(1300 * u, b.x - a.x);
+        const ImVec2 p0{(a.x + b.x - w) * 0.5f, a.y + 10 * u}, p1{p0.x + w, b.y - 20 * u};
+        Panel(dl, p0, p1, u, 0.2f);
+        const float x = p0.x + 40 * u;
+        float y = p0.y + 24 * u;
+        const bool on = EmulatorSettings.IsShadNetEnabled();
+        if (!on) {
+            Txt(dl, g_ft_title, 30 * u, {x, y}, Gold(), "Multijugador desactivado");
+            y += 64 * u;
+            static const char* lines[] = {
+                "El juego en línea está apagado: no se conecta a ningún servidor.",
+                "Para jugar en cooperativo, actívalo en el launcher (opción Multijugador),",
+                "indica la dirección del servidor shadNet y tu cuenta, y vuelve a abrir el juego.",
+                "Las demás opciones de este menú no se ven afectadas."};
+            for (const char* l : lines) {
+                Txt(dl, g_ft_text, 26 * u, {x, y}, Parch(0.9f), l);
+                y += 40 * u;
+            }
+            return;
+        }
+        CoopPoll();
+        // ---- server
+        Txt(dl, g_ft_title, 30 * u, {x, y}, Gold(), "Servidor");
+        y += 52 * u;
+        static const char* state_txt[] = {"Sin conectar", "Conectando…", "Conectado", "Error"};
+        static constexpr int dot_rgb[4][3] = {{130, 126, 120}, {232, 170, 70}, {110, 200, 120},
+                                              {220, 80, 70}};
+        const int si = std::clamp(static_cast<int>(coop.server), 0, 3);
+        // the dot eases between colours when the state changes
+        if (coop_dot_state != si) coop_dot_from = coop_dot_now, coop_dot_state = si, coop_dot = 0;
+        coop_dot = Approach(coop_dot, 1.0f, dt, 5.0f);
+        for (int c = 0; c < 3; c++) {
+            coop_dot_now[c] = coop_dot_from[c] + (dot_rgb[si][c] - coop_dot_from[c]) * coop_dot;
+        }
+        const auto dot = [this](float al) {
+            return Col(static_cast<int>(coop_dot_now[0]), static_cast<int>(coop_dot_now[1]),
+                       static_cast<int>(coop_dot_now[2]), al);
+        };
+        const float pulse = coop.server == State::Off ? 0.0f
+                            : 0.5f + 0.5f * std::sin(static_cast<float>(now) *
+                                                     (coop.server == State::Connecting ? 6.0f : 2.5f));
+        const ImVec2 dc{x + 12 * u, y + 15 * u};
+        dl->AddCircleFilled(dc, (10 + 8 * pulse) * u, dot(0.25f * (1.0f - pulse)));
+        dl->AddCircleFilled(dc, 8 * u, dot(1.0f));
+        std::string st = state_txt[si];
+        if (coop.server == State::Error) st += fmt::format(" (código {})", coop.error_code);
+        Txt(dl, g_ft_text, 28 * u, {x + 40 * u, y}, Parch(), st.c_str());
+        y += 46 * u;
+        const auto kv = [&](const char* k, const std::string& v) {
+            Txt(dl, g_ft_ui, 22 * u, {x, y}, Muted(), k);
+            Txt(dl, g_ft_ui, 22 * u, {x + 260 * u, y}, Parch(0.95f), v.empty() ? "—" : v.c_str());
+            y += 34 * u;
+        };
+        kv("Dirección", EmulatorSettings.GetShadNetServer());
+        kv("Latencia", "—"); // the shadNet protocol has no server ping
+        kv("Cuenta (NP ID)", coop.npid);
+        y += 14 * u;
+        // ---- session
+        Txt(dl, g_ft_title, 30 * u, {x, y}, Gold(), "Sesión");
+        y += 52 * u;
+        kv("Modo", Core::BBCoop::IsSeamlessEnabled() ? "Cooperativo sin cortes (experimental)"
+                                                     : "Cooperativo tradicional");
+        kv("Papel", !coop.in_room ? "Ninguno" : coop.is_owner ? "Anfitrión" : "Invitado");
+        std::string host_map;
+#ifdef ARCH_X86_64
+        if (const auto m = Core::Bloodborne::GetReceivedHostMap()) host_map = fmt::format("{:#010x}", *m);
+#endif
+        kv("Mapa del anfitrión", host_map);
+        // live toggle: appear offline (applies at once); the mode needs the launcher
+        if (Toggle("##offline", {x, y + 4 * u}, Libraries::Np::NpHandler::GetInstance().IsAppearOffline(),
+                   tog_offline, u, true)) {
+            CoopToggleOffline();
+        }
+        Txt(dl, g_ft_text, 26 * u, {x + 90 * u, y + 4 * u}, Parch(), "Aparecer desconectado");
+        y += 52 * u;
+        Txt(dl, g_ft_italic, 21 * u, {x, y}, Muted(0.85f),
+            "Modo, servidor y cuenta se cambian en el launcher y requieren reiniciar el juego.");
+        // ---- players (right column)
+        const float rx = p0.x + w * 0.55f;
+        float ry = p0.y + 24 * u;
+        Txt(dl, g_ft_title, 30 * u, {rx, ry}, Gold(), "Cazadores conectados");
+        ry += 56 * u;
+        if (coop_rows.empty()) {
+            Txt(dl, g_ft_italic, 24 * u, {rx, ry}, Muted(0.9f),
+                coop.in_room ? "Nadie más en la sesión" : "Nadie conectado");
+            return;
+        }
+        const float rw = p1.x - 40 * u - rx;
+        for (auto& r : coop_rows) {
+            const float in = EaseOut(std::clamp(static_cast<float>(now - r.since) / 0.35f, 0.0f, 1.0f));
+            const float out = r.gone < 0 ? 1.0f
+                              : 1.0f - std::clamp(static_cast<float>(now - r.gone) / 0.35f, 0.0f, 1.0f);
+            const float k = in * out;
+            const float sa = g_a;
+            g_a = sa * k;
+            const float sx = (1.0f - k) * 60 * u;
+            const ImVec2 c0{rx + sx, ry}, c1{rx + sx + rw, ry + 76 * u};
+            dl->AddRectFilled(c0, c1, Col(20, 18, 17, 0.8f), 12 * u);
+            dl->AddRect(c0, c1, Bronze(0.6f), 12 * u, 0, std::max(1.0f, u));
+            dl->AddCircleFilled({c0.x + 22 * u, c0.y + 38 * u}, 7 * u,
+                                r.peer.active ? Col(110, 200, 120) : Col(232, 170, 70));
+            Txt(dl, g_ft_text, 26 * u, {c0.x + 44 * u, c0.y + 8 * u}, Parch(), r.peer.name.c_str());
+            const char* role = r.peer.is_owner ? "Anfitrión" : "Invitado";
+            const char* cs = r.peer.active ? "Conectado" : "Conectando…";
+            Txt(dl, g_ft_ui, 20 * u, {c0.x + 44 * u, c0.y + 44 * u}, Muted(),
+                fmt::format("{} · {}", role, cs).c_str());
+            if (r.peer.ping_ms >= 0) {
+                r.ping_shown = r.ping_shown < 0 ? static_cast<float>(r.peer.ping_ms)
+                                                : Approach(r.ping_shown, static_cast<float>(r.peer.ping_ms),
+                                                           dt, 6.0f);
+            }
+            const std::string ping =
+                r.peer.ping_ms >= 0 ? fmt::format("{:.0f} ms", r.ping_shown) : std::string("—");
+            const ImVec2 ts = TextSize(g_ft_ui, 22 * u, ping.c_str());
+            Txt(dl, g_ft_ui, 22 * u, {c1.x - 20 * u - ts.x, c0.y + 26 * u}, Parch(0.9f), ping.c_str());
+            g_a = sa;
+            ry += (76 + 14) * u * k;
+        }
     }
 
     // ------------------------------------------------------------ Salir
