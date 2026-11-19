@@ -399,8 +399,12 @@ bool Tracer::Init() {
 }
 
 bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
-    if (!ready || draw.instances == 0 || draw.num_indices < 3) {
-        ++stat_skipped;
+    if (!ready) {
+        NoteReject(Reject::NotReady);
+        return false;
+    }
+    if (draw.instances == 0 || draw.num_indices < 3) {
+        NoteReject(Reject::NoIndices);
         return false;
     }
     const u32 prims = draw.num_indices / 3;
@@ -410,16 +414,16 @@ bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
     u8* index_out = nullptr;
     if (draw.index_size != 0) {
         if (draw.index_size != 2 && draw.index_size != 4) {
-            ++stat_skipped;
+            NoteReject(Reject::IndexSize);
             return false;
         }
         const u64 bytes = u64(vertices) * draw.index_size;
         if (u64(index_bytes_used) + ((bytes + 3) & ~u64(3)) > index_capacity) {
-            ++stat_skipped;
+            NoteReject(Reject::IndexCapacity);
             return false;
         }
         if (memory.ClampRangeSize(draw.index_address, bytes) < bytes) {
-            ++stat_skipped;
+            NoteReject(Reject::IndexRange);
             return false;
         }
         index_out = static_cast<u8*>(indices[frame_slot].mapped) + index_bytes_used;
@@ -443,7 +447,7 @@ bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
             hi = std::max(hi, v);
         }
         if (lo > hi) {
-            ++stat_skipped;
+            NoteReject(Reject::MarkersOnly);
             return false; // only restart markers
         }
         index_min = lo;
@@ -454,7 +458,7 @@ bool Tracer::CaptureDraw(const DrawCapture& draw, Shader::PushData& push) {
     if (u64(triangles_used) + triangles > TriangleCapacity() ||
         u64(position_slots) + slots > position_capacity || record_count >= max_records ||
         span > 0xFFFFFFFFull / draw.instances || span > position_capacity) {
-        ++stat_skipped;
+        NoteReject(Reject::Capacity);
         return false;
     }
 
@@ -649,18 +653,43 @@ vk::ImageView Tracer::Trace(vk::CommandBuffer cmd, vk::Extent2D extent, const fl
     return out.view;
 }
 
+u64 Tracer::TakeSceneDepth() {
+    u64 best = 0;
+    u32 votes = 0;
+    for (const auto& [address, count] : depth_votes) {
+        if (count > votes) {
+            best = address;
+            votes = count;
+        }
+    }
+    depth_votes.clear();
+    return best;
+}
+
 void Tracer::EndFrame() {
     if (!ready) {
         return;
     }
     ++stat_frames;
     stat_triangles += triangles_used;
-    if (stat_frames % 600 == 0) {
+    if (stat_frames == 60 || stat_frames % 600 == 0) {
+        u64 rejected = 0;
+        for (const u64 n : stat_reject) {
+            rejected += n;
+        }
         LOG_INFO(Render_Vulkan,
-                 "[pt] {} frames ({} traced): {} draws captured, {} triangles ({} per frame), {} "
-                 "draws skipped (capacity, unmapped or unusable indices)",
-                 stat_frames, stat_traced, stat_draws, stat_triangles, stat_triangles / stat_frames,
-                 stat_skipped);
+                 "[pt] {} frames ({} traced): draws seen {}, captured {} ({} triangles per frame), "
+                 "rejected {} (no capture pipeline {}, not triangles {}, indirect {}, not ready {}, "
+                 "no indices {}, index size {}, index capacity {}, index range {}, markers only {}, "
+                 "capacity {}), scene depth candidates {}",
+                 stat_frames, stat_traced, stat_seen, stat_draws, stat_triangles,
+                 stat_triangles / stat_frames, rejected,
+                 stat_reject[u32(Reject::NoPipeline)], stat_reject[u32(Reject::NotTriangles)],
+                 stat_reject[u32(Reject::Indirect)], stat_reject[u32(Reject::NotReady)],
+                 stat_reject[u32(Reject::NoIndices)], stat_reject[u32(Reject::IndexSize)],
+                 stat_reject[u32(Reject::IndexCapacity)], stat_reject[u32(Reject::IndexRange)],
+                 stat_reject[u32(Reject::MarkersOnly)], stat_reject[u32(Reject::Capacity)],
+                 depth_votes.size());
     }
     frame_slot = (frame_slot + 1) % FrameSlots;
     position_slots = 0;

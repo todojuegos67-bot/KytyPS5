@@ -241,6 +241,7 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
 void Rasterizer::BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset) {
     const auto& regs = liverpool->regs;
     if (regs.primitive_type != AmdGpu::PrimitiveType::TriangleList) {
+        bb_pt->NoteReject(BB::PathTrace::Reject::NotTriangles);
         return;
     }
     const auto [vertex_offset, instance_offset] =
@@ -264,6 +265,12 @@ void Rasterizer::BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, 
 
 void Rasterizer::BbPtFrameEnd() {
     if (bb_pt) {
+        // Without the upscaler the objmv2 pass learns the scene depth here, one frame late.
+        if (!BB::Upscale::Capture()) {
+            if (const u64 depth = bb_pt->TakeSceneDepth()) {
+                BB::ObjMv2::NoteSceneDepth(depth);
+            }
+        }
         bb_pt->EndFrame();
     }
 }
@@ -1393,6 +1400,9 @@ void Rasterizer::BbVolFogDraw(const GraphicsPipeline& pipeline) {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    if (bb_pt) {
+        bb_pt->NoteDrawSeen();
+    }
 
     scheduler.PopPendingOperations();
 
@@ -1445,8 +1455,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     push_data.xoffset *= bb_target_scale[0];
     push_data.yscale *= bb_target_scale[1];
     push_data.yoffset *= bb_target_scale[1];
-    if (bb_pt && pipeline->BbPtCapture()) {
-        BbPtCapture(*pipeline, is_indexed, index_offset);
+    // bb-pathtrace (bb_pt.h): every draw that reaches here is either captured or counted by reason.
+    if (bb_pt) {
+        if (!BB::Upscale::Capture() && regs.depth_control.depth_enable &&
+            regs.depth_control.depth_write_enable && regs.color_buffers[0] &&
+            regs.color_target_mask.GetMask(0)) {
+            bb_pt->NoteDepth(regs.depth_buffer.DepthAddress());
+        }
+        if (pipeline->BbPtCapture()) {
+            BbPtCapture(*pipeline, is_indexed, index_offset);
+        } else {
+            bb_pt->NoteReject(BB::PathTrace::Reject::NoPipeline);
+        }
     }
     BbObjMvDraw(pipeline,
                 is_indexed ? regs.index_base_address.Address<VAddr>() + index_offset : 0,
@@ -1486,6 +1506,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    if (bb_pt) {
+        bb_pt->NoteDrawSeen();
+        bb_pt->NoteReject(BB::PathTrace::Reject::Indirect);
+    }
 
     scheduler.PopPendingOperations();
 

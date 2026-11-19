@@ -12,6 +12,7 @@
 
 #include <array>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -47,6 +48,21 @@ struct DrawCapture {
     u32 instance_offset = 0;          // gl_InstanceIndex of instance 0 (Vulkan firstInstance)
 };
 
+// Why a draw of the scene was not captured (the EndFrame log counts each).
+enum class Reject : u32 {
+    NoPipeline,    // not a capture pipeline: the objmv2 opaque variant is not bound
+    NotTriangles,  // not a triangle list
+    Indirect,      // an indirect draw: its count is only known on the GPU, not captured
+    NotReady,      // the tracer's buffers are not up
+    NoIndices,     // no instances, or fewer than three indices
+    IndexSize,     // index type other than 16 or 32 bits
+    IndexCapacity, // the frame's index ring is full
+    IndexRange,    // the index bytes are not mapped in guest memory
+    MarkersOnly,   // only primitive restart markers
+    Capacity,      // triangle, slot or record capacity of the frame
+    Count,
+};
+
 class Tracer {
 public:
     Tracer(const Vulkan::Instance& instance, Core::MemoryManager& memory);
@@ -78,6 +94,15 @@ public:
     // triangle soup Trace built this frame.
     vk::AccelerationStructureKHR SceneTlas() const { return tlas; }
     vk::Buffer SoupBuffer() const { return soup.buffer; }
+
+    void NoteDrawSeen() { ++stat_seen; }
+    void NoteReject(Reject reason) { ++stat_reject[u32(reason)]; }
+    // Scene depth candidate of this frame (a depth-writing draw with a colour target): the depth
+    // address drawn most often. Without the upscaler the objmv2 pass learns the scene depth from
+    // it (the upscaler path notes it itself).
+    void NoteDepth(u64 depth_address) { ++depth_votes[depth_address]; }
+    // The most voted depth address of the frame (0 if none), then the votes are cleared.
+    u64 TakeSceneDepth();
 
     // Once per guest frame, after its draws: logs the counters every 600 frames and moves the
     // tables on to the next frame in flight.
@@ -140,10 +165,12 @@ private:
     u32 max_records = 0;
     u32 position_capacity = 0;     // slots
     u32 index_capacity = 0;        // bytes
+    std::unordered_map<u64, u32> depth_votes;
     u64 stat_frames = 0;
+    u64 stat_seen = 0;
     u64 stat_draws = 0;
     u64 stat_triangles = 0;
-    u64 stat_skipped = 0;
+    std::array<u64, u32(Reject::Count)> stat_reject{};
     u64 stat_traced = 0;
 };
 
