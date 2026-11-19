@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/nativeMem.h"
 
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 
 #include <algorithm>
 #include <array>
@@ -55,12 +56,12 @@ bool Enabled() {
 		const char* value = std::getenv("KYTY_NATIVE_MEM");
 		const bool  on    = value != nullptr && value[0] == '1' && value[1] == '\0';
 		if (on) {
-			LOGF("Native mem: on (KYTY_NATIVE_MEM=1): GT7's 2 MiB GPU pool chunks are written "
+			Log::WriteUnmuted(fmt::sprintf("Native mem: on (KYTY_NATIVE_MEM=1): GT7's 2 MiB GPU pool chunks are written "
 			     "without page faults (a page written since its upload, by its hash, is "
 			     "uploaded again after each slice and passed wait); a kept page unchanged "
 			     "%" PRIu64 " us is tracked again (KYTY_NATIVE_MEM_IDLE_US), at most %zu pages "
 			     "kept (KYTY_NATIVE_MEM_CAP)\n",
-			     IdleMicros(), PageCap());
+			     IdleMicros(), PageCap()));
 		}
 		return on;
 	}();
@@ -181,7 +182,7 @@ void MaybeReport(uint64_t now_ms) {
 	// two refreshes faulted once at most then too). "uploaded at most": the pages made CPU-dirty
 	// again, 4 KB each, which the next use of each uploads (only those inside a cached buffer are
 	// copied; the "GPU phases" line's "buffer uploads" has the bytes really copied).
-	LOGF("Native mem (%.0f s): pool %" PRIu64 " chunks (%" PRIu64 " MB) | pool write faults "
+	Log::WriteUnmuted(fmt::sprintf("Native mem (%.0f s): pool %" PRIu64 " chunks (%" PRIu64 " MB) | pool write faults "
 	     "%.0f/s (%.0f released their 64 KB block), %.0f pages kept/s | kept now %" PRIu64
 	     " (peak %" PRIu64 ") | faults avoided %.0f/s | refreshes %.0f/s at slices, %.0f/s at "
 	     "waits (%.0f/s waits not released by the CPU) | made dirty again %.0f pages/s, uploaded "
@@ -189,7 +190,7 @@ void MaybeReport(uint64_t now_ms) {
 	     seconds, g_pool_chunks.load(std::memory_order_relaxed),
 	     g_pool_chunks.load(std::memory_order_relaxed) * 2u, faults, released, marked,
 	     c.kept_now.load(std::memory_order_relaxed), peak, written, slices, waits, skipped,
-	     redirtied, redirtied * 4096.0 / (1024.0 * 1024.0), dropped, hashed, hash_ms);
+	     redirtied, redirtied * 4096.0 / (1024.0 * 1024.0), dropped, hashed, hash_ms));
 }
 
 } // namespace Libs::Graphics::NativeMem
