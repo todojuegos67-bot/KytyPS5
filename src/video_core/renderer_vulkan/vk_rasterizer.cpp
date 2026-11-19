@@ -19,6 +19,7 @@
 #include "core/bb_hud_native_hook.h"
 #include "core/bb_ssr_probe.h"
 #include "video_core/renderer_vulkan/bb_rt_reflect.h"
+#include "video_core/renderer_vulkan/bb_volfog.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -97,6 +98,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                     "[fog-fx] BB_FOG_FX={} requested but this device has no ray query / "
                     "acceleration structures: volumetric fog off",
                     BB::FogFx::Level());
+    }
+
+    // bb-volfog: froxel volumetric fog (no ray tracing: works on any device).
+    if (BB::VolFog::Level() > 0) {
+        bb_volfog = std::make_unique<BB::VolFog>(instance);
+        if (!bb_volfog->Init()) {
+            LOG_ERROR(Render_Vulkan, "[volfog] init failed: volumetric fog off");
+            bb_volfog.reset();
+        }
     }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
@@ -1098,6 +1108,162 @@ void Rasterizer::BbRtLightRun(const GraphicsPipeline& pipeline) {
     status();
 }
 
+// bb-volfog (BB_VOLFOG=1..3, bb_volfog.h), per draw after the resources are bound:
+//  - the deferred shadow-mask pass (ps 0xf55643de in the user's [hud-trace] / [jitter-fs] logs, or
+//    any full-screen draw sampling a square >= 2048 depth image and the scene depth): the moon
+//    visibility of every froxel is injected from that cascade atlas right before it;
+//  - the composite (PS 0x3fe9e964) after a G-buffer pass: the frame's point lights are closed and
+//    the apply is armed on its HDR target;
+//  - the first draw that samples the HDR target without rendering into it (after the forward
+//    pass; PS 0x8650418f in the user's logs): the fog is lit, integrated and applied there.
+void Rasterizer::BbVolFogDraw(const GraphicsPipeline& pipeline) {
+    u64 ps = 0;
+    for (const auto* stage : pipeline.GetStages()) {
+        if (stage && stage->sw_stage == Shader::SwStage::Fragment) ps = stage->pgm_hash;
+    }
+    const auto& regs = liverpool->regs;
+    if (ps == BbCompositePsHash) {
+        if (!bb_vf_gbuf_seen) {
+            return; // drawn again with no G-buffer pass in between: the same frame
+        }
+        VideoCore::Image* hdr = nullptr;
+        for (const auto& image_id : bound_images) {
+            auto& img = texture_cache.GetImage(image_id);
+            if (img.binding.is_target && !img.info.props.is_depth &&
+                (!hdr || u64(img.info.size.width) * img.info.size.height >
+                             u64(hdr->info.size.width) * hdr->info.size.height)) {
+                hdr = &img;
+            }
+        }
+        if (!hdr) {
+            return;
+        }
+        bb_vf_gbuf_seen = false;
+        if (bb_vf_pending) {
+            bb_volfog->NoteSkip("no draw read the HDR target after the forward pass");
+        }
+        bb_vf_pending = true;
+        bb_vf_hdr_addr = BbAddr(*hdr);
+        ++bb_vf_seq;
+        bb_volfog->FrameLightsDone();
+        return;
+    }
+    if (bb_vf_pending) {
+        VideoCore::Image* hdr = nullptr;
+        bool writes = false;
+        for (const auto& image_id : bound_images) {
+            auto& img = texture_cache.GetImage(image_id);
+            if (BbAddr(img) == bb_vf_hdr_addr && !img.info.props.is_depth) {
+                if (img.binding.is_target) {
+                    writes = true;
+                } else {
+                    hdr = &img;
+                }
+            }
+        }
+        if (writes || !hdr) {
+            return; // the forward pass (or an unrelated draw)
+        }
+        bb_vf_pending = false;
+        const auto hfmt = hdr->info.pixel_format;
+        const bool r11 = hfmt == vk::Format::eB10G11R11UfloatPack32;
+        if ((!r11 && hfmt != vk::Format::eR16G16B16A16Sfloat) || hdr->info.num_samples > 1) {
+            bb_volfog->NoteSkip("HDR target not RGBA16F / B10G11R11 (or multisampled)");
+            return;
+        }
+        VideoCore::Image* d32 = texture_cache.TryGetImage(bb_vf_depth_id, bb_vf_depth_uid);
+        if (!d32 || u64(d32->info.size.width) * hdr->info.size.height !=
+                        u64(d32->info.size.height) * hdr->info.size.width) {
+            bb_volfog->NoteSkip(d32 ? "scene depth aspect differs from the HDR target"
+                                    : "scene depth image gone");
+            return;
+        }
+        VideoCore::ImageViewInfo sv{};
+        sv.format = r11 ? vk::Format::eR32Uint : vk::Format::eR16G16B16A16Sfloat;
+        sv.is_storage = true;
+        VideoCore::ImageViewInfo dv{};
+        dv.format = vk::Format::eR32Sfloat; // depth aspect (ImageView picks the depth format)
+        const BB::VolFog::ApplyInput in{
+            .hdr = hdr->GetImage(),
+            .hdr_storage_view = *hdr->FindView(sv, false).image_view,
+            .hdr_r11 = r11,
+            .hdr_layout = BbLayoutOf(*hdr),
+            .hdr_w = hdr->info.size.width,
+            .hdr_h = hdr->info.size.height,
+            .depth = d32->GetImage(),
+            .depth_view = *d32->FindView(dv, false).image_view,
+            .depth_layout = BbLayoutOf(*d32),
+            .depth_stencil = bool(d32->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+            .depth_w = d32->info.size.width,
+            .depth_h = d32->info.size.height,
+            .injected = bb_vf_inject_seq == bb_vf_seq,
+        };
+        if (!(bb_vf_logged & 1)) {
+            bb_vf_logged |= 1;
+            LOG_INFO(Render_Vulkan,
+                     "[volfog] apply hook: PS {:#x} reads the HDR target {:#x} {}x{} {}; scene "
+                     "depth {:#x} {}x{} {}",
+                     ps, bb_vf_hdr_addr, in.hdr_w, in.hdr_h, vk::to_string(hfmt), BbAddr(*d32),
+                     in.depth_w, in.depth_h, vk::to_string(d32->info.pixel_format));
+        }
+        bb_volfog->NoteHdrReader(ps);
+        scheduler.EndRendering();
+        const char* why = nullptr;
+        if (!bb_volfog->Apply(scheduler.CommandBuffer(), in, why)) {
+            bb_volfog->NoteSkip(why);
+        }
+        return;
+    }
+    if (bb_vf_inject_seq == bb_vf_seq + 1) {
+        return; // this frame's inject is done
+    }
+    VideoCore::Image* atlas = nullptr;
+    bool scene_depth = false;
+    const VideoCore::Image* gdepth = texture_cache.TryGetImage(bb_vf_depth_id, bb_vf_depth_uid);
+    for (const auto& image_id : bound_images) {
+        auto& img = texture_cache.GetImage(image_id);
+        if (img.binding.is_target || img.info.num_samples > 1) {
+            continue;
+        }
+        const u32 w = img.info.size.width, h = img.info.size.height;
+        if (img.info.props.is_depth && w == h && w >= 2048) {
+            if (!atlas || w > atlas->info.size.width) atlas = &img;
+        } else if (gdepth && w == gdepth->info.size.width && h == gdepth->info.size.height &&
+                   (img.info.props.is_depth || img.info.pixel_format == vk::Format::eR32Sfloat)) {
+            scene_depth = true;
+        }
+    }
+    constexpr u64 ShadowMaskPs = 0xf55643de; // [jitter-fs] / [hud-trace] (commit 3141ea133)
+    if (!atlas || !(ps == ShadowMaskPs || (scene_depth && regs.num_indices <= 6))) {
+        return;
+    }
+    bb_vf_inject_seq = bb_vf_seq + 1;
+    VideoCore::ImageViewInfo dv{};
+    dv.format = vk::Format::eR32Sfloat;
+    const BB::VolFog::InjectInput in{
+        .atlas = atlas->GetImage(),
+        .atlas_view = *atlas->FindView(dv, false).image_view,
+        .atlas_layout = BbLayoutOf(*atlas),
+        .atlas_stencil = bool(atlas->aspect_mask & vk::ImageAspectFlagBits::eStencil),
+        .atlas_w = atlas->info.size.width,
+        .atlas_h = atlas->info.size.height,
+        .atlas_addr = BbAddr(*atlas),
+        .ps_hash = ps,
+    };
+    if (!(bb_vf_logged & 2)) {
+        bb_vf_logged |= 2;
+        LOG_INFO(Render_Vulkan,
+                 "[volfog] inject hook: shadow-mask PS {:#x} ({}), cascade atlas {:#x} {}x{} {}",
+                 ps, ps == ShadowMaskPs ? "known hash" : "full-screen + scene depth + atlas rule",
+                 in.atlas_addr, in.atlas_w, in.atlas_h, vk::to_string(atlas->info.pixel_format));
+    }
+    scheduler.EndRendering();
+    const char* why = nullptr;
+    if (!bb_volfog->Inject(scheduler.CommandBuffer(), in, why)) {
+        bb_volfog->NoteSkip(why);
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -1141,6 +1307,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (bb_rt_reflect) {
         BbRtLightRun(*pipeline);
         BbRtReflectPost(*pipeline);
+    }
+    if (bb_volfog) {
+        BbVolFogDraw(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -1240,6 +1409,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (bb_rt_reflect) {
         BbRtLightRun(*pipeline);
         BbRtReflectPost(*pipeline);
+    }
+    if (bb_volfog) {
+        BbVolFogDraw(*pipeline);
     }
 
     // bb-clean-021-bbport (Supermedo): screen-space (clip disabled) draws into the upscaler's
@@ -1432,6 +1604,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         uses_dma |= stage->uses_dma;
     }
     if (!bb_draw_cbs.empty()) {
+        if (bb_volfog) {
+            bb_volfog->OnDrawCbs(bb_draw_cbs.data(), bb_draw_cbs.size());
+        }
         BB::Upscale::OnDrawConstants(bb_draw_cbs.data(), bb_draw_cbs.size());
         bb_draw_cbs.clear();
     }
@@ -1836,9 +2011,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // 84 B of data) constant buffers, layouts from Ghidra (FUN_026deeb0,
                 // FUN_02651f10); bound to the forward-lit object draws (any VS / PS). Collected
                 // for the whole draw, see OnDrawConstants (after the stage loop).
+                // bb-volfog alone: only the light-set CB sizes and the point-light draws' PS.
+                const bool vf_want =
+                    bb_volfog && ((size >= 288 && size <= 320) ||
+                                  (stage.sw_stage == Shader::SwStage::Fragment &&
+                                   BB::VolFog::IsPointLightPs(stage.pgm_hash)));
                 if ((stage.sw_stage == Shader::SwStage::Vertex ||
                      stage.sw_stage == Shader::SwStage::Fragment) &&
-                    !desc.is_written && size >= 64 && size <= 1024 && BbRtLightRequested() &&
+                    !desc.is_written && size >= 64 && size <= (bb_volfog ? 2048u : 1024u) &&
+                    (BbRtLightRequested() || vf_want) &&
                     bb_draw_cbs.size() < 32 &&
                     memory->IsValidMapping(vsharp.base_address, size)) {
                     bb_draw_cbs.push_back(BB::Upscale::DrawCb{
@@ -2583,6 +2764,28 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        if (bb_volfog && regs.depth_control.depth_enable &&
+            regs.depth_control.depth_write_enable && image.info.num_samples == 1) {
+            // bb-volfog: the G-buffer MRT's depth (>= 2 RGBA8 colour targets of its size) is the
+            // scene depth (as bb-rt-light, Ghidra FUN_026c39f0).
+            u32 n_rgba8 = 0;
+            for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+                const auto cid = cb_descs[cb].image_id;
+                if (!cid || !state.color_attachments[cb].image_view) continue;
+                const auto& ci = texture_cache.GetImage(cid);
+                if (ci.info.size.width == image.info.size.width &&
+                    ci.info.size.height == image.info.size.height &&
+                    (ci.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+                     ci.info.pixel_format == vk::Format::eR8G8B8A8Srgb)) {
+                    ++n_rgba8;
+                }
+            }
+            if (n_rgba8 >= 2) {
+                bb_vf_depth_id = image_id;
+                bb_vf_depth_uid = image.image_uid;
+                bb_vf_gbuf_seen = true;
+            }
+        }
         if (bb_rt_reflect) {
             const bool writes =
                 regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;

@@ -21,6 +21,7 @@ struct Liverpool;
 
 namespace BB {
 class RtReflect; // bb-rt-reflect
+class VolFog;    // bb-volfog
 }
 
 namespace Core {
@@ -141,6 +142,9 @@ private:
     void BbRtWaterLog();
     void BbRtRestoreDepth(); // the scene depth as before the water draws wrote it
     void BbRtLightRun(const GraphicsPipeline& pipeline); // bb-rt-light: before the composite
+    // bb-volfog (BB_VOLFOG=1..3): inject before the shadow-mask pass, arm at the composite,
+    // apply before the first draw that reads the HDR target after the forward pass.
+    void BbVolFogDraw(const GraphicsPipeline& pipeline);
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -243,6 +247,17 @@ private:
     bool needs_barrier{};
 
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
+    std::unique_ptr<BB::VolFog> bb_volfog;        // bb-volfog (no ray tracing needed)
+    // bb-volfog state: the composite's HDR target and whether the apply is pending; a G-buffer
+    // pass (its depth = the scene depth) since the last composite; the frame sequence (composites)
+    // and the sequence the last inject belongs to.
+    VAddr bb_vf_hdr_addr = 0;
+    bool bb_vf_pending = false;
+    bool bb_vf_gbuf_seen = false;
+    u64 bb_vf_seq = 0, bb_vf_inject_seq = 0;
+    VideoCore::ImageId bb_vf_depth_id{};
+    u64 bb_vf_depth_uid = 0;
+    u32 bb_vf_logged = 0;
     // bb-rt-reflect: the composite's HDR target (guest address) and whether this frame's pass
     // is still to run (snapshot taken, no draw has read the HDR target since); forward draws
     // into it in between (for the log).

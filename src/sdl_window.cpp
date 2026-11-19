@@ -46,6 +46,7 @@ CMRC_DECLARE(res);
 namespace BB {
 void RtReflectCycleDebug(); // video_core/renderer_vulkan/bb_rt_reflect.cpp
 void RtReflectCycleHide();  // video_core/renderer_vulkan/vk_rasterizer.cpp
+void VolFogCycleDebug();    // video_core/renderer_vulkan/bb_volfog.cpp
 }
 
 namespace Frontend {
@@ -271,6 +272,20 @@ void WindowSDL::WaitEvent() {
         event.key.key == SDLK_F8) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
             BB::Upscale::ToggleOverlay();
+        }
+        return;
+    }
+
+    // bb-volfog Shift+F7 (BB_VOLFOG=1..3 only): fog debug view off / fog only / fog off /
+    // transmittance.
+    static const bool volfog = [] {
+        const char* e = std::getenv("BB_VOLFOG");
+        return e && e[0] >= '1' && e[0] <= '3';
+    }();
+    if (volfog && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.key == SDLK_F7 && (event.key.mod & SDL_KMOD_SHIFT)) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+            BB::VolFogCycleDebug();
         }
         return;
     }
