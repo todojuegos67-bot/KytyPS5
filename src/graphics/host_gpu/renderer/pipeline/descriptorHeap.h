@@ -38,6 +38,10 @@ private:
 	vk::DescriptorPool                                  m_current_pool = nullptr;
 	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
 	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+	// gt7-emit-1119 (KYTY_EMIT_FAST): the batch of the last layout, without the map's lookup
+	// (null after the map is cleared).
+	vk::DescriptorSetLayout m_last_layout = nullptr;
+	Batch*                  m_last_batch  = nullptr;
 };
 
 } // namespace Libs::Graphics

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -92,6 +93,10 @@ void               ScrubDeadRenderingViews(const vk::RenderingInfo& info, const 
 // Storage image descriptors only.
 void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t count,
                               const char* where);
+// gt7-emit-1119: the same for a descriptor update template's array of infos: the storage image
+// infos at `offsets` (bytes into `data`).
+void ScrubDeadTemplateViews(std::byte* data, const uint32_t* offsets, uint32_t count,
+                            const char* where);
 
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawMemo.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
+#include "graphics/host_gpu/renderer/emitStats.h"
 #include "graphics/host_gpu/renderer/speculation.h"
 #include "graphics/host_gpu/renderer/mtGpuStageA.h"
 
@@ -652,6 +653,8 @@ void ReportIfDue(uint64_t frames) {
 	Speculation::Report(cycles_per_us, seconds);
 	MtGpu::Report(new_frames, seconds);
 	Replay::Report(seconds); // gt7-replay-1119 (KYTY_REPLAY; nothing while off)
+	// gt7-emit-1119: the draws' emission, call by call (KYTY_EMIT_FAST).
+	EmitStats::Report(cycles_per_us, seconds, delta.count[static_cast<size_t>(Phase::Draw)]);
 	{
 		// Round 165: what the renderer recorded besides draws and dispatches, a frame.
 		namespace RC = RecordedCommands;

@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/replay.h"
+#include "graphics/host_gpu/renderer/emitStats.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageDump.h"
@@ -4790,7 +4791,8 @@ void PrefaultDmaPointers(BufferCache& buffers, const ShaderStageRuntime& stage) 
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
+	// stage d; gt7-emit-1119: its waits counted
+	const EmitStats::LockScope translation_lock(m_translation_mutex);
 	bool uses_dma = false;
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
@@ -4840,11 +4842,191 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 }
 
+// gt7-emit-1119 (KYTY_EMIT_FAST): set 0 through a descriptor update template.
+namespace {
+
+static_assert(sizeof(vk::DescriptorImageInfo) == 24 && sizeof(vk::DescriptorBufferInfo) == 24);
+constexpr uint32_t EmitInfoStride = 24;
+
+// A write's two signature words: binding and type; count and whether its infos are images.
+std::pair<uint64_t, uint64_t> EmitSignature(const vk::WriteDescriptorSet& write) {
+	return {static_cast<uint64_t>(write.dstBinding) |
+	            static_cast<uint64_t>(static_cast<uint32_t>(write.descriptorType)) << 32u,
+	        static_cast<uint64_t>(write.descriptorCount) |
+	            (write.pImageInfo != nullptr ? 1ull << 32u : 0ull)};
+}
+
+// The writes, flattened as the replay does (KYTY_REPLAY): what the normal path bound, for =2.
+std::vector<uint64_t> FlattenWrites(const std::vector<vk::WriteDescriptorSet>& writes) {
+	std::vector<uint64_t> words;
+	for (const auto& write: writes) {
+		const auto [first, second] = EmitSignature(write);
+		words.push_back(first);
+		words.push_back(second);
+		for (uint32_t k = 0; k < write.descriptorCount; k++) {
+			if (write.pImageInfo != nullptr) {
+				const auto& info = write.pImageInfo[k];
+				words.push_back(write.descriptorType == vk::DescriptorType::eSampler
+				                    ? reinterpret_cast<uint64_t>(static_cast<VkSampler>(info.sampler))
+				                    : 0u);
+				if (write.descriptorType != vk::DescriptorType::eSampler) {
+					words.push_back(reinterpret_cast<uint64_t>(
+					    static_cast<VkImageView>(info.imageView)));
+					words.push_back(static_cast<uint64_t>(info.imageLayout));
+				}
+			}
+			if (write.pBufferInfo != nullptr) {
+				const auto& info = write.pBufferInfo[k];
+				words.push_back(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(info.buffer)));
+				words.push_back(info.offset);
+				words.push_back(info.range);
+			}
+		}
+	}
+	return words;
+}
+
+// The infos of the writes, in order, 24 bytes each; an image info's last 4 bytes (padding) are
+// zeroed, so that equal descriptors compare equal.
+void PackEmitSet(const std::vector<vk::WriteDescriptorSet>& writes, uint32_t size,
+                 std::vector<std::byte>& blob) {
+	blob.resize(size);
+	uint32_t offset = 0;
+	for (const auto& write: writes) {
+		const auto  bytes  = write.descriptorCount * EmitInfoStride;
+		const void* source = write.pImageInfo != nullptr
+		                         ? static_cast<const void*>(write.pImageInfo)
+		                         : static_cast<const void*>(write.pBufferInfo);
+		std::memcpy(blob.data() + offset, source, bytes);
+		if (write.pImageInfo != nullptr) {
+			for (uint32_t k = 0; k < write.descriptorCount; k++) {
+				std::memset(blob.data() + offset + k * EmitInfoStride + 20u, 0, 4u);
+			}
+		}
+		offset += bytes;
+	}
+}
+
+} // namespace
+
+const PipelineCache::EmitSetTemplate*
+RenderExecutor::EmitSetTemplateFor(const PipelineCache::Pipeline&             pipeline,
+                                   vk::PipelineBindPoint                      bind_point,
+                                   const std::vector<vk::WriteDescriptorSet>& writes) {
+	auto& slot = pipeline.emit_template;
+	if (slot == nullptr) {
+		const EmitStats::Scope stats(EmitStats::StepTemplate);
+		auto made = std::make_shared<PipelineCache::EmitSetTemplate>();
+		std::vector<vk::DescriptorUpdateTemplateEntry> entries;
+		uint32_t                                       offset = 0;
+		for (const auto& write: writes) {
+			const bool images = write.pImageInfo != nullptr;
+			if (write.dstArrayElement != 0 || write.pTexelBufferView != nullptr ||
+			    images == (write.pBufferInfo != nullptr) || write.descriptorCount == 0) {
+				made->failed = true;
+				break;
+			}
+			entries.push_back({write.dstBinding, 0, write.descriptorCount, write.descriptorType,
+			                   offset, EmitInfoStride});
+			const auto [first, second] = EmitSignature(write);
+			made->signature.push_back(first);
+			made->signature.push_back(second);
+			if (write.descriptorType == vk::DescriptorType::eStorageImage) {
+				for (uint32_t k = 0; k < write.descriptorCount; k++) {
+					made->storage_offsets.push_back(offset + k * EmitInfoStride);
+				}
+			}
+			offset += write.descriptorCount * EmitInfoStride;
+		}
+		made->size = offset;
+		if (!made->failed) {
+			vk::DescriptorUpdateTemplateCreateInfo create {};
+			create.descriptorUpdateEntryCount = static_cast<uint32_t>(entries.size());
+			create.pDescriptorUpdateEntries   = entries.data();
+			if (pipeline.uses_push_descriptors) {
+				create.templateType      = vk::DescriptorUpdateTemplateType::ePushDescriptors;
+				create.pipelineBindPoint = bind_point;
+				create.pipelineLayout    = pipeline.pipeline_layout;
+				create.set               = 0;
+			} else {
+				create.templateType        = vk::DescriptorUpdateTemplateType::eDescriptorSet;
+				create.descriptorSetLayout = pipeline.descriptor_set_layout;
+			}
+			if (m_context.GetGraphics().device.createDescriptorUpdateTemplate(
+			        &create, nullptr, &made->update) != vk::Result::eSuccess) {
+				made->update = nullptr;
+				made->failed = true;
+			}
+		}
+		slot = std::move(made);
+	}
+	if (slot->failed) {
+		return nullptr;
+	}
+	bool same = slot->signature.size() == writes.size() * 2u;
+	for (size_t i = 0; same && i < writes.size(); i++) {
+		const auto [first, second] = EmitSignature(writes[i]);
+		same = slot->signature[i * 2u] == first && slot->signature[i * 2u + 1u] == second;
+	}
+	if (!same) {
+		EmitStats::NoteDiff(EmitStats::Diff::Signature,
+		                    fmt::format("{} escrituras contra {} de la plantilla", writes.size(),
+		                                slot->signature.size() / 2u));
+		return nullptr;
+	}
+	return slot.get();
+}
+
+// KYTY_EMIT_FAST=2: the template's array against the writes, field by field as the descriptor's
+// type reads it, and the fast path's decision to leave the set out against the normal path's own
+// record of what it bound last (its writes, flattened).
+void RenderExecutor::VerifyEmitSet(const DynamicStateShadow&                  shadow,
+                                   const PipelineCache::Pipeline&             pipeline,
+                                   const std::vector<vk::WriteDescriptorSet>& writes,
+                                   const std::vector<std::byte>& blob, bool fast_skip) {
+	uint32_t offset = 0;
+	for (size_t i = 0; i < writes.size(); i++) {
+		const auto& write = writes[i];
+		for (uint32_t k = 0; k < write.descriptorCount; k++, offset += EmitInfoStride) {
+			bool same = offset + EmitInfoStride <= blob.size();
+			if (same && write.pImageInfo != nullptr) {
+				vk::DescriptorImageInfo info {};
+				std::memcpy(&info, blob.data() + offset, sizeof(info));
+				const auto& normal = write.pImageInfo[k];
+				same = write.descriptorType == vk::DescriptorType::eSampler
+				           ? info.sampler == normal.sampler
+				           : info.imageView == normal.imageView &&
+				                 info.imageLayout == normal.imageLayout;
+			} else if (same) {
+				vk::DescriptorBufferInfo info {};
+				std::memcpy(&info, blob.data() + offset, sizeof(info));
+				const auto& normal = write.pBufferInfo[k];
+				same = info.buffer == normal.buffer && info.offset == normal.offset &&
+				       info.range == normal.range;
+			}
+			if (!same) {
+				EmitStats::NoteDiff(EmitStats::Diff::Template,
+				                    fmt::format("escritura {} (binding {}) elemento {}", i,
+				                                write.dstBinding, k));
+				return;
+			}
+		}
+	}
+	const bool normal_same = shadow.emit_set_valid &&
+	                         shadow.emit_set_layout == pipeline.pipeline_layout &&
+	                         shadow.emit_set_words == FlattenWrites(writes);
+	if (fast_skip != normal_same) {
+		EmitStats::NoteDiff(fast_skip ? EmitStats::Diff::SetSkip : EmitStats::Diff::SetPush,
+		                    fmt::format("{} escrituras, {} bytes", writes.size(), blob.size()));
+	}
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
-	const std::scoped_lock translation_lock(m_translation_mutex); // stage d
+	// stage d; gt7-emit-1119: its waits counted
+	const EmitStats::LockScope translation_lock(m_translation_mutex);
 	KYTY_PROFILER_FUNCTION();
 	const auto vk_buffer    = buffer.Recorder();
 	size_t descriptor_count = 0;
@@ -4994,6 +5176,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 	spec_check_phase.End();
+	EmitStats::Scope writes_stats(EmitStats::StepWrites); // gt7-emit-1119
 	ActivePtr()->descriptor_buffers.clear();
 	ActivePtr()->descriptor_images.clear();
 	ActivePtr()->descriptor_writes.clear();
@@ -5234,6 +5417,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	writes_stats.End();
+	EmitStats::Add(EmitStats::CountWrites, ActivePtr()->descriptor_writes.size());
+	EmitStats::Add(EmitStats::CountInfos, ActivePtr()->descriptor_images.size() +
+	                                          ActivePtr()->descriptor_buffers.size());
+	const EmitStats::Scope set_stats(EmitStats::StepSet);
+
 	// gt7-replay-1119 (KYTY_REPLAY): a draw's push constants and set 0 that the command buffer
 	// holds already (the draw before pushed the same with the same layout) are left out (=1) or
 	// counted (=2). The flattened writes: binding, type, count, then each info's handles,
@@ -5244,6 +5433,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	        ? vk_buffer.StateShadow()
 	        : nullptr;
 	const bool replay_leave_out = Replay::Mode() == 1;
+	// gt7-emit-1119 (KYTY_EMIT_FAST, emitStats.h): a draw's set 0 through its pipeline's update
+	// template, and the set 0 and push constants the command buffer holds already left out (=1),
+	// or compared with the normal path (=2). Not with the replay's own (KYTY_REPLAY).
+	const int                 emit_mode   = EmitStats::Mode();
+	DynamicStateShadow* const emit_shadow = emit_mode != 0 && replay_shadow == nullptr &&
+	                                                pipeline_bind_point ==
+	                                                    vk::PipelineBindPoint::eGraphics
+	                                            ? vk_buffer.StateShadow()
+	                                            : nullptr;
 	if (has_push_data) {
 		bool same = false;
 		if (replay_shadow != nullptr) {
@@ -5258,7 +5456,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				Replay::NoteMiss(Replay::Part::Constants, Replay::Miss::Words);
 			}
 		}
-		if (!same || !replay_leave_out) {
+		bool emit_same = false;
+		if (emit_shadow != nullptr) {
+			emit_same = emit_shadow->emit_constants_valid &&
+			            emit_shadow->emit_constants_layout == pipeline.pipeline_layout &&
+			            emit_shadow->emit_constants_stages == static_cast<uint32_t>(push_stages) &&
+			            emit_shadow->emit_constants == push_data.dwords;
+			if (emit_same) {
+				EmitStats::Add(EmitStats::SkipConstants);
+			}
+		}
+		if ((!same || !replay_leave_out) && (!emit_same || emit_mode != 1)) {
 			vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 			                        push_data.dwords.data());
 			if (replay_shadow != nullptr) {
@@ -5266,6 +5474,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				replay_shadow->replay_constants_layout = pipeline.pipeline_layout;
 				replay_shadow->replay_constants_stages = static_cast<uint32_t>(push_stages);
 				replay_shadow->replay_constants        = push_data.dwords;
+			}
+			if (emit_shadow != nullptr) {
+				emit_shadow->emit_constants_valid  = true;
+				emit_shadow->emit_constants_layout = pipeline.pipeline_layout;
+				emit_shadow->emit_constants_stages = static_cast<uint32_t>(push_stages);
+				emit_shadow->emit_constants        = push_data.dwords;
 			}
 		}
 	}
@@ -5305,8 +5519,52 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			Replay::NoteMiss(Replay::Part::Descriptors, Replay::Miss::Words);
 		}
 	}
+	// gt7-emit-1119: the template's array of this draw's infos.
+	thread_local std::vector<std::byte> emit_blob;
+	const PipelineCache::EmitSetTemplate* emit_template = nullptr;
+	bool                                  emit_skip     = false;
+	if (emit_shadow != nullptr && !ActivePtr()->descriptor_writes.empty()) {
+		auto& writes = ActivePtr()->descriptor_writes;
+		// As the normal path does below (again: a view scrubbed there is null here already).
+		ScrubDeadDescriptorViews(writes.data(), static_cast<uint32_t>(writes.size()),
+		                         "a draw's descriptors");
+		emit_template = EmitSetTemplateFor(pipeline, pipeline_bind_point, writes);
+		if (emit_template != nullptr) {
+			PackEmitSet(writes, emit_template->size, emit_blob);
+			emit_skip = emit_shadow->emit_set_valid &&
+			            emit_shadow->emit_set_layout == pipeline.pipeline_layout &&
+			            emit_shadow->emit_set_blob == emit_blob;
+			if (emit_skip) {
+				EmitStats::Add(EmitStats::SkipSet);
+			}
+			if (emit_mode == 2) {
+				VerifyEmitSet(*emit_shadow, pipeline, writes, emit_blob, emit_skip);
+			}
+		}
+	}
 	if (!ActivePtr()->descriptor_writes.empty() && replay_same_set && replay_leave_out) {
 		// The command buffer holds this set 0 already.
+	} else if (emit_template != nullptr && emit_mode == 1) {
+		// KYTY_EMIT_FAST=1: the template's array, unless the command buffer holds it already.
+		if (!emit_skip) {
+			const auto size = static_cast<uint32_t>(emit_blob.size());
+			const auto storage_count =
+			    static_cast<uint32_t>(emit_template->storage_offsets.size());
+			if (pipeline.uses_push_descriptors) {
+				vk_buffer.pushDescriptorSetWithTemplate(
+				    pipeline_bind_point, emit_template->update, pipeline.pipeline_layout, 0,
+				    emit_blob.data(), size, emit_template->storage_offsets.data(), storage_count);
+			} else {
+				const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+				vk_buffer.updateWithTemplateAndBindDescriptorSet(
+				    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout,
+				    set, emit_template->update, emit_blob.data(), size,
+				    emit_template->storage_offsets.data(), storage_count);
+			}
+			emit_shadow->emit_set_valid  = true;
+			emit_shadow->emit_set_layout = pipeline.pipeline_layout;
+			emit_shadow->emit_set_blob.assign(emit_blob.begin(), emit_blob.end());
+		}
 	} else if (!ActivePtr()->descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		ScrubDeadDescriptorViews(ActivePtr()->descriptor_writes.data(),
@@ -5336,6 +5594,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.updateAndBindDescriptorSet(
 			    m_context.GetGraphics().device, pipeline_bind_point, pipeline.pipeline_layout, set,
 			    static_cast<uint32_t>(ActivePtr()->descriptor_writes.size()), ActivePtr()->descriptor_writes.data());
+		}
+		if (emit_template != nullptr) {
+			// KYTY_EMIT_FAST=2: what the command buffer now holds, for the next draw's compare.
+			emit_shadow->emit_set_valid  = true;
+			emit_shadow->emit_set_layout = pipeline.pipeline_layout;
+			emit_shadow->emit_set_blob.assign(emit_blob.begin(), emit_blob.end());
+			emit_shadow->emit_set_words = FlattenWrites(ActivePtr()->descriptor_writes);
 		}
 	}
 	if (pipeline.uses_bindless) {

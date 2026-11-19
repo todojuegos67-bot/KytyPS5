@@ -309,6 +309,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range,
                     const CommandRecorder&               command_buffer) {
+	const EmitStats::Scope stats(EmitStats::StepTransit); // gt7-emit-1119
 	// Every use of the image goes through here (layouts), also when no barrier is needed: the
 	// cache keeps a released image until the GPU has finished the last tick that used it.
 	tick_accessed_last = std::max(tick_accessed_last, m_scheduler.CurrentTick());
@@ -328,6 +329,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	EmitStats::Add(EmitStats::CountTransitBarriers);
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());

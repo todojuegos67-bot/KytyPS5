@@ -907,7 +907,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		    owner->binding.needs_rebind) {
 			EXIT("color target changed after render-state discovery\n");
 		}
+		EmitStats::Scope views_stats(EmitStats::StepTargetViews); // gt7-emit-1119
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		views_stats.End();
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
@@ -969,7 +971,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		if (owner == nullptr || !owner->registered || owner->binding.needs_rebind) {
 			EXIT("depth target changed after render-state discovery\n");
 		}
+		EmitStats::Scope views_stats(EmitStats::StepTargetViews); // gt7-emit-1119
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		views_stats.End();
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
@@ -3378,6 +3382,7 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 	// memory. Recorded through the recording thread when it runs.
 	GpuPhases::Scope emit_phase(GpuPhases::Phase::DrawEmit);
 	const auto       vk_buffer = buffer.Recorder();
+	EmitStats::Scope annotate_stats(EmitStats::StepAnnotate); // gt7-emit-1119
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	buffer.AnnotateDiagnosticCheckpoint(
 	    vertex_stages.front().stage.program->shader_hash,
@@ -3429,6 +3434,7 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 		                (ds.has_stencil ? 1u << 11u : 0u);
 		buffer.AnnotateDiagnosticTargets(targets);
 	}
+	annotate_stats.End();
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -3465,7 +3471,11 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	{
+		const EmitStats::Scope stats(EmitStats::StepDynamic); // gt7-emit-1119
+		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info,
+		                         rendering);
+	}
 	if (m_context.GetTextureCache().TraceEnabled()) {
 		TraceTargetDraws(m_context.GetTextureCache(), buffer, state.depth_info, state.color_info,
 		                 state.color_count, rendering);
@@ -3581,6 +3591,7 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
 	LogDrawPhase(draw.Name(), "BeginRendering");
+	EmitStats::Scope queries_stats(EmitStats::StepQueries); // gt7-emit-1119
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	FrameGraphQueries::PrepareDraw(m_context.GetGraphics().device, m_context.GetCommandScheduler(),
 	                               vk_buffer);
@@ -3588,15 +3599,20 @@ void RenderExecutor::EmitPreparedDraw(TranslationContext& tc, uint64_t submit_id
 	// so a capture's own query leaves the draw to it.
 	const int32_t occlusion_query = OcclusionQueries::PrepareDraw(
 	    m_context, vk_buffer, buffer.GetRegisters().GetDbCountControl());
+	queries_stats.End();
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	// Round 172: a guest pipeline keeps the dynamic state the draws set (the color write enables
-	// only with color targets), which the draw set before it.
-	vk_buffer.bindGuestPipeline(pipeline.pipeline, rendering.num_color_attachments != 0);
+	// only with color targets), which the draw set before it. gt7-emit-1119: with its layout, for
+	// the push constants KYTY_EMIT_FAST leaves out.
+	vk_buffer.bindGuestPipeline(pipeline.pipeline, rendering.num_color_attachments != 0,
+	                            pipeline.pipeline_layout);
+	EmitStats::Scope queries_after_stats(EmitStats::StepQueries);
 	SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	GpuTiming::Before(m_context, buffer);
 	OcclusionQueries::BeginDraw(vk_buffer, occlusion_query);
 	const int32_t samples_query =
 	    occlusion_query < 0 ? FrameGraphQueries::BeginDraw(vk_buffer) : -1;
+	queries_after_stats.End();
 	int64_t gpu_zone = -1;
 	if (Profiler::g_counters) {
 		// The draw's program, as its GPU zone's name and its command zone's text.
@@ -3778,6 +3794,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 	const Replay::DrawScope replay_draw; // gt7-replay-1119: the draw's place (KYTY_REPLAY)
+	const EmitStats::DrawScope emit_draw; // gt7-emit-1119: the emission's counters
 	const GpuPhases::OpStats op_stats(false);
 	// KYTY_BISECT's slow:gpu (round 114).
 	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());
@@ -3976,6 +3993,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope draw_phase(GpuPhases::Phase::Draw);
 	const Replay::DrawScope replay_draw; // gt7-replay-1119: the draw's place (KYTY_REPLAY)
+	const EmitStats::DrawScope emit_draw; // gt7-emit-1119: the emission's counters
 	const GpuPhases::OpStats op_stats(false);
 	// KYTY_BISECT's slow:gpu (round 114).
 	Bisect::SpinMicroseconds(Bisect::SlowGpuMicroseconds());

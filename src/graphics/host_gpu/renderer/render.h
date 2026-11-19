@@ -22,6 +22,8 @@
 
 namespace Libs::Graphics {
 
+struct DynamicStateShadow; // commandScheduler.h
+
 namespace HW {
 class Context;
 class UserConfig;
@@ -353,6 +355,15 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// gt7-emit-1119 (KYTY_EMIT_FAST): the pipeline's set-0 template for these writes (made at
+	// its first draw), or null when it cannot serve them; and =2's comparison with the writes.
+	const PipelineCache::EmitSetTemplate*
+	     EmitSetTemplateFor(const PipelineCache::Pipeline& pipeline, vk::PipelineBindPoint bind_point,
+	                        const std::vector<vk::WriteDescriptorSet>& writes);
+	void VerifyEmitSet(const DynamicStateShadow&                  shadow,
+	                   const PipelineCache::Pipeline&             pipeline,
+	                   const std::vector<vk::WriteDescriptorSet>& writes,
+	                   const std::vector<std::byte>& blob, bool fast_skip);
 	// Watch mode (GpuTiming): the pixel stage's first light grid as this draw reads it, and its
 	// user-data buffer's words, into `detail.grid` (round 71).
 	void DescribeLightGrid(const PreparedBindings& pixel, GpuTiming::DrawDetail& detail);
