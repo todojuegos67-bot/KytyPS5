@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/emitStats.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -151,6 +152,7 @@ public:
 	}
 
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
+		const EmitStats::Scope stats(EmitStats::CallBindPipeline);
 		if (auto* shadow = Shadow(); shadow != nullptr) {
 			// Round 172: a graphics pipeline of the emulator's own (blits, clears) may hold any
 			// state static, which binding it makes undefined: the shadow holds none after it. Such
@@ -161,6 +163,8 @@ public:
 					return;
 				}
 				shadow->compute_pipeline = pipeline;
+				// gt7-emit-1119: another layout may disturb the push constants.
+				shadow->emit_constants_valid = false;
 			} else {
 				shadow->binds++;
 				shadow->InvalidateGraphics();
@@ -172,11 +176,18 @@ public:
 	// (pipeline/shaders.cpp), the color write enables only with color targets. The other
 	// optional ones (raster state, feedback loop) are the same for every pipeline of a run. A
 	// state a guest pipeline may hold static must be invalidated here.
-	void bindGuestPipeline(vk::Pipeline pipeline, bool color_write_dynamic) const {
+	// gt7-emit-1119: `layout` is the pipeline's layout; binding one other than the push
+	// constants' may disturb them (KYTY_EMIT_FAST then pushes them again).
+	void bindGuestPipeline(vk::Pipeline pipeline, bool color_write_dynamic,
+	                       vk::PipelineLayout layout = nullptr) const {
 		auto* shadow = Shadow();
 		if (shadow == nullptr) {
 			bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
 			return;
+		}
+		const EmitStats::Scope stats(EmitStats::CallBindPipeline);
+		if (layout == nullptr || layout != shadow->emit_constants_layout) {
+			shadow->emit_constants_valid = false;
 		}
 		if (NoteBind(*shadow, shadow->graphics_pipeline == pipeline)) {
 			return;
@@ -191,6 +202,7 @@ public:
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.draw(vertices, instances, first_vertex, first_instance);
@@ -198,6 +210,7 @@ public:
 	}
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
@@ -205,6 +218,7 @@ public:
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndirect(buffer, offset, count, stride);
@@ -212,17 +226,20 @@ public:
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
+		const EmitStats::Scope stats(EmitStats::CallDraw);
 		Touch();
 		Run([=](vk::CommandBuffer command) {
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
@@ -237,11 +254,35 @@ public:
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
+		const EmitStats::Scope stats(EmitStats::CallBindIndex);
+		// gt7-emit-1119 (KYTY_EMIT_FAST=1): the index buffer bound already is left out.
+		if (auto* shadow = Shadow(); shadow != nullptr && EmitStats::Mode() != 0) {
+			const bool same = shadow->emit_index_valid && shadow->emit_index_buffer == buffer &&
+			                  shadow->emit_index_offset == offset && shadow->emit_index_type == type;
+			if (same) {
+				EmitStats::Add(EmitStats::SkipIndex);
+				if (EmitStats::Mode() == 1) {
+					return;
+				}
+			}
+			shadow->emit_index_valid  = true;
+			shadow->emit_index_buffer = buffer;
+			shadow->emit_index_offset = offset;
+			shadow->emit_index_type   = type;
+		}
 		Run([=](vk::CommandBuffer command) { command.bindIndexBuffer(buffer, offset, type); });
 	}
 	void bindVertexBuffers2(uint32_t first, uint32_t count, const vk::Buffer* buffers,
 	                        const vk::DeviceSize* offsets, const vk::DeviceSize* sizes,
 	                        const vk::DeviceSize* strides) const {
+		const EmitStats::Scope stats(EmitStats::CallBindVertex);
+		if (EmitStats::Mode() != 0 && SameVertexBuffers(first, count, buffers, offsets, sizes,
+		                                                strides)) {
+			EmitStats::Add(EmitStats::SkipVertex);
+			if (EmitStats::Mode() == 1) {
+				return;
+			}
+		}
 		if (!Threaded()) {
 			m_direct.bindVertexBuffers2(first, count, buffers, offsets, sizes, strides);
 			return;
@@ -256,8 +297,10 @@ public:
 	}
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* values) const {
+		const EmitStats::Scope stats(EmitStats::CallPushConstants);
 		if (auto* shadow = Shadow(); shadow != nullptr) {
 			shadow->replay_constants_valid = false; // gt7-replay-1119
+			shadow->emit_constants_valid   = false; // gt7-emit-1119
 		}
 		if (!Threaded()) {
 			m_direct.pushConstants(layout, stages, offset, size, values);
@@ -271,10 +314,12 @@ public:
 	void bindDescriptorSets(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                        uint32_t first, uint32_t count, const vk::DescriptorSet* sets,
 	                        uint32_t dynamic_count, const uint32_t* dynamic_offsets) const {
+		const EmitStats::Scope stats(EmitStats::CallBindSets);
 		if (auto* shadow = Shadow();
 		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics && first == 0) {
 			shadow->replay_set_valid = false; // gt7-replay-1119
 		}
+		ForgetEmitSet(bind_point, layout, first);
 		if (!Threaded()) {
 			m_direct.bindDescriptorSets(bind_point, layout, first, count, sets, dynamic_count,
 			                            dynamic_offsets);
@@ -289,10 +334,12 @@ public:
 	void pushDescriptorSetKHR(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
 	                          uint32_t set, uint32_t count,
 	                          const vk::WriteDescriptorSet* writes) const {
+		const EmitStats::Scope stats(EmitStats::CallPushDescriptors);
 		if (auto* shadow = Shadow();
 		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics && set == 0) {
 			shadow->replay_set_valid = false; // gt7-replay-1119
 		}
+		ForgetEmitSet(bind_point, layout, set);
 		if (!Threaded()) {
 			m_direct.pushDescriptorSetKHR(bind_point, layout, set, count, writes);
 			return;
@@ -308,10 +355,12 @@ public:
 	void updateAndBindDescriptorSet(vk::Device device, vk::PipelineBindPoint bind_point,
 	                                vk::PipelineLayout layout, vk::DescriptorSet set,
 	                                uint32_t count, const vk::WriteDescriptorSet* writes) const {
+		const EmitStats::Scope stats(EmitStats::CallUpdateBindSet);
 		if (auto* shadow = Shadow();
 		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics) {
 			shadow->replay_set_valid = false; // gt7-replay-1119
 		}
+		ForgetEmitSet(bind_point, layout, 0);
 		if (!Threaded()) {
 			device.updateDescriptorSets(count, writes, 0, nullptr);
 			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
@@ -324,12 +373,67 @@ public:
 			command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
 		});
 	}
+	// gt7-emit-1119 (KYTY_EMIT_FAST=1): set `set` of a push-descriptor layout from `size` bytes
+	// of descriptor infos laid out as `update` (made for the layout) reads them. The storage image
+	// infos at `storage_offsets` (an array that outlives the recording) are checked for views
+	// destroyed since, as the writes' are.
+	void pushDescriptorSetWithTemplate(vk::PipelineBindPoint bind_point,
+	                                   vk::DescriptorUpdateTemplate update,
+	                                   vk::PipelineLayout layout, uint32_t set,
+	                                   const std::byte* data, uint32_t size,
+	                                   const uint32_t* storage_offsets,
+	                                   uint32_t storage_count) const {
+		const EmitStats::Scope stats(EmitStats::CallPushTemplate);
+		if (auto* shadow = Shadow();
+		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics && set == 0) {
+			shadow->replay_set_valid = false;
+		}
+		ForgetEmitSet(bind_point, layout, set);
+		EmitStats::Add(EmitStats::CountTemplateBytes, size);
+		if (!Threaded()) {
+			m_direct.pushDescriptorSetWithTemplateKHR(update, layout, set, data);
+			return;
+		}
+		auto* copy = const_cast<std::byte*>(m_scheduler->Stash(data, size));
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			ScrubDeadTemplateViews(copy, storage_offsets, storage_count, "recorded descriptors");
+			command.pushDescriptorSetWithTemplateKHR(update, layout, set, copy);
+		});
+	}
+	// The same for a fresh set of a pool (vkUpdateDescriptorSetWithTemplate), then its bind as set
+	// 0, both on the recording thread as updateAndBindDescriptorSet's.
+	void updateWithTemplateAndBindDescriptorSet(vk::Device device, vk::PipelineBindPoint bind_point,
+	                                            vk::PipelineLayout layout, vk::DescriptorSet set,
+	                                            vk::DescriptorUpdateTemplate update,
+	                                            const std::byte* data, uint32_t size,
+	                                            const uint32_t* storage_offsets,
+	                                            uint32_t        storage_count) const {
+		const EmitStats::Scope stats(EmitStats::CallUpdateTemplateSet);
+		if (auto* shadow = Shadow();
+		    shadow != nullptr && bind_point == vk::PipelineBindPoint::eGraphics) {
+			shadow->replay_set_valid = false;
+		}
+		ForgetEmitSet(bind_point, layout, 0);
+		EmitStats::Add(EmitStats::CountTemplateBytes, size);
+		if (!Threaded()) {
+			device.updateDescriptorSetWithTemplate(set, update, data);
+			m_direct.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+			return;
+		}
+		auto* copy = const_cast<std::byte*>(m_scheduler->Stash(data, size));
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			ScrubDeadTemplateViews(copy, storage_offsets, storage_count, "recorded descriptors");
+			device.updateDescriptorSetWithTemplate(set, update, copy);
+			command.bindDescriptorSets(bind_point, layout, 0, 1, &set, 0, nullptr);
+		});
+	}
 	void pipelineBarrier(vk::PipelineStageFlags source, vk::PipelineStageFlags destination,
 	                     vk::DependencyFlags flags, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
 	                     const vk::ImageMemoryBarrier* images,
 	                     const std::source_location& site = std::source_location::current()) const {
+		const EmitStats::Scope stats(EmitStats::CallBarrier);
 		Touch();
 		{
 			uint32_t layouts = 0;
@@ -359,6 +463,7 @@ public:
 	void
 	pipelineBarrier2(const vk::DependencyInfo&   dependency,
 	                 const std::source_location& site = std::source_location::current()) const {
+		const EmitStats::Scope stats(EmitStats::CallBarrier);
 		auto*      batch = Batch();
 		const bool full  = WaitsForEverything(dependency);
 		if (batch != nullptr && batch->after_pending) {
@@ -392,6 +497,7 @@ public:
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                const vk::BufferCopy* regions) const {
+		const EmitStats::Scope stats(EmitStats::CallCopy);
 		Touch();
 		RecordCopy(source, destination, count, regions);
 	}
@@ -405,6 +511,7 @@ public:
 	// it. The caller has ended the rendering.
 	void copyBufferBatched(vk::Buffer source, vk::Buffer destination, uint32_t count,
 	                       const vk::BufferCopy* regions, bool wait_before) const {
+		const EmitStats::Scope stats(EmitStats::CallCopy);
 		auto* batch = Batch();
 		EXIT_IF(batch == nullptr || count == 0);
 		uint64_t begin = UINT64_MAX;
@@ -455,6 +562,7 @@ public:
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const {
+		const EmitStats::Scope stats(EmitStats::CallCopy);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferUpdates);
 		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
@@ -469,22 +577,28 @@ public:
 		});
 	}
 	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {
+		const EmitStats::Scope stats(EmitStats::CallQuery);
 		Run([=](vk::CommandBuffer command) { command.writeTimestamp(stage, pool, query); });
 	}
 	void resetQueryPool(vk::QueryPool pool, uint32_t first, uint32_t count) const {
+		const EmitStats::Scope stats(EmitStats::CallQuery);
 		Run([=](vk::CommandBuffer command) { command.resetQueryPool(pool, first, count); });
 	}
 	void beginQuery(vk::QueryPool pool, uint32_t query) const {
+		const EmitStats::Scope stats(EmitStats::CallQuery);
 		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, {}); });
 	}
 	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		const EmitStats::Scope stats(EmitStats::CallQuery);
 		Run([=](vk::CommandBuffer command) { command.beginQuery(pool, query, flags); });
 	}
 	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		const EmitStats::Scope stats(EmitStats::CallQuery);
 		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
+		const EmitStats::Scope stats(EmitStats::CallCopy);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferFills);
 		RecordedCommands::Add(RecordedCommands::BufferFillBytes, size);
@@ -597,6 +711,7 @@ public:
 	void beginRendering(const vk::RenderingInfo* info) const { beginRendering(*info); }
 	void beginRendering(const vk::RenderingInfo& info) const {
 		// A barrier cannot go inside the rendering: the batch's goes before it.
+		const EmitStats::Scope stats(EmitStats::CallBeginRendering);
 		Touch();
 		{
 			uint64_t loaded = 0;
@@ -633,6 +748,7 @@ public:
 		});
 	}
 	void endRendering() const {
+		const EmitStats::Scope stats(EmitStats::CallEndRendering);
 		RecordedCommands::Mark(RecordedCommands::GapRenderPass);
 		Run([](vk::CommandBuffer command) { command.endRendering(); });
 	}
@@ -821,6 +937,7 @@ private:
 			return false;
 		}
 		shadow->calls++;
+		EmitStats::Add(EmitStats::CallState);
 		if (!shadow->Same(kind, data, static_cast<uint32_t>(size))) {
 			return false;
 		}
@@ -829,6 +946,7 @@ private:
 			return false;
 		}
 		shadow->left_out++;
+		EmitStats::Add(EmitStats::SkipState);
 		return true;
 	}
 	// A stencil state of the front face, the back face or both.
@@ -849,6 +967,7 @@ private:
 		if (face & vk::StencilFaceFlagBits::eBack) {
 			same = shadow->Same(back, data, bytes) && same;
 		}
+		EmitStats::Add(EmitStats::CallState);
 		if (!same) {
 			return false;
 		}
@@ -857,7 +976,50 @@ private:
 			return false;
 		}
 		shadow->left_out++;
+		EmitStats::Add(EmitStats::SkipState);
 		return true;
+	}
+	// gt7-emit-1119: a bind of descriptor set `first` with `layout` at `bind_point`: the graphics
+	// set 0 the shadow holds is gone if it is set 0, or if another layout may have disturbed it.
+	void ForgetEmitSet(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+	                   uint32_t first) const noexcept {
+		auto* shadow = Shadow();
+		if (shadow == nullptr || bind_point != vk::PipelineBindPoint::eGraphics) {
+			return;
+		}
+		if (first == 0 || layout != shadow->emit_set_layout) {
+			shadow->emit_set_valid = false;
+		}
+	}
+	// gt7-emit-1119 (KYTY_EMIT_FAST): whether the vertex buffers are those bound already; the
+	// shadow holds these after.
+	[[nodiscard]] bool SameVertexBuffers(uint32_t first, uint32_t count, const vk::Buffer* buffers,
+	                                     const vk::DeviceSize* offsets, const vk::DeviceSize* sizes,
+	                                     const vk::DeviceSize* strides) const noexcept {
+		auto* shadow = Shadow();
+		if (shadow == nullptr) {
+			return false;
+		}
+		if (first != 0 || strides != nullptr ||
+		    count > DynamicStateShadow::MaxEmitVertexBuffers) {
+			shadow->emit_vertex_valid = false;
+			return false;
+		}
+		const bool sized = sizes != nullptr;
+		bool       same  = shadow->emit_vertex_valid && shadow->emit_vertex_count == count &&
+		            shadow->emit_vertex_sized == sized;
+		for (uint32_t i = 0; i < count; i++) {
+			same = same && shadow->emit_vertex_buffers[i] == buffers[i] &&
+			       shadow->emit_vertex_offsets[i] == offsets[i] &&
+			       (!sized || shadow->emit_vertex_sizes[i] == sizes[i]);
+			shadow->emit_vertex_buffers[i] = buffers[i];
+			shadow->emit_vertex_offsets[i] = offsets[i];
+			shadow->emit_vertex_sizes[i]   = sized ? sizes[i] : 0;
+		}
+		shadow->emit_vertex_valid = true;
+		shadow->emit_vertex_count = count;
+		shadow->emit_vertex_sized = sized;
+		return same;
 	}
 	void Invalidate(DynamicStateShadow::Kind kind) const noexcept {
 		if (auto* shadow = Shadow(); shadow != nullptr) {
@@ -875,6 +1037,7 @@ private:
 			return false;
 		}
 		shadow.left_out++;
+		EmitStats::Add(EmitStats::SkipPipeline);
 		return true;
 	}
 	[[nodiscard]] CopyBatchState* Batch() const noexcept {

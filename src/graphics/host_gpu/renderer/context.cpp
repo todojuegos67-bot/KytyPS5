@@ -265,6 +265,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	EmitStats::NoteEndRendering(); // gt7-emit-1119
 	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};

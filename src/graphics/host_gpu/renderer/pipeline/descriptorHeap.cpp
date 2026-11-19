@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/emitStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 namespace Libs::Graphics {
@@ -34,8 +35,17 @@ DescriptorHeap::~DescriptorHeap() {
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(layout == nullptr);
+	const EmitStats::Scope stats(EmitStats::StepHeapCommit); // gt7-emit-1119
 
-	auto& batch = m_sets[layout];
+	Batch* last = nullptr;
+	if (EmitStats::Mode() == 1) {
+		if (m_last_batch == nullptr || m_last_layout != layout) {
+			m_last_layout = layout;
+			m_last_batch  = &m_sets[layout];
+		}
+		last = m_last_batch;
+	}
+	auto& batch = last != nullptr ? *last : m_sets[layout];
 	if (batch.size != 0) {
 		return batch.sets[--batch.size];
 	}
@@ -53,6 +63,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_sets.clear();
+	m_last_batch      = nullptr;
 	auto& fresh_batch = m_sets[layout];
 	EXIT_IF(!Allocate(layout, fresh_batch));
 	return fresh_batch.sets[--fresh_batch.size];
@@ -68,6 +79,7 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 
 	for (;;) {
 		allocate.descriptorSetCount = batch.allocation;
+		EmitStats::Add(EmitStats::CountPoolAllocations);
 		const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
 		if (result == vk::Result::eSuccess) {
 			batch.size = batch.allocation;

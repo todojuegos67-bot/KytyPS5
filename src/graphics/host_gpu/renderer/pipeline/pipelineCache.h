@@ -269,6 +269,19 @@ public:
 	// Round seedcs: the "Pipelines this run" line (at Save).
 	void LogPipelinesMade();
 
+	// gt7-emit-1119 (KYTY_EMIT_FAST): a pipeline's descriptor update template for set 0, made
+	// at its first draw (CommitBindings, under the translation lock) from the draw's writes: one
+	// entry per write, its infos 24 bytes apart in one array. `signature` holds each write's
+	// binding and type, then its count and whether its infos are images; a draw whose writes
+	// differ does not use the template.
+	struct EmitSetTemplate {
+		vk::DescriptorUpdateTemplate update = nullptr;
+		std::vector<uint64_t>        signature;
+		std::vector<uint32_t>        storage_offsets; // the storage image infos, in bytes
+		uint32_t                     size   = 0;
+		bool                         failed = false;
+	};
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -284,6 +297,8 @@ public:
 		// Round 117: built with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT (KYTY_PARTITION_QUICK
 		// for the partitions of the ray tracing material passes), looked up so as well.
 		bool disable_optimization = false;
+		// gt7-emit-1119 (KYTY_EMIT_FAST): set 0's template (EmitSetTemplate), null until a draw.
+		mutable std::shared_ptr<EmitSetTemplate> emit_template;
 	};
 
 	struct GraphicsPrograms {

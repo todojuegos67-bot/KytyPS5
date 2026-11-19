@@ -5091,6 +5091,10 @@ PipelineCache::~PipelineCache() {
 				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
 			}
 			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			if (pipeline->emit_template && pipeline->emit_template->update) {
+				m_graphics.device.destroyDescriptorUpdateTemplate(pipeline->emit_template->update,
+				                                                  nullptr);
+			}
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}

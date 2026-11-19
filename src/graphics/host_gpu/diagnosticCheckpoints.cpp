@@ -334,6 +334,21 @@ void ScrubDeadDescriptorViews(const vk::WriteDescriptorSet* writes, uint32_t cou
 	}
 }
 
+void ScrubDeadTemplateViews(std::byte* data, const uint32_t* offsets, uint32_t count,
+                            const char* where) {
+	if (!g_any_dead_views.load(std::memory_order_relaxed) || data == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		auto* info = reinterpret_cast<vk::DescriptorImageInfo*>(data + offsets[i]);
+		if (DiagnosticViewIsLive(info->imageView)) {
+			continue;
+		}
+		ReportDeadView(where, "template descriptor", i, info->imageView);
+		info->imageView = nullptr;
+	}
+}
+
 DiagnosticCheckpoint* RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint) {
 	const auto sequence = g_checkpoint_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 	auto&      slot     = g_checkpoints[sequence % CHECKPOINT_RING_SIZE];

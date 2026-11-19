@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/emitStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
@@ -124,6 +125,37 @@ struct DynamicStateShadow {
 	void InvalidateReplay() noexcept {
 		replay_set_valid       = false;
 		replay_constants_valid = false;
+		InvalidateEmit();
+	}
+	// gt7-emit-1119 (KYTY_EMIT_FAST): the graphics set 0 (its template array, or with =2 the
+	// normal path's writes, flattened) and push constants a draw last recorded, with the pipeline
+	// layout, and the index and vertex buffers bound, so the next draw can leave out the same
+	// again. Forgotten as the replay's are, and the push constants also when a guest pipeline of
+	// another layout or another compute pipeline is bound (which may disturb them).
+	static constexpr uint32_t MaxEmitVertexBuffers = 32;
+	bool                      emit_set_valid = false;
+	vk::PipelineLayout        emit_set_layout;
+	std::vector<std::byte>    emit_set_blob;
+	std::vector<uint64_t>     emit_set_words; // =2: the normal path's writes
+	bool                      emit_constants_valid = false;
+	vk::PipelineLayout        emit_constants_layout;
+	uint32_t                  emit_constants_stages = 0;
+	std::array<uint32_t, 32>  emit_constants {};
+	bool                      emit_index_valid = false;
+	vk::Buffer                emit_index_buffer;
+	vk::DeviceSize            emit_index_offset = 0;
+	vk::IndexType             emit_index_type   = vk::IndexType::eUint16;
+	bool                      emit_vertex_valid = false;
+	uint32_t                  emit_vertex_count = 0;
+	std::array<vk::Buffer, MaxEmitVertexBuffers>     emit_vertex_buffers {};
+	std::array<vk::DeviceSize, MaxEmitVertexBuffers> emit_vertex_offsets {};
+	std::array<vk::DeviceSize, MaxEmitVertexBuffers> emit_vertex_sizes {};
+	bool                                             emit_vertex_sized = false;
+	void InvalidateEmit() noexcept {
+		emit_set_valid       = false;
+		emit_constants_valid = false;
+		emit_index_valid     = false;
+		emit_vertex_valid    = false;
 	}
 	void InvalidateGraphics() noexcept {
 		for (auto& entry: entries) {
@@ -243,6 +275,7 @@ public:
 	template <typename F>
 	void Record(F&& fn) {
 		using Command = TypedCommand<std::decay_t<F>>;
+		EmitStats::Add(EmitStats::CountRecords); // gt7-emit-1119
 		void* memory  = Allocate(sizeof(Command), alignof(Command));
 		auto* command = new (memory) Command(std::forward<F>(fn));
 		if (m_chunk->last != nullptr) {
@@ -259,6 +292,7 @@ public:
 		if (data == nullptr || count == 0) {
 			return nullptr;
 		}
+		EmitStats::Add(EmitStats::CountStashBytes, sizeof(T) * count); // gt7-emit-1119
 		auto* copy = static_cast<T*>(Allocate(sizeof(T) * count, alignof(T)));
 		std::memcpy(static_cast<void*>(copy), data, sizeof(T) * count);
 		return copy;
