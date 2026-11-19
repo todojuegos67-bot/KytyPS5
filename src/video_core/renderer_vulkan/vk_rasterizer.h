@@ -22,6 +22,9 @@ struct Liverpool;
 namespace BB {
 class RtReflect; // bb-rt-reflect
 class VolFog;    // bb-volfog
+namespace PathTrace {
+class Tracer; // bb-pathtrace (bb_pt.h)
+}
 }
 
 namespace Core {
@@ -167,6 +170,10 @@ private:
     // bb-hud-fullres: the scissor of viewport `index` for a draw laid out for the output.
     vk::Rect2D BbFullResScissor(u32 index) const;
     void BbObjMvDraw(const GraphicsPipeline* pipeline, u64 identity, u32 count, u32 instances);
+    void BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset);
+public:
+    void BbPtFrameEnd(); // bb-pathtrace: the presenter, once per guest frame
+private:
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -248,6 +255,7 @@ private:
 
     std::unique_ptr<BB::RtReflect> bb_rt_reflect; // bb-rt: reflect / volumetric / shadows
     std::unique_ptr<BB::VolFog> bb_volfog;        // bb-volfog (no ray tracing needed)
+    std::unique_ptr<BB::PathTrace::Tracer> bb_pt; // bb-pathtrace: BB_PT=1 (bb_pt.h)
     // bb-volfog state: the composite's HDR target and whether the apply is pending; a G-buffer
     // pass (its depth = the scene depth) since the last composite; the frame sequence (composites)
     // and the sequence the last inject belongs to.

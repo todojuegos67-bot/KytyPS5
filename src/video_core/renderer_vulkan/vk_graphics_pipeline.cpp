@@ -41,6 +41,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    bb_pt_capture = runtime_infos[u32(Shader::SwStage::Vertex)].hw.vs.bb_pt_capture;
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 

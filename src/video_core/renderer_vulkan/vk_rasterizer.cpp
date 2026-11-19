@@ -19,6 +19,7 @@
 #include "core/bb_hud_native_hook.h"
 #include "core/bb_ssr_probe.h"
 #include "video_core/renderer_vulkan/bb_rt_reflect.h"
+#include "video_core/renderer_vulkan/bb_pt.h"
 #include "video_core/renderer_vulkan/bb_volfog.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -98,6 +99,20 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                     "[fog-fx] BB_FOG_FX={} requested but this device has no ray query / "
                     "acceleration structures: volumetric fog off",
                     BB::FogFx::Level());
+    }
+
+    // bb-pathtrace (BB_PT=1, bb_pt.h): capture buffers at start, never lazily during play.
+    if (BB::PathTrace::Requested()) {
+        if (instance.IsRtReflectEnabled()) {
+            bb_pt = std::make_unique<BB::PathTrace::Tracer>(instance, *memory);
+            if (!bb_pt->Init()) {
+                LOG_ERROR(Render_Vulkan, "[pt] init failed: path tracer off");
+                bb_pt.reset();
+            }
+        } else {
+            LOG_WARNING(Render_Vulkan, "[pt] BB_PT=1 requested but this device has no ray query / "
+                                       "acceleration structures: path tracer off");
+        }
     }
 
     // bb-volfog: froxel volumetric fog (no ray tracing: works on any device).
@@ -218,6 +233,38 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
         }
     }
     return {vertex_offset, instance_offset};
+}
+
+// bb-pathtrace (bb_pt.h): an opaque scene draw of a capture pipeline (its vertex variant stores the
+// clip positions). Index bytes and the slot range go to the tracer, which fills the push fields.
+void Rasterizer::BbPtCapture(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset) {
+    const auto& regs = liverpool->regs;
+    if (regs.primitive_type != AmdGpu::PrimitiveType::TriangleList) {
+        return;
+    }
+    const auto [vertex_offset, instance_offset] =
+        GetDrawOffsets(regs, pipeline.GetStage(Shader::SwStage::Vertex),
+                       pipeline.GetFetchShader());
+    const bool index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_indexed ? (index16 ? 2u : 4u) : 0u;
+    bb_pt->CaptureDraw(
+        BB::PathTrace::DrawCapture{
+            .index_address = is_indexed ? regs.index_base_address.Address<VAddr>() +
+                                              u64(index_offset) * index_size
+                                        : 0,
+            .index_size = index_size,
+            .num_indices = regs.num_indices,
+            .instances = regs.num_instances.NumInstances(),
+            .vertex_offset = vertex_offset,
+            .instance_offset = instance_offset,
+        },
+        push_data);
+}
+
+void Rasterizer::BbPtFrameEnd() {
+    if (bb_pt) {
+        bb_pt->EndFrame();
+    }
 }
 
 void Rasterizer::EliminateFastClear() {
@@ -1324,6 +1371,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     push_data.xoffset *= bb_target_scale[0];
     push_data.yscale *= bb_target_scale[1];
     push_data.yoffset *= bb_target_scale[1];
+    if (bb_pt && pipeline->BbPtCapture()) {
+        BbPtCapture(*pipeline, is_indexed, index_offset);
+    }
     BbObjMvDraw(pipeline,
                 is_indexed ? regs.index_base_address.Address<VAddr>() + index_offset : 0,
                 regs.num_indices, regs.num_instances.NumInstances());

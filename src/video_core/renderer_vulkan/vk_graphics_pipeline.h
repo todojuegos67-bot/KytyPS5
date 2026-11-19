@@ -101,6 +101,11 @@ public:
         return key;
     }
 
+    /// bb-pathtrace: the vertex variant stores clip positions (bb_pt.h, Tracer::CaptureDraw).
+    bool BbPtCapture() const noexcept {
+        return bb_pt_capture;
+    }
+
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
@@ -114,6 +119,7 @@ private:
 private:
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
+    bool bb_pt_capture{};
 };
 
 struct ClipDistanceShaderKey {

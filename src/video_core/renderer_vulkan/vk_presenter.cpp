@@ -1445,6 +1445,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
+    // bb-pathtrace (bb_pt.h): this guest frame's captured geometry ends here.
+    rasterizer->BbPtFrameEnd();
+
     // bb-mv-skin: the scene frame of the colour presented (FG pairing; the inputs carry the
     // stamps of where they were made).
     if (frame->fg.valid) frame->fg.color_frame = BB::SceneFrameNumber();
