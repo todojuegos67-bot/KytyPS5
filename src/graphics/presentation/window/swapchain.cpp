@@ -24,6 +24,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -1112,6 +1114,27 @@ void Presenter::Present(Frame& frame) {
 	Present(std::span(&layer, 1));
 }
 
+
+// KYTY_FPSLOG=<file>: writes one line per presented frame (unix time in microseconds) so an
+// external script can compute average fps and 1% lows. Unset = no file, no cost beyond one check.
+static void KytyFpsLogFrame() {
+	static FILE* f = [] {
+		const char* path = std::getenv("KYTY_FPSLOG");
+		return (path != nullptr && path[0] != '\0') ? std::fopen(path, "w") : nullptr;
+	}();
+	if (f == nullptr) {
+		return;
+	}
+	static unsigned n = 0;
+	const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                    std::chrono::system_clock::now().time_since_epoch())
+	                    .count();
+	std::fprintf(f, "%lld\n", static_cast<long long>(us));
+	if (++n % 60 == 0) {
+		std::fflush(f);
+	}
+}
+
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
@@ -1123,6 +1146,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 		previous = layer;
 	}
 	m_impl->Present();
+	KytyFpsLogFrame();
 }
 
 void Presenter::ClearLayer(int bus) {
