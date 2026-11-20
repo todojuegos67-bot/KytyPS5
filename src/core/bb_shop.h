@@ -12,9 +12,8 @@
 // ShopLineupParam / ItemLotParam), msg/<lang>/item.msgbnd.dcx (names, captions, lore) and
 // menu/menu_knowledge_NNNNN.tpf.dcx (icons, BC7, PS4 tiled). Loaded on a worker thread when the
 // card opens, freed when it closes; nothing runs while the card has never been opened.
-// A purchase is applied on the game thread at the next frame (the game is paused while the
-// menu is open): echoes are taken atomically and the item is given by the game's own
-// add-item function (the one the Lua AddInventoryItem command uses, with its "item obtained" log).
+// A purchase is applied on the game thread at the next frame: echoes are taken atomically
+// and the item is given by the game's own add-item function (the one the Lua AddInventoryItem command uses, with its "item obtained" log).
 namespace BB::Shop {
 
 enum class Tab : u8 { Weapons, Items, Tools, Materials, Count };

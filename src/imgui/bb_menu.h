@@ -32,13 +32,6 @@ bool IsOpen();
 // while the menu was up).
 u32 OpenChanges();
 
-// (bb-menu-pause) The menu pauses the game (not in co-op: BB_COOP=1 with a Matching2 room).
-// Guest flip entry points call this first: it blocks while the menu holds the pause.
-void WaitWhilePaused();
-// Wake the parked guest thread so it runs queued work (shop purchases) while paused.
-void WakePause();
-// The pause is on (audio out writes silence).
-bool GamePaused();
 
 // (bb-kbmcam-142) "Jugar con teclado y ratón" (bb_menu.ini kbm_play) is on.
 bool KbmPlay();

@@ -19,7 +19,6 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "video_core/bb/bb_perf2.h"
-#include "imgui/bb_menu.h"
 
 namespace Libraries::AudioOut {
 
@@ -583,11 +582,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
         }
 
         if (ptr != nullptr) {
-            if (BbMenu::GamePaused()) { // F1 menu pause: silence, not the game's last buffers
-                std::memset(port->output_buffer, 0, port->BufferSize());
-            } else {
-                std::memcpy(port->output_buffer, ptr, port->BufferSize());
-            }
+            std::memcpy(port->output_buffer, ptr, port->BufferSize());
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
@@ -694,11 +689,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     // Copy data to all ports
     for (u32 i = 0; i < num; i++) {
         if (param[i].ptr != nullptr) {
-            if (BbMenu::GamePaused()) { // F1 menu pause: silence
-                std::memset(ports[i]->output_buffer, 0, ports[i]->BufferSize());
-            } else {
-                std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
-            }
+            std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
         }
     }

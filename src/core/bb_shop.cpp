@@ -58,7 +58,6 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/memory.h"
-#include "imgui/bb_menu.h"
 
 namespace BB::Shop {
 namespace {
@@ -90,7 +89,7 @@ T Rd(u64 a) {
     std::memcpy(&v, reinterpret_cast<const void*>(a), sizeof(T));
     return v;
 }
-// true when the inventory index has the key; reads only (any thread while the game is paused).
+// true when the inventory index has the key; reads only (menu thread, and the game thread).
 void Put32(u64 a, u32 v) {
     std::memcpy(reinterpret_cast<void*>(a), &v, 4);
 }
@@ -591,7 +590,6 @@ bool Buy(const Item& item, std::string& why) {
     g_queue.push_back({item.id, item.tab == Tab::Weapons ? CatWeapon : CatGoods, item.price,
                        item.name});
     g_pending = true;
-    BbMenu::WakePause(); // applied now by the guest thread parked in the pause
     return true;
 }
 

@@ -12,7 +12,6 @@
 #include "core/address_space.h"
 #include "core/bb_cheats.h"
 #include "core/bb_vardt.h"
-#include "imgui/bb_menu.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/gnmdriver/gnm_error.h"
@@ -2385,7 +2384,6 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
-    BbMenu::WaitWhilePaused(); // F1 menu open: the game waits here (bb-menu-pause)
     BB::NativeMv::OnGuestFlip();
     BB::VarDt::OnGuestFlip(static_cast<int>(flip_mode));
     BB::Cheats::OnGuestFlip();

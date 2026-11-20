@@ -190,8 +190,8 @@ void AddInsight(s32 n) {
     if (g_ok) g_add_insight += n;
 }
 // Read straight from game memory (read only) with the same validation as the frame code: the
-// F1 menu pauses the game, so values sampled by the guest frame are stale or empty while it is
-// open (the shop saw in_game = false whenever no stats had been sampled before the pause).
+// frame code only samples them while a cheat is on or the menu asked on an earlier frame, so the
+// shop could see in_game = false with a save loaded.
 Stats Read() {
     g_want_stats = true;
     Stats st{};
