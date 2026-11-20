@@ -2216,6 +2216,11 @@ void CustomWatcher() {
     int since_write = 0;
     s32 echo_base = -1; // (bb-trophy-beast) lowest echoes seen this run (minus cheat echoes)
     const auto on_map = [&](const std::string& id) {
+        // (bb-trophy-beast) m27_00 is loaded right after m24_01 while the player stays in
+        // Central Yharnam (seen in the logs every time): not a map change.
+        if (id == "m27_00_00_00" && cur_map == kMapYharnam) {
+            return;
+        }
         cur_map = id;
         any_map = true;
         if (!s.armed) {
@@ -2304,12 +2309,14 @@ void CustomWatcher() {
         // no weapon; the only thing that gives echoes in the clinic before the first Hunter's
         // Dream is killing the clinic beast. Echoes going up in Central Yharnam before the
         // first dream = the beast was killed. Echoes added by the F1 cheats are ignored.
-        if (!s.unlocked[2] && s.yharnam_seen && !s.dream_seen && cur_map == kMapYharnam) {
+        if (!s.unlocked[2] && s.yharnam_seen && !s.dream_seen) {
             const BB::Cheats::Stats st = BB::Cheats::Read();
             if (st.in_game) {
                 const s32 cheat_add = BB::Cheats::EchoesAddedByCheats();
                 const s32 now = st.echoes - cheat_add;
                 if (echo_base < 0 || now < echo_base) {
+                    LOG_INFO(Frontend, "[bbtrophy] beast check: echoes base {} (cheats added {})",
+                             now, cheat_add);
                     echo_base = now;
                 } else if (now > echo_base) {
                     LOG_INFO(Frontend, "[bbtrophy] echoes {} -> {} before the first dream", echo_base,
