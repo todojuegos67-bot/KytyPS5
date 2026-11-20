@@ -8981,7 +8981,7 @@ void SettingsBlock(float unit) {
 	}
 	Anim::Highlight(unit);
 	ImGui::SetNextItemWidth(std::round(420 * unit));
-	ImGui::InputTextWithHint(I18n::T("Servidor"), "127.0.0.1  /  84.79.155.54", g_server, sizeof(g_server));
+	ImGui::InputTextWithHint(I18n::T("Servidor"), "127.0.0.1  /  bloodbornetdj67.duckdns.org", g_server, sizeof(g_server));
 	Anim::Highlight(unit);
 	FieldTools("##g_server", g_server, sizeof(g_server)); // (online6) Pegar
 	ImGui::SetNextItemWidth(std::round(420 * unit));

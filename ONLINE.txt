@@ -1,7 +1,8 @@
 DEMON'S SOULS PC - MULTIJUGADOR ONLINE
 =====================================
 
-El servidor online funciona en el PC del anfitrion (IP publica 84.79.155.54).
+El servidor online funciona en el PC del anfitrion. Los amigos se conectan
+al nombre bloodbornetdj67.duckdns.org (siempre apunta a la IP publica actual).
 Mensajes en el suelo, manchas de sangre, fantasmas y senales de invocacion
 pasan por ese servidor. Nadie mas tiene que abrir puertos en su router.
 
@@ -30,7 +31,7 @@ Para jugar el anfitrion: F2 -> Multijugador -> Servidor 127.0.0.1
 B) JUGADORES (amigos)
 ---------------------------------------------------------------
   1. Abrir el juego y pulsar F2 -> Multijugador.
-  2. Servidor: 84.79.155.54
+  2. Servidor: bloodbornetdj67.duckdns.org
   3. Nombre: el tuyo.  Contrasena: la que quieras (apuntala).
      Cada jugador tiene SU cuenta; no hace falta la del anfitrion.
      Se puede pegar con Ctrl+V.
