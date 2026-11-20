@@ -305,6 +305,8 @@ jobs:
             Copy-Item tools\local\steam\Anadir-a-Steam.cmd, tools\local\steam\Anadir-a-Steam.ps1, tools\local\steam\fondo-steam.jpg $out
             # (11-17) What to download apart and the steps, in the folder root.
             Copy-Item LEEME-PRIMERO.txt $out
+            # (online) multiplayer notes and server start/stop next to the exe
+            foreach ($f in 'ONLINE.txt','ENCENDER-SERVIDOR.cmd','PARAR-SERVIDOR.cmd','tools\online\Servidor-DS-instalar.cmd') { if (Test-Path $f) { Copy-Item $f $out } }
             # (10-28) AMD FSR 4 (Reescalado FSR 4): the v07 INT8 model next to the exe, checked against its manifests.
             python tools\local\fsr4\spv_reflect.py fsr4_shaders
             if ($LASTEXITCODE -ne 0) { throw 'fsr4_shaders: the assets do not match their manifests' }
