@@ -31,6 +31,7 @@
 #include <cstring>
 #include <mutex>
 #include "common/logging/log.h"
+#include "core/bb_shop.h"
 #include "core/memory.h"
 
 namespace BB::Cheats {
@@ -188,7 +189,8 @@ void OnGuestFlip() {
     g_applied[idx(Cheat::OneHitKill)] = kill;
 
     // Nothing on, nothing queued and the menu not reading: do not touch game memory at all.
-    bool busy = g_items_data != 0 || g_add_echoes.load() != 0 || g_add_insight.load() != 0;
+    bool busy = g_items_data != 0 || g_add_echoes.load() != 0 || g_add_insight.load() != 0 ||
+                BB::Shop::HasPending();
     for (u32 i = 0; i < idx(Cheat::Count); i++) busy = busy || g_on[i].load();
     if (!g_want_stats.exchange(false) && !busy) return;
 
@@ -246,6 +248,7 @@ void OnGuestFlip() {
             AddClamped(pgd + PgdInsight, i, 0, InsightMax);
             LOG_INFO(Lib_VideoOut, "[cheats] insight {:+}", i);
         }
+        BB::Shop::OnGuestFlip(pgd); // purchases from F1 > ARMAS Y OBJETOS
         st.in_game = true;
         st.echoes = Get<s32>(pgd + PgdEchoes);
         st.insight = Get<s32>(pgd + PgdInsight);

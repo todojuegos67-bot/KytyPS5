@@ -121,6 +121,24 @@ static std::deque<Job> g_job_list;
 static std::mutex g_upload_mtx;
 static std::deque<UploadJob> g_upload_list;
 
+RefCountedTexture RefCountedTexture::UploadBc7(std::vector<u8> blocks, u32 width, u32 height) {
+    if (blocks.size() != size_t(width / 4) * (height / 4) * 16 || width % 4 || height % 4 ||
+        EmulatorSettings.IsVkCrashDiagnosticEnabled()) {
+        return {};
+    }
+    const auto core = new Inner;
+    ++core->count; // the upload job's reference
+    core->upload_data = Vulkan::UploadTexture(blocks.data(), vk::Format::eBc7UnormBlock, width,
+                                              height, blocks.size());
+    core->width = width;
+    core->height = height;
+    {
+        std::unique_lock upload_lk{g_upload_mtx};
+        g_upload_list.emplace_back(UploadJob{.core = core});
+    }
+    return RefCountedTexture(core);
+}
+
 namespace Core::TextureManager {
 
 Inner::~Inner() {

@@ -35,6 +35,7 @@
 #include "common/arch.h"
 #include "core/bb_cheats.h"
 #include "core/bb_coop_config.h"
+#include "core/bb_shop.h"
 #include "core/bloodborne_re.h"
 #include "core/libraries/np/np_handler/np_handler.h"
 #include "core/bb_vardt.h"
@@ -2581,9 +2582,10 @@ enum class Screen {
     Options = 3,
     Cheats = 4,
     Coop = 5,
-    Exit = 6
+    Shop = 6, // (bb-shop) ARMAS Y OBJETOS (core/bb_shop.h)
+    Exit = 7
 };
-constexpr int kCards = 7;
+constexpr int kCards = 8;
 // (bb-cheats) Trucos rows: 4 toggles, game speed, echoes +10k / +100k, insight +1 / +10
 constexpr int kCheatRows = 9;
 constexpr float kSpeeds[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
@@ -2647,6 +2649,22 @@ void IconVial(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     dl->PathFillConvex(col);
 }
 // (bb-coop) two hunters joined by a bell's ring
+// (bb-shop) a saw cleaver over a coin
+void IconShop(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float th = std::max(1.5f, s * 0.035f);
+    dl->AddCircle({c.x + 0.12f * s, c.y + 0.12f * s}, 0.18f * s, col, 32, th);
+    dl->AddCircle({c.x + 0.12f * s, c.y + 0.12f * s}, 0.12f * s, col, 32, th * 0.7f);
+    dl->AddLine({c.x - 0.36f * s, c.y + 0.30f * s}, {c.x - 0.18f * s, c.y + 0.12f * s}, col,
+                th * 1.6f);
+    dl->AddQuad({c.x - 0.18f * s, c.y + 0.12f * s}, {c.x + 0.16f * s, c.y - 0.30f * s},
+                {c.x + 0.22f * s, c.y - 0.26f * s}, {c.x - 0.12f * s, c.y + 0.18f * s}, col, th);
+    for (int i = 0; i < 4; i++) {
+        const float k = 0.2f + i * 0.2f;
+        const ImVec2 e{c.x - 0.18f * s + k * 0.34f * s, c.y + 0.12f * s - k * 0.42f * s};
+        dl->AddTriangleFilled(e, {e.x - 0.05f * s, e.y - 0.02f * s}, {e.x - 0.01f * s, e.y - 0.06f * s},
+                              col);
+    }
+}
 void IconCoop(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     const float th = std::max(1.5f, s * 0.035f);
     for (const float side : {-1.0f, 1.0f}) {
@@ -2763,6 +2781,13 @@ public:
     int exit_focus = 0;
     float tog_direct = 0, tog_stick = 0, tog_look = 0, tog_inv = 0, tog_vib = 0;
     int cheat_focus = 0; // (bb-cheats) kCheatRows index
+    // (bb-shop) ARMAS Y OBJETOS
+    int shop_tab = 0, shop_focus = 0, shop_cols = 1;
+    float shop_scroll = 0, shop_desc_scroll = 0, shop_sel_anim = 0;
+    bool shop_scroll_to = false;
+    double shop_msg_t = -10, shop_tab_t = 0;
+    std::string shop_msg;
+    u32 shop_serial = 0;
     float tog_cheat[4] = {};
     // (bb-coop) MULTIJUGADOR: a network snapshot polled twice a second while the card is open
     using CoopSnap = Libraries::Np::NpHandler::CoopSnapshot;
@@ -2822,6 +2847,11 @@ public:
         }
         if (s == Screen::Coop) {
             coop_poll_t = -1.0; // read the network state right away
+        }
+        if (screen == Screen::Shop && s != Screen::Shop) BB::Shop::Close();
+        if (s == Screen::Shop && screen != Screen::Shop) {
+            BB::Shop::Open();
+            shop_tab = 0, shop_focus = 0, shop_scroll = 0, shop_desc_scroll = 0;
         }
         screen = s;
         scr_t = ImGui::GetTime();
@@ -2970,6 +3000,7 @@ public:
             case Screen::Coop:
                 if (n == Nav::Accept) CoopToggleOffline();
                 break;
+            case Screen::Shop: ShopNav(n); break;
             case Screen::Exit:
                 if (n == Nav::Left || n == Nav::Right || n == Nav::Up || n == Nav::Down) {
                     exit_focus ^= 1;
@@ -3048,7 +3079,7 @@ public:
         } else {
             static const char* titles[] = {"MANDO",  "TECLADO Y RATÓN", "TROFEOS",
                                            "OPCIONES", "TRUCOS", "MULTIJUGADOR",
-                                           "SALIR DEL JUEGO"};
+                                           "ARMAS Y OBJETOS", "SALIR DEL JUEGO"};
             TxtSpaced(dl, g_ft_title, 22 * u, {disp.x * 0.5f, 38 * u}, Bronze(), "BLOODBORNE", 6 * u,
                       true);
             TxtSpaced(dl, g_ft_title, 50 * u, {disp.x * 0.5f, 66 * u}, Gold(),
@@ -3101,6 +3132,9 @@ public:
         case Screen::Coop:
             hints = {{"cross", "Cambiar"}, {"circle", "Volver"}};
             break;
+        case Screen::Shop:
+            hints = {{"pad", "Elegir"}, {"l1", "Pestaña"}, {"cross", "Comprar"}, {"circle", "Volver"}};
+            break;
         default:
             hints = {{"cross", "Aceptar"}, {"circle", "Volver"}};
             break;
@@ -3136,6 +3170,10 @@ public:
         const float dt = ImGui::GetIO().DeltaTime;
         anim = std::clamp(anim + (g_open ? dt : -dt) / 0.25f, 0.0f, 1.0f);
         if (!g_open && anim <= 0.0f) {
+            if (was_open && screen == Screen::Shop) {
+                BB::Shop::Close(); // icons and text are only kept while the card is open
+                screen = Screen::Hub;
+            }
             was_open = false;
             TakeNav();
             return;
@@ -3202,6 +3240,7 @@ public:
             case Screen::Options: OptionsScreen(a, b, u); break;
             case Screen::Cheats: CheatsScreen(a, b, u); break;
             case Screen::Coop: CoopScreen(a, b, u); break;
+            case Screen::Shop: ShopScreen(a, b, u); break;
             case Screen::Exit: ExitScreen(disp, u); break;
             }
             g_a = e;
@@ -3223,7 +3262,8 @@ public:
     // ------------------------------------------------------------ hub
     void HubScreen(ImVec2 disp, float u) {
         static const char* titles[kCards] = {"MANDO",  "TECLADO Y RATÓN", "TROFEOS",
-                                             "OPCIONES", "TRUCOS", "MULTIJUGADOR", "SALIR"};
+                                             "OPCIONES", "TRUCOS", "MULTIJUGADOR",
+                                             "ARMAS Y OBJETOS", "SALIR"};
         int earned = 0;
         for (const auto& tr : g_trophies) earned += tr.earned;
         const std::string tsub = fmt::format("{} de {} conseguidos", earned, g_trophies.size());
@@ -3231,6 +3271,7 @@ public:
                                     "Teclas, ratón y cámara", tsub.c_str(),
                                     "Inicio directo y ajustes", "Vida, ecos, percepción y más",
                                     "Servidor, sesión y cazadores conectados",
+                                    "Compra con ecos de sangre",
                                     "Cierra el juego con seguridad"};
         const float gap = 30 * u;
         const float cw = std::min(330 * u, (disp.x - 240 * u - gap * (kCards - 1)) / kCards);
@@ -3295,6 +3336,7 @@ public:
             case 3: IconGear(dl, m, is, ic, t * 0.4f * h); break;
             case 4: IconVial(dl, m, is, ic); break;
             case 5: IconCoop(dl, m, is, ic); break;
+            case 6: IconShop(dl, m, is, ic); break;
             default: IconDoor(dl, m, is, ic); break;
             }
             // title, rule, subtitle
@@ -4107,6 +4149,242 @@ public:
             Txt(dl, g_ft_ui, 22 * u, {c1.x - 20 * u - ts.x, c0.y + 26 * u}, Parch(0.9f), ping.c_str());
             g_a = sa;
             ry += (76 + 14) * u * k;
+        }
+    }
+
+    // ------------------------------------------------------------ Armas y objetos (bb-shop)
+    static constexpr const char* kShopTabs[] = {"Armas", "Objetos", "Herramientas", "Materiales"};
+    void ShopSay(std::string m) {
+        shop_msg = std::move(m);
+        shop_msg_t = ImGui::GetTime();
+    }
+    void ShopBuy(const BB::Shop::Item& it) {
+        std::string why;
+        if (!BB::Cheats::Read().in_game) {
+            ShopSay("Carga una partida para comprar");
+        } else if (BB::Cheats::Read().echoes < it.price) {
+            ShopSay(fmt::format("No tienes ecos suficientes ({} de {})", BB::Cheats::Read().echoes,
+                                it.price));
+        } else if (!BB::Shop::Buy(it, why)) {
+            ShopSay(why);
+        } else {
+            ShopSay(fmt::format("{}: se entrega al volver al juego", it.name));
+        }
+    }
+    void ShopNav(Nav n) {
+        const int tabs = static_cast<int>(BB::Shop::Tab::Count);
+        if (n == Nav::Prev || n == Nav::Next) {
+            shop_tab = (shop_tab + (n == Nav::Next ? 1 : tabs - 1)) % tabs;
+            shop_focus = 0, shop_scroll = 0, shop_desc_scroll = 0;
+            shop_tab_t = ImGui::GetTime();
+            return;
+        }
+        const auto items = BB::Shop::Items(static_cast<BB::Shop::Tab>(shop_tab));
+        const int cnt = static_cast<int>(items.size());
+        if (cnt == 0) return;
+        const int old = shop_focus;
+        if (n == Nav::Left) shop_focus = std::max(0, shop_focus - 1);
+        if (n == Nav::Right) shop_focus = std::min(cnt - 1, shop_focus + 1);
+        if (n == Nav::Up) shop_focus = std::max(0, shop_focus - shop_cols);
+        if (n == Nav::Down) shop_focus = std::min(cnt - 1, shop_focus + shop_cols);
+        if (old != shop_focus) shop_desc_scroll = 0, shop_scroll_to = true;
+        if (n == Nav::Accept && shop_focus < cnt) ShopBuy(*items[shop_focus]);
+    }
+    void ShopScreen(ImVec2 a, ImVec2 b, float u) {
+        using BB::Shop::State;
+        auto* dl = ImGui::GetWindowDrawList();
+        const BB::Cheats::Stats st = BB::Cheats::Read();
+        const ImVec2 p0{a.x, a.y + 10 * u}, p1{b.x, b.y - 20 * u};
+        // tabs
+        const int tabs = static_cast<int>(BB::Shop::Tab::Count);
+        float tx = p0.x;
+        for (int i = 0; i < tabs; i++) {
+            const auto cnt = BB::Shop::Items(static_cast<BB::Shop::Tab>(i)).size();
+            const std::string label = fmt::format("{} ({})", kShopTabs[i], cnt);
+            const float w = TextSize(g_ft_title, 24 * u, label.c_str()).x + 44 * u;
+            bool hov = false;
+            const std::string id = "##shoptab" + std::to_string(i);
+            if (Hit(id.c_str(), {tx, p0.y}, {tx + w, p0.y + 50 * u}, &hov) && shop_tab != i) {
+                shop_tab = i, shop_focus = 0, shop_scroll = 0, shop_desc_scroll = 0;
+                shop_tab_t = ImGui::GetTime();
+            }
+            const bool on = shop_tab == i;
+            dl->AddRectFilled({tx, p0.y}, {tx + w, p0.y + 50 * u},
+                              on ? Col(70, 52, 30, 0.95f) : Col(20, 18, 17, hov ? 0.95f : 0.8f), 8 * u);
+            dl->AddRect({tx, p0.y}, {tx + w, p0.y + 50 * u}, on || hov ? Gold() : Bronze(0.7f), 8 * u,
+                        0, std::max(1.0f, 1.2f * u));
+            Txt(dl, g_ft_title, 24 * u, {tx + 22 * u, p0.y + 11 * u}, on ? Parch() : Muted(), label.c_str());
+            tx += w + 14 * u;
+        }
+        const std::string ech = st.in_game ? fmt::format("Ecos de sangre: {}", st.echoes)
+                                           : std::string("Carga una partida para comprar");
+        TxtR(dl, g_ft_title, 24 * u, p1.x, p0.y + 11 * u, Gold(), ech.c_str());
+        std::string why;
+        if (!BB::Shop::BuyAvailable(&why)) {
+            TxtR(dl, g_ft_italic, 20 * u, p1.x, p0.y + 52 * u, Col(232, 170, 90), why.c_str());
+        }
+        std::string msg;
+        int prog = 0, total = 0;
+        const State state = BB::Shop::GetState(&msg, &prog, &total);
+        const float top = p0.y + 80 * u;
+        if (state == State::Failed) {
+            TxtC(dl, g_ft_text, 28 * u, (p0.x + p1.x) * 0.5f, top + 120 * u, Col(232, 120, 100),
+                 msg.c_str());
+            return;
+        }
+        const auto items = BB::Shop::Items(static_cast<BB::Shop::Tab>(shop_tab));
+        if (state == State::Loading && items.empty()) {
+            const std::string l = total > 0 ? fmt::format("Leyendo los archivos del juego... {} / {}",
+                                                          prog, total)
+                                            : std::string("Leyendo los archivos del juego...");
+            TxtC(dl, g_ft_italic, 28 * u, (p0.x + p1.x) * 0.5f, top + 120 * u, Muted(), l.c_str());
+            return;
+        }
+        // grid (left 58 %)
+        const float gw = (p1.x - p0.x) * 0.58f;
+        const ImVec2 g0{p0.x, top}, g1{p0.x + gw, p1.y};
+        Panel(dl, g0, g1, u, 0.1f);
+        const float cell = 168 * u, pad = 14 * u;
+        shop_cols = std::max(1, static_cast<int>((gw - 2 * pad) / cell));
+        const int cnt = static_cast<int>(items.size());
+        shop_focus = std::clamp(shop_focus, 0, std::max(0, cnt - 1));
+        const int rows = (cnt + shop_cols - 1) / shop_cols;
+        const float view_h = g1.y - g0.y - 2 * pad, content_h = rows * cell;
+        const ImGuiIO& io = ImGui::GetIO();
+        const bool in_grid = io.MousePos.x >= g0.x && io.MousePos.x < g1.x &&
+                             io.MousePos.y >= g0.y && io.MousePos.y < g1.y;
+        if (in_grid && io.MouseWheel != 0.0f) shop_scroll -= io.MouseWheel * cell * 0.75f;
+        if (shop_scroll_to) {
+            const float fy = (shop_focus / shop_cols) * cell;
+            if (fy < shop_scroll) shop_scroll = fy;
+            if (fy + cell > shop_scroll + view_h) shop_scroll = fy + cell - view_h;
+            shop_scroll_to = false;
+        }
+        shop_scroll = std::clamp(shop_scroll, 0.0f, std::max(0.0f, content_h - view_h));
+        const float ta = std::clamp(static_cast<float>(ImGui::GetTime() - shop_tab_t) / 0.3f, 0.0f, 1.0f);
+        dl->PushClipRect({g0.x + 2 * u, g0.y + 2 * u}, {g1.x - 2 * u, g1.y - 2 * u}, true);
+        const float sa = g_a;
+        g_a = sa * EaseOut(ta);
+        for (int i = 0; i < cnt; i++) {
+            const int r = i / shop_cols, c = i % shop_cols;
+            const ImVec2 c0{g0.x + pad + c * cell, g0.y + pad + r * cell - shop_scroll +
+                                                       (1.0f - EaseOut(ta)) * 30 * u};
+            const ImVec2 c1{c0.x + cell - 10 * u, c0.y + cell - 10 * u};
+            if (c1.y < g0.y || c0.y > g1.y) continue;
+            bool hov = false;
+            const std::string id = "##shopitem" + std::to_string(i);
+            if (Hit(id.c_str(), c0, c1, &hov) && in_grid) {
+                if (shop_focus != i) shop_desc_scroll = 0;
+                shop_focus = i;
+            }
+            if (hov && MouseMoved()) shop_focus = i;
+            const bool on = shop_focus == i;
+            dl->AddRectFilled(c0, c1, on ? Col(64, 48, 30, 0.95f) : Col(14, 12, 12, 0.9f), 6 * u);
+            dl->AddRect(c0, c1, on ? Gold() : Bronze(hov ? 0.9f : 0.45f), 6 * u, 0,
+                        std::max(1.0f, (on ? 2.0f : 1.0f) * u));
+            const auto& it = *items[i];
+            const float isz = cell - 60 * u;
+            const ImVec2 i0{(c0.x + c1.x - isz) * 0.5f, c0.y + 6 * u};
+            if (it.tex) {
+                dl->AddImage(it.tex.GetTexture().im_id, i0, {i0.x + isz, i0.y + isz}, {0, 0},
+                             {1, 1}, Col(255, 255, 255));
+            }
+            const auto nl = Wrap(g_ft_ui, 16 * u, it.name, cell - 16 * u);
+            for (size_t l = 0; l < nl.size() && l < 2; l++) {
+                TxtC(dl, g_ft_ui, 16 * u, (c0.x + c1.x) * 0.5f, i0.y + isz + 2 * u + l * 18 * u,
+                     on ? Parch() : Muted(0.9f), nl[l].c_str());
+            }
+        }
+        g_a = sa;
+        dl->PopClipRect();
+        if (cnt == 0) {
+            TxtC(dl, g_ft_italic, 24 * u, (g0.x + g1.x) * 0.5f, g0.y + 60 * u, Muted(),
+                 state == State::Loading ? "Cargando..." : "Nada en esta pestaña");
+            return;
+        }
+        // details (right)
+        const auto& it = *items[shop_focus];
+        const ImVec2 d0{g1.x + 24 * u, top}, d1{p1.x, p1.y};
+        Panel(dl, d0, d1, u, 0.25f);
+        const float dw = d1.x - d0.x;
+        const float big = std::min(260 * u, dw * 0.45f);
+        const ImVec2 b0{d0.x + 30 * u, d0.y + 30 * u};
+        if (it.tex) {
+            dl->AddImage(it.tex.GetTexture().im_id, b0, {b0.x + big, b0.y + big}, {0, 0}, {1, 1},
+                         Col(255, 255, 255));
+        }
+        dl->AddRect(b0, {b0.x + big, b0.y + big}, Bronze(0.8f), 4 * u, 0, std::max(1.0f, u));
+        const float rx = b0.x + big + 26 * u, rw = d1.x - rx - 26 * u;
+        float y = b0.y;
+        for (const auto& l : Wrap(g_ft_title, 30 * u, it.name, rw)) {
+            Txt(dl, g_ft_title, 30 * u, {rx, y}, Gold(), l.c_str());
+            y += 36 * u;
+        }
+        y += 8 * u;
+        Txt(dl, g_ft_text, 26 * u, {rx, y}, Parch(), fmt::format("{} ecos", it.price).c_str());
+        y += 32 * u;
+        Txt(dl, g_ft_italic, 19 * u, {rx, y}, Muted(0.8f),
+            it.game_price ? "precio de la tienda del juego" : "precio fijo (el juego no lo vende)");
+        y += 40 * u;
+        const bool can = st.in_game && BB::Shop::BuyAvailable() && st.echoes >= it.price;
+        if (CardButton("##shopbuy", {rx, y}, {rx + std::min(rw, 260 * u), y + 62 * u}, "COMPRAR", u,
+                       can) &&
+            BB::Shop::BuyAvailable()) {
+            ShopBuy(it);
+        }
+        // the game's own text, scrollable
+        const ImVec2 t0{d0.x + 30 * u, std::max(b0.y + big, y + 62 * u) + 24 * u};
+        const ImVec2 t1{d1.x - 30 * u, d1.y - 24 * u};
+        std::vector<std::string> lines;
+        for (const std::string* src : {&it.caption, &it.lore}) {
+            if (src->empty()) continue;
+            if (!lines.empty()) lines.push_back("");
+            size_t s0 = 0;
+            while (s0 <= src->size()) {
+                const size_t e = std::min(src->find('\n', s0), src->size());
+                const auto w = Wrap(g_ft_text, 22 * u, src->substr(s0, e - s0), t1.x - t0.x);
+                lines.insert(lines.end(), w.begin(), w.end());
+                if (w.empty()) lines.push_back("");
+                s0 = e + 1;
+            }
+        }
+        const float lh = 28 * u, text_h = lines.size() * lh, tv = t1.y - t0.y;
+        const bool in_text = io.MousePos.x >= t0.x && io.MousePos.x < t1.x &&
+                             io.MousePos.y >= t0.y && io.MousePos.y < t1.y;
+        if (in_text && io.MouseWheel != 0.0f) shop_desc_scroll -= io.MouseWheel * lh * 3;
+        // right stick scrolls the text with the pad
+        if (std::abs(g_axis[SDL_GAMEPAD_AXIS_RIGHTY].load()) > 12000) {
+            shop_desc_scroll += g_axis[SDL_GAMEPAD_AXIS_RIGHTY].load() / 32767.0f * 600 * u *
+                                io.DeltaTime;
+        }
+        shop_desc_scroll = std::clamp(shop_desc_scroll, 0.0f, std::max(0.0f, text_h - tv));
+        dl->PushClipRect(t0, t1, true);
+        for (size_t l = 0; l < lines.size(); l++) {
+            const float ly = t0.y + l * lh - shop_desc_scroll;
+            if (ly + lh < t0.y || ly > t1.y) continue;
+            Txt(dl, g_ft_text, 22 * u, {t0.x, ly}, Parch(0.92f), lines[l].c_str());
+        }
+        dl->PopClipRect();
+        // purchase results
+        u32 serial = 0;
+        const std::string res = BB::Shop::LastResult(&serial);
+        if (serial != shop_serial) {
+            shop_serial = serial;
+            if (!res.empty()) ShopSay(res);
+        }
+        const float age = static_cast<float>(ImGui::GetTime() - shop_msg_t);
+        if (age < 4.0f && !shop_msg.empty()) {
+            const float al = std::clamp((4.0f - age) / 0.5f, 0.0f, 1.0f) * EaseOut(age / 0.2f);
+            const float mw = TextSize(g_ft_text, 24 * u, shop_msg.c_str()).x + 60 * u;
+            const float cx = (p0.x + p1.x) * 0.5f, my = p1.y - 70 * u;
+            const float sa2 = g_a;
+            g_a = sa2 * al;
+            dl->AddRectFilled({cx - mw * 0.5f, my}, {cx + mw * 0.5f, my + 46 * u}, Col(24, 20, 16, 0.96f),
+                              10 * u);
+            dl->AddRect({cx - mw * 0.5f, my}, {cx + mw * 0.5f, my + 46 * u}, Gold(), 10 * u, 0,
+                        std::max(1.0f, 1.4f * u));
+            TxtC(dl, g_ft_text, 24 * u, cx, my + 9 * u, Parch(), shop_msg.c_str());
+            g_a = sa2;
         }
     }
 

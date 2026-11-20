@@ -18,6 +18,7 @@
 #include "core/bb_objcol.h"
 #include "core/bb_respatch.h"
 #include "core/bb_cheats.h"
+#include "core/bb_shop.h"
 #include "core/bloodborne_re.h"
 #include "core/bb_vardt.h"
 #include "core/cpu_patches.h"
@@ -393,6 +394,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             BB::VarDt::OnEbootLoaded(base_virtual_addr, base_size); // BB_VARIABLE_DT=1
             BB::Reflex::OnEbootLoaded(base_virtual_addr, base_size); // after VarDt: its cap
             BB::Cheats::OnEbootLoaded(base_virtual_addr, base_size); // F1 > Trucos
+            BB::Shop::OnEbootLoaded(base_virtual_addr, base_size);   // F1 > Armas y objetos
 #ifdef ARCH_X86_64
             // Bloodborne co-op (from shadp2p): both are no-ops unless their env var is set
             // (BB_COOP_SEAMLESS / SHADPS4_BLOODBORNE_SEAMLESS_COOP, SHADPS4_BLOODBORNE_RE_TRACE).

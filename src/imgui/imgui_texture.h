@@ -31,6 +31,10 @@ public:
 
     static RefCountedTexture DecodePngFile(std::filesystem::path path);
 
+    // (bb-shop) BC7 blocks, linear (width / 4 x height / 4 blocks of 16 bytes). Records the
+    // upload on the calling thread; the texture appears once uploaded.
+    static RefCountedTexture UploadBc7(std::vector<u8> blocks, u32 width, u32 height);
+
     RefCountedTexture();
 
     RefCountedTexture(const RefCountedTexture& other);
