@@ -890,11 +890,29 @@ void LogFloorPaths() {
 // the same point, nothing changes); (2) that history read with a 5-tap Catmull-Rom (no blur accumulating frame after
 // frame) only while it moves (> 0.5 px); (3) Stabilize counts the reflected point's own screen motion as motion. Cost:
 // ~3 bilinear fetches more per trace pixel and 4 more for the history in motion, ~0.05-0.1 ms at 1280x720 (estimate).
+// (rtback LEJOS) KYTY_RTREFL_LEJOS=1 (default 0: exactly 9589439): distant reflections sharper and steadier. CPU: the ray's
+// view-space length x2 and its longest screen length x1.3 (at most the render height). Shader (misc.w & 32768), scaled
+// by the surface's distance (nothing up to 12 m, all from 40 m): hi-z iterations up to 1.5x with no halving for rough
+// rays, the GGX lobe 30 % narrower, half the a-trous radius, the history read with Catmull-Rom while it moves > 0.5 px
+// and its YCoCg box 30 % tighter in motion.
+bool LejosWanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RTREFL_LEJOS");
+		const bool  v = e != nullptr && e[0] == '1';
+		std::printf("RT reflections: lejos (KYTY_RTREFL_LEJOS=%s): %s\n", e != nullptr ? e : "(unset)",
+		            v ? "far reflectors: ray length x2, screen cap x1.3, up to 1.5x iterations, narrower lobe, half the a-trous "
+		                "radius, Catmull-Rom history in motion"
+		              : "as 9589439");
+		std::fflush(stdout);
+		return v;
+	}();
+	return on;
+}
+
 bool ReprojWanted() {
 	static const bool on = [] {
-		const char* e  = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
-		const char* e1 = std::getenv("KYTY_RTREFL1"); // (rtrefl1: the master switch turns this on too)
-		const bool  v  = (e != nullptr && e[0] == '1') || (e1 != nullptr && e1[0] == '1');
+		const char* e = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
+		const bool  v = e != nullptr && e[0] == '1';
 		std::printf("RT reflections: reprojection fix (rtrefl1) %s (KYTY_RT_REFLECTIONS_REPROJ=%s): %s\n", v ? "on" : "off",
 		            e != nullptr ? e : "(unset)",
 		            v ? "history at the best of surface / reflected-point (own and 3x3 hit distance) positions, Catmull-Rom in "
@@ -1577,7 +1595,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int   iters    = cfg.iters;
 	const float cutoff   = cfg.cutoff;
 	const int   passes   = cfg.passes;
-	const float cap_px   = cfg.cap * static_cast<float>(color.extent.height);
+	const float cap_px   = (LejosWanted() ? std::min(cfg.cap * 1.3f, 1.0f) : cfg.cap) * static_cast<float>(color.extent.height);
 	{
 		static bool said = false;
 		if (!said) {
@@ -1600,7 +1618,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	push.size[0] = static_cast<float>(color.extent.width), push.size[1] = static_cast<float>(color.extent.height);
 	push.size[2] = static_cast<float>(g_rt.trace.width), push.size[3] = static_cast<float>(g_rt.trace.height);
 	push.params[0] = strength, push.params[1] = EnvFloat("KYTY_RT_REFLECTIONS_THICKNESS", 0.3f, 0.01f, 4.0f);
-	push.params[2] = cfg.max_len;
+	push.params[2] = LejosWanted() ? cfg.max_len * 2.0f : cfg.max_len; // (LEJOS)
 	push.motion[0] = inputs.motion_scale_x, push.motion[1] = inputs.motion_scale_y;
 	push.motion[2] = cutoff, push.motion[3] = cfg.alpha;
 	push.misc[1] = static_cast<int32_t>(g_rt.frame & 0x7fffffff);
@@ -1611,7 +1629,8 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
 	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0) | // (water-1030)
 	               (FlatFloorWanted() ? 8192 : 0) | // (des-refl2-1108)
-	               (ReprojWanted() ? 16384 : 0);    // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ)
+	               (ReprojWanted() ? 16384 : 0) |   // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ)
+	               (LejosWanted() ? 32768 : 0);     // (rtback: KYTY_RTREFL_LEJOS)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1965,5 +1984,15 @@ void RtReflectionsPrewarm(GraphicContext& graphics) {
 	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
 	std::fflush(stdout);
 }
+
+// (rtback) The RT reflections are 9589439's (16-11, the good build). The later switches the rest of the code still
+// calls (rt3/rt4/rt5, rpost1 KYTY_REFL_POST) compile but stay off: their passes are not in this file.
+bool Rt3Wanted() { return false; }
+bool Rt4Wanted() { return false; }
+bool Rt5Wanted() { return false; }
+bool RtReflPostWanted() { return false; }
+bool RtReflPostLive() { return false; }
+bool RtReflPostToggle() { return false; }
+bool RtReflectionsPostAdd(vk::CommandBuffer /*command*/, vk::ImageView /*target*/, vk::Extent2D /*size*/) { return false; }
 
 } // namespace Libs::Graphics::FrameGen

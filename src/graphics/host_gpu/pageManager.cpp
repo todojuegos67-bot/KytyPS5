@@ -2,6 +2,7 @@
 #include "slow-log.h"
 #include "raiz.h" // (raiz1: KYTY_RAIZ)
 #include "lock-watch.h" // (raiz10: the granule locks' waits)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE: the pages GPU work marks no-access)
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -888,6 +889,7 @@ struct PageManager::Impl {
 
 	// A no-access range joins the pending ones: merged with those it overlaps or touches (one call for all).
 	static void AddReadProtect(uint64_t begin, uint64_t end) noexcept {
+		G1::NoteReadTrack(begin, end); // (g1: by pass and label; one relaxed load when off)
 		auto& ranges = g_read_protects;
 		for (size_t i = 0; i < ranges.size();) {
 			if (ranges[i].begin <= end && begin <= ranges[i].end) {

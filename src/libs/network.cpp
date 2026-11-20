@@ -17,6 +17,8 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <netdb.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #include "../local/guest-lazy-commit.h"
@@ -42,11 +44,24 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <cstdlib>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
 namespace Libs::Network {
+
+namespace Online {
+bool Enabled(); // online2/3 (KYTY_ONLINE=1), defined before NpManager
+// (online5) the P2P bridge's hooks in Bind / Sendto / Recvfrom (defined with Online below)
+void P2pBind(int s, sockaddr_storage* host_addr);
+void P2pBound(int s, uint64_t native);
+bool P2pSendto(int s, const void* buf, uint64_t len, const sockaddr_storage* to, int64_t* result);
+void P2pRecvfrom(int s, sockaddr_storage* from);
+void DeliverCallbacks(); // (online5) libNet.cpp: queued push / signaling events, from sceNpCheckCallback
+} // namespace Online
 
 class Network {
 public:
@@ -1706,10 +1721,12 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 		return -1;
 	}
+	Online::P2pBind(s, &host_addr); // (online5) the game's P2P socket (port 3658): bridged
 
 	if (::bind(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
 		return SetHostSocketError();
 	}
+	Online::P2pBound(s, static_cast<uint64_t>(socket));
 
 	return 0;
 }
@@ -1985,6 +2002,9 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 		if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
 			return -1;
 		}
+		if (int64_t bridged = 0; Online::P2pSendto(s, buf, host_len, &host_addr, &bridged)) {
+			return bridged; // (online5) to a peer's virtual address: through the relay; SSDP: dropped
+		}
 		result = ::sendto(socket, static_cast<const char*>(buf), host_len, host_flags,
 		                  reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen);
 	}
@@ -2041,6 +2061,9 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		SocketLength     host_addrlen = sizeof(host_addr);
 		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
 		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+		if (result >= 0) {
+			Online::P2pRecvfrom(s, &host_addr); // (online5) a peer's packet from the relay: shown from its virtual address
+		}
 		if (result >= 0 &&
 		    ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
 			return -1;
@@ -2305,7 +2328,7 @@ static const char* HttpMethodToString(int method) {
 	}
 }
 
-int KYTY_SYSV_ABI HttpInit(int memid, int ssl_ctx_id, uint64_t pool_size) {
+int KYTY_SYSV_ABI HttpInit_impl(int memid, int ssl_ctx_id, uint64_t pool_size) {
 	PRINT_NAME();
 
 	LOGF("\t memid      = %d\n"
@@ -2324,6 +2347,19 @@ int KYTY_SYSV_ABI HttpInit(int memid, int ssl_ctx_id, uint64_t pool_size) {
 	}
 
 	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI HttpInit(int memid, int ssl_ctx_id, uint64_t pool_size) {
+	const int online_ret = HttpInit_impl(memid, ssl_ctx_id, pool_size);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(memid=%lld ssl_ctx_id=%lld pool_size=%lld) = 0x%08x\n", "HttpInit", static_cast<long long>(memid), static_cast<long long>(ssl_ctx_id), static_cast<long long>(pool_size), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI HttpTerm(int http_ctx_id) {
@@ -2759,7 +2795,7 @@ int KYTY_SYSV_ABI HttpCreateConnection(int tmpl_id, const char* server_name, con
 	return id.ToInt();
 }
 
-int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int enable_keep_alive) {
+int KYTY_SYSV_ABI HttpCreateConnectionWithURL_impl(int tmpl_id, const char* url, int enable_keep_alive) {
 	PRINT_NAME();
 
 	LOGF("\t tmpl_id           = %d\n"
@@ -2780,6 +2816,19 @@ int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int 
 	}
 
 	return id.ToInt();
+}
+
+int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int enable_keep_alive) {
+	const int online_ret = HttpCreateConnectionWithURL_impl(tmpl_id, url, enable_keep_alive);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(tmpl_id=%lld enable_keep_alive=%lld url=%s) = 0x%08x\n", "HttpCreateConnectionWithURL", static_cast<long long>(tmpl_id), static_cast<long long>(enable_keep_alive), (url != nullptr ? url : "(null)"), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI HttpDeleteConnection(int conn_id) {
@@ -3109,27 +3158,37 @@ static HostNetworkInfo QueryHostNetworkInfo() {
 
 static bool NetCtlConnected() {
 	if (!g_net_ctl_status_initialized.load()) {
-		// g_net_ctl_connected          = HostNetworkConnected();
-		g_net_ctl_connected          = false;
+		// (online7) offline unless multiplayer is on: then NetCtl says "connected" (the game's server is ours).
+		g_net_ctl_connected          = Online::Enabled();
 		g_net_ctl_status_initialized = true;
-		// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" :
-		// "false"));
-		LOGF("\t host network connected = false (forced offline)\n");
+		LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true (online)" : "false (forced offline)"));
 	}
 
 	return g_net_ctl_connected.load();
 }
 
-int KYTY_SYSV_ABI NetCtlInit() {
+int KYTY_SYSV_ABI NetCtlInit_impl() {
 	PRINT_NAME();
 
-	// g_net_ctl_connected = HostNetworkConnected();
-	g_net_ctl_connected          = false;
+	// (online7) offline unless multiplayer is on (KYTY_ONLINE=1)
+	g_net_ctl_connected          = Online::Enabled();
 	g_net_ctl_status_initialized = true;
-	// LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true" : "false"));
-	LOGF("\t host network connected = false (forced offline)\n");
+	LOGF("\t host network connected = %s\n", (g_net_ctl_connected.load() ? "true (online)" : "false (forced offline)"));
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetCtlInit() {
+	const int online_ret = NetCtlInit_impl();
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s() = 0x%08x\n", "NetCtlInit", static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 void KYTY_SYSV_ABI NetCtlTerm() {
@@ -3142,7 +3201,7 @@ void KYTY_SYSV_ABI NetCtlTerm() {
 	}
 }
 
-int KYTY_SYSV_ABI NetCtlGetNatInfo(NetCtlNatInfo* nat_info) {
+int KYTY_SYSV_ABI NetCtlGetNatInfo_impl(NetCtlNatInfo* nat_info) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(nat_info == nullptr);
@@ -3153,6 +3212,19 @@ int KYTY_SYSV_ABI NetCtlGetNatInfo(NetCtlNatInfo* nat_info) {
 	nat_info->mappedAddr.s_addr = 0;
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetCtlGetNatInfo(NetCtlNatInfo* nat_info) {
+	const int online_ret = NetCtlGetNatInfo_impl(nat_info);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s() = 0x%08x\n", "NetCtlGetNatInfo", static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI NetCtlCheckCallback() {
@@ -3170,7 +3242,7 @@ int KYTY_SYSV_ABI NetCtlCheckCallback() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NetCtlGetState(int* state) {
+int KYTY_SYSV_ABI NetCtlGetState_impl(int* state) {
 	PRINT_NAME();
 
 	if (state == nullptr) {
@@ -3180,6 +3252,19 @@ int KYTY_SYSV_ABI NetCtlGetState(int* state) {
 	*state = (NetCtlConnected() ? NET_CTL_STATE_IPOBTAINED : NET_CTL_STATE_DISCONNECTED);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NetCtlGetState(int* state) {
+	const int online_ret = NetCtlGetState_impl(state);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(*state=%lld) = 0x%08x\n", "NetCtlGetState", (state != nullptr ? static_cast<long long>(*state) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI NetCtlGetStateV6(int* state) {
@@ -3255,7 +3340,7 @@ int KYTY_SYSV_ABI NetCtlGetResult(int event_type, int* error_code) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
+int KYTY_SYSV_ABI NetCtlGetInfo_impl(int code, NetCtlInfo* info) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
@@ -3313,7 +3398,593 @@ int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI NetCtlGetInfo(int code, NetCtlInfo* info) {
+	const int online_ret = NetCtlGetInfo_impl(code, info);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(code=%lld) = 0x%08x\n", "NetCtlGetInfo", static_cast<long long>(code), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
 } // namespace NetCtl
+
+// ---------------------------------------------------------------------------------------------
+// KYTY_ONLINE (online1): experimental online mode, OFF by default.
+//   KYTY_ONLINE=1                 -> the game sees a signed-in PSN user and its sceHttp2 requests
+//                                    go to our own server (instead of failing with TIMEOUT).
+//   KYTY_ONLINE_SERVER=host:port  -> server (default 127.0.0.1:8090, plain HTTP, no TLS).
+//   KYTY_ONLINE_NAME=Name         -> online id (max 16 chars, default KytyPlayer).
+//   KYTY_ONLINE_ACCOUNT_ID=number -> account id (default: hash of the name).
+// Without KYTY_ONLINE=1 nothing changes: every function below keeps its previous behaviour.
+// ---------------------------------------------------------------------------------------------
+namespace Online {
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* v  = std::getenv("KYTY_ONLINE");
+		const bool  on = v != nullptr && v[0] == '1';
+		if (on) {
+			const char* s = std::getenv("KYTY_ONLINE_SERVER");
+			std::printf("Online: ON (KYTY_ONLINE=1), server %s\n",
+			            (s != nullptr && s[0] != '\0') ? s : "127.0.0.1:8090");
+			std::fflush(stdout);
+		}
+		return on;
+	}();
+	return enabled;
+}
+
+static std::string env_or(const char* name, const char* def) {
+	const char* v = std::getenv(name);
+	return (v != nullptr && v[0] != '\0') ? std::string(v) : std::string(def);
+}
+
+bool        Login();
+uint64_t    LoggedAccount();
+std::string LoggedName();
+std::string Token();
+
+std::string PlayerName() {
+	if (Login()) {
+		auto n = LoggedName();
+		if (!n.empty()) return n.size() > 16 ? n.substr(0, 16) : n;
+	}
+	auto name = env_or("KYTY_ONLINE_NAME", "KytyPlayer");
+	if (name.size() > 16) {
+		name.resize(16);
+	}
+	return name;
+}
+
+uint64_t AccountId() {
+	if (const uint64_t logged = LoggedAccount(); logged != 0) return logged; // (online5) the server's account
+	const char* v = std::getenv("KYTY_ONLINE_ACCOUNT_ID");
+	if (v != nullptr && v[0] != '\0') {
+		const uint64_t id = std::strtoull(v, nullptr, 10);
+		if (id != 0) {
+			return id;
+		}
+	}
+	uint64_t h = 1469598103934665603ull; // FNV-1a of the name: same id every session
+	for (char c: PlayerName()) {
+		h ^= static_cast<uint8_t>(c);
+		h *= 1099511628211ull;
+	}
+	return (h & 0x0fffffffffffffffull) | 0x1000000000000000ull;
+}
+
+#if defined(_WIN32)
+using online_socket_t                         = SOCKET;
+static constexpr online_socket_t online_bad_socket = INVALID_SOCKET;
+static void online_close(online_socket_t s) {
+	closesocket(s);
+}
+#else
+using online_socket_t                         = int;
+static constexpr online_socket_t online_bad_socket = -1;
+static void online_close(online_socket_t s) {
+	close(s);
+}
+#endif
+
+// One plain HTTP/1.1 exchange with our server. The original URL (https://<sony host>/<path>) keeps its
+// path; only scheme/host/port are replaced. Returns false if the server can't be reached.
+// (online7) the last network step of an exchange that failed: "<stage> (error N)", logged by HttpExchange.
+static thread_local std::string g_online_step;
+static int online_last_error() {
+#if defined(_WIN32)
+	return WSAGetLastError();
+#else
+	return errno;
+#endif
+}
+static bool online_fail(const char* stage) {
+	g_online_step = std::string(stage) + " (error " + std::to_string(online_last_error()) + ")";
+	return false;
+}
+
+static bool HttpExchangeOnce(const std::string& method, const std::string& url,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             const std::string& body, int* status, std::string* resp_headers,
+                             std::string* resp_body) {
+	g_online_step.clear();
+	*status = 0;
+	resp_headers->clear();
+	resp_body->clear();
+
+	const auto server = env_or("KYTY_ONLINE_SERVER", "127.0.0.1:8090");
+	const auto colon  = server.rfind(':');
+	const auto host   = (colon == std::string::npos ? server : server.substr(0, colon));
+	const auto port   = (colon == std::string::npos ? std::string("8090") : server.substr(colon + 1));
+
+	std::string path = "/";
+	const auto  scheme = url.find("://");
+	const auto  slash  = url.find('/', scheme == std::string::npos ? 0 : scheme + 3);
+	if (slash != std::string::npos) {
+		path = url.substr(slash);
+	}
+
+#if defined(_WIN32)
+	static const bool wsa_ok = [] {
+		WSADATA data {};
+		return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+	}();
+	if (!wsa_ok) {
+		return online_fail("WSAStartup");
+	}
+#endif
+
+	addrinfo hints {};
+	hints.ai_family   = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	addrinfo* res     = nullptr;
+	if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || res == nullptr) {
+		return online_fail("resolver la direccion");
+	}
+	online_socket_t s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	if (s == online_bad_socket) {
+		freeaddrinfo(res);
+		return online_fail("crear el socket");
+	}
+	// online2: every wait is bounded (KYTY_ONLINE_TIMEOUT_MS, default 4000): connect without blocking + select,
+	// then send/recv timeouts. A server that is off or unreachable never stalls anything for longer.
+	const int timeout_ms = [] {
+		const char* v = std::getenv("KYTY_ONLINE_TIMEOUT_MS");
+		const int   n = (v != nullptr ? std::atoi(v) : 0);
+		return (n >= 200 && n <= 60000) ? n : 4000;
+	}();
+#if defined(_WIN32)
+	DWORD tmo = static_cast<DWORD>(timeout_ms);
+	u_long nonblocking = 1;
+	ioctlsocket(s, FIONBIO, &nonblocking);
+#else
+	timeval tmo {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+	fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+	bool connected = connect(s, res->ai_addr, static_cast<int>(res->ai_addrlen)) == 0;
+	freeaddrinfo(res);
+	int connect_err = 0;
+	if (!connected) {
+		fd_set wset;
+		fd_set eset;
+		FD_ZERO(&wset);
+		FD_ZERO(&eset);
+		FD_SET(s, &wset);
+		FD_SET(s, &eset);
+		timeval wait {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+		if (select(static_cast<int>(s + 1), nullptr, &wset, &eset, &wait) > 0 && FD_ISSET(s, &wset)) {
+			int       err = 0;
+			socklen_t len = sizeof(err);
+			getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+			connected = (err == 0);
+			connect_err = err;
+		} else {
+			connect_err = -1; // no answer within the timeout
+		}
+	}
+#if defined(_WIN32)
+	nonblocking = 0;
+	ioctlsocket(s, FIONBIO, &nonblocking);
+#else
+	fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) & ~O_NONBLOCK);
+#endif
+	if (!connected) {
+		online_close(s);
+		g_online_step = "conectar con " + host + ":" + port +
+		                (connect_err == -1 ? std::string(" (sin respuesta en ") + std::to_string(timeout_ms) + " ms)"
+		                                   : " (error " + std::to_string(connect_err) + ")");
+		return false;
+	}
+
+	std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + server +
+	                  "\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) +
+	                  "\r\nX-Kyty-Url: " + url + "\r\n";
+	bool has_auth = false;
+	for (const auto& h: headers) {
+		if (h.first == "Host" || h.first == "Content-Length" || h.first == "Connection") {
+			continue;
+		}
+		if (h.first == "Authorization" || h.first == "authorization") {
+			has_auth = true;
+		}
+		req += h.first + ": " + h.second + "\r\n";
+	}
+	if (const std::string token = Token(); !has_auth && !token.empty()) {
+		req += "Authorization: Bearer " + token + "\r\n"; // (online5) our server's session token
+	}
+	req += "\r\n";
+	req += body;
+
+	size_t sent = 0;
+	while (sent < req.size()) {
+		const int n = static_cast<int>(send(s, req.data() + sent, static_cast<int>(req.size() - sent), 0));
+		if (n <= 0) {
+			const int e = online_last_error();
+			online_close(s);
+			g_online_step = "enviar la peticion (error " + std::to_string(e) + ")";
+			return false;
+		}
+		sent += static_cast<size_t>(n);
+	}
+
+	std::string raw;
+	char        buf[16384];
+	for (;;) {
+		const int n = static_cast<int>(recv(s, buf, sizeof(buf), 0));
+		if (n <= 0) {
+			break;
+		}
+		raw.append(buf, static_cast<size_t>(n));
+	}
+	online_close(s);
+
+	const auto header_end = raw.find("\r\n\r\n");
+	if (raw.compare(0, 5, "HTTP/") != 0 || header_end == std::string::npos) {
+		g_online_step = "leer la respuesta (" + std::to_string(raw.size()) + " bytes, sin cabecera HTTP)";
+		return false;
+	}
+	const auto sp = raw.find(' ');
+	*status       = std::atoi(raw.c_str() + sp + 1);
+	const auto first_line_end = raw.find("\r\n");
+	*resp_headers = raw.substr(first_line_end + 2, header_end - first_line_end);
+	*resp_body    = raw.substr(header_end + 4);
+	if (*status == 0) g_online_step = "leer la respuesta (estado HTTP 0)";
+	return *status != 0;
+}
+
+// (online7) The server on this PC (KYTY_ONLINE_SERVER 127.0.0.1 / localhost) not answering: started again in the
+// background ("<this exe>" --servidor 31415, out of the game's job), at most once every 20 s. Logged.
+static bool online_restart_local_server() {
+#if defined(_WIN32)
+	const auto server = env_or("KYTY_ONLINE_SERVER", "127.0.0.1:8090");
+	const auto host   = server.substr(0, server.rfind(':'));
+	if (host != "127.0.0.1" && host != "localhost") {
+		return false;
+	}
+	static std::mutex                            m;
+	static std::chrono::steady_clock::time_point last {};
+	std::lock_guard                              lock(m);
+	const auto                                   now = std::chrono::steady_clock::now();
+	if (last.time_since_epoch().count() != 0 && now - last < std::chrono::seconds(20)) {
+		return false;
+	}
+	last = now;
+	wchar_t exe[MAX_PATH] = {};
+	GetModuleFileNameW(nullptr, exe, MAX_PATH);
+	std::wstring        cmd = L"\"" + std::wstring(exe) + L"\" --servidor 31415";
+	STARTUPINFOW        si {};
+	PROCESS_INFORMATION pi {};
+	si.cb         = sizeof(si);
+	const DWORD f = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+	const bool  ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, f | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi) ||
+	                CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, f, nullptr, nullptr, &si, &pi);
+	if (ok) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	}
+	std::printf("Online: red: el servidor de este PC no responde: %s (ver servidor.log en %%LOCALAPPDATA%%\\Demon's Souls PC\\servidor-online)\n",
+	            ok ? "arrancado de nuevo" : "no se pudo arrancar");
+	std::fflush(stdout);
+	if (ok) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+	}
+	return ok;
+#else
+	return false;
+#endif
+}
+
+// (online7) one retry after 300 ms (a server just started, a busy accept queue); a failure logs its last step.
+bool HttpExchange(const std::string& method, const std::string& url,
+                  const std::vector<std::pair<std::string, std::string>>& headers,
+                  const std::string& body, int* status, std::string* resp_headers,
+                  std::string* resp_body) {
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		if (HttpExchangeOnce(method, url, headers, body, status, resp_headers, resp_body)) {
+			if (attempt > 1) {
+				std::printf("Online: red: %s %s respondio al segundo intento\n", method.c_str(), url.c_str());
+				std::fflush(stdout);
+			}
+			return true;
+		}
+		{ // the same failure of the same path: logged once every 30 s (the push / signaling loops ask every 2 s)
+			static std::mutex                                                     log_m;
+			static std::map<std::string, std::chrono::steady_clock::time_point> last;
+			const std::string key = url.substr(0, url.find('?')) + " " + g_online_step;
+			const auto        now = std::chrono::steady_clock::now();
+			std::lock_guard   lock(log_m);
+			auto              it = last.find(key);
+			if (it == last.end() || now - it->second > std::chrono::seconds(30)) {
+				last[key] = now;
+				std::printf("Online: red: %s %s -> fallo, ultimo paso: %s (servidor %s, intento %d/2)\n", method.c_str(),
+				            url.c_str(), g_online_step.c_str(), env_or("KYTY_ONLINE_SERVER", "127.0.0.1:8090").c_str(), attempt);
+				std::fflush(stdout);
+			}
+		}
+		if (attempt == 1 && !(g_online_step.rfind("conectar", 0) == 0 && online_restart_local_server())) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		}
+	}
+	return false;
+}
+
+
+// ---- (online5) Account, P2P bridge (relay) ----------------------------------------------------------------------
+//   Login: POST http://<server host>:31413/cuenta/login {name, password} -> accountId, onlineId, token (KYTY_ONLINE_NAME,
+//   KYTY_ONLINE_PASSWORD from the launcher). Every request to our server carries "Authorization: Bearer <token>".
+//   P2P: the game's UDP P2P socket binds port 3658 (UDPP2PSocket, eboot+0x13ffec0: sockaddr constant 0x4a0e0210). Here it
+//   binds an ephemeral port instead; what the game sends to a peer's virtual address (10.77.x.y, given by our session
+//   signaling) goes to the relay (UDP <server>:3758) with the peer's account; what the relay brings back is handed to
+//   the game's socket over loopback from a helper socket of that peer, and Recvfrom shows it as coming from the peer's
+//   virtual address. No port is opened at the players'. The game's UPnP (SSDP to 239.255.255.250:1900, eboot+0x1d3f1e0)
+//   is dropped (reported as sent).
+namespace {
+std::mutex  g_login_m;
+bool        g_login_tried = false, g_logged = false;
+uint64_t    g_account     = 0;
+std::string g_online_id, g_token;
+
+std::string server_hostport() {
+	return env_or("KYTY_ONLINE_SERVER", "127.0.0.1:31415");
+}
+std::string server_host() {
+	const auto hp = server_hostport();
+	const auto c  = hp.rfind(':');
+	return c == std::string::npos ? hp : hp.substr(0, c);
+}
+} // namespace
+
+std::string Token() {
+	std::lock_guard lock(g_login_m);
+	return g_token;
+}
+
+bool Login() {
+	static std::mutex run; // one login at a time; the others wait for its result
+	std::lock_guard   once(run);
+	{
+		std::lock_guard lock(g_login_m);
+		if (g_login_tried) return g_logged;
+		g_login_tried = true;
+	}
+	const std::string name = env_or("KYTY_ONLINE_NAME", ""), pw = env_or("KYTY_ONLINE_PASSWORD", "");
+	if (name.empty() || pw.empty()) {
+		std::printf("Online: sin cuenta (KYTY_ONLINE_NAME / KYTY_ONLINE_PASSWORD vacios): solo lo asincrono, sin cooperativo\n");
+		std::fflush(stdout);
+		return false;
+	}
+	std::string body = "{\"name\":\"" + name + "\",\"password\":\"";
+	for (char c: pw) {
+		if (c == '"' || c == '\\') body += '\\';
+		body += c;
+	}
+	body += "\"}";
+	int         status = 0;
+	std::string headers, reply;
+	const bool  ok = HttpExchange("POST", "http://" + server_host() + ":31413/cuenta/login", {{"Content-Type", "application/json"}}, body, &status,
+	                              &headers, &reply);
+	const auto field = [&](const char* key) {
+		const std::string k = std::string("\"") + key + "\":\"";
+		const auto        a = reply.find(k);
+		if (a == std::string::npos) return std::string();
+		const auto b = reply.find('"', a + k.size());
+		return reply.substr(a + k.size(), b - a - k.size());
+	};
+	std::lock_guard lock(g_login_m);
+	if (ok && status == 200 && reply.find("\"ok\":true") != std::string::npos) {
+		g_account   = std::strtoull(field("accountId").c_str(), nullptr, 10);
+		g_online_id = field("onlineId");
+		g_token     = field("token");
+		g_logged    = g_account != 0 && !g_token.empty();
+	}
+	std::printf("Online: login %s en %s:31413 -> %s (HTTP %d)%s\n", name.c_str(), server_host().c_str(), g_logged ? "OK" : "FALLO", status,
+	            g_logged ? "" : (" " + reply.substr(0, 120)).c_str());
+	std::fflush(stdout);
+	return g_logged;
+}
+
+std::string LoggedName() {
+	std::lock_guard lock(g_login_m);
+	return g_online_id;
+}
+
+uint64_t LoggedAccount() {
+	Login();
+	std::lock_guard lock(g_login_m);
+	return g_account;
+}
+
+// -- virtual peer addresses (10.77.0.0/16): one per peer account --
+namespace {
+std::mutex                    g_vip_m;
+std::map<uint64_t, uint32_t>  g_vip_of;  // account -> virtual IPv4 (host order)
+std::map<uint32_t, uint64_t>  g_acc_of;  // virtual IPv4 -> account
+constexpr uint32_t            kVipBase = 0x0A4D0000u; // 10.77.0.0
+} // namespace
+
+uint32_t PeerVip(uint64_t account) {
+	std::lock_guard lock(g_vip_m);
+	if (auto it = g_vip_of.find(account); it != g_vip_of.end()) return it->second;
+	const uint32_t vip = kVipBase + 1 + static_cast<uint32_t>(g_vip_of.size());
+	g_vip_of[account]  = vip;
+	g_acc_of[vip]      = account;
+	return vip;
+}
+uint64_t VipAccount(uint32_t vip) {
+	std::lock_guard lock(g_vip_m);
+	auto it = g_acc_of.find(vip);
+	return it == g_acc_of.end() ? 0 : it->second;
+}
+
+// -- the bridge --
+namespace {
+std::mutex                         g_br_m;
+int                                g_p2p_guest_socket = -1;
+uint16_t                           g_p2p_host_port    = 0; // the game's socket, host side (network order)
+online_socket_t                    g_relay            = online_bad_socket;
+sockaddr_in                        g_relay_addr {};
+std::map<uint64_t, online_socket_t> g_helper;              // peer account -> loopback helper socket
+std::map<uint16_t, uint64_t>       g_helper_port;          // helper's port (network order) -> peer account
+std::atomic<bool>                  g_br_started {false};
+std::atomic<long long>             g_br_up {0}, g_br_down {0};
+
+online_socket_t Helper(uint64_t account) { // under g_br_m
+	if (auto it = g_helper.find(account); it != g_helper.end()) return it->second;
+	online_socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (s == online_bad_socket) return s;
+	sockaddr_in a {};
+	a.sin_family      = AF_INET;
+	a.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+	bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+	socklen_t len = sizeof(a);
+	getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+	g_helper[account]          = s;
+	g_helper_port[a.sin_port] = account;
+	return s;
+}
+
+void RelayLoop() {
+	std::vector<char> buf(65536 + 16);
+	auto              last_hello = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+	auto              last_log   = std::chrono::steady_clock::now();
+	for (;;) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_hello > std::chrono::seconds(3)) {
+			const std::string hello = std::string("DSR\x01", 4) + Token();
+			sendto(g_relay, hello.data(), static_cast<int>(hello.size()), 0, reinterpret_cast<sockaddr*>(&g_relay_addr), sizeof(g_relay_addr));
+			last_hello = now;
+		}
+		if (now - last_log > std::chrono::seconds(30)) {
+			std::printf("Online: puente P2P: %lld paquetes enviados, %lld recibidos (relay %s:3758)\n", g_br_up.load(), g_br_down.load(), server_host().c_str());
+			std::fflush(stdout);
+			last_log = now;
+		}
+		fd_set rs;
+		FD_ZERO(&rs);
+		FD_SET(g_relay, &rs);
+		timeval wait {0, 500000};
+		if (select(static_cast<int>(g_relay + 1), &rs, nullptr, nullptr, &wait) <= 0) continue;
+		const int n = static_cast<int>(recv(g_relay, buf.data(), static_cast<int>(buf.size()), 0));
+		if (n < 12 || std::memcmp(buf.data(), "DSR\x02", 4) != 0) continue;
+		uint64_t src = 0;
+		std::memcpy(&src, buf.data() + 4, 8);
+		PeerVip(src);
+		std::lock_guard lock(g_br_m);
+		if (g_p2p_host_port == 0) continue;
+		online_socket_t h = Helper(src);
+		if (h == online_bad_socket) continue;
+		sockaddr_in to {};
+		to.sin_family      = AF_INET;
+		to.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+		to.sin_port        = g_p2p_host_port;
+		sendto(h, buf.data() + 12, n - 12, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
+		g_br_down++;
+	}
+}
+
+void BridgeStart() {
+	if (g_br_started.exchange(true)) return;
+	Login();
+	g_relay = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	addrinfo hints {};
+	hints.ai_family   = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+	addrinfo* res     = nullptr;
+	if (g_relay == online_bad_socket || getaddrinfo(server_host().c_str(), "3758", &hints, &res) != 0 || res == nullptr) {
+		std::printf("Online: puente P2P: no se pudo preparar el relay (%s:3758)\n", server_host().c_str());
+		std::fflush(stdout);
+		return;
+	}
+	std::memcpy(&g_relay_addr, res->ai_addr, sizeof(g_relay_addr));
+	freeaddrinfo(res);
+	std::thread(RelayLoop).detach();
+	std::printf("Online: puente P2P activo: socket del juego -> relay %s:3758\n", server_host().c_str());
+	std::fflush(stdout);
+}
+} // namespace
+
+void P2pBind(int s, sockaddr_storage* host_addr) {
+	if (!Enabled() || host_addr == nullptr || host_addr->ss_family != AF_INET) return;
+	auto* in = reinterpret_cast<sockaddr_in*>(host_addr);
+	if (ntohs(in->sin_port) != 3658) return;
+	in->sin_port = 0; // the host side: any free port (3658 may be another game's, e.g. Bloodborne's)
+	std::lock_guard lock(g_br_m);
+	g_p2p_guest_socket = s;
+}
+void P2pBound(int s, uint64_t native) {
+	if (!Enabled()) return;
+	{
+		std::lock_guard lock(g_br_m);
+		if (s != g_p2p_guest_socket) return;
+		sockaddr_in a {};
+		socklen_t   len = sizeof(a);
+		getsockname(static_cast<online_socket_t>(native), reinterpret_cast<sockaddr*>(&a), &len);
+		g_p2p_host_port = a.sin_port;
+		std::printf("Online: socket P2P del juego (3658) en el puerto local %u\n", ntohs(a.sin_port));
+		std::fflush(stdout);
+	}
+	BridgeStart();
+}
+bool P2pSendto(int s, const void* buf, uint64_t len, const sockaddr_storage* to, int64_t* result) {
+	if (!Enabled() || to == nullptr || to->ss_family != AF_INET) return false;
+	const auto*    in = reinterpret_cast<const sockaddr_in*>(to);
+	const uint32_t ip = ntohl(in->sin_addr.S_un.S_addr);
+	if (ip == 0xEFFFFFFAu && ntohs(in->sin_port) == 1900) { // SSDP (the game's UPnP): not sent
+		*result = static_cast<int64_t>(len);
+		return true;
+	}
+	if ((ip & 0xFFFF0000u) != kVipBase) return false;
+	const uint64_t peer = VipAccount(ip);
+	*result             = static_cast<int64_t>(len);
+	if (peer == 0 || g_relay == online_bad_socket) return true;
+	std::string frame("DSR\x02", 4);
+	frame.append(reinterpret_cast<const char*>(&peer), 8);
+	frame.append(static_cast<const char*>(buf), static_cast<size_t>(len));
+	sendto(g_relay, frame.data(), static_cast<int>(frame.size()), 0, reinterpret_cast<sockaddr*>(&g_relay_addr), sizeof(g_relay_addr));
+	g_br_up++;
+	(void)s;
+	return true;
+}
+void P2pRecvfrom(int s, sockaddr_storage* from) {
+	if (!Enabled() || from == nullptr || from->ss_family != AF_INET) return;
+	auto* in = reinterpret_cast<sockaddr_in*>(from);
+	if (ntohl(in->sin_addr.S_un.S_addr) != INADDR_LOOPBACK) return;
+	std::lock_guard lock(g_br_m);
+	if (s != g_p2p_guest_socket) return;
+	auto it = g_helper_port.find(in->sin_port);
+	if (it == g_helper_port.end()) return;
+	in->sin_addr.S_un.S_addr = htonl(PeerVip(it->second));
+	in->sin_port        = htons(3658);
+}
+
+} // namespace Online
 
 namespace NpManager {
 
@@ -3455,8 +4126,28 @@ static int np_complete_signed_out_locked(NpRequest* request) {
 	return (request->async ? OK : np_error_signed_out);
 }
 
+// online1: with KYTY_ONLINE=1 the request completes OK (signed in) instead of signed out.
+static int np_complete_online_locked(NpRequest* request) {
+	if (!Online::Enabled()) {
+		return np_complete_signed_out_locked(request);
+	}
+	if (request->state == NpRequestState::Complete) {
+		request->result = np_error_invalid_argument;
+		return np_error_invalid_argument;
+	}
+	if (request->state == NpRequestState::Aborted) {
+		request->result = np_error_aborted;
+		return np_error_aborted;
+	}
+	request->state  = NpRequestState::Complete;
+	request->result = OK;
+	return OK;
+}
+
 int KYTY_SYSV_ABI NpCheckCallback() {
 	PRINT_NAME();
+
+	Online::DeliverCallbacks(); // (online5) on the game's thread (CrossgenMatchingSystem::Update, eboot+0x13a4ef0)
 
 	return OK;
 }
@@ -3528,7 +4219,7 @@ int KYTY_SYSV_ABI NpRegisterNpReachabilityStateCallback(void* /*callback*/, void
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
+int KYTY_SYSV_ABI NpGetNpId_impl(int user_id, NpId* np_id) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);
@@ -3540,11 +4231,30 @@ int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
 	// np_id->handle.term = 0;
 	std::memset(np_id, 0, sizeof(*np_id));
 
+	if (Online::Enabled()) {
+		const auto name = Online::PlayerName();
+		std::memcpy(np_id->handle.data, name.data(), name.size());
+		return OK;
+	}
+
 	// return OK;
 	return np_error_signed_out;
 }
 
-int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
+int KYTY_SYSV_ABI NpGetNpId(int user_id, NpId* np_id) {
+	const int online_ret = NpGetNpId_impl(user_id, np_id);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld) = 0x%08x\n", "NpGetNpId", static_cast<long long>(user_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpGetOnlineId_impl(int user_id, NpOnlineId* online_id) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);
@@ -3556,11 +4266,30 @@ int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
 	// online_id->term = 0;
 	std::memset(online_id, 0, sizeof(*online_id));
 
+	if (Online::Enabled()) {
+		const auto name = Online::PlayerName();
+		std::memcpy(online_id->data, name.data(), name.size());
+		return OK;
+	}
+
 	// return OK;
 	return np_error_signed_out;
 }
 
-int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
+int KYTY_SYSV_ABI NpGetOnlineId(int user_id, NpOnlineId* online_id) {
+	const int online_ret = NpGetOnlineId_impl(user_id, online_id);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld) = 0x%08x\n", "NpGetOnlineId", static_cast<long long>(user_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpGetAccountIdA_impl(int user_id, uint64_t* account_id) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);
@@ -3570,11 +4299,29 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 	// *account_id = 0x00000000feedfaceull;
 	*account_id = 0;
 
+	if (Online::Enabled()) {
+		*account_id = Online::AccountId();
+		return OK;
+	}
+
 	// return OK;
 	return np_error_signed_out;
 }
 
-int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
+int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
+	const int online_ret = NpGetAccountIdA_impl(user_id, account_id);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld *account_id=%lld) = 0x%08x\n", "NpGetAccountIdA", static_cast<long long>(user_id), (account_id != nullptr ? static_cast<long long>(*account_id) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpGetAccountCountryA_impl(int user_id, void* country_code) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);
@@ -3586,8 +4333,28 @@ int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 	// code->data[0] = '';
 	// code->data[1] = 'S';
 
+	if (Online::Enabled()) {
+		const char* c = std::getenv("KYTY_ONLINE_COUNTRY");
+		const char* cc = (c != nullptr && std::strlen(c) >= 2) ? c : "es";
+		std::memcpy(code, cc, 2);
+		return OK;
+	}
+
 	// return OK;
 	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
+	const int online_ret = NpGetAccountCountryA_impl(user_id, country_code);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld) = 0x%08x\n", "NpGetAccountCountryA", static_cast<long long>(user_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
@@ -3604,11 +4371,16 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 	// *age = 21;
 	*age = 0;
 
+	if (Online::Enabled()) {
+		*age = 30;
+		return OK;
+	}
+
 	// return OK;
 	return np_error_signed_out;
 }
 
-int KYTY_SYSV_ABI NpCreateRequest() {
+int KYTY_SYSV_ABI NpCreateRequest_impl() {
 	PRINT_NAME();
 
 	const auto req_id = np_create_request(false);
@@ -3618,7 +4390,20 @@ int KYTY_SYSV_ABI NpCreateRequest() {
 	return req_id;
 }
 
-int KYTY_SYSV_ABI NpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param) {
+int KYTY_SYSV_ABI NpCreateRequest() {
+	const int online_ret = NpCreateRequest_impl();
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s() = 0x%08x\n", "NpCreateRequest", static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpCreateAsyncRequest_impl(const NpCreateAsyncRequestParameter* param) {
 	PRINT_NAME();
 
 	if (param == nullptr) {
@@ -3639,6 +4424,19 @@ int KYTY_SYSV_ABI NpCreateAsyncRequest(const NpCreateAsyncRequestParameter* para
 	LOGF("\t req_id            = %d\n", req_id);
 
 	return req_id;
+}
+
+int KYTY_SYSV_ABI NpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param) {
+	const int online_ret = NpCreateAsyncRequest_impl(param);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s() = 0x%08x\n", "NpCreateAsyncRequest", static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 int KYTY_SYSV_ABI NpDeleteRequest(int req_id) {
@@ -3678,7 +4476,7 @@ int KYTY_SYSV_ABI NpAbortRequest(int req_id) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* result) {
+int KYTY_SYSV_ABI NpCheckNpAvailability_impl(int req_id, const char* user, void* result) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(req_id <= 0);
@@ -3705,10 +4503,23 @@ int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* resu
 	}
 
 	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_online_locked(request);
 }
 
-int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
+int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* result) {
+	const int online_ret = NpCheckNpAvailability_impl(req_id, user, result);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(req_id=%lld user=%s) = 0x%08x\n", "NpCheckNpAvailability", static_cast<long long>(req_id), (user != nullptr ? user : "(null)"), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpCheckNpReachability_impl(int req_id, int user_id) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(req_id <= 0);
@@ -3728,10 +4539,23 @@ int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
 	}
 
 	// return OK;
-	return np_complete_signed_out_locked(request);
+	return np_complete_online_locked(request);
 }
 
-int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
+int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
+	const int online_ret = NpCheckNpReachability_impl(req_id, user_id);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(req_id=%lld user_id=%lld) = 0x%08x\n", "NpCheckNpReachability", static_cast<long long>(req_id), static_cast<long long>(user_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpPollAsync_impl(int req_id, int* result) {
 	PRINT_NAME();
 
 	if (result == nullptr) {
@@ -3757,7 +4581,20 @@ int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* param,
+int KYTY_SYSV_ABI NpPollAsync(int req_id, int* result) {
+	const int online_ret = NpPollAsync_impl(req_id, result);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(req_id=%lld *result=%lld) = 0x%08x\n", "NpPollAsync", static_cast<long long>(req_id), (result != nullptr ? static_cast<long long>(*result) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpCheckPremium_impl(int req_id, const NpCheckPremiumParameter* param,
                                  NpCheckPremiumResult* result) {
 	PRINT_NAME();
 
@@ -3797,6 +4634,11 @@ int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* para
 	std::memset(result, 0, sizeof(*result));
 	// result->authorized = true;
 
+	if (Online::Enabled()) {
+		result->authorized = true; // PS Plus check (DsPremiumOnlineCheck_PS4_PS5.cpp)
+		return np_complete_online_locked(request);
+	}
+
 	// request->state  = NpRequestState::Complete;
 	// request->result = OK;
 
@@ -3804,19 +4646,46 @@ int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* para
 	return np_complete_signed_out_locked(request);
 }
 
-int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
+int KYTY_SYSV_ABI NpCheckPremium(int req_id, const NpCheckPremiumParameter* param,
+                                 NpCheckPremiumResult* result) {
+	const int online_ret = NpCheckPremium_impl(req_id, param, result);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(req_id=%lld) = 0x%08x\n", "NpCheckPremium", static_cast<long long>(req_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpGetState_impl(int user_id, uint32_t* state) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*state = 1; // Signed out
+	*state = (Online::Enabled() ? 2 : 1); // 2 = signed in (KYTY_ONLINE=1), 1 = signed out
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
+int KYTY_SYSV_ABI NpGetState(int user_id, uint32_t* state) {
+	const int online_ret = NpGetState_impl(user_id, state);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld *state=%lld) = 0x%08x\n", "NpGetState", static_cast<long long>(user_id), (state != nullptr ? static_cast<long long>(*state) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpGetNpReachabilityState_impl(int user_id, uint32_t* state) {
 	PRINT_NAME();
 
 	if (state == nullptr) {
@@ -3826,12 +4695,25 @@ int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
 	LOGF("\t user_id = %d\n", user_id);
 
 	// *state = 2; // SCE_NP_REACHABILITY_STATE_REACHABLE
-	*state = 0; // SCE_NP_REACHABILITY_STATE_UNAVAILABLE
+	*state = (Online::Enabled() ? 2 : 0); // SCE_NP_REACHABILITY_STATE_REACHABLE / UNAVAILABLE
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
+int KYTY_SYSV_ABI NpGetNpReachabilityState(int user_id, uint32_t* state) {
+	const int online_ret = NpGetNpReachabilityState_impl(user_id, state);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld *state=%lld) = 0x%08x\n", "NpGetNpReachabilityState", static_cast<long long>(user_id), (state != nullptr ? static_cast<long long>(*state) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+int KYTY_SYSV_ABI NpHasSignedUp_impl(int user_id, bool* has_signed_up) {
 	PRINT_NAME();
 
 	if (has_signed_up == nullptr) {
@@ -3840,9 +4722,22 @@ int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
 
 	LOGF("\t user_id = %d\n", user_id);
 
-	*has_signed_up = false;
+	*has_signed_up = Online::Enabled();
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI NpHasSignedUp(int user_id, bool* has_signed_up) {
+	const int online_ret = NpHasSignedUp_impl(user_id, has_signed_up);
+	if (Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_id=%lld *has_signed_up=%lld) = 0x%08x\n", "NpHasSignedUp", static_cast<long long>(user_id), (has_signed_up != nullptr ? static_cast<long long>(*has_signed_up) : -1LL), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 } // namespace NpManager

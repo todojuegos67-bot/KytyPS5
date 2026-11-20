@@ -55,6 +55,7 @@
 
 #include "mem-guard.h"
 #include "cold-store.h" // (ram11)
+#include "f0-measure.h" // (f0)
 
 #include <atomic>
 #include <cstdint>
@@ -435,6 +436,7 @@ inline bool Prefault(const void* address, uint64_t size) {
 	// (ram11, KYTY_COLD_STORE) A kernel-mode access - file reads and writes, sockets - does not fault: what the cold
 	// store holds there comes back first. Nothing when it holds nothing.
 	ColdStore::Ensure(reinterpret_cast<uint64_t>(address), size);
+	F0Measure::Ensure(reinterpret_cast<uint64_t>(address), size); // (f0: our guards off first)
 	auto& state = Get();
 	if (!state.enabled || address == nullptr || size == 0) return true;
 	uint64_t begin = 0, end = 0;

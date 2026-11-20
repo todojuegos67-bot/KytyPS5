@@ -16,7 +16,11 @@ void SetThreadName(const char* name);
 // The OS id of the calling thread (Linux: gettid, Windows: GetCurrentThreadId).
 uint32_t ThreadId();
 
-// Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
+// A CPU list as read ("0,8-15" -> "0,8,9,10,11,12,13,14,15"; "none" when it names no CPU 0..63): what start-up lines
+// print, so a list read otherwise than meant shows.
+std::string CpuListResolved(const char* list);
+
+// Pins the calling thread to a comma-separated CPU list ("1,2,3", ranges "8-15"); an empty or invalid
 // list leaves the affinity alone.
 void PinThreadToCpuList(const char* list);
 

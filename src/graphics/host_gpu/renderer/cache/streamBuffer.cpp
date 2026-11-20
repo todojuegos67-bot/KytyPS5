@@ -388,7 +388,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::Buffer buffer,
+               vk::DeviceMemory memory, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Upload), m_cpu_address(cpu_address),
+      m_buffer(buffer), m_size(size), m_coherent(true), m_in_system_memory(true), m_imported(memory) {}
+
 Buffer::~Buffer() {
+	if (m_imported) { // (tiron7: freed after the GPU work that read it, BufferCache)
+		const auto native_device = static_cast<VkDevice>(m_graphics->device);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, static_cast<VkDeviceMemory>(m_imported), nullptr);
+		return;
+	}
 	DeviceFault::NoteDestroyed(m_device_address);
 	if (m_sparse) {
 		const auto native_device = static_cast<VkDevice>(m_graphics->device);

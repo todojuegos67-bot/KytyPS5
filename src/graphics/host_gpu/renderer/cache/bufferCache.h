@@ -243,6 +243,35 @@ public:
 	// needs no second ObtainBuffer (TableBlocks' memo).
 	[[nodiscard]] uint64_t WrittenObtainEpoch() const { return m_written_obtain_epoch.load(std::memory_order_acquire); }
 	void                   MoveWrittenObtainEpoch() { m_written_obtain_epoch.fetch_add(1, std::memory_order_acq_rel); }
+	// (trad1, KYTY_TRAD1; local/trad1.h) Moves whenever m_gpu_modified_ranges loses bytes (m_gpu_coverage_epoch). GPU thread.
+	[[nodiscard]] uint64_t GpuCoverageEpoch() const { return m_gpu_coverage_epoch; }
+	// (trad1b) Whether m_gpu_modified_ranges may have lost bytes of [vaddr, vaddr + size) since `epoch` (a value of
+	// GpuCoverageEpoch): the loss stamps of its 4 MiB tracker regions (Trad1StampCoverage), kept once a caller asked
+	// (Trad1EnableCoverage; every region counts as lost before that). Conservative: a loss elsewhere in a region counts.
+	[[nodiscard]] bool Trad1CoverageMoved(uint64_t vaddr, uint64_t size, uint64_t epoch) const {
+		if (m_trad1_coverage == nullptr || m_trad1_coverage_far > epoch || size == 0) return true;
+		const auto first = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last >= Trad1CoverageRegions || last - first > 64) return true;
+		for (auto region = first; region <= last; ++region)
+			if (m_trad1_coverage[region] > epoch) return true;
+		return false;
+	}
+	void Trad1EnableCoverage() {
+		if (m_trad1_coverage != nullptr) return;
+		m_trad1_coverage      = std::make_unique<uint64_t[]>(Trad1CoverageRegions);
+		m_trad1_coverage_far  = m_gpu_coverage_epoch; // (losses before now were not stamped)
+	}
+	// (trad1) A range ObtainBuffer obtained as written into buffer `id` (`expect`), at registration epoch `registration`
+	// and coverage epoch `coverage`, written again: what ObtainBuffer's write memo path does (the policy, the readback
+	// drain, the LRU touch, the copy feedback invalidated, the GPU and native write notes) when, after the drain, those
+	// epochs still stand and the buffer is live and holds the range (its pages still GPU-owned and the range still in the
+	// GPU-modified set: SynchronizeBuffer and the Add would find nothing to do). False: nothing noted (the drain may have
+	// run); the caller obtains it as before. Not texel, not speculative.
+	[[nodiscard]] bool Trad1RenoteWritten(BufferId id, const Buffer* expect, uint64_t vaddr, uint64_t size,
+	                                      uint64_t registration, uint64_t coverage);
+	// (trad1, KYTY_TRAD1=2) Whether SynchronizeBuffer of the range as written would upload anything (some page of it not
+	// GPU-owned), as ObtainBuffer would find it now.
+	[[nodiscard]] bool Trad1SyncWouldUpload(uint64_t vaddr, uint64_t size);
 	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
 	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
 	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
@@ -501,6 +530,25 @@ private:
 	// Moves whenever m_gpu_modified_ranges loses bytes (readbacks, copy feedback, downloads, discards: CPU writes and
 	// unmaps go through those first). GPU thread.
 	uint64_t m_gpu_coverage_epoch = 1;
+	// (trad1b) Per tracker region, the coverage epoch of its last loss (null until Trad1EnableCoverage: nothing stamped);
+	// `far`: a loss not stamped by region (too wide, out of the table, before it existed).
+	static constexpr uint64_t   Trad1CoverageRegions = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	std::unique_ptr<uint64_t[]> m_trad1_coverage;
+	uint64_t                    m_trad1_coverage_far = 0;
+	void Trad1StampCoverage(uint64_t vaddr, uint64_t size) {
+		if (m_trad1_coverage == nullptr || size == 0) return;
+		const auto first = vaddr / TRACKER_REGION_SIZE, last = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last >= Trad1CoverageRegions || last - first > 4096) {
+			m_trad1_coverage_far = m_gpu_coverage_epoch;
+			return;
+		}
+		for (auto region = first; region <= last; ++region) m_trad1_coverage[region] = m_gpu_coverage_epoch;
+	}
+	template <typename Ranges>
+	void Trad1StampCoverageAll(const Ranges& ranges) {
+		if (m_trad1_coverage == nullptr) return;
+		for (const auto& range: ranges) Trad1StampCoverage(range.address, range.size);
+	}
 	// The ranges ObtainBuffer made GPU-written lately (GPU thread): one written again while no buffer was registered
 	// or unregistered and no GPU-written byte was given back since is the same buffer's, its pages still GPU-owned
 	// and its bytes still in m_gpu_modified_ranges (what SynchronizeBuffer and the Add would find).

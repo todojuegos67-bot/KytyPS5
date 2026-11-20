@@ -48,6 +48,9 @@ public:
 	// A game buffer bound to `allocation` (a defragmentation pass's destination: BufferCache::Defragment).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
 	       uint64_t size, VmaAllocation allocation);
+	// (tiron7) Host memory imported as a buffer (VK_EXT_external_memory_host): `memory` and `buffer` are owned and freed with it.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::Buffer buffer,
+	       vk::DeviceMemory memory, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -128,6 +131,7 @@ private:
 	bool                          m_coherent = false;
 	bool                          m_in_system_memory = false;
 	std::span<uint8_t>            m_mapped;
+	vk::DeviceMemory              m_imported = nullptr; // (tiron7)
 	struct Sparse;
 	std::unique_ptr<Sparse> m_sparse;
 };

@@ -38,6 +38,7 @@
 #include "local/parpadeo5.h" // (parpadeo5: KYTY_PARPADEO5)
 #include "local/parpadeo6.h" // (parpadeo6: KYTY_PARPADEO6)
 #include "local/parpadeo7.h" // (parpadeo7: KYTY_PARPADEO7)
+#include "local/juego3.h" // (juego3: KYTY_JUEGO3)
 #include "local/serie1.h"    // (serie1: KYTY_SERIE1)
 #include "local/raiz.h"      // (raiz12: KYTY_RAIZ_SETTLE)
 
@@ -1570,9 +1571,11 @@ void KYTY_SYSV_ABI OnBinkSubmit(uint64_t context) {
 	}
 }
 void KYTY_SYSV_ABI OnReadPointer(uint64_t buffer) {
+	Juego3::Scope juego3_wait(Juego3::TagAccessor); // (juego3)
 	ReadbackAccess(buffer, RPointer);
 }
 void KYTY_SYSV_ABI OnReadCopy(uint64_t buffer) {
+	Juego3::Scope juego3_wait(Juego3::TagAccessor); // (juego3)
 	ReadbackAccess(buffer, RCopy);
 }
 
@@ -1589,6 +1592,7 @@ thread_local XprCall         t_xpr[XprDepth];
 thread_local size_t          t_xpr_depth = 0;
 void KYTY_SYSV_ABI OnXprReadBefore(uint64_t /*object*/, uint64_t /*pass*/, uint64_t entry, uint64_t /*rcx*/, uint64_t /*r8*/,
                                    uint64_t /*r9*/, const uint64_t* frame, uint64_t /*rbp*/) {
+	Juego3::Scope juego3_wait(Juego3::TagAccessor); // (juego3: the raiz12 settle of the index cull's counters)
 	if (t_xpr_depth >= XprDepth) {
 		std::printf("[raiz12] 0xa1f020 nested %zu deep: not expected, stopping (KYTY_RAIZ_SETTLE=0 leaves the hook out)\n", t_xpr_depth);
 		std::fflush(stdout);
@@ -1932,7 +1936,8 @@ uint32_t SettleChunkBitsFix(uint64_t bits_at, uint64_t mask2_at, uint64_t bytes,
 	uint32_t   flags  = Libs::LibKernel::Memory::RaizSettleRange(bits_at, bytes, Raiz::SettleChunkBits, 1);
 	uint32_t   ranges = 1;
 	// (parpadeo7) What the settle met of the readbacks begun at the label (diagnostics: local/parpadeo7.h's line).
-	const bool prefetch = Parpadeo7::On();
+	// (juego3) Also with KYTY_JUEGO3: its prefetch at the label shares those counters ([juego3] line).
+	const bool prefetch = Parpadeo7::On() || Juego3::On();
 	if (prefetch) Parpadeo7::NoteSettle(bits_at, bytes, (flags & Libs::LibKernel::Memory::RaizSettleReadback) != 0);
 	if (mask2_at != 0) {
 		const uint32_t more = Libs::LibKernel::Memory::RaizSettleRange(mask2_at, bytes, Raiz::SettleChunkBits, 1);
@@ -1944,9 +1949,10 @@ uint32_t SettleChunkBitsFix(uint64_t bits_at, uint64_t mask2_at, uint64_t bytes,
 	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 	Parpadeo6::Note(flags, ranges, us);
 	Parpadeo6::MaybeReport();
+	Juego3::NoteSettle(us, (flags & Libs::LibKernel::Memory::RaizSettleReadback) != 0); // (juego3)
 	// (serie1) KYTY_SERIE1: the wall time from the culling's label to the bits in (the game waiting for the GPU to run it).
 	if (Serie1::Mode() != 0 && (flags & Libs::LibKernel::Memory::RaizSettleReadback) != 0) Serie1::NoteSettleReadback();
-	if (prefetch) Parpadeo7::MaybeReport();
+	if (Parpadeo7::On()) Parpadeo7::MaybeReport();
 	if (us_out != nullptr) *us_out = us;
 	return flags;
 }
@@ -1954,6 +1960,7 @@ void KYTY_SYSV_ABI OnChunkDraws(uint64_t section, uint64_t view, uint64_t pass) 
 	const int  level = Parpadeo5::Level();
 	const bool fix   = Parpadeo6::On(); // (parpadeo6)
 	if (level == 0 && !fix) return;
+	Juego3::Scope juego3_wait(Juego3::TagSettle); // (juego3: the game thread in 0xa1f290's settle)
 	try {
 		// (8 KiB each: 65,535 chunks at most; thread_local, not on the game thread's stack.)
 		thread_local std::array<uint64_t, 1024> bits {}, before {}, mask2 {}, drawn {}, old {};
@@ -2002,8 +2009,8 @@ void KYTY_SYSV_ABI OnChunkDraws(uint64_t section, uint64_t view, uint64_t pass) 
 		if (Parpadeo7::On()) {
 			uint64_t base = 0;
 			if (!GuestRead(view + 0x120, &base)) base = 0;
-			Parpadeo7::Learn(view, label_at, base, sec_index, static_cast<uint32_t>(slot), static_cast<uint32_t>(words));
-			if (!path_a) Parpadeo7::Learn(view, label_at, base, sec_index, static_cast<uint32_t>(i7), static_cast<uint32_t>(words));
+			Parpadeo7::Learn(view, label_at, base, sec_index, static_cast<uint32_t>(slot), static_cast<uint32_t>(words), table);
+			if (!path_a) Parpadeo7::Learn(view, label_at, base, sec_index, static_cast<uint32_t>(i7), static_cast<uint32_t>(words), table);
 		}
 		// (parpadeo6, without the detector) The settle, and the game's code runs.
 		if (level == 0) {

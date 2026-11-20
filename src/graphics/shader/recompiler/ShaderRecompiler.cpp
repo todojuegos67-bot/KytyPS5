@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Rtq2Patch.h" // (rtq2: suelo estable)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -583,7 +584,10 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+TranslateResult TranslateProgram(std::span<const uint32_t> code_in, const CompileOptions& options) {
+	// (rtq2) KYTY_RTQ2_IBL: the game's IBL with one instruction replaced (Rtq2Patch.h); every other program as it is.
+	thread_local std::vector<uint32_t> rtq2_patched;
+	const std::span<const uint32_t>    code = Rtq2Patch::Apply(options.shader_hash, code_in, rtq2_patched);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -754,7 +758,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
 		     IR::ProgramToString(ir).c_str());
 	}
-	IR::TrackResources(ir);
+	IR::TrackResources(ir, options.stage == ShaderType::Pixel &&
+	                           (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelInterlock) != 0);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

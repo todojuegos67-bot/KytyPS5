@@ -136,8 +136,10 @@ bool GpuAssistedValidationEnabled() {
 	return g_config->gpu_assisted_validation_enabled && g_config->vulkan_validation_enabled;
 }
 
+// (rdoc1) --rd, or KYTY_RENDERDOC=1 (the port's settings.ini extra / CAPTURA-RENDERDOC.cmd).
 bool RenderDocEnabled() {
-	return g_config->renderdoc_enabled;
+	const char* value = std::getenv("KYTY_RENDERDOC");
+	return g_config->renderdoc_enabled || (value != nullptr && value[0] == '1');
 }
 
 bool ReadbackLinearImagesEnabled() {

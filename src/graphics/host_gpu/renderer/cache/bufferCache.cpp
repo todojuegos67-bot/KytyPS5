@@ -12,9 +12,14 @@
 #include "live-trace.h"
 #include "native-resource-state.h"
 #include "async-upload.h"
+#include "local/tiron7.h" // (tiron7: KYTY_TIRON7)
 #include "raiz.h" // (raiz2: KYTY_RAIZ)
 #include "parpadeo7.h" // (parpadeo7: KYTY_PARPADEO7)
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
+#include "f0-measure.h" // (f0: KYTY_F0)
 #include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/trad2.h" // (trad2: KYTY_TRAD2)
+#include "local/live-control.h" // (trad2: LiveControl::g_flips, the [trad2] line's frames)
 #include "raiz-wb-guard.h" // (crash-ba2b1f: KYTY_RAIZ_WB_GUARD)
 #include "parallel-pages.h"
 #include "readback-queue.h"
@@ -546,6 +551,7 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size, uint64_t caller) {
+	Juego3::NoteWrite(vaddr, size); // (juego3: what a dispatch writes, by its shader; off: one load)
 	if (caller == 0 && SyncStats::Enabled()) caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
@@ -795,6 +801,7 @@ void BufferCache::FinishGuestReadback(size_t slot, bool detach) {
 		m_gpu_modified_ranges.SubtractSorted(request->parts);
 		MoveWrittenObtainEpoch();
 		++m_gpu_coverage_epoch;
+		Trad1StampCoverageAll(request->parts); // (trad1b)
 	}
 	// The renderer may have dirtied other pages in the widened window since handoff.
 	for (const auto& page: request->pages)
@@ -1186,6 +1193,7 @@ bool BufferCache::VerifyEagerFeedback(const EagerFeedback& entry) {
 		const std::unique_lock lock(m_gpu_modified_mutex);
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		++m_gpu_coverage_epoch;
+		Trad1StampCoverageAll(copies); // (trad1b)
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 	LiveCounters::Add(LiveCounters::EagerVerified);
@@ -1288,6 +1296,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
 		++m_gpu_coverage_epoch;
+		Trad1StampCoverageAll(copies); // (trad1b)
 	}
 	// Only complete dirty-page coverage allows dropping protection. CPU-clean bytes
 	// are never published from the snapshot. Any later upload/GPU write invalidates it.
@@ -1644,6 +1653,7 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 		m_gpu_modified_ranges.SubtractSorted(copies);
 		MoveWrittenObtainEpoch();
 		++m_gpu_coverage_epoch;
+		Trad1StampCoverageAll(copies); // (trad1b)
 	}
 }
 
@@ -1765,6 +1775,14 @@ uint64_t BufferCacheStagingRingSize() {
 			const uint64_t value = std::strtoull(mb, nullptr, 10);
 			if (value >= 64 && value <= 2048) return value * MiB;
 		}
+		// (tiron9, KYTY_TIRON9=1) 768 MiB: 20261120-011558, the 622.7 ms frame uploaded 362 MB of images through the 256 MiB
+		// ring - the render thread waited in StreamBuffer::Map <- CommandScheduler::Wait (gpu_wait 124 ms, 22% of its samples)
+		// for the GPU to free ring space, and the GPU's submissions waited for the upload copies (upload_wait 253 ms).
+		if (const char* t9 = std::getenv("KYTY_TIRON9"); t9 != nullptr && t9[0] == '1') {
+			std::printf("[tiron9] KYTY_TIRON9=1: anillo de subida de imagenes 768 MiB (antes 256)\n");
+			std::fflush(stdout);
+			return uint64_t {768} * MiB;
+		}
 		const char* diet = std::getenv("KYTY_RAM_DIET_STAGING");
 		const bool  off  = diet != nullptr && diet[0] == '0';
 		if (LocalPlatform::LowMemVram() || !off) return 256 * MiB; // KYTY_LOWMEM_VRAM=1 or the RAM diet
@@ -1858,6 +1876,95 @@ void BufferCache::GrowBdaTable(uint64_t entries) {
 	std::fflush(stdout);
 }
 
+// (unificada, KYTY_UNIFICADA=1; measurement only) Can this driver import host memory of the kind the guest's is - private,
+// committed, MEM_WRITE_WATCH - and does it still once the pages are made read-only after the import, or only while
+// writable? TIRON7 v2 (20261120-000053): every import of guest pages refused at vkAllocateMemory with
+// VK_ERROR_OUT_OF_DEVICE_MEMORY, pages MEM_COMMIT PAGE_READONLY MEM_PRIVATE. Four cases, 64 MiB each, one "[unificada]"
+// line per case; nothing of the emulator uses them.
+static void UnificadaProbe(GraphicContext& graphics) {
+#if defined(_WIN32)
+	const char* on = std::getenv("KYTY_UNIFICADA");
+	if (on == nullptr || on[0] != '1') return;
+	if (!Tiron7::g_extension.load(std::memory_order_relaxed)) {
+		std::printf("[unificada] VK_EXT_external_memory_host no activada: sin prueba\n");
+		std::fflush(stdout);
+		return;
+	}
+	auto&          vk     = VULKAN_HPP_DEFAULT_DISPATCHER;
+	const auto     device = static_cast<VkDevice>(graphics.device);
+	constexpr SIZE_T Bytes = SIZE_T {64} << 20u;
+	struct Case {
+		const char* name;
+		DWORD       type;
+		DWORD       protect_before; // at the import
+		DWORD       protect_after;  // set after the import (0: none)
+	};
+	const Case cases[] {
+	    {"privada RW", MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0},
+	    {"privada RW + MEM_WRITE_WATCH (como la del juego)", MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE, 0},
+	    {"WRITE_WATCH, importada RW y luego READONLY (como RAIZ)", MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE,
+	     PAGE_READONLY},
+	    {"WRITE_WATCH en READONLY al importar", MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READONLY, 0},
+	};
+	for (const auto& c: cases) {
+		void* host = VirtualAlloc(nullptr, Bytes, c.type, PAGE_READWRITE);
+		if (host == nullptr) {
+			std::printf("[unificada] %s: VirtualAlloc fallo (%lu)\n", c.name, GetLastError());
+			continue;
+		}
+		std::memset(host, 0x5a, Bytes); // (committed and touched, as the game's)
+		DWORD old = 0;
+		if (c.protect_before != PAGE_READWRITE) (void)VirtualProtect(host, Bytes, c.protect_before, &old);
+		VkMemoryHostPointerPropertiesEXT props {};
+		props.sType           = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+		const VkResult query  = vk.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                                        host, &props);
+		VkPhysicalDeviceMemoryProperties memory_props {};
+		vk.vkGetPhysicalDeviceMemoryProperties(static_cast<VkPhysicalDevice>(graphics.physical_device), &memory_props);
+		uint32_t type = UINT32_MAX;
+		for (uint32_t i = 0; i < memory_props.memoryTypeCount && type == UINT32_MAX; ++i)
+			if ((props.memoryTypeBits & (1u << i)) != 0 &&
+			    (memory_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+				type = i;
+		VkResult       alloc  = VK_ERROR_UNKNOWN;
+		VkDeviceMemory memory = VK_NULL_HANDLE;
+		const auto     start  = std::chrono::steady_clock::now();
+		if (query == VK_SUCCESS && type != UINT32_MAX) {
+			VkImportMemoryHostPointerInfoEXT import_info {};
+			import_info.sType        = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+			import_info.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+			import_info.pHostPointer = host;
+			VkMemoryAllocateInfo allocate {};
+			allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+			allocate.pNext           = &import_info;
+			allocate.allocationSize  = Bytes;
+			allocate.memoryTypeIndex = type;
+			alloc                    = vk.vkAllocateMemory(device, &allocate, nullptr, &memory);
+		}
+		const double ms      = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+		BOOL         after   = TRUE;
+		DWORD        after_e = 0;
+		if (alloc == VK_SUCCESS && c.protect_after != 0) {
+			after = VirtualProtect(host, Bytes, c.protect_after, &old);
+			if (!after) after_e = GetLastError();
+		}
+		std::printf("[unificada] %s: query %d (memoryTypeBits 0x%x, tipo %d), import %d en %.1f ms%s%s\n", c.name,
+		            static_cast<int>(query), props.memoryTypeBits, type == UINT32_MAX ? -1 : static_cast<int>(type),
+		            static_cast<int>(alloc), ms, alloc == VK_SUCCESS ? " -> ACEPTADA" : " -> RECHAZADA",
+		            c.protect_after == 0 || alloc != VK_SUCCESS ? ""
+		            : after                                   ? "; protegerla READONLY despues: OK"
+		                                                      : "; protegerla READONLY despues: FALLO");
+		if (!after) std::printf("[unificada]   (VirtualProtect error %lu)\n", after_e);
+		std::fflush(stdout);
+		if (memory != VK_NULL_HANDLE) vk.vkFreeMemory(device, memory, nullptr);
+		(void)VirtualProtect(host, Bytes, PAGE_READWRITE, &old);
+		VirtualFree(host, 0, MEM_RELEASE);
+	}
+#else
+	(void)graphics;
+#endif
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache,
                          GpuResourceManager* resources)
@@ -1911,6 +2018,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	UnificadaProbe(graphics); // (unificada)
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -2095,6 +2203,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		m_gpu_modified_ranges.Subtract(first, last - first);
 		MoveWrittenObtainEpoch();
 		++m_gpu_coverage_epoch;
+		Trad1StampCoverage(first, last - first); // (trad1b)
 	}
 	LiveCounters::Add(LiveCounters::DiscardedGpuBytes, dropped);
 	InvalidateCopyFeedback(first, last - first);
@@ -2232,10 +2341,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		std::printf("SLOW ReadMemory %.1f ms addr=0x%llx size=0x%llx write=%d %s\n", ms, static_cast<unsigned long long>(vaddr),
 		            static_cast<unsigned long long>(size), is_write ? 1 : 0, guest ? "guest" : "render");
 	});
+	Juego3::Scope juego3_readback(guest ? Juego3::TagReadback : 0u); // (juego3: the game thread's whole readback)
 	if ((!is_write || async_write) && !GuestGpu::IsGpuThread() && GuestReadbacksEnabled()) {
 		std::shared_ptr<GuestReadback> request;
 		auto& gpu = m_scheduler.Context().GetGpu();
 		gpu.SendCommandSync([&] {
+			Juego3::LearnReadback(vaddr, size); // (juego3: the range's writer, for the readback at the label)
 			if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
 			bool completed = false;
 			request = BeginGuestReadback(vaddr, size, &completed);
@@ -2298,7 +2409,9 @@ uint32_t BufferCache::PrefetchGuestRead(uint64_t vaddr, uint64_t size, int64_t l
 		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) { return page.address < end && vaddr < page.End(); }))
 			return Parpadeo7::PrefetchInflight;
 	}
-	if (free == 0) return Parpadeo7::PrefetchNoSlot;
+	// (juego3: its prefetches leave 8 slots to the game's own reads - a read finding every slot pending retires the oldest,
+	// the GPU thread waiting for that copy -.)
+	if (free == 0 || (Juego3::FixNow() && free < 8)) return Parpadeo7::PrefetchNoSlot;
 	{
 		std::lock_guard lock(m_prefetch_helper_mutex);
 		if (!m_prefetch_helper) {
@@ -2725,7 +2838,10 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    }
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, &ring); }, &last_dirty);
-	if (total_size != 0) LaneSync::NoteRange(buffer.lane_marks, vaddr, size, true);
+	if (total_size != 0) {
+		LaneSync::NoteRange(buffer.lane_marks, vaddr, size, true);
+		++Trad2::g_upload_runs; // (trad2: its verification)
+	}
 	if (source) {
 		// The pieces of one run (split at mapping boundaries for the upload worker's reads, which UploadCopies pushed)
 		// are adjacent in the staging ring and in the buffer: one copy region each run from here on. (The game's
@@ -2905,6 +3021,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 	LiveCounters::Add(LiveCounters::UploadCopies, copies.size());
 	LiveCounters::Add(LiveCounters::UploadBytes, total_size);
+	if (F0Measure::On()) for (const auto& copy: copies) F0Measure::NoteUpload(buffer.CpuAddress() + copy.dstOffset, copy.size); // (f0)
 	if (LiveCounters::g_granules_on.load(std::memory_order_relaxed)) {
 		for (const auto& copy: copies) {
 			LiveCounters::AddGranule(buffer.CpuAddress() + copy.dstOffset, LiveCounters::GUploadBytes, copy.size);
@@ -3261,6 +3378,257 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {buffer, buffer->Offset(vaddr)};
 }
 
+// (trad1, KYTY_TRAD1; local/trad1.h) ObtainBuffer's write memo path for a range the caller proved: the same calls, in the
+// same order, without the memo's lookup, the page table, SynchronizeBuffer and the range Add (the coverage epoch
+// unchanged since the obtain that added the range: none of its bytes left m_gpu_modified_ranges, its pages are still
+// GPU-owned: SynchronizeBuffer would return at once, the Add would add nothing).
+bool BufferCache::Trad1RenoteWritten(BufferId id, const Buffer* expect, uint64_t vaddr, uint64_t size,
+                                     uint64_t registration, uint64_t coverage) {
+	if (Spec::Current() != nullptr || size == 0) return false;
+	PolicyBeforeUse(vaddr, size, true); // (policy1)
+	DrainGuestReadback(vaddr, size, false, true);
+	// (After the drain: a readback it finished gave bytes back and moved the coverage epoch. trad1b: only a loss in the
+	// range's own tracker regions counts; the rest of m_gpu_modified_ranges is not what SynchronizeBuffer looks at.)
+	if (Trad1CoverageMoved(vaddr, size, coverage) || RegistrationEpoch() != registration) return false;
+	auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer == nullptr || buffer != expect || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) return false;
+	if (LiveTrace::WriteTicks()) LiveTrace::Event(LiveTrace::BufferUse, vaddr, size | uint64_t {1} << 63u);
+	TouchBuffer(*buffer);
+	LaneSync::NoteRange(buffer->lane_marks, vaddr, size, true);
+	const Envio1::Scope envio1_mod(Envio1::BufMod); // (envio1)
+	InvalidateCopyFeedback(vaddr, size);
+	NoteGpuWrite(vaddr, size);
+	Spec::NoteGpuWrite(vaddr, size);
+	LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
+	LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWriteBytes, size);
+	NoteNativeWrite(vaddr, size);
+	return true;
+}
+
+// (trad1, KYTY_TRAD1=2) SynchronizeBuffer's test for a written range, without its work.
+bool BufferCache::Trad1SyncWouldUpload(uint64_t vaddr, uint64_t size) {
+	if (kyty_local_buffer_residency_mode.load(std::memory_order_relaxed) != 0 && native_buffer_download_depth == 0 &&
+	    m_gpu_modified_ranges.Contains(vaddr, size))
+		return false;
+	return !m_memory_tracker.IsRegionFullyGpuModified(vaddr, size);
+}
+
+// (tiron7, KYTY_TIRON7=1: local/tiron7.h) Imported guest memory a recorded image upload reads on the GPU. Render thread only
+// (imports are not made on a recorder's thread, in a deferred operation or on the upload worker).
+namespace {
+struct Tiron7Import {
+	std::unique_ptr<Buffer> buffer;
+	uint64_t                guest = 0, guest_size = 0; // the guest range it covers
+	uint64_t                tick  = 0;                 // the work that reads it
+};
+struct Tiron7State {
+	GraphicContext*          graphics  = nullptr;
+	CommandScheduler*        scheduler = nullptr;
+	uint64_t                 alignment = 0;
+	bool                     usable    = false;
+	std::vector<Tiron7Import> live;
+	// (v2) Guest ranges refused before, and when: not tried again for 10 s (a refusal costs a driver call each time).
+	std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::chrono::steady_clock::time_point>> refused;
+	std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
+};
+Tiron7State& Tiron7S() {
+	static Tiron7State state;
+	return state;
+}
+
+void Tiron7Report() {
+	auto&      st  = Tiron7S();
+	const auto now = std::chrono::steady_clock::now();
+	if (now - st.last_report < std::chrono::seconds(5)) return;
+	st.last_report = now;
+	std::printf("[tiron7] importadas %llu (%.0f MB, %.1f ms en total de import), fallidas %llu (fueron por el camino de antes), "
+	            "liberadas %llu, vivas %llu (%.0f MB); esperas a la GPU por un drenado %llu (%.1f ms); fallos %.1f ms, saltados "
+	            "por fallo previo %llu\n",
+	            static_cast<unsigned long long>(Tiron7::g_imports.load()), Tiron7::g_import_bytes.load() / 1e6,
+	            Tiron7::g_import_us.load() / 1000.0, static_cast<unsigned long long>(Tiron7::g_fails.load()),
+	            static_cast<unsigned long long>(Tiron7::g_frees.load()), static_cast<unsigned long long>(st.live.size()),
+	            Tiron7::g_live_bytes.load() / 1e6, static_cast<unsigned long long>(Tiron7::g_drain_waits.load()),
+	            Tiron7::g_drain_wait_us.load() / 1000.0, Tiron7::g_fail_us.load() / 1000.0,
+	            static_cast<unsigned long long>(Tiron7::g_skipped.load()));
+	std::fflush(stdout);
+}
+
+// Frees the imports whose work is complete.
+void Tiron7Reclaim() {
+	auto& st = Tiron7S();
+	std::erase_if(st.live, [&](Tiron7Import& import) {
+		if (import.tick >= CommandScheduler::PendingTick || !st.scheduler->IsFree(import.tick)) return false;
+		Tiron7::g_live_bytes.fetch_sub(import.buffer->Size(), std::memory_order_relaxed);
+		Tiron7::g_frees.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	});
+}
+
+// AsyncUpload::DrainRange: guest [vaddr, vaddr + size) is about to change (unmap, offload, a command processor write):
+// the GPU work reading it through an import completes first, then the import is freed.
+void Tiron7Drain(uint64_t vaddr, uint64_t size) {
+	auto& st = Tiron7S();
+	if (st.live.empty() || AsyncUpload::t_worker || CommandScheduler::ThreadRecorder() != nullptr) return;
+	uint64_t wait = 0;
+	for (const auto& import: st.live)
+		if (import.guest < vaddr + size && vaddr < import.guest + import.guest_size) wait = std::max(wait, import.tick);
+	if (wait == 0) return;
+	if (!st.scheduler->IsFree(wait)) {
+		const auto start = std::chrono::steady_clock::now();
+		st.scheduler->Wait(wait);
+		Tiron7::g_drain_waits.fetch_add(1, std::memory_order_relaxed);
+		Tiron7::g_drain_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                                            std::chrono::steady_clock::now() - start)
+		                                                            .count()),
+		                                  std::memory_order_relaxed);
+	}
+	Tiron7Reclaim();
+}
+
+// The guest's bytes of [vaddr, vaddr + size) as a buffer the GPU reads them from, at the returned offset; null: not
+// importable (the caller takes the old path).
+std::pair<Buffer*, uint64_t> Tiron7Import(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t vaddr,
+                                          uint64_t size, const uint8_t* source) {
+	auto& st = Tiron7S();
+	if (st.graphics == nullptr) {
+		st.graphics  = &graphics;
+		st.scheduler = &scheduler;
+		if (Tiron7::g_extension.load(std::memory_order_relaxed)) {
+			VkPhysicalDeviceExternalMemoryHostPropertiesEXT host {};
+			host.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+			VkPhysicalDeviceProperties2 props {};
+			props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+			props.pNext = &host;
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(static_cast<VkPhysicalDevice>(graphics.physical_device),
+			                                                             &props);
+			st.alignment = host.minImportedHostPointerAlignment;
+			st.usable    = st.alignment != 0 && (st.alignment & (st.alignment - 1)) == 0 &&
+			            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetMemoryHostPointerPropertiesEXT != nullptr;
+			AsyncUpload::g_import_drain = Tiron7Drain;
+		}
+		std::printf("[tiron7] import de memoria del juego %s (alineacion %llu)\n", st.usable ? "listo" : "NO usable: como antes",
+		            static_cast<unsigned long long>(st.alignment));
+		std::fflush(stdout);
+	}
+	Tiron7Reclaim();
+	Tiron7Report();
+	// (A copy's buffer offset is a multiple of the texel block: the staging ring's 16, kept.)
+	if (!st.usable || (reinterpret_cast<uint64_t>(source) & 15u) != 0) return {nullptr, 0};
+	const auto start   = std::chrono::steady_clock::now();
+	std::erase_if(st.refused, [&](const auto& entry) { return start - entry.second > std::chrono::seconds(10); });
+	for (const auto& entry: st.refused)
+		if (entry.first.first < vaddr + size && vaddr < entry.first.second) {
+			Tiron7::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			return {nullptr, 0};
+		}
+	const auto address = reinterpret_cast<uint64_t>(source);
+	const auto base    = address & ~(st.alignment - 1);
+	const auto end     = (address + size + st.alignment - 1) & ~(st.alignment - 1);
+	const auto bytes   = end - base;
+	const auto device  = static_cast<VkDevice>(graphics.device);
+	auto&      vk      = VULKAN_HPP_DEFAULT_DISPATCHER;
+	uint32_t   host_bits = 0, buffer_bits = 0;
+	const auto fail    = [&](const char* stage, VkResult result, VkBuffer buffer, VkDeviceMemory memory) {
+		if (buffer != VK_NULL_HANDLE) vk.vkDestroyBuffer(device, buffer, nullptr);
+		if (memory != VK_NULL_HANDLE) vk.vkFreeMemory(device, memory, nullptr);
+		st.refused.push_back({{vaddr, vaddr + size}, std::chrono::steady_clock::now()});
+		Tiron7::g_fail_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                                      std::chrono::steady_clock::now() - start)
+		                                                      .count()),
+		                            std::memory_order_relaxed);
+		if (Tiron7::g_fails.fetch_add(1, std::memory_order_relaxed) < 16) {
+			unsigned long state = 0, protect = 0, type = 0, allocation_protect = 0;
+			uint64_t      region = 0, allocation = 0;
+#if defined(_WIN32)
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(base), &info, sizeof(info)) != 0) {
+				state = info.State; protect = info.Protect; type = info.Type; allocation_protect = info.AllocationProtect;
+				region = info.RegionSize; allocation = reinterpret_cast<uint64_t>(info.AllocationBase);
+			}
+#endif
+			std::printf("[tiron7] import refused at %s: VkResult %d, guest 0x%llx size 0x%llx host %p base 0x%llx bytes 0x%llx "
+			            "(alignment %llu), memoryTypeBits host 0x%x buffer 0x%x; host memory: state 0x%lx protect 0x%lx type 0x%lx "
+			            "allocation 0x%llx (protect 0x%lx) region 0x%llx: the old path\n",
+			            stage, static_cast<int>(result), static_cast<unsigned long long>(vaddr),
+			            static_cast<unsigned long long>(size), static_cast<const void*>(source),
+			            static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes),
+			            static_cast<unsigned long long>(st.alignment), host_bits, buffer_bits, state, protect, type,
+			            static_cast<unsigned long long>(allocation), allocation_protect, static_cast<unsigned long long>(region));
+			std::fflush(stdout);
+		}
+		return std::pair<Buffer*, uint64_t> {nullptr, 0};
+	};
+
+	VkMemoryHostPointerPropertiesEXT host_props {};
+	host_props.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+	if (const auto result = vk.vkGetMemoryHostPointerPropertiesEXT(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+	                                                               reinterpret_cast<const void*>(base), &host_props);
+	    result != VK_SUCCESS || host_props.memoryTypeBits == 0)
+		return fail("vkGetMemoryHostPointerPropertiesEXT", result, VK_NULL_HANDLE, VK_NULL_HANDLE);
+	host_bits = host_props.memoryTypeBits;
+	VkExternalMemoryBufferCreateInfo external {};
+	external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+	external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.pNext       = &external;
+	buffer_info.size        = bytes;
+	buffer_info.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) { // (as Buffer::Buffer)
+		buffer_info.sharingMode           = VK_SHARING_MODE_CONCURRENT;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
+	VkBuffer buffer = VK_NULL_HANDLE;
+	if (const auto result = vk.vkCreateBuffer(device, &buffer_info, nullptr, &buffer); result != VK_SUCCESS)
+		return fail("vkCreateBuffer", result, VK_NULL_HANDLE, VK_NULL_HANDLE);
+	VkMemoryRequirements requirements {};
+	vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+	buffer_bits          = requirements.memoryTypeBits;
+	const uint32_t types = requirements.memoryTypeBits & host_props.memoryTypeBits;
+	VkPhysicalDeviceMemoryProperties memory_props {};
+	vk.vkGetPhysicalDeviceMemoryProperties(static_cast<VkPhysicalDevice>(graphics.physical_device), &memory_props);
+	uint32_t type = UINT32_MAX;
+	for (uint32_t i = 0; i < memory_props.memoryTypeCount && type == UINT32_MAX; ++i)
+		if ((types & (1u << i)) != 0 && (memory_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+			type = i;
+	if (type == UINT32_MAX || requirements.size > bytes) return fail("memory type", VK_SUCCESS, buffer, VK_NULL_HANDLE);
+	VkImportMemoryHostPointerInfoEXT import_info {};
+	import_info.sType        = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+	import_info.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+	import_info.pHostPointer = reinterpret_cast<void*>(base);
+	VkMemoryAllocateInfo allocate {};
+	allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	allocate.pNext           = &import_info;
+	allocate.allocationSize  = bytes;
+	allocate.memoryTypeIndex = type;
+	VkDeviceMemory memory    = VK_NULL_HANDLE;
+	if (const auto result = vk.vkAllocateMemory(device, &allocate, nullptr, &memory); result != VK_SUCCESS)
+		return fail("vkAllocateMemory", result, buffer, VK_NULL_HANDLE);
+	if (const auto result = vk.vkBindBufferMemory(device, buffer, memory, 0); result != VK_SUCCESS)
+		return fail("vkBindBufferMemory", result, buffer, memory);
+	// cpu_address: the guest address the buffer's byte 0 stands for (Offset(vaddr) = the image's bytes).
+	const uint64_t guest_base = vaddr - (address - base);
+	auto&          import     = st.live.emplace_back();
+	import.buffer     = std::make_unique<Buffer>(graphics, scheduler, guest_base, vk::Buffer(buffer), vk::DeviceMemory(memory),
+                                             bytes);
+	import.guest      = vaddr;
+	import.guest_size = size;
+	import.tick       = scheduler.CurrentTick();
+	Tiron7::g_imports.fetch_add(1, std::memory_order_relaxed);
+	Tiron7::g_import_bytes.fetch_add(size, std::memory_order_relaxed);
+	Tiron7::g_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	Tiron7::g_import_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                                        std::chrono::steady_clock::now() - start)
+	                                                        .count()),
+	                              std::memory_order_relaxed);
+	return {import.buffer.get(), address - base};
+}
+} // namespace
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size, bool* refillable) {
 	PolicyBeforeUse(vaddr, size, false); // (policy1)
 	using Clock = std::chrono::steady_clock;
@@ -3298,6 +3666,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		path = "gpu";
 		ApplyImageProtects();
 		return ObtainBuffer(vaddr, size, false, false);
+	}
+	// (tiron7, KYTY_TIRON7=1) A large upload: the GPU reads the guest's bytes where they are (local/tiron7.h); neither
+	// copied by the upload worker nor waited for at the submission. Not importable: the paths below.
+	if (Tiron7::ImportOn() && size >= Tiron7::MinBytes() && !AsyncUpload::t_worker && !CommandScheduler::InDeferredOperation() &&
+	    CommandScheduler::ThreadRecorder() == nullptr) {
+		if (const auto* source = Libs::LibKernel::Memory::TryGetBackingPointer(vaddr, size); source != nullptr) {
+			ApplyImageProtects();
+			if (const auto imported = Tiron7Import(m_graphics, m_scheduler, vaddr, size, source); imported.first != nullptr) {
+				path = "tiron7";
+				if (refillable != nullptr) *refillable = false;
+				return imported;
+			}
+		}
 	}
 	// More than the whole staging ring holds (a texture over a streamed pool expanded to 1.35 GB while
 	// playing in Boletaria, and the upload exited): a buffer over the range, which SynchronizeBuffer
@@ -3597,6 +3978,18 @@ bool BufferCache::PrepareAliasesForCpuWrite(uint64_t vaddr, uint64_t size) {
 static constexpr uint64_t ParallelCompareBytes = uint64_t {2} << 20u;
 static constexpr uint64_t ParallelComparePages = 64; // (a chunk: 256 KiB)
 
+// An in-order copy's bytes that change: the upload jobs pending over them (work recorded before the copy, whose bytes the
+// upload worker has not taken yet) are done first, so that work reads the bytes from before the copy, as it does on the
+// PS5; as a label's write waits for them (WriteGuestMemory). Only the runs written: a page the copy leaves as it was is
+// the same for those jobs either way. (Found by CarpetHead reading mode 4's commit against the in-order path, PR #349's
+// "known, not fixed": at 1-1 such jobs were pending, ~70 us a frame of waits when drained over the whole destination.)
+// Live switch copy_drain_range (KYTY_COPY_DRAIN_RANGE=0: not waited for). (A function of its own: CopyGuestMemory keeps
+// its shape, and with it its PGO profile.)
+static void DrainCopyDestination(uint64_t vaddr, uint64_t size) {
+	static auto& drain = LiveSwitch::Find("copy_drain_range", 1);
+	if (drain.load(std::memory_order_relaxed) != 0) AsyncUpload::DrainRange(vaddr, size);
+}
+
 void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size) {
 	// The game's linear copies mostly rewrite what the destination already holds (95% of the bytes in the fixed
 	// scene): only the destination pages whose bytes differ are written, so the others stay clean (no upload of their
@@ -3608,6 +4001,7 @@ void BufferCache::CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64
 		if (run_end == run) return;
 		const auto  address = dst_vaddr + run, bytes = run_end - run;
 		const auto* from    = reinterpret_cast<const void*>(src_vaddr + run);
+		DrainCopyDestination(address, bytes); // (up1118, upstream 7f7ec8a: in-order copies)
 		if (!m_memory_tracker.IsRegionFullyCpuModified(address, bytes)) {
 			// (As the write faults would: the images over the pages first.)
 			m_texture_cache.InvalidateMemory(address, bytes);
@@ -4162,6 +4556,76 @@ void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
 	const auto registered = RegionRegistrationEpoch(request.address);
 	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered) {
 		LiveCounters::Add(LiveCounters::RegionSkips);
+		return;
+	}
+	// (trad2, KYTY_TRAD2) A request with no CPU-dirty page (and no no-watch page the policy could give back) is not
+	// walked: SynchronizeBuffersInRange would find every piece clean (SynchronizeBuffer's first check, over a part of the
+	// request) and upload nothing. local/trad2.h.
+	if (const uint32_t trad2 = Trad2::Mode(); trad2 != 0) {
+		Trad2::g.why[request.cpu_epoch == 0 ? Trad2::Unproven
+		             : epoch == 0           ? Trad2::EpochZero
+		             : request.registration_epoch != registered ? Trad2::Registration
+		                                                        : Trad2::EpochMoved] += 1;
+		const bool     sample_fast = Trad2::SampleFast();
+		const uint64_t fast_start  = sample_fast ? __rdtsc() : 0;
+		const bool     dirty       = m_memory_tracker.IsRegionCpuModified(request.address, request.size);
+		const bool     nowatch     = !dirty && ::Loader::DemonsSoulsWriteAudit::SplitOn() &&
+		                     m_memory_tracker.AnyNoWatch(request.address, request.size);
+		if (dirty || nowatch) {
+			Trad2::g.result[dirty ? Trad2::Dirty : Trad2::NoWatch] += 1;
+			const bool     sample = dirty && Trad2::SampleDirty();
+			const uint64_t start  = sample ? __rdtsc() : 0;
+			{
+				LiveCounters::Add(LiveCounters::RegionSyncs);
+				LiveCounters::ScopedUs timed(LiveCounters::RegionSyncUs);
+				SynchronizeBuffersInRange(request.address, request.size);
+			}
+			if (sample) {
+				Trad2::g.dirty_cycles += __rdtsc() - start;
+				++Trad2::g.dirty_samples;
+			}
+		} else {
+			Trad2::g.result[Trad2::Shortcut] += 1;
+			// (The proof as the old path's below: the epochs read before the check, unchanged after it.)
+			const bool proven = epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&
+			                    m_memory_tracker.CpuModificationEpoch(request.address, request.size) == epoch;
+			if (sample_fast) {
+				Trad2::g.fast_cycles += __rdtsc() - fast_start;
+				++Trad2::g.fast_samples;
+			}
+			if (!Trad2::ShortcutRunsOld()) {
+				request.cpu_epoch = 0;
+				if (proven) {
+					++Trad2::g.proven;
+					request.cpu_epoch          = epoch;
+					request.registration_epoch = registered;
+				}
+				Trad2::MaybeReport(LiveControl::g_flips.load(std::memory_order_relaxed));
+				return;
+			}
+			// The old path over it (mode 2: always; mode 1: 1 in 32), timed and checked: it must upload nothing.
+			++Trad2::g.checked;
+			const bool     sample = Trad2::SampleCleanTiming();
+			const uint64_t runs   = Trad2::g_upload_runs;
+			const uint64_t start  = sample ? __rdtsc() : 0;
+			{
+				LiveCounters::Add(LiveCounters::RegionSyncs);
+				LiveCounters::ScopedUs timed(LiveCounters::RegionSyncUs);
+				SynchronizeBuffersInRange(request.address, request.size);
+			}
+			if (sample) {
+				Trad2::g.clean_cycles += __rdtsc() - start;
+				++Trad2::g.clean_samples;
+			}
+			if (Trad2::g_upload_runs != runs) Trad2::NoteDifference(request.address, request.size, Trad2::g_upload_runs - runs);
+		}
+		request.cpu_epoch = 0;
+		if (epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&
+		    m_memory_tracker.CpuModificationEpoch(request.address, request.size) == epoch) {
+			request.cpu_epoch = epoch;
+			request.registration_epoch = registered;
+		}
+		Trad2::MaybeReport(LiveControl::g_flips.load(std::memory_order_relaxed));
 		return;
 	}
 	LiveCounters::Add(LiveCounters::RegionSyncs);

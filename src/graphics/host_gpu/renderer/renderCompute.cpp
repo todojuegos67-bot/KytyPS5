@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
 #include "local/envio1.h"
 #include "local/rt-local-lights.h"
 #include "local/hwrt-scene.h"
@@ -45,6 +46,8 @@
 #include "speculation-state.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "p7-compat.h" // (p7, KYTY_P7: C1)
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
 
 #include <algorithm>
 #include <cinttypes>
@@ -61,10 +64,13 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include "local/tiron4-counters.h" // (tiron5)
 #include <unordered_map>
 #include <vector>
 
 extern volatile std::atomic<uint32_t> kyty_local_fill_clear_mode; // (textureCache.cpp)
+
+#include "local/onda-dump-gpu.inc" // (onda4: KYTY_ONDA_DUMP, F12 image sequence)
 
 namespace Libs::Graphics {
 
@@ -334,13 +340,34 @@ private:
 	[[gnu::noinline]] void Begin(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings,
 	                             BufferCache& cache) {
 		m_traced = Programs() != "rtls" && (Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
-		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos));
+		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos) ||
+		                                    CensusNow());
 		m_on = m_traced || RtLocal::Wanted();
 		if (!m_on) return;
 		m_shader_hash = shader_hash;
 		if (!m_traced) return;
 		for (const auto& source: bindings.buffer_sources)
 			m_dirty_before.push_back(source.size != 0 && cache.IsRegionCpuModified(source.address, source.size));
+	}
+	// (rtq2) KYTY_PROG_TRACE=* : a census of every compute program of the frame, once, KYTY_PROG_TRACE_AFTER_S (default
+	// 90) seconds after the first dispatch (in play, not in the menus), for KYTY_PROG_TRACE_FRAMES_S (default 2) seconds:
+	// per program at most 4 lines (its bindings, images with address/format/size, written). Used to find the game's
+	// SSR / IBL / fog chain by the addresses one writes and the next reads (kRTT_SSR -> CS 9fb5cc274b5e4f82).
+	static bool CensusNow() {
+		static const bool star = Programs().find('*') != std::string::npos;
+		if (!star) return false;
+		using Clock = std::chrono::steady_clock;
+		static const Clock::time_point first = Clock::now();
+		static const double after = [] {
+			const char* v = std::getenv("KYTY_PROG_TRACE_AFTER_S");
+			return v != nullptr && *v != 0 ? std::atof(v) : 90.0;
+		}();
+		static const double span = [] {
+			const char* v = std::getenv("KYTY_PROG_TRACE_FRAMES_S");
+			return v != nullptr && *v != 0 ? std::atof(v) : 2.0;
+		}();
+		const double t = std::chrono::duration<double>(Clock::now() - first).count();
+		return t >= after && t < after + span;
 	}
 	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
 	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
@@ -366,7 +393,8 @@ private:
 		static uint32_t                               lines = 0;
 		{
 			std::lock_guard lock(lines_mutex);
-			if (lines >= 20000 || per_program[m_shader_hash]++ >= 50) return;
+			static const bool star = Programs().find('*') != std::string::npos;
+			if (lines >= 20000 || per_program[m_shader_hash]++ >= (star ? 4u : 50u)) return;
 			++lines;
 		}
 		const auto& program = *bindings.runtime->program;
@@ -747,6 +775,7 @@ AsyncComputeDispatches& AsyncComputeState() {
 		};
 		const char* value   = std::getenv("KYTY_ASYNC_COMPUTE_PIPELINES");
 		made.on             = value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		if (Tiron4::PipeOn()) made.on = true; // (tiron5: KYTY_TIRON5_PIPE=1)
 		made.sync_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_SYNC_MS", 2.0, 0.0, 1000.0) * 1000.0);
 		made.wait_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_WAIT_MS", 2.0, 0.0, 1000.0) * 1000.0);
 		made.hold_ms        = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_HOLD_MS", 250.0, 0.0, 60000.0));
@@ -884,6 +913,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	LiveCounters::g_last_dispatch_shader = sh_ctx.GetCs().cs_regs.data_addr;
 	SyncStats::g_shader = sh_ctx.GetCs().cs_regs.data_addr;
+	const Juego3::DispatchScope juego3_cs(sh_ctx.GetCs().cs_regs.data_addr); // (juego3: the writes below are this shader's)
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -918,7 +948,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// indirect dispatch of threads: the normal path reads its counts).
 	const bool thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_dispatch_declined          = nullptr;
-	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && (!thread_dimensions || indirect_args == 0) &&
+	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && !OndaDump::Recording() && // (onda4)
+	    (!thread_dimensions || indirect_args == 0) &&
 	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
 		LiveCensus::Scope census_table(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10);
 		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) return;
@@ -1350,6 +1381,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	// KYTY_TAA_DIAG=1: the TAA dispatch's images (slot, guest address, format, size, storage), the first frames and
 	// every 600th (the plan to put DLSS in its place: which image its output is, and what reads it after).
+	// (onda3) The TAA's weights (CB from user data s0:s1 -> qword [8]; dwords 7..11 = s20..s23 and the deflicker term,
+	// dword 24 = history valid, dword 25 = the CPU's ramp at offset 100), printed whenever they change: to see the static
+	// weight against the motion one in the same run as the "onda".
+	if (FrameGen::IsTaaShader(program.shader_hash) && std::getenv("KYTY_ONDA_JUEGO") != nullptr) {
+		const auto& cs  = sh_ctx.GetCs();
+		const uint64_t ud = static_cast<uint64_t>(cs.cs_user_sgpr.value[0]) | (static_cast<uint64_t>(cs.cs_user_sgpr.value[1]) << 32u);
+		if (ud != 0) {
+			const uint64_t cb = reinterpret_cast<const uint64_t*>(ud)[1];
+			if (cb != 0) {
+				const auto* w = reinterpret_cast<const float*>(cb);
+				static float last[7] {};
+				const float  now[7] {w[7], w[8], w[9], w[10], w[11], w[24], w[25]};
+				if (std::memcmp(now, last, sizeof(now)) != 0) {
+					std::memcpy(last, now, sizeof(now));
+					uint32_t valid = 0;
+					std::memcpy(&valid, &now[5], 4);
+					std::printf("[onda3] TAA %016llx pesos: estatico(s20) %.4f movimiento(s21) %.4f factor(s22) %.4f "
+					            "deflicker(s23) %.4f off44 %.4f historia %u rampa(off100) %.4f\n",
+					            static_cast<unsigned long long>(program.shader_hash), now[0], now[1], now[2], now[3],
+					            now[4], valid, now[6]);
+					std::fflush(stdout);
+				}
+			}
+		}
+	}
 	if (FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaDiagFrame()) {
 		auto& cache = m_context.GetTextureCache();
 		std::printf("[taa] dispatch %ux%ux%u groups, %zu images:", thread_group_x, thread_group_y, thread_group_z,
@@ -1421,6 +1477,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const bool        chain            = DemonsSouls::ComputeChains(program.shader_hash);
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
+	// (onda4, KYTY_ONDA_DUMP: during an F12 session, a listed shader's bound images copied before it runs)
+	uint64_t   onda_written = 0;
+	const bool onda = OndaDump::Wanted() && Role() == 0 && Spec::Current() == nullptr &&
+	                  OndaDump::BeginDispatch(m_context.GetCommandScheduler(), m_context.FrameNumber());
+	if (onda && !bindings.images.empty()) {
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) onda_written |= uint64_t {1} << i;
+		OndaDump::BeforeDispatch(m_context.GetGraphics(), m_context.GetCommandScheduler(), m_context.GetTextureCache(), vk_buffer,
+		                         m_context.FrameNumber(), program.shader_hash, std::span<const TextureBinding> {bindings.images},
+		                         onda_written);
+	}
 	// (KYTY_SSR: before a G-buffer consumer, the packed layers copied; before the commit, the bindings intact.)
 	if (FrameGen::SsrWanted() && !bindings.images.empty())
 		FrameGen::SsrCaptureGbuffer(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
@@ -1445,6 +1512,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// (p7b, C1 precise: local/p7-compat.h) A chained dispatch's hazards against its chain's earlier dispatches, from
+	// the guest ranges of its V#s (what CommitBindings bound); one barrier only where there is one. Counted in any mode
+	// but KYTY_P7=0, recorded with KYTY_P7_C1=1.
+	if (chain && P7::Tracking()) {
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count = 0;
+		for (size_t i = 0; i < bindings.buffer_sources.size() && i < program.info.buffers.size(); ++i) {
+			const auto& source   = bindings.buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (source.size == 0 || source.address == 0) continue;
+			if (count == accesses.size()) {
+				// (More buffers than room: everything this one touches unknown - counted as reads of anything.)
+				count = SIZE_MAX;
+				break;
+			}
+			accesses[count++] = {.begin  = source.address,
+			                     .end    = source.address + source.size,
+			                     .read   = resource.read,
+			                     .write  = resource.written,
+			                     .atomic = resource.atomic};
+		}
+		const bool unknown = count == SIZE_MAX || program.info.uses_dma;
+		const auto hazard  = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(),
+		                                   count == SIZE_MAX ? accesses.size() : count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -1463,7 +1565,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always) {
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
@@ -1495,6 +1600,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// (onda4) what it wrote, for a listed shader or a listed address
+	if (onda && !bindings.images.empty())
+		OndaDump::AfterDispatch(m_context.GetGraphics(), m_context.GetCommandScheduler(), m_context.GetTextureCache(), vk_buffer,
+		                        m_context.FrameNumber(), program.shader_hash, std::span<const TextureBinding> {bindings.images},
+		                        onda_written);
 	// (KYTY_GBUF_VIEW / KYTY_GBUF_TAP, refl7 diagnostic: a G-buffer reader's outputs logged, the tapped image copied;
 	// refl8: KYTY_RT_REFLECTIONS' guide, the game's own SSR result copied from the deferred lighting's inputs)
 	if ((FrameGen::GbufViewWanted() || FrameGen::RtReflGuideWanted()) && !bindings.images.empty()) {
@@ -1505,6 +1615,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                               std::span<const TextureBinding> {bindings.images}, written);
 		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                                   std::span<const TextureBinding> {bindings.images}, written);
+	}
+	// (pt1, BB_PATHTRACING: the images of the dispatches inside the scopes it reads: ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && PathTrace::WantDispatchHook()) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::AfterDispatch(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
+	}
+	// (pt1c, BB_PATHTRACING: the colour the game's TAA reads = the lit HDR image)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && FrameGen::IsTaaShader(program.shader_hash)) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::NoteTaaInput(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
 	}
 	// (KYTY_RT_SUN: the first dispatch of a flip sampling the sun cascades' array copies their layers)
 	if (FrameGen::RtSunWanted() && !bindings.images.empty())

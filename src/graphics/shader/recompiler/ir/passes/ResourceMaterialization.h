@@ -42,6 +42,13 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Keeps only the plan's memory infos its values read: a plan is evaluated with the entries of its runtime reads alone
+// (ReadConstBuffer and the address reads: SrtWalker's raw reads, LinearSrt, EquivalentValue), where the program's vector
+// holds one for each of its memory instructions (~16 KB a plan). Those values' indices are moved to the kept entries;
+// nothing in a plan reads the others. ExtractResourcePlan and ResourcePlanSerial::Load call it (plans of earlier builds
+// too).
+void CompactPlanMemoryInfo(ResourcePlan& plan);
+
 // Resolves and specializes the immutable resource plan in one transaction. On failure both
 // destinations are unchanged.
 struct MaterializeReport {

@@ -16,6 +16,7 @@
 #include "SDL_video.h"
 #include "SDL_vulkan.h"
 #include "common/assert.h"
+#include "ram-native-tex.h" // (ram1b: KYTY_RAM_NATIVE_TEX)
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -26,6 +27,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h" // (up1118: StaticStoreFeatures)
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -47,6 +49,7 @@
 #include "local/fsr3-fg.h"
 #include "local/anti-lag.h"
 #include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/p7-compat.h" // (p7, KYTY_P7)
 #include "local/hwrt-scene.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
@@ -66,6 +69,7 @@
 #include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
+#include "local/tiron7.h" // (tiron7)
 
 // IWYU pragma: no_include <intrin.h>
 
@@ -142,6 +146,81 @@ static void AddCopyMemoryIndirectExtension(const std::vector<vk::ExtensionProper
 	if ((setting == nullptr || std::string_view(setting) != "0") &&
 	    HasExtension(available, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME))
 		extensions.push_back(VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+}
+
+// (tiron7, KYTY_TIRON7=1) VK_EXT_external_memory_host: large texture uploads read guest memory on the GPU (local/tiron7.h).
+static void AddTiron7Extension(const std::vector<vk::ExtensionProperties>& available, std::vector<const char*>& extensions) {
+	const char* unified = std::getenv("KYTY_UNIFICADA"); // (unificada: its start-up import probe, BufferCache)
+	if (!Tiron7::ImportOn() && !(unified != nullptr && unified[0] == '1')) return; // (v3: KYTY_TIRON7_IMPORT=1)
+	const bool has = HasExtension(available, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+	if (has && !HasExtension(extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+		extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+	Tiron7::g_extension.store(has, std::memory_order_relaxed);
+	std::printf("[tiron7] KYTY_TIRON7=1: VK_EXT_external_memory_host %s (texturas grandes leidas por la GPU desde la memoria del "
+	            "juego, sin copia ni espera en el hilo de render)\n", has ? "activada" : "NO disponible: como antes");
+	std::fflush(stdout);
+}
+
+// (up1118, upstream 8fd86d4) VK_EXT_fragment_shader_interlock where the GPU has its pixel-ordered interlock and reads
+// storage images without a format (both enabled by VulkanCreateDevice): the deferred decals' read and write of the
+// G-buffer ordered per pixel (TranslatorFeaturePixelInterlock, upstream issues #315 and #341). Not AMD's Windows driver,
+// which has no interlock. The emulator (`emulator`) only where its static pipeline store's translation may use it: none,
+// or one a precompile made with it; a store made before keeps the old translation. KYTY_PIXEL_INTERLOCK=1 enables it
+// whatever the store; =0 neither the extension nor the translation. Returns whether.
+static bool PixelInterlockExtension(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
+                                    std::vector<const char*>& extensions, GraphicContext& graphics, bool emulator) {
+	graphics.fragment_shader_pixel_interlock = false;
+	const char* value  = std::getenv("KYTY_PIXEL_INTERLOCK");
+	const bool  forced = value != nullptr && std::string_view(value) == "1";
+	const auto  off    = [](const char* why) {
+		std::printf("Vulkan pixel interlock: off (%s)\n", why);
+		return false;
+	};
+	if (value != nullptr && std::string_view(value) == "0") return off("KYTY_PIXEL_INTERLOCK=0");
+	if (!HasExtension(available, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME))
+		return off("the driver has no VK_EXT_fragment_shader_interlock");
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock {};
+	vk::PhysicalDeviceFeatures2                          features {};
+	features.pNext = &interlock;
+	physical_device.getFeatures2(&features);
+	if (interlock.fragmentShaderPixelInterlock != VK_TRUE || features.features.shaderStorageImageReadWithoutFormat != VK_TRUE)
+		return off("the GPU lacks the pixel interlock or storage image reads without a format");
+	// (up1120, upstream c9beef1, issue #355) Not on AMD's Windows driver unless KYTY_PIXEL_INTERLOCK=1 (characters' faces
+	// as the missing-texture checker on an RX 9070). NVIDIA, Intel and RADV unchanged.
+	if (!forced) {
+		vk::PhysicalDeviceDriverProperties driver {};
+		vk::PhysicalDeviceProperties2      properties {};
+		properties.pNext = &driver;
+		physical_device.getProperties2(&properties);
+		if (driver.driverID == vk::DriverId::eAmdProprietary)
+			return off("AMD's Windows driver: characters' faces come out wrong with it, issue #355; KYTY_PIXEL_INTERLOCK=1 "
+			           "enables it");
+	}
+	namespace Translate = ShaderRecompiler::Frontend;
+	if (emulator && !forced && (PipelineCache::StaticStoreFeatures() & Translate::TranslatorFeaturePixelInterlock) == 0)
+		return off("the static pipeline store was made without it: the next precompile brings it, or KYTY_PIXEL_INTERLOCK=1");
+	if (!HasExtension(extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME))
+		extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+	graphics.fragment_shader_pixel_interlock = true;
+	std::printf("Vulkan pixel interlock: on (the deferred decals ordered per pixel)\n");
+	return true;
+}
+
+// The translation features without the pixel interlock where its extension is not enabled (PixelInterlockExtension).
+static uint32_t PixelInterlockFeatureMask(const GraphicContext& graphics) {
+	return graphics.fragment_shader_pixel_interlock ? ~0u : ~ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock;
+}
+
+// The device's pixel interlock and storage image reads without a format, where PixelInterlockExtension enabled the
+// extension (both supported there).
+static void ChainPixelInterlock(const GraphicContext& graphics, vk::DeviceCreateInfo& create_info,
+                                vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT& interlock,
+                                vk::PhysicalDeviceFeatures& device_features) {
+	if (!graphics.fragment_shader_pixel_interlock) return;
+	interlock.fragmentShaderPixelInterlock              = VK_TRUE;
+	interlock.pNext                                     = const_cast<void*>(create_info.pNext);
+	create_info.pNext                                   = &interlock;
+	device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
 }
 
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
@@ -563,9 +642,14 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
                                           GraphicContext&    graphics) {
 	EXIT_IF(physical_device == nullptr);
 
+	// (p7: the driver's name and version for the "[p7] GPU" line.)
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	properties12.sType = vk::StructureType::ePhysicalDeviceVulkan12Properties;
+	properties12.pNext = nullptr;
+
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 	subgroup_size_control.sType = vk::StructureType::ePhysicalDeviceSubgroupSizeControlProperties;
-	subgroup_size_control.pNext = nullptr;
+	subgroup_size_control.pNext = &properties12;
 
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
 	properties11.sType = vk::StructureType::ePhysicalDeviceVulkan11Properties;
@@ -635,8 +719,10 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	// Float min/max as host instructions only on AMD GPUs (Translate::TranslatorFeatureNativeFloatMinMax).
 	namespace Translate = ShaderRecompiler::Frontend;
 	const bool     amd      = device_properties.vendorID == 0x1002u;
-	const uint32_t features = amd ? Translate::TranslatorFeatures
-	                              : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax;
+	// (up1118) The pixel interlock only where its extension is enabled (PixelInterlockExtension).
+	const uint32_t features = (amd ? Translate::TranslatorFeatures
+	                               : Translate::TranslatorFeatures & ~Translate::TranslatorFeatureNativeFloatMinMax) &
+	                          PixelInterlockFeatureMask(graphics);
 	if (device_properties.vendorID != 0x10deu) {
 		Translate::SetTranslatorDeviceFeatures(features & ~Translate::TranslatorFeatureCooperativeHalves,
 		                                       amd ? Translate::TranslatorFeatureTableSlotsAtUse : 0u);
@@ -646,6 +732,29 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 		Translate::SetTranslatorDeviceFeatures(features);
 	}
 	std::fflush(stdout);
+
+	// (p7, local/p7-compat.h) The vendor, driver and subgroup properties in the log, and the decision per cause (C3/C4:
+	// the subgroup sizes pipelines require; the device enables subgroupSizeControl / computeFullSubgroups for them).
+	{
+		P7::SubgroupCaps caps;
+		caps.vendor_id            = device_properties.vendorID;
+		caps.device_id            = device_properties.deviceID;
+		caps.api_version          = device_properties.apiVersion;
+		caps.driver_version       = device_properties.driverVersion;
+		caps.default_size         = properties11.subgroupSize;
+		caps.size_low             = subgroup_size_control.minSubgroupSize;
+		caps.size_high            = subgroup_size_control.maxSubgroupSize;
+		caps.supported_stages     = static_cast<uint32_t>(static_cast<vk::ShaderStageFlags::MaskType>(properties11.subgroupSupportedStages));
+		caps.supported_operations = static_cast<uint32_t>(static_cast<vk::SubgroupFeatureFlags::MaskType>(properties11.subgroupSupportedOperations));
+		caps.required_stages      = static_cast<uint32_t>(static_cast<vk::ShaderStageFlags::MaskType>(subgroup_size_control.requiredSubgroupSizeStages));
+		caps.size_control         = features13.subgroupSizeControl == VK_TRUE;
+		caps.full_subgroups       = features13.computeFullSubgroups == VK_TRUE;
+		caps.quad_all_stages      = properties11.subgroupQuadOperationsInAllStages == VK_TRUE;
+		std::snprintf(caps.name, sizeof(caps.name), "%s", device_properties.deviceName.data());
+		std::snprintf(caps.driver_name, sizeof(caps.driver_name), "%s", properties12.driverName.data());
+		std::snprintf(caps.driver_info, sizeof(caps.driver_info), "%s", properties12.driverInfo.data());
+		P7::Decide(caps);
+	}
 
 	graphics.fragment_wave64_requirable =
 	    features13.subgroupSizeControl == VK_TRUE &&
@@ -950,6 +1059,26 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			device_features.sparseBinding         = VK_TRUE;
 			device_features.sparseResidencyBuffer = VK_TRUE;
 		}
+		// (ram1b) KYTY_RAM_NATIVE_TEX=1|2 (ram-native-tex.h): sparse residency 2D images for the game's texture arrays
+		// (renderer/image/sparseImage.cpp). Off: nothing enabled, as before.
+		if (RamNativeTex::On()) {
+			graphics.sparse_residency_images =
+			    supported_features2.features.sparseBinding == VK_TRUE &&
+			    supported_features2.features.sparseResidencyImage2D == VK_TRUE && queue_family < family_count &&
+			    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+			if (graphics.sparse_residency_images) {
+				device_features.sparseBinding          = VK_TRUE;
+				device_features.sparseResidencyImage2D = VK_TRUE;
+			}
+			std::printf("[rnt] dispositivo: imagenes dispersas 2D %s (sparseBinding %d, sparseResidencyImage2D %d, cola grafica con "
+			            "sparse %d, lectura de capas sin ligar a cero %d)\n",
+			            graphics.sparse_residency_images ? "SI" : "NO (arrays densos como siempre)",
+			            supported_features2.features.sparseBinding == VK_TRUE ? 1 : 0,
+			            supported_features2.features.sparseResidencyImage2D == VK_TRUE ? 1 : 0,
+			            queue_family < family_count && static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding) ? 1 : 0,
+			            properties.sparseProperties.residencyNonResidentStrict == VK_TRUE ? 1 : 0);
+			std::fflush(stdout);
+		}
 	}
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
@@ -984,8 +1113,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	ShaderRecompiler::SetDeviceStorageBufferBounds(device_buffer_bounds);
 	LOGF("Vulkan storage buffer bounds: %s\n", device_buffer_bounds ? "device" : "shader");
 
+	// (p7) Also where a pipeline requires a size only for KYTY_P7's C3/C4 (Intel: 64 lanes are not possible there).
 	const bool subgroup_size_control_enabled =
-	    graphics.compute_subgroup_size_control_enabled &&
+	    (graphics.compute_subgroup_size_control_enabled || P7::S().needs_size_control) &&
 	    supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
@@ -999,6 +1129,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	if (P7::S().needs_size_control && !subgroup_size_control_enabled) {
+		std::printf("[p7] AVISO: subgroupSizeControl no se pudo activar: C3/C4 no exigen tamano\n");
+		std::fflush(stdout);
+	}
 	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
 	graphics.pipeline_cache_control_enabled = features13.pipelineCreationCacheControl == VK_TRUE;
 
@@ -1090,6 +1224,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	// where the device has them (local/fsr4-sr.h; nothing changed without it).
 	create_info.pNext = Libs::Graphics::Fsr4::ChainDeviceFeatures(physical_device, device_extensions, features12, features13,
 	                                                              device_features, const_cast<void*>(create_info.pNext));
+	// (up1118) The pixel interlock and storage reads without a format, where PixelInterlockExtension enabled it.
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT pixel_interlock {};
+	ChainPixelInterlock(graphics, create_info, pixel_interlock, device_features);
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1206,6 +1343,18 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 			}
 		}
 	}
+	// (p7) KYTY_VULKAN_SYNCVAL=1 without the layer (the Vulkan SDK) or its extensions: said in the log, not silent.
+	const auto syncval_missing = [&](const char* what) {
+		if (!Config::SyncValidationEnabled()) return;
+		std::printf("[p7-syncval] KYTY_VULKAN_SYNCVAL=1 pero %s: la validacion de sincronizacion NO esta activa (instala el "
+		            "Vulkan SDK de LunarG y vuelve a lanzar)\n",
+		            what);
+		std::fflush(stdout);
+	};
+	if (!r.enable_validation_layers && (Config::VulkanValidationEnabled() || Config::SyncValidationEnabled()))
+		syncval_missing(HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)
+		                    ? "falta la capa VK_LAYER_KHRONOS_validation"
+		                    : "falta VK_EXT_debug_utils");
 
 	if (r.enable_validation_layers) {
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
@@ -1222,8 +1371,14 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 
 		if (HasExtension(available_extensions, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
 			r.required_extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+			if (Config::SyncValidationEnabled()) {
+				std::printf("[p7-syncval] capa VK_LAYER_KHRONOS_validation encontrada: validacion de sincronizacion activa "
+				            "(lenta; resumen [p7-syncval] cada 30 s y al salir)\n");
+				std::fflush(stdout);
+			}
 		} else {
 			r.enable_validation_layers = false;
+			syncval_missing("la capa no tiene VK_EXT_validation_features");
 		}
 	}
 }
@@ -1285,6 +1440,7 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		std::string       kind = id + ':';
 		for (const char* at = callback_data->pMessage; *at != '\0' && kind.size() < id.size() + 240; ++at)
 			if (*at < '0' || *at > '9') kind += *at;
+		P7::SyncvalNote(callback_data->pMessageIdName, callback_data->pMessage); // (p7: every one counted, the summary)
 		std::lock_guard lock(logged_mutex);
 		if (const auto count = ++logged[kind]; count <= 5 && ++total <= 20000) {
 			std::printf("SYNCVAL %s #%u (kinds %zu): %s\n", id.c_str(), count, logged.size(), callback_data->pMessage);
@@ -1626,6 +1782,8 @@ void WindowContext::CreateVulkan() {
 		Libs::Graphics::FrameGen::DlssNrAddDeviceExtensions(available_extensions, device_extensions);
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		AddTiron7Extension(available_extensions, device_extensions); // (tiron7)
+		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, true); // (up1118)
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
 		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).
@@ -1822,6 +1980,8 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		AddTiron7Extension(available_extensions, device_extensions); // (tiron7)
+		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, false); // (up1118)
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
 		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
 		// KYTY_ANTILAG=1: AMD Anti-Lag 2 where the device has it (local/anti-lag.h).

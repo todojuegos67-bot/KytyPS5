@@ -12,6 +12,7 @@
 
 #include "common/logging/log.h"
 #include "local-platform.h"
+#include "tiron4-counters.h" // (tiron5)
 #include "slow-log.h"
 #include "local/local-pass-cache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -33,6 +34,7 @@
 #include "gpu_tiler_shaders/gtao_spv.h"
 #include "local/rt-ao.h"
 #include "gpu_tiler_shaders/ssr_spv.h"
+#include "local/rt-nuevo.h" // (rtq2 b: KYTY_RTN)
 #include "local/rt-reflections.h"
 #include "local/gbuf-view.h"
 #include "local/shine.h"
@@ -49,6 +51,7 @@
 #include "local/hw-lights.h"
 #include "local/rt-contact.h"
 #include "local/rt-water.h"
+#include "local/rtx1-convars.h" // (rtx1: the game's own fog / AO / SSR settings read and moved relative to its values)
 #include "gpu_tiler_shaders/cshadow_spv.h"
 #include "gpu_tiler_shaders/rtsun_spv.h"
 #include "gpu_tiler_shaders/rtsun_hw_spv.h"
@@ -6196,6 +6199,19 @@ struct SsrGbuffer {
 	std::array<float, 16>       old_view_proj {}, old_prev_view_proj {};
 	uint64_t                    old_vp_flip = ~0ull;
 	bool                        old_have_prev = false;
+	// (rt2) the TAA jitter (SRT words 57, 58, NDC) of the frame and of the frame before it, for both entries above
+	std::array<float, 2>        jitter {}, prev_jitter {}, old_jitter {}, old_prev_jitter {};
+	bool                        have_jitter = false, have_prev_jitter = false, old_have_jitter = false, old_have_prev_jitter = false;
+	// (rt2) the data on where the jitter is: the view-projection's off-centre (cx, cy) against the jitter word, frame to
+	// frame (votes: +J in the matrix, -J, not in it); the previous matrix (words 45..) against the last frame's
+	// view-projection as it was and with its jitter taken out
+	std::array<float, 2>        last_c {};
+	bool                        have_last_c = false;
+	uint32_t                    vote_vp[3] {}, vote_pv[3] {}; // vp: +J, -J, none; pv: as the last VP, its VP without J, neither
+	uint32_t                    rt2_frames = 0;
+	double                      rt2_jit_px = 0.0;
+	int                         vp_jit = -2; // decided: 1 (+J in the matrix), -1 (-J), 0 (not in it), -2 unknown
+	int                         pv_jit = -2; // 1 the previous matrix carries the last frame's jitter, 0 it does not, -2 unknown
 } g_ssr_gb;
 
 bool SsrEnsure(GraphicContext& graphics, vk::Extent2D render, int level) {
@@ -6766,9 +6782,92 @@ bool SsrWanted() {
 	       HwGiWanted() ||           // (KYTY_HWRT_AO / KYTY_HWRT_GI: its normal and albedo)
 	       RtAoLevel() > 0 ||        // (ao-1028: KYTY_AO: its normal, albedo and the lighting's depth)
 	       TorchLevel() > 0 ||       // (KYTY_TORCH: the firelight's normal, albedo and roughness)
-	       MotesLevel() > 0;         // (motes-1031: the G-buffer pass's view-projection, the motes' world anchor)
+	       MotesLevel() > 0 ||       // (motes-1031: the G-buffer pass's view-projection, the motes' world anchor)
+	       RtNuevoWanted();          // (rtq2 b, KYTY_RTN: the G-buffer copy and the guide hooks)
 }
 bool SsrPassWanted() { return SsrLevel() > 0; }
+
+// (rt2) KYTY_RT2=1: see rt-reflections.h. Off by default (exactly as before).
+bool Rt2Wanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT2");
+		const bool  v = (e != nullptr && e[0] == '1') || Rt3Wanted(); // (rt3 implies rt2)
+		if (v) {
+			std::printf("RT2: on (KYTY_RT2=1): rtrefl1's camera / G-buffer frame match and reprojection, the camera matrices "
+			            "made consistent in the TAA jitter (from the data, logged), the reflection history by the material, the "
+			            "sun's RT shadows on the game's cascade light axis with a surface-anchored sample pattern\n");
+			std::fflush(stdout);
+		}
+		return v;
+	}();
+	return on;
+}
+
+namespace {
+// (rt2) Where the TAA jitter is, from the game's own constants (g_ssr_gb.mutex held): the view-projection's off-centre
+// terms (clip x = sx x + cx w: cx = row 0 . row 3 / |row 3|^2 over the xyz) change frame to frame by the jitter word's
+// change (+J in the matrix), by minus it, or not at all (the vertex shader adds it); the previous matrix (rows x, y, w)
+// equals the last frame's view-projection as it was, or with its jitter taken out. Votes, decided by majority every 600
+// captures and logged ("RT2: camera:").
+void Rt2NoteCamera(std::span<const uint32_t> srt, const std::array<float, 16>& vp, const std::array<float, 2>& jit, bool consecutive) {
+	auto& g = g_ssr_gb;
+	const auto off = [](const std::array<float, 16>& m, int row) {
+		const double w2 = double(m[12]) * m[12] + double(m[13]) * m[13] + double(m[14]) * m[14];
+		return w2 > 1e-12 ? (double(m[row * 4]) * m[12] + double(m[row * 4 + 1]) * m[13] + double(m[row * 4 + 2]) * m[14]) / w2 : 0.0;
+	};
+	const std::array<float, 2> c {static_cast<float>(off(vp, 0)), static_cast<float>(off(vp, 1))};
+	if (consecutive && g.have_last_c && g.have_jitter) {
+		const double dcx = c[0] - g.last_c[0], dcy = c[1] - g.last_c[1];
+		const double djx = jit[0] - g.jitter[0], djy = jit[1] - g.jitter[1];
+		const double dj  = std::sqrt(djx * djx + djy * djy);
+		if (dj > 1e-6) {
+			const double ep = std::hypot(dcx - djx, dcy - djy), em = std::hypot(dcx + djx, dcy + djy), e0 = std::hypot(dcx, dcy);
+			if (ep < 0.2 * dj) ++g.vote_vp[0];
+			else if (em < 0.2 * dj) ++g.vote_vp[1];
+			else if (e0 < 0.2 * dj) ++g.vote_vp[2];
+		}
+		// The previous matrix's rows x, y (and w) against the last frame's view-projection, as it was and without its jitter.
+		if (g.have_vp && srt.size() >= SrtPrevViewProj + 12) {
+			double er = 0.0, eu = 0.0, sc = 0.0;
+			const int s = g.vp_jit == -1 ? -1 : 1;
+			for (int row: {0, 1, 3})
+				for (int j = 0; j < 4; ++j) {
+					// (this frame's previous matrix: SRT 45.. rows x, y, w)
+					const double pv   = AsFloat(srt[SrtPrevViewProj + (row == 3 ? 8 : row * 4) + j]);
+					const double last = g.view_proj[row * 4 + j];
+					const double unj = row == 3 ? last : last - s * double(g.jitter[row]) * g.view_proj[12 + j];
+					er = std::max(er, std::abs(pv - last)), eu = std::max(eu, std::abs(pv - unj));
+					sc = std::max(sc, std::abs(last));
+				}
+			// (the comparison is meaningful only when the jitter moves the rows by more than rounding)
+			double jm = 0.0;
+			for (int j = 0; j < 4; ++j) jm = std::max(jm, std::abs(double(g.jitter[0]) * g.view_proj[12 + j]));
+			if (jm > 1e-6 * sc) {
+				if (er < 0.25 * jm && er <= eu) ++g.vote_pv[0];
+				else if (eu < 0.25 * jm) ++g.vote_pv[1];
+				else ++g.vote_pv[2];
+			}
+		}
+	}
+	g.last_c = c, g.have_last_c = true;
+	g.rt2_jit_px += std::hypot(double(jit[0]), double(jit[1]));
+	if (++g.rt2_frames < 600) return;
+	const uint32_t nv = g.vote_vp[0] + g.vote_vp[1] + g.vote_vp[2], np = g.vote_pv[0] + g.vote_pv[1] + g.vote_pv[2];
+	if (nv >= 60) g.vp_jit = g.vote_vp[0] * 4 >= nv * 3 ? 1 : g.vote_vp[1] * 4 >= nv * 3 ? -1 : g.vote_vp[2] * 4 >= nv * 3 ? 0 : -2;
+	if (np >= 60 && g.vp_jit != -2) g.pv_jit = g.vote_pv[0] * 4 >= np * 3 ? (g.vp_jit != 0 ? 1 : 0) : g.vote_pv[1] * 4 >= np * 3 ? 0 : -2;
+	std::printf("RT2: camera (600 G-buffer frames): jitter in the view-projection (SRT 29): +J %u, -J %u, not in it %u of %u "
+	            "-> %s; previous matrix (SRT 45): = last VP %u, = last VP without its jitter %u, neither %u of %u -> %s; mean "
+	            "|jitter| %.5f NDC\n",
+	            g.vote_vp[0], g.vote_vp[1], g.vote_vp[2], nv,
+	            g.vp_jit == 1 ? "jittered (+J)" : g.vp_jit == -1 ? "jittered (-J)" : g.vp_jit == 0 ? "not jittered" : "undecided",
+	            g.vote_pv[0], g.vote_pv[1], g.vote_pv[2], np,
+	            g.pv_jit == 1 ? "jittered" : g.pv_jit == 0 ? "not jittered" : "undecided", g.rt2_jit_px / 600.0);
+	std::fflush(stdout);
+	g.rt2_frames = 0, g.rt2_jit_px = 0.0;
+	for (auto& v: g.vote_vp) v = 0;
+	for (auto& v: g.vote_pv) v = 0;
+}
+} // namespace
 
 void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 	if (!IsGbufferVertexShader(vs_hash) || srt.size() < SrtViewProj + 16) return;
@@ -6786,12 +6885,24 @@ void OnSsrDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 		vp[i] = AsFloat(srt[SrtViewProj + i]);
 		if (!std::isfinite(vp[i])) return;
 	}
+	// (rt2) this frame's jitter (SRT 57, 58) and the frame before's (only if that capture was the previous flip)
+	std::array<float, 2> jit {};
+	const bool have_jit = srt.size() >= SrtJitter + 2 && std::isfinite(AsFloat(srt[SrtJitter])) && std::isfinite(AsFloat(srt[SrtJitter + 1]));
+	if (have_jit) jit = {AsFloat(srt[SrtJitter]), AsFloat(srt[SrtJitter + 1])};
+	const bool consecutive = g_ssr_gb.have_vp && g_ssr_gb.vp_flip + 1 == flip;
+	if (have_jit && Rt2Wanted()) Rt2NoteCamera(srt, vp, jit, consecutive);
 	if (g_ssr_gb.have_vp) { // (rtrefl1) keep the last frame's camera
 		g_ssr_gb.old_view_proj      = g_ssr_gb.view_proj;
 		g_ssr_gb.old_prev_view_proj = g_ssr_gb.prev_view_proj;
 		g_ssr_gb.old_vp_flip        = g_ssr_gb.vp_flip;
 		g_ssr_gb.old_have_prev      = g_ssr_gb.have_prev;
+		g_ssr_gb.old_jitter = g_ssr_gb.jitter, g_ssr_gb.old_have_jitter = g_ssr_gb.have_jitter;
+		g_ssr_gb.old_prev_jitter = g_ssr_gb.prev_jitter, g_ssr_gb.old_have_prev_jitter = g_ssr_gb.have_prev_jitter;
 	}
+	g_ssr_gb.prev_jitter      = g_ssr_gb.jitter;
+	g_ssr_gb.have_prev_jitter = consecutive && g_ssr_gb.have_jitter;
+	g_ssr_gb.jitter           = jit;
+	g_ssr_gb.have_jitter      = have_jit;
 	g_ssr_gb.view_proj = vp;
 	g_ssr_gb.have_vp   = true;
 	g_ssr_gb.vp_flip   = flip;
@@ -6891,7 +7002,7 @@ bool SsrIsDepthFormat(vk::Format f) {
 // size) copied right after the G-buffer layers, in the same command buffer.
 void SsrCaptureDepth(TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash, std::span<const TextureBinding> images,
                      uint32_t width, uint32_t height, uint64_t flip) {
-	if (!RtReflectionsWanted() || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
+	if (!(RtReflectionsWanted() || RtNuevoWanted()) || g_ssr.depth_failed || g_graphics_ctx == nullptr) return;
 	static bool listed = false;
 	if (!listed) {
 		// (once: what the consumer binds, for the next look at its inputs)
@@ -7401,11 +7512,396 @@ vk::Extent2D BindingExtent(TextureCache& cache, const TextureBinding& b) {
 	const uint32_t level = b.desc.view_info.base_level;
 	return {std::max(1u, im.backing.extent.width >> level), std::max(1u, im.backing.extent.height >> level)};
 }
+
+// (rt4) KYTY_RT4: the image the same lighting dispatch WRITES, the game's specular IBL. Ghidra (eboot 1.07, FUN_00917c30,
+// the render targets' setup): in the "Lighting" / "SpecularIBL" group the engine creates kRTT_SpecularIBL_HalfResX at
+// (width / 2, height), kRTT_SpecularIBL_HalfResY, _HalfResXY, kRTT_SpecularIBL (full) and kRTT_SpecularIBLOcclusion; the
+// convar r_iblResolution=HalfResX (our KYTY_GAME_CONVARS_EXTRA) picks the half-width one, which is what CS
+// 9fb5cc274b5e4f82 writes (logged: "WRITES RGBA16F 1280x1440" at 2560x1440, 852x960 at 1704x960). IBLRendering.cpp owns
+// both the SSR (SSRClear / SSRCreateRays / SSRGetActiveTiles / SSRRaymarch, kRTT_SSR: the guide) and the IBL probes
+// (CCPLdrIBLLocalBox: box-projected local cubemaps, CCPLdrIBLDistant: the distant one, IBLOcclusion): this image is the
+// game's whole specular reflection, the SSR where it hit and the cubemaps elsewhere. Copied after every run of that CS
+// (the last one of a flip wins, as the guide).
+struct IblState {
+	bool                  parsed = false, failed = false, logged = false;
+	int                   slot = -1, used_slot = -1;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::Format            format = vk::Format::eUndefined;
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	std::atomic<const char*> status {"the lighting (guide CS) not seen yet"};
+	std::vector<SsrPass::RetiredCopy> retired;
+} g_ibl;
+
+void Rt4IblAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                         std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!g_ibl.parsed) {
+		g_ibl.parsed = true;
+		if (const char* v = std::getenv("KYTY_RT4_IBL_SLOT"); v != nullptr && *v != '\0') g_ibl.slot = std::atoi(v);
+	}
+	if (g_ibl.failed) return;
+	// The render size: the largest depth binding (the G-buffer's), as the guide's rule.
+	vk::Extent2D ref {};
+	for (size_t i = 0; i < images.size() && i < 64; ++i) {
+		if (!images[i].image_id) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		if (SsrIsDepthFormat(cache.GetImage(images[i].image_id).backing.format) && uint64_t {e.width} * e.height > uint64_t {ref.width} * ref.height)
+			ref = e;
+	}
+	const auto rgba_float_written = [&](size_t i) {
+		if (i >= images.size() || !images[i].image_id || ((written_mask >> i) & 1u) == 0) return false;
+		const vk::Format f = cache.GetImage(images[i].image_id).backing.format;
+		return f == vk::Format::eR16G16B16A16Sfloat || f == vk::Format::eR32G32B32A32Sfloat;
+	};
+	int slot = g_ibl.slot;
+	if (slot < 0) {
+		for (size_t i = 0; i < images.size() && i < 64; ++i) {
+			if (!rgba_float_written(i) || ref.width == 0) continue;
+			const vk::Extent2D e = BindingExtent(cache, images[i]);
+			// (half the width, the full height: kRTT_SpecularIBL_HalfResX; the full size too, should r_iblResolution be Full)
+			const bool half_x = e.width + 1 >= (ref.width + 1) / 2 && e.width <= (ref.width + 1) / 2 + 1 && e.height == ref.height;
+			const bool full   = e.width == ref.width && e.height == ref.height;
+			if (half_x || full) {
+				slot = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+	if (!g_ibl.logged) {
+		g_ibl.logged = true;
+		std::printf("[rt4] the game's specular IBL: CS %016llx slot %s (render %ux%u)%s\n", static_cast<unsigned long long>(cs_hash),
+		            slot >= 0 ? std::to_string(slot).c_str() : "none", ref.width, ref.height,
+		            slot >= 0 ? "" : ": no written RGBA float image at half the width (no fill)");
+		std::fflush(stdout);
+	}
+	if (slot < 0 || static_cast<size_t>(slot) >= images.size() || !images[slot].image_id || !rgba_float_written(static_cast<size_t>(slot))) {
+		g_ibl.status.store("the lighting ran without a written RGBA float image of the IBL's size", std::memory_order_relaxed);
+		return;
+	}
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) {
+		g_ibl.status.store("the IBL image has no backing", std::memory_order_relaxed);
+		return;
+	}
+	const vk::Format   fmt    = image.backing.format;
+	const uint64_t     flip   = g_flips_taken.load(std::memory_order_relaxed);
+	const uint32_t     level  = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent = BindingExtent(cache, binding);
+	for (size_t i = 0; i < g_ibl.retired.size();) {
+		auto& r = g_ibl.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_ibl.retired.back();
+		g_ibl.retired.pop_back();
+	}
+	if (g_ibl.image != VK_NULL_HANDLE && (g_ibl.extent != extent || g_ibl.format != fmt)) {
+		SsrPass::RetiredCopy r;
+		r.image = g_ibl.image, r.mem = g_ibl.mem, r.flip = flip, r.views[0] = g_ibl.view;
+		g_ibl.retired.push_back(r);
+		g_ibl.image = VK_NULL_HANDLE, g_ibl.mem = nullptr, g_ibl.view = nullptr, g_ibl.layout = vk::ImageLayout::eUndefined;
+		g_ibl.flip.store(~0ull, std::memory_order_release);
+	}
+	if (g_ibl.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = static_cast<VkFormat>(fmt);
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_ibl.image, &g_ibl.mem, nullptr) != VK_SUCCESS) {
+			g_ibl.image  = VK_NULL_HANDLE;
+			g_ibl.failed = true;
+			g_ibl.status.store("the IBL copy image could not be created", std::memory_order_relaxed);
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_ibl.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = fmt;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_ibl.view) != vk::Result::eSuccess) {
+			g_ibl.view   = nullptr;
+			g_ibl.failed = true;
+			g_ibl.status.store("the IBL copy view could not be created", std::memory_order_relaxed);
+			return;
+		}
+		g_ibl.extent = extent, g_ibl.format = fmt;
+		static uint32_t created = 0;
+		if (++created <= 8)
+			std::printf("[rt4] the game's specular IBL copy %ux%u %s from CS %016llx slot %d (mip %u layer %u @0x%llx; render %ux%u)\n",
+			            extent.width, extent.height, SsrFormatName(fmt), static_cast<unsigned long long>(cs_hash), slot, level, layer,
+			            static_cast<unsigned long long>(binding.desc.info.data.address), ref.width, ref.height);
+		std::fflush(stdout);
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		// (this dispatch's writes before the copy; also inside a compute chain)
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_ibl.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_ibl.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_ibl.image), vk::ImageLayout::eTransferDstOptimal,
+	                  1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_ibl.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	// (back as the dispatch left it: written, so general unless the binding says otherwise)
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_ibl.used_slot = slot;
+	g_ibl.status.store("copied", std::memory_order_relaxed);
+	g_ibl.flip.store(flip, std::memory_order_release);
+}
 } // namespace
+
+// (rtq2 b) KYTY_RTN: the game's SSR tile mask (kRTT_SSR's active tiles, R8_UINT, 16x16 render pixels a tile; written by the
+// tile classifier bb1fd2419da34939, read by the IBL 9fb5cc274b5e4f82 at pc 0xc1c), copied after the IBL dispatch as the
+// guide is (the same barriers and layouts). Slot: the IBL's unwritten R8_UINT input whose size is the render size / 16.
+namespace {
+struct RtnTiles {
+	bool                  failed = false, logged = false;
+	int                   slot = -1;
+	VkImage               image = VK_NULL_HANDLE;
+	VmaAllocation         mem   = nullptr;
+	vk::ImageView         view  = nullptr;
+	vk::Extent2D          extent {};
+	vk::ImageLayout       layout = vk::ImageLayout::eUndefined;
+	std::atomic<uint64_t> flip {~0ull};
+	std::vector<SsrPass::RetiredCopy> retired;
+} g_rtn_tiles;
+
+// (rtq2 b, compilacion 2) The game's IBL output (the written RGBA16F image at half the width or the full size, as rt4 finds
+// it) handed to RtNuevoInject in GENERAL; left there (the cache's state follows Transit: its next user transits it).
+void RtNuevoInjectAfterIbl(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, std::span<const TextureBinding> images,
+                           uint64_t written_mask, vk::Extent2D ref) {
+	if (!RtNuevoInjectReady() || ref.width == 0) return;
+	int slot = -1;
+	for (size_t i = 0; i < images.size() && i < 64; ++i) {
+		if (!images[i].image_id || ((written_mask >> i) & 1u) == 0) continue;
+		if (cache.GetImage(images[i].image_id).backing.format != vk::Format::eR16G16B16A16Sfloat) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		const bool half_x = e.width + 1 >= (ref.width + 1) / 2 && e.width <= (ref.width + 1) / 2 + 1 && e.height == ref.height;
+		const bool full   = e.width == ref.width && e.height == ref.height;
+		if (half_x || full) {
+			slot = static_cast<int>(i);
+			break;
+		}
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		std::printf("[rtn] IBL del juego (destino de la inyeccion): slot %d\n", slot);
+		std::fflush(stdout);
+	}
+	if (slot < 0) return;
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) return;
+	const uint32_t              level = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		mb.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	(void)RtNuevoInject(graphics, command, image.backing.image, image.backing.format, image.backing.usage, BindingExtent(cache, binding),
+	                    level, layer);
+}
+} // namespace
+
+void RtNuevoTilesAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
+                               std::span<const TextureBinding> images, uint64_t written_mask) {
+	if (!RtNuevoWanted() || g_rtn_tiles.failed || cs_hash != 0x9fb5cc274b5e4f82ull) return;
+	vk::Extent2D ref {};
+	for (size_t i = 0; i < images.size() && i < 64; ++i) {
+		if (!images[i].image_id) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		if (SsrIsDepthFormat(cache.GetImage(images[i].image_id).backing.format) && uint64_t {e.width} * e.height > uint64_t {ref.width} * ref.height)
+			ref = e;
+	}
+	int slot = -1;
+	for (size_t i = 0; i < images.size() && i < 64 && ref.width != 0; ++i) {
+		if (!images[i].image_id || ((written_mask >> i) & 1u) != 0) continue;
+		if (cache.GetImage(images[i].image_id).backing.format != vk::Format::eR8Uint) continue;
+		const vk::Extent2D e = BindingExtent(cache, images[i]);
+		if (e.width == (ref.width + 15) / 16 && (e.height == (ref.height + 15) / 16 || e.height == (ref.height + 15) / 16 + 1)) {
+			slot = static_cast<int>(i);
+			break;
+		}
+	}
+	if (!g_rtn_tiles.logged) {
+		g_rtn_tiles.logged = true;
+		std::printf("[rtn] mascara de tiles del SSR del juego: CS %016llx slot %s (render %ux%u)\n", static_cast<unsigned long long>(cs_hash),
+		            slot >= 0 ? std::to_string(slot).c_str() : "ninguno (sin entrada R8_UINT de render/16)", ref.width, ref.height);
+		std::fflush(stdout);
+	}
+	if (slot < 0) return;
+	const auto& binding = images[slot];
+	auto&       image   = cache.GetImage(binding.image_id);
+	if (image.backing.image == nullptr) return;
+	const uint64_t     flip   = g_flips_taken.load(std::memory_order_relaxed);
+	const uint32_t     level  = binding.desc.view_info.base_level, layer = binding.desc.view_info.base_layer;
+	const vk::Extent2D extent = BindingExtent(cache, binding);
+	for (size_t i = 0; i < g_rtn_tiles.retired.size();) {
+		auto& r = g_rtn_tiles.retired[i];
+		if (flip < r.flip + 8) {
+			++i;
+			continue;
+		}
+		if (r.views[0] != nullptr) graphics.device.destroyImageView(r.views[0], nullptr);
+		if (r.image != VK_NULL_HANDLE) vmaDestroyImage(graphics.allocator, r.image, r.mem);
+		r = g_rtn_tiles.retired.back();
+		g_rtn_tiles.retired.pop_back();
+	}
+	if (g_rtn_tiles.image != VK_NULL_HANDLE && g_rtn_tiles.extent != extent) {
+		SsrPass::RetiredCopy r;
+		r.image = g_rtn_tiles.image, r.mem = g_rtn_tiles.mem, r.flip = flip, r.views[0] = g_rtn_tiles.view;
+		g_rtn_tiles.retired.push_back(r);
+		g_rtn_tiles.image = VK_NULL_HANDLE, g_rtn_tiles.mem = nullptr, g_rtn_tiles.view = nullptr;
+		g_rtn_tiles.layout = vk::ImageLayout::eUndefined;
+		g_rtn_tiles.flip.store(~0ull, std::memory_order_release);
+	}
+	if (g_rtn_tiles.image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType   = VK_IMAGE_TYPE_2D;
+		create.format      = VK_FORMAT_R8_UINT;
+		create.extent      = {extent.width, extent.height, 1};
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.samples     = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling      = VK_IMAGE_TILING_OPTIMAL;
+		create.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &g_rtn_tiles.image, &g_rtn_tiles.mem, nullptr) != VK_SUCCESS) {
+			g_rtn_tiles.image  = VK_NULL_HANDLE;
+			g_rtn_tiles.failed = true;
+			return;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = vk::Image(g_rtn_tiles.image);
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = vk::Format::eR8Uint;
+		view_info.subresourceRange = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		if (graphics.device.createImageView(&view_info, nullptr, &g_rtn_tiles.view) != vk::Result::eSuccess) {
+			g_rtn_tiles.view   = nullptr;
+			g_rtn_tiles.failed = true;
+			return;
+		}
+		g_rtn_tiles.extent = extent, g_rtn_tiles.slot = slot;
+	}
+	const ImageSubresourceRange range {level, 1, layer, 1};
+	{
+		vk::MemoryBarrier2 mb {};
+		mb.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		mb.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		mb.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		mb.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &mb;
+		command.pipelineBarrier2(dependency);
+	}
+	image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                         vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = src_stage;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = dst_stage;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = vk::Image(g_rtn_tiles.image);
+		b.subresourceRange    = vk::ImageSubresourceRange {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	barrier(g_rtn_tiles.layout, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+	vk::ImageCopy copy {};
+	copy.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+	copy.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.extent         = vk::Extent3D {extent.width, extent.height, 1};
+	command.copyImage(image.backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(g_rtn_tiles.image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, vk::PipelineStageFlagBits2::eTransfer,
+	        vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+	g_rtn_tiles.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	const vk::ImageLayout back = binding.layout == vk::ImageLayout::eUndefined ? vk::ImageLayout::eGeneral : binding.layout;
+	image.Transit(back, vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite, range, command);
+	g_rtn_tiles.flip.store(flip, std::memory_order_release);
+	RtNuevoInjectAfterIbl(graphics, cache, command, images, written_mask, ref);
+}
+
+bool RtNuevoGetTiles(vk::ImageView& view, vk::Extent2D& extent) {
+	const uint64_t taken = g_rtn_tiles.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_rtn_tiles.view == nullptr) return false;
+	view   = g_rtn_tiles.view;
+	extent = g_rtn_tiles.extent;
+	return true;
+}
 
 void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer command, uint64_t cs_hash,
                               std::span<const TextureBinding> images, uint64_t written_mask) {
 	if (!RtReflGuideWanted()) return;
+	if (RtNuevoWanted()) RtNuevoTilesAfterDispatch(graphics, cache, command, cs_hash, images, written_mask); // (rtq2 b)
 	if (!g_guide.parsed) {
 		g_guide.parsed = true;
 		if (const char* v = std::getenv("KYTY_RT_REFLECTIONS_GUIDE_CS"); v != nullptr && *v != '\0') {
@@ -7437,6 +7933,7 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 			break;
 		}
 	}
+	if (cs_hash == g_guide.hash && Rt4Wanted()) Rt4IblAfterDispatch(graphics, cache, command, cs_hash, images, written_mask); // (rt4)
 	if (g_guide.failed || cs_hash != g_guide.hash) return;
 	// The slot. (refl8 fix, combo19) The first version took the first RGBA16F input at half the size of the first
 	// image the lighting WRITES; that held only on the very first run (a 2560x1440 lighting writing 2560x1440, guide
@@ -7651,6 +8148,19 @@ void RtReflGuideAfterDispatch(GraphicContext& graphics, TextureCache& cache, vk:
 
 const char* RtReflGuideStatus() { return g_guide.status.load(std::memory_order_relaxed); }
 
+// (rt4) The game's specular IBL copy (Rt4IblAfterDispatch) of this flip or the last.
+bool Rt4GetIbl(RtReflGuide& out) {
+	const uint64_t taken = g_ibl.flip.load(std::memory_order_acquire);
+	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
+	if (taken == ~0ull || flips > taken + 1 || g_ibl.view == nullptr) return false;
+	out.view   = g_ibl.view;
+	out.extent = g_ibl.extent;
+	out.cs     = g_guide.hash;
+	out.slot   = g_ibl.used_slot;
+	return true;
+}
+const char* Rt4IblStatus() { return g_ibl.status.load(std::memory_order_relaxed); }
+
 bool RtReflGetGuide(RtReflGuide& out) {
 	const uint64_t taken = g_guide.flip.load(std::memory_order_acquire);
 	const uint64_t flips = g_flips_taken.load(std::memory_order_relaxed);
@@ -7755,9 +8265,13 @@ void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& ou
 	// camera is taken (the kept frame-before one if the newest is ahead), and with none matching: motion vectors only.
 	static const bool fix = [] {
 		const char* e = std::getenv("KYTY_RTREFL1");
-		return e != nullptr && e[0] == '1';
+		return (e != nullptr && e[0] == '1') || Rt2Wanted(); // (rt2 implies it)
 	}();
 	static uint32_t calls = 0, same = 0, older = 0, none = 0;
+	// (rt2) the matched frame's jitter and its frame before's, and what the data says is in the matrices
+	std::array<float, 2> j_cur {}, j_prev {};
+	bool                 have_j = false;
+	int                  vp_jit = -2, pv_jit = -2;
 	{
 		std::lock_guard lock(g_ssr_gb.mutex);
 		const uint64_t copied = g_ssr.copy_flip.load(std::memory_order_acquire);
@@ -7777,12 +8291,44 @@ void RtReflGetCamera(const std::array<float, 16>& view_to_clip, RtReflCamera& ou
 			}
 		}
 		if (fix) {
-			if (match_cur) vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
-			else if (match_old) vp = g_ssr_gb.old_view_proj, pv = g_ssr_gb.old_prev_view_proj;
-			else return;
+			if (match_cur) {
+				vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+				j_cur = g_ssr_gb.jitter, j_prev = g_ssr_gb.prev_jitter, have_j = g_ssr_gb.have_jitter && g_ssr_gb.have_prev_jitter;
+			} else if (match_old) {
+				vp = g_ssr_gb.old_view_proj, pv = g_ssr_gb.old_prev_view_proj;
+				j_cur = g_ssr_gb.old_jitter, j_prev = g_ssr_gb.old_prev_jitter;
+				have_j = g_ssr_gb.old_have_jitter && g_ssr_gb.old_have_prev_jitter;
+			} else return;
+			vp_jit = g_ssr_gb.vp_jit, pv_jit = g_ssr_gb.pv_jit;
 		} else {
 			if (!cur_ok || g_flips_taken.load(std::memory_order_relaxed) > g_ssr_gb.vp_flip + 2) return;
 			vp = g_ssr_gb.view_proj, pv = g_ssr_gb.prev_view_proj;
+		}
+	}
+	// (rt2) Both matrices in the same jitter convention as the pixels they map: the depth (and so every trace / history
+	// pixel) was rasterized with this frame's jitter, the history with the last frame's. When the data shows the
+	// view-projection jittered (+J or -J) and the previous matrix without it, the last frame's jitter is put back into
+	// the previous matrix (same sign): before, the mapping moved by the jitter's change every frame (up to a pixel, a
+	// different direction each frame: the history crawled in place while walking). Nothing is assumed: undecided, or
+	// neither matrix jittered (no sign known), stays as it was.
+	static uint32_t rt2_calls = 0, rt2_fixed = 0;
+	if (Rt2Wanted()) {
+		++rt2_calls;
+		if (have_j && (vp_jit == 1 || vp_jit == -1) && pv_jit == 0) {
+			const float sgn = static_cast<float>(vp_jit);
+			for (int j = 0; j < 4; ++j) {
+				pv[0 * 4 + j] += sgn * j_prev[0] * pv[12 + j];
+				pv[1 * 4 + j] += sgn * j_prev[1] * pv[12 + j];
+			}
+			++rt2_fixed;
+		}
+		if (rt2_calls >= 600) {
+			std::printf("RT2: reflections' camera (600 frames): previous matrix given the last frame's jitter on %u (view-projection "
+			            "%s, previous matrix %s)\n", rt2_fixed,
+			            vp_jit == 1 ? "+J" : vp_jit == -1 ? "-J" : vp_jit == 0 ? "not jittered" : "undecided",
+			            pv_jit == 1 ? "jittered: consistent" : pv_jit == 0 ? "not jittered" : "undecided");
+			std::fflush(stdout);
+			rt2_calls = rt2_fixed = 0;
 		}
 	}
 	// Current clip -> previous clip = VP_prev * VP^-1 (row-major, column vectors: clip = M * world).
@@ -8698,6 +9244,15 @@ bool CShadowEnsure(GraphicContext& graphics, vk::Extent2D render, int quality) {
 // (KYTY_RT_SUN) This frame's cascades into `slot` of the shader's buffer (rt-sun.comp SunBuf): each copied layer's light
 // matrix composed with the camera's view -> world (from the projection and the G-buffer draws' view-projection, as
 // CShadowView, with the translation), sorted finest first. False while there is no copy of the last 8 flips.
+// (rt2) The game's own light axis: the finest cascade's light clip z row in our view space (an orthographic cascade's z
+// gradient is the light's direction), kept for the "RT2: sun:" line against the latched sun the passes are given.
+struct Rt2Sun {
+	std::array<double, 3> axis {};
+	bool                  valid = false;
+	uint32_t              frames = 0, n = 0;
+	double                sum_deg = 0.0, max_deg = 0.0;
+} g_rt2_sun;
+
 bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& vp, uint32_t slot) {
 	if (g_rs.buf_mapped == nullptr || g_rs.view == nullptr) return false;
 	std::vector<RtSunEntry> table;
@@ -8758,6 +9313,12 @@ bool RtSunPrepare(const std::array<float, 16>& m, const std::array<float, 16>& v
 	}
 	if (cs.empty()) return false;
 	std::ranges::sort(cs, {}, &Casc::texel);
+	if (Rt2Wanted()) {
+		const double* r2 = cs.front().r + 8;
+		const double  n  = std::sqrt(r2[0] * r2[0] + r2[1] * r2[1] + r2[2] * r2[2]);
+		g_rt2_sun.valid  = n > 1e-9 && std::isfinite(n);
+		if (g_rt2_sun.valid) g_rt2_sun.axis = {r2[0] / n, r2[1] / n, r2[2] / n};
+	}
 	static const float angle   = RtSunEnv("KYTY_RT_SUN_ANGLE", 0.8f, 0.1f, 5.0f);     // the sun's apparent size (deg)
 	static const float reach   = RtSunEnv("KYTY_RT_SUN_REACH", 6.0f, 0.5f, 50.0f);    // occluder heights the penumbra search sees (m)
 	static const float pcf     = RtSunEnv("KYTY_RT_SUN_GAMEPCF", 1.0f, 0.0f, 3.0f);   // the game emulation's PCF radius (taps)
@@ -9533,6 +10094,23 @@ bool CShadowApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, g_cs.pool, entry * 2);
 	}
 	push.misc[3] = (inputs.reset ? 1 : 0) | (g_cs.history_valid ? 2 : 0) | (hyp < 6 ? 4 : 0); // (slot 0: statistics at word 64)
+	// (rt2) the sun's RT shadows (KYTY_RT_SUN): the light from the game's cascades, the sample pattern on the surface
+	if (sun_mode && Rt2Wanted()) {
+		push.misc[3] |= 32;
+		if (g_rt2_sun.valid) {
+			const double d = std::abs(g_rt2_sun.axis[0] * l_view[0] + g_rt2_sun.axis[1] * l_view[1] + g_rt2_sun.axis[2] * l_view[2]) /
+			                 std::max(std::sqrt(l_view[0] * l_view[0] + l_view[1] * l_view[1] + l_view[2] * l_view[2]), 1e-9);
+			const double deg = std::acos(std::clamp(d, 0.0, 1.0)) * 57.29578;
+			g_rt2_sun.sum_deg += deg, g_rt2_sun.max_deg = std::max(g_rt2_sun.max_deg, deg), ++g_rt2_sun.n;
+		}
+		if (++g_rt2_sun.frames >= 600) {
+			std::printf("RT2: sun (600 frames): the latched sun vs the game's cascade light axis: mean %.3f deg, max %.3f deg over %u "
+			            "frames (the shadows now use the cascade axis; the surface-anchored PCSS pattern, the slope-scaled normal "
+			            "offset)\n", g_rt2_sun.n ? g_rt2_sun.sum_deg / g_rt2_sun.n : 0.0, g_rt2_sun.max_deg, g_rt2_sun.n);
+			std::fflush(stdout);
+			g_rt2_sun.frames = g_rt2_sun.n = 0, g_rt2_sun.sum_deg = g_rt2_sun.max_deg = 0.0;
+		}
+	}
 	// trace -> raw (+ gbuf[cur]); temporal (raw, history[prev]) -> tmp_a, count -> moments[cur]; a-trous 1 -> history[cur]
 	// (next frame's history); a-trous 2 -> tmp_b; (a-trous 4 -> tmp_a); composite -> out.
 	if (stats && g_cs.hw) push.misc[3] |= 16; // (KYTY_HWRT_SHADOW: the trace counts its darkening outliers)
@@ -9667,6 +10245,7 @@ void PrewarmLocalPasses(GraphicContext& graphics) {
 		if (value != nullptr && value[0] == '0') return;
 		std::thread([g = &graphics] {
 			LocalPlatform::SetThreadName("Kyty.RtPrewarm");
+			if (Tiron4::PipeOn()) LocalPlatform::MakeShaderWorkerThread(); // (tiron5: below normal, not against the game)
 			auto&      graphics = *g;
 			const auto begin    = std::chrono::steady_clock::now();
 			std::string made;
@@ -9704,6 +10283,7 @@ void PrewarmLocalPasses(GraphicContext& graphics) {
 }
 
 bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
+	::Libs::Graphics::FrameGen::Rtx1::Tick(); // (rtx1: KYTY_RTX1_FOG / _AO / _SSR_OFF / _LOG; nothing when all are off)
 	// (The local passes' pipelines: PrewarmLocalPasses, from the first guest flip; here too in case none came first.)
 	if (inputs_in.graphics != nullptr) {
 		PrewarmLocalPasses(*inputs_in.graphics);
@@ -9748,6 +10328,7 @@ bool Upscale(vk::CommandBuffer command, const UpscaleInputs& inputs_in) {
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Gi, "HwGiApply")
 	TimedPass("SsrApply", [&] { SsrApply(command, inputs); }); // (KYTY_SSR: likewise, after GTAO; nothing when off)
 	probed(RtFlicker::Reflections, "RtReflectionsApply", [&] { return RtReflectionsApply(command, inputs); }); // (KYTY_RT_REFLECTIONS: likewise, rt-reflections.cpp; nothing when off)
+	TimedPass("RtNuevoApply", [&] { (void)RtNuevoApply(command, inputs); }); // (rtq2 b, KYTY_RTN: trace only; KYTY_RTN=2 the debug view; nothing when off)
 	// (ds-rt-stable-1027) removed (particle light, contact shadows, RT GI + AO, water mirrors): probed(RtFlicker::Water, "RtWaterApply")
 	TimedPass("ShineApply", [&] { ShineApply(command, inputs); }); // (KYTY_SHINE: likewise, shine.cpp; nothing when off)
 	probed(RtFlicker::Volumetric, "GodraysApply", [&] { return GodraysApply(command, inputs); }); // (KYTY_GODRAYS: likewise, godrays.cpp; nothing when off; flicker self-check)

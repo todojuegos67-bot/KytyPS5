@@ -2,6 +2,8 @@
 
 #if defined(_WIN32)
 
+#include "common/hostException.h"
+
 #include <windows.h>
 
 extern "C" {
@@ -34,8 +36,30 @@ __asm__(".text\n"
 
 namespace Common {
 
+// (fix7) Before HostException::InstallHandler nothing resumes a fault at kyty_guarded_copy_fault (a thread such as
+// the RAM line can read the game's image while the start waits, e.g. KYTY_TIRON6's warm-up): copy only the readable
+// prefix VirtualQuery reports, the same "bytes not copied" contract.
+static uint64_t ReadablePrefix(const void* source, uint64_t size) noexcept {
+	auto       at  = reinterpret_cast<uintptr_t>(source);
+	const auto end = at + size;
+	while (at < end) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+		    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 || mbi.Protect == 0) {
+			break;
+		}
+		at = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+	}
+	return (at < end ? at : end) - reinterpret_cast<uintptr_t>(source);
+}
+
 uint64_t GuardedCopy(void* destination, const void* source, uint64_t size) noexcept {
-	return size == 0 ? 0 : kyty_guarded_copy(destination, source, size);
+	if (size == 0) return 0;
+	if (!HostException::HandlerInstalled()) {
+		const uint64_t readable = ReadablePrefix(source, size);
+		return readable == 0 ? size : (size - readable) + kyty_guarded_copy(destination, source, readable);
+	}
+	return kyty_guarded_copy(destination, source, size);
 }
 
 bool ResumeGuardedCopy(void* context) noexcept {

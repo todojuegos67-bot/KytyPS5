@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include "mem1.h" // (mem1: KYTY_MEM1=1 needs the answer and the ranges too)
+
 namespace GpuResidency {
 
 enum Kind : uint8_t {
@@ -54,7 +56,7 @@ inline bool Ram20On();
 inline bool Ram19On() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_RAM19");
-		return (value != nullptr && value[0] == '1' && value[1] == '\0') || Ram20On();
+		return (value != nullptr && value[0] == '1' && value[1] == '\0') || Ram20On() || Mem1::On(); // (mem1: its census)
 	}();
 	return on;
 }

@@ -1,0 +1,1143 @@
+#version 460
+// BB_PATHTRACING=1 (pathtrace.cpp): ray-traced sun shadows and reflections through the scene TLAS that the G-buffer
+// capture builds (hwrt-scene.cpp), injected into the game's own intermediate images before its lighting resolves, so the
+// game's tonemap, bloom, TAA, upscaler and HUD run unchanged on top.
+//
+// One module, one descriptor layout; the pass is push.mode:
+//   0  shadow trace     (trace res) world position from the game's depth; one sun ray inside the sun cone (R2 + hash
+//                       per pixel); TLAS instances static (0x01) + dynamic current (0x02); the hit's instance tells
+//                       whether a moving mesh blocked it. Writes s_raw = (visibility, dynamic, view distance, valid).
+//                       On a sparse grid: the depth <-> TLAS self-test (primary rays, both screen y conventions).
+//   1  shadow temporal  camera reprojection of the surface (world point through the previous view-projection),
+//                       4 bilinear taps checked against the stored distance (disocclusion), history length capped
+//                       (dynamic occluders: short history, no trail). s_hist[cur] = (vis, len, dyn, dist).
+//   2  shadow spatial   5x5 edge-aware filter (distance + depth-derived normal) of s_hist[cur] -> s_filt.
+//   3  shadow compose   (target res) depth-aware upsample of s_filt; the game's sun-shadow channel (calibrated on the CPU
+//                       from this pass's statistics) gets min(game, ours) or ours; statistics for the calibration.
+//   4  refl trace       (trace res) only where the G-buffer roughness is below the preset's cutoff: one GGX sample
+//                       around the mirror of the depth-derived (geometric) normal - the normal map never bends the ray,
+//                       so no "wave" on stone; the hit's radiance is the game's own lit colour of this frame where the
+//                       hit is on screen and not hidden, else nothing (confidence 0: the game keeps its cubemap).
+//   5  refl temporal    reprojection of the reflection's virtual image (mirror) blended toward the surface's (rough) by
+//                       roughness; YCoCg neighbourhood clamp; no history drop by camera speed.
+//   6  refl spatial     edge-aware 3x3 (5x5 for rough) filter -> r_filt.
+//   7  refl compose     (the game's SSR image res) depth-aware upsample; the game's SSR result (rgb, confidence a) is
+//                       replaced where our ray found the hit, with the CPU-calibrated scale and alpha convention;
+//                       statistics for the calibration.
+//   (pt1e) modes 4..7 only with BB_PT_REFL_LEGACY=1; the default reflections are rt-reflections' fill:
+//   9  fill learn       one primary ray per 16x16 render pixels: where it hits at the depth's distance, that pixel's lit
+//                       colour is added to its mesh's radiance sums (the instance custom index)
+//   10 fill             (one thread per block of trace pixels) on "Reflejos RT"'s trace: only its reflective pixels whose
+//                       screen-space ray missed (not water): one ray query from the block's first such pixel along the
+//                       same mirror direction; the hit's colour from this frame's screen where the hit is visible there,
+//                       else from the last composite where it was visible then, else its mesh's learned radiance, else
+//                       nothing. Mixed into out_a at that source's share (the game's fill keeps the rest).
+//   11 fill resolve     the sums folded into the per-mesh means (first: the mean; then 1/8 a frame), idle slots freed
+//   The per-mesh radiance (one mean lit colour per mesh, learned from on-screen hits, used off screen) is the technique of
+//   the GPL-2.0 Bloodborne path-tracing mod (its "slice 5", per-BLAS material cache); this code is ours.
+// Every write is NaN / Inf guarded: a bad value keeps the game's pixel (never a black frame).
+#extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform accelerationStructureEXT tlas;
+layout(binding = 1) uniform sampler2D depth_tex;       // the G-buffer pass's depth (depth aspect), nearest
+layout(binding = 2) uniform usampler2D rough_tex;      // the G-buffer array layer holding roughness (R32_UINT)
+layout(binding = 3) uniform sampler2D lit_tex;         // the lit HDR colour of this frame (ResolveLighting's output), linear
+layout(binding = 4) uniform sampler2D target_tex;      // the game's target, read (nearest)
+layout(binding = 5) uniform writeonly image2D target_img; // the same image, written (format of the game's image)
+layout(binding = 6, rgba16f) uniform image2D s_raw;
+layout(binding = 7, rgba16f) uniform image2D s_hist0;
+layout(binding = 8, rgba16f) uniform image2D s_hist1;
+layout(binding = 9, rgba16f) uniform image2D s_filt;
+layout(binding = 10, rgba16f) uniform image2D r_raw;   // rgb radiance, confidence
+layout(binding = 11, rgba16f) uniform image2D r_aux;   // hit distance, roughness, view distance, valid
+layout(binding = 12, rgba16f) uniform image2D r_hist0;
+layout(binding = 13, rgba16f) uniform image2D r_hist1;
+layout(binding = 14, rgba16f) uniform image2D r_haux0; // hit distance, length, view distance, roughness
+layout(binding = 15, rgba16f) uniform image2D r_haux1;
+layout(binding = 16, rgba16f) uniform image2D r_filt;
+layout(std430, binding = 17) buffer Stats { uint st[]; };
+// (pt1e) the reflections' fill (rt-reflections' images; trace size unless said)
+layout(binding = 19) uniform sampler2D fl_rad;   // out_a: premultiplied tonemapped colour, confidence (-1: not traced this frame)
+layout(binding = 20) uniform sampler2D fl_aux;   // out_c: roughness, mask, hit distance, hit flag (+ 2 on water)
+layout(binding = 21) uniform sampler2D fl_gb;    // out_b this frame: view normal, view distance (6e4: sky)
+layout(binding = 22) uniform sampler2D fl_gbp;   // the same, last frame
+layout(binding = 23) uniform sampler2D fl_prev;  // the last composite (pre-exposure HDR, render size), linear
+layout(binding = 24, rgba16f) uniform writeonly image2D fl_out; // out_a with the fill
+const uint CACHE = 32768u;
+layout(std430, binding = 25) buffer Cache {
+	vec4  c_mean[CACHE]; // exposed tonemap-free colour (rgb), frames learned (w)
+	uint  c_sum[CACHE * 4u]; // this frame's sums (rgb x 256, count), 4 words a slot
+	uint  c_id[CACHE];   // owner: the mesh id + 1 (0: free)
+	uint  c_idle[CACHE]; // frames without a sample
+};
+layout(std430, binding = 26) readonly buffer Exposure { float exposure_values[]; };
+layout(std140, binding = 18) uniform Frame {
+	vec4  inv[4];      // clip -> world rows (this frame's G-buffer camera, jitter included)
+	vec4  vp[4];       // world -> clip rows
+	vec4  pvp[4];      // the previous frame's world -> clip rows
+	vec4  cam;         // xyz camera, w 1 valid
+	vec4  pcam;        // previous camera, w 1 valid
+	vec4  proj;        // view_to_clip M[0], M[5], M[8], M[9] (the PS5 Pro packet's: the depth's distance)
+	vec4  depth_map;   // A = M[10], B = M[14], C = M[11], D = M[15]
+	vec4  sun;         // xyz toward the sun (world), w cos of the sun cone half-angle
+	vec4  render;      // depth size xy, 1 / size zw
+	vec4  strace;      // shadow trace size xy, 1 / size zw
+	vec4  rtrace;      // reflection trace size xy, 1 / size zw
+	vec4  target;      // target size xy, 1 / size zw
+	vec4  par;         // x shadow max distance, y reflection max distance, z roughness cutoff, w shadow strength
+	vec4  par2;        // x reflection scale, y shadow history cap, z reflection history cap, w normal bias scale
+	ivec4 cfg;         // x frame, y flags, z shadow channel (-1 none), w rough decode (byte index | layer << 8; -1 none)
+	ivec4 cfg2;        // x stats slot base (words), y history index (0/1: which is current), z debug view, w reflection spp
+	// (pt1e) the fill: rt-reflections' view_to_clip (its view space), sizes, options
+	vec4  fproj;       // M[0], M[5], M[8], M[9]
+	vec4  fdepth;      // M[10], M[14], M[11], M[15]
+	vec4  fsize;       // render w, h, trace w, h
+	vec4  fpar;        // x ray reach, y share from the last frame, z share from the mesh's radiance, w frames before it is used
+	ivec4 cfg3;        // x exposure index (-1: 1.0), y block (trace pixels per ray, per axis), z learning grid, w rt-reflections'
+	                   // roughness cutoff (per mille)
+} u;
+layout(push_constant) uniform Push {
+	int mode;
+	int step;
+	int pad0, pad1;
+} push;
+
+// cfg.y flags
+const int F_YFLIP      = 1;    // NDC y = -(uv.y * 2 - 1) (measured in DS: mirrored)
+const int F_HISTORY    = 2;    // the history images hold the previous frame's (else reset)
+const int F_COMPOSE_SH = 4;    // shadow compose may write the game's target
+const int F_SH_REPLACE = 8;    // shadow: ours replaces the channel (else min(game, ours))
+const int F_COMPOSE_RF = 16;   // reflection compose may write the game's target
+const int F_RF_PREMUL  = 32;   // the game's SSR rgb is premultiplied by its alpha
+const int F_ALPHA_DYN  = 64;   // dynamic instances carry bit 23 of the custom index
+const int F_ROUGH      = 128;  // a roughness source is bound
+const int F_SELFTEST   = 256;  // run the depth <-> TLAS self-test this frame
+const int F_DBG_SH     = 512;  // (pt1c, mode 8) this frame's traced shadows are valid
+const int F_DBG_RF     = 1024; // (pt1c, mode 8) this frame's traced reflections are valid
+const int F_SH_CHECKER = 2048; // (pt1e) shadow trace: half the texels a frame (the dispatch covers pairs)
+const int F_SH_GATE    = 4096; // (pt1e) no ray where the game's own mask is dark (min() could not change it)
+const int F_SH_STATIC  = 8192; // (pt1e) static occluders only (TLAS mask 0x01)
+const int F_SH_TARGET  = 16384; // (pt1e) shadows: the game's mask is bound (calibration in the trace, the gate)
+const int F_FL_ROW0UP  = 16384; // (pt1e, fill) rt-reflections' screen y convention: row 0 = NDC y +1
+const int F_FL_DEBUG   = 32768; // (pt1e, fill) BB_PT_DEBUG=1: the fill's colour by source (blue now, cyan last frame, magenta mesh)
+
+// Statistics words (per slot, cfg2.x base; read on the CPU 4 frames later, pathtrace.cpp ReadStats)
+const uint S_SELF_N   = 0u;   // self-test samples
+const uint S_SELF_A   = 1u;   // agree, the flag's convention
+const uint S_SELF_B   = 2u;   // agree, mirrored
+const uint S_SELF_MISS= 3u;   // no hit at all
+const uint S_SELF_OFF = 4u;   // samples off the horizon band (where the two differ)
+const uint S_SELF_NEAR = 5u;  // (pt1d) the flag's ray hit nearer than the depth (something in the TLAS the camera does not see there)
+const uint S_SELF_FAR  = 6u;  // (pt1d) it hit farther (the depth's surface missing from the TLAS)
+const uint S_SH_PIX   = 8u;   // shadow traced pixels
+const uint S_SH_OCC   = 9u;   // occluded
+const uint S_SH_DYN   = 10u;  // occluded by a moving mesh
+const uint S_SH_DISO  = 11u;  // temporal: disoccluded (history dropped)
+const uint S_SH_N     = 16u;  // calibration samples (compose)
+const uint S_SH_SV    = 17u;  // sum v * 1024
+const uint S_SH_SVV   = 18u;  // sum v^2 * 1024
+const uint S_SH_CH    = 20u;  // per channel c (4): +0 sum x*1024, +1 sum x^2*1024, +2 sum x*v*1024
+const uint S_SH_WRITE = 32u;  // compose pixels changed
+const uint S_SH_CPIX  = 33u;  // (pt1e) compose: sampled pixels (1 of 8x8)
+const uint S_SH_OVER  = 36u;  // per channel c (4): samples above 1.01 (not a visibility: a lighting image)
+const uint S_RF_PIX   = 40u;  // reflection trace: glossy pixels
+const uint S_RF_RAYS  = 41u;
+const uint S_RF_ONSCR = 42u;  // hits seen on screen (radiance taken)
+const uint S_RF_OFF   = 43u;  // hits off screen or hidden (confidence 0)
+const uint S_RF_MISS  = 44u;  // no hit within the distance
+const uint S_RF_SKY   = 45u;  // miss toward a sky pixel (radiance taken)
+const uint S_RF_DISO  = 46u;
+const uint S_RF_WRITE = 47u;  // compose pixels changed
+const uint S_RF_CALN  = 48u;  // calibration samples (a > 0.9)
+const uint S_RF_CPIX  = 49u;  // compose: sampled target pixels (not sky)
+const uint S_RF_HISTA = 64u;  // 64 bins: log2(game / ours), a > 0.9, bins of 1/8 over [-4, 4)
+const uint S_RF_HISTB = 128u; // 64 bins: log2(game / ours), 0.3 < a < 0.7
+const uint S_RF_HISTC = 192u; // 64 bins: log2(game / (ours * a)), 0.3 < a < 0.7
+const uint S_ROUGH    = 256u; // 16 bins of the decoded roughness (glossy decision check)
+// (pt1e) the fill's counters (every trace pixel / ray; subgroup sums): pathtrace.cpp's window words 64..95
+const uint S_FL       = 288u;
+const int  FL_REFL = 0, FL_MISS = 1, FL_RAYS = 2, FL_HIT = 3, FL_CUR = 4, FL_PREV = 5, FL_CACHE = 6, FL_NONE = 7, FL_APPLIED = 8;
+const int  FL_LEARN = 9, FL_LEARN_HIT = 10, FL_WATER = 11, FL_SKY = 12, FL_TOTAL = 13;
+const uint S_WORDS    = 512u;
+
+const float PI = 3.14159265;
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+bool  Finite(float x) { return !(isnan(x) || isinf(x)); }
+bool  Finite3(vec3 v) { return Finite(v.x) && Finite(v.y) && Finite(v.z); }
+
+// ---- camera ----
+vec2 Ndc(vec2 uv) {
+	vec2 n = uv * 2.0 - 1.0;
+	if ((u.cfg.y & F_YFLIP) != 0) n.y = -n.y;
+	return n;
+}
+vec3 ClipToWorld(vec4 c) {
+	vec4 h = vec4(dot(u.inv[0], c), dot(u.inv[1], c), dot(u.inv[2], c), dot(u.inv[3], c));
+	return h.xyz / (abs(h.w) > 1e-20 ? h.w : 1e-20);
+}
+// The depth buffer's value is not the scene camera's clip z / w (measured, hwrt-gi fix 2): only x / y go through the
+// scene camera (the pixel's view ray), the distance along it comes from the depth through the packet's view_to_clip.
+vec3 RayDirN(vec2 n) {
+	vec3 a = ClipToWorld(vec4(n, 0.25, 1.0)), b = ClipToWorld(vec4(n, 0.75, 1.0));
+	vec3 d = normalize(b - a);
+	if (dot(d, a - u.cam.xyz) < 0.0 && dot(d, b - u.cam.xyz) < 0.0) d = -d;
+	return d;
+}
+vec3 RayDir(vec2 uv) { return RayDirN(Ndc(uv)); }
+float ViewZ(float d) {
+	float den = d * u.depth_map.z - u.depth_map.x;
+	return abs(den) > 1e-12 ? (u.depth_map.y - d * u.depth_map.w) / den : 1e6;
+}
+float ViewDist(vec2 uv, float d) {
+	float z  = ViewZ(d);
+	float w  = z * u.depth_map.z + u.depth_map.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	vec3  v  = vec3((nd.x * w - z * u.proj.z) / u.proj.x, (nd.y * w - z * u.proj.w) / u.proj.y, z);
+	return length(v);
+}
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999 || abs(ViewZ(d)) > 2e4; }
+vec3 WorldAt(vec2 uv, float d) { return u.cam.xyz + RayDir(uv) * ViewDist(uv, d); }
+// world -> (uv, w > 0)
+vec3 ProjectWith(vec4 r0, vec4 r1, vec4 r3, vec3 p) {
+	vec4 c = vec4(p, 1.0);
+	float w = dot(r3, c);
+	if (w <= 1e-6) return vec3(-1.0, -1.0, 0.0);
+	vec2 n = vec2(dot(r0, c), dot(r1, c)) / w;
+	if ((u.cfg.y & F_YFLIP) != 0) n.y = -n.y;
+	return vec3(n * 0.5 + 0.5, 1.0);
+}
+vec3 Project(vec3 p) { return ProjectWith(u.vp[0], u.vp[1], u.vp[3], p); }
+vec3 ProjectPrev(vec3 p) { return ProjectWith(u.pvp[0], u.pvp[1], u.pvp[3], p); }
+
+float DepthAt(vec2 uv) { return textureLod(depth_tex, uv, 0.0).r; }
+float DistAt(vec2 uv) { float d = DepthAt(uv); return IsSky(d) ? 1e6 : ViewDist(uv, d); }
+
+// The geometric normal from the depth (the smaller one-sided difference per axis: no bleeding over silhouettes), facing
+// the camera. Never the normal-mapped G-buffer normal: its per-pixel relief bent the reflection rays (RT4: the wave on
+// stone, 95-99.9 % of the floor samples).
+vec3 GeoNormal(vec2 uv, vec3 P, vec2 px) {
+	vec2 dx = vec2(px.x, 0.0), dy = vec2(0.0, px.y);
+	float dl = DepthAt(uv - dx), dr = DepthAt(uv + dx), dd = DepthAt(uv - dy), du = DepthAt(uv + dy);
+	vec3 L = WorldAt(uv - dx, dl), R = WorldAt(uv + dx, dr), D = WorldAt(uv - dy, dd), U = WorldAt(uv + dy, du);
+	vec3 ex = abs(distance(L, P)) < abs(distance(R, P)) ? P - L : R - P;
+	vec3 ey = abs(distance(D, P)) < abs(distance(U, P)) ? P - D : U - P;
+	vec3 n  = cross(ex, ey);
+	float l = length(n);
+	if (l < 1e-12 || !Finite3(n)) return -RayDir(uv);
+	n /= l;
+	if (dot(n, u.cam.xyz - P) < 0.0) n = -n;
+	return n;
+}
+
+// ---- sampling: R2 sequence rotated by a per-pixel hash (no screen-space structure that slides when moving: RT4) ----
+uint HashU(uvec2 p) {
+	uint h = p.x * 1664525u + p.y * 1013904223u;
+	h ^= h >> 16u; h *= 0x7feb352du; h ^= h >> 15u; h *= 0x846ca68bu; h ^= h >> 16u;
+	return h;
+}
+vec2 R2(ivec2 pixel, int frame, int i) {
+	uint  h  = HashU(uvec2(pixel));
+	vec2  cp = vec2(float(h & 0xffffu), float(h >> 16u)) / 65536.0;
+	float n  = float((frame * 4 + i) & 0xffff); // (bounded: fract keeps its precision)
+	return fract(cp + n * vec2(0.7548776662, 0.5698402910));
+}
+mat3 Basis(vec3 n) {
+	vec3 t = abs(n.y) < 0.999 ? normalize(cross(vec3(0.0, 1.0, 0.0), n)) : vec3(1.0, 0.0, 0.0);
+	return mat3(t, cross(n, t), n);
+}
+vec3 ConeSample(vec3 axis, float cos_max, vec2 xi) {
+	float c   = mix(1.0, cos_max, xi.x);
+	float s   = sqrt(max(0.0, 1.0 - c * c));
+	float phi = 2.0 * PI * xi.y;
+	return normalize(Basis(axis) * vec3(cos(phi) * s, sin(phi) * s, c));
+}
+// GGX visible-normal sample (Heitz 2018) in the frame of n; alpha = roughness^2
+vec3 GgxVndf(vec3 V, vec3 n, float alpha, vec2 xi) {
+	mat3  B  = Basis(n);
+	vec3  Vl = transpose(B) * V;
+	vec3  Vh = normalize(vec3(alpha * Vl.x, alpha * Vl.y, Vl.z));
+	float l2 = Vh.x * Vh.x + Vh.y * Vh.y;
+	vec3  T1 = l2 > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(l2) : vec3(1.0, 0.0, 0.0);
+	vec3  T2 = cross(Vh, T1);
+	float r  = sqrt(xi.x), phi = 2.0 * PI * xi.y;
+	float t1 = r * cos(phi), t2 = r * sin(phi);
+	float s  = 0.5 * (1.0 + Vh.z);
+	t2       = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+	vec3  Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+	vec3  Hl = normalize(vec3(alpha * Nh.x, alpha * Nh.y, max(0.0, Nh.z)));
+	return B * Hl;
+}
+
+// ---- ray queries ----
+// t of the first opaque hit (-1 none); dyn: the hit instance is a moving mesh
+float Trace(vec3 o, vec3 d, float tmax, uint mask, bool first, out bool dyn) {
+	dyn = false;
+	rayQueryEXT q;
+	uint flags = gl_RayFlagsOpaqueEXT | (first ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
+	rayQueryInitializeEXT(q, tlas, flags, mask, o, 0.0, d, tmax);
+	while (rayQueryProceedEXT(q)) {}
+	if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionTriangleEXT) return -1.0;
+	if ((u.cfg.y & F_ALPHA_DYN) != 0) dyn = (rayQueryGetIntersectionInstanceCustomIndexEXT(q, true) & 0x800000) != 0;
+	return rayQueryGetIntersectionTEXT(q, true);
+}
+
+// ---- roughness from the G-buffer array (layer and byte from the CPU: RT5's calibration, overridable) ----
+float RoughAt(vec2 uv) {
+	if ((u.cfg.y & F_ROUGH) == 0 || u.cfg.w < 0) return 0.0; // no source (BB_PT_ROUGH=none): every surface below the cutoff test counts as a mirror
+	ivec2 sz = textureSize(rough_tex, 0);
+	uint  w  = texelFetch(rough_tex, clamp(ivec2(uv * vec2(sz)), ivec2(0), sz - 1), 0).r;
+	int   b  = u.cfg.w & 3;
+	return float((w >> uint(b * 8)) & 0xffu) / 255.0;
+}
+
+// ---- small helpers for our own images (manual bilinear with per-tap validity) ----
+vec4 Ld(int which, ivec2 p) {
+	if (which == 0) return imageLoad(s_hist0, p);
+	if (which == 1) return imageLoad(s_hist1, p);
+	if (which == 2) return imageLoad(r_hist0, p);
+	if (which == 3) return imageLoad(r_hist1, p);
+	if (which == 4) return imageLoad(r_haux0, p);
+	return imageLoad(r_haux1, p);
+}
+vec3 ToYCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 FromYCoCg(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+
+void Stat(uint w, uint v) { atomicAdd(st[uint(u.cfg2.x) + w], v); }
+
+// =====================================================================================================================
+// (pt1e) The calibration texels (1 of 4x4): always traced (not the checkerboard, not the gate), the channel statistics
+// measured on them (raw visibility against the game's mask), so skipping rays elsewhere biases nothing.
+bool CalibTexel(ivec2 p) { return ((p.x | p.y) & 3) == 0; }
+// The game's channel over a trace texel's footprint (its brightest of 4 taps; -1: not bound / not calibrated).
+float GameShadowAt(vec2 uv) {
+	int ch = u.cfg.z;
+	if ((u.cfg.y & F_SH_TARGET) == 0 || ch < 0 || ch > 3) return -1.0;
+	vec2  o = 0.25 * u.strace.zw;
+	float m = 0.0;
+	for (int k = 0; k < 4; ++k) m = max(m, textureLod(target_tex, uv + vec2((k & 1) != 0 ? o.x : -o.x, (k & 2) != 0 ? o.y : -o.y), 0.0)[ch]);
+	return m;
+}
+
+void ShadowTexel(ivec2 p, bool trace) {
+	vec2 size = u.strace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	vec2  uv = (vec2(p) + 0.5) * u.strace.zw;
+	float d  = DepthAt(uv);
+	if (IsSky(d)) {
+		imageStore(s_raw, p, vec4(1.0, 0.0, 1e6, 0.0));
+		return;
+	}
+	float dist  = ViewDist(uv, d);
+	bool  calib = CalibTexel(p);
+	// (pt1e) the checkerboard's other half this frame: marked untraced (w -1), the temporal pass fills it
+	if (!trace && !calib) {
+		imageStore(s_raw, p, vec4(1.0, 0.0, dist, -1.0));
+		return;
+	}
+	vec3  P    = WorldAt(uv, d);
+	vec3  N    = GeoNormal(uv, P, u.render.zw);
+	vec3  L    = normalize(u.sun.xyz);
+	bool  stat = ((p.x | p.y) & 7) == 0;
+	float vis  = 1.0;
+	bool  dyn  = false;
+	// (pt1e) the gate: where the game's own mask is already dark, min() keeps it: no ray (the texel reads as shadowed)
+	float gs   = (u.cfg.y & F_SH_GATE) != 0 && !calib ? GameShadowAt(uv) : -1.0;
+	if (gs >= 0.0 && gs < 0.02) {
+		vis = 0.0;
+	} else if (dist < u.par.x && dot(N, L) > 0.0) {
+		vec3  dir  = ConeSample(L, u.sun.w, R2(p, u.cfg.x, 0));
+		// Normal offset grows with distance (depth precision) and grazing light; never below a few cm.
+		float bias = (0.02 + 0.0015 * dist) * u.par2.w;
+		vec3  o    = P + N * bias * (1.0 + 2.0 * (1.0 - dot(N, L))) + dir * bias;
+		float t    = Trace(o, dir, u.par.x * 2.0, (u.cfg.y & F_SH_STATIC) != 0 ? 0x01u : 0x03u, true, dyn);
+		vis        = t >= 0.0 ? 0.0 : 1.0;
+	} else if (dot(N, L) <= 0.0) {
+		vis = 1.0; // back-facing to the sun: the game's own lighting is already dark there; nothing to add
+	}
+	if (stat) {
+		Stat(S_SH_PIX, 1u);
+		if (vis < 0.5) Stat(S_SH_OCC, 1u);
+		if (dyn) Stat(S_SH_DYN, 1u);
+	}
+	imageStore(s_raw, p, vec4(vis, dyn ? 1.0 : 0.0, dist, 1.0));
+
+	// (pt1e) Calibration statistics on the calibration texels: the game's channels at this texel against our raw
+	// visibility (pt1d took them in the compose from the filtered visibility; the gate and the checkerboard would bias it).
+	if (calib && (u.cfg.y & F_SH_TARGET) != 0) {
+		vec4 gv = textureLod(target_tex, uv, 0.0);
+		Stat(S_SH_N, 1u);
+		Stat(S_SH_SV, uint(vis * 1024.0 + 0.5));
+		Stat(S_SH_SVV, uint(vis * vis * 1024.0 + 0.5));
+		for (int c = 0; c < 4; ++c) {
+			if (!(gv[c] <= 1.01)) Stat(S_SH_OVER + uint(c), 1u);
+			float x = clamp(gv[c], 0.0, 1.0);
+			Stat(S_SH_CH + uint(c) * 3u + 0u, uint(x * 1024.0 + 0.5));
+			Stat(S_SH_CH + uint(c) * 3u + 1u, uint(x * x * 1024.0 + 0.5));
+			Stat(S_SH_CH + uint(c) * 3u + 2u, uint(x * vis * 1024.0 + 0.5));
+		}
+	}
+
+	// Depth <-> TLAS self-test on a sparse grid: a primary ray from the camera through this pixel with the flag's y
+	// convention (A) and mirrored (B); each agrees when it hits at this pixel's distance (3 % + 5 cm).
+	if ((u.cfg.y & F_SELFTEST) != 0 && (p.x & 15) == 8 && (p.y & 15) == 8) {
+		vec2 n  = Ndc(uv);
+		vec3 da = RayDirN(n), db = RayDirN(vec2(n.x, -n.y));
+		bool dd;
+		// (pt1d) the mask the shadow rays use (0x03): the test checks the geometry those rays see
+		float ta = Trace(u.cam.xyz, da, 5000.0, 0x03u, false, dd);
+		float tb = Trace(u.cam.xyz, db, 5000.0, 0x03u, false, dd);
+		float tol = 0.03 * dist + 0.05;
+		Stat(S_SELF_N, 1u);
+		if (ta >= 0.0 && abs(ta - dist) < tol) Stat(S_SELF_A, 1u);
+		else if (ta >= 0.0 && ta < dist) Stat(S_SELF_NEAR, 1u);
+		else if (ta >= 0.0) Stat(S_SELF_FAR, 1u);
+		if (tb >= 0.0 && abs(tb - dist) < tol) Stat(S_SELF_B, 1u);
+		if (ta < 0.0) Stat(S_SELF_MISS, 1u);
+		if (abs(n.y) > 0.3) Stat(S_SELF_OFF, 1u);
+	}
+}
+
+// (pt1e) Mode 0: with the checkerboard a thread per pair of horizontal texels, the traced one by the row and frame.
+void ShadowTrace(ivec2 q) {
+	if ((u.cfg.y & F_SH_CHECKER) == 0) {
+		ShadowTexel(q, true);
+		return;
+	}
+	int par = (q.y + u.cfg.x) & 1;
+	for (int k = 0; k < 2; ++k) ShadowTexel(ivec2(q.x * 2 + k, q.y), k == par);
+}
+
+// Reprojected history sample of a surface point P (world) into the previous frame's image `which` of size `size`:
+// bilinear over the taps whose stored view distance matches the expected one. ok = the taps' weight found.
+vec4 Reproject(int which, vec2 size, vec3 P, out float ok) {
+	ok = 0.0;
+	if ((u.cfg.y & F_HISTORY) == 0 || u.pcam.w < 0.5) return vec4(0.0);
+	vec3 pu = ProjectPrev(P);
+	if (pu.z <= 0.0 || any(lessThan(pu.xy, vec2(0.0))) || any(greaterThan(pu.xy, vec2(1.0)))) return vec4(0.0);
+	float expect = distance(P, u.pcam.xyz);
+	vec2  f      = pu.xy * size - 0.5;
+	ivec2 b      = ivec2(floor(f));
+	vec2  w      = fract(f);
+	vec4  sum    = vec4(0.0);
+	float wsum   = 0.0;
+	for (int j = 0; j < 4; ++j) {
+		ivec2 q  = b + ivec2(j & 1, j >> 1);
+		if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(size)))) continue;
+		vec4  h  = Ld(which, q);
+		// the stored view distance: shadows .w; reflection colour history -> its aux image's .z; aux images .z
+		float hd = which <= 1 ? h.w : (which <= 3 ? Ld(which + 2, q).z : h.z);
+		if (!(abs(hd - expect) < 0.03 * expect + 0.05)) continue;
+		float bw = ((j & 1) != 0 ? w.x : 1.0 - w.x) * ((j >> 1) != 0 ? w.y : 1.0 - w.y);
+		sum += h * bw;
+		wsum += bw;
+	}
+	if (wsum < 1e-3) return vec4(0.0);
+	ok = wsum;
+	return sum / wsum;
+}
+
+void ShadowTemporal(ivec2 p) {
+	vec2 size = u.strace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	vec4  raw = imageLoad(s_raw, p);
+	int   cur = u.cfg2.y;
+	vec4  outv;
+	if (raw.w < -0.5) {
+		// (pt1e) not traced this frame (checkerboard): the history as it was (its length not raised), else the traced
+		// partner of the pair on the same surface, else lit
+		vec2  uv = (vec2(p) + 0.5) * u.strace.zw;
+		vec3  P  = WorldAt(uv, DepthAt(uv));
+		float ok;
+		vec4  h  = Reproject(cur == 0 ? 1 : 0, size, P, ok);
+		if (ok > 0.0) {
+			outv = vec4(h.x, max(h.y, 1.0), h.z, raw.z);
+		} else {
+			ivec2 q  = clamp(ivec2(p.x ^ 1, p.y), ivec2(0), ivec2(size) - 1);
+			vec4  nb = imageLoad(s_raw, q);
+			bool  same = nb.w > 0.5 && abs(nb.z - raw.z) < 0.03 * raw.z + 0.05;
+			outv = vec4(same ? nb.x : 1.0, 1.0, same ? nb.y : 0.0, raw.z);
+			if (((p.x | p.y) & 7) == 0) Stat(S_SH_DISO, 1u);
+		}
+	} else if (raw.w < 0.5) {
+		outv = vec4(1.0, 0.0, 0.0, 1e6);
+	} else {
+		vec2  uv = (vec2(p) + 0.5) * u.strace.zw;
+		vec3  P  = WorldAt(uv, DepthAt(uv));
+		float ok;
+		vec4  h  = Reproject(cur == 0 ? 1 : 0, size, P, ok);
+		float len = ok > 0.0 ? h.y : 0.0;
+		if (ok <= 0.0 && ((p.x | p.y) & 7) == 0) Stat(S_SH_DISO, 1u);
+		// A moving occluder now or in the history: short history (its shadow follows it, no trail).
+		bool  dyn = raw.y > 0.5 || (ok > 0.0 && h.z > 0.25);
+		float cap = dyn ? 2.0 : u.par2.y;
+		len       = min(len + 1.0, cap);
+		float vis = ok > 0.0 ? mix(h.x, raw.x, 1.0 / len) : raw.x;
+		outv      = vec4(vis, len, max(raw.y, ok > 0.0 ? h.z * 0.5 : 0.0), raw.z);
+	}
+	if (cur == 0) imageStore(s_hist0, p, outv);
+	else imageStore(s_hist1, p, outv);
+}
+
+void ShadowSpatial(ivec2 p) {
+	vec2 size = u.strace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	int  cur = u.cfg2.y;
+	vec4 c   = Ld(cur, p);
+	if (c.w >= 1e5) {
+		imageStore(s_filt, p, vec4(1.0, 0.0, c.w, 0.0));
+		return;
+	}
+	vec2  uv = (vec2(p) + 0.5) * u.strace.zw;
+	vec3  P  = WorldAt(uv, DepthAt(uv));
+	vec3  N  = GeoNormal(uv, P, u.render.zw);
+	// Fewer taps once the history is long (converged): the filter mainly cleans young / disoccluded pixels.
+	int   r  = c.y >= 6.0 ? 1 : 2;
+	float sw = 0.0, sv = 0.0;
+	for (int y = -r; y <= r; ++y)
+		for (int x = -r; x <= r; ++x) {
+			ivec2 q = clamp(p + ivec2(x, y), ivec2(0), ivec2(size) - 1);
+			vec4  h = Ld(cur, q);
+			if (h.w >= 1e5) continue;
+			vec2  quv = (vec2(q) + 0.5) * u.strace.zw;
+			vec3  Q   = u.cam.xyz + RayDir(quv) * h.w;
+			float pl  = abs(dot(Q - P, N)) / (0.01 * c.w + 0.02); // plane distance in units of tolerance
+			float w   = exp(-pl * pl) * exp(-float(x * x + y * y) / 4.0);
+			sv += h.x * w;
+			sw += w;
+		}
+	imageStore(s_filt, p, vec4(sw > 0.0 ? sv / sw : c.x, c.y, c.w, 1.0));
+}
+
+void ShadowCompose(ivec2 p) {
+	vec2 tsize = u.target.xy;
+	if (any(greaterThanEqual(p, ivec2(tsize)))) return;
+	// (pt1e) the calibration's statistics are taken in the trace: here only the composition (when allowed)
+	int ch = u.cfg.z;
+	if ((u.cfg.y & F_COMPOSE_SH) == 0 || ch < 0 || ch > 3) return;
+	vec2  uv = (vec2(p) + 0.5) * u.target.zw;
+	float d  = DepthAt(uv);
+	if (IsSky(d)) return;
+	vec4  g    = texelFetch(target_tex, p, 0);
+	bool  smp  = ((p.x | p.y) & 7) == 0;
+	if (smp) Stat(S_SH_CPIX, 1u);
+	float game = g[ch];
+	// min(): a pixel the game already darkens fully cannot change (the cheap exit before the upsample)
+	if ((u.cfg.y & F_SH_REPLACE) == 0 && u.cfg2.z != 1 && game <= 1.0 / 512.0) return;
+	float dist = ViewDist(uv, d);
+	// Depth-aware upsample from the trace grid.
+	vec2  f = uv * u.strace.xy - 0.5;
+	ivec2 b = ivec2(floor(f));
+	vec2  w = fract(f);
+	float sv = 0.0, sw = 0.0;
+	for (int j = 0; j < 4; ++j) {
+		ivec2 q  = clamp(b + ivec2(j & 1, j >> 1), ivec2(0), ivec2(u.strace.xy) - 1);
+		vec4  h  = imageLoad(s_filt, q);
+		float bw = ((j & 1) != 0 ? w.x : 1.0 - w.x) * ((j >> 1) != 0 ? w.y : 1.0 - w.y);
+		float dw = exp(-abs(h.z - dist) / (0.02 * dist + 0.05));
+		sv += h.x * bw * dw;
+		sw += bw * dw;
+	}
+	if (sw < 1e-4) return;
+	float v    = clamp(sv / sw, 0.0, 1.0);
+	float ours = mix(1.0, v, u.par.w);
+	float nv   = (u.cfg.y & F_SH_REPLACE) != 0 ? ours : min(game, ours);
+	// (debug view 1: our visibility alone in the channel)
+	if (u.cfg2.z == 1) nv = v;
+	if (!Finite(nv) || abs(nv - game) < 1.0 / 512.0) return;
+	vec4 o = g;
+	o[ch]  = nv;
+	imageStore(target_img, p, o);
+	if (smp) Stat(S_SH_WRITE, 1u);
+}
+
+// =====================================================================================================================
+void ReflTrace(ivec2 p) {
+	vec2 size = u.rtrace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	vec2  uv = (vec2(p) + 0.5) * u.rtrace.zw;
+	float d  = DepthAt(uv);
+	bool  stat = ((p.x | p.y) & 3) == 0;
+	if (IsSky(d)) {
+		imageStore(r_raw, p, vec4(0.0));
+		imageStore(r_aux, p, vec4(0.0, 1.0, 1e6, 0.0));
+		return;
+	}
+	float rough = RoughAt(uv);
+	float dist  = ViewDist(uv, d);
+	if (stat) Stat(S_ROUGH + uint(clamp(rough * 16.0, 0.0, 15.0)), 1u);
+	if (rough > u.par.z || dist > u.par.y * 4.0) {
+		imageStore(r_raw, p, vec4(0.0));
+		imageStore(r_aux, p, vec4(0.0, rough, dist, 0.0));
+		return;
+	}
+	vec3  P = WorldAt(uv, d);
+	vec3  N = GeoNormal(uv, P, u.render.zw);
+	vec3  V = normalize(u.cam.xyz - P);
+	float alpha = max(rough * rough, 0.002);
+	int   spp   = max(u.cfg2.w, 1);
+	vec3  sum   = vec3(0.0);
+	float conf  = 0.0, hit_t = 0.0, hits = 0.0;
+	if (stat) Stat(S_RF_PIX, 1u);
+	for (int i = 0; i < spp; ++i) {
+		vec3 H = rough < 0.03 ? N : GgxVndf(V, N, alpha, R2(p, u.cfg.x, i));
+		vec3 D = reflect(-V, H);
+		if (dot(D, N) <= 0.0) D = reflect(-V, N);
+		float bias = 0.02 + 0.001 * dist;
+		bool  dyn;
+		float t = Trace(P + N * bias, D, u.par.y, 0x03u, false, dyn);
+		if (stat) Stat(S_RF_RAYS, 1u);
+		if (t < 0.0) {
+			// A miss: the sky seen on screen in that direction (far point projected), else nothing.
+			vec3 s = Project(P + D * 1e4);
+			if (s.z > 0.0 && all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0))) && IsSky(DepthAt(s.xy))) {
+				vec3 c = textureLod(lit_tex, s.xy, 0.0).rgb;
+				if (Finite3(c)) {
+					sum += c;
+					conf += 1.0;
+					hit_t += 1e4;
+					hits += 1.0;
+					if (stat) Stat(S_RF_SKY, 1u);
+				}
+			} else if (stat) {
+				Stat(S_RF_MISS, 1u);
+			}
+			continue;
+		}
+		vec3 Hp = P + N * bias + D * t;
+		vec3 s  = Project(Hp);
+		bool on = s.z > 0.0 && all(greaterThan(s.xy, vec2(0.0))) && all(lessThan(s.xy, vec2(1.0)));
+		if (on) {
+			float sd = DistAt(s.xy);
+			float hd = distance(Hp, u.cam.xyz);
+			on       = abs(sd - hd) < 0.03 * hd + 0.1; // the hit is what the camera sees there (not hidden)
+		}
+		if (!on) {
+			if (stat) Stat(S_RF_OFF, 1u);
+			continue;
+		}
+		vec3 c = textureLod(lit_tex, s.xy, 0.0).rgb;
+		if (!Finite3(c)) continue;
+		// Fade near the screen edges (the lit image ends there).
+		vec2  e  = min(s.xy, 1.0 - s.xy);
+		float fe = clamp(min(e.x, e.y) * 20.0, 0.0, 1.0);
+		sum += c * fe;
+		conf += fe;
+		hit_t += t;
+		hits += 1.0;
+		if (stat) Stat(S_RF_ONSCR, 1u);
+	}
+	// (no shadow pass: the depth <-> TLAS self-test here, same rule as ShadowTrace)
+	if ((u.cfg.y & F_SELFTEST) != 0 && (p.x & 15) == 8 && (p.y & 15) == 8) {
+		vec2 n  = Ndc(uv);
+		bool dd;
+		float ta = Trace(u.cam.xyz, RayDirN(n), 5000.0, 0x03u, false, dd);
+		float tb = Trace(u.cam.xyz, RayDirN(vec2(n.x, -n.y)), 5000.0, 0x03u, false, dd);
+		float tol = 0.03 * dist + 0.05;
+		Stat(S_SELF_N, 1u);
+		if (ta >= 0.0 && abs(ta - dist) < tol) Stat(S_SELF_A, 1u);
+		else if (ta >= 0.0 && ta < dist) Stat(S_SELF_NEAR, 1u);
+		else if (ta >= 0.0) Stat(S_SELF_FAR, 1u);
+		if (tb >= 0.0 && abs(tb - dist) < tol) Stat(S_SELF_B, 1u);
+		if (ta < 0.0) Stat(S_SELF_MISS, 1u);
+	}
+	vec3  rad = conf > 1e-4 ? sum / conf : vec3(0.0);
+	float c   = conf / float(spp);
+	imageStore(r_raw, p, vec4(min(rad, vec3(64000.0)), c));
+	imageStore(r_aux, p, vec4(hits > 0.0 ? hit_t / hits : 0.0, rough, dist, 1.0));
+}
+
+void ReflTemporal(ivec2 p) {
+	vec2 size = u.rtrace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	int  cur = u.cfg2.y;
+	vec4 raw = imageLoad(r_raw, p);
+	vec4 aux = imageLoad(r_aux, p);
+	vec4 oh, oa;
+	if (aux.w < 0.5) {
+		oh = vec4(0.0);
+		oa = vec4(0.0, 0.0, aux.z, aux.y);
+	} else {
+		vec2  uv = (vec2(p) + 0.5) * u.rtrace.zw;
+		vec3  P  = WorldAt(uv, DepthAt(uv));
+		float rough = aux.y;
+		// The reflection's virtual image: behind the surface by the hit distance, seen from the camera (a mirror's
+		// content moves with it, not with the surface); rough lobes follow the surface.
+		vec3  Vd = normalize(P - u.cam.xyz);
+		float hd = aux.x > 0.0 ? min(aux.x, 1e3) : 0.0;
+		vec3  Xv = P + Vd * hd;
+		float okS, okV;
+		int   hw = cur == 0 ? 3 : 2;
+		vec4  hS = Reproject(hw, size, P, okS);
+		float okA = 0.0;
+		vec4  aS = vec4(0.0);
+		if (okS > 0.0) aS = Reproject(hw + 2, size, P, okA);
+		if (okA <= 0.0) okS = 0.0;
+		// (virtual: the surface's own tap decides validity - the distance stored is the surface's)
+		vec3  pu = ProjectPrev(Xv);
+		vec3  ps = ProjectPrev(P);
+		float k  = smoothstep(0.1, 0.5, rough); // 0 mirror -> virtual, 1 rough -> surface
+		vec4  h  = hS;
+		float ok = okS;
+		if (okS > 0.0 && hd > 0.0 && k < 1.0 && pu.z > 0.0) {
+			// The virtual position's offset applied to the surface's history lookup (same image, shifted taps).
+			vec2  shift = (pu.xy - ps.xy) * (1.0 - k);
+			vec2  f     = (ps.xy + shift) * size - 0.5;
+			ivec2 b     = ivec2(floor(f));
+			vec2  w     = fract(f);
+			vec4  sum   = vec4(0.0);
+			float wsum  = 0.0;
+			float expect = distance(P, u.pcam.xyz);
+			for (int j = 0; j < 4; ++j) {
+				ivec2 q = b + ivec2(j & 1, j >> 1);
+				if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(size)))) continue;
+				vec4  qa = Ld(hw + 2, q);
+				// the tap must lie on the same surface (distance within 10 %: the virtual shift slides along it)
+				if (!(abs(qa.z - expect) < 0.1 * expect + 0.1)) continue;
+				float bw = ((j & 1) != 0 ? w.x : 1.0 - w.x) * ((j >> 1) != 0 ? w.y : 1.0 - w.y);
+				sum += Ld(hw, q) * bw;
+				wsum += bw;
+			}
+			if (wsum > 1e-3) h = sum / wsum;
+		}
+		if (ok <= 0.0 && ((p.x | p.y) & 3) == 0) Stat(S_RF_DISO, 1u);
+		// Neighbourhood clamp (YCoCg) around this frame's raw samples; wider for rough lobes (noisier).
+		vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+		float n = 0.0;
+		for (int y = -1; y <= 1; ++y)
+			for (int x = -1; x <= 1; ++x) {
+				ivec2 q = clamp(p + ivec2(x, y), ivec2(0), ivec2(size) - 1);
+				vec4  r = imageLoad(r_raw, q);
+				if (r.a <= 0.0) continue;
+				vec3  yc = ToYCoCg(r.rgb);
+				m1 += yc;
+				m2 += yc * yc;
+				n += 1.0;
+			}
+		float len = ok > 0.0 ? aS.y : 0.0;
+		vec3  hy  = ToYCoCg(h.rgb);
+		if (n > 0.0) {
+			m1 /= n;
+			vec3 sg = sqrt(max(m2 / n - m1 * m1, vec3(0.0)));
+			float g = mix(1.25, 3.0, k);
+			hy = clamp(hy, m1 - sg * g, m1 + sg * g);
+		}
+		len = min(len + 1.0, mix(4.0, u.par2.z, k));
+		float a   = ok > 0.0 ? 1.0 / len : 1.0;
+		vec3  col = mix(FromYCoCg(hy), raw.rgb, raw.a > 0.0 ? a : 0.0);
+		float cf  = ok > 0.0 ? mix(h.a, raw.a, a) : raw.a;
+		if (!Finite3(col) || !Finite(cf)) col = raw.rgb, cf = raw.a, len = 1.0;
+		oh = vec4(col, cf);
+		oa = vec4(aux.x, len, aux.z, rough);
+	}
+	if (cur == 0) {
+		imageStore(r_hist0, p, oh);
+		imageStore(r_haux0, p, oa);
+	} else {
+		imageStore(r_hist1, p, oh);
+		imageStore(r_haux1, p, oa);
+	}
+}
+
+void ReflSpatial(ivec2 p) {
+	vec2 size = u.rtrace.xy;
+	if (any(greaterThanEqual(p, ivec2(size)))) return;
+	int  cur = u.cfg2.y;
+	int  hw  = cur == 0 ? 2 : 3;
+	vec4 c   = Ld(hw, p);
+	vec4 a   = Ld(hw + 2, p);
+	if (a.z >= 1e5 || c.a <= 0.0) {
+		imageStore(r_filt, p, c);
+		return;
+	}
+	float rough = a.w;
+	int   r     = rough < 0.1 ? 0 : (rough < 0.3 || a.y >= 6.0 ? 1 : 2);
+	vec4  sum   = vec4(0.0);
+	float sw    = 0.0;
+	for (int y = -r; y <= r; ++y)
+		for (int x = -r; x <= r; ++x) {
+			ivec2 q  = clamp(p + ivec2(x, y), ivec2(0), ivec2(size) - 1);
+			vec4  qa = Ld(hw + 2, q);
+			vec4  qc = Ld(hw, q);
+			if (qc.a <= 0.0) continue;
+			float dz = abs(qa.z - a.z) / (0.02 * a.z + 0.05);
+			float dr = abs(qa.w - rough) * 8.0;
+			float w  = exp(-dz * dz - dr * dr - float(x * x + y * y) / 4.0);
+			sum += qc * w;
+			sw += w;
+		}
+	imageStore(r_filt, p, sw > 0.0 ? sum / sw : c);
+}
+
+int Bin(float l2) { return clamp(int(floor((l2 + 4.0) * 8.0)), 0, 63); }
+
+void ReflCompose(ivec2 p) {
+	vec2 tsize = u.target.xy;
+	if (any(greaterThanEqual(p, ivec2(tsize)))) return;
+	if ((u.cfg.y & F_COMPOSE_RF) == 0 && ((p.x | p.y) & 3) != 0) return;
+	vec2  uv = (vec2(p) + 0.5) * u.target.zw;
+	float d  = DepthAt(uv);
+	if (IsSky(d)) return;
+	float dist = ViewDist(uv, d);
+	if (((p.x | p.y) & 3) == 0) Stat(S_RF_CPIX, 1u);
+	vec2  f = uv * u.rtrace.xy - 0.5;
+	ivec2 b = ivec2(floor(f));
+	vec2  w = fract(f);
+	vec4  sum = vec4(0.0);
+	float sw = 0.0;
+	for (int j = 0; j < 4; ++j) {
+		ivec2 q  = clamp(b + ivec2(j & 1, j >> 1), ivec2(0), ivec2(u.rtrace.xy) - 1);
+		vec4  qa = Ld(u.cfg2.y == 0 ? 4 : 5, q);
+		vec4  qc = imageLoad(r_filt, q);
+		float bw = ((j & 1) != 0 ? w.x : 1.0 - w.x) * ((j >> 1) != 0 ? w.y : 1.0 - w.y);
+		float dw = exp(-abs(qa.z - dist) / (0.02 * dist + 0.05));
+		sum += qc * bw * dw;
+		sw += bw * dw;
+	}
+	if (sw < 1e-4) return;
+	vec4  ours = sum / sw;
+	float conf = clamp(ours.a, 0.0, 1.0);
+	if (conf < 0.02) return;
+	vec4  g = texelFetch(target_tex, p, 0);
+	float ga = clamp(g.a, 0.0, 1.0);
+	// Calibration (1 pixel of 4x4): log2 of the game's SSR colour over ours, where both are confident.
+	if (((p.x | p.y) & 3) == 0 && conf > 0.9) {
+		float lo = Luma(ours.rgb), lg = Luma(g.rgb);
+		if (lo > 1e-4 && lg > 1e-4) {
+			float l2 = log2(lg / lo);
+			if (ga > 0.9) {
+				Stat(S_RF_CALN, 1u);
+				Stat(S_RF_HISTA + uint(Bin(l2)), 1u);
+			} else if (ga > 0.3 && ga < 0.7) {
+				Stat(S_RF_HISTB + uint(Bin(l2)), 1u);
+				Stat(S_RF_HISTC + uint(Bin(log2(lg / (lo * ga)))), 1u);
+			}
+		}
+	}
+	if ((u.cfg.y & F_COMPOSE_RF) == 0) return;
+	bool  premul = (u.cfg.y & F_RF_PREMUL) != 0;
+	vec3  grad   = premul ? (ga > 1e-3 ? g.rgb / ga : vec3(0.0)) : g.rgb;
+	vec3  orad   = ours.rgb * u.par2.x;
+	vec3  nrad   = mix(grad, orad, conf);
+	float na     = mix(ga, 1.0, conf);
+	vec4  o      = vec4(premul ? nrad * na : nrad, na);
+	if (u.cfg2.z == 2) o = vec4(orad * conf, conf); // debug view 2: our reflection alone
+	if (!Finite3(o.rgb) || !Finite(o.a)) return;
+	imageStore(target_img, p, o);
+	if (((p.x | p.y) & 3) == 0) Stat(S_RF_WRITE, 1u);
+}
+
+// (pt1c) BB_PT_DEBUG=1: the lit HDR colour (the image the game's TAA reads) tinted where our rays found something: red
+// where the traced sun shadow is occluded, blue where a traced reflection hit (confidence). Shows what the passes do
+// whatever the calibrations say; before the post chain, so the HUD stays clean.
+void DebugTint(ivec2 p) {
+	vec2 tsize = u.target.xy;
+	if (any(greaterThanEqual(p, ivec2(tsize)))) return;
+	vec2 uv = (vec2(p) + 0.5) * u.target.zw;
+	vec4 c  = texelFetch(target_tex, p, 0);
+	if (!Finite3(c.rgb)) return;
+	float l = max(Luma(c.rgb), 0.02);
+	vec3  o = c.rgb;
+	bool  changed = false;
+	if ((u.cfg.y & F_DBG_SH) != 0) {
+		vec4 h = imageLoad(s_filt, clamp(ivec2(uv * u.strace.xy), ivec2(0), ivec2(u.strace.xy) - 1));
+		if (h.w > 0.5 && h.x < 0.5) {
+			o       = mix(o, vec3(l * 3.0, 0.0, 0.0), 0.6 * (1.0 - h.x));
+			changed = true;
+		}
+	}
+	if ((u.cfg.y & F_DBG_RF) != 0) {
+		vec4 r = imageLoad(r_filt, clamp(ivec2(uv * u.rtrace.xy), ivec2(0), ivec2(u.rtrace.xy) - 1));
+		if (r.a > 0.3) {
+			o       = mix(o, vec3(0.0, 0.0, l * 3.0), 0.6 * clamp(r.a, 0.0, 1.0));
+			changed = true;
+		}
+	}
+	if (changed) imageStore(target_img, p, vec4(o, c.a));
+}
+
+// =====================================================================================================================
+// (pt1e) The reflections' fill over rt-reflections' trace (modes 9, 10, 11). rt-reflections' view space (its own
+// view_to_clip copy and screen y convention) gives the mirror direction exactly as its screen-space ray took it; the
+// world (the TLAS's) comes from the screen point through this file's own camera (RayDir + ViewDist), as the shadows do.
+void FlStat(int k, uint v) {
+	uint s = subgroupAdd(v);
+	if (subgroupElect() && s > 0u) atomicAdd(st[uint(u.cfg2.x) + S_FL + uint(k)], s);
+}
+float FlExposure() {
+	if (u.cfg3.x < 0) return 1.0;
+	float e = exposure_values[u.cfg3.x];
+	return (e > 1e-12 && e < 1e12) ? e : 1.0;
+}
+vec3  FlSafe(vec3 c) { return Finite3(c) ? clamp(c, vec3(0.0), vec3(6.0e4)) : vec3(0.0); }
+float FlMax3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+vec3  FlTonemap(vec3 c) { return c / (1.0 + FlMax3(c)); }
+float FlYS() { return (u.cfg.y & F_FL_ROW0UP) != 0 ? -1.0 : 1.0; }
+float FlViewZ(float d) {
+	float den = d * u.fdepth.z - u.fdepth.x;
+	return abs(den) > 1e-12 ? (u.fdepth.y - d * u.fdepth.w) / den : 1e6;
+}
+vec3 FlViewPos(vec2 uv, float d) {
+	float z  = FlViewZ(d);
+	float w  = z * u.fdepth.z + u.fdepth.w;
+	vec2  nd = uv * 2.0 - 1.0;
+	nd.y *= FlYS();
+	return vec3((nd.x * w - z * u.fproj.z) / u.fproj.x, (nd.y * w - z * u.fproj.w) / u.fproj.y, z);
+}
+vec4 FlClip(vec3 p) {
+	return vec4(p.x * u.fproj.x + p.z * u.fproj.z, p.y * u.fproj.y + p.z * u.fproj.w, p.z * u.fdepth.x + u.fdepth.y, p.z * u.fdepth.z + u.fdepth.w);
+}
+bool FlBad(vec4 v) { return !(Finite(v.x) && Finite(v.y) && Finite(v.z) && Finite(v.w)); }
+// A reflective trace pixel (rt-reflections' own mask, traced this frame, not the sky) whose screen-space ray missed.
+// water: rt-reflections' water flag (+ 2 in out_c.w): left to its own water path.
+bool FlCandidate(ivec2 p, out bool reflective, out bool water) {
+	reflective = false, water = false;
+	if (any(greaterThanEqual(p, ivec2(u.fsize.zw)))) return false;
+	vec4 rad = texelFetch(fl_rad, p, 0), ax = texelFetch(fl_aux, p, 0), gb = texelFetch(fl_gb, p, 0);
+	if (FlBad(rad) || FlBad(ax) || FlBad(gb)) return false;
+	// (out_c.x the roughness: above the cutoff rt-reflections stored a miss without tracing, its mask kept)
+	reflective = rad.a >= 0.0 && ax.y >= 0.01 && ax.x <= float(u.cfg3.w) * 0.001 && gb.w < 5e4 && length(gb.xyz) > 0.5;
+	water      = ax.w > 1.5;
+	return reflective && !water && mod(ax.w, 2.0) < 0.5;
+}
+// The mesh's slot in the radiance cache, claimed for it when free; false: another mesh owns it.
+bool FlSlot(uint id, out uint slot) {
+	slot     = id & (CACHE - 1u);
+	uint tag = id + 1u;
+	uint old = atomicCompSwap(c_id[slot], 0u, tag);
+	return old == 0u || old == tag;
+}
+void FlLearn(uint id, vec3 c) {
+	uint slot;
+	if (!FlSlot(id, slot)) return;
+	uvec3 q = uvec3(clamp(c, vec3(0.0), vec3(16.0)) * 256.0 + 0.5);
+	atomicAdd(c_sum[slot * 4u + 0u], q.x);
+	atomicAdd(c_sum[slot * 4u + 1u], q.y);
+	atomicAdd(c_sum[slot * 4u + 2u], q.z);
+	atomicAdd(c_sum[slot * 4u + 3u], 1u);
+}
+
+// Mode 9: one primary ray per learning tile, at a pixel that moves with the frame; the hit agreeing with the depth gives
+// its mesh this pixel's lit colour (exposed, as the reflections use it).
+void FillLearn(ivec2 q) {
+	int   grid = max(u.cfg3.z, 4);
+	uint  h    = HashU(uvec2(q) + uvec2(uint(u.cfg.x) * 7919u, uint(u.cfg.x) * 104729u));
+	ivec2 px   = q * grid + ivec2(int(h & 0xffu) % grid, int((h >> 8u) & 0xffu) % grid);
+	bool  in_  = all(lessThan(px, ivec2(u.render.xy)));
+	bool  ok   = false;
+	if (in_) {
+		vec2  uv = (vec2(px) + 0.5) * u.render.zw;
+		float d  = texelFetch(depth_tex, px, 0).r;
+		if (!IsSky(d)) {
+			float dist = ViewDist(uv, d);
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x07u, u.cam.xyz, 0.0, RayDir(uv), dist * 1.05 + 0.5);
+			while (rayQueryProceedEXT(rq)) {}
+			if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+				float t = rayQueryGetIntersectionTEXT(rq, true);
+				if (abs(t - dist) < 0.03 * dist + 0.05) {
+					uint id = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) & 0x7fffffu;
+					vec3 c  = FlSafe(texelFetch(lit_tex, px, 0).rgb) * FlExposure();
+					FlLearn(id, c);
+					ok = true;
+				}
+			}
+		}
+	}
+	FlStat(FL_LEARN, in_ ? 1u : 0u);
+	FlStat(FL_LEARN_HIT, ok ? 1u : 0u);
+}
+
+// Mode 10: one thread per block of trace pixels (u.cfg3.y per axis).
+void Fill(ivec2 q) {
+	int   B    = clamp(u.cfg3.y, 1, 4);
+	ivec2 ts   = ivec2(u.fsize.zw);
+	ivec2 base = q * B;
+	// the block's pixels: which are candidates, the first one (from a corner that turns with the frame) traces
+	int   n = B * B, rep = -1, start = u.cfg.x % n;
+	uint  refl_n = 0u, miss_n = 0u, water_n = 0u, total_n = 0u;
+	for (int k = 0; k < n; ++k) {
+		int   kk = (start + k) % n;
+		ivec2 p  = base + ivec2(kk % B, kk / B);
+		if (any(greaterThanEqual(p, ts))) continue;
+		++total_n;
+		bool refl, wat;
+		bool cand = FlCandidate(p, refl, wat);
+		if (refl) ++refl_n;
+		if (refl && wat && mod(texelFetch(fl_aux, p, 0).w, 2.0) < 0.5) ++water_n;
+		if (cand) {
+			++miss_n;
+			if (rep < 0) rep = kk;
+		}
+	}
+	FlStat(FL_TOTAL, total_n);
+	FlStat(FL_REFL, refl_n);
+	FlStat(FL_MISS, miss_n);
+	FlStat(FL_WATER, water_n);
+
+	// ---- the ray (one per block) ----
+	bool  traced = false, hit = false;
+	int   src = 0; // 0 none, 1 this frame's screen, 2 the last composite, 3 the mesh's radiance
+	vec3  col = vec3(0.0);
+	float share = 0.0;
+	vec4  grep = vec4(0.0);
+	if (rep >= 0) {
+		ivec2 rp_t = base + ivec2(rep % B, rep / B);
+		grep       = texelFetch(fl_gb, rp_t, 0);
+		vec2  uvt  = (vec2(rp_t) + 0.5) / u.fsize.zw;
+		ivec2 rp   = clamp(ivec2(uvt * u.fsize.xy), ivec2(0), ivec2(u.fsize.xy) - 1);
+		vec2  ruv  = (vec2(rp) + 0.5) / u.fsize.xy;
+		float d    = texelFetch(depth_tex, rp, 0).r;
+		if (!IsSky(d)) {
+			vec3  Pv  = FlViewPos(ruv, d);
+			vec3  N   = normalize(grep.xyz);
+			vec3  V   = normalize(-Pv);
+			vec3  Rv  = reflect(-V, N);
+			float dv  = abs(Pv.z);
+			float sgn = Pv.z >= 0.0 ? 1.0 : -1.0;
+			float fwd = Rv.z * sgn;
+			float sl  = 0.25 * dv + 0.1;
+			if (fwd < 0.0) sl = min(sl, 0.5 * max(dv - 0.2, 0.0) / -fwd);
+			vec4  c1 = FlClip(Pv), c2 = FlClip(Pv + Rv * sl);
+			if (Finite3(Rv) && sl > 1e-3 && c1.w * c2.w > 0.0 && abs(c2.w) > 1e-6) {
+				vec2  uv2 = vec2(c2.x / c2.w, FlYS() * c2.y / c2.w) * 0.5 + 0.5;
+				float d2  = c2.z / c2.w;
+				vec3  O   = WorldAt(ruv, d);
+				vec3  D   = WorldAt(uv2, d2) - O;
+				float dl  = length(D);
+				if (dl > 1e-6 && Finite3(O) && Finite3(D)) {
+					D          = D / dl;
+					traced     = true;
+					float dist = distance(O, u.cam.xyz);
+					float tmin = 0.03 + 0.004 * dist;
+					rayQueryEXT rq;
+					// 0x07: static, moving (current and older positions); not the alpha-tested cards (0x10) nor tiny debris
+					rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0x07u, O, tmin, D, max(u.fpar.x, tmin * 2.0));
+					while (rayQueryProceedEXT(rq)) {}
+					hit = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+					if (hit) {
+						vec3  H  = O + D * rayQueryGetIntersectionTEXT(rq, true);
+						uint  id = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true)) & 0x7fffffu;
+						float e  = FlExposure();
+						// (a) visible on this frame's screen: its lit colour now (the same source as the screen-space hits)
+						vec3 s = Project(H);
+						if (s.z > 0.0 && all(greaterThan(s.xy, vec2(0.002))) && all(lessThan(s.xy, vec2(0.998)))) {
+							float hd = distance(H, u.cam.xyz);
+							if (abs(DistAt(s.xy) - hd) < 0.03 * hd + 0.1) {
+								vec2 eg = min(s.xy, 1.0 - s.xy);
+								col     = FlSafe(textureLod(lit_tex, s.xy, 0.0).rgb) * e;
+								share   = clamp(min(eg.x, eg.y) * 20.0, 0.0, 1.0);
+								src     = 1;
+								if ((HashU(uvec2(q) + uvec2(uint(u.cfg.x))) & 3u) == 0u) FlLearn(id, col);
+							}
+						}
+						// (b) visible in the last composite (its distance then = the last trace's surface there)
+						if (src == 0 && (u.cfg.y & F_HISTORY) != 0 && u.pcam.w > 0.5) {
+							vec4  pc = vec4(H, 1.0);
+							float pw = dot(u.pvp[3], pc);
+							if (pw > 1e-5) {
+								vec2 pn = vec2(dot(u.pvp[0], pc), dot(u.pvp[1], pc)) / pw;
+								if ((u.cfg.y & F_YFLIP) != 0) pn.y = -pn.y;
+								vec2 puv = pn * 0.5 + 0.5;
+								if (all(greaterThan(puv, vec2(0.01))) && all(lessThan(puv, vec2(0.99)))) {
+									vec4 pg = texelFetch(fl_gbp, clamp(ivec2(puv * u.fsize.zw), ivec2(0), ts - 1), 0);
+									if (!FlBad(pg) && pg.w < 5e4 && abs(pg.w - pw) < 0.04 * pw + 0.05) {
+										col   = FlSafe(textureLod(fl_prev, puv, 0.0).rgb) * e;
+										share = u.fpar.y;
+										src   = 2;
+									}
+								}
+							}
+						}
+						// (c) its mesh's learned radiance
+						if (src == 0) {
+							uint slot = id & (CACHE - 1u);
+							vec4 m    = c_mean[slot];
+							if (c_id[slot] == id + 1u && m.w >= u.fpar.w && Finite3(m.rgb)) {
+								col   = max(m.rgb, vec3(0.0));
+								share = u.fpar.z;
+								src   = 3;
+							}
+						}
+					} else {
+						FlStat(FL_SKY, 1u);
+					}
+				}
+			}
+		}
+	}
+	FlStat(FL_RAYS, traced ? 1u : 0u);
+	FlStat(FL_HIT, hit ? 1u : 0u);
+	FlStat(FL_CUR, src == 1 ? 1u : 0u);
+	FlStat(FL_PREV, src == 2 ? 1u : 0u);
+	FlStat(FL_CACHE, src == 3 ? 1u : 0u);
+	FlStat(FL_NONE, hit && src == 0 ? 1u : 0u);
+
+	// ---- out_a for every pixel of the block: the candidates on the same surface as the traced one take the fill ----
+	vec3 tc = FlTonemap(col);
+	if ((u.cfg.y & F_FL_DEBUG) != 0) tc = src == 1 ? vec3(0.0, 0.0, 1.0) : src == 2 ? vec3(0.0, 1.0, 1.0) : vec3(1.0, 0.0, 1.0);
+	uint applied = 0u;
+	for (int k = 0; k < n; ++k) {
+		ivec2 p = base + ivec2(k % B, k / B);
+		if (any(greaterThanEqual(p, ts))) continue;
+		vec4 rad = texelFetch(fl_rad, p, 0);
+		vec4 o   = rad;
+		bool refl, wat;
+		if (src != 0 && share > 1e-3 && FlCandidate(p, refl, wat)) {
+			vec4 g2 = texelFetch(fl_gb, p, 0);
+			if (abs(g2.w - grep.w) < 0.05 * grep.w + 0.05 && dot(g2.xyz, grep.xyz) > 0.9) {
+				// premultiplied: what was there (the game's own fill, rt4) keeps 1 - share
+				o = vec4(rad.rgb * (1.0 - share) + tc * share, max(rad.a, 0.0) * (1.0 - share) + share);
+				if (FlBad(o)) o = rad;
+				else ++applied;
+			}
+		}
+		imageStore(fl_out, p, o);
+	}
+	FlStat(FL_APPLIED, applied);
+}
+
+// Mode 11: the sums folded into the means (first: the mean; then 1/8 a frame), sums cleared, slots idle 600 frames freed.
+void FillResolve(ivec2 q) {
+	uint i = uint(q.y) * 256u + uint(q.x);
+	if (i >= CACHE) return;
+	uvec4 sm = uvec4(c_sum[i * 4u + 0u], c_sum[i * 4u + 1u], c_sum[i * 4u + 2u], c_sum[i * 4u + 3u]);
+	if (sm.w > 0u) {
+		vec3 mean = vec3(sm.xyz) / (256.0 * float(sm.w));
+		vec4 m    = c_mean[i];
+		vec3 nm   = m.w < 0.5 ? mean : mix(m.rgb, mean, 0.125);
+		c_mean[i] = vec4(Finite3(nm) ? nm : mean, min(m.w + 1.0, 255.0));
+		c_sum[i * 4u + 0u] = 0u, c_sum[i * 4u + 1u] = 0u, c_sum[i * 4u + 2u] = 0u, c_sum[i * 4u + 3u] = 0u;
+		c_idle[i] = 0u;
+	} else if (c_id[i] != 0u) {
+		uint idle = c_idle[i] + 1u;
+		if (idle > 600u) {
+			c_id[i]   = 0u;
+			c_mean[i] = vec4(0.0);
+			idle      = 0u;
+		}
+		c_idle[i] = idle;
+	}
+}
+
+void main() {
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	switch (push.mode) {
+		case 0: ShadowTrace(p); break;
+		case 1: ShadowTemporal(p); break;
+		case 2: ShadowSpatial(p); break;
+		case 3: ShadowCompose(p); break;
+		case 4: ReflTrace(p); break;
+		case 5: ReflTemporal(p); break;
+		case 6: ReflSpatial(p); break;
+		case 7: ReflCompose(p); break;
+		case 8: DebugTint(p); break;
+		case 9: FillLearn(p); break;   // (pt1e)
+		case 10: Fill(p); break;       // (pt1e)
+		case 11: FillResolve(p); break; // (pt1e)
+		default: break;
+	}
+}

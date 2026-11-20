@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "local/f0-measure.h" // (cpu1: the game thread's waits)
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -286,6 +287,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	F0Measure::WaitScope f0w_(3, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 
 	if (ef == nullptr) {

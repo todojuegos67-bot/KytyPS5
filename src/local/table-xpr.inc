@@ -346,6 +346,31 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t                WrittenEntries = 1024;
 	std::array<WrittenRange, WrittenEntries> written;
+	// (trad1b, KYTY_TRAD1; local/trad1.h) A written range's last full ObtainBuffer (the main executor, no speculation,
+	// unformatted), keyed by the range itself (its clamped address and size: what ObtainBuffer is asked), not by the
+	// V#'s words or their entry: kept across the special generation's moves (mappings, image starts) and across V#s
+	// whose other words differ. While its registration epoch stands, its buffer is live and no GPU-written byte of its
+	// tracker regions was given back since `coverage`, a use in another tick only renotes the write. 2-way by the range,
+	// the older way replaced; allocated at the first use with KYTY_TRAD1 on.
+	struct Trad1Range {
+		uint64_t          address = 0, size = 0;
+		vk::DeviceAddress device = 0;
+		BufferId          owner {};
+		const Buffer*     owner_buffer = nullptr;
+		uint64_t          registration = 0, coverage = 0, used = 0;
+	};
+	static constexpr size_t       Trad1Sets = 4096;
+	std::unique_ptr<Trad1Range[]> trad1_ranges;
+	uint64_t                      trad1_clock = 0;
+	// The entry of [address, address + size): the way that holds it, else the one to replace (address 0 there).
+	Trad1Range& Trad1Find(uint64_t address, uint64_t size) {
+		if (trad1_ranges == nullptr) trad1_ranges = std::make_unique<Trad1Range[]>(2 * Trad1Sets);
+		const auto set = (((address >> 2u) ^ (size * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull) >> 52u;
+		auto*      way = &trad1_ranges[2 * set];
+		if (way[0].address == address && way[0].size == size) return way[0];
+		if (way[1].address == address && way[1].size == size) return way[1];
+		return way[0].used <= way[1].used ? way[0] : way[1];
+	}
 	// The draw's blocks (per stage): its slots (IR::TablePlan::BlockDwords), then its buffers.
 	std::array<std::vector<uint32_t>, 2> blocks;
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
@@ -958,6 +983,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	const bool full  = !own || textures.GcTick() >= set.touched_tick + TableImageSet::TouchTicks ||
 	                  textures.CurrentFrame() >= set.touched_frame + TableImageSet::TouchTicks ||
 	                  m_context.GetCommandScheduler().Current().IsInvalid();
+	G1::NoteSetCheck(full); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
 	// Registrations since: their pages say which proofs they reach (none, when the log of the latest has none over the
 	// views' span: the game moves registrations every frame somewhere).
 	bool moved = set.resolution_epoch[Role()] != resolution;
@@ -982,6 +1008,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		const bool held = !full && dep.proven && image->validity == dep.validity &&
 		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
 		                                                          set.resolution_epoch[0]));
+		G1::NoteSetUse(held); // (g1 NP1)
 		if (held && mode != 2) continue;
 		const auto refuse = [&] {
 			if (held) {
@@ -998,6 +1025,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
 		// as the normal path's FindTexture does.
 		if (TableRefreshPending(*image, dep.desc)) {
+			G1::NoteSetRefresh(); // (g1 NP1)
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
@@ -1062,6 +1090,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		set.touched_tick  = textures.GcTick();
 		set.touched_frame = textures.CurrentFrame();
 	}
+	G1::NoteSetOk(); // (g1 NP1)
 	return true;
 }
 
@@ -1135,11 +1164,13 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 		TrustedDepth::NoteRun(st, first, count, address); // (trust1: while an XPR depth draw captures its reads)
 		if (!probing) {
 			reader.Read(address, count, out);
+			if (PortR::Verifying() && PortR::t_capture) PortR::NoteRun(st, address, count, out); // (port-r=2: the run, for TableDraw's comparison)
 			return;
 		}
 		// (TSC cycles, not steady_clock: two clock reads per run were 20% of the render thread at the dragon's path.)
 		const auto begin = __rdtsc();
 		reader.Read(address, count, out);
+		if (PortR::Verifying() && PortR::t_capture) PortR::NoteRun(st, address, count, out); // (port-r=2)
 		const auto cycles = __rdtsc() - begin;
 		const auto ns     = cycles / 4u; // (~4 GHz TSC: a threshold and a total, not a measurement)
 		const uint64_t key   = pair.vs * 31u + st * 7919u + index;
@@ -1874,6 +1905,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (block_stats) ++LiveCensus::g_table_blocks[0];
 				auto& proof = table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
 				if (proof.special != table.special_generation || proof.words != words4) {
+					if (Trad1::Mode() != 0) ++(proof.words != words4 ? Trad1::g.reset_words : Trad1::g.reset_special); // (trad1b)
 					const auto [clamped_address, clamped_size] = range_of(words4);
 					proof = {.words = words4, .special = table.special_generation, .address = clamped_address, .size = clamped_size};
 				}
@@ -1896,6 +1928,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					    buffer_cache.GetBufferIfLive(proof.owner) == proof.owner_buffer) {
 						device = proof.device;
 						LiveCounters::Add(LiveCounters::TableWrittenMemo);
+						if (Trad1::Mode() != 0) ++Trad1::g.old_memo; // (trad1)
 						// KYTY_TABLE_WRITTEN_VERIFY=1: the lookup as well, its result against the memo's.
 						static const bool verify = std::getenv("KYTY_TABLE_WRITTEN_VERIFY") != nullptr;
 						if (verify) {
@@ -1909,25 +1942,119 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								            static_cast<unsigned long long>(device), static_cast<unsigned long long>(found));
 						}
 					} else {
-						if (block_stats) ++LiveCensus::g_table_blocks[1];
-						proof.memo                 = false;
-						const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
-						region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
-						const auto id = buffer_cache.FindBuffer(address, size);
-						if (owner == nullptr || buffer_cache.GetBufferIfLive(id) != owner) return false;
-						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
-						device = owner->BufferDeviceAddress() + offset;
-						// (The epochs after ObtainBuffer: its uploads and GPU marks are what the next use must find.)
-						if (const auto epoch = buffer_cache.CpuModificationEpoch(address, size); own_plain && epoch != 0) {
-							proof.memo         = true;
-							proof.device       = device;
-							proof.owner        = id;
-							proof.owner_buffer = owner;
-							proof.tick         = tick;
-							proof.registration = buffer_cache.RegistrationEpoch();
-							proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
-							proof.cpu_epoch    = epoch;
+						// (trad1b, KYTY_TRAD1; local/trad1.h) Another tick, or an epoch the old memo needs moved: with this
+						// range's last full obtain still standing on ObtainBuffer's write memo terms (registration, the
+						// same live buffer, no GPU-written byte of its regions given back), the write is only noted again
+						// (=1), or the old path checked against it (=2). Looked up by the range, not the V#'s entry.
+						const uint32_t trad1    = own_plain ? Trad1::Mode() : 0u;
+						bool           taken    = false;
+						bool           eligible = false;
+						auto           why      = Trad1::NoProof;
+						TableXpr::Trad1Range* range = nullptr;
+						if (trad1 != 0) {
+							buffer_cache.Trad1EnableCoverage();
+							range = &table.Trad1Find(address, size);
+							if (range->address != address || range->size != size) why = Trad1::NoProof;
+							else if (range->registration != buffer_cache.RegistrationEpoch()) why = Trad1::Registration;
+							else if (buffer_cache.GetBufferIfLive(range->owner) != range->owner_buffer) why = Trad1::BufferGone;
+							else if (buffer_cache.Trad1CoverageMoved(address, size, range->coverage)) why = Trad1::Coverage;
+							else eligible = true;
+							if (eligible && trad1 == 1) {
+								const bool     sample = Trad1::SampleFast();
+								const uint64_t start  = sample ? __rdtsc() : 0;
+								if (buffer_cache.Trad1RenoteWritten(range->owner, range->owner_buffer, address, size,
+								                                    range->registration, range->coverage)) {
+									taken       = true;
+									device      = range->device;
+									range->used = ++table.trad1_clock;
+									++Trad1::g.hits;
+									region_epochs.fill({UINT64_MAX, 0}); // (the drain may have moved them)
+									// As after a full obtain: the old memo holds for the rest of the tick.
+									const auto epoch   = buffer_cache.CpuModificationEpoch(address, size);
+									proof.memo         = epoch != 0;
+									proof.device       = range->device;
+									proof.owner        = range->owner;
+									proof.owner_buffer = range->owner_buffer;
+									proof.tick         = tick;
+									proof.registration = range->registration;
+									proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
+									proof.cpu_epoch    = epoch;
+									if (sample) {
+										Trad1::g.fast_cycles += __rdtsc() - start;
+										++Trad1::g.fast_samples;
+									}
+								} else {
+									eligible = false;
+									why      = Trad1::Refused;
+								}
+							}
+							if (!eligible) ++Trad1::g.miss[why];
 						}
+						if (!taken) {
+							const bool verify      = trad1 == 2 && eligible;
+							bool       would_write = false;
+							vk::DeviceAddress expect_device = 0;
+							const Buffer*     expect_buffer = nullptr;
+							uint64_t          expect_coverage = 0, expect_registration = 0;
+							if (verify) {
+								++Trad1::g.hits; // (what =1 would take)
+								would_write         = buffer_cache.Trad1SyncWouldUpload(address, size);
+								expect_device       = range->device;
+								expect_buffer       = range->owner_buffer;
+								expect_coverage     = range->coverage;
+								expect_registration = range->registration;
+							}
+							const bool     sample = trad1 != 0 && (trad1 == 1 || verify) && Trad1::SampleFull();
+							const uint64_t start  = sample ? __rdtsc() : 0;
+							if (block_stats) ++LiveCensus::g_table_blocks[1];
+							proof.memo                 = false;
+							const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+							region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
+							const auto id = buffer_cache.FindBuffer(address, size);
+							if (owner == nullptr || buffer_cache.GetBufferIfLive(id) != owner) return false;
+							if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
+							device = owner->BufferDeviceAddress() + offset;
+							if (sample) {
+								Trad1::g.full_cycles += __rdtsc() - start;
+								++Trad1::g.full_samples;
+							}
+							// (trad1, =2) Only where the shortcut would still have been taken after the drain (the
+							// epochs unchanged by the old path's own drain and lookups).
+							if (verify && !buffer_cache.Trad1CoverageMoved(address, size, expect_coverage) &&
+							    buffer_cache.RegistrationEpoch() == expect_registration) {
+								++Trad1::g.checked;
+								if (owner != expect_buffer)
+									Trad1::NoteDifference("buffer", address, size, reinterpret_cast<uint64_t>(expect_buffer),
+									                      reinterpret_cast<uint64_t>(owner));
+								else if (device != expect_device)
+									Trad1::NoteDifference("device", address, size, expect_device, device);
+								if (would_write) {
+									++Trad1::g.dirty;
+									Trad1::NoteDifference("upload (pages not GPU-owned)", address, size, 0, 1);
+								}
+							}
+							// (The epochs after ObtainBuffer: its uploads and GPU marks are what the next use must find.)
+							if (const auto epoch = buffer_cache.CpuModificationEpoch(address, size); own_plain && epoch != 0) {
+								proof.memo         = true;
+								proof.device       = device;
+								proof.owner        = id;
+								proof.owner_buffer = owner;
+								proof.tick         = tick;
+								proof.registration = buffer_cache.RegistrationEpoch();
+								proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
+								proof.cpu_epoch    = epoch;
+							}
+							if (trad1 != 0)
+								*range = {.address      = address,
+								          .size         = size,
+								          .device       = device,
+								          .owner        = id,
+								          .owner_buffer = owner,
+								          .registration = buffer_cache.RegistrationEpoch(),
+								          .coverage     = buffer_cache.GpuCoverageEpoch(),
+								          .used         = ++table.trad1_clock};
+						}
+						if (trad1 != 0) Trad1::MaybeReport(LiveControl::g_flips.load(std::memory_order_relaxed));
 					}
 				}
 				const auto [word, stride]      = word_of(words4);
@@ -1977,6 +2104,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
 					if (block_stats) ++LiveCensus::g_table_blocks[4];
 					current = range_clean(held.address, held.size);
+					G1::NoteReprove(current); // (g1 NP1)
 					if (current) held.cpu_epoch = epoch;
 				}
 			}
@@ -2021,6 +2149,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
 							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							F0Measure::NoteRingCopy(address, size); // (f0)
 							if (shared != nullptr && cpu != 0)
 								*shared = {.address     = address,
 								           .size        = size,
@@ -2177,6 +2306,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
+	// (port-r, KYTY_PORT_R=2; local/port-r.h) A draw of the game's geometry list run by the host (eboot+0xab57d0): its
+	// native description (found by the table address its user data carries) is compared with what this draw translates
+	// to, after the evaluation (PortR::End below); the clock takes the whole step, every return. Off: one load.
+	PortR::DrawClock port_r_clock(PortR::Verifying() && Role() == 0 && Spec::Current() == nullptr &&
+	                              PortR::Begin(user_data[0], stages > 1 ? user_data[1] : std::span<const uint32_t> {}));
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
 	if (index_base != 0) {
 		const auto* held = &table.indices[(index_base * 0x9e3779b97f4a7c15ull) >> 51u];
@@ -2363,6 +2497,23 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
 		TableGather(pair, user_data);
 		phase.reset();
+	}
+	if (port_r_clock.on) {
+		PortR::Translated port_r;
+		port_r.vs            = pair.vs;
+		port_r.ps            = pair.ps;
+		port_r.state         = variant.state;
+		port_r.draw_state    = &draw_state;
+		port_r.words         = std::span<const uint32_t> {table.words.data(), table.words.size()};
+		port_r.ud_vs         = user_data[0];
+		port_r.ud_ps         = stages > 1 ? user_data[1] : std::span<const uint32_t> {};
+		port_r.evaluated     = !trust_hit;
+		port_r.direct        = direct != nullptr && direct->indexed && direct->instance_count == 1;
+		port_r.index_base    = index_base;
+		port_r.index_address = direct != nullptr ? direct->index_address : 0;
+		port_r.index_count   = direct != nullptr ? direct->index_count : 0;
+		port_r.index_size    = index_type == vk::IndexType::eUint16 ? 2u : 4u;
+		PortR::End(port_r);
 	}
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
@@ -2626,6 +2777,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (Render5Flags::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
+	// (pt1) BB_PATHTRACING: the sun's light matrix from the draws inside a RenderShadowCascade scope
+	if (PathTrace::Requested() && Spec::Current() == nullptr)
+		PathTrace::OnDraw(pair.programs[0]->shader_hash,
+		                  std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	if (Render5Flags::Wanted(Render5Flags::Ssr) && Spec::Current() == nullptr)
 		FrameGen::OnSsrDraw(pair.programs[0]->shader_hash,
 		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
@@ -2657,6 +2812,33 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		++groups;
 		first += count;
 	}
+	// (render1 F2c) What the draw's shaders read of its own depth target (its set's images: the program's bindings).
+	if (Render1::Mode() == 2 && Render1::t_current.native) {
+		auto& read = Render1::t_read;
+		read       = {};
+		read.known = true;
+		for (const auto& target: draw_state.targets) {
+			if (!target.requested.IsDepth()) continue;
+			for (const auto& image: set->images) {
+				++read.images;
+				if (!(image.id == target.id)) continue;
+				read.reads_depth = true;
+				read.base_layer  = image.range.base_layer;
+				read.layers      = image.range.layer_count;
+				read.base_level  = image.range.base_level;
+				read.levels      = image.range.level_count;
+			}
+			break;
+		}
+	}
+	// (render1 F2, KYTY_RENDER1=2: a p0/p1 depth draw into the native batch; before anything is bound or compared with
+	// what is bound: a new batch starts by copying the depth and invalidates the graphics state)
+	const bool render1 = Render1::Mode() == 2 && Render1::t_current.native &&
+	                     Render1Begin(buffer, draw_state,
+	                                  direct != nullptr || commands.empty() ? Render1::RDirect
+	                                  : writes                              ? Render1::RWrites
+	                                  : variant.hwrt_scene && HwScene::Active() ? Render1::RHwrt
+	                                                                            : Render1::Reasons);
 	auto&      emit       = cache.emit;
 	const bool indexed    = direct == nullptr || direct->indexed; // (a draw of vertices binds no indices)
 	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
@@ -2685,6 +2867,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool own           = Spec::Current() == nullptr;
+	// (f5b) A verified pass's targets (KYTY_NATIVE_PASSES ..:2; one load otherwise).
+	if (own && NativeRender::NoteTargetsWanted()) // (pt1: BB_PATHTRACING's GBuffer / ResolveLighting targets too)
+		for (const auto& target: draw_state.targets)
+			NativeRender::NoteTarget(target.id.index, target.id.generation, target.range.base_level, target.range.base_layer,
+			                         target.requested.IsDepth());
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own;
 	if (!in_place) {
@@ -2711,7 +2898,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's draws take its capturing pipeline (same layout), on this
 	// render thread only; the first record of each draw call goes in push constant dword HwScene::CursorDword.
 	bool hwrt_capture = false;
-	if (variant.hwrt_scene && HwScene::Active()) {
+	// (pt1) BB_PATHTRACING: only inside the game's capture scopes (GBuffer, VirtualGeo: the frame map); CaptureHere is
+	// true when it is off.
+	if (variant.hwrt_scene && HwScene::Active() && PathTrace::CaptureHere()) {
 		const uint32_t draws = direct != nullptr ? 1u : static_cast<uint32_t>(commands.size());
 		if (Role() != 0 || Spec::Current() != nullptr) {
 			HwScene::NoteSkip(HwScene::Skip::Speculation, draws);
@@ -2753,6 +2942,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 				d.ps_module = variant.hwrt_ps_module;
 				d.ps_images = &set->hwrt_ps_images;
 				d.cache     = &texture_cache;
+			} else if (PathTrace::Requested()) {
+				d.ps_module = variant.hwrt_ps_module; // (pt1: whether it discards - alpha-tested meshes stay out of the rays)
 			}
 			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
 			d.index_count    = index_count;
@@ -2761,6 +2952,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
 			if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
 				HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+				HwScene::NoteGpuWrittenKind(false); // (pt1e: the indices)
 				return false;
 			}
 			d.index_address = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
@@ -2787,6 +2979,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
 				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
 					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					HwScene::NoteGpuWrittenKind(true); // (pt1e: the indirect arguments)
 					continue;
 				}
 				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
@@ -2853,6 +3046,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
 	}
+	if (render1 && !hwrt_capture)
+		Render1Add(buffer, draw_state, pipeline, set->set, {}, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		           {push_data.dwords.data(), push_dwords}, !same_index, !same_index ? indices.first->Handle() : vk::Buffer {},
+		           !same_index ? indices.second : 0, index_base, index_bytes, index_type, {arguments.data(), groups},
+		           {group_sizes.data(), groups}, commands);
 	if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
 	if (Render5Flags::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
@@ -3299,6 +3497,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (KYTY_HWRT: the TAA's dispatch is where the scene's acceleration structures are built, on the normal path.)
 	if (HwScene::Active() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: hardware ray tracing (TAA)", false;
+	// (pt1) BB_PATHTRACING reads the images of the dispatches in a few scopes (ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR: ~45 a frame): the normal path, whose bindings reach PathTrace::AfterDispatch.
+	if (PathTrace::Requested() && Role() == 0 && PathTrace::WantDispatchHook())
+		return m_dispatch_declined = "table: path tracing (scope images)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
@@ -3499,6 +3701,45 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// (p7b, C1 precise: local/p7-compat.h) As DispatchDirect's: the hazards against the chain's earlier dispatches,
+	// from the guest ranges of its V#s (the words TableBlocks resolved); one barrier only where there is one.
+	if (chain && P7::Tracking()) {
+		const auto&                     shader  = *pair.programs[0];
+		const auto&                     entries = OwnTable().entries[0];
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count   = 0;
+		bool                            unknown = shader.info.uses_dma || shader.table_plan.global_memory ||
+		                                          shader.table_plan.dynamic_reads;
+		for (size_t i = 0; i < entries.size() && i < shader.info.buffers.size(); ++i) {
+			ShaderBufferResource descriptor;
+			std::copy_n(entries[i].first.begin(), 4, descriptor.fields);
+			const auto address = descriptor.Base48();
+			const auto bytes   = descriptor.Stride() != 0 ? uint64_t {descriptor.Stride()} * descriptor.NumRecords()
+			                                              : uint64_t {descriptor.NumRecords()};
+			if (descriptor.Type() != 0 || address == 0 || bytes == 0) continue;
+			if (count == accesses.size()) {
+				unknown = true;
+				break;
+			}
+			const auto& resource = shader.info.buffers[i];
+			accesses[count++]    = {.begin  = address,
+			                        .end    = address + bytes,
+			                        .read   = resource.read,
+			                        .write  = resource.written,
+			                        .atomic = resource.atomic};
+		}
+		const auto hazard = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(), count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -3516,7 +3757,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always)
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7)
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);

@@ -732,6 +732,37 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 	return result;
 }
 
+// A texel read of a storage image (EmitStorageImageRead), as a sampled image's view would give it: a format the device
+// converts unpacked (UnpackImageTexel, its swizzle with it); otherwise the swizzle a storage view cannot take, each
+// component the channel its selector names, or 0 or 1 of the image's class.
+uint32_t StorageReadTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
+	if (ImageConversionFormat(ctx.state, mem).format != Prospero::BufferFormat::kInvalid) {
+		return UnpackImageTexel(ctx, mem, texel);
+	}
+	auto&       state   = ctx.state;
+	const auto& image   = state.program.info.images[mem.resource];
+	const auto  swizzle = image.shader_swizzle;
+	if (swizzle == IR::ShaderImageIdentitySwizzle) return texel;
+	const bool integer     = image.numeric_class == Prospero::TextureNumericClass::Uint;
+	const auto scalar_type = ImageScalarType(state, image.numeric_class);
+	uint32_t   selected[4] {};
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = (swizzle >> (component * 3u)) & 7u;
+		if (selector >= 4u) {
+			selected[component] = state.builder.AllocateId();
+			state.builder.AddFunction({OpCompositeExtract, scalar_type, selected[component], texel, selector - 4u});
+		} else if (selector == 1u) {
+			selected[component] = integer ? ConstantU32(state, 1u) : ConstantF32(state, 0x3f800000u);
+		} else {
+			selected[component] = integer ? ConstantU32(state, 0u) : ZeroF32(state);
+		}
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, ImageVectorType(state, image.numeric_class, 4), result,
+	                           selected[0], selected[1], selected[2], selected[3]});
+	return result;
+}
+
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
@@ -934,6 +965,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
+			        if (image.resource_class == IR::ImageResourceClass::Storage) {
+				        // The storage image it stores to as well (IR::TrackResources' `storage_reads`), in the pixel
+				        // interlock: coherent, so a later decal reads what an earlier one wrote.
+				        const auto texel =
+				            EmitStorageImageRead(state, mem.resource, CoordU32(ctx, mem, *address, dimension));
+				        return ResultVector(ctx, StorageReadTexel(ctx, mem, texel), numeric_class, false, mem);
+			        }
 			        const auto descriptor = LoadSampledImageDescriptor(state, mem.resource);
 			        const auto color      = state.builder.AllocateId();
 			        const auto coord      = CoordU32(ctx, mem, *address, dimension);

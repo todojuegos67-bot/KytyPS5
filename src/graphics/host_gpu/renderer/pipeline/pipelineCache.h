@@ -188,6 +188,10 @@ public:
 	static bool MergeDriverCacheShards(GraphicContext& graphics, uint32_t shards);
 	static bool DriverCacheWarm(GraphicContext& graphics, uint32_t shards, uint32_t* done = nullptr);
 #endif
+	// (up1118) The translation features the static store was made with (ShaderRecompiler::Frontend::TranslatorFeatures,
+	// the precompile's stamp; all without a store), before the device is made: the emulator enables the pixel interlock's
+	// extension only where the store's translation may use it (vulkanWindow.cpp).
+	static uint32_t StaticStoreFeatures();
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
 	// a worker compiles the optimized one, which then replaces it (PromoteOptimized).
@@ -501,6 +505,7 @@ private:
 	// m_warmup_thread, their programs translated first (local/tiron1.h). m_tiron1_quiet: GetPrefetchProgress leaves
 	// that warmup's phase out (no "Preparing" line on screen while playing).
 	void              Tiron1WarmCompute(uint64_t compute_video);
+	void              Tiron6WaitInFront(); // (tiron6 v2: start-up waits for Tiron1WarmCompute)
 	std::atomic<bool> m_tiron1_quiet {false};
 	// Pipelines made where first needed (CreateGraphicsPipeline, CreateComputePipeline), and the time it took.
 	uint64_t m_render_pipelines   = 0;

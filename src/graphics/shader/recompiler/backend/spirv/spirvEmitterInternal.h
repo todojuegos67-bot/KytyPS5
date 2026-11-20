@@ -34,6 +34,7 @@ enum : uint32_t {
 	ExecutionModeLocalSize                   = 17,
 	ExecutionModeSignedZeroInfNanPreserve    = 4461,
 	ExecutionModeDerivativeGroupQuadsKHR     = 5289,
+	ExecutionModePixelInterlockOrderedEXT    = 5366,
 	AddressingModelLogical                   = 0,
 	AddressingModelPhysicalStorageBuffer64   = 5348,
 	MemoryModelGLSL450                       = 1,
@@ -47,6 +48,7 @@ enum : uint32_t {
 	CapabilitySampled1D                      = 43,
 	CapabilityImage1D                        = 44,
 	CapabilityImageQuery                     = 50,
+	CapabilityStorageImageReadWithoutFormat  = 55,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
 	CapabilityGroupNonUniformVote            = 62,
@@ -60,6 +62,7 @@ enum : uint32_t {
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
 	CapabilityPhysicalStorageBufferAddresses = 5347,
+	CapabilityFragmentShaderPixelInterlockEXT = 5378,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
@@ -81,6 +84,7 @@ enum : uint32_t {
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
 	DecorationAliased       = 20,
+	DecorationCoherent      = 23,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -187,6 +191,7 @@ enum : uint32_t {
 	OpImageFetch                   = 95,
 	OpImageGather                  = 96,
 	OpImageDrefGather              = 97,
+	OpImageRead                    = 98,
 	OpImageWrite                   = 99,
 	OpImageQuerySizeLod            = 103,
 	OpImageQueryLod                = 105,
@@ -280,6 +285,8 @@ enum : uint32_t {
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
+	OpBeginInvocationInterlockEXT  = 5364,
+	OpEndInvocationInterlockEXT    = 5365,
 	OpGroupNonUniformElect         = 333,
 	OpGroupNonUniformAllEqual      = 336,
 	OpGroupNonUniformIAdd          = 349,
@@ -430,6 +437,8 @@ struct EmitterState {
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
+	// (UsesPixelInterlock) The guest program's function, which the entry point calls inside the interlock.
+	uint32_t                   interlock_guest_func                  = 0;
 	uint32_t                   mesh_allocation                       = 0;
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
@@ -619,6 +628,13 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
 
 uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
+
+// A storage image the shader reads (IR::TrackResources' `storage_reads`): coherent, its texel read as `numeric_class`.
+uint32_t EmitStorageImageRead(EmitterState& state, uint32_t resource, uint32_t coord);
+
+// A pixel shader that reads a storage image (IR::TrackResources' `storage_reads`, which only the pixel interlock gives):
+// its program runs inside a pixel-ordered critical section of VK_EXT_fragment_shader_interlock.
+[[nodiscard]] bool UsesPixelInterlock(const EmitterState& state);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);

@@ -67,6 +67,9 @@
 #include <vector>
 
 #include "local-platform.h"
+#include "mem1.h" // (mem1: the emulator's windows over the streamed textures' zone, stamped)
+#include "ram-native-tex.h" // (ram1b: KYTY_RAM_NATIVE_TEX)
+#include "tiron4-counters.h" // (tiron4)
 #include "raiz.h" // (ram15: KYTY_RAIZ forces KYTY_NATIVE_MEMORY=1 at its first read)
 
 #if defined(_WIN32)
@@ -191,7 +194,15 @@ struct Range {
 	// (ram20, KYTY_RAM20) A cold range taken because video memory holds a copy of it: 1 + its kind (GpuResidency::Kind:
 	// texture, render target, GPU-written image, buffer, GPU-written buffer); 0: none (a RAM18 range or a texture).
 	uint8_t                               r20       = 0;
+	// (ram1b, KYTY_RAM_NATIVE_TEX=1) A cold range taken because a GPU cache's image holds it: 1 a texture array's layers
+	// (VirtualMemoryGPU), 2 a render target (RTShared/RTPersist); 0: none.
+	// (ram2, KYTY_RAM2=1) 3 (RntRam2): memory of that zone no image has used for KYTY_RAM2_AGE_S since it was mapped. Its
+	// bytes' hash as written to the disk store (r2_hashed: kept whole since; a range cut by an unmap is not verified).
+	uint8_t                               rnt       = 0;
+	uint64_t                              r2_hash   = 0;
+	bool                                  r2_hashed = false;
 };
+constexpr uint8_t RntRam2 = 3; // (ram2: Range::rnt of its ranges; not one of State::RntKinds, whose counters stay ram1b's)
 
 // Set by the texture cache: the page manager's read watchers of a guest range removed; a restore of the discarded ranges
 // over a guest range by the render thread (any thread CanWait allows: it returns when they are back); whether the calling
@@ -272,6 +283,18 @@ struct State {
 	uint64_t r20_now[R20Kinds] {}, r20_peak = 0, r20_taken[R20Kinds] {}, r20_taken_bytes[R20Kinds] {};
 	uint64_t r20_reads[R20Kinds] {}, r20_read_bytes[R20Kinds] {}, r20_read_us = 0, r20_read_us_max = 0;
 	uint64_t r20_zero_bytes = 0, r20_written_bytes = 0, r20_lost = 0, r20_failed = 0, r20_released = 0;
+	// (ram1b, KYTY_RAM_NATIVE_TEX=1) Its ranges by kind (index rnt - 1: arrays, render targets), within the cold ones; the
+	// touches that brought them back by how long after the take (<10 s, <60 s, later).
+	static constexpr size_t RntKinds = 2;
+	uint64_t rnt_now[RntKinds] {}, rnt_peak = 0, rnt_taken[RntKinds] {}, rnt_taken_bytes[RntKinds] {};
+	uint64_t rnt_reads[RntKinds] {}, rnt_read_bytes[RntKinds] {}, rnt_read_us = 0, rnt_read_us_max = 0;
+	uint64_t rnt_zero_bytes = 0, rnt_written_bytes = 0, rnt_lost = 0, rnt_failed = 0, rnt_released = 0, rnt_ages[3] {};
+	// (ram2, KYTY_RAM2=1) Its ranges' numbers (Range::rnt == RntRam2), within the cold ones: out of RAM now and peak, taken,
+	// written / all zero / not written, read back by a touch (bytes, time, the longest, by age since the take: <10 s,
+	// <60 s, later), unmapped while out, lost; the verification of each read back (checked, equal, DISCREPANCIA, time).
+	uint64_t r2_now = 0, r2_peak = 0, r2_taken = 0, r2_taken_bytes = 0, r2_written_bytes = 0, r2_zero_bytes = 0, r2_failed = 0;
+	uint64_t r2_reads = 0, r2_read_bytes = 0, r2_read_us = 0, r2_read_us_max = 0, r2_ages[3] {}, r2_unmapped = 0, r2_lost = 0;
+	uint64_t r2_checked = 0, r2_checked_bytes = 0, r2_equal = 0, r2_discrepancy = 0, r2_unchecked = 0, r2_check_us = 0;
 };
 
 inline State& Get() {
@@ -304,7 +327,7 @@ inline int Ram17HoldSeconds() {
 	static const int seconds = [] {
 		if (!Ram17On()) return 0;
 		const char* value = std::getenv("KYTY_RAM17_HOLD_S");
-		if (value == nullptr || value[0] == '\0') return 30;
+		if (value == nullptr || value[0] == '\0') return Tiron4::TexOn() ? 300 : 30; // (tiron5: KYTY_TIRON5_TEX=1)
 		const long asked = std::strtol(value, nullptr, 10);
 		return asked <= 0 ? 0 : static_cast<int>(std::min<long>(asked, 3600));
 	}();
@@ -337,8 +360,12 @@ inline bool Ram18Own() {
 	}();
 	return on;
 }
+// (ram1b) KYTY_RAM_NATIVE_TEX=1 takes its ranges through the cold-range path too (=2 takes none).
+inline bool RntAsked() {
+	return RamNativeTex::Mode() == 1;
+}
 inline bool Ram18On() {
-	static const bool on = (Ram18Own() || Ram20Asked()) && Ram17On();
+	static const bool on = (Ram18Own() || Ram20Asked() || RntAsked()) && Ram17On();
 	return on;
 }
 inline bool Ram20Active() {
@@ -368,7 +395,7 @@ inline int Ram16RetakeSeconds() {
 		const char* on = std::getenv("KYTY_RAM16");
 		if (on == nullptr || on[0] != '1') return 0;
 		const char* value = std::getenv("KYTY_RAM16_RETAKE_S");
-		if (value == nullptr || value[0] == '\0') return 60;
+		if (value == nullptr || value[0] == '\0') return Tiron4::TexOn() ? 300 : 60; // (tiron5: KYTY_TIRON5_TEX=1)
 		const long asked = std::strtol(value, nullptr, 10);
 		return asked <= 0 ? 0 : static_cast<int>(std::min<long>(asked, 3600));
 	}();
@@ -661,7 +688,7 @@ inline void Add(uint64_t vaddr, uint64_t size, std::vector<Piece> pieces, uint64
 // touched, restored or dropped since it was taken. Under the state's lock: no touch or restore of it meanwhile.
 inline bool DiscardRangeNative(uint64_t begin);
 inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off, uint64_t* file_len,
-                           bool* zero = nullptr); // (ram17, below)
+                           bool* zero = nullptr, uint64_t* hash = nullptr); // (ram17, below; ram2: `hash`)
 inline bool DiscardRange(uint64_t begin) {
 	if (Native()) return DiscardRangeNative(begin);
 	auto&           state = Get();
@@ -747,6 +774,7 @@ inline bool DiscardRangeNative(uint64_t begin) {
 	std::vector<Piece> pieces;
 	bool               cold = false; // (ram18)
 	uint8_t            r20  = 0;     // (ram20)
+	uint8_t            rnt  = 0;     // (ram1b)
 	{
 		std::lock_guard lock(state.mutex);
 		const auto      it = state.guest.find(begin);
@@ -759,6 +787,7 @@ inline bool DiscardRangeNative(uint64_t begin) {
 		pieces = it->second.pieces;
 		cold   = it->second.cold;
 		r20    = it->second.r20;
+		rnt    = it->second.rnt;
 	}
 	// (ram18) A cold range is let go (its bytes left in RAM, its watchers removed: Drain) unless its bytes are in the disk
 	// store; all zero, it is only reset (a reset page reads as its old bytes or zeros: zeros either way) and let go too.
@@ -772,10 +801,14 @@ inline bool DiscardRangeNative(uint64_t begin) {
 		}
 		if (failed) state.cold_failed++;
 		if (failed && r20 != 0) state.r20_failed++;
+		if (failed && rnt != 0 && rnt <= State::RntKinds) state.rnt_failed++; // (ram1b)
+		if (failed && rnt == RntRam2) state.r2_failed++;                        // (ram2)
 		if (zero_bytes != 0) {
 			state.cold_zero++;
 			state.cold_zero_bytes += zero_bytes;
 			if (r20 != 0) state.r20_zero_bytes += zero_bytes;
+			if (rnt != 0 && rnt <= State::RntKinds) state.rnt_zero_bytes += zero_bytes; // (ram1b)
+			if (rnt == RntRam2) state.r2_zero_bytes += zero_bytes;                     // (ram2)
 		}
 		it->second.dropped = 0;
 		if (!it->second.touched) {
@@ -797,13 +830,14 @@ inline bool DiscardRangeNative(uint64_t begin) {
 	for (const auto& piece: pieces) range_bytes += piece.size;
 	uint64_t file_off = 0, file_len = 0;
 	bool     zero     = false; // (ram18: a cold range all zeros)
+	uint64_t hash     = 0;     // (ram2: its bytes' hash as written)
 	if (cold && (!Ram17On() || range_bytes > FileChunk)) {
 		let_go(true, 0);
 		return true;
 	}
 	if (Ram17On() && (range_bytes <= file_max || cold)) {
 		const auto file_start = std::chrono::steady_clock::now();
-		const bool written    = FileWriteRange(pieces, &file_off, &file_len, cold ? &zero : nullptr);
+		const bool written    = FileWriteRange(pieces, &file_off, &file_len, cold ? &zero : nullptr, rnt == RntRam2 ? &hash : nullptr);
 		const auto file_us    = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - file_start).count());
 		if (cold && !written && !zero) {
@@ -817,6 +851,8 @@ inline bool DiscardRangeNative(uint64_t begin) {
 				state.cold_written_bytes += file_len;
 				state.cold_write_us += file_us;
 				if (r20 != 0) state.r20_written_bytes += file_len;
+				if (rnt != 0 && rnt <= State::RntKinds) state.rnt_written_bytes += file_len; // (ram1b)
+				if (rnt == RntRam2) state.r2_written_bytes += file_len;                     // (ram2)
 			}
 		} else if (written) {
 			state.file_writes++;
@@ -874,6 +910,10 @@ inline bool DiscardRangeNative(uint64_t begin) {
 		if (dropped != 0 && !it->second.touched && it->second.file_len == 0 && file_len == it->second.guest_end - begin) {
 			it->second.file_off = file_off;
 			it->second.file_len = file_len;
+			if (it->second.rnt == RntRam2) { // (ram2: verified when read back)
+				it->second.r2_hash   = hash;
+				it->second.r2_hashed = true;
+			}
 		} else {
 			FileFree(file_off, file_len);
 		}
@@ -895,6 +935,16 @@ inline bool DiscardRangeNative(uint64_t begin) {
 			uint64_t all = 0;
 			for (const auto v: state.r20_now) all += v;
 			state.r20_peak = std::max(state.r20_peak, all);
+		}
+		if (it->second.rnt != 0 && it->second.rnt <= State::RntKinds) { // (ram1b)
+			state.rnt_now[it->second.rnt - 1] += it->second.dropped;
+			uint64_t all = 0;
+			for (const auto v: state.rnt_now) all += v;
+			state.rnt_peak = std::max(state.rnt_peak, all);
+		}
+		if (it->second.rnt == RntRam2) { // (ram2)
+			state.r2_now += it->second.dropped;
+			state.r2_peak = std::max(state.r2_peak, state.r2_now);
 		}
 		return true;
 	}
@@ -988,6 +1038,17 @@ inline void CountLocked(State& state, std::map<uint64_t, Range>::iterator it, To
 			auto& now = state.r20_now[range.r20 - 1];
 			now -= std::min(now, range.dropped);
 			state.r20_released++;
+		}
+		if (range.rnt != 0 && range.rnt <= State::RntKinds) { // (ram1b)
+			auto& now = state.rnt_now[range.rnt - 1];
+			now -= std::min(now, range.dropped);
+			state.rnt_released++;
+			const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - range.since).count();
+			state.rnt_ages[seconds < 10 ? 0 : seconds < 60 ? 1 : 2]++;
+		}
+		if (range.rnt == RntRam2) { // (ram2: its touches by age are counted where it is read back)
+			state.r2_now -= std::min(state.r2_now, range.dropped);
+			if (touch == Touch::Unmap || touch == Touch::HostOverwrite) state.r2_unmapped += size;
 		}
 		state.cold_ranges -= std::min<uint64_t>(state.cold_ranges, 1);
 		state.cold_released++;
@@ -1145,6 +1206,11 @@ inline void NoteCheck(uint64_t images, uint64_t bytes, uint64_t failed) {
 #if defined(_WIN32)
 // (ram15) Native memory: this thread's write of restored bytes (its own window must not ask for them again).
 inline thread_local bool t_native_writing = false;
+// (ram2b) This thread's last fault on a ram2 range: its page, how many times in a row (within a second), when.
+inline thread_local uint64_t                              t_r2_page   = 0;
+inline thread_local uint32_t                              t_r2_repeat = 0;
+inline thread_local std::chrono::steady_clock::time_point t_r2_when {};
+constexpr uint32_t                                        Ram2RepeatMax = 8;
 
 // (ram15, native) Restored bytes written over guest [vaddr, vaddr + size) through a write window (memory.cpp
 // NativeOffloadWrite); without native memory, a plain copy as before.
@@ -1168,10 +1234,12 @@ inline void WriteBack(uint64_t vaddr, const void* data, uint64_t size) {
 // the disk store of their size: read through a window (memory.cpp NativeGuardedRead: the pages are no-access by then;
 // this thread's window does not ask the offload for them, t_native_writing), a MiB at a time. False: nothing kept.
 // (ram18) `zero`: asked for a range of one chunk at most; set when its bytes are all zero (nothing written, false).
-inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off, uint64_t* file_len, bool* zero) {
+// (ram2) `hash`: the bytes written, hashed (RamNativeTex::Ram2Hash, chunk after chunk).
+inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off, uint64_t* file_len, bool* zero, uint64_t* hash) {
 	*file_off = 0;
 	*file_len = 0;
 	if (zero != nullptr) *zero = false;
+	if (hash != nullptr) *hash = 0;
 	auto&      state = Get();
 	const auto read  = state.native_read.load(std::memory_order_acquire);
 	uint64_t   bytes = 0;
@@ -1205,6 +1273,7 @@ inline bool FileWriteRange(const std::vector<Piece>& pieces, uint64_t* file_off,
 					return false;
 				}
 			}
+			if (ok && hash != nullptr) *hash = RamNativeTex::Ram2Hash(*hash, staging, n); // (ram2)
 			ok               = ok && FileIo(true, offset + at, staging, n);
 			done += n;
 			at += n;
@@ -1230,9 +1299,17 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 inline size_t FileRestore(uint64_t vaddr, uint64_t size, Touch touch, bool remove_now) {
 	// (A range the offload worker was writing and dropping meanwhile has its copy on disk once that is over: looked at
 	// again after the wait, so that a thread that cannot wait for the render thread finds it there.)
+	const auto   tiron5_begin = std::chrono::steady_clock::now(); // (tiron5: the [tiron3] line's RAM17 restore ms)
 	bool         waited = false;
-	const size_t first  = FileRestoreOnce(vaddr, size, touch, remove_now, &waited);
-	return waited ? first + FileRestoreOnce(vaddr, size, touch, remove_now, &waited) : first;
+	size_t       first  = FileRestoreOnce(vaddr, size, touch, remove_now, &waited);
+	if (waited) first += FileRestoreOnce(vaddr, size, touch, remove_now, &waited);
+	if (first != 0) {
+		Tiron4::g_restore_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                   std::chrono::steady_clock::now() - tiron5_begin).count()),
+		                               std::memory_order_relaxed);
+		Tiron4::g_restores.fetch_add(first, std::memory_order_relaxed);
+	}
+	return first;
 }
 inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool remove_now, bool* waited) {
 	*waited    = false;
@@ -1246,6 +1323,9 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 		std::chrono::steady_clock::time_point since;
 		bool                                  cold = false; // (ram18)
 		uint8_t                               r20  = 0;     // (ram20)
+		uint8_t                               rnt  = 0;     // (ram1b)
+		uint64_t                              r2_hash   = 0;     // (ram2)
+		bool                                  r2_hashed = false; // (ram2)
 	};
 	std::vector<Job> jobs;
 	bool             wait = false;
@@ -1264,11 +1344,13 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 			range.restoring = true;
 			range.restorer  = std::this_thread::get_id();
 			state.restoring_ranges.fetch_add(1, std::memory_order_acq_rel);
-			jobs.push_back({it->first, range.guest_end, range.file_off, range.pieces, range.since, range.cold, range.r20});
+			jobs.push_back({it->first, range.guest_end, range.file_off, range.pieces, range.since, range.cold, range.r20, range.rnt,
+			                range.r2_hash, range.r2_hashed});
 		}
 	}
 	const auto write  = state.native_write.load(std::memory_order_acquire);
 	const auto forget = state.native_forget.load(std::memory_order_acquire);
+	std::vector<uint64_t> r2_slow; // (ram2b: ram2 ranges whose read back took over KYTY_RAM2_SLOW_MS)
 	for (const auto& job: jobs) {
 		const auto start   = std::chrono::steady_clock::now();
 		uint8_t*   staging = FileStaging();
@@ -1295,6 +1377,34 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 		}
 		const auto now = std::chrono::steady_clock::now();
 		const auto us  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - start).count());
+		if (job.rnt == RntRam2 && us > static_cast<uint64_t>(RamNativeTex::Ram2SlowMs()) * 1000u) r2_slow.push_back(job.begin);
+		// (ram2) Verification: the guest bytes now (read through this thread's window: the range is still marked as being
+		// restored by it, no other touch meanwhile) hashed against those written to the disk store.
+		int      r2_check    = 0; // 0 not checked, 1 equal, 2 different
+		uint64_t r2_check_us = 0;
+		if (ok && job.rnt == RntRam2 && job.r2_hashed) {
+			const auto check_start = std::chrono::steady_clock::now();
+			const auto read        = state.native_read.load(std::memory_order_acquire);
+			uint64_t   h           = 0;
+			bool       read_ok     = read != nullptr && staging != nullptr;
+			for (const auto& piece: job.pieces) {
+				for (uint64_t done = 0; read_ok && done < piece.size;) {
+					const uint64_t n = std::min(FileChunk, piece.size - done);
+					t_native_writing = true;
+					read_ok          = read(staging, reinterpret_cast<const void*>(piece.backing + done), n);
+					t_native_writing = false;
+					if (read_ok) h = RamNativeTex::Ram2Hash(h, staging, n);
+					done += n;
+				}
+			}
+			r2_check    = !read_ok ? 0 : h == job.r2_hash ? 1 : 2;
+			r2_check_us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - check_start).count());
+			if (r2_check == 2)
+				std::printf("[ram2] DISCREPANCIA: 0x%llx..0x%llx leido del disco no coincide con lo escrito (hash %016llx, ahora %016llx)\n",
+				            static_cast<unsigned long long>(job.begin), static_cast<unsigned long long>(job.end),
+				            static_cast<unsigned long long>(job.r2_hash), static_cast<unsigned long long>(h));
+		}
 		std::lock_guard lock(state.mutex);
 		auto            it = state.guest.find(job.begin);
 		if (it != state.guest.end()) {
@@ -1308,6 +1418,8 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 				// (ram18) No image to restore it from: its bytes are lost (never seen: 0 file failures in RAM17's runs).
 				state.cold_lost++;
 				if (job.r20 != 0) state.r20_lost++; // (ram20)
+				if (job.rnt != 0 && job.rnt <= State::RntKinds) state.rnt_lost++; // (ram1b)
+				if (job.rnt == RntRam2) state.r2_lost++;                          // (ram2)
 				std::printf("[ram18] PERDIDO: lectura del disco fallida de 0x%llx..0x%llx (sin imagen de la que volver)\n",
 				            static_cast<unsigned long long>(job.begin), static_cast<unsigned long long>(job.end));
 			} else if (!ok) {
@@ -1330,17 +1442,44 @@ inline size_t FileRestoreOnce(uint64_t vaddr, uint64_t size, Touch touch, bool r
 				state.r20_read_us += us;
 				state.r20_read_us_max = std::max(state.r20_read_us_max, us);
 			}
+			if (job.rnt != 0 && job.rnt <= State::RntKinds) { // (ram1b)
+				state.rnt_reads[job.rnt - 1]++;
+				state.rnt_read_bytes[job.rnt - 1] += job.end - job.begin;
+				state.rnt_read_us += us;
+				state.rnt_read_us_max = std::max(state.rnt_read_us_max, us);
+			}
+			if (job.rnt == RntRam2) { // (ram2)
+				const double seconds = std::chrono::duration<double>(now - job.since).count();
+				state.r2_reads++;
+				state.r2_read_bytes += job.end - job.begin;
+				state.r2_read_us += us;
+				state.r2_read_us_max = std::max(state.r2_read_us_max, us);
+				state.r2_ages[seconds < 10 ? 0 : seconds < 60 ? 1 : 2]++;
+				if (r2_check == 0) state.r2_unchecked++;
+				else {
+					state.r2_checked++;
+					state.r2_checked_bytes += job.end - job.begin;
+					state.r2_check_us += r2_check_us;
+					if (r2_check == 1) state.r2_equal++;
+					else state.r2_discrepancy++;
+				}
+			}
 			if (Ram17HoldSeconds() != 0) state.recent[job.begin] = {job.end, now};
 		} else if (ok) {
 			state.file_reads++;
 			state.file_read_bytes += job.end - job.begin;
 			state.file_read_us += us;
+			Tiron4::g_ram17_us.fetch_add(us, std::memory_order_relaxed), Tiron4::g_ram17_reads.fetch_add(1, std::memory_order_relaxed); // (tiron4)
 			state.file_read_us_max = std::max(state.file_read_us_max, us);
 			if (now - job.since < std::chrono::seconds(30)) state.file_quick++;
 			if (Ram17HoldSeconds() != 0) state.recent[job.begin] = {job.end, now};
 		} else {
 			state.file_read_failed++;
 		}
+	}
+	for (const auto begin: r2_slow) { // (ram2b)
+		RamNativeTex::Ram2Guards().slow.fetch_add(1, std::memory_order_relaxed);
+		RamNativeTex::Ram2Block(begin, "lectura del disco lenta", "");
 	}
 	if (remove_now && !jobs.empty()) {
 		std::vector<std::pair<uint64_t, uint64_t>> ranges;
@@ -1398,11 +1537,13 @@ inline bool OnFaultNative(uint64_t address, uint64_t rip, const void* native_con
 	auto& state = Get();
 	if (address < state.guest_lo.load(std::memory_order_relaxed) || address >= state.guest_hi.load(std::memory_order_relaxed))
 		return false;
-	enum class Act { Wait, Download, Remove, Open, File } act = Act::Wait;
+	enum class Act { Wait, Download, Remove, Open, File, Escape } act = Act::Wait;
 	std::vector<std::pair<uint64_t, uint64_t>> now;
 	uint64_t                                   begin = 0, size = 0;
 	Touch                                      touch = Touch::GameRead;
 	bool                                       host_code = false;
+	bool                                       ram2      = false; // (ram2b)
+	const auto                                 r2_start  = std::chrono::steady_clock::now();
 	{
 		std::unique_lock lock(state.mutex);
 		auto             found = state.guest.upper_bound(address);
@@ -1417,7 +1558,33 @@ inline bool OnFaultNative(uint64_t address, uint64_t rip, const void* native_con
 		touch           = host ? (write ? Touch::EmulatorGuestWrite : Touch::EmulatorGuestRead) : (write ? Touch::GameWrite : Touch::GameRead);
 		const auto can_wait = state.can_wait.load(std::memory_order_acquire);
 		const bool can = state.restore.load(std::memory_order_acquire) != nullptr && can_wait != nullptr && can_wait();
-		if (range.restoring) {
+		if (range.rnt == RntRam2) {
+			// (ram2b) A ram2 range (cold: only the disk store gives it back; the GPU path never does - a "Download" or a miss
+			// would leave the page protected and the fault coming back for ever). The same page faulting again and again on
+			// this thread (more than Ram2RepeatMax times within a second): let go whatever its state (Escape).
+			ram2 = true;
+			const uint64_t page = address >> 12u;
+			if (page == t_r2_page && r2_start - t_r2_when < std::chrono::seconds(1)) t_r2_repeat++;
+			else t_r2_page = page, t_r2_repeat = 1;
+			t_r2_when = r2_start;
+			if (t_r2_repeat > Ram2RepeatMax) {
+				act = Act::Escape;
+			} else if (range.restoring) {
+				if (range.restorer == std::this_thread::get_id()) return false; // (not ours: this thread restores it)
+				act = Act::Wait; // (the RAM18 thread writing it to the disk store, or another thread reading it back)
+			} else if (range.touched) {
+				range.missed = false; // (never a miss: its bytes are in RAM or were read back)
+				if (!host) act = Act::Remove, now = TakePendingLocked(state);
+				else act = Act::Open;
+			} else if (range.file_len != 0) {
+				act = Act::File;
+			} else {
+				// Not dropped yet: its bytes are there. Let go.
+				TouchLocked(state, found, touch, host ? rip : 0, host ? CallerOf(native_context) : 0);
+				if (!host) act = Act::Remove, now = TakePendingLocked(state);
+				else act = Act::Open;
+			}
+		} else if (range.restoring) {
 			if (range.restorer == std::this_thread::get_id()) return false; // (not ours: this thread restores it)
 			act = can ? Act::Download : Act::Wait; // (a restore waits for the other one first, its GPU work submitted)
 		} else if (range.touched) {
@@ -1478,6 +1645,43 @@ inline bool OnFaultNative(uint64_t address, uint64_t rip, const void* native_con
 			}
 			break;
 		}
+		case Act::Escape: {
+			// (ram2b) Its bytes back from the disk store if they are there, then let go and opened, whatever its state; its
+			// window out of ram2.
+			t_r2_repeat = 0;
+			(void)FileRestore(begin, size, touch, !host_code);
+			{
+				std::lock_guard lock(state.mutex);
+				const auto      it = state.guest.find(begin);
+				if (it != state.guest.end() && it->second.rnt == RntRam2 && !it->second.restoring) {
+					if (!it->second.touched) TouchLocked(state, it, touch);
+					it->second.missed = false;
+					now               = TakePendingLocked(state);
+				}
+			}
+			RemoveAll(state, now);
+			const auto open = state.native_open.load(std::memory_order_acquire);
+			if (open != nullptr) (void)open(begin, size, write);
+			auto& guard = RamNativeTex::Ram2Guards();
+			guard.repeats.fetch_add(1, std::memory_order_relaxed);
+			guard.escapes.fetch_add(1, std::memory_order_relaxed);
+			char label[24] {};
+			(void)Loader::DemonsSoulsMemMap::LabelAt(address, label, sizeof(label));
+			RamNativeTex::Ram2Block(address, "fallo repetido en la misma pagina", label);
+			break;
+		}
+	}
+	if (ram2) { // (ram2b) A fault that took too long: its window out of ram2.
+		const auto us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - r2_start).count());
+		auto& guard = RamNativeTex::Ram2Guards();
+		if (us > guard.slow_us_max.load(std::memory_order_relaxed)) guard.slow_us_max.store(us, std::memory_order_relaxed);
+		if (us > static_cast<uint64_t>(RamNativeTex::Ram2SlowMs()) * 1000u) {
+			guard.slow.fetch_add(1, std::memory_order_relaxed);
+			char label[24] {};
+			(void)Loader::DemonsSoulsMemMap::LabelAt(address, label, sizeof(label));
+			RamNativeTex::Ram2Block(address, "fallo lento", label);
+		}
 	}
 	return true;
 }
@@ -1508,6 +1712,7 @@ inline void ThreadWho(char* out, size_t size, bool gate_held) {
 // waiting for the render thread. One that cannot wait (the upload worker, deferred GPU work, a recorder, a window inside
 // a window) is a miss: counted; the window copies what is there, the range restored after (Drain).
 inline void NativeBeforeWindow(uint64_t vaddr, uint64_t bytes, bool writes, bool gate_held) {
+	Mem1::NoteWindow(vaddr, bytes); // (mem1, KYTY_MEM1=1: when the emulator last read or wrote VirtualMemo; off: a bool)
 	auto& state = Get();
 	state.window_calls.fetch_add(1, std::memory_order_relaxed);
 	if (t_native_writing || bytes == 0 || vaddr + bytes <= state.guest_lo.load(std::memory_order_relaxed) ||
@@ -1722,6 +1927,8 @@ inline std::pair<uint64_t, uint64_t> SplitLocked(State& state, uint64_t begin, u
 		part->orphan    = whole.orphan;
 		part->cold      = whole.cold; // (ram18)
 		part->r20       = whole.r20;  // (ram20)
+		part->rnt       = whole.rnt;  // (ram1b)
+		part->r2_hashed = false;      // (ram2: a part's bytes are not the hash's: not verified)
 	}
 	uint64_t at = begin;
 	for (const auto& piece: whole.pieces) {
@@ -1760,6 +1967,12 @@ inline std::pair<uint64_t, uint64_t> SplitLocked(State& state, uint64_t begin, u
 	if (whole.cold) { // (ram18: its own count)
 		state.cold_now -= std::min(state.cold_now, lost_dropped);
 		if (whole.r20 != 0) state.r20_now[whole.r20 - 1] -= std::min(state.r20_now[whole.r20 - 1], lost_dropped); // (ram20)
+		if (whole.rnt != 0 && whole.rnt <= State::RntKinds) // (ram1b)
+			state.rnt_now[whole.rnt - 1] -= std::min(state.rnt_now[whole.rnt - 1], lost_dropped);
+		if (whole.rnt == RntRam2) { // (ram2)
+			state.r2_now -= std::min(state.r2_now, lost_dropped);
+			state.r2_unmapped += cut_end > cut_begin ? cut_end - cut_begin : 0;
+		}
 		state.cold_ranges += (keep_head ? 1 : 0) + (keep_tail ? 1 : 0);
 		state.cold_ranges -= std::min<uint64_t>(state.cold_ranges, 1);
 		state.cold_unmapped += cut_end > cut_begin ? cut_end - cut_begin : 0;
@@ -1797,10 +2010,12 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 	if (vaddr + size <= state.guest_lo.load(std::memory_order_relaxed) || vaddr >= state.guest_hi.load(std::memory_order_relaxed)) return;
 	WaitRestores(vaddr, size);
 	std::vector<std::pair<uint64_t, uint64_t>> ranges, restore;
+	std::vector<uint64_t>                      ram2_hits; // (ram2b: ram2 ranges a host write meets)
 	{
 		std::lock_guard lock(state.mutex);
 		std::vector<uint64_t> cut; // (ram3, UnmapSplit: discarded ranges the unmap covers a part of)
 		for (auto it = FirstOver(state, vaddr); it != state.guest.end() && it->first < vaddr + size; ++it) {
+			if (!unmap && it->second.rnt == RntRam2) ram2_hits.push_back(it->first); // (ram2b)
 			if (it->second.restoring) continue; // (this thread's own restore)
 			const bool covered = over_all && it->first >= vaddr && it->second.guest_end <= vaddr + size;
 			if (it->second.touched) {
@@ -1832,6 +2047,25 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 	const auto can_wait   = state.can_wait.load(std::memory_order_acquire);
 	for (const auto& [begin, bytes]: restore) {
 		(void)FileRestore(begin, bytes, Touch::HostWrite, true); // (ram17: any thread, from the disk store; normal context)
+		// (ram2b) A ram2 range (cold: no image, the GPU never gives it back) the disk store did not give back has its bytes
+		// in RAM still (taken, not dropped yet: a cold range is only dropped with its copy on disk): let go, never a miss -
+		// a missed cold range could never be restored, and a game thread's write fault on it looped for ever (ram2's hang,
+		// 11-18 21:26). The window is taken out: the host writes there, it is not the streamed textures' memory.
+		if (std::find(ram2_hits.begin(), ram2_hits.end(), begin) != ram2_hits.end()) {
+			{
+				std::lock_guard lock(state.mutex);
+				auto            it = state.guest.find(begin);
+				if (it != state.guest.end() && it->second.rnt == RntRam2) {
+					if (!it->second.touched && !it->second.restoring) TouchLocked(state, it, Touch::HostWrite);
+					it->second.missed = false;
+					ranges = TakePendingLocked(state);
+				} else {
+					ranges.clear();
+				}
+			}
+			RemoveAll(state, ranges);
+			continue;
+		}
 		if (restore_fn != nullptr && can_wait != nullptr && can_wait()) {
 			restore_fn(begin, bytes, Touch::HostWrite);
 			continue;
@@ -1845,6 +2079,13 @@ inline void OnHostAccess(uint64_t vaddr, uint64_t size, bool unmap, bool over_al
 		std::printf("Texture offload: MISSED host write over part of 0x%llx..0x%llx (zeros until restored)\n",
 		            static_cast<unsigned long long>(begin), static_cast<unsigned long long>(begin + bytes));
 		TouchLocked(state, it, Touch::HostWrite);
+	}
+	// (ram2b) The windows of the ram2 ranges a host write met: out of ram2 (it is not the streamed textures' memory).
+	for (const auto begin: ram2_hits) {
+		RamNativeTex::Ram2Guards().host_writes.fetch_add(1, std::memory_order_relaxed);
+		char label[24] {};
+		(void)Loader::DemonsSoulsMemMap::LabelAt(begin, label, sizeof(label));
+		RamNativeTex::Ram2Block(begin, "escritura del emulador sobre memoria tomada", label);
 	}
 }
 
@@ -1930,6 +2171,180 @@ inline std::vector<std::pair<uint64_t, uint64_t>> Ram18TakeQueued() {
 	state.cold_queue.clear();
 	state.r20_queue.clear();
 	return added;
+}
+
+// (ram1b, KYTY_RAM_NATIVE_TEX=1) Render thread (TextureCache::RntScan, where the textures are): ranges (begin, size,
+// kind 1 arrays / 2 render targets) a GPU cache's image holds, taken as cold ranges now with the RAM18 rules (whole
+// pages, at most a chunk; none over a range already taken; not touched within the RAM16 retake time; not read back
+// within the RAM17 hold time): written to the disk store and dropped by the RAM18 thread at its next pass. Returned: those
+// added, whose read watchers the caller puts on.
+inline std::vector<std::pair<uint64_t, uint64_t>> RntTakeNow(const std::vector<std::tuple<uint64_t, uint64_t, uint8_t>>& ranges) {
+	std::vector<std::pair<uint64_t, uint64_t>> added;
+	if (!RntAsked() || !Ram18On() || !Native()) return added;
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	for (const auto& [begin, size, kind]: ranges) {
+		if (size == 0 || size > FileChunk || begin % FileUnit != 0 || size % FileUnit != 0 || kind == 0 || kind > State::RntKinds) continue;
+		if (TouchedLocked(state, ColdSerial(begin))) continue;
+		auto it = state.guest.upper_bound(begin);
+		if (it != state.guest.begin() && std::prev(it)->second.guest_end > begin) continue;
+		if (it != state.guest.end() && it->first < begin + size) continue;
+		if (HeldLocked(state, begin, size)) continue;
+		Range range;
+		range.guest_end = begin + size;
+		range.pieces    = {{begin, size}}; // (native memory: the guest pages themselves)
+		range.serial    = ColdSerial(begin);
+		range.image     = 0;
+		range.since     = std::chrono::steady_clock::now();
+		range.discarded = true;
+		range.orphan    = true;
+		range.cold      = true;
+		range.rnt       = kind;
+		state.backing[begin] = begin;
+		if (begin < state.guest_lo.load(std::memory_order_relaxed)) state.guest_lo.store(begin, std::memory_order_relaxed);
+		if (begin + size > state.guest_hi.load(std::memory_order_relaxed)) state.guest_hi.store(begin + size, std::memory_order_relaxed);
+		state.guest.emplace(begin, std::move(range));
+		state.cold_ranges++;
+		state.cold_taken++;
+		state.cold_taken_bytes += size;
+		state.rnt_taken[kind - 1]++;
+		state.rnt_taken_bytes[kind - 1] += size;
+		state.cold_drop.push_back(begin);
+		added.emplace_back(begin, size);
+	}
+	return added;
+}
+
+// (ram2, KYTY_RAM2=1) Render thread (TextureCache::RntScan): ranges (begin, size) of the VirtualMemoryGPU zone no image
+// has used for KYTY_RAM2_AGE_S since they were mapped, in RAM, outside every image of the cache, taken as cold ranges now
+// with the RAM18 rules (as RntTakeNow): written to the disk store (hashed) and dropped by the RAM18 thread at its next
+// pass; any touch reads them back from the file and verifies them. Returned: those added, whose read watchers the caller
+// puts on.
+inline std::vector<std::pair<uint64_t, uint64_t>> Ram2TakeNow(const std::vector<std::tuple<uint64_t, uint64_t, uint8_t>>& ranges) {
+	std::vector<std::pair<uint64_t, uint64_t>> added;
+	if (RamNativeTex::Ram2Mode() != 1 || !Ram18On() || !Native()) return added;
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	for (const auto& [begin, size, kind]: ranges) {
+		if (size == 0 || size > FileChunk || begin % FileUnit != 0 || size % FileUnit != 0 || kind != RntRam2) continue;
+		if (TouchedLocked(state, ColdSerial(begin))) continue;
+		auto it = state.guest.upper_bound(begin);
+		if (it != state.guest.begin() && std::prev(it)->second.guest_end > begin) continue;
+		if (it != state.guest.end() && it->first < begin + size) continue;
+		if (HeldLocked(state, begin, size)) continue;
+		Range range;
+		range.guest_end = begin + size;
+		range.pieces    = {{begin, size}}; // (native memory: the guest pages themselves)
+		range.serial    = ColdSerial(begin);
+		range.image     = 0;
+		range.since     = std::chrono::steady_clock::now();
+		range.discarded = true;
+		range.orphan    = true;
+		range.cold      = true;
+		range.rnt       = RntRam2;
+		state.backing[begin] = begin;
+		if (begin < state.guest_lo.load(std::memory_order_relaxed)) state.guest_lo.store(begin, std::memory_order_relaxed);
+		if (begin + size > state.guest_hi.load(std::memory_order_relaxed)) state.guest_hi.store(begin + size, std::memory_order_relaxed);
+		state.guest.emplace(begin, std::move(range));
+		state.cold_ranges++;
+		state.cold_taken++;
+		state.cold_taken_bytes += size;
+		state.r2_taken++;
+		state.r2_taken_bytes += size;
+		state.cold_drop.push_back(begin);
+		added.emplace_back(begin, size);
+	}
+	return added;
+}
+
+// (ram2; render thread, its scan) 0: [begin, begin + size) may be taken (Ram2TakeNow's rules); 1: a range over it is
+// taken; 2: held back (touched within the RAM16 retake time, or read back within the RAM17 hold time).
+[[nodiscard]] inline int Ram2Status(uint64_t begin, uint64_t size) {
+	auto&           state = Get();
+	std::lock_guard lock(state.mutex);
+	auto            it = state.guest.upper_bound(begin);
+	if (it != state.guest.begin() && std::prev(it)->second.guest_end > begin) return 1;
+	if (it != state.guest.end() && it->first < begin + size) return 1;
+	if (TouchedLocked(state, ColdSerial(begin)) || HeldLocked(state, begin, size)) return 2;
+	return 0;
+}
+
+// (ram2) The "[ram2]" line's numbers (never waits: false when the state's lock is busy).
+struct Ram2View {
+	uint64_t now = 0, peak = 0, taken = 0, taken_bytes = 0, written_bytes = 0, zero_bytes = 0, failed = 0, reads = 0;
+	uint64_t read_bytes = 0, read_us = 0, read_us_max = 0, ages[3] {}, unmapped = 0, lost = 0, checked = 0, checked_bytes = 0;
+	uint64_t equal = 0, discrepancy = 0, unchecked = 0, check_us = 0, file_used = 0, file_size = 0;
+};
+inline bool Ram2Read(Ram2View* out) {
+	auto&                        state = Get();
+	std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return false;
+	out->now           = state.r2_now;
+	out->peak          = state.r2_peak;
+	out->taken         = state.r2_taken;
+	out->taken_bytes   = state.r2_taken_bytes;
+	out->written_bytes = state.r2_written_bytes;
+	out->zero_bytes    = state.r2_zero_bytes;
+	out->failed        = state.r2_failed;
+	out->reads         = state.r2_reads;
+	out->read_bytes    = state.r2_read_bytes;
+	out->read_us       = state.r2_read_us;
+	out->read_us_max   = state.r2_read_us_max;
+	for (size_t k = 0; k < 3; k++) out->ages[k] = state.r2_ages[k];
+	out->unmapped      = state.r2_unmapped;
+	out->lost          = state.r2_lost;
+	out->checked       = state.r2_checked;
+	out->checked_bytes = state.r2_checked_bytes;
+	out->equal         = state.r2_equal;
+	out->discrepancy   = state.r2_discrepancy;
+	out->unchecked     = state.r2_unchecked;
+	out->check_us      = state.r2_check_us;
+	lock.unlock();
+	FileUse(&out->file_used, &out->file_size);
+	return true;
+}
+
+// (ram1b) Whether [vaddr, vaddr + size) meets a taken range (any kind).
+[[nodiscard]] inline bool AnyTakenOver(uint64_t vaddr, uint64_t size) {
+	auto& state = Get();
+	if (size == 0 || vaddr + size <= state.guest_lo.load(std::memory_order_relaxed) || vaddr >= state.guest_hi.load(std::memory_order_relaxed))
+		return false;
+	std::lock_guard lock(state.mutex);
+	auto            it = state.guest.upper_bound(vaddr);
+	if (it != state.guest.begin() && std::prev(it)->second.guest_end > vaddr) return true;
+	return it != state.guest.end() && it->first < vaddr + size;
+}
+
+// (ram1b) The "[rnt]" line's numbers (never waits: false when the state's lock is busy).
+struct RntView {
+	static constexpr size_t Kinds = State::RntKinds;
+	uint64_t now[Kinds] {}, peak = 0, taken[Kinds] {}, taken_bytes[Kinds] {}, reads[Kinds] {}, read_bytes[Kinds] {};
+	uint64_t read_us = 0, read_us_max = 0, zero_bytes = 0, written_bytes = 0, lost = 0, failed = 0, released = 0, ages[3] {};
+	uint64_t file_used = 0, file_size = 0;
+};
+inline bool RntRead(RntView* out) {
+	auto&                        state = Get();
+	std::unique_lock<std::mutex> lock(state.mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return false;
+	for (size_t k = 0; k < State::RntKinds; k++) {
+		out->now[k]         = state.rnt_now[k];
+		out->taken[k]       = state.rnt_taken[k];
+		out->taken_bytes[k] = state.rnt_taken_bytes[k];
+		out->reads[k]       = state.rnt_reads[k];
+		out->read_bytes[k]  = state.rnt_read_bytes[k];
+	}
+	out->peak          = state.rnt_peak;
+	out->read_us       = state.rnt_read_us;
+	out->read_us_max   = state.rnt_read_us_max;
+	out->zero_bytes    = state.rnt_zero_bytes;
+	out->written_bytes = state.rnt_written_bytes;
+	out->lost          = state.rnt_lost;
+	out->failed        = state.rnt_failed;
+	out->released      = state.rnt_released;
+	for (size_t k = 0; k < 3; k++) out->ages[k] = state.rnt_ages[k];
+	lock.unlock();
+	FileUse(&out->file_used, &out->file_size);
+	return true;
 }
 
 // The RAM18 thread: the cold ranges taken (watchers on) and not dropped yet, to write and drop (DiscardRangeNative).

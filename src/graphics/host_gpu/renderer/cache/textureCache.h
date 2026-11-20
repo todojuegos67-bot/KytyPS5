@@ -209,6 +209,15 @@ public:
 	// KYTY_GPU_ONLY_OFFLOAD: formats (guest format, tiling, bgra16) a check proved (or found to differ) the download of.
 	std::unordered_set<uint64_t>                m_offload_good_formats;
 	std::unordered_set<uint64_t>                m_offload_bad_formats;
+	// (ram1b) KYTY_RAM_NATIVE_TEX=1|2 (ram-native-tex.h), once a flip from RunGarbageCollector: every 120 flips the guest
+	// copy of the arrays' layers and the render targets the cache holds, clean at two scans, to the disk store (=1); every
+	// 5 s the "[rnt]" line and (=2) one sparse image's verification (RntVerify).
+	void RntScan(uint64_t tick);
+	void RntVerify();
+	struct RntCheck;
+	std::vector<std::unique_ptr<RntCheck>>      m_rnt_checks;
+	std::unordered_map<uint64_t, uint64_t>      m_rnt_clean;        // image serial -> the first scan it was eligible at
+	uint64_t                                    m_rnt_verify_after = 0; // the serial the next verification starts after
 	// RunGarbageCollector's line on the PC's memory, when it moved.
 	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).

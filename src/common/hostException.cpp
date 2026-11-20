@@ -502,6 +502,10 @@ bool InstallHandler(Handler handler) {
 	return true;
 }
 
+bool HandlerInstalled() noexcept {
+	return g_install_state.load(std::memory_order_acquire) == 2;
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void SetProbeHandler(ProbeHandler /*handler*/) {}
 #endif

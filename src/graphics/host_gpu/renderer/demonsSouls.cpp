@@ -9,6 +9,7 @@
 #include "sync-stats.h"
 #include "parpadeo.h"          // (parpadeo2)
 #include "speculation-state.h" // (parpadeo2: Spec::Current)
+#include "f0-measure.h"        // (f0: KYTY_F0)
 
 #include <algorithm>
 #include <array>
@@ -260,6 +261,7 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 		}
 		NoteCopy(g_copy_stats.copies_aliased);
 	}
+	const F0Measure::LinearCopyScope f0_copy(copy->dst, copy->src, copy->bytes); // (f0)
 	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
 	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
 	NoteCopy(g_copy_stats.copies);
@@ -379,6 +381,7 @@ bool TryLinearCopyRanges(BufferCache& cache, uint64_t dst, uint64_t src, uint32_
 		if (!cache.PrepareAliasesForCpuWrite(copy->dst, copy->bytes)) return false;
 		NoteCopy(g_copy_stats.copies_aliased);
 	}
+	const F0Measure::LinearCopyScope f0_copy(copy->dst, copy->src, copy->bytes); // (f0)
 	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
 	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
 	NoteCopy(g_copy_stats.copies);

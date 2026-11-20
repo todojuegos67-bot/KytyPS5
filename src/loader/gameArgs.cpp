@@ -87,6 +87,43 @@ const std::string& ExtraLines() {
 			at = end + 1;
 		}
 		if (cam_mine) out += "+cp11_Setting_CameraSpeed=" + std::to_string(cam) + "\n";
+		// (online2) KYTY_ONLINE=1: our own server for the game's online (Ghidra, eboot 01.007.000):
+		//  - ds_domainserver (string convar, object eboot+0x282db08, value pointer +0x60 = eboot+0x282db68): when set,
+		//    getServerState (request type 0x1b, URL built at eboot+0x663e40) goes to "<it>/dsmaster/ss" instead of
+		//    reading the selected server-list entry (that path reads entry+0x40 of a NULL entry if the list is empty).
+		//  - cp11_summoning_sandbox (string convar, value pointer eboot+0x282ddd8): getServerState only reads the server
+		//    list for the sandbox when this one is empty (eboot+0x664f60), so it is set too.
+		//  - cp11_addServer <region|All> <language> <name> <id> <ping url> <master url> (handler eboot+0x14555d0, 6
+		//    positional arguments; entry built by eboot+0x145dfb0): the frontend network step (eboot+0x79e410 /
+		//    eboot+0x79e610) asks the server list for a selected server and shows "no server" otherwise; the ping
+		//    pass (eboot+0x1455100) selects the first entry even if its ping fails.
+		// The values have no '+', '-', '=' or leading "//": the engine's command line parser (eboot+0x8189b0) would
+		// split or drop them.
+		{
+			const char* on = std::getenv("KYTY_ONLINE");
+			if (on != nullptr && on[0] == '1') {
+				const char* s      = std::getenv("KYTY_ONLINE_SERVER");
+				std::string server = (s != nullptr && s[0] != '\0') ? s : "127.0.0.1:8090";
+				if (server.find_first_of("+-= ") != std::string::npos) {
+					std::printf("Game convars: KYTY_ONLINE_SERVER=%s has '+', '-', '=' or a space; use an IP:port. Using 127.0.0.1:8090\n",
+					            server.c_str());
+					server = "127.0.0.1:8090";
+				}
+				const std::string url = "http://" + server;
+				out += "+ds_domainserver=" + url + "\n";
+				out += "+cp11_summoning_sandbox=kyty\n";
+				for (const char* language: {"Global", "English", "Spanish"}) { // the name shown per language; same id
+					out += std::string("+cp11_addServer All ") + language + " KytyOnline kyty " + url + "/ping " + url + "\n";
+				}
+				// (online3) The ping pass that selects a server (UpdateServerPingTest, started by eboot+0x1454d90) is
+				// only started by the server-list menu or by this command (handler eboot+0x1455560); the frontend's
+				// network step (eboot+0x79e410) only waits for it. Without it no server is selected and the step
+				// shows "could not connect to the server" (message 0xc3b6, eboot+0x79e610) before any request.
+				out += "+cp11_determineServerPings\n";
+				std::printf("Game convars: online (KYTY_ONLINE=1): server %s\n", url.c_str());
+				std::fflush(stdout);
+			}
+		}
 		// (ao-1028) KYTY_AO (rt-ao.cpp) replaces the game's own ambient occlusion: r_enableAmbientShadowing off, so the
 		// occlusion is never applied twice (KYTY_AO_GAME=keep leaves the game's on; a list naming the convar wins)
 		{

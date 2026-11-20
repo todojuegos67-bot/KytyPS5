@@ -1,9 +1,14 @@
 #include "local/envio1.h" // (envio1: table-xpr.inc)
+#include "local/f0-measure.h" // (f0: table-xpr.inc, KYTY_F0)
+#include "local/trad1.h" // (trad1: table-xpr.inc, KYTY_TRAD1)
+#include "local/live-control.h" // (trad1b: LiveControl::g_flips, the [trad1] line's frames)
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"
+#include "local/pathtrace.h" // (pt1: table-xpr.inc, native-xpr.inc, render1-native.inc)
 #include "local/rt-water.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "native/native-render.h" // (f5b: verified passes' targets, KYTY_NATIVE_PASSES)
 #include "live-trace-gpu.h"
 
 #include "common/assert.h"
@@ -41,6 +46,10 @@
 #include "libs/errno.h"
 #include "live-census.h"
 #include "trusted-depth.h" // (trust1: table-xpr.inc)
+#include "render1.h" // (render1 F2: native-xpr.inc, table-xpr.inc, render1-native.inc)
+#include "port-r.h" // (port-r, KYTY_PORT_R=2: table-xpr.inc compares the draws of eboot+0xab57d0)
+#include "p7-compat.h" // (p7, KYTY_P7: C1 in table-xpr.inc)
+#include "gpu_tiler_shaders/render1_cmp_spv.h" // (render1 F2: render1-native.inc)
 #include "live-counters.h"
 #include "device-fault.h"
 #include "frame-capture.h"
@@ -764,6 +773,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
+		NativeRender::NoteTarget(target.image_id.index, target.image_id.generation, target.desc.view_info.base_level,
+		                         target.desc.view_info.base_layer, false); // (f5b: a verified pass's target)
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     target.target_slot, image.info.data.address, image.info.data.size,
@@ -804,6 +815,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		NativeRender::NoteTarget(depth.image_id.index, depth.image_id.generation, depth.desc.view_info.base_level,
+		                         depth.desc.view_info.base_layer, true); // (f5b: a verified pass's target)
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
@@ -2068,6 +2081,17 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 #endif
 #include "native-xpr.inc"
 #include "table-xpr.inc"
+#include "render1-native.inc" // (render1 F2, KYTY_RENDER1=2)
+#endif
+#ifndef KYTY_LOCAL_VULKAN_RECORDING
+// (render1 F2: without the native paths there is no batch)
+bool RenderExecutor::Render1BatchOpen() const noexcept { return false; }
+void RenderExecutor::Render1EndBatch(CommandBuffer& /*buffer*/, uint32_t /*why*/) {}
+void RenderExecutor::Render1Taint(uint32_t /*reason*/) {}
+bool RenderExecutor::Render1Draw(CommandBuffer& /*buffer*/, bool /*clean*/, std::span<const uint64_t> /*commands*/,
+                                 uint64_t /*index_base*/, uint64_t /*index_bytes*/, vk::IndexType /*index_type*/) {
+	return false;
+}
 #endif
 
 bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) {

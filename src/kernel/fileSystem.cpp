@@ -18,6 +18,7 @@
 #include "loader/gameArgs.h"
 #include "graphics/presentation/videoOut.h"
 #include "local/soft-release.h"
+#include "local/tiron4-counters.h" // (tiron4)
 
 #include <algorithm>
 #include <atomic>
@@ -489,6 +490,7 @@ bool IntroMovieBlocked(const char* path) {
 
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(true); // (tiron4: ms in the guest's file calls)
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -766,6 +768,7 @@ static void WriteFromGuest(Common::File& f, const void* buf, uint32_t nbytes, ui
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(false, nbytes); // (tiron4: ms in the guest's file calls)
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EPERM;
@@ -897,6 +900,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(false, nbytes); // (tiron4: ms in the guest's file calls)
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EPERM;

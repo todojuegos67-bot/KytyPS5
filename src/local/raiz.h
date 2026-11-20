@@ -65,6 +65,17 @@ inline void PutEnv(const char* key, const char* value) {
 		default_env("KYTY_DS_WRITE_ANNOUNCED", "2");
 		default_env("KYTY_DS_READBACK_HOOK", "1");
 		default_env("KYTY_DS_LINEAR_COPY_HOOK", "1");
+		// (ganchos2, KYTY_FRAME_NATIVO=1) The frame memory by the game's own allocator and submit hooks, not by protection:
+		// the frame policy (KYTY_DS_WRITE_FRAME, anuncio1/2) with its stale-use check (=2) and KYTY_RAIZ_ANNOUNCE. Without it,
+		// a frame reservation over no-watch pages asks them back to the watch (20261120-020146: 101609 per 5 s, "reservas de
+		// frame que pidieron paginas de vuelta"), and frame memory is 57% of the write faults (20261115-203605 audit).
+		if (const char* fn = std::getenv("KYTY_FRAME_NATIVO"); fn != nullptr && fn[0] == '1') {
+			default_env("KYTY_RAIZ_ANNOUNCE", "1");
+			default_env("KYTY_DS_WRITE_FRAME", "2");
+			std::printf("[frame-nativo] KYTY_FRAME_NATIVO=1: memoria de frame por los ganchos del asignador y de los envios "
+			            "(KYTY_RAIZ_ANNOUNCE=%s, KYTY_DS_WRITE_FRAME=%s: con comprobacion de datos viejos)\n",
+			            std::getenv("KYTY_RAIZ_ANNOUNCE"), std::getenv("KYTY_DS_WRITE_FRAME"));
+		}
 		const char* r = std::getenv("KYTY_RAIZ_WINDOW_RESYNC");
 		const char* f = std::getenv("KYTY_RAIZ_VERIFY");
 		std::printf("Raiz: policies NEIGHBOR_SPLIT=%s WRITE_ANNOUNCED=%s READBACK_HOOK=%s LINEAR_COPY_HOOK=%s\n",

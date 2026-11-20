@@ -88,7 +88,11 @@ const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-
 const int    kAntiLagDlssgCount = 3;
 const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
                               {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
-const int    kRtReflLevelCount = 6; // (11-16 release) Hibrido (hardware RT) no longer offered
+const int    kRtReflLevelCount = 7;
+// (pt1) Path tracing (BB_PATHTRACING): sombras del sol trazadas por hardware y (pt1e) el relleno de "Reflejos RT" donde su rayo
+// de pantalla falla; No = nada cambia.
+const Choice kPathTracingLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}};
+const int    kPathTracingLevelCount = 5;
 const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
 const int    kRtReflSharpCount = 3;
 const Choice kMotesLevels[] = {{"0", "No"}, {"1", "Sutil"}, {"2", "Media"}, {"3", "Densa"}}; // (motes-1031)
@@ -98,6 +102,14 @@ const int    kRtReflWavesCount = 3;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+const Choice kVolLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
+const int    kVolLevelCount = 5;
+const Choice kRtx1Levels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
+const int    kRtx1LevelCount = 5;
+const Choice kRtq2OnOff[] = {{"0", "No"}, {"1", "Sí"}}; // (rtq2) Suelo estable
+const int    kRtq2OnOffCount = 2;
+const Choice kRtnLevels[] = {{"0", "No"}, {"1", "Sí"}, {"2", "Depuración"}}; // (rtq2 b)
+const int    kRtnLevelCount = 3;
 // (ds-particles-1029) No, Suave. (ds-pc-port10) Its "Antorchas" level (the smoke lit by the torch light) is gone with
 // the torch light: an old 2 is Suave.
 const Choice kSmokeLevels[] = {{"0", "No"}, {"1", "Suave"}};
@@ -195,6 +207,19 @@ const char* FrameGenLabel(const std::string& id) {
 	return FindFg(id)->label;
 }
 
+// (rtq2) The old ray-tracing options are retired (no menu or launcher row): forced off whatever settings.ini or a preset
+// holds. Kept: Suelo estable, Reflejos RT nuevos, Luz volumetrica (godrays), Particulas volumetricas and Reflejos RT
+// (reflejos_rt, nitidez, ondas: the user's choice back).
+static void RetireOldRt(Settings* s) {
+	// (rtback) Luz RT (luz_rt_pantalla) honoured again, as in 9589439. Suelo estable / Reflejos RT nuevos did not exist
+	// there: off, so the same settings.ini gives the same RT as 9589439.
+	s->floor_stable = s->rt_nuevo = "0";
+	s->refl_stable = s->shadow_rtx = s->ao_rtx = "0"; // Reflejos estables, Sombras mejoradas, Oclusion mejorada (rtx1)
+	s->path_tracing = "0";
+	s->rt_hw_exp = false;   // RT por hardware (experimental) and its rows
+	s->rt_reflections = false;
+}
+
 bool LoadSettings(const std::string& path, Settings* s) {
 	std::ifstream in(path);
 	if (!in) return false;
@@ -258,7 +283,6 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
-	s->simulate_vram8 = false; // (11-16 release) test option, not in the public build
 	// (11-14) Option back in the launcher (Simular gráfica de 8 GB, pruebas): the file's value counts.
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
@@ -270,6 +294,11 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
+	boo("multijugador", s->multiplayer);
+	str("multijugador_servidor", s->online_server);
+	if (s->online_server.empty()) s->online_server = "127.0.0.1";
+	str("multijugador_cuenta", s->online_name);
+	str("multijugador_clave", s->online_password);
 	boo("antilag", s->antilag);
 	// (before 10-27 "antilag" was a box, written 0 by default: the launcher's default, auto, either way)
 	str("antilag_modo", s->antilag_mode);
@@ -284,6 +313,11 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rt_oclusion", s->rt_ao);
 	str("luz_volumetrica", s->godrays);
 	str("particulas_volumetricas", s->motes);
+	str("reflejos_estables", s->refl_stable); // (rtx1)
+	str("sombras_mejoradas", s->shadow_rtx);  // (rtx1)
+	str("oclusion_mejorada", s->ao_rtx);      // (rtx1)
+	str("suelo_estable", s->floor_stable);    // (rtq2)
+	str("reflejos_rt_nuevos", s->rt_nuevo);   // (rtq2 b)
 	boo("juego_original", s->pure_game);
 	str("bordes_sombras", s->shadow_edges);
 	str("sombra_rincones", s->corner_shadow);
@@ -328,7 +362,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rend_feedback_agrupado", s->perf_feedback_batch);
 	boo("rend_shaders_lane_local", s->perf_lane_wide);
 	str("reflejos_rt", s->rt_ss_refl);
-	if (s->rt_ss_refl == "6") s->rt_ss_refl = "3"; // (11-16 release) Hibrido gone: its screen-space part, Alto
+	str("path_tracing", s->path_tracing); // (pt1)
+	if (s->rt_ss_refl == "6") s->rt_ss_refl = "3"; // (rtback, as 9589439) Hibrido gone: its screen-space part, Alto
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
 	str("luz_rt_pantalla", s->rt_ssgi);
@@ -338,13 +373,15 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("luz_antorchas", s->torch);
 	boo("destellos_lente", s->lens_flare);
 	boo("rt_experimental", s->rt_hw_exp);
-	s->rt_hw_exp = false; // (11-16 release) hardware RT removed from the port (the owner: of no use)
 	// (Out of range: No.)
 	const auto clamp_level = [](std::string& v, int max) {
 		const int n = std::atoi(v.c_str());
 		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
 	};
 	clamp_level(s->rt_ss_refl, 6);
+	clamp_level(s->path_tracing, 4); // (pt1)
+	s->path_tracing = "0"; // (rtq1) Path tracing retired: always off (no launcher or menu row; the dormant code stays)
+	RetireOldRt(s); // (rtq2)
 	clamp_level(s->rt_refl_sharp, 2);
 	clamp_level(s->motes, 3);
 	clamp_level(s->rt_refl_waves, 2);
@@ -518,8 +555,18 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "rt_particulas=" << b(s.rt_particles) << "\n"
 	  << "rt_metal=" << b(s.rt_metal) << "\n"
 	  << "rt_oclusion=" << b(s.rt_ao) << "\n"
-	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
+	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra (volumen a media resolucion + niebla del juego mas densa; excluye rt_sombras_sol)\n"
 	  << "luz_volumetrica=" << s.godrays << "\n"
+	  << "; Reflejos estables (suelos sin la onda al mover la camara): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "reflejos_estables=" << s.refl_stable << "\n"
+	  << "; Suelo estable (el reflejo del suelo sigue la superficie, no el relieve: sin onda al mover la camara; el agua no cambia): 0 no, 1 si\n"
+	  << "suelo_estable=" << s.floor_stable << "\n"
+	  << "; Reflejos RT nuevos (ray tracing por hardware solo donde el juego refleja): 0 no, 1 si, 2 depuracion (encima al 50 %: verde rayo usado, azul zona del juego sin acierto)\n"
+	  << "reflejos_rt_nuevos=" << s.rt_nuevo << "\n"
+	  << "; Sombras mejoradas (antorchas y velas, contacto y cascadas del sol): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "sombras_mejoradas=" << s.shadow_rtx << "\n"
+	  << "; Oclusion mejorada (oclusion ambiental del juego mas marcada y mas lejos): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "oclusion_mejorada=" << s.ao_rtx << "\n"
 	  << "; Particulas volumetricas (motas de polvo iluminadas por la luz volumetrica): 0 no, 1 sutil, 2 media, 3 densa\n"
 	  << "particulas_volumetricas=" << s.motes << "\n"
 	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
@@ -576,6 +623,13 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
 	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"
+	  << "[Multijugador]\n"
+	  << "; 1: online con el servidor propio (mensajes, manchas, fantasmas, cooperativo, invasiones). 0: sin conexion, como siempre\n"
+	  << "multijugador=" << b(s.multiplayer) << "\n"
+	  << "; Direccion del servidor: 127.0.0.1 si este PC es el servidor; si no, la IP publica del anfitrion\n"
+	  << "multijugador_servidor=" << s.online_server << "\n"
+	  << "multijugador_cuenta=" << s.online_name << "\n"
+	  << "multijugador_clave=" << s.online_password << "\n\n"
 	  << "[Avanzado]\n"
 	  << "; Interruptores del emulador: KYTY_X=1;KYTY_Y=2 (KYTY_X= lo quita). Solo para pruebas.\n"
 	  << "extra=" << s.extra << "\n";
@@ -680,6 +734,8 @@ std::string GameSettingsConvars(const Settings& s) {
 }
 
 std::string ShadowFilterLevel(const Settings& s) {
+	// (rtx1b) Only "Bordes sombras": rtx1 raised it from Sombras mejoradas and that changed the driver cache key (a cold
+	// pipeline cache, PCSS lighting shaders made on the render thread: [L] 20261119-040338, 24 pipelines, 18.2 s, no frame).
 	return s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3" ? s.shadow_edges : std::string();
 }
 
@@ -745,7 +801,10 @@ void RecommendFor(PcInfo* pc) {
 	}
 }
 
-LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcInfo& pc) {
+LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const PcInfo& pc) {
+	Settings retired = s_in;
+	RetireOldRt(&retired); // (rtq2) a preset applied in this session may have set an old RT option
+	const Settings& s = retired;
 	LaunchPlan plan;
 	Env        env;
 	const bool demons = title_id.empty() || title_id.rfind("PPSA0134", 0) == 0;
@@ -892,6 +951,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_RT_REFLECTIONS_SHARP", "");
 		sets.emplace_back("KYTY_RT_REFLECTIONS_WATER_WAVES", "");
 	}
+	// (pt1) Path tracing: BB_PATHTRACING=1 + its preset; No (or Juego original): both empty, nothing of it runs.
+	{
+		static const char* quality[] = {"", "low", "medium", "high", "ultra"};
+		const int          level     = s.pure_game ? 0 : std::clamp(std::atoi(s.path_tracing.c_str()), 0, 4);
+		sets.emplace_back("BB_PATHTRACING", level > 0 ? "1" : "");
+		sets.emplace_back("BB_PATHTRACING_QUALITY", quality[level]);
+	}
 	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
 	sets.emplace_back("KYTY_DS_SIXTY_STEP", "0");    // (10-22) cinematic as on PS5
@@ -943,9 +1009,20 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
 				sets.emplace_back(k, "0");
 	}
-	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
+	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3" || s.godrays == "4"); // (rtx1: 4 Ultra)
 	const bool shadows = false; // (ds-pc-port9) Sombras RT retired
 	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
+	// (rtq2 b) Reflejos RT nuevos (rt-nuevo.cpp): the KYTY_HWRT scene (no visual change by itself) + KYTY_RTN. Compilacion 1:
+	// 1 on (compilacion 2: composited by the game in its IBL), 2 the same + the debug overlay.
+	if (!s.pure_game && (s.rt_nuevo == "1" || s.rt_nuevo == "2")) {
+		sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
+		sets.emplace_back("KYTY_HWRT", "1");
+		sets.emplace_back("KYTY_RTN", s.rt_nuevo);
+		if (!s.rt_hw_exp) // (the other hardware passes stay off, as with Reflejos RT Hibrido)
+			for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
+			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
+				sets.emplace_back(k, "0");
+	}
 	const bool motes = !s.pure_game && (s.motes == "1" || s.motes == "2" || s.motes == "3"); // (motes-1031)
 	sets.emplace_back("KYTY_MOTES", motes ? s.motes : "");
 	if (shadows) {
@@ -1249,20 +1326,15 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
-	// (11-16 release) The configuration validated with JUGAR.cmd (native memory, parpadeo6, rend1, ram16/ram17), on by
-	// default; [Avanzado] extra (below) can still change any of them (KEY=0).
-	{
-		std::stringstream list(
-		    "KYTY_FG_PARTICLE_MV=1;KYTY_TEXTURE_OFFLOAD=1;KYTY_GPU_ONLY_OFFLOAD=1;KYTY_OFFLOAD_PAGEOUT=1;KYTY_BIG_WINDOW=1;"
-		    "KYTY_VOLATILE_EXTRA_ALLOCATORS=HeapAllocator,PageAllocator,Bucket;KYTY_FAULT_STATS=0;KYTY_TEXTURE_PROBE=0;"
-		    "KYTY_BUFFER_PROBE=0;KYTY_RESIDENCY_LOG=0;KYTY_RAM_GUARD=0;KYTY_RAM_LINE=1;KYTY_RENDER_STATS=0;KYTY_RAIZ=1;"
-		    "KYTY_DS_FREED_RELEASE=1;KYTY_PM_LOCK_HOLDERS=1;KYTY_REG_LANE=1;KYTY_DRAW_FLAGS=1;KYTY_CENSUS_LIGHT=1;"
-		    "KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1;KYTY_RAM18=1;KYTY_CAM1=1");
-		std::string pair;
-		while (std::getline(list, pair, ';')) {
-			const auto eq = pair.find('=');
-			env.Set(pair.substr(0, eq), pair.substr(eq + 1));
-		}
+	// (online5) [Multijugador]: the online switches (libs/network.cpp, libs/libNet.cpp, loader/gameArgs.cpp). Our server:
+	// TCP 31415 (game server + WebAPI), TCP 31413 (accounts), UDP 3758 (P2P relay). Off: offline as before.
+	if (s.multiplayer) {
+		std::string host = s.online_server.empty() ? std::string("127.0.0.1") : s.online_server;
+		if (const auto c = host.find(':'); c != std::string::npos) host = host.substr(0, c);
+		env.Set("KYTY_ONLINE", "1");
+		env.Set("KYTY_ONLINE_SERVER", host + ":31415");
+		env.Set("KYTY_ONLINE_NAME", s.online_name);
+		env.Set("KYTY_ONLINE_PASSWORD", s.online_password);
 	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
 	{
@@ -1281,6 +1353,101 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (demons) {
 		if (const std::string pool_mb = env.Get("KYTY_DS_TEXTURE_POOL_MB"); !pool_mb.empty() && pool_mb != "0")
 			env.AppendConvars("texturePoolSizeMiBs=" + pool_mb);
+	}
+	// (ibl0) KYTY_DS_IBL_TEMPORAL=0 in [Avanzado] extra: the game's IBL / SSR temporal off (convar r_enableIBLTemporal,
+	// render config +0x770). [G] RenderIBL FUN_009d66d0 reads it (with r_iblResolution +0x76c) to alternate the half-width
+	// columns frame to frame and blend with the previous frame; the frame setup FUN_00a14886 keeps it only with the
+	// game's TAA (r_aaMethod +0xaa0 == 1). The doubled reflection while turning: the reflections' own history. Off unless set.
+	if (demons && env.Get("KYTY_DS_IBL_TEMPORAL") == "0") env.AppendConvars("r_enableIBLTemporal=false");
+	// (ssr0) KYTY_DS_SSR_OFF=1 in [Avanzado] extra: the game's own SSR off (r_ssrEnableOverrides with no ray: cutoff and
+	// length ~0, one iteration). Its normal-mapped blobs move as the camera turns (the "wave" on level floors); with our RT
+	// reflections on, ours replaces it (needs KYTY_RT_REFLECTIONS_GUIDE=0: the guide is that SSR). Off unless set.
+	if (demons && env.Get("KYTY_DS_SSR_OFF") == "1")
+		env.AppendConvars("r_ssrEnableOverrides=true;r_ssrMaxIterations=1;r_ssrMaxRayLength=0.01;r_ssrCutoffDistance=0.01");
+	// (rtx1) Reflejos estables / Luz volumetrica Ultra / Sombras mejoradas / Oclusion mejorada (0 = nothing, as before).
+	// Last of the convars (they win over Detalle / Sombras / Ajustes del juego); a key the user put in [Avanzado] extra wins.
+	if (demons && !s.pure_game) {
+		const auto lv  = [](const std::string& v) { return std::clamp(std::atoi(v.c_str()), 0, 4); };
+		const auto put = [&](const char* k, const std::string& v) {
+			if (s.extra.find(std::string(k) + "=") == std::string::npos) env.Set(k, v);
+		};
+		// (rtx1b) [L] 20261119-040338: "+r_enableSpotShadows=false" came after ours (gs_spot's default in
+		// KYTY_GAME_CONVARS_EXTRA, applied after KYTY_GAME_CONVARS): ours go last of the EXTRA list.
+		const auto last_cv = [&](const std::string& cv) {
+			const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA");
+			env.Set("KYTY_GAME_CONVARS_EXTRA", old.empty() ? cv : old + ";" + cv);
+		};
+		const auto rt_refl_on = [&] {
+			const std::string r = env.Get("KYTY_RT_REFLECTIONS");
+			return !r.empty() && r != "0";
+		};
+		// Reflejos estables. [L] 20261118-114603 (the game's SSR cut, ours "not guided"): "camera vs G-buffer frame (rtrefl1,
+		// fix off): neither 92 of 600" = 15 % of the frames reprojected with another frame's camera, the wave of OUR pass;
+		// every test ran with that fix off. [L] 20261118-094400 (the video): "game SSR confident 33-36 %, blobby on level
+		// floors 7-15 %" = the GAME's SSR, [G/ISA] CS 9fb5cc274b5e4f82 pc 0xc44: kRTT_SSR read with IMAGE_LOAD at (x>>1,
+		// y>>1) (half resolution, point, no filter; 640x360 at a 720p render) behind a 16x16 tile mask, along the
+		// normal-mapped G-buffer normal. [G] r_ssrMethod (+0x788) is the engine's own switch: SSRPreRender FUN_009d6030
+		// and RenderSSR FUN_009d5120 run only at 1 (HiZ), RenderIBL FUN_009d66d0 takes its no-SSR variant at 0 (Off).
+		// (rtx1c) No level turns the game's SSR off any more: r_ssrMethod=Off is global and took the water's reflections
+		// with it ([L] 20261119-042737 + the user). Nor does any level raise Reflejos RT's strength / sharpness (Ultra 4 +
+		// Maxima looked overdone: "shown 74 %" of floor samples). Per surface, the game's SSR on level non-water floors is
+		// already replaced at its share by our flat ray while the guide is on (des-refl2 "flat fix"), which stays on here.
+		//   1 Bajo:  rtrefl1: our reflections with the camera of the G-buffer's own frame + the parallax history.
+		//   2 Medio: + r_ssrSinglePixelStep=true ([G] +0x78c, a flag of SSRRaymarch's constants: the game's march at
+		//            every pixel instead of Hi-Z jumps: fewer stair-steps in its reflection, water included).
+		//   3 Alto:  + r_ssrPlaneRejectEnable=true ([G] +0x78e: the game's own rejection of hits on the reflecting plane).
+		//   4 Ultra: + Reflejos RT on at Alto (3) if they were off (never above what the user chose).
+		// (rtq2) Suelo estable: one instruction of the game's IBL (graphics/shader/recompiler/Rtq2Patch.h).
+		if (s.floor_stable == "1") put("KYTY_RTQ2_IBL", "1");
+		if (const int r = lv(s.refl_stable); r > 0) {
+			put("KYTY_RTREFL1", "1");
+			if (r >= 2) last_cv("r_ssrSinglePixelStep=true");
+			if (r >= 3) last_cv("r_ssrPlaneRejectEnable=true");
+			if (r >= 4 && !rt_refl_on()) put("KYTY_RT_REFLECTIONS", "3");
+		}
+		// Luz volumetrica Ultra: godrays.cpp level 4 (KYTY_GODRAYS=4 above) + the game's froxel fog (Fog FUN_00994310)
+		// denser and more forward-scattering, relative to its own values (rtx1-convars.h).
+		if (s.godrays == "4") put("KYTY_RTX1_FOG", "4");
+		// Sombras mejoradas: the presets of Ajustes del juego (gs_spot / gs_contact / gs_sun), [G] convars of FUN_00944dc0
+		// (r_enableSpotShadows +0xf0, r_contactShadows* +0x91..0x9c, sunShadow* +0xd4..0xec); filtering by ShadowFilterLevel.
+		//   1: torch / candle shadows on (the port's default had them off: "+r_enableSpotShadows=false" in every log), contact 0.06
+		//   2: + contact 0.10, sun 250 m in 2 cascades (the game's factory cut)
+		//   3: + contact 0.30 (thicker, softer edge), sun 400 m in 4 cascades
+		//   4: + sun 1000 m in 4 cascades (the game's maximum; CPU: ~+10-15 % shadow draws)
+		//   (rtx1b) No shadow filter here (that is Bordes sombras: its own pipeline cache, a cold start).
+		static const char* shadow_cv[] = {
+		    "",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.06",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.1;r_virtualGeometryNumShadowCascades=2;"
+		    "sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;sunShadowLightDistance=1000",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;"
+		    "r_contactShadowsSoftness=0.2;r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;"
+		    "sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;"
+		    "r_contactShadowsSoftness=0.2;r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;"
+		    "sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000"};
+		if (const int sh = lv(s.shadow_rtx); sh > 0) last_cv(shadow_cv[sh]);
+		// Oclusion mejorada: the game's ambient shadowing range (gs_ambient Alto / Ultra / Ultra / Extremo) + its SSAO
+		// (Gtao_Intensity, Hbao_Radius, Hbao_MaxAOLinearDepth) relative to its own values, live (rtx1-convars.h).
+		static const char* ao_cv[] = {"", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=100;r_ambientShadowCutoffFadeDistance=20",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100"};
+		if (const int ao = lv(s.ao_rtx); ao > 0) {
+			last_cv(ao_cv[ao]);
+			put("KYTY_RTX1_AO", std::to_string(ao));
+		}
+	}
+	// (rtx1b) KYTY_RENDERDOC=1 (rdoc1): no hardware RT. [L] 20261119-041214 ends right after "HWRT: VK_KHR_acceleration_structure
+	// + VK_KHR_ray_query enabled": the device with those under RenderDoc does not come up. Reflejos RT at most Alto (3), no
+	// hardware fill; every KYTY_HWRT* pass off (each has its screen-space or no-pass fallback).
+	if (env.Get("KYTY_RENDERDOC") == "1") {
+		for (const char* k: {"KYTY_HWRT", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_RT_REFLECTIONS_HYBRID", "KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW",
+		                     "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN",
+		                     "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO_HW"})
+			env.Set(k, "0");
+		if (const std::string r = env.Get("KYTY_RT_REFLECTIONS"); !r.empty() && std::atoi(r.c_str()) > 3) env.Set("KYTY_RT_REFLECTIONS", "3");
+		env.Set("BB_PATHTRACING", "");
 	}
 	// (11-13) The fire and particle blending as before: with KYTY_FG_PARTICLE_MV=1 the native particle vectors always on
 	// (a run came up with KYTY_FG_PARTICLE_NATIVE=0 from outside the settings and ghosting around fire); only an explicit
@@ -1363,13 +1530,13 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
 	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
 	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || LampLevel(l) != LampLevel(n) || l.rt_metal != n.rt_metal ||
-	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
+	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.refl_stable != n.refl_stable || l.floor_stable != n.floor_stable || l.rt_nuevo != n.rt_nuevo || l.shadow_rtx != n.shadow_rtx || l.ao_rtx != n.ao_rtx || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
 	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.perf_pm4_regfile != n.perf_pm4_regfile || l.perf_upload_lanes != n.perf_upload_lanes || l.perf_upload_help != n.perf_upload_help || l.perf_spin_gate != n.perf_spin_gate || l.perf_eager_feedback != n.perf_eager_feedback || l.perf_feedback_batch != n.perf_feedback_batch || l.perf_lane_wide != n.perf_lane_wide || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.shader_turbo != n.shader_turbo || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.path_tracing != n.path_tracing || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
 	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
@@ -1383,6 +1550,8 @@ void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
 	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = s->motes = "0";
+	s->path_tracing = "0"; // (pt1)
+	s->refl_stable = s->shadow_rtx = s->ao_rtx = "0"; // (rtx1)
 	s->lens_flare = false;
 }
 
@@ -1418,7 +1587,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->motion_blur = false;
 		s->dof = s->bloom = s->vignette = s->eye_adapt = true;
 		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
-		s->pure_game      = true;           // (11-11) and Juego original (no added effects)
+		s->pure_game      = false;          // (rtq2) no preset turns on Juego original (it turned Suelo estable / RT nuevos off)
 		s->sharpness      = "0.75";
 		s->fullscreen     = true;           // (11-12) 1080p by default in Souls ligero / ligero +
 		s->resolution     = "1920x1080";
@@ -1435,11 +1604,11 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->sharpness = "1";
 		s->res       = "fsr4-calidad"; // (11-11) FSR 4 Calidad (was DLSS Calidad K) and Juego original
 		s->dlss_preset = "K";
-		s->pure_game = true;
+		s->pure_game = false; // (rtq2) no preset turns on Juego original
 	} else if (preset == "ultra") {
 		max();
 		s->res = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default, and Juego original
-		s->pure_game = true;
+		s->pure_game = false; // (rtq2) no preset turns on Juego original
 		s->detail   = "muy-alto";
 		s->aa_sharp = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {

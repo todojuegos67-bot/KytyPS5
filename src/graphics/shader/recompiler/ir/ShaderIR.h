@@ -13,12 +13,16 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <iterator>
 #include <list>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -655,6 +659,113 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// A plan's values: Insts that never move once made (values refer to each other by address), in blocks allocated whole.
+// A std::list<Inst> gave each its own heap block, 112 bytes with the links, 128 with the heap's header (1-1 at the default
+// policy: 3.65M plan values, ~445 MiB; 96 bytes each here). A block holds what reserve() asked for (a plan loaded:
+// ResourcePlanSerial knows the count), else a growing share of the values so far.
+class PlanValues {
+	struct Block {
+		Inst*    values   = nullptr;
+		uint32_t used     = 0;
+		uint32_t capacity = 0;
+	};
+
+public:
+	template <class B, class T>
+	class Iterator {
+	public:
+		using iterator_category = std::forward_iterator_tag;
+		using value_type        = Inst;
+		using difference_type   = std::ptrdiff_t;
+		using pointer           = T*;
+		using reference         = T&;
+		Iterator() = default;
+		Iterator(B* block, B* end): block(block), end(end) { Skip(); }
+		reference operator*() const { return block->values[index]; }
+		pointer   operator->() const { return &block->values[index]; }
+		Iterator& operator++() {
+			if (++index == block->used) {
+				++block;
+				index = 0;
+				Skip();
+			}
+			return *this;
+		}
+		Iterator operator++(int) {
+			auto old = *this;
+			++*this;
+			return old;
+		}
+		bool operator==(const Iterator& other) const { return block == other.block && index == other.index; }
+
+	private:
+		void Skip() {
+			while (block != end && block->used == 0) ++block;
+		}
+		B*       block = nullptr;
+		B*       end   = nullptr;
+		uint32_t index = 0;
+	};
+	using iterator       = Iterator<Block, Inst>;
+	using const_iterator = Iterator<const Block, const Inst>;
+
+	PlanValues() = default;
+	~PlanValues() { Clear(); }
+	PlanValues(const PlanValues&)            = delete;
+	PlanValues& operator=(const PlanValues&) = delete;
+	PlanValues(PlanValues&& other) noexcept: blocks(std::move(other.blocks)), count(std::exchange(other.count, 0)) {
+		other.blocks.clear();
+	}
+	PlanValues& operator=(PlanValues&& other) noexcept {
+		if (this != &other) {
+			Clear();
+			blocks = std::move(other.blocks);
+			count  = std::exchange(other.count, 0);
+			other.blocks.clear();
+		}
+		return *this;
+	}
+
+	// Room for `n` more values without another block (a hint: more fit all the same).
+	void reserve(size_t n) {
+		const size_t room = blocks.empty() ? 0 : blocks.back().capacity - blocks.back().used;
+		if (n > room) AddBlock(n);
+	}
+	template <class... A>
+	Inst& emplace_back(A&&... args) {
+		if (blocks.empty() || blocks.back().used == blocks.back().capacity) AddBlock(std::max<size_t>(16, count / 2));
+		auto& block = blocks.back();
+		auto* inst  = new (block.values + block.used) Inst(std::forward<A>(args)...);
+		block.used++;
+		count++;
+		return *inst;
+	}
+	[[nodiscard]] size_t size() const { return count; }
+	[[nodiscard]] bool   empty() const { return count == 0; }
+	iterator             begin() { return {blocks.data(), blocks.data() + blocks.size()}; }
+	iterator             end() { return {blocks.data() + blocks.size(), blocks.data() + blocks.size()}; }
+	const_iterator       begin() const { return {blocks.data(), blocks.data() + blocks.size()}; }
+	const_iterator       end() const { return {blocks.data() + blocks.size(), blocks.data() + blocks.size()}; }
+
+private:
+	void AddBlock(size_t capacity) {
+		Block block;
+		block.capacity = static_cast<uint32_t>(capacity);
+		block.values   = static_cast<Inst*>(::operator new(capacity * sizeof(Inst), std::align_val_t {alignof(Inst)}));
+		blocks.push_back(block);
+	}
+	void Clear() {
+		for (auto& block: blocks) {
+			for (uint32_t i = block.used; i-- > 0;) block.values[i].~Inst();
+			::operator delete(block.values, std::align_val_t {alignof(Inst)});
+		}
+		blocks.clear();
+		count = 0;
+	}
+	std::vector<Block> blocks;
+	size_t             count = 0;
+};
+
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
 struct LinearSrtPlan;
@@ -671,7 +782,7 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>                     value_storage;
+	PlanValues                          value_storage;
 	std::shared_ptr<const LinearSrtPlan> linear_srt;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;

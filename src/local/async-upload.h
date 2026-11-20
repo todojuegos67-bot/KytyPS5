@@ -10,9 +10,11 @@
 
 #include "common/guardedCopy.h"
 #include "raiz.h" // (raiz2: KYTY_RAIZ, CopyFrom)
+#include "tiron8.h" // (tiron8: KYTY_TIRON8)
 
 namespace Libs::LibKernel::Memory {
 bool NativeGuardedRead(void* destination, const void* guest, uint64_t size); // (raiz2, kernel/memory.h)
+void NativeWindowRun(const void* guest, uint64_t size, void (*access)(void*), void* context); // (tiron8, kernel/memory.h)
 } // namespace Libs::LibKernel::Memory
 #include "live-census.h"
 #include "live-counters.h"
@@ -111,6 +113,7 @@ public:
 	static constexpr uint64_t LaneRegion = uint64_t {4} << 20u;
 
 	Worker(): m_jobs(std::make_unique<Job[]>(Capacity)), m_pipeline(ProtThreadOn()), m_thread([this] { Run(); }) {
+		(void)Tiron8::On(); // (tiron8 v2: its start-up line, on or off)
 		if (m_pipeline) m_prot_thread = std::thread([this] { ProtRun(); }); // (raiz9)
 	}
 	~Worker() {
@@ -613,28 +616,158 @@ private:
 	// small neighbours), and a frame where it brings a new area (~1 GB of textures, every submission waiting for their
 	// copies) stalled ~300 ms. (Copied one by one, a walk's slow frames at Boletarian Palace 1-3 waited 25-28 ms for
 	// them; as runs, 14 ms.)
+	// (tiron8, KYTY_TIRON8=1) A large copy (1 MiB or more, a texture) whose guest pages RAIZ may have made no-access: one
+	// window over it (NativeWindowRun: the gate taken once, every no-access region opened READ-ONLY at once - a game write
+	// meanwhile still faults and waits at the gate -, the kept GPU bytes put in first, the protections back at the end),
+	// the copy made by the eight helper threads while it is open; at most 64 MiB a window. Before, each 256 KiB piece that
+	// met such a page took the gate alone for its own window: the eight threads in a row (20261119-204418: 343 MB in
+	// 320 ms, 910 stops, ~1 GB/s; the 354 ms frame).
+	static constexpr uint64_t Tiron8MinBytes    = uint64_t {1} << 20u;  // a span's least bytes (KYTY_TIRON8_MIN_KB)
+	// a window's most: 64 MiB; (tiron12, KYTY_TIRON12=1) 8 MiB. The window holds the protection gate alone while its eight
+	// threads copy (64 MiB at 7.8 GB/s: ~8 ms), and every protection change of the render thread waits for it
+	// (20261120-020146, the 276.2 ms frame: 11% NativeProtectLock <- ProtectMappedUnlocked, 16% in
+	// UpdatePageWatchersForRegion's lock under RegionManager::UpdateGpuProtection). 8 MiB: ~1 ms a wait, the same copies.
+	static uint64_t Tiron8WindowBytesNow() {
+		static const uint64_t bytes = [] {
+			const char* v   = std::getenv("KYTY_TIRON12");
+			const bool  set = v != nullptr && v[0] == '1';
+			std::printf("[tiron12] ventanas de copia de TIRON8 de %s MiB como maximo%s\n", set ? "8" : "64",
+			            set ? " (KYTY_TIRON12=1): esperas del hilo de render al candado de ~1 ms" : "");
+			std::fflush(stdout);
+			return (set ? uint64_t {8} : uint64_t {64}) << 20u;
+		}();
+		return bytes;
+	}
+	static ParallelPages::Pool& CopyPool() {
+		static auto* const pool = new ParallelPages::Pool(7, "Kyty.UploadCopy"); // (never destroyed)
+		return *pool;
+	}
+	// (v2) A span: guest-contiguous copies of the run (an image comes as many copies - its pieces, one per guest mapping,
+	// most under 1 MiB: 20261120-001423, 657 guard stops in the 564 ms frame and no copy of 1 MiB alone), the copies' bytes
+	// at offsets in the span; the last entry its end.
+	static void Tiron8Window(void* context) {
+		const auto& span = *static_cast<const std::vector<RunCopy>*>(context);
+		CopyPool().For(span.back().offset, uint64_t {256} << 10u, [](void* at, uint64_t from, uint64_t to) {
+			const auto& run = *static_cast<const std::vector<RunCopy>*>(at);
+			auto it = std::prev(std::upper_bound(run.begin(), std::prev(run.end()), from,
+			                                     [](uint64_t at_byte, const RunCopy& copy) { return at_byte < copy.offset; }));
+			for (; from < to; ++it) {
+				const auto end  = std::min(to, std::next(it)->offset);
+				const auto skip = from - it->offset;
+				// (Inside the window every committed page reads; one not committed reads as zeros, as NativeGuardedRead.)
+				if (const uint64_t rest = Common::GuardedCopy(it->destination + skip,
+				                                              reinterpret_cast<const uint8_t*>(it->guest + skip), end - from);
+				    rest != 0)
+					std::memset(it->destination + skip + (end - from) - rest, 0, rest);
+				from = end;
+			}
+		}, const_cast<std::vector<RunCopy>*>(&span));
+	}
+	// m_span's copies, through one window over guest [m_span.front().guest, + its bytes).
+	void Tiron8Flush() {
+		const uint64_t bytes = m_span.back().offset;
+		const auto     start = std::chrono::steady_clock::now();
+		Libs::LibKernel::Memory::NativeWindowRun(reinterpret_cast<const void*>(m_span.front().guest), bytes, Tiron8Window, &m_span);
+		Tiron8::g_windows.fetch_add(1, std::memory_order_relaxed);
+		Tiron8::g_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		Tiron8::g_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                                 std::chrono::steady_clock::now() - start)
+		                                                 .count()),
+		                       std::memory_order_relaxed);
+	}
+	// The run's copies in guest-contiguous spans of Tiron8MinBytes or more, each through its windows (a copy over 64 MiB in
+	// pieces of 64 MiB); m_tiron8_done marks the jobs made. Returns their bytes.
+	uint64_t Tiron8Spans(uint64_t first, uint64_t last) {
+		static const uint64_t min_bytes = [] {
+			const char* v = std::getenv("KYTY_TIRON8_MIN_KB");
+			return v != nullptr && v[0] != '\0' ? std::strtoull(v, nullptr, 10) * 1024u : Tiron8MinBytes;
+		}();
+		m_tiron8_done.assign(last - first, 0);
+		uint64_t made = 0;
+		const auto eligible = [&](const Job& job) {
+			return job.call == nullptr && job.source != nullptr && job.size != 0 &&
+			       job.source == reinterpret_cast<const uint8_t*>(job.guest); // (RAIZ: the source is guest memory itself)
+		};
+		for (uint64_t at = first; at < last;) {
+			const Job& head = m_jobs[at % Capacity];
+			if (!eligible(head)) {
+				++at;
+				continue;
+			}
+			// The span from `at`: the next copies (calls - protections - between them are done already: Protections) that go
+			// on where it ends.
+			uint64_t end = at + 1, span_end = head.guest + head.size, total = head.size;
+			for (; end < last; ++end) {
+				const Job& next = m_jobs[end % Capacity];
+				if (next.call != nullptr) continue;
+				if (!eligible(next) || next.guest != span_end) break;
+				span_end = next.guest + next.size;
+				total += next.size;
+			}
+			if (total < min_bytes) {
+				at = end;
+				continue;
+			}
+			// Windows of at most 64 MiB, cut at copy boundaries (a copy over 64 MiB: in pieces).
+			m_span.clear();
+			uint64_t offset = 0;
+			const auto flush = [&] {
+				if (m_span.empty()) return;
+				m_span.push_back({offset, nullptr, nullptr, 0});
+				Tiron8Flush();
+				m_span.clear();
+				offset = 0;
+			};
+			for (uint64_t k = at; k < end; ++k) {
+				const Job& job = m_jobs[k % Capacity];
+				if (job.call != nullptr) continue;
+				for (uint64_t done = 0; done < job.size;) {
+					const uint64_t part = std::min(Tiron8WindowBytesNow(), job.size - done);
+					if (offset != 0 && offset + part > Tiron8WindowBytesNow()) flush();
+					m_span.push_back({offset, job.destination + done, job.source + done, job.guest + done});
+					offset += part;
+					done += part;
+				}
+				m_tiron8_done[k - first] = 1;
+				made += job.size;
+			}
+			flush();
+			at = end;
+		}
+		return made;
+	}
+
 	void CopyRun(uint64_t first, uint64_t last, uint64_t bytes) {
 		constexpr uint64_t Chunk = uint64_t {256} << 10u;
 		if (bytes == 0) return;
+		// (tiron8) The large copies first, each in its windows; the rest as before. (Only without the audits' hook, and
+		// with RAIZ: there `source` is guest memory itself.)
+		if (Tiron8::On() && Raiz::On() && g_copy_hook.load(std::memory_order_relaxed) == nullptr) {
+			bytes -= std::min(bytes, Tiron8Spans(first, last));
+			Tiron8::Report();
+			if (bytes == 0) return;
+		} else {
+			m_tiron8_done.clear();
+		}
+		const auto taken = [&](uint64_t at) { return !m_tiron8_done.empty() && m_tiron8_done[at - first] != 0; };
 		if (bytes < 4 * Chunk) {
-			for (; first < last; ++first)
-				if (const Job& job = m_jobs[first % Capacity]; job.call == nullptr)
+			for (uint64_t at = first; at < last; ++at)
+				if (const Job& job = m_jobs[at % Capacity]; job.call == nullptr && !taken(at))
 					CopyFrom(job.destination, job.source, job.guest, job.size);
 			return;
 		}
 		// The run's copies, each at its offset in the run's bytes.
 		m_run.clear();
 		uint64_t offset = 0;
-		for (; first < last; ++first) {
-			const Job& job = m_jobs[first % Capacity];
-			if (job.call != nullptr) continue;
+		for (uint64_t at = first; at < last; ++at) {
+			const Job& job = m_jobs[at % Capacity];
+			if (job.call != nullptr || taken(at)) continue;
 			m_run.push_back({offset, job.destination, job.source, job.guest});
 			offset += job.size;
 		}
 		m_run.push_back({offset, nullptr, nullptr, 0});
 		LiveCounters::Add(LiveCounters::UploadSharedRuns);
-		static auto* const pool = new ParallelPages::Pool(7, "Kyty.UploadCopy"); // (never destroyed)
-		pool->For(bytes, Chunk, [](void* at, uint64_t from, uint64_t to) {
+		CopyPool().For(offset, Chunk, [](void* at, uint64_t from, uint64_t to) {
 			const auto& run = *static_cast<const std::vector<RunCopy>*>(at);
 			// The copy holding byte `from`, then the ones after it up to `to`.
 			auto it = std::prev(std::upper_bound(run.begin(), std::prev(run.end()), from,
@@ -695,6 +828,8 @@ private:
 		uint64_t       guest;
 	};
 	std::vector<RunCopy>               m_run; // (the worker's)
+	std::vector<uint8_t>               m_tiron8_done; // (tiron8: the run's jobs made in windows)
+	std::vector<RunCopy>               m_span;        // (tiron8 v2: a window's copies, Tiron8Spans)
 	// KYTY_UPLOAD_LANES: the run's jobs per lane (written under m_process before a post, read by the second thread until it
 	// finishes that post), the second thread, its post / finish generations, and whether the poster sleeps on the finish.
 	std::vector<uint64_t>              m_lane_jobs[2];
@@ -797,8 +932,13 @@ inline void Drain(bool serve = false) {
 }
 
 // Render thread: every recorded job on guest [vaddr, vaddr + size) is done before this returns.
+// (tiron7) Set by BufferCache with KYTY_TIRON7=1: waits for the GPU work reading guest [vaddr, vaddr + size) through an
+// imported buffer, and frees those imports.
+inline void (*g_import_drain)(uint64_t vaddr, uint64_t size) = nullptr;
+
 inline void DrainRange(uint64_t vaddr, uint64_t size) {
 	if (g_used.load(std::memory_order_relaxed)) Wait(Get().PendingOn(vaddr, size));
+	if (auto* const drain = g_import_drain; drain != nullptr) drain(vaddr, size); // (tiron7)
 }
 
 } // namespace AsyncUpload

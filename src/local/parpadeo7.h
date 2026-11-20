@@ -78,7 +78,15 @@ struct Entry {
 	uint64_t                           last_label = 0;          // the label address last seen
 	uint64_t                           labels     = 0;          // labels matched
 	std::unordered_map<uint64_t, Slot> slots;                   // (section << 32 | slot) -> words
+	// (lab1 p7b2) The view's last frames: (*(view+0x120), *(view+0x58)) as the game had them when it read. The label
+	// is translated a frame or two after the game set them up, by then view+0x120/0x58 name the next frame's block and
+	// table (0xa0d2d0 makes both anew each frame), so the label is matched against these and the slots read from the
+	// table of ITS frame.
+	uint64_t hist_base[8] {}, hist_table[8] {};
+	uint32_t hist_next = 0;
 };
+// (lab1 p7b2) Learn calls with the label within 0x1000 of *(view+0x120) (offset known) or not.
+inline std::atomic<uint64_t> g_learn_off {0}, g_learn_nooff {0}, g_hist_hits {0};
 constexpr size_t   MaxEntries = 16;
 constexpr size_t   MaxSlots   = 4096;
 constexpr uint64_t StaleAfter = 8; // labels of the entry without the game reading the slot: dropped
@@ -88,14 +96,21 @@ inline std::vector<Entry>   g_entries;
 inline std::atomic<size_t>  g_entry_count {0};
 
 // The game thread (the hook), after it found the call's ranges. `base`: *(view+0x120) (0: unread).
-inline void Learn(uint64_t view, uint64_t label, uint64_t base, uint32_t section, uint32_t slot, uint32_t words) noexcept {
+inline void Learn(uint64_t view, uint64_t label, uint64_t base, uint32_t section, uint32_t slot, uint32_t words,
+                  uint64_t table = 0) noexcept {
 	if (view == 0 || label == 0 || words == 0) return;
 	try {
 		const int64_t   off = base != 0 && label >= base && label - base < 0x1000 ? static_cast<int64_t>(label - base) : INT64_MIN;
 		std::lock_guard lock(g_mutex);
 		Entry*          entry = nullptr;
+		(off != INT64_MIN ? g_learn_off : g_learn_nooff).fetch_add(1, std::memory_order_relaxed);
+		// (lab1 p7b2) One entry per view and offset; an unknown offset joins the view's entry (it was one entry per
+		// frame before: the label is new each frame, and the 16 entries filled up with dead ones).
 		for (auto& e: g_entries)
-			if (e.view == view && (e.last_label == label || (off != INT64_MIN && e.off == off))) entry = &e;
+			if (e.view == view && (e.last_label == label || e.off == off || off == INT64_MIN)) {
+				entry = &e;
+				break;
+			}
 		if (entry == nullptr) {
 			if (g_entries.size() >= MaxEntries) return;
 			g_entries.emplace_back();
@@ -103,8 +118,16 @@ inline void Learn(uint64_t view, uint64_t label, uint64_t base, uint32_t section
 			entry->view = view;
 			g_entry_count.store(g_entries.size(), std::memory_order_release);
 		}
-		entry->off        = off;
+		if (off != INT64_MIN || entry->off == INT64_MIN) entry->off = off;
 		entry->last_label = label;
+		if (base != 0 && table >= 0x10000) {
+			const uint32_t last = (entry->hist_next + 7u) & 7u;
+			if (entry->hist_base[last] != base || entry->hist_table[last] != table) {
+				entry->hist_base[entry->hist_next]  = base;
+				entry->hist_table[entry->hist_next] = table;
+				entry->hist_next                    = (entry->hist_next + 1u) & 7u;
+			}
+		}
 		const uint64_t key = uint64_t {section} << 32u | slot;
 		auto           it  = entry->slots.find(key);
 		if (it == entry->slots.end()) {
@@ -164,20 +187,36 @@ bool MatchLabel(uint64_t label, Read&& read, std::vector<std::pair<uint64_t, uin
 	}
 	try {
 		for (auto& e: g_entries) {
-			bool hit = e.last_label == label;
-			if (!hit && e.off != INT64_MIN) {
-				uint64_t base = 0;
-				hit = read(e.view + 0x120, &base) && base != 0 && base + static_cast<uint64_t>(e.off) == label;
+			// (lab1 p7b2) The label against the view's last frames: b + its offset, or the two XPR labels 0x912960 writes
+			// (0xa0b020: *(view+0x120)+0x1c0; 0xa0b120 shadows: +0x120; parpadeo3 Ghidra). The slots come from the
+			// table of that frame, checked as before: *(table+0x2cd30) == b + 0x120 (0xa0d2d0).
+			uint64_t table = 0, b = 0;
+			for (uint32_t h = 0; h < 8u && table == 0; ++h) {
+				const uint64_t hb = e.hist_base[h];
+				if (hb == 0) continue;
+				if ((e.off != INT64_MIN && hb + static_cast<uint64_t>(e.off) == label) || hb + 0x120u == label || hb + 0x1c0u == label) {
+					table = e.hist_table[h];
+					b     = hb;
+				}
 			}
-			if (!hit) continue;
-			uint64_t table = 0;
-			if (!read(e.view + 0x58, &table) || table < 0x10000) continue;
+			if (table == 0) {
+				// The old way (the frame the game is on now), kept as it was.
+				bool hit = e.last_label == label;
+				if (!hit && e.off != INT64_MIN) {
+					hit = read(e.view + 0x120, &b) && b != 0 && b + static_cast<uint64_t>(e.off) == label;
+				}
+				if (!hit) continue;
+				if (!read(e.view + 0x58, &table) || table < 0x10000) continue;
+				if (b == 0 && e.off != INT64_MIN) b = label - static_cast<uint64_t>(e.off);
+			} else {
+				g_hist_hits.fetch_add(1, std::memory_order_relaxed);
+			}
 			// The frame's table (0xa0d2d0 allocates one a frame) is this label's: its first pass entry points at the
-			// view's label block + 0x120 (0xa0d2d0: *(table+0x2cd30) = *(view+0x120) + 0x120). Else the game set up the
-			// next frame already: its slots name other bytes.
-			if (e.off != INT64_MIN) {
+			// view's label block + 0x120 (0xa0d2d0: *(table+0x2cd30) = *(view+0x120) + 0x120). Else the frame's table is
+			// gone or reused: its slots name other bytes.
+			if (b != 0) {
 				uint64_t first = 0;
-				if (!read(table + 0x2cd30, &first) || first != label - static_cast<uint64_t>(e.off) + 0x120) {
+				if (!read(table + 0x2cd30, &first) || first != b + 0x120) {
 					g_c.other_frame.fetch_add(1, std::memory_order_relaxed);
 					continue;
 				}
@@ -316,6 +355,12 @@ inline void MaybeReport() noexcept {
 	            static_cast<double>(gpu_us) / 1000.0, seconds > 0.0 ? static_cast<double>(gpu_us) / 1000.0 / seconds : 0.0,
 	            copied, detached, copied != 0 ? static_cast<double>(copy_us) / static_cast<double>(copied) : 0.0, copy_max,
 	            applied, s_in, s_late, s_miss, l2g_n != 0 ? static_cast<double>(l2g_us) / static_cast<double>(l2g_n) : 0.0);
+	std::fflush(stdout);
+	// (lab1 p7b2) How the matching went: the learn calls with a known offset, and the labels found in the history.
+	std::printf("[p7b2] aprendizaje: con offset %llu, sin offset %llu; etiquetas halladas en el historial de frames %llu\n",
+	            static_cast<unsigned long long>(g_learn_off.exchange(0, std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_learn_nooff.exchange(0, std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_hist_hits.exchange(0, std::memory_order_relaxed)));
 	std::fflush(stdout);
 }
 

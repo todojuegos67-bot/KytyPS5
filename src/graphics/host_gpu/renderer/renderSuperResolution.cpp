@@ -1,6 +1,7 @@
 // Sony's PS5 Pro super resolution as Demon's Souls dispatches it (graphics/guest_gpu/superResolution.h), done here:
 // DLSS (KYTY_UPSCALER=dlss, frame-gen.h) where Streamline offers it, else a linear stretch of the input.
 #include "local/hwrt-scene.h"
+#include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/superResolution.h"
@@ -356,6 +357,9 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	// (Frame generation's depth and motion, as the TAA pass's: DLSS-G's and FSR 3's.)
 	FrameGen::OnUpscale(bindings[2].image_id, bindings[2].desc.info.data.address, bindings[1].image_id,
 		                    bindings[1].desc.info.data.address);
+	// (pt1d, BB_PATHTRACING) The PS5 Pro path has no TAA dispatch (log: "its upscaler in place of the TAA"): the colour
+	// this packet upscales (binding 0) is the frame's lit HDR image.
+	PathTrace::NoteTaaInput(cache, std::span<const TextureBinding>(bindings.data(), 1), 0, 0);
 	buffer.EndRendering();
 	const auto vk_buffer = buffer.Handle();
 	// (KYTY_HWRT: the frame's scene acceleration structures - the PS5 Pro path has no TAA dispatch)
@@ -414,6 +418,7 @@ void RenderExecutor::RunSuperResolution(CommandBuffer& buffer, const SuperResolu
 	inputs.motion_scale_y = Word(packet, MotionScaleWord + 1);
 	inputs.reset          = reinterpret_cast<const uint8_t*>(packet.parameters)[ResetByte] != 0;
 	for (uint32_t i = 0; i < 16; i++) inputs.view_to_clip[i] = Word(packet, ViewToClipWord + i);
+	PathTrace::NoteViewToClip(inputs.view_to_clip.data()); // (pt1, BB_PATHTRACING: the depth's distance, next frame's passes)
 	inputs.near_plane = Word(packet, NearWord);
 	inputs.far_plane  = Word(packet, FarWord);
 	inputs.graphics   = &m_context.GetGraphics();

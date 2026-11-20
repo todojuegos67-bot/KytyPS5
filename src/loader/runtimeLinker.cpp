@@ -30,6 +30,7 @@
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/demonsSoulsSkipIntro.h"
 #include "loader/demonsSoulsAllocClamp.h"
+#include "loader/demonsSoulsInventory.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -37,6 +38,8 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
+#include "native/g1-probe.h" // (g1)
 
 #include <algorithm>
 #include <atomic>
@@ -854,6 +857,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		Juego3::Scope juego3_fault(Juego3::TagFault); // (juego3: the game thread's time in the fault handler)
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -879,6 +883,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			DemonsSoulsWriteAudit::NoteFaultSite(info->exception_address, info->rsp);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
+			// (g1, KYTY_G1_PROBE: the CPU's reads of GPU-written pages by call site; one relaxed load when off)
+			G1::NoteGpuFault(access == GpuAccess::Read, info->exception_address, info->rsp, info->access_violation_vaddr);
 			return true;
 		}
 	}
@@ -1647,6 +1653,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSkipIntro::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsCamera::InstallNoRamp(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsInventory::Install(m_programs.empty() ? nullptr : m_programs.front()); // (trucos3/4) F2 > Trucos: game-thread writes, inventory, names
 	// (audit1) KYTY_DS_WRITE_AUDIT=1, off by default. Last: DemonsSoulsGpuPages (above) verifies whole functions this
 	// patches the entries of, and every patch above has checked the game's own bytes by now.
 	DemonsSoulsWriteAudit::Install(m_programs.empty() ? nullptr : m_programs.front());

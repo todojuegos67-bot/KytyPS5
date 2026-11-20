@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "local/f0-measure.h" // (cpu1: the game thread's waits)
 #include "live-trace.h"
 #include "time-census.h"
 
@@ -387,6 +388,7 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
+	F0Measure::WaitScope f0w_(4, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 	KYTY_TIME_CENSUS(WaitEqueue, timo != nullptr ? static_cast<uint64_t>(*timo) : ~uint64_t {0});
 

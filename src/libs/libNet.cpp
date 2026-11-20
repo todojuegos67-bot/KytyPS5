@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/eventQueue.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -668,6 +670,15 @@ LIB_DEFINE(InitNet_1_Http) {
 
 } // namespace LibHttp
 
+// online1 (KYTY_ONLINE=1): implemented in network.cpp
+namespace Network::Online {
+bool Enabled();
+bool HttpExchange(const std::string& method, const std::string& url,
+                  const std::vector<std::pair<std::string, std::string>>& headers,
+                  const std::string& body, int* status, std::string* resp_headers,
+                  std::string* resp_body);
+} // namespace Network::Online
+
 namespace LibHttp2 {
 
 LIB_VERSION("Http2", 1, "Http2", 1, 1);
@@ -741,6 +752,113 @@ static std::map<int, Http2Context>  g_http2_contexts;
 static std::map<int, Http2Template> g_http2_templates;
 static std::map<int, Http2Request>  g_http2_requests;
 
+// online1: kqueue option of sceHttp2SendRequestAsync/ReadDataAsync. Layout from Ghidra
+// (HttpRequest::AsyncSendRequest @0x860a10): {equeue, user-event id, udata}. The game waits for the
+// EVFILT_USER event with that id (UpdateReturnFinalizableState @0x860c80) and then calls WaitAsync.
+struct Http2KqueueOption {
+	int64_t eq;
+	int64_t ident;
+	void*   udata;
+};
+
+static void online_trigger(const Http2KqueueOption& opt) {
+	if (opt.eq == 0) {
+		return;
+	}
+	LibKernel::EventQueue::KernelTriggerUserEvent(opt.eq, static_cast<int>(opt.ident), opt.udata);
+}
+
+static Http2KqueueOption online_option(const void* kqueue_option) {
+	Http2KqueueOption opt {};
+	if (kqueue_option != nullptr) {
+		opt = *static_cast<const Http2KqueueOption*>(kqueue_option);
+	}
+	return opt;
+}
+
+// online2: the exchange runs on a host thread, so the game's thread never waits for the network (a server that
+// does not answer costs at most KYTY_ONLINE_TIMEOUT_MS, then the request fails like a PSN timeout). The result is
+// moved into the request by online_collect() (called by every getter) once the thread is done.
+struct OnlinePending {
+	bool        done   = false;
+	bool        ok     = false;
+	int         status = 0;
+	std::string headers;
+	std::string body;
+};
+
+static std::mutex                                     g_online_mutex;
+static std::map<int, std::shared_ptr<OnlinePending>> g_online_pending;
+
+static void online_apply(Http2Request* r, const OnlinePending& p, size_t sent) {
+	r->response_headers = p.headers;
+	r->response_body    = p.body;
+	r->read_offset      = 0;
+	r->status_code      = p.status;
+	r->send_result      = p.ok ? 0 : HTTP2_ERROR_TIMEOUT;
+	r->async_result     = r->send_result;
+	r->async_event      = 0;
+	std::printf("Online: %s %s -> %s %d (sent %zu, received %zu bytes)\n", r->method.c_str(), r->url.c_str(),
+	            p.ok ? "HTTP" : "NO SERVER", p.status, sent, r->response_body.size());
+	std::fflush(stdout);
+}
+
+static void online_collect(int req_id, Http2Request* r) {
+	std::shared_ptr<OnlinePending> p;
+	{
+		std::lock_guard lock(g_online_mutex);
+		auto            it = g_online_pending.find(req_id);
+		if (it == g_online_pending.end() || !it->second->done) {
+			return;
+		}
+		p = it->second;
+		g_online_pending.erase(it);
+	}
+	online_apply(r, *p, 0);
+}
+
+static void online_forget(int req_id) {
+	std::lock_guard lock(g_online_mutex);
+	g_online_pending.erase(req_id);
+}
+
+static void online_send_sync(Http2Request* r, const void* post_data, size_t size) {
+	const std::string body(post_data != nullptr ? static_cast<const char*>(post_data) : "", size);
+	OnlinePending     p;
+	p.ok = Network::Online::HttpExchange(r->method, r->url, r->headers, body, &p.status, &p.headers, &p.body);
+	online_apply(r, p, size);
+}
+
+static void online_send_async(int req_id, Http2Request* r, const void* post_data, size_t size,
+                              const void* kqueue_option) {
+	auto pending = std::make_shared<OnlinePending>();
+	{
+		std::lock_guard lock(g_online_mutex);
+		g_online_pending[req_id] = pending;
+	}
+	r->send_result  = HTTP2_ERROR_BEFORE_SEND;
+	r->async_result = HTTP2_ERROR_BEFORE_SEND;
+	r->async_event  = 0;
+	std::string body(post_data != nullptr ? static_cast<const char*>(post_data) : "", size);
+	std::thread(
+	    [pending, method = r->method, url = r->url, headers = r->headers, body = std::move(body),
+	     opt = online_option(kqueue_option)]() {
+		    OnlinePending result;
+		    result.ok = Network::Online::HttpExchange(method, url, headers, body, &result.status,
+		                                              &result.headers, &result.body);
+		    {
+			    std::lock_guard lock(g_online_mutex);
+			    pending->ok      = result.ok;
+			    pending->status  = result.status;
+			    pending->headers = std::move(result.headers);
+			    pending->body    = std::move(result.body);
+			    pending->done    = true;
+		    }
+		    online_trigger(opt);
+	    })
+	    .detach();
+}
+
 static Http2Options* GetHttp2Options(int id) {
 	auto request = g_http2_requests.find(id);
 	if (request != g_http2_requests.end()) {
@@ -755,7 +873,7 @@ static Http2Options* GetHttp2Options(int id) {
 	return nullptr;
 }
 
-static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t pool_size,
+static int KYTY_SYSV_ABI Http2Init_impl(int libnet_mem_id, int libssl_ctx_id, size_t pool_size,
                                    int max_concurrent_request) {
 	PRINT_NAME();
 
@@ -771,7 +889,21 @@ static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t 
 	return id;
 }
 
-static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* user_agent,
+static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t pool_size,
+                                   int max_concurrent_request) {
+	const int online_ret = Http2Init_impl(libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(libnet_mem_id=%lld libssl_ctx_id=%lld pool_size=%lld max_concurrent_request=%lld) = 0x%08x\n", "Http2Init", static_cast<long long>(libnet_mem_id), static_cast<long long>(libssl_ctx_id), static_cast<long long>(pool_size), static_cast<long long>(max_concurrent_request), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+static int KYTY_SYSV_ABI Http2CreateTemplate_impl(int lib_http2_ctx_id, const char* user_agent,
                                              int http_ver, int is_auto_proxy_conf) {
 	PRINT_NAME();
 
@@ -789,6 +921,20 @@ static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* u
 	                              http_ver, is_auto_proxy_conf};
 
 	return tmpl_id;
+}
+
+static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* user_agent,
+                                             int http_ver, int is_auto_proxy_conf) {
+	const int online_ret = Http2CreateTemplate_impl(lib_http2_ctx_id, user_agent, http_ver, is_auto_proxy_conf);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(lib_http2_ctx_id=%lld http_ver=%lld is_auto_proxy_conf=%lld user_agent=%s) = 0x%08x\n", "Http2CreateTemplate", static_cast<long long>(lib_http2_ctx_id), static_cast<long long>(http_ver), static_cast<long long>(is_auto_proxy_conf), (user_agent != nullptr ? user_agent : "(null)"), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 static int KYTY_SYSV_ABI Http2DeleteTemplate(int tmpl_id) {
@@ -845,7 +991,7 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* method, const char* url,
+static int KYTY_SYSV_ABI Http2CreateRequestWithURL_impl(int tmpl_id, const char* method, const char* url,
                                                    uint64_t content_length) {
 	PRINT_NAME();
 
@@ -866,6 +1012,20 @@ static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* meth
 	g_http2_requests[req_id] = {tmpl_id, method, url, content_length};
 
 	return req_id;
+}
+
+static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* method, const char* url,
+                                                   uint64_t content_length) {
+	const int online_ret = Http2CreateRequestWithURL_impl(tmpl_id, method, url, content_length);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(tmpl_id=%lld content_length=%lld method=%s url=%s) = 0x%08x\n", "Http2CreateRequestWithURL", static_cast<long long>(tmpl_id), static_cast<long long>(content_length), (method != nullptr ? method : "(null)"), (url != nullptr ? url : "(null)"), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 static int KYTY_SYSV_ABI Http2AddRequestHeader(int id, const char* name, const char* value,
@@ -1135,13 +1295,18 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Network::Online::Enabled()) {
+		online_send_sync(&request->second, post_data, size);
+		return request->second.send_result;
+	}
+
 	request->second.send_result = HTTP2_ERROR_TIMEOUT;
 
 	return request->second.send_result;
 }
 
 static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
-                                               void* /*kqueue_option*/, void* /*option*/) {
+                                               void* kqueue_option, void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1155,6 +1320,11 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (Network::Online::Enabled()) {
+		online_send_async(req_id, &request->second, post_data, size, kqueue_option);
+		return 0;
 	}
 
 	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
@@ -1180,6 +1350,10 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
+	}
+
 	*result            = {};
 	result->event_type = request->second.async_event;
 	result->req_id     = req_id;
@@ -1203,6 +1377,10 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
 	}
 
 	const int send_result = request->second.send_result;
@@ -1232,6 +1410,10 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
 	}
 
 	const int send_result = request->second.send_result;
@@ -1264,6 +1446,10 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
+	}
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1290,6 +1476,10 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
+	}
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1309,7 +1499,7 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 }
 
 static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
-                                            void* /*kqueue_option*/, void* /*option*/) {
+                                            void* kqueue_option, void* /*option*/) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1325,10 +1515,17 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	if (Network::Online::Enabled()) {
+		online_collect(req_id, &request->second);
+	}
+
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		request->second.async_result = send_result;
 		request->second.async_event  = 1;
+		if (Network::Online::Enabled()) {
+			online_trigger(online_option(kqueue_option));
+		}
 		return 0;
 	}
 
@@ -1345,6 +1542,10 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	request->second.async_result = static_cast<int>(to_copy);
 	request->second.async_event  = 1;
 
+	if (Network::Online::Enabled()) {
+		online_trigger(online_option(kqueue_option));
+	}
+
 	return 0;
 }
 
@@ -1356,6 +1557,10 @@ static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 	auto request = g_http2_requests.find(req_id);
 	if (request == g_http2_requests.end()) {
 		return HTTP2_ERROR_INVALID_ID;
+	}
+
+	if (Network::Online::Enabled()) {
+		online_forget(req_id);
 	}
 
 	g_http2_requests.erase(request);
@@ -1499,6 +1704,245 @@ LIB_DEFINE(InitNet_1_NpManager) {
 
 } // namespace LibNpManager
 
+// ---- (online5) NpWebApi2 against our server, its push events, NpSessionSignaling ----------------------------------
+// Ghidra (eboot 01.007.000), NexusRevolution2 PS4_PS5_Crossgen:
+//  - every WebAPI call goes through bpe::webApi2Helpers::SendRequest (@0x13bbe80): CreateRequest(userCtx, api group,
+//    path, method, content param) + AddHttpRequestHeader + SendRequest(id, body, size, &responseInfo) + ReadData.
+//  - push: CreatePushContext(userCtx, char[37]) (NNVf18SlbT8, @0x13bd410), StartPushContext (AAj9X+4aGYA),
+//    CreateFilter(lib, handle, service, 0, {dataType char[0x41]}, 1) and RegisterCallback(userCtx, filter, cb, arg)
+//    (@0x13bc920); the callback: (userCtx, callbackId, npServiceName, npServiceLabel, to PeerAddressA*, to OnlineId*,
+//    from PeerAddressA*, from OnlineId*, dataType*, data, dataLen, extd*, extdNum, arg) (its template name in the eboot).
+//  - sceNpCheckCallback is called by Matching::PS4_PS5_CrossgenMatchingSystem::Update() (@0x13a4ef0): the queued push
+//    events and signaling events are delivered there, on the game's thread.
+//  - NpSessionSignaling: CreateContext2({userId, pad, ctxCb, arg, groupCb, arg, connCb, arg}, &ctx) (@0x13af380);
+//    ActivateSession(ctx, sessionId, GAME_SESSION, opt, &group); the connection callback (@0x13af750:
+//    SessionSignalingConnectionCallback(ctx, group, conn, event, error, arg)): event 1 -> GetConnectionInfo code 7
+//    (PEER_ADDRESS: accountId 8 bytes) and code 4 (NET_ADDRESS: in_addr + port, network order) -> the peer; event 0 ->
+//    the connection is gone.
+namespace Network::Online {
+bool Enabled();
+bool HttpExchange(const std::string& method, const std::string& url, const std::vector<std::pair<std::string, std::string>>& headers,
+                  const std::string& body, int* status, std::string* resp_headers, std::string* resp_body);
+std::string Token();
+uint64_t    LoggedAccount();
+uint32_t    PeerVip(uint64_t account);
+} // namespace Network::Online
+
+namespace Online5 {
+namespace On = Network::Online;
+
+std::string ServerUrl(const std::string& path) {
+	const char* s = std::getenv("KYTY_ONLINE_SERVER");
+	return std::string("http://") + ((s != nullptr && *s != 0) ? s : "127.0.0.1:31415") + path;
+}
+
+struct PeerAddressA {
+	uint64_t account_id;
+	int32_t  platform;
+	uint8_t  pad[4];
+};
+struct OnlineIdA {
+	char data[16];
+	char term;
+	char dummy[3];
+};
+struct DataTypeA {
+	char val[0x41];
+	char pad[7];
+};
+using push_cb_t = KYTY_SYSV_ABI void (*)(int, int, const char*, uint32_t, const PeerAddressA*, const OnlineIdA*, const PeerAddressA*,
+                                         const OnlineIdA*, const DataTypeA*, const char*, size_t, const void*, size_t, void*);
+using conn_cb_t = KYTY_SYSV_ABI void (*)(int, int, int, int, int, void*);
+
+struct Filter {
+	std::string service, data_type;
+};
+struct Callback {
+	int       user_ctx = 0, filter = 0;
+	push_cb_t cb       = nullptr;
+	void*     arg      = nullptr;
+};
+struct Event {
+	std::string service, data_type, data, from_online_id;
+	uint64_t    from = 0;
+};
+struct SigCtx {
+	int       user_id = 0;
+	conn_cb_t conn_cb = nullptr;
+	void*     conn_arg = nullptr;
+};
+struct SigConn {
+	int      ctx = 0, group = 0;
+	uint64_t account = 0;
+	bool     up = false;
+};
+struct SigGroup {
+	int         ctx = 0;
+	std::string session;
+	bool        active = true;
+};
+struct SigEvent {
+	int ctx, group, conn, event;
+};
+
+std::mutex                      g_m;
+std::map<int, Filter>           g_filters;
+std::map<int, Callback>         g_callbacks;
+std::deque<Event>               g_events;
+std::map<int, SigCtx>           g_sig_ctx;
+std::map<int, SigGroup>         g_sig_group;
+std::map<int, SigConn>          g_sig_conn;
+std::deque<SigEvent>            g_sig_events;
+int                             g_next_filter = 1, g_next_cb = 1, g_next_ctx = 1, g_next_group = 1, g_next_conn = 1;
+std::atomic<bool>               g_push_started {false}, g_sig_started {false};
+
+// a tiny reader for our server's own JSON answers (flat strings by key, repeated)
+std::vector<std::string> Values(const std::string& json, const std::string& key) {
+	std::vector<std::string> out;
+	const std::string        k = "\"" + key + "\":\"";
+	for (size_t at = json.find(k); at != std::string::npos; at = json.find(k, at + 1)) {
+		std::string v;
+		for (size_t i = at + k.size(); i < json.size() && json[i] != '"'; i++) {
+			if (json[i] == '\\' && i + 1 < json.size()) {
+				i++;
+				v += json[i] == 'n' ? '\n' : json[i];
+			} else {
+				v += json[i];
+			}
+		}
+		out.push_back(v);
+	}
+	return out;
+}
+
+void PushLoop() {
+	for (;;) {
+		int         status = 0;
+		std::string h, body;
+		if (On::HttpExchange("GET", ServerUrl("/kyty/push?espera=2"), {}, "", &status, &h, &body) && status == 200) {
+			// {"events":[{"npServiceName":..,"dataType":..,"data":"<json text>","from":..,"fromOnlineId":..},...]}
+			const auto services = Values(body, "npServiceName"), types = Values(body, "dataType"), datas = Values(body, "data"),
+			           froms = Values(body, "from"), names = Values(body, "fromOnlineId");
+			std::lock_guard lock(g_m);
+			for (size_t i = 0; i < services.size() && i < types.size() && i < datas.size(); i++) {
+				Event e;
+				e.service        = services[i];
+				e.data_type      = types[i];
+				e.data           = datas[i];
+				e.from           = i < froms.size() ? std::strtoull(froms[i].c_str(), nullptr, 10) : 0;
+				e.from_online_id = i < names.size() ? names[i] : "";
+				g_events.push_back(e);
+				std::printf("Online: push %s (%s) de %s\n", e.data_type.c_str(), e.service.c_str(), e.from_online_id.c_str());
+				std::fflush(stdout);
+			}
+		} else {
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+		}
+	}
+}
+
+void StartPush() {
+	if (g_push_started.exchange(true)) return;
+	std::thread(PushLoop).detach();
+}
+
+// The members of each active signaling group (the session's JOINED players other than us): a connection each.
+void SignalingLoop() {
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+		std::vector<std::pair<int, SigGroup>> groups;
+		{
+			std::lock_guard lock(g_m);
+			for (const auto& g: g_sig_group)
+				if (g.second.active) groups.emplace_back(g.first, g.second);
+		}
+		const uint64_t me = On::LoggedAccount();
+		for (const auto& [gid, g]: groups) {
+			int         status = 0;
+			std::string h, body;
+			if (!On::HttpExchange("GET", ServerUrl("/kyty/miembros?sesion=" + g.session), {}, "", &status, &h, &body) ||
+			    status != 200)
+				continue;
+			// {"jugadores":[{"accountId":"..","joinState":".."},...]} (server: /kyty/miembros, one pair per player)
+			std::vector<uint64_t> joined;
+			const auto            ids = Values(body, "accountId"), states = Values(body, "joinState");
+			for (size_t k = 0; k < ids.size() && k < states.size(); k++) {
+				const uint64_t a = std::strtoull(ids[k].c_str(), nullptr, 10);
+				if (a != 0 && a != me && states[k] == "JOINED" && std::find(joined.begin(), joined.end(), a) == joined.end()) joined.push_back(a);
+			}
+			std::lock_guard lock(g_m);
+			for (uint64_t a: joined) {
+				bool have = false;
+				for (const auto& c: g_sig_conn)
+					if (c.second.group == gid && c.second.account == a) have = true;
+				if (have) continue;
+				const int conn  = g_next_conn++;
+				g_sig_conn[conn] = {g.ctx, gid, a, true};
+				On::PeerVip(a);
+				g_sig_events.push_back({g.ctx, gid, conn, 1}); // ESTABLISHED
+				std::printf("Online: signaling: conexion %d con %llu en la sesion %s\n", conn, static_cast<unsigned long long>(a), g.session.c_str());
+				std::fflush(stdout);
+			}
+			for (auto it = g_sig_conn.begin(); it != g_sig_conn.end();) {
+				if (it->second.group == gid && std::find(joined.begin(), joined.end(), it->second.account) == joined.end()) {
+					g_sig_events.push_back({it->second.ctx, gid, it->first, 0}); // gone
+					std::printf("Online: signaling: conexion %d cerrada\n", it->first);
+					std::fflush(stdout);
+					it = g_sig_conn.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+	}
+}
+
+} // namespace Online5
+
+namespace Network::Online {
+// (online5) From sceNpCheckCallback (network.cpp), on the game's thread: the queued push and signaling events.
+void DeliverCallbacks() {
+	using namespace Online5;
+	if (!Enabled()) return;
+	std::deque<Event>    events;
+	std::deque<SigEvent> sig;
+	std::vector<std::pair<int, Callback>> cbs;
+	std::map<int, Filter>                 filters;
+	std::map<int, SigCtx>                 ctxs;
+	{
+		std::lock_guard lock(g_m);
+		events.swap(g_events);
+		sig.swap(g_sig_events);
+		for (const auto& c: g_callbacks) cbs.emplace_back(c.first, c.second);
+		filters = g_filters;
+		ctxs    = g_sig_ctx;
+	}
+	const uint64_t me = LoggedAccount();
+	for (const auto& e: events) {
+		PeerAddressA to {me, 2, {}}, from {e.from, 2, {}};
+		OnlineIdA    to_id {}, from_id {};
+		std::snprintf(from_id.data, sizeof(from_id.data), "%s", e.from_online_id.c_str());
+		DataTypeA dt {};
+		std::snprintf(dt.val, sizeof(dt.val), "%s", e.data_type.c_str());
+		int delivered = 0;
+		for (const auto& [id, c]: cbs) {
+			auto f = filters.find(c.filter);
+			if (f == filters.end() || c.cb == nullptr) continue;
+			if (!f->second.data_type.empty() && f->second.data_type != e.data_type) continue;
+			c.cb(c.user_ctx, id, e.service.c_str(), 0, &to, &to_id, &from, &from_id, &dt, e.data.c_str(), e.data.size(), nullptr, 0, c.arg);
+			delivered++;
+		}
+		std::printf("Online: push %s entregado a %d callback(s)\n", e.data_type.c_str(), delivered);
+		std::fflush(stdout);
+	}
+	for (const auto& s: sig) {
+		auto c = ctxs.find(s.ctx);
+		if (c == ctxs.end() || c->second.conn_cb == nullptr) continue;
+		c->second.conn_cb(s.ctx, s.group, s.conn, s.event, 0, c->second.conn_arg);
+	}
+}
+} // namespace Network::Online
+
 namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
@@ -1511,8 +1955,96 @@ static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	return 0;
 }
 
+// (online5) The game's session signaling (connections to the other players of a game session), with KYTY_ONLINE=1:
+// connections are the session's JOINED players (our server), peer address = a virtual 10.77.x.y the P2P bridge
+// (network.cpp) routes through the relay. Off: as before (only Initialize; the rest unresolved).
+struct SigCreateParam {
+	int32_t user_id;
+	int32_t pad;
+	void*   ctx_cb;
+	void*   ctx_arg;
+	void*   group_cb;
+	void*   group_arg;
+	void*   conn_cb;
+	void*   conn_arg;
+};
+
+static int KYTY_SYSV_ABI NpSessionSignalingTerminate() {
+	return 0;
+}
+static int KYTY_SYSV_ABI NpSessionSignalingCreateContext2(const SigCreateParam* param, int* ctx_id) {
+	if (param == nullptr || ctx_id == nullptr) return -2141913085; // invalid argument
+	std::lock_guard lock(Online5::g_m);
+	const int       id      = Online5::g_next_ctx++;
+	Online5::g_sig_ctx[id]  = {param->user_id, reinterpret_cast<Online5::conn_cb_t>(param->conn_cb), param->conn_arg};
+	*ctx_id                 = id;
+	std::printf("Online: signaling: contexto %d (usuario %d)\n", id, param->user_id);
+	std::fflush(stdout);
+	return 0;
+}
+static int KYTY_SYSV_ABI NpSessionSignalingDestroyContext(int ctx_id) {
+	std::lock_guard lock(Online5::g_m);
+	Online5::g_sig_ctx.erase(ctx_id);
+	return 0;
+}
+static int KYTY_SYSV_ABI NpSessionSignalingActivateSession(int ctx_id, const char* session_id, int type, const void* /*opt*/, int* group_id) {
+	if (session_id == nullptr || group_id == nullptr) return -2141913085;
+	{
+		std::lock_guard lock(Online5::g_m);
+		const int       id       = Online5::g_next_group++;
+		Online5::g_sig_group[id] = {ctx_id, session_id, true};
+		*group_id                = id;
+	}
+	std::printf("Online: signaling: ActivateSession %s (tipo %d) -> grupo %d\n", session_id, type, *group_id);
+	std::fflush(stdout);
+	if (!Online5::g_sig_started.exchange(true)) std::thread(Online5::SignalingLoop).detach();
+	return 0;
+}
+static int KYTY_SYSV_ABI NpSessionSignalingDeactivate(int ctx_id, int group_id) {
+	std::lock_guard lock(Online5::g_m);
+	Online5::g_sig_group.erase(group_id);
+	for (auto it = Online5::g_sig_conn.begin(); it != Online5::g_sig_conn.end();)
+		it = (it->second.group == group_id) ? Online5::g_sig_conn.erase(it) : std::next(it);
+	(void)ctx_id;
+	return 0;
+}
+static int KYTY_SYSV_ABI NpSessionSignalingGetConnectionInfo(int ctx_id, int conn_id, int code, void* info) {
+	if (info == nullptr) return -2141913085;
+	uint64_t account = 0;
+	{
+		std::lock_guard lock(Online5::g_m);
+		auto            it = Online5::g_sig_conn.find(conn_id);
+		if (it == Online5::g_sig_conn.end()) return -2141913068; // not found
+		account = it->second.account;
+	}
+	auto* out = static_cast<uint8_t*>(info);
+	if (code == 7) { // PEER_ADDRESS: SceNpPeerAddressA {accountId, platform}
+		std::memcpy(out, &account, 8);
+		const int32_t platform = 2;
+		std::memcpy(out + 8, &platform, 4);
+	} else if (code == 4) { // NET_ADDRESS: in_addr + port (network order)
+		const uint32_t vip  = Network::Online::PeerVip(account);
+		const uint32_t ip_n = ((vip & 0xFFu) << 24) | ((vip & 0xFF00u) << 8) | ((vip >> 8) & 0xFF00u) | (vip >> 24);
+		const uint16_t port = static_cast<uint16_t>((3658 >> 8) | ((3658 & 0xFF) << 8));
+		std::memcpy(out, &ip_n, 4);
+		std::memcpy(out + 4, &port, 2);
+	} else {
+		std::memset(out, 0, 8);
+	}
+	(void)ctx_id;
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpSessionSignaling) {
 	LIB_FUNC("ysmw6J-P8Ak", NpSessionSignalingInitialize);
+	if (Network::Online::Enabled()) {
+		LIB_FUNC("CqJuNXo5yiM", NpSessionSignalingTerminate);
+		LIB_FUNC("aBuX0PX-T7I", NpSessionSignalingCreateContext2);
+		LIB_FUNC("Z9Q9LzQDXf0", NpSessionSignalingDestroyContext);
+		LIB_FUNC("r4XacqHvkn4", NpSessionSignalingActivateSession);
+		LIB_FUNC("cQkBH-pXhF0", NpSessionSignalingDeactivate);
+		LIB_FUNC("yJw2m6UWDYU", NpSessionSignalingGetConnectionInfo);
+	}
 }
 
 } // namespace LibNpSessionSignaling
@@ -3426,6 +3958,8 @@ struct NpWebApi2Request {
 	std::string method;
 	std::string response;
 	size_t      read_offset = 0;
+	std::vector<std::pair<std::string, std::string>> headers; // (online5)
+	std::string response_headers;                             // (online5)
 };
 
 static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
@@ -3443,7 +3977,7 @@ static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
 	return "{}";
 }
 
-static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
+static int KYTY_SYSV_ABI NpWebApi2Initialize_impl(int lib_http_ctx_id, size_t pool_size) {
 	PRINT_NAME();
 
 	LOGF("\t lib_http_ctx_id = %d\n"
@@ -3455,7 +3989,20 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 	return ++id;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
+static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
+	const int online_ret = NpWebApi2Initialize_impl(lib_http_ctx_id, pool_size);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(lib_http_ctx_id=%lld pool_size=%lld) = 0x%08x\n", "NpWebApi2Initialize", static_cast<long long>(lib_http_ctx_id), static_cast<long long>(pool_size), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle_impl(int lib_ctx_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
@@ -3465,7 +4012,20 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
 	return ++handle;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id) {
+static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
+	const int online_ret = NpWebApi2PushEventCreateHandle_impl(lib_ctx_id);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(lib_ctx_id=%lld) = 0x%08x\n", "NpWebApi2PushEventCreateHandle", static_cast<long long>(lib_ctx_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2CreateUserContext_impl(int lib_ctx_id, int user_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n"
@@ -3477,6 +4037,19 @@ static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id)
 	return ++user_context;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id) {
+	const int online_ret = NpWebApi2CreateUserContext_impl(lib_ctx_id, user_id);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(lib_ctx_id=%lld user_id=%lld) = 0x%08x\n", "NpWebApi2CreateUserContext", static_cast<long long>(lib_ctx_id), static_cast<long long>(user_id), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
 static int KYTY_SYSV_ABI NpWebApi2DeleteUserContext(int user_context_id) {
 	PRINT_NAME();
 
@@ -3485,7 +4058,7 @@ static int KYTY_SYSV_ABI NpWebApi2DeleteUserContext(int user_context_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char* api_group,
+static int KYTY_SYSV_ABI NpWebApi2CreateRequest_impl(int user_context_id, const char* api_group,
                                                 const char* path, const char* method,
                                                 const void* content_parameter,
                                                 int64_t*    request_id) {
@@ -3513,6 +4086,22 @@ static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char*
 	return 0;
 }
 
+static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char* api_group,
+                                                const char* path, const char* method,
+                                                const void* content_parameter,
+                                                int64_t*    request_id) {
+	const int online_ret = NpWebApi2CreateRequest_impl(user_context_id, api_group, path, method, content_parameter, request_id);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(user_context_id=%lld api_group=%s path=%s method=%s) = 0x%08x\n", "NpWebApi2CreateRequest", static_cast<long long>(user_context_id), (api_group != nullptr ? api_group : "(null)"), (path != nullptr ? path : "(null)"), (method != nullptr ? method : "(null)"), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
+}
+
 static int KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
 	PRINT_NAME();
 
@@ -3523,8 +4112,7 @@ static int KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
 	            : 0);
 }
 
-static int KYTY_SYSV_ABI
-NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
+static int KYTY_SYSV_ABI NpWebApi2SendRequest_impl(int64_t request_id, const void* data, size_t data_size,
                      NpWebApi2ResponseInformationOption* response_info_option) {
 	PRINT_NAME();
 
@@ -3543,6 +4131,31 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 	request->second.response.clear();
 	request->second.read_offset = 0;
 
+	if (Network::Online::Enabled()) { // (online5) the call to our server (same path, method, headers and body)
+		(void)Network::Online::LoggedAccount(); // logged in first: the token says who "me" is
+		auto headers = request->second.headers;
+		headers.emplace_back("X-Kyty-ApiGroup", request->second.api_group);
+		headers.emplace_back("Content-Type", "application/json; charset=utf-8");
+		int         status = 0;
+		std::string body(data != nullptr ? static_cast<const char*>(data) : "", data != nullptr ? data_size : 0);
+		const bool  ok = Network::Online::HttpExchange(request->second.method.empty() ? "GET" : request->second.method,
+		                                                Online5::ServerUrl(request->second.path), headers, body, &status,
+		                                                &request->second.response_headers, &request->second.response);
+		std::printf("Online: WebAPI %s %s %s -> %s %d (%zu bytes)\n", request->second.api_group.c_str(), request->second.method.c_str(),
+		            request->second.path.c_str(), ok ? "HTTP" : "SIN SERVIDOR", status, request->second.response.size());
+		std::fflush(stdout);
+		if (ok) {
+			if (response_info_option != nullptr) {
+				response_info_option->http_status        = status;
+				response_info_option->response_data_size = request->second.response.size();
+				if (response_info_option->error_object != nullptr && response_info_option->error_object_size > 0) {
+					response_info_option->error_object[0] = '\0';
+				}
+			}
+			return 0;
+		}
+	}
+
 	if (response_info_option != nullptr) {
 		// response_info_option->http_status        = 200;
 		response_info_option->http_status        = 0;
@@ -3555,6 +4168,20 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 
 	// return 0;
 	return NP_WEBAPI2_ERROR_NOT_SIGNED_IN;
+}
+
+static int KYTY_SYSV_ABI NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
+                     NpWebApi2ResponseInformationOption* response_info_option) {
+	const int online_ret = NpWebApi2SendRequest_impl(request_id, data, data_size, response_info_option);
+	if (Network::Online::Enabled()) {
+		static int traced = 0;
+		if (traced < 40) {
+			traced++;
+			std::printf("Online: %s(request_id=%lld data_size=%lld) = 0x%08x\n", "NpWebApi2SendRequest", static_cast<long long>(request_id), static_cast<long long>(data_size), static_cast<unsigned>(online_ret));
+			std::fflush(stdout);
+		}
+	}
+	return online_ret;
 }
 
 static int KYTY_SYSV_ABI NpWebApi2ReadData(int64_t request_id, void* data, size_t size) {
@@ -3601,6 +4228,10 @@ static int KYTY_SYSV_ABI NpWebApi2AddHttpRequestHeader(int64_t request_id, const
 	LOGF("\t field_name = %s\n", field_name != nullptr ? field_name : "(null)");
 	LOGF("\t value      = %s\n", value != nullptr ? value : "(null)");
 
+	if (field_name != nullptr && value != nullptr) { // (online5) sent to our server (X-PSN-SESSION-MANAGER-SESSION-IDS...)
+		auto request = NpWebApi2Requests().find(request_id);
+		if (request != NpWebApi2Requests().end()) request->second.headers.emplace_back(field_name, value);
+	}
 	return 0;
 }
 
@@ -3692,6 +4323,17 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int hand
 	LOGF("\t filter_param     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(filter_param));
 	LOGF("\t filter_param_num = %" PRIu64 "\n", filter_param_num);
 
+	if (Network::Online::Enabled()) { // (online5) kept: push events are delivered by service + data type
+		std::lock_guard lock(Online5::g_m);
+		const int       id = Online5::g_next_filter++;
+		Online5::Filter f;
+		f.service = np_service_name != nullptr ? np_service_name : "";
+		if (filter_param != nullptr && filter_param_num > 0) f.data_type.assign(static_cast<const char*>(filter_param), strnlen(static_cast<const char*>(filter_param), 0x40));
+		Online5::g_filters[id] = f;
+		std::printf("Online: push filtro %d: %s / %s\n", id, f.service.c_str(), f.data_type.c_str());
+		std::fflush(stdout);
+		return id;
+	}
 	static int filter_id = 1;
 
 	return filter_id++;
@@ -3706,6 +4348,12 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	LOGF("\t callback        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(callback));
 	LOGF("\t user_arg        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(user_arg));
 
+	if (Network::Online::Enabled()) { // (online5) called from sceNpCheckCallback (Network::Online::DeliverCallbacks)
+		std::lock_guard lock(Online5::g_m);
+		const int       id   = Online5::g_next_cb++;
+		Online5::g_callbacks[id] = {user_context_id, filter_id, reinterpret_cast<Online5::push_cb_t>(callback), user_arg};
+		return id;
+	}
 	static int callback_id = 1;
 
 	return callback_id++;
@@ -3722,6 +4370,30 @@ static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
 
+	return 0;
+}
+
+// (online5) Push contexts (the game sends its pushContextId in its session's member data) and their start / stop.
+static int KYTY_SYSV_ABI NpWebApi2PushEventCreatePushContext(int user_context_id, char* push_context_id) {
+	if (push_context_id == nullptr) return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
+	static std::atomic<uint32_t> n {0};
+	const uint32_t k = ++n;
+	std::snprintf(push_context_id, 37, "%08X-%04X-4%03X-8%03X-%012llX", static_cast<unsigned>(std::time(nullptr)), k & 0xFFFF,
+	              static_cast<unsigned>(user_context_id & 0xFFF), k & 0xFFF, static_cast<unsigned long long>(Network::Online::LoggedAccount() & 0xFFFFFFFFFFFFull));
+	return 0;
+}
+static int KYTY_SYSV_ABI NpWebApi2PushEventStartPushContext(int /*user_context_id*/, const char* /*push_context_id*/) {
+	Online5::StartPush();
+	return 0;
+}
+static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int /*lib_ctx_id*/, int filter_id) {
+	std::lock_guard lock(Online5::g_m);
+	Online5::g_filters.erase(filter_id);
+	return 0;
+}
+static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int /*user_context_id*/, int callback_id) {
+	std::lock_guard lock(Online5::g_m);
+	Online5::g_callbacks.erase(callback_id);
 	return 0;
 }
 
@@ -3744,6 +4416,12 @@ LIB_DEFINE(InitNet_1_NpWebApi2) {
 	LIB_FUNC("fY3QqeNkF8k", LibNpWebApi2::NpWebApi2PushEventRegisterCallback);
 	LIB_FUNC("3Tt9zL3tkoc", LibNpWebApi2::NpWebApi2CheckTimeout);
 	LIB_FUNC("bEvXpcEk200", LibNpWebApi2::NpWebApi2Terminate);
+	if (Network::Online::Enabled()) { // (online5) Ghidra: NNVf18SlbT8 / AAj9X+4aGYA (@0x13bd410), KJdPcOGmK58 / hOnIlcGrO6g (@0x13bcd00)
+		LIB_FUNC("NNVf18SlbT8", LibNpWebApi2::NpWebApi2PushEventCreatePushContext);
+		LIB_FUNC("AAj9X+4aGYA", LibNpWebApi2::NpWebApi2PushEventStartPushContext);
+		LIB_FUNC("KJdPcOGmK58", LibNpWebApi2::NpWebApi2PushEventDeleteFilter);
+		LIB_FUNC("hOnIlcGrO6g", LibNpWebApi2::NpWebApi2PushEventUnregisterCallback);
+	}
 }
 
 } // namespace LibNpWebApi2

@@ -13,6 +13,7 @@
 #include "otros1.h"
 #include "render5.h"
 #include "sync-stats.h"
+#include "native/g1-probe.h" // (g1: tq6 by pass)
 
 namespace LiveCensus {
 
@@ -347,7 +348,10 @@ public:
 				g_xpr_cycles[m_a & 3] += cycles;
 				g_xpr_calls[m_a & 3] += 1; // (thread1)
 			}
-			if (m_kind == DrawPhase && (m_a | 1u) == 0x7ab1fu) g_table_phase_cycles[m_a & 1u][m_b & (Phases - 1)] += cycles;
+			if (m_kind == DrawPhase && (m_a | 1u) == 0x7ab1fu) {
+				g_table_phase_cycles[m_a & 1u][m_b & (Phases - 1)] += cycles;
+				if (m_a == 0x7ab1fu && (m_b & (Phases - 1)) == 6) G1::NoteTq6(cycles); // (g1: tq6 by pass)
+			}
 			if (m_stats) {
 				auto& by_queue = m_kind == Dispatch ? g_queue_dispatches : g_queue_runs;
 				by_queue[(m_b & QueueAsync) != 0 ? 1 : 0][0] += 1;

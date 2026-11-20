@@ -768,6 +768,10 @@ void RStat(int k, int v) {
 	if (subgroupElect()) atomicAdd(calib[RSTATS + k], sum);
 }
 bool ReprojFix() { return (push.misc.w & 16384) != 0; } // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ=1)
+// (rtback LEJOS) KYTY_RTREFL_LEJOS=1 (misc.w & 32768; 0: exactly 9589439): distant reflectors keep their rays and detail.
+// FarW: 0 up to 12 view units (m), 1 from 40; every change below is scaled by it (near reflections unchanged).
+bool  Lejos() { return (push.misc.w & 32768) != 0; }
+float FarW(float z) { return Lejos() ? smoothstep(12.0, 40.0, z) : 0.0; }
 // (rtrefl1) The history at uv through a 5-tap Catmull-Rom (bilinear taps): the bilinear fetch alone blurs the history a
 // little more every frame the reflection moves. Ringing is cut by the neighbourhood clamp after it.
 vec4 HistCR(vec2 uv) {
@@ -923,9 +927,11 @@ void Trace(ivec2 px, bool march) {
 	float f  = float(push.misc.y & 1023);
 	vec2  xi = vec2(fract(Ign(vec2(px)) + f * 0.6180340), fract(Ign(vec2(px) + vec2(47.0, 17.0)) + f * 0.7548777));
 	vec3  R;
-	if (s.rough < 0.02) R = reflect(-V, s.N);
+	float fw = FarW(dist);                          // (LEJOS)
+	float gr = s.rough * mix(1.0, 0.7, fw);         // (LEJOS: far, the lobe 30 % narrower; 0: s.rough as before)
+	if (gr < 0.02) R = reflect(-V, s.N);
 	else {
-		vec3 H = SampleGgxVndf(s.N, V, max(s.rough * s.rough, 1e-3), xi);
+		vec3 H = SampleGgxVndf(s.N, V, max(gr * gr, 1e-3), xi);
 		R      = reflect(-V, H);
 		if (dot(R, s.N) <= 0.02) R = reflect(-V, s.N);
 	}
@@ -938,6 +944,7 @@ void Trace(ivec2 px, bool march) {
 	vec4 hc;
 	float hdist;
 	int   iters = max(int(float(push.misc2.z) * mix(1.0, 0.5, smoothstep(0.15, 0.45, s.rough))), 8);
+	if (fw > 0.0) iters = max(iters, int(float(push.misc2.z) * mix(1.0, 1.5, fw))); // (LEJOS: far, up to 1.5x, no rough halving)
 	if (WaterStable() && s.water > 0.0) iters += iters / 2; // (water-1030: water's mirror ray finds more, a finer march)
 	if (!March(P, s.N, R, V, iters, hc, hdist)) { StoreMiss(px, s); return; }
 	if (st) Stat(5, 1);
@@ -1098,6 +1105,13 @@ void Temporal(ivec2 px) {
 				if (!Bad(hc)) hist = max(hc, vec4(0));
 			}
 		} else if (rst) hsc = HistScore(hist, m1, sig, a1, asig);
+		// (LEJOS) far surfaces moving > 0.5 px: the sharp Catmull-Rom history fetch (the bilinear one blurs a bit more every
+		// frame in motion), as rtrefl1 does, without its candidates
+		float fwt = FarW(g.w);
+		if (!rfix && fwt > 0.0 && length((puv - uv) * RenderSize()) > 0.5) {
+			vec4 hc = HistCR(puv);
+			if (!Bad(hc)) hist = max(hc, vec4(0));
+		}
 		if (rst) {
 			RStat(0, 1), RStat(1, pick == 0 ? 1 : 0), RStat(2, pick == 1 ? 1 : 0), RStat(3, pick == 2 ? 1 : 0);
 			RStat(4, int(min(hsc, 10.0) * 100.0)), RStat(5, hsc > 2.0 ? 1 : 0);
@@ -1105,6 +1119,7 @@ void Temporal(ivec2 px) {
 		if (Bad(hist)) hist = cur;
 		float k    = mix(0.75, 2.5, smoothstep(0.05, 0.4, rough)); // (refl3: mirrors clamped tighter: no ghosts)
 		k         *= mix(1.0, int(yparams.z + 0.5) >= 1 ? 0.4 : 0.6, tmov); // (refl-motion-1031: the YCoCg box tighter in motion)
+		k         *= mix(1.0, 0.7, fwt * smoothstep(0.5, 2.0, length((puv - uv) * RenderSize()))); // (LEJOS: far and moving)
 		vec3  hy   = clamp(YCoCg(hist.rgb), m1 - k * sig - 1e-4, m1 + k * sig + 1e-4);
 		hist.rgb   = max(Rgb(hy), vec3(0));
 		hist.a     = clamp(hist.a, a1 - k * asig - 0.02, a1 + k * asig + 0.02);
@@ -1179,6 +1194,7 @@ void Atrous(ivec2 px) {
 	step *= clamp(25.0 / max(g.w, 1e-3), 0.3, 1.0);
 	if (ax.z > 0.0) step *= clamp(ax.z / max(g.w * 0.1, 1e-3), 0.3, 1.0);
 	step          *= sh == 2 ? 0.4 : sh == 1 ? 0.65 : 1.0; // (refl-sharp-1031: a smaller radius)
+	step          *= mix(1.0, 0.5, FarW(g.w));              // (LEJOS: far, half the radius)
 	step           = max(step, 1.0);
 	const float kern[3] = float[](0.375, 0.25, 0.0625);
 	float lc       = c.a > 1e-3 ? Luma(c.rgb / c.a) : 0.0;

@@ -1152,6 +1152,18 @@ uint32_t BufferDescriptorWord(const DescriptorValue& value) {
 	       descriptor.DstSelXYZW() << BufferWord::DstSelShift;
 }
 
+// (TrackResources' `storage_reads`) A storage image the shader reads as well as stores: its loads take each component the
+// swizzle gives, so the swizzle stays as the descriptor has it.
+static bool KeepsIdentitySwizzleShortcut(const ImageResource& base, bool storage) {
+	return !(storage && base.read && !base.atomic);
+}
+
+// An image read by atomics (TrackResources' `storage_reads` reads a raw 32-bit signed storage image as its bits, as it
+// stores them).
+static bool ReadByAtomics(const ImageResource& base) {
+	return base.read && base.atomic;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializeWorkspace& workspace,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization,
@@ -1333,10 +1345,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 			// Loads of a format the device converts apply no swizzle, and a store writes each channel
 			// of the format the component the swizzle routes to it first: one that routes every channel
-			// its own component (X001, XXXX, XY00...) writes what an identity one does.
+			// its own component (X001, XXXX, XY00...) writes what an identity one does. Not a storage image
+			// the shader reads (KeepsIdentitySwizzleShortcut; a call and &, the function's PGO profile kept).
 			const auto count    = Format::GetFormatInfo(format).component_count;
 			bool       identity = image.conversion_format == Prospero::BufferFormat::kInvalid && count >= 1u &&
 			                count <= 4u;
+			identity &= KeepsIdentitySwizzleShortcut(base, storage);
 			for (uint32_t channel = 0; identity && channel < count; channel++) {
 				uint32_t source = 0;
 				while (source < 4u && ((image.shader_swizzle >> (source * 3u)) & 7u) != 4u + channel) source++;
@@ -1344,8 +1358,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			}
 			if (identity) image.shader_swizzle = ShaderImageIdentitySwizzle;
 		}
+		// (Read too, but not by atomics: ReadByAtomics.)
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
+		                              base.written && !ReadByAtomics(base) && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
@@ -1911,8 +1926,31 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	CompactPlanMemoryInfo(plan); // (up1120, upstream 144c38a)
 	BuildLinearSrtPlan(plan);
 	return plan;
+}
+
+void CompactPlanMemoryInfo(ResourcePlan& plan) {
+	std::vector<uint32_t>   kept_at(plan.memory_info.size(), UINT32_MAX);
+	std::vector<MemoryInfo> kept;
+	for (auto& inst: plan.value_storage) {
+		// (The runtime reads, as Program.cpp's IsRuntimeRead: all EquivalentValue compares by their memory infos.)
+		const auto op = inst.GetOpcode();
+		if (op != ValueOpcode::ReadConstBuffer && AddressOpcodeInfoOf(op).access != AddressAccess::Read) continue;
+		auto flags = inst.Flags<MemoryFlags>();
+		if (flags.index >= kept_at.size()) continue; // (refused by its readers as before: past any kept entry too)
+		auto& at = kept_at[flags.index];
+		if (at == UINT32_MAX) {
+			at = static_cast<uint32_t>(kept.size());
+			kept.push_back(plan.memory_info[flags.index]);
+		}
+		flags.index = at;
+		inst.SetFlags(flags);
+	}
+	// (Always the kept order: the values now index it, also where every entry is kept.)
+	kept.shrink_to_fit();
+	plan.memory_info = std::move(kept);
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

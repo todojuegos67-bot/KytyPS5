@@ -7,6 +7,8 @@
 #include "writeback-verify.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
+#include "f0-measure.h" // (f0, KYTY_F0: memoryAddressSpace.inc)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE: memoryAddressSpace.inc)
 #include "mem-guard.h"
 #include "ram-guard.h"
 #include "common/guardedCopy.h" // (raiz2: NativeGuardedRead, the read probes)
@@ -1599,6 +1601,25 @@ bool NativeGuardedRead(void* destination, const void* guest, uint64_t size) {
 #endif
 	NativeGuardedAccess(from, size, [&] { std::memcpy(to, from, size); });
 	return true;
+}
+
+void NativeWindowRun(const void* guest, uint64_t size, void (*access)(void*), void* context) { // (tiron8)
+	if (size == 0) return;
+	const auto* from = static_cast<const uint8_t*>(guest);
+#if defined(_WIN32)
+	// (raiz11, as NativeGuardedRead) Checked against the put-ins of kept GPU bytes under way: one overlapping it may have
+	// shown the copy the pages' old bytes; read again then (KYTY_RAIZ_STALE_FIX), the gate waiting for the put-in to end.
+	NativeReadTicket ticket;
+	if (Raiz::On()) NativeReadTicketTake(reinterpret_cast<uint64_t>(from), size, &ticket);
+	NativeGuardedAccess(from, size, [&] { access(context); });
+	if (Raiz::On() && !NativeReadTicketClean(ticket)) {
+		const bool fix = NativeStaleFixOn();
+		NativeNoteStale(Raiz::StaleUpload, reinterpret_cast<uint64_t>(from), size, static_cast<uint64_t>(Raiz::t_site), fix);
+		if (fix) NativeGuardedAccess(from, size, [&] { access(context); });
+	}
+#else
+	NativeGuardedAccess(from, size, [&] { access(context); });
+#endif
 }
 
 const uint8_t* TryGetUploadSourcePointer(uint64_t vaddr, uint64_t size) {

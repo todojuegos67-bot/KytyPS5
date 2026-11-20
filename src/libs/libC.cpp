@@ -11,6 +11,7 @@
 #include "libs/libs.h"
 #include "libs/vaContext.h"
 #include "loader/demonsSoulsTextureProbe.h"
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE)
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
@@ -651,7 +652,11 @@ void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
 	// KYTY_TEXTURE_PROBE: counts only the streamed texture chunks' copy (measurement, demonsSoulsTextureProbe.h).
 	::Loader::DemonsSoulsTextureProbe::OnCopy(reinterpret_cast<uint64_t>(__builtin_return_address(0)), dest, n);
-	return ::memcpy(dest, src, n);
+	// (g1, KYTY_G1_PROBE: the binder's register-pair copies; one relaxed load when off. native/g1-probe.h)
+	::G1::OnMemcpy(reinterpret_cast<uint64_t>(__builtin_return_address(0)), dest, src, n);
+	void* const result = ::memcpy(dest, src, n);
+	::G1::AfterMemcpy();
+	return result;
 }
 
 void* KYTY_SYSV_ABI memmove(void* dest, const void* src, size_t n) {

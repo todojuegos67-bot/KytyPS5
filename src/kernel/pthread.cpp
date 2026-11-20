@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "local/f0-measure.h" // (cpu1: the game thread's waits)
 #include "time-census.h"
 
 #include "common/assert.h"
@@ -2124,6 +2125,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	F0Measure::WaitScope f0w_(2, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2178,6 +2180,7 @@ int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
+	F0Measure::WaitScope f0w_(2, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2798,6 +2801,7 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 }
 
 int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
+	F0Measure::WaitScope f0w_(7, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// Hot path for some PS5 titles; per-call name logging can dominate runtime.
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2815,6 +2819,7 @@ int KYTY_SYSV_ABI PthreadRwlockRdlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	F0Measure::WaitScope f0w_(7, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2832,6 +2837,7 @@ int KYTY_SYSV_ABI PthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds
 }
 
 int KYTY_SYSV_ABI PthreadRwlockTimedwrlock(PthreadRwlock* rwlock, KernelUseconds usec) {
+	F0Measure::WaitScope f0w_(7, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2949,6 +2955,7 @@ int KYTY_SYSV_ABI PthreadRwlockUnlock(PthreadRwlock* rwlock) {
 }
 
 int KYTY_SYSV_ABI PthreadRwlockWrlock(PthreadRwlock* rwlock) {
+	F0Measure::WaitScope f0w_(7, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3268,6 +3275,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	F0Measure::WaitScope f0w_(1, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3355,6 +3363,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	F0Measure::WaitScope f0w_(1, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3439,6 +3448,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	F0Measure::WaitScope f0w_(1, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3831,6 +3841,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 }
 
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
+	F0Measure::WaitScope f0w_(6, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 
 	if (thread == nullptr) {
@@ -4354,6 +4365,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	F0Measure::WaitScope f0w_(5, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	KYTY_TIME_CENSUS(Usleep, microseconds);
 	Common::Timer t;
 	t.Start();
@@ -4375,6 +4387,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	F0Measure::WaitScope f0w_(5, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	PRINT_NAME();
 	KYTY_TIME_CENSUS(Nanosleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_sec) * 1000000u +
 	                                                  static_cast<uint64_t>(rqtp->tv_nsec) / 1000u

@@ -7,7 +7,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Collects immutable resource topology from typed SSA handles, interns their resolved dwords in
 // descriptor_sources, then writes dense indices to handle flags and MemoryInfo.
-void TrackResources(Program& program);
+// `storage_reads` (a pixel shader with Frontend::TranslatorFeaturePixelInterlock): the loads of an image the shader also
+// stores through the same descriptor read the storage image (ImageResource::read of a storage image).
+void TrackResources(Program& program, bool storage_reads = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

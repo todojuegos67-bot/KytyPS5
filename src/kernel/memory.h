@@ -138,6 +138,9 @@ bool                   NativeGuardedRead(void* destination, const void* guest, u
 // also over pages a tracker may have protected (TryGetBackingPointer refuses those). Read it with NativeGuardedRead
 // only. Without KYTY_RAIZ: TryGetBackingPointer.
 const uint8_t*         TryGetUploadSourcePointer(uint64_t vaddr, uint64_t size);
+// (tiron8, KYTY_TIRON8) access(context) with guest [guest, guest + size) readable: one NativeGuardedAccess window (RAIZ's
+// no-access pages opened READ-ONLY, the gate held until access returns); without native read faults, access alone.
+void                   NativeWindowRun(const void* guest, uint64_t size, void (*access)(void*), void* context);
 // The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
 uint64_t               BackingMappingEnd(uint64_t vaddr);
 // KYTY_GUEST_LAZY_COMMIT (local/guest-lazy-commit.h): the never-touched pages of [address, address + size) committed,

@@ -36,6 +36,9 @@
 #include "graphics/host_gpu/renderer/cache/shadowPoolTrace.h"
 #include "loader/demonsSoulsMemMap.h" // (ram1: KYTY_DS_RT_OFFLOAD, the render-target arenas)
 #include "common/guardedCopy.h" // (ram15: KYTY_NATIVE_TEXTURE_OFFLOAD, the check's compare)
+#include "graphics/host_gpu/hostMemory.h" // (rtq2: HashGuestRange, pages not committed)
+#include "ram-native-tex.h" // (ram1b: KYTY_RAM_NATIVE_TEX)
+#include "graphics/host_gpu/renderer/image/sparseImage.h" // (ram1b)
 
 #include <algorithm>
 #include <array>
@@ -334,6 +337,18 @@ struct TextureCache::OffloadRestore {
 	uint64_t                               bytes = 0, lost = 0;
 	std::chrono::steady_clock::time_point  start;
 	std::atomic<bool>                      done {false};
+};
+
+// (ram1b, KYTY_RAM_NATIVE_TEX=2) A sparse image's bound layers against a dense copy of the same description uploaded
+// from guest memory by the current path: both downloaded, every level of each layer, into one buffer (the reference's
+// first, then the sparse image's at `half`), compared by layer (XXH3) by the offload worker when the GPU is done.
+struct TextureCache::RntCheck {
+	std::unique_ptr<Buffer>                   buffer;
+	uint64_t                                  half = 0;
+	std::vector<std::tuple<uint32_t, uint64_t, uint64_t>> layers; // (layer, offset, bytes)
+	bool                                      proven = false;     // its format proven exact by an offload check
+	std::string                               what;
+	std::atomic<bool>                         done {false};
 };
 
 // The checks' compares, the asynchronous restores' write-backs and the discards of taken ranges: on a thread of their
@@ -693,6 +708,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info, bool may_fail) {
 	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
+		RamNativeTex::ProbeEnd(info.data.address, info.data.End(), true); // (ram1b: the first-use probe)
 	}
 	return id;
 }
@@ -2708,7 +2724,36 @@ void DirtyRowBands(const std::vector<std::pair<uint64_t, uint64_t>>& dirty, uint
 
 [[nodiscard]] uint64_t HashGuestRange(uint64_t vaddr, uint64_t size) {
 	if (const auto* data = LibKernel::Memory::TryGetBackingPointer(vaddr, size)) {
-		return XXH3_64bits(data, static_cast<size_t>(size));
+		// (rtq2) A mapping that covers the range does not mean every page of it is committed: build 7c84280-dirty crashed
+		// in XXH3_hashLong_64b <- UploadDepthPartial on a 4 MiB depth array at 0x1036c00000 with only 0xbe000 committed
+		// (the rest MEM_RESERVE). Read straight only when every page is readable now; otherwise a guarded copy, page by
+		// page (a page that cannot be read hashes as zeros, as a range the guest never wrote), never a fault.
+		uint64_t readable = 0;
+		if (Libs::Graphics::HostMemoryQueryReadable(reinterpret_cast<uint64_t>(data), size, readable) && readable >= size) {
+			return XXH3_64bits(data, static_cast<size_t>(size));
+		}
+		thread_local SoftRelease::Scratch guarded("texture hash guarded copy");
+		const auto                        hold_g = guarded.Use();
+		auto&                             out    = guarded.bytes;
+		out.resize(size);
+		constexpr uint64_t Page = 0x1000;
+		for (uint64_t done = 0; done < size;) {
+			const uint64_t at   = reinterpret_cast<uint64_t>(data) + done;
+			const uint64_t step = std::min<uint64_t>(size - done, Page - (at & (Page - 1)));
+			if (const uint64_t left = Common::GuardedCopy(out.data() + done, data + done, step); left != 0) {
+				std::memset(out.data() + done + (step - left), 0, static_cast<size_t>(left));
+			}
+			done += step;
+		}
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("rtq2: guest range 0x%llx size 0x%llx only 0x%llx readable at its start: hashed through a guarded "
+			            "copy (no fault)\n",
+			            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(readable));
+			std::fflush(stdout);
+		}
+		return XXH3_64bits(out.data(), static_cast<size_t>(size));
 	}
 	// (A copy of the texture's guest bytes, up to hundreds of MiB, kept by the thread: KYTY_SOFT_RELEASE frees it idle.)
 	thread_local SoftRelease::Scratch scratch("texture hash copy");
@@ -5879,6 +5924,7 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid map range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	RamNativeTex::ProbeMap(address, address + size); // (ram1b: the first-use probe)
 	// Memory mapped under a cached image replaces its contents without a CPU write through the
 	// watched pages (the new pages may have been filled through another mapping).
 	for (const auto id: FindImagesInRegion(address, size, false)) {
@@ -5886,6 +5932,9 @@ void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
+		// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse array: the layers the map commits get video memory (before the upload the
+		// dirty state below brings).
+		if (owner->IsSparse() && GuestGpu::IsGpuThread()) owner->SparseUpdate(address, address + size);
 		NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByMap);
 		if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
@@ -5946,12 +5995,17 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		for (size_t i = 0; i < bits.size(); ++i) m_meta_filter[i].store(bits[i], std::memory_order_release);
 	}
 	m_meta_epoch.fetch_add(1, std::memory_order_release);
+	RamNativeTex::ProbeEnd(address, address + size, false); // (ram1b: the first-use probe)
 	auto images = FindImagesInRegion(address, size, false);
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
 		}
+		// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse array keeping its other layers: the layers decommitted lose their memory.
+		if (owner->IsSparse() && GuestGpu::IsGpuThread() &&
+		    (address > owner->info.data.address || address + size < owner->info.data.End()))
+			owner->SparseUpdate(address, address + size, address, address + size);
 		// A texture pool the game streams through keeps its other layers: the game unmaps one
 		// layer's memory at a time. The unmapped span becomes dirty (read back as it is when
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
@@ -6063,6 +6117,487 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 	std::fflush(stdout);
 }
 
+// (ram1b) KYTY_RAM_NATIVE_TEX=1|2 (ram-native-tex.h). GPU thread, once a flip, m_lock held (RunGarbageCollector).
+// Every 120 flips (between OffloadScan's): (b) the guest copy of what the cache's images hold - a texture array's
+// committed layers (an image of the VirtualMemoryGPU zone with layers, only sampled: Ghidra 01.007.000, its CPU writes
+// the layers and never reads them back) and the render targets (GPU-written images of the RTShared/RTPersist arenas:
+// PS5CRenderDisplay 0x90ad80 reserves them for GPU work only) -, clean at two scans in a row (no CPU or GPU buffer write
+// pending, tracked; a target with no read back pending), mapped, outside the pages it stopped watching and, for an
+// array, outside every other GPU-written image: taken as cold ranges of up to 1 MiB (texture-offload.h, RntTakeNow), the
+// RAM18 thread writing them to the disk store and dropping them; any touch reads them back from the file. Up to
+// KYTY_RAM_NATIVE_TEX_MB (default 512) a scan. =2 takes nothing and counts what it would take.
+// Every 5 s: the "[rnt]" line and (=2) one verification (RntVerify).
+void TextureCache::RntScan(uint64_t tick) {
+	using Clock         = std::chrono::steady_clock;
+	const int     mode  = RamNativeTex::Mode();
+	static auto   last  = Clock::now();
+	constexpr double MiB = 1024.0 * 1024.0;
+	if (Clock::now() - last >= std::chrono::seconds(5)) {
+		last = Clock::now();
+		if (mode == 2) RntVerify();
+		auto&      sp = RamNativeTex::Sparse();
+		auto&      vf = RamNativeTex::Verify();
+		const auto bound = sp.bound_bytes.load(), dense = sp.dense_bytes.load(), chunks = sp.chunk_bytes.load();
+		TextureOffload::RntView view;
+		const bool read = TextureOffload::RntRead(&view);
+		char       probe[640];
+		RamNativeTex::ProbeLine(probe, sizeof(probe));
+		std::printf("[rnt] 5 s modo=%d | VRAM arrays dispersos: %llu imagenes (hechas %llu, densas por rechazo %llu), ligado %.0f MiB "
+		            "(reservado %.0f) de %.0f MiB densos -> ahorro %.0f MiB; capas +%llu -%llu en %llu llamadas (%.1f ms); capas sin "
+		            "memoria %llu | RAM %s: soltado ahora capas %.0f + RT %.0f MiB (pico %.0f); tomados capas %.0f / RT %.0f MiB; al "
+		            "disco %.0f MiB, en cero %.0f MiB, no escritos %llu; vueltos por un toque: capas %llu (%.0f MiB), RT %llu (%.0f MiB), "
+		            "%.1f ms en total (el mayor %.1f ms), edad <10 s %llu, <60 s %llu, mas %llu; PERDIDAS %llu; disco %.0f/%.0f MiB | "
+		            "=2 soltaria: capas %.0f + RT %.0f MiB; verificacion: pasadas %llu, capas %llu, iguales %llu, DISCREPANCIA %llu, "
+		            "omitidas %llu, formato sin prueba %llu | %s\n",
+		            mode, static_cast<unsigned long long>(sp.images.load()), static_cast<unsigned long long>(sp.made.load()),
+		            static_cast<unsigned long long>(sp.refused.load()), bound / MiB, chunks / MiB, dense / MiB,
+		            dense > chunks ? (dense - chunks) / MiB : 0.0, static_cast<unsigned long long>(sp.layers_bound.load()),
+		            static_cast<unsigned long long>(sp.layers_unbound.load()), static_cast<unsigned long long>(sp.bind_calls.load()),
+		            sp.bind_us.load() / 1000.0, static_cast<unsigned long long>(sp.alloc_failed.load()),
+		            read ? "" : "(sin leer: cerrojo ocupado)", view.now[0] / MiB, view.now[1] / MiB, view.peak / MiB,
+		            view.taken_bytes[0] / MiB, view.taken_bytes[1] / MiB, view.written_bytes / MiB, view.zero_bytes / MiB,
+		            static_cast<unsigned long long>(view.failed), static_cast<unsigned long long>(view.reads[0]), view.read_bytes[0] / MiB,
+		            static_cast<unsigned long long>(view.reads[1]), view.read_bytes[1] / MiB, view.read_us / 1000.0,
+		            view.read_us_max / 1000.0, static_cast<unsigned long long>(view.ages[0]), static_cast<unsigned long long>(view.ages[1]),
+		            static_cast<unsigned long long>(view.ages[2]), static_cast<unsigned long long>(view.lost), view.file_used / MiB,
+		            view.file_size / MiB, RamNativeTex::WouldRelease(0).load() / MiB, RamNativeTex::WouldRelease(1).load() / MiB,
+		            static_cast<unsigned long long>(vf.runs.load()), static_cast<unsigned long long>(vf.layers.load()),
+		            static_cast<unsigned long long>(vf.equal.load()), static_cast<unsigned long long>(vf.discrepancy.load()),
+		            static_cast<unsigned long long>(vf.skipped.load()), static_cast<unsigned long long>(vf.unproven_format.load()), probe);
+		// (ram2, KYTY_RAM2) Its line: the last scan, what is out of RAM, the touches that brought it back and their check.
+		if (const int ram2 = RamNativeTex::Ram2Mode(); ram2 != 0) {
+			auto&                    rs = RamNativeTex::Ram2Scan();
+			TextureOffload::Ram2View r2;
+			const bool               r2_read = TextureOffload::Ram2Read(&r2);
+			const uint64_t           scans   = rs.scans.load();
+			std::printf("[ram2] 5 s modo=%d (sin imagen %d s o mas desde el mapeo) | ultima pasada: esperan %.0f MiB, mirados %.0f, "
+			            "de ellos de otro asignador (no VirtualMemo) %.0f, en zona vetada %.0f, bajo imagen %.0f, ya tomados %.0f, "
+			            "retenidos por un toque reciente %.0f, fuera de RAM o protegidos %.0f, %s %.0f MiB; pasada %.2f ms (media "
+			            "%.2f, la mayor %.2f) | RAM%s: soltado ahora %.0f MiB (pico %.0f); "
+			            "tomados %llu (%.0f MiB); al disco %.0f MiB, en cero %.0f MiB, no escritos "
+			            "%llu; desmapeados fuera %.0f MiB | vueltos por un toque %llu (%.0f MiB), %.1f ms en total (el mayor %.2f ms), "
+			            "edad desde la toma <10 s %llu, <60 s %llu, mas %llu | verificacion: comprobados %llu (%.0f MiB, %.1f ms), "
+			            "iguales %llu, DISCREPANCIA %llu, sin comprobar %llu | PERDIDAS %llu | disco %.0f/%.0f MiB | proteccion: zonas "
+			            "vetadas %llu (escrituras del emulador %llu, fallos repetidos %llu, lentos %llu; el fallo mas largo %.1f ms)\n",
+			            ram2, RamNativeTex::Ram2AgeSeconds(), rs.waiting.load() / MiB, rs.aged.load() / MiB,
+			            rs.other_label.load() / MiB, rs.blocked.load() / MiB, rs.under_image.load() / MiB, rs.taken.load() / MiB, rs.held.load() / MiB, rs.not_ram.load() / MiB, ram2 == 1 ? "propuestos" : "=2 soltaria", rs.proposed.load() / MiB,
+			            rs.scan_us_last.load() / 1000.0, scans != 0 ? rs.scan_us.load() / 1000.0 / static_cast<double>(scans) : 0.0,
+			            rs.scan_us_max.load() / 1000.0, r2_read ? "" : " (sin leer: cerrojo ocupado)", r2.now / MiB, r2.peak / MiB,
+			            static_cast<unsigned long long>(r2.taken), r2.taken_bytes / MiB, r2.written_bytes / MiB, r2.zero_bytes / MiB,
+			            static_cast<unsigned long long>(r2.failed), r2.unmapped / MiB, static_cast<unsigned long long>(r2.reads),
+			            r2.read_bytes / MiB, r2.read_us / 1000.0, r2.read_us_max / 1000.0, static_cast<unsigned long long>(r2.ages[0]),
+			            static_cast<unsigned long long>(r2.ages[1]), static_cast<unsigned long long>(r2.ages[2]),
+			            static_cast<unsigned long long>(r2.checked), r2.checked_bytes / MiB, r2.check_us / 1000.0,
+			            static_cast<unsigned long long>(r2.equal), static_cast<unsigned long long>(r2.discrepancy),
+			            static_cast<unsigned long long>(r2.unchecked), static_cast<unsigned long long>(r2.lost), r2.file_used / MiB,
+			            r2.file_size / MiB, static_cast<unsigned long long>(RamNativeTex::Ram2Guards().count.load()),
+			            static_cast<unsigned long long>(RamNativeTex::Ram2Guards().host_writes.load()),
+			            static_cast<unsigned long long>(RamNativeTex::Ram2Guards().repeats.load()),
+			            static_cast<unsigned long long>(RamNativeTex::Ram2Guards().slow.load()),
+			            RamNativeTex::Ram2Guards().slow_us_max.load() / 1000.0);
+		}
+		std::fflush(stdout);
+	}
+	if (tick % 120 != 60 || !TextureOffload::Native()) return;
+	if (mode == 1 && !TextureOffload::Ram18On()) return;
+	// (ram2, KYTY_RAM2=1|2) The zone's memory no image has used for KYTY_RAM2_AGE_S since its map (the first-use probe's
+	// waits, oldest first), mapped, outside every image of the cache (an image over it is RAM16's / (b)'s), not taken,
+	// committed plain read-write or read-only with a page in RAM: taken as cold ranges of up to 1 MiB (RntRam2), the RAM18
+	// thread writing them to the disk store and dropping them; any touch reads them back and verifies them. Up to
+	// KYTY_RAM2_MB (128) a scan, 4 GiB of waits and 768 chunks' page checks at most (render thread: its time is in the
+	// line). =2 takes nothing and counts what it would take.
+	if (const int ram2 = RamNativeTex::Ram2Mode(); ram2 != 0) {
+		using Clock2 = std::chrono::steady_clock;
+		const auto r2_start = Clock2::now();
+		constexpr uint64_t R2Page = TRACKER_PAGE_SIZE, R2Chunk = uint64_t {1} << 20u, R2Look = uint64_t {4} << 30u;
+		const uint64_t r2_budget = ram2 == 2 ? UINT64_MAX : RamNativeTex::Ram2Budget();
+		std::vector<std::pair<uint64_t, uint64_t>>           waits, mapped, pieces, scratch;
+		std::vector<std::tuple<uint64_t, uint64_t, uint8_t>> r2_chunks;
+		RamNativeTex::ProbeAged(static_cast<double>(RamNativeTex::Ram2AgeSeconds()), &waits);
+		uint64_t aged = 0, under_image = 0, taken = 0, held = 0, proposed = 0, not_ram = 0, waiting = 0, other_label = 0, blocked = 0;
+		// (ram2b) Only the VirtualMemo allocator's memory (the streamed textures): the game's heaps (cpuheap, cpubkt, ...)
+		// map 2 MiB blocks in the same address zone, and the CPU and the emulator (file reads) write them - ram2's hang of
+		// 11-18 21:26 was a game heap write faulting for ever on a range a host write had marked missed. The ranges of the
+		// game's allocators from the memory map's last snapshot (lock-free); none (no snapshot): nothing taken this scan.
+		static std::vector<uint64_t> r2_pairs(uint64_t {2} * 16384u);
+		std::vector<std::pair<uint64_t, uint64_t>> r2_vm, r2_other;
+		{
+			static const char* const vm_label[] = {"VirtualMemo"};
+			static const char* const other_labels[] = {"cpuheap", "gpuheap", "cpubkt", "cpupage", "gpubkt", "gpupage",
+			                                           "DefaultTagg", "RTSharedAll", "RTPersistAl", "ring", "pool", "ctx"};
+			const size_t n = Loader::DemonsSoulsMemMap::RangesOf(vm_label, 1, r2_pairs.data(), r2_pairs.size() / 2);
+			if (n != SIZE_MAX)
+				for (size_t i = 0; i < n; i++)
+					if (r2_pairs[2 * i + 1] > r2_pairs[2 * i]) r2_vm.emplace_back(r2_pairs[2 * i], r2_pairs[2 * i + 1]);
+			const size_t m = n == SIZE_MAX ? SIZE_MAX
+			                               : Loader::DemonsSoulsMemMap::RangesOf(other_labels, sizeof(other_labels) / sizeof(other_labels[0]), r2_pairs.data(),
+			                                                                     r2_pairs.size() / 2);
+			if (m == SIZE_MAX) r2_vm.clear(); // (no snapshot of both: nothing this scan)
+			else
+				for (size_t i = 0; i < m; i++)
+					if (r2_pairs[2 * i + 1] > r2_pairs[2 * i]) r2_other.emplace_back(r2_pairs[2 * i], r2_pairs[2 * i + 1]);
+			for (auto* list: {&r2_vm, &r2_other}) { // (sorted, overlaps merged)
+				std::sort(list->begin(), list->end());
+				size_t w = 0;
+				for (size_t r = 0; r < list->size(); r++) {
+					if (w != 0 && (*list)[r].first <= (*list)[w - 1].second) (*list)[w - 1].second = std::max((*list)[w - 1].second, (*list)[r].second);
+					else (*list)[w++] = (*list)[r];
+				}
+				list->resize(w);
+			}
+		}
+		// [lo, hi) pieces kept inside the VirtualMemo ranges and outside every other allocator's (into `out`).
+		const auto keep_vm = [&](uint64_t lo, uint64_t hi, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+			auto it = std::upper_bound(r2_vm.begin(), r2_vm.end(), std::make_pair(lo, UINT64_MAX));
+			if (it != r2_vm.begin()) --it;
+			for (; it != r2_vm.end() && it->first < hi; ++it) {
+				uint64_t a = std::max(lo, it->first), b = std::min(hi, it->second);
+				if (a >= b) continue;
+				auto ot = std::upper_bound(r2_other.begin(), r2_other.end(), std::make_pair(a, UINT64_MAX));
+				if (ot != r2_other.begin()) --ot;
+				for (; ot != r2_other.end() && ot->first < b && a < b; ++ot) {
+					if (ot->second <= a) continue;
+					if (ot->first > a) out.emplace_back(a, ot->first);
+					a = std::max(a, ot->second);
+				}
+				if (a < b) out.emplace_back(a, b);
+			}
+		};
+		int      checks = ram2 == 2 ? 4096 : 768;
+		// A wait that gave nothing to take (all taken, under an image, out of RAM or protected) is looked at again in 30 s,
+		// not at every scan (the render thread's time).
+		static std::unordered_map<uint64_t, Clock2::time_point> r2_next;
+		std::unordered_map<uint64_t, Clock2::time_point>        r2_keep;
+		for (const auto& [wait_begin, wait_end]: waits) {
+			waiting += wait_end - wait_begin;
+			const auto next = r2_next.find(wait_begin);
+			if (next != r2_next.end() && r2_start < next->second) {
+				r2_keep.emplace(next->first, next->second);
+				continue;
+			}
+			if (aged >= R2Look || proposed >= r2_budget || checks <= 0) continue;
+			const uint64_t proposed_before = proposed;
+			bool           cut_short       = false;
+			Libs::LibKernel::Memory::MappedParts(wait_begin, wait_end - wait_begin, &mapped);
+			pieces.clear();
+			scratch.clear();
+			for (const auto& [at, bytes]: mapped) {
+				const uint64_t lo = (std::max(at, wait_begin) + R2Page - 1) & ~(R2Page - 1);
+				const uint64_t hi = std::min(at + bytes, wait_end) & ~(R2Page - 1);
+				if (lo < hi) scratch.emplace_back(lo, hi);
+			}
+			uint64_t mapped_bytes = 0, kept_bytes = 0;
+			for (const auto& [lo, hi]: scratch) {
+				mapped_bytes += hi - lo;
+				keep_vm(lo, hi, pieces);
+			}
+			for (auto& [lo, hi]: pieces) {
+				lo = (lo + R2Page - 1) & ~(R2Page - 1);
+				hi = hi & ~(R2Page - 1);
+				if (hi < lo) hi = lo;
+				kept_bytes += hi - lo;
+			}
+			aged += mapped_bytes;
+			other_label += mapped_bytes - std::min(mapped_bytes, kept_bytes);
+			// Any image of the cache over it (made before the map, or merged): its memory is the images' paths', not this.
+			for (const auto id: FindImagesInRegion(wait_begin, wait_end - wait_begin, false)) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image == nullptr || image->info.data.Empty()) continue;
+				const uint64_t cut_lo = image->info.data.address & ~(R2Page - 1);
+				const uint64_t cut_hi = (image->info.data.End() + R2Page - 1) & ~(R2Page - 1);
+				scratch.clear();
+				for (const auto& [lo, hi]: pieces) {
+					if (cut_hi <= lo || cut_lo >= hi) {
+						scratch.emplace_back(lo, hi);
+						continue;
+					}
+					under_image += std::min(hi, cut_hi) - std::max(lo, cut_lo);
+					if (lo < cut_lo) scratch.emplace_back(lo, cut_lo);
+					if (cut_hi < hi) scratch.emplace_back(cut_hi, hi);
+				}
+				pieces.swap(scratch);
+			}
+			for (const auto& [lo, hi]: pieces) {
+				for (uint64_t at = lo; at < hi && !cut_short;) {
+					if (proposed >= r2_budget || checks <= 0) {
+						cut_short = true;
+						break;
+					}
+					const uint64_t stop = std::min(hi, (at | (R2Chunk - 1)) + 1);
+					const int status = RamNativeTex::Ram2Blocked(at, stop) ? 3 : TextureOffload::Ram2Status(at, stop - at);
+					if (status == 3) {
+						blocked += stop - at;
+					} else if (status == 1) {
+						taken += stop - at;
+					} else if (status == 2) {
+						held += stop - at;
+					} else {
+						checks--;
+						if (!RamNativeTex::Ram2Plain(at, stop - at)) {
+							not_ram += stop - at;
+						} else {
+							r2_chunks.emplace_back(at, stop - at, TextureOffload::RntRam2);
+							proposed += stop - at;
+						}
+					}
+					at = stop;
+				}
+			}
+			if (!cut_short && proposed == proposed_before) r2_keep[wait_begin] = r2_start + std::chrono::seconds(30);
+		}
+		r2_next.swap(r2_keep);
+		if (ram2 == 1 && !r2_chunks.empty()) {
+			// Their read watchers on before the RAM18 thread writes and drops them (pending upload jobs over them first).
+			for (const auto& [begin, size]: TextureOffload::Ram2TakeNow(r2_chunks)) {
+				AsyncUpload::DrainRange(begin, size);
+				m_page_manager.UpdateReadWatchers<true>(begin, size);
+			}
+		}
+		auto&          rs = RamNativeTex::Ram2Scan();
+		const uint64_t us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock2::now() - r2_start).count());
+		rs.waiting.store(waiting, std::memory_order_relaxed);
+		rs.aged.store(aged, std::memory_order_relaxed);
+		rs.under_image.store(under_image, std::memory_order_relaxed);
+		rs.taken.store(taken, std::memory_order_relaxed);
+		rs.held.store(held, std::memory_order_relaxed);
+		rs.other_label.store(other_label, std::memory_order_relaxed);
+		rs.blocked.store(blocked, std::memory_order_relaxed);
+		rs.not_ram.store(not_ram, std::memory_order_relaxed);
+		rs.proposed.store(proposed, std::memory_order_relaxed);
+		rs.scan_us.fetch_add(us, std::memory_order_relaxed);
+		rs.scan_us_last.store(us, std::memory_order_relaxed);
+		rs.scans.fetch_add(1, std::memory_order_relaxed);
+		if (us > rs.scan_us_max.load(std::memory_order_relaxed)) rs.scan_us_max.store(us, std::memory_order_relaxed);
+	}
+	static const uint64_t take_budget = [] {
+		const char* value = std::getenv("KYTY_RAM_NATIVE_TEX_MB");
+		return (value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {512}) << 20u;
+	}();
+	const uint64_t budget = mode == 2 ? UINT64_MAX : take_budget; // (=2 counts all it would take)
+	constexpr uint64_t Page = TRACKER_PAGE_SIZE, Chunk = uint64_t {1} << 20u;
+	struct Candidate {
+		uint64_t                                   begin = 0, end = 0;
+		uint8_t                                    kind  = 0; // 1 array, 2 render target
+		std::vector<std::pair<uint64_t, uint64_t>> holes;
+	};
+	std::vector<Candidate>                     candidates;
+	std::vector<std::pair<uint64_t, uint64_t>> gpu_ranges; // (other GPU-written images: arrays' chunks under them stay)
+	std::unordered_map<uint64_t, uint64_t>     seen;
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		if (!image.registered || image.info.data.Empty()) return;
+		const uint64_t begin = (image.info.data.address + Page - 1) & ~(Page - 1), end = image.info.data.End() & ~(Page - 1);
+		if (end <= begin) return;
+		const bool gpu   = GpuWrittenImage(image);
+		const int  arena = gpu ? Loader::DemonsSoulsMemMap::RtArenaOf(image.info.data.address, image.info.data.End()) : 0;
+		uint8_t    kind  = 0;
+		if (gpu && (arena == 1 || arena == 2) && !image.usage.video_out) kind = 2;
+		else if (gpu) {
+			gpu_ranges.emplace_back(begin, end);
+			return;
+		} else if (image.usage.texture && !image.usage.video_out && !image.depth_id && image.info.resources.layers >= 2 &&
+		           RamNativeTex::InZone(begin, end))
+			kind = 1;
+		if (kind == 0 || image.IsCpuDirty() || image.IsBufferModified() || !image.IsTracked()) return;
+		if (kind == 2 && (m_download_images.contains(id) || HasPendingDownload(image.info.data.address, image.info.data.size) ||
+		                  m_buffer_cache.HasGpuDirtyBytes(image.info.data.address, image.info.data.size)))
+			return;
+		const auto first   = m_rnt_clean.find(image.serial);
+		seen[image.serial] = first != m_rnt_clean.end() ? first->second : tick;
+		if (first == m_rnt_clean.end()) return;
+		candidates.push_back({begin, end, kind, image.untracked_holes});
+	});
+	m_rnt_clean.swap(seen);
+	std::sort(gpu_ranges.begin(), gpu_ranges.end());
+	std::vector<std::tuple<uint64_t, uint64_t, uint8_t>> chunks;
+	uint64_t                                             proposed = 0, would[2] {};
+	std::vector<std::pair<uint64_t, uint64_t>>           parts, pieces, next;
+	const auto subtract = [](std::vector<std::pair<uint64_t, uint64_t>>& from, const std::vector<std::pair<uint64_t, uint64_t>>& cut,
+	                         std::vector<std::pair<uint64_t, uint64_t>>& scratch) {
+		for (const auto& [cut_begin, cut_end]: cut) {
+			scratch.clear();
+			for (const auto& [lo, hi]: from) {
+				if (cut_end <= lo || cut_begin >= hi) {
+					scratch.emplace_back(lo, hi);
+					continue;
+				}
+				if (lo < cut_begin) scratch.emplace_back(lo, cut_begin);
+				if (cut_end < hi) scratch.emplace_back(cut_end, hi);
+			}
+			from.swap(scratch);
+		}
+	};
+	for (const auto& candidate: candidates) {
+		if (proposed >= budget) break;
+		Libs::LibKernel::Memory::MappedParts(candidate.begin, candidate.end - candidate.begin, &parts);
+		pieces.clear();
+		for (const auto& [at, bytes]: parts) {
+			const uint64_t lo = std::max(at, candidate.begin), hi = std::min(at + bytes, candidate.end);
+			if (lo < hi) pieces.emplace_back(lo, hi);
+		}
+		subtract(pieces, candidate.holes, next);
+		if (candidate.kind == 1) {
+			std::vector<std::pair<uint64_t, uint64_t>> under;
+			for (const auto& range: gpu_ranges)
+				if (range.first < candidate.end && range.second > candidate.begin) under.push_back(range);
+			subtract(pieces, under, next);
+		}
+		for (const auto& [lo_raw, hi_raw]: pieces) {
+			const uint64_t lo = (lo_raw + Page - 1) & ~(Page - 1), hi = hi_raw & ~(Page - 1);
+			for (uint64_t at = lo; at < hi && proposed < budget;) {
+				const uint64_t stop = std::min(hi, (at | (Chunk - 1)) + 1);
+				if (TextureOffload::AnyTakenOver(at, stop - at)) {
+					at = stop;
+					continue;
+				}
+				chunks.emplace_back(at, stop - at, candidate.kind);
+				proposed += stop - at;
+				at = stop;
+			}
+		}
+	}
+	// (Images over the same memory - a texture held from a level and the whole one - propose it once.)
+	std::sort(chunks.begin(), chunks.end());
+	chunks.erase(std::unique(chunks.begin(), chunks.end(),
+	                         [](const auto& a, const auto& b) { return std::get<0>(a) == std::get<0>(b); }),
+	             chunks.end());
+	for (const auto& [begin, size, kind]: chunks) would[kind - 1] += size;
+	if (mode == 2) {
+		RamNativeTex::WouldRelease(0).store(would[0], std::memory_order_relaxed);
+		RamNativeTex::WouldRelease(1).store(would[1], std::memory_order_relaxed);
+		return;
+	}
+	if (chunks.empty()) return;
+	// Their read watchers on before the RAM18 thread writes and drops them (pending upload jobs over them first).
+	for (const auto& [begin, size]: TextureOffload::RntTakeNow(chunks)) {
+		AsyncUpload::DrainRange(begin, size);
+		m_page_manager.UpdateReadWatchers<true>(begin, size);
+	}
+}
+
+// (ram1b, KYTY_RAM_NATIVE_TEX=2) One sparse image (the next by serial, clean, only sampled) checked against the current
+// path: a dense image of its description uploaded from guest memory (UploadImage, as InitializeImage's whole upload),
+// both downloaded for up to 32 MiB of its bound layers (a rotating window), compared layer by layer by the offload worker
+// ("DISCREPANCIA" in the "[rnt]" line, the first ones logged). One at a time. Skipped (counted) when an offload holds part
+// of its guest bytes out of RAM (its reference would read them back) or a buffer cannot be had.
+void TextureCache::RntVerify() {
+	auto& counters = RamNativeTex::Verify();
+	std::erase_if(m_rnt_checks, [](const std::unique_ptr<RntCheck>& check) { return check->done.load(std::memory_order_acquire); });
+	if (!m_rnt_checks.empty() || !g_offload_alive.load(std::memory_order_acquire) || CommandScheduler::ThreadRecorder() != nullptr)
+		return;
+	ImageId  chosen {}, first {};
+	uint64_t chosen_serial = UINT64_MAX, first_serial = UINT64_MAX;
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		if (!image.IsSparse() || !image.registered || image.IsCpuDirty() || image.IsBufferModified() || image.IsGpuModified() ||
+		    image.usage.render_target || image.usage.storage || image.usage.depth_target)
+			return;
+		if (image.serial > m_rnt_verify_after && image.serial < chosen_serial) chosen = id, chosen_serial = image.serial;
+		if (image.serial < first_serial) first = id, first_serial = image.serial;
+	});
+	if (chosen_serial == UINT64_MAX) chosen = first, chosen_serial = first_serial;
+	if (chosen_serial == UINT64_MAX) return;
+	m_rnt_verify_after = chosen_serial;
+	const ImageInfo info = m_slot_images[chosen].info;
+	if (TextureOffload::Overlaps(info.data.address, info.data.size) || TextureOffload::AnyTakenOver(info.data.address, info.data.size)) {
+		counters.skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	std::vector<uint32_t> bound;
+	SparseBoundLayers(m_slot_images[chosen].backing, &bound);
+	if (bound.empty()) return;
+	// Every level of a layer, tightly packed in the format's blocks.
+	const auto     format      = m_slot_images[chosen].backing.format;
+	const uint64_t block_bytes = vk::blockSize(static_cast<VULKAN_HPP_NAMESPACE::Format>(format));
+	const auto     block       = vk::blockExtent(static_cast<VULKAN_HPP_NAMESPACE::Format>(format));
+	const uint32_t levels      = m_slot_images[chosen].backing.mip_levels;
+	const auto     extent      = m_slot_images[chosen].backing.extent;
+	if (block_bytes == 0 || block[0] == 0 || block[1] == 0) {
+		counters.skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	uint64_t layer_bytes = 0;
+	for (uint32_t level = 0; level < levels; level++) {
+		const uint64_t w = std::max(extent.width >> level, 1u), h = std::max(extent.height >> level, 1u);
+		layer_bytes += ((w + block[0] - 1) / block[0]) * ((h + block[1] - 1) / block[1]) * block_bytes;
+	}
+	constexpr uint64_t Window = uint64_t {32} << 20u;
+	const size_t       count  = std::max<size_t>(1, std::min<size_t>(bound.size(), static_cast<size_t>(Window / std::max<uint64_t>(layer_bytes, 1))));
+	static uint64_t    rotate = 0;
+	const size_t       start  = static_cast<size_t>(rotate++ % bound.size());
+	auto               check  = std::make_unique<RntCheck>();
+	std::vector<vk::BufferImageCopy> copies;
+	uint64_t                         offset = 0;
+	for (size_t i = 0; i < count; i++) {
+		const uint32_t layer = bound[(start + i) % bound.size()];
+		check->layers.emplace_back(layer, offset, layer_bytes);
+		for (uint32_t level = 0; level < levels; level++) {
+			const uint32_t      w = std::max(extent.width >> level, 1u), h = std::max(extent.height >> level, 1u);
+			vk::BufferImageCopy copy {};
+			copy.bufferOffset     = offset;
+			copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+			copy.imageExtent      = vk::Extent3D {w, h, 1};
+			copies.push_back(copy);
+			offset += ((w + block[0] - 1) / block[0]) * ((h + block[1] - 1) / block[1]) * block_bytes;
+		}
+	}
+	check->half = (offset + 255) & ~uint64_t {255};
+	// The reference: the same description, dense, uploaded from guest memory now.
+	ImageId reference_id {};
+	{
+		ImageForceDense dense;
+		reference_id = m_slot_images.insert(m_graphics, m_scheduler, info, true);
+	}
+	auto& reference = m_slot_images[reference_id];
+	if (reference.CreateFailed() || reference.IsSparse()) {
+		RetireImage(reference_id);
+		counters.skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	reference.usage   = m_slot_images[chosen].usage;
+	reference.binding = m_slot_images[chosen].binding;
+	bool refillable   = false;
+	const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(info.data.address, info.data.size, &refillable);
+	if (source == nullptr) {
+		RetireImage(reference_id);
+		counters.skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	UploadImage(reference, *source, source_offset);
+	check->buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0, AllFlags, check->half * 2);
+	m_slot_images[reference_id].Download(copies, check->buffer->Handle(), 0, check->half);
+	for (auto& copy: copies) copy.bufferOffset += check->half;
+	m_slot_images[chosen].Download(copies, check->buffer->Handle(), check->half, check->half);
+	RetireImage(reference_id);
+	check->proven = m_offload_good_formats.contains(OffloadFormat(m_slot_images[chosen]));
+	char what[160];
+	std::snprintf(what, sizeof(what), "0x%llx %ux%u capas=%u niveles=%u formato=%d", static_cast<unsigned long long>(info.data.address),
+	              extent.width, extent.height, m_slot_images[chosen].backing.layers, levels, static_cast<int>(format));
+	check->what = what;
+	counters.runs.fetch_add(1, std::memory_order_relaxed);
+	auto* raw = check.get();
+	m_rnt_checks.push_back(std::move(check));
+	m_scheduler.DeferPriorityOperation([raw] { OffloadWorker::Post([raw] {
+		auto& verify = RamNativeTex::Verify();
+		if (!g_offload_alive.load(std::memory_order_acquire)) {
+			raw->done.store(true, std::memory_order_release);
+			return;
+		}
+		raw->buffer->Invalidate(0, raw->buffer->Size());
+		const auto* mapped = raw->buffer->Mapped().data();
+		static std::atomic<uint32_t> reports {0};
+		for (const auto& [layer, at, bytes]: raw->layers) {
+			const bool equal = XXH3_64bits(mapped + at, bytes) == XXH3_64bits(mapped + raw->half + at, bytes);
+			verify.layers.fetch_add(1, std::memory_order_relaxed);
+			(equal ? verify.equal : verify.discrepancy).fetch_add(1, std::memory_order_relaxed);
+			if (!equal && reports.fetch_add(1, std::memory_order_relaxed) < 16)
+				std::printf("[rnt] DISCREPANCIA: capa %u de %s distinta de la via actual (formato %s)\n", layer, raw->what.c_str(),
+				            raw->proven ? "probado" : "sin prueba de descarga");
+		}
+		if (!raw->proven) verify.unproven_format.fetch_add(1, std::memory_order_relaxed);
+		std::fflush(stdout);
+		raw->done.store(true, std::memory_order_release);
+	}); });
+}
+
 void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
@@ -6076,6 +6611,7 @@ void TextureCache::RunGarbageCollector() {
 	RetireStaleImages(tick);
 	ShadowPoolTrace::Flip(tick);
 	if (TextureOffload::Enabled()) OffloadScan(tick);
+	if (RamNativeTex::On()) RntScan(tick); // (ram1b)
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

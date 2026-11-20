@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/shader/recompiler/Rtq2Patch.h" // (rtq2: suelo estable, the disk key)
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -68,6 +69,7 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include "local/tiron6-seeds.h" // (tiron6)
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -625,7 +627,47 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		// (tiron11, KYTY_TIRON11=1) SpecializationHash(specialization), taken at its first lookup (0: not yet; the
+		// specialization of a stored permutation never changes).
+		mutable uint64_t spec_hash = 0;
 	};
+
+	// (tiron11) A hash of every field of a specialization (field by field: no padding bytes), never 0.
+	static uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& value) {
+		uint64_t   h   = 0xcbf29ce484222325ull ^ (value.buffers.size() * 0x9e3779b97f4a7c15ull) ^ value.images.size();
+		const auto mix = [&](uint64_t v) {
+			h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+			h *= 0x100000001b3ull;
+		};
+		for (const auto& b: value.buffers) {
+			mix(b.packed_stride);
+			mix(static_cast<uint64_t>(b.descriptor_format));
+			mix(b.descriptor_swizzle);
+			mix(b.byte_base_offset ? 1u : 0u);
+		}
+		for (const auto& i: value.images) {
+			mix(static_cast<uint64_t>(i.numeric_class));
+			mix(static_cast<uint64_t>(i.dimension));
+			mix(i.mip_count);
+			mix(static_cast<uint64_t>(i.conversion_format));
+			mix(i.shader_swizzle);
+			mix(i.indirect_root);
+			mix(i.indirect_mapping_offset);
+			mix(i.indirect_search_iterations);
+			mix((i.cube ? 1u : 0u) | (i.fmask ? 2u : 0u));
+		}
+		return h != 0 ? h : 1;
+	}
+	[[nodiscard]] static bool Tiron11On() {
+		static const bool on = [] {
+			const char* v   = std::getenv("KYTY_TIRON11");
+			const bool  set = v != nullptr && v[0] == '1';
+			std::printf("[tiron11] busqueda de permutaciones de shader por hash: %s\n", set ? "ON (KYTY_TIRON11=1)" : "off");
+			std::fflush(stdout);
+			return set;
+		}();
+		return on;
+	}
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
 	// a fifth of it), or as it is (spirv_bytes 0).
@@ -930,8 +972,9 @@ struct PipelineCache::ProgramCache {
 			std::atomic<uint8_t>                              state {Pending};
 			std::atomic<uint32_t>                             worker {0};      // (ds-pc-port44) its translating thread
 			std::atomic<bool>                                 boosted {false}; // (raised for the render thread waiting)
-			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
-			std::vector<PrefetchedModule>                     modules;
+			// (up1120, upstream 5d4487f: held apart; an empty optional took a ResourcePlan's 520 bytes in each group.)
+			std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> plan;
+			std::vector<PrefetchedModule>                       modules;
 			// The plan in the scratch file instead (zstd-compressed ResourcePlanSerial bytes): `plan` stays empty until
 			// the game takes the group over (LoadSpilledPlan). Its linear SRT plan stays here: rebuilding it (its code
 			// generated, its AOT function looked up) took ~1 ms of the render thread's per plan; the plan's values ~0.2.
@@ -1067,6 +1110,17 @@ struct PipelineCache::ProgramCache {
 			return v != nullptr && v[0] == '1';
 		}();
 		if (!on) return;
+		// (tiron13, KYTY_TIRON13=1) Not on the render thread: 20261120-022835, its first pass took 154.7 ms under the cache's
+		// lock at a flip (the 183.8 ms frame: 63% of the samples in RamCensus <- PromoteFinished <- CommandProcessor::Flip).
+		// A diagnostic only: the "[ram]" line (system calls) stays.
+		static const bool skip = [] {
+			const char* v = std::getenv("KYTY_TIRON13");
+			const bool  set = v != nullptr && v[0] == '1';
+			std::printf("[tiron13] censo de la cache de pipelines en el hilo de render: %s\n", set ? "QUITADO (KYTY_TIRON13=1)" : "cada 60 s");
+			std::fflush(stdout);
+			return set;
+		}();
+		if (skip) return;
 		static auto last = std::chrono::steady_clock::now();
 		const auto  now  = std::chrono::steady_clock::now();
 		if (now - last < std::chrono::seconds(60)) return;
@@ -1122,9 +1176,10 @@ struct PipelineCache::ProgramCache {
 		std::array<uint64_t, PrefetchMemoryParts> n {};
 		n[MemGroup] = sizeof(group) + Capacity(group.records) + Capacity(group.modules);
 		if (group.plan) {
+			n[MemGroup] += sizeof(*group.plan);
 			const auto& plan = *group.plan;
 			for (const auto& inst: plan.value_storage)
-				n[MemPlanValues] += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
+				n[MemPlanValues] += sizeof(inst) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
 				                    inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
 			n[MemPlanMemoryInfo] = Capacity(plan.memory_info);
 			n[MemPlanOther]      = Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
@@ -1203,6 +1258,7 @@ struct PipelineCache::ProgramCache {
 				if (recorded.empty()) return;
 				p.inputs.records.clear();
 			}
+			p.inputs.KeepRecordsOnly(); // (the records alone are read: the recipes go)
 			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
 			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;
@@ -1474,7 +1530,7 @@ struct PipelineCache::ProgramCache {
 	}
 	// The plan SpillPlan wrote, back in the group (render thread, the group taken over); false when it cannot be read.
 	bool LoadSpilledPlan(Prefetch::Group& group) {
-		if (group.plan || group.plan_bytes == 0) return group.plan.has_value();
+		if (group.plan || group.plan_bytes == 0) return group.plan != nullptr;
 		const auto begin = std::chrono::steady_clock::now();
 		std::vector<char>    packed(group.plan_bytes);
 		std::vector<uint8_t> bytes(group.plan_raw);
@@ -1488,7 +1544,7 @@ struct PipelineCache::ProgramCache {
 		const auto values = std::chrono::steady_clock::now();
 		if (linear != (group.plan_linear != nullptr)) return false;
 		plan.linear_srt = std::move(group.plan_linear);
-		group.plan.emplace(std::move(plan));
+		group.plan      = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(plan));
 		const auto end = std::chrono::steady_clock::now();
 		prefetch->plan_read_ms += std::chrono::duration<double, std::milli>(read - begin).count();
 		prefetch->plan_values_ms += std::chrono::duration<double, std::milli>(values - read).count();
@@ -1510,11 +1566,21 @@ struct PipelineCache::ProgramCache {
 	// options: what TranslateProgram and CompileProgram read).
 	uint64_t DiskKey(const Prefetch& p, const Prefetch::Group& group) const {
 		uint64_t h = 0x6b79747973707631ull; // (chained: each record's words seeded with the hash so far, and its length)
+		bool rtq2 = false;
+		bool onda3 = false;
 		for (const auto index: group.records) {
 			const auto& words = p.inputs.records[index];
 			h = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), h ^ (static_cast<uint64_t>(words.size()) << 32u));
+			// (rtq2) With the IBL patch on, the group holding the IBL's code is keyed apart: its patched translation is
+			// made and stored beside the unpatched one (which stays for the patch off).
+			if (!rtq2 && ShaderRecompiler::Rtq2Patch::IblOn())
+				rtq2 = ShaderRecompiler::Rtq2Patch::HoldsIblSignature({words.data(), words.size()});
+			// (onda3) Same for the TAA patch (KYTY_ONDA_JUEGO=1).
+			if (!onda3 && ShaderRecompiler::Rtq2Patch::TaaOn())
+				onda3 = ShaderRecompiler::Rtq2Patch::HoldsTaaSignature({words.data(), words.size()});
 		}
-		return h;
+		if (onda3) h ^= 0x6f6e646133544141ull;
+		return rtq2 ? h ^ 0x7274713249424c31ull : h;
 	}
 
 	// The group from the disk store: its plan and modules (their SPIR-V into the scratch file, as a translation's).
@@ -1562,7 +1628,7 @@ struct PipelineCache::ProgramCache {
 			modules.push_back(std::move(m));
 		}
 		if (at != payload.size()) return false;
-		group.plan    = std::move(plan);
+		if (plan) group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(*plan)); // (up1120)
 		group.modules = std::move(modules);
 		const auto hits = p.disk_hits.fetch_add(1, std::memory_order_relaxed) + 1;
 		if (hits == 1 || hits % 5000 == 0) PipelineCacheLog("Shader prefetch: {} programs taken from the disk store", hits);
@@ -1586,7 +1652,9 @@ struct PipelineCache::ProgramCache {
 				// Inputs the recompiler rejects (code the game never runs) are left out, as the precompile did.
 				Common::RecoverableExitScope recoverable;
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
-				if (!group.plan) group.plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+				if (!group.plan)
+					group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+					    ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
@@ -1993,10 +2061,18 @@ struct PipelineCache::ProgramCache {
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 				    push_data_cursor, layout.ShaderDataDwords());
 			};
+			// (tiron11) The hash first: a full compare (vectors of buffers and images) only where it matches.
+			// 20261120-020146, the 237.7 ms frame: ProgramCache::Get<Compute> 9% of the render thread's samples in
+			// ResourceSpecialization::operator== (and 5-5-3% in the 276.2 ms one, through GetGraphicsPrograms).
+			const uint64_t wanted_hash = Tiron11On() ? SpecializationHash(active_specialization) : 0;
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
+				        if (candidate.table_mode != table_mode || !compatible_push_data(candidate)) return false;
+				        if (wanted_hash != 0) {
+					        if (candidate.spec_hash == 0) candidate.spec_hash = SpecializationHash(candidate.specialization);
+					        if (candidate.spec_hash != wanted_hash) return false;
+				        }
+				        return candidate.specialization == active_specialization;
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
@@ -2256,6 +2332,7 @@ struct PipelineCache::ProgramCache {
 	// (default SpareThreads).
 	static uint32_t WarmupThreads(bool background) {
 		uint32_t threads = background ? SpareThreads() : 1;
+		if (background && Tiron6::On()) threads = Tiron6::Threads(threads, LocalPlatform::AvailablePhysicalMemory()); // (tiron6)
 		const char* name = background ? "KYTY_SHADER_WARMUP_BACKGROUND_THREADS" : "KYTY_SHADER_WARMUP_THREADS";
 		if (const char* value = std::getenv(name); value && *value) {
 			const auto end    = value + std::strlen(value);
@@ -2808,27 +2885,42 @@ bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bo
 }
 } // namespace
 
-// What a graphics pipeline is made of, as its remake keeps it (~11 KB: the vertex input info's 32 resource slots), without
-// the draw's resource values (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
+// What a graphics pipeline is made of, as its remake keeps it, without the draw's resource values
+// (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
 struct PipelineCache::GraphicsMakeInputs {
 	PipelineRenderingState   rendering;
 	PipelineVertexInputState vertex_input;
 	PipelineStaticParameters static_params;
-	ShaderVertexInputInfo    vs_input_info;
 	ShaderPixelInputInfo     ps_input_info;
 	ShaderProgram            vertex_program;
 	ShaderProgram            pixel_program;
 	bool                     ps_active       = false;
 	bool                     native_bindings = false;
 	bool                     table           = false; // the table pipelines' driver cache
+	// The vertex input info as a warmup record holds it (LocalShaderWarmup::VisitVertexInput: what pipeline creation
+	// reads of it), and its program. Whole, its three 32-slot arrays made ~10 KB of a remake's ~11 (16 GB policy at 1-1:
+	// 1,337 remakes held 14.6 MiB, growing with the pipelines of every world played).
+	std::vector<uint32_t>                           vs_input_words;
+	const ShaderRecompiler::IR::CompiledShaderInfo* vs_program = nullptr;
+
+	void SetVertexInput(const ShaderVertexInputInfo& info) {
+		LocalShaderWarmup::Writer writer; // (only reads it)
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(writer, const_cast<ShaderVertexInputInfo&>(info)));
+		vs_input_words = std::move(writer.words);
+		vs_input_words.shrink_to_fit();
+		vs_program = info.stage.program;
+	}
 };
 
 std::shared_ptr<const std::function<void(PipelineCache::Pipeline&)>>
 PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
-	inputs.vs_input_info.stage.resources = {};
 	inputs.ps_input_info.stage.resources = {};
 	return std::make_shared<const std::function<void(Pipeline&)>>([this, in = std::move(inputs)](Pipeline& target) {
-		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, in.vs_input_info, in.vertex_program,
+		const auto                vs_input_info = std::make_unique<ShaderVertexInputInfo>();
+		LocalShaderWarmup::Reader reader {in.vs_input_words};
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(reader, *vs_input_info) || reader.cursor != in.vs_input_words.size());
+		vs_input_info->stage.program = in.vs_program;
+		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, *vs_input_info, in.vertex_program,
 		                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params,
 		                       in.table ? TablePipelineCache() : m_driver_cache, in.native_bindings, PipelineBuild::Full);
 	});
@@ -3375,9 +3467,14 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			RunWarmup(settings);
 			// (tiron1, KYTY_TIRON1=1) Under 30 GB of RAM no pipeline is made before play: the compute ones, which the
 			// render thread waits for (13-132 ms of a zone's first frames, 0.6-0.75 ms each), beside the game.
-			if (Tiron1::On() && low_ram && std::string_view(warmup) == "1" && !m_warm_cache_only &&
+			// (tiron6, KYTY_TIRON6=1: also without KYTY_TIRON1 or with enough RAM, when nothing else warms compute)
+			if ((Tiron1::On() || Tiron6::On()) && (low_ram || !settings.warm_pipelines) && std::string_view(warmup) == "1" &&
+			    !m_warm_cache_only &&
 			    (only == nullptr || std::string_view(only) != "1") && force != "0")
 				m_warmup_thread = std::thread([this, compute_video] { Tiron1WarmCompute(compute_video); });
+			// (tiron6 v2) Before the game starts: this thread waits for those compute pipelines (the splash's bar
+			// shows them), at most KYTY_TIRON6_MAX_S (60 s); past it they go on beside the game, as v1.
+			if (Tiron6::On() && m_warmup_thread.joinable()) Tiron6WaitInFront();
 		}
 	}
 	if (!prefetch_by_warmup) StartShaderPrefetch({});
@@ -3467,6 +3564,7 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		programs.warming = false;
 		programs.ReleaseRetired();
 		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
 		PipelineCacheLog("Shader warmup: done beside the game in {} ms; meanwhile the game translated {} programs itself "
 		                 "({:.0f} ms) and made {} pipelines ({:.0f} ms)",
 		                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
@@ -3483,6 +3581,10 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		    mib(memory_after.working_set, memory_shaders.working_set),
 		    mib(m_graphics.GetDeviceMemoryUsage(), video_before));
 		m_graphics.LogVideoMemory("warmup");
+		{
+			Common::LockGuard lock(m_mutex);
+			programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
+		}
 		programs.warmup.StartWriter();
 		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
 			if (!Save()) {
@@ -3641,35 +3743,87 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 // recording read again: its compute recipes only, newest first up to KYTY_TIRON1_COMPUTE_MAX, their records translated
 // (TranslateWarmup, those records only) and their pipelines made (WarmPipelines, the warmup's video memory cap). What the
 // game made meanwhile stays the game's.
+// (tiron6 v2) The caller's thread (start-up, before the game runs) waits for Tiron1WarmCompute: its progress on the
+// splash (the precompile's bar and status line), KYTY_TIRON6_MAX_S at most; then the game starts whatever is left.
+void PipelineCache::Tiron6WaitInFront() {
+	auto&      programs = *m_program_cache;
+	const auto begin    = std::chrono::steady_clock::now();
+	const auto limit    = std::chrono::milliseconds(static_cast<int64_t>(Tiron6::MaxSeconds() * 1000.0));
+	int        last     = -1;
+	while (!Tiron6::g_done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() - begin < limit) {
+		const auto phase = programs.warm_phase.load(std::memory_order_acquire);
+		const auto total = programs.warm_total.load(std::memory_order_relaxed);
+		const auto done  = std::min(programs.warm_done.load(std::memory_order_relaxed), total);
+		// (Shaders first, half the bar; then the pipelines, the other half.)
+		const float part = total == 0 ? 0.0f : static_cast<float>(done) / static_cast<float>(total);
+		const float bar  = phase == 2 ? 0.5f + 0.5f * part : phase == 1 ? 0.5f * part : 0.0f;
+		const int   step = static_cast<int>(bar * 100.0f);
+		if (step != last) {
+			last = step;
+			char text[160];
+			std::snprintf(text, sizeof(text), "Preparando pipelines de compute: %s %zu/%zu (%d %%)",
+			              phase == 2 ? "pipelines" : "shaders", done, total, step);
+			Tiron6::Report(text, bar);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+	const bool done = Tiron6::g_done.load(std::memory_order_acquire);
+	Tiron6::Report(done ? "Iniciando..." : "Iniciando (el resto de pipelines sigue en segundo plano)...", -1.0f);
+	PipelineCacheLog("Tiron6: the game waited {} ms for its compute pipelines ({}; KYTY_TIRON6_MAX_S={})", ms,
+	                 done ? "all made" : "time out: the rest beside the game", Tiron6::MaxSeconds());
+}
+
 void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 	LocalPlatform::SetThreadName("Kyty.Warmup");
 	auto& programs = *m_program_cache;
 	Tiron1::g_warm_state.store(1, std::memory_order_relaxed);
 	// The shader prefetch first (it translates every program of the game on every thread at start-up): at most 180 s.
 	const auto begin = std::chrono::steady_clock::now();
-	while (!m_warmup_stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
+	// (tiron6: not waited for. On a 16 GB PC the prefetch stops below 3 GiB free and this wait ran out at 180 s, so these
+	// pipelines were made at the end of the session (log 19-11 19:36: done at line 13269 of 14792) instead of before play.)
+	if (Tiron6::On()) LocalPlatform::MakeShaderWorkerThread(); // (below normal: never against the game's threads)
+	while (!Tiron6::On() && !m_warmup_stop.load(std::memory_order_relaxed) &&
+	       std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
 		const auto progress = GetPrefetchProgress();
 		if (progress.label == nullptr && progress.total != 0 && progress.done >= progress.total) break;
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 	}
-	if (m_warmup_stop.load(std::memory_order_relaxed)) return;
+	if (m_warmup_stop.load(std::memory_order_relaxed)) { Tiron6::g_done.store(true); return; }
 	const auto start = std::chrono::steady_clock::now();
+	const auto tiron6_memory = LocalPlatform::ProcessMemory(); // (tiron6: the RAM this costs)
 	std::vector<std::vector<uint32_t>> records, recipes;
 	if (!LocalShaderWarmup::Cache::ReadInputs(m_warmup_path, records, recipes)) {
 		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
 		PipelineCacheLog("Tiron1: compute pipelines before play: the recording could not be read");
+		Tiron6::g_done.store(true);
 		return;
 	}
-	const auto cap = static_cast<size_t>(Tiron1::EnvNumber("KYTY_TIRON1_COMPUTE_MAX", 1500.0, 0.0, 1000000.0));
+	// (tiron6: no 1500 cap - every session made the newest 1500 and still 900-1400 more on use; the seeds, the compute
+	// pipelines the game used in earlier sessions, first.)
+	const auto cap = Tiron6::On() ? SIZE_MAX
+	                              : static_cast<size_t>(Tiron1::EnvNumber("KYTY_TIRON1_COMPUTE_MAX", 1500.0, 0.0, 1000000.0));
+	if (Tiron6::On()) Tiron6::OrderBySeeds(recipes, [](const std::vector<uint32_t>& words) { return LocalShaderWarmup::RecipeKey(words); });
 	std::vector<std::vector<uint32_t>> compute;
 	std::vector<uint8_t>               needed(records.size(), 0);
 	std::unordered_set<uint64_t>       only;
 	for (auto recorded = recipes.rbegin(); recorded != recipes.rend() && compute.size() < cap; ++recorded) {
 		LocalShaderWarmup::PipelineRecord recipe;
 		LocalShaderWarmup::Reader         reader {*recorded};
-		if (!LocalShaderWarmup::VisitPipeline(reader, recipe) || recipe.compute == LocalShaderWarmup::NoShader ||
-		    recipe.compute >= records.size())
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+		if (recipe.compute == LocalShaderWarmup::NoShader) {
+			// (tiron10) A graphics recipe the game made in an earlier session (a seed): warmed too, its programs translated.
+			const auto key = LocalShaderWarmup::RecipeKey(*recorded);
+			if (!Tiron6::On() || !Tiron6::GraphicsOn() || !Tiron6::IsSeed(key) || recipe.vertex >= records.size() ||
+			    (recipe.pixel != LocalShaderWarmup::NoShader && recipe.pixel >= records.size()))
+				continue;
+			if (!only.insert(key).second) continue;
+			needed[recipe.vertex] = 1;
+			if (recipe.pixel != LocalShaderWarmup::NoShader) needed[recipe.pixel] = 1;
+			compute.push_back(std::move(*recorded));
 			continue;
+		}
+		if (recipe.compute >= records.size()) continue;
 		if (!only.insert(LocalShaderWarmup::RecipeKey(*recorded)).second) continue;
 		needed[recipe.compute] = 1;
 		compute.push_back(std::move(*recorded));
@@ -3678,6 +3832,7 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 	if (compute.empty()) {
 		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
 		PipelineCacheLog("Tiron1: compute pipelines before play: none recorded yet");
+		Tiron6::g_done.store(true);
 		return;
 	}
 	Tiron1::g_warm_wanted.store(compute.size(), std::memory_order_relaxed);
@@ -3699,7 +3854,8 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 			translated += needed[i] != 0 && programs.warm_permutations[i] != nullptr ? 1 : 0;
 	}
 	Tiron1::g_warm_programs.store(translated, std::memory_order_relaxed);
-	if (!m_warmup_stop.load(std::memory_order_relaxed)) WarmPipelines(compute_video, true, &only);
+	if (!m_warmup_stop.load(std::memory_order_relaxed))
+		WarmPipelines(Tiron6::On() ? Tiron6::VideoCap(compute_video, m_graphics.GetTotalMemoryBudget()) : compute_video, true, &only);
 	size_t made = 0;
 	{
 		Common::LockGuard lock(m_mutex);
@@ -3719,6 +3875,23 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 	PipelineCacheLog("Tiron1: compute pipelines before play: {} recipes, {} programs translated, {} pipelines made (the "
 	                 "game's own meanwhile kept) in {} ms",
 	                 Tiron1::g_warm_wanted.load(), translated, made, ms);
+	if (Tiron6::On()) {
+		const auto memory_after = LocalPlatform::ProcessMemory();
+		PipelineCacheLog("Tiron6: compute before play: {} seeds from earlier sessions, {} recipes, {} made in {} ms ({} "
+		                 "threads); RAM {:+} MiB committed {:+} MiB resident, {} MiB left free",
+		                 Tiron6::SeedCount(), Tiron1::g_warm_wanted.load(), made, ms,
+		                 ProgramCache::WarmupThreads(true),
+		                 (static_cast<int64_t>(memory_after.private_bytes) - static_cast<int64_t>(tiron6_memory.private_bytes)) >> 20,
+		                 (static_cast<int64_t>(memory_after.working_set) - static_cast<int64_t>(tiron6_memory.working_set)) >> 20,
+		                 LocalPlatform::AvailablePhysicalMemory() >> 20u);
+		Tiron6::g_done.store(true, std::memory_order_release);
+		// (The seeds this session adds go to the disk every 5 s, from this thread: none from the render thread.)
+		while (!m_warmup_stop.load(std::memory_order_relaxed)) {
+			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			Tiron6::Flush();
+		}
+	}
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {
@@ -4037,6 +4210,15 @@ static bool StaticBlobsFromCache() {
 		return value != nullptr && std::string_view(value) == "1";
 	}();
 	return on;
+}
+
+// (up1118, upstream 8fd86d4) As InitializeStaticCache takes them: none of the store's files, all.
+uint32_t PipelineCache::StaticStoreFeatures() {
+	std::error_code error;
+	for (const auto& path: {StaticFeaturesPath(), StaticCachePath(), StaticBinariesPath(), StaticBlobsPath()}) {
+		if (std::filesystem::exists(path, error)) return ReadStaticFeatures();
+	}
+	return ~0u;
 }
 
 // A static pipeline cache of this GPU and driver exists (its file begins with their signature).
@@ -4485,6 +4667,7 @@ bool PipelineCache::Save() {
 		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
 	}
 	if (m_played != nullptr) saved &= m_played->Save();
+	Tiron6::Flush(); // (tiron6)
 	return saved;
 }
 
@@ -4898,7 +5081,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				inputs.rendering       = job->rendering;
 				inputs.vertex_input    = job->vertex_input;
 				inputs.static_params   = job->static_params;
-				inputs.vs_input_info   = job->vs_input_info;
+				inputs.SetVertexInput(job->vs_input_info);
 				inputs.ps_input_info   = job->ps_input_info;
 				inputs.ps_active       = job->ps_active;
 				inputs.vertex_program  = job->vertex_program;
@@ -4979,7 +5162,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		inputs.rendering       = rendering;
 		inputs.vertex_input    = iter->first.vertex_input;
 		inputs.static_params   = static_params;
-		inputs.vs_input_info   = vs_input_info;
+		inputs.SetVertexInput(vs_input_info);
 		inputs.ps_active       = ps_active;
 		inputs.vertex_program  = vertex_program;
 		inputs.pixel_program   = pixel_program;
@@ -5003,6 +5186,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
 		m_program_cache->warmup.AddPipeline(recipe);
 		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		if (Tiron6::On() && Tiron6::GraphicsOn()) Tiron6::Note(iter->second->recipe); // (tiron10: a graphics seed)
 	}
 
 	return iter->second.get();
@@ -5067,6 +5251,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	if (recipe.compute != LocalShaderWarmup::NoShader) {
 		m_program_cache->warmup.AddPipeline(recipe);
 		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		Tiron6::Note(iter->second->recipe); // (tiron6: a seed for the next session's warm)
 	}
 
 	return *iter->second;
@@ -5211,6 +5396,7 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipelineAsync(const Shad
 	if (recipe.compute != LocalShaderWarmup::NoShader) {
 		m_program_cache->warmup.AddPipeline(recipe);
 		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		Tiron6::Note(iter->second->recipe); // (tiron6: a seed for the next session's warm)
 	}
 	return iter->second.get();
 }

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "label-pages.h" // (up1120, upstream a8b5a8c)
 
 #include <algorithm>
 #include <array>
@@ -478,19 +479,20 @@ inline void Stop(const char* why) noexcept {
 
 // The guest memory the command processor writes (labels): a wait on one is satisfied by work of the GPU queues, which
 // the commit checks a speculation against (EffectsLog); one on memory only the CPU writes orders CPU writes the
-// speculation cannot see (it stops there).
+// speculation cannot see (it stops there). The words by guest page (LabelPages::Set: a bit a word, nothing rehashed
+// as it grows; a std::unordered_set rehashed every word under the mutex at each doubling, tens of ms past a million).
 struct Labels {
-	std::mutex                   mutex;
-	std::unordered_set<uint64_t> addresses;
+	std::mutex      mutex;
+	LabelPages::Set addresses;
 };
 inline Labels g_labels;
 inline void   NoteLabel(uint64_t address) {
 	  std::lock_guard lock(g_labels.mutex);
-	  g_labels.addresses.insert(address & ~uint64_t {3});
+	  g_labels.addresses.Insert(address & ~uint64_t {3});
 }
 [[nodiscard]] inline bool IsLabel(uint64_t address) {
 	std::lock_guard lock(g_labels.mutex);
-	return g_labels.addresses.contains(address & ~uint64_t {3});
+	return g_labels.addresses.Contains(address & ~uint64_t {3});
 }
 
 // What the thread that commits is doing (its effects' source, for the commits' stop reasons): translating the normal

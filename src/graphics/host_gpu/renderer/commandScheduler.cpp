@@ -15,6 +15,7 @@
 #include "local-platform.h"
 #include "lane-sync.h"
 #include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/f0-measure.h" // (f0: KYTY_F0)
 
 #include <algorithm>
 #include <atomic>
@@ -604,6 +605,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command_clock    = g_cpu_dirty_clock.load(std::memory_order_acquire);
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_command.m_buffer), true); // (f0)
 	LiveTrace::g_mark_command = static_cast<VkCommandBuffer>(m_command.m_buffer);
 	return m_command;
 }
@@ -702,6 +704,7 @@ vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t
 		// (Committed for the open buffer's submission: the pool reuses it once that completes.)
 		m_prologue.m_buffer = m_command_pool.Commit();
 		m_prologue.Begin();
+		F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_prologue.m_buffer), false); // (f0)
 		// The copies after everything submitted before (which may read or write their destinations).
 		VulkanMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -763,6 +766,8 @@ void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t va
 }
 
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	if (F0Measure::On()) // (f0: the end stamps, recorded before the buffers end)
+		for (const auto& entry: entries) F0Measure::BufferSubmit(static_cast<VkCommandBuffer>(entry.buffer), entry.ended, m_lane);
 	if (m_next_wait_semaphore != nullptr) {
 		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
 			submit.AddWait(m_next_wait_semaphore, m_next_wait_value);

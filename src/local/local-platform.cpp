@@ -57,15 +57,25 @@
 
 namespace LocalPlatform {
 
-// "1,2,3" -> bit mask of CPUs 0..63; 0 for an empty or invalid list.
+// "1,2,3" or "0,8-15" (a range "a-b" takes a to b, both ends; "15-8" as "8-15") -> bit mask of CPUs 0..63; 0 for an
+// empty or invalid list. A range with an end below 0 is skipped; "8-" or "8-x" takes the 8 and stops there. A list with
+// no '-' reads as it did before ranges. (Ranges were read as two CPUs before, "0,8-15" as {0, 8}: a Linux tester's
+// KYTY_RENDER_CPUS, 16 Nov.)
 static uint64_t CpuListMask(const char* list) {
 	uint64_t mask = 0;
 	if (list == nullptr) return 0;
 	for (const char* p = list; *p != '\0';) {
-		char*      end = nullptr;
-		const long cpu = std::strtol(p, &end, 10);
+		char* end   = nullptr;
+		long  first = std::strtol(p, &end, 10);
 		if (end == p) break;
-		if (cpu >= 0 && cpu < 64) mask |= uint64_t(1) << cpu;
+		long last = first;
+		if (*end == '-') {
+			char*      range_end = nullptr;
+			const long to        = std::strtol(end + 1, &range_end, 10);
+			if (range_end != end + 1) last = to, end = range_end; // (else the '-' stops the list after `first`)
+		}
+		if (last < first) std::swap(first, last);
+		for (long cpu = first; first >= 0 && cpu <= last && cpu < 64; ++cpu) mask |= uint64_t(1) << cpu;
 		p = (*end == ',') ? end + 1 : end;
 	}
 	return mask;
@@ -77,6 +87,15 @@ bool LowMemVram() {
 		return text != nullptr && text[0] == '1';
 	}();
 	return on;
+}
+
+// (up1120, upstream 593ccfc) A CPU list's CPUs as the list gave them, for the start-up lines.
+std::string CpuListResolved(const char* list) {
+	const uint64_t mask = CpuListMask(list);
+	std::string    text;
+	for (uint32_t cpu = 0; cpu < 64; ++cpu)
+		if ((mask >> cpu) & 1u) text += (text.empty() ? "" : ",") + std::to_string(cpu);
+	return text.empty() ? std::string("none") : text;
 }
 
 #if defined(_WIN32)

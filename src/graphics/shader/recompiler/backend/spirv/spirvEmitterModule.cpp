@@ -607,6 +607,15 @@ void DecorateDescriptor(EmitterState& state, uint32_t variable, const char* name
 	    {OpDecorate, variable, DecorationBinding, IR::NativeBinding(state.program.stage, kind)});
 }
 
+// (UsesPixelInterlock) A storage image binding coherent: what one invocation's critical section stores, the next one's
+// reads.
+static void DecorateInterlockedStorage(EmitterState& state, IR::DescriptorBindingKind kind) {
+	const auto variable = state.image_variables[IR::ImageBindingIndex(kind)];
+	if (IR::ImageBindingResourceClass(kind) != IR::ImageResourceClass::Storage || variable == 0 || !UsesPixelInterlock(state))
+		return;
+	state.builder.AddAnnotation({OpDecorate, variable, DecorationCoherent});
+}
+
 void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	auto Decorate = [&](uint32_t variable, const char* name, IR::DescriptorBindingKind kind) {
 		DecorateDescriptor(state, variable, name, kind);
@@ -637,6 +646,7 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 		const auto name = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
 		Decorate(state.image_variables[IR::ImageBindingIndex(binding.kind)], name.c_str(),
 		         binding.kind);
+		DecorateInterlockedStorage(state, binding.kind);
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
@@ -664,6 +674,15 @@ void AddVsharpAnnotationsAndNames(EmitterState& state) {
 	}
 }
 
+// (UsesPixelInterlock) EmitProgram makes the guest program a function of its own, the entry point its critical section.
+static void DefinePixelInterlock(EmitterState& state) {
+	if (!UsesPixelInterlock(state)) return;
+	state.interlock_guest_func = state.builder.AllocateId();
+	state.builder.RequireCapability(CapabilityFragmentShaderPixelInterlockEXT);
+	state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+	state.builder.AddExecutionMode({state.main_func, ExecutionModePixelInterlockOrderedEXT});
+}
+
 void DefineModule(EmitterState& state) {
 	DefineDescriptorVariables(state);
 	if (state.requirements.function_lds) {
@@ -685,6 +704,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddExecutionMode(
 		    {state.main_func, 5270u, state.input_info.vertex->mesh.max_primitives});
 	}
+	DefinePixelInterlock(state);
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(CapabilityShader);

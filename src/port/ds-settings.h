@@ -70,6 +70,8 @@ extern const int     kAntiLagDlssgCount;
 // (10-28, ds-torch-1028's launcher) The screen-space RT set (c3e58bd5) and the new passes: their rows' levels.
 extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5), Hibrido (6: Alto + KYTY_RT_REFLECTIONS_HYBRID)
 extern const int     kRtReflLevelCount;
+extern const Choice  kPathTracingLevels[]; // (pt1) Path tracing: No, Bajo, Medio, Alto, Ultra (BB_PATHTRACING + _QUALITY)
+extern const int     kPathTracingLevelCount;
 extern const Choice  kRtReflSharp[];   // (refl-sharp-1031) Nitidez de reflejos RT: Normal, Alta, Maxima
 extern const int     kRtReflSharpCount;
 extern const Choice  kMotesLevels[];   // (motes-1031) Particulas volumetricas: No, Sutil, Media, Densa
@@ -82,6 +84,14 @@ extern const Choice  kSmokeLevels[]; // No, Suave, Antorchas (Humo y particulas)
 extern const int     kSmokeLevelCount;
 extern const Choice  kRtLevels[];      // No, Bajo, Medio, Alto (Luz volumetrica, Oclusion ambiental, Sombras RT)
 extern const int     kRtLevelCount;
+extern const Choice  kVolLevels[];     // (rtx1) Luz volumetrica: No, Bajo, Medio, Alto, Ultra
+extern const int     kVolLevelCount;
+extern const Choice  kRtq2OnOff[];     // (rtq2) Suelo estable: No, Si
+extern const int     kRtq2OnOffCount;
+extern const Choice  kRtnLevels[];      // (rtq2 b) Reflejos RT nuevos: No, Si, Depuracion
+extern const int     kRtnLevelCount;
+extern const Choice  kRtx1Levels[];    // (rtx1) Reflejos estables / Sombras mejoradas / Oclusion mejorada: No, Bajo, Medio, Alto, Ultra
+extern const int     kRtx1LevelCount;
 extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido (ds-pc-port10: no longer offered)
 extern const int     kTorchLevelCount;
 // (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering, ds-foveated-1029's foveated grid): No, Suave, Medio, Fuerte
@@ -161,9 +171,16 @@ struct Settings {
 	// (10-28) Antorchas (the launcher's hwlamp4): 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_HWRT_LIGHTS level, with the RT particles).
 	std::string rt_lamps = "";       // empty: from rt_particles (an older settings.ini: Si = 2)
 	std::string motes = "0";         // (motes-1031) particulas_volumetricas: 0 No, 1 Sutil, 2 Media, 3 Densa (KYTY_MOTES)
-	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
+	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto, 4 Ultra (rtx1) (KYTY_GODRAYS + the hidden RT sun pass)
+	// (rtx1) Three options of 4 levels each (0 = exactly as before), ds-settings.cpp BuildLaunch "(rtx1)":
+	std::string refl_stable = "0";   // reflejos_estables: the floor's reflection without the moving "wave" (rtrefl1, the game's SSR off, Reflejos RT presence)
+	std::string shadow_rtx = "0";    // sombras_mejoradas: torch / candle shadows, contact shadows and sun cascades (no filter: Bordes sombras)
+	std::string rt_nuevo = "0";      // (rtq2 b) reflejos_rt_nuevos: 0 no, 1 si (compilacion 1: solo traza), 2 depuracion (KYTY_RTN)
+	std::string floor_stable = "0";  // (rtq2) suelo_estable: 0 no, 1 si: the game's IBL reflects along the geometric normal (KYTY_RTQ2_IBL)
+	std::string ao_rtx = "0";        // oclusion_mejorada: the game's AO moved relative to its own values + its ambient shadowing range
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
+	std::string path_tracing = "0";  // (pt1) path_tracing: 0 No, 1 Bajo, 2 Medio, 3 Alto, 4 Ultra (BB_PATHTRACING=1 + BB_PATHTRACING_QUALITY)
 	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-6 (KYTY_RT_REFLECTIONS; 4-5: more presence; 6 Hibrido)
 	std::string rt_refl_sharp = "0"; // (refl-sharp-1031) nitidez_reflejos_rt: 0 Normal, 1 Alta, 2 Maxima (KYTY_RT_REFLECTIONS_SHARP)
 	std::string rt_refl_waves = "0"; // (refl-sharp-1031) ondas_agua_reflejos: 0 Como ahora, 1 Suaves, 2 Espejo (KYTY_RT_REFLECTIONS_WATER_WAVES)
@@ -211,6 +228,11 @@ struct Settings {
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
 	bool        rumble = true;
 	float       rumble_gain = 4.0f;
+	// [Multijugador] (online5) multijugador=1: the online (messages, stains, ghosts, co-op, invasions) through our server
+	bool        multiplayer = false;
+	std::string online_server = "127.0.0.1"; // the server's address (127.0.0.1: this PC is the host; friends: its public IP)
+	std::string online_name;                 // the account (F2 / launcher: "Crear cuenta")
+	std::string online_password;
 	// [Avanzado]
 	std::string extra; // KEY=VALUE;KEY=VALUE (run-windows -Set; KEY= removes it)
 };

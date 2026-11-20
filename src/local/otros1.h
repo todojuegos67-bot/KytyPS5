@@ -66,6 +66,49 @@ inline void Report(int64_t now_ns, double per_cycle_ms_hint) {
 	static uint64_t last_cycles[Keys] {}, last_packets[Keys] {}, last_pre[2] {}, last_pairs[3] {}, last_indirect[3] {};
 	++frames;
 	const uint64_t tsc = __rdtsc();
+	// (lab1 p7b2, tiron2) KYTY_OTROS1=3: also each frame whose PM4 walk took over KYTY_TIRON2_MS (default 30) ms of
+	// the render thread: a [tiron2] line with that frame's walk, preamble and its 6 dearest packet kinds. For the
+	// hitches with 90-125 ms of render-thread CPU and nothing in draws, uploads or images (log 20261119-054809-785).
+	if (Mode() == 3) {
+		static uint64_t f_cycles[Keys] {}, f_pre = 0, f_tsc = 0;
+		static const double limit_ms = [] {
+			const char* t = std::getenv("KYTY_TIRON2_MS");
+			const double v = t != nullptr ? std::atof(t) : 0.0;
+			return v > 0.0 ? v : 30.0;
+		}();
+		static double per_cycle_f = 0.0;
+		if (f_tsc != 0 && now_ns > 0) {
+			uint64_t walk = 0;
+			for (uint32_t k = 0; k < Keys; ++k) walk += g_cycles[k] - f_cycles[k];
+			if (per_cycle_f <= 0.0 && last_ns != 0 && tsc > last_tsc && now_ns > last_ns)
+				per_cycle_f = static_cast<double>(now_ns - last_ns) / 1e6 / static_cast<double>(tsc - last_tsc);
+			const double pc = per_cycle_ms_hint > 0.0 ? per_cycle_ms_hint : per_cycle_f;
+			if (pc > 0.0 && static_cast<double>(walk) * pc >= limit_ms) {
+				std::array<uint32_t, Keys> o {};
+				for (uint32_t k = 0; k < Keys; ++k) o[k] = k;
+				std::partial_sort(o.begin(), o.begin() + 6, o.end(),
+				                  [&](uint32_t a, uint32_t b) { return g_cycles[a] - f_cycles[a] > g_cycles[b] - f_cycles[b]; });
+				std::printf("[tiron2] frame %.1f ms (flip a flip), recorrido PM4 %.1f ms, preambulo (comandos+write-back) %.1f ms | top",
+				            static_cast<double>(tsc - f_tsc) * pc, static_cast<double>(walk) * pc,
+				            static_cast<double>(g_pre_cycles - f_pre) * pc);
+				for (uint32_t i = 0; i < 6; ++i) {
+					const uint32_t k = o[i];
+					const uint64_t c = g_cycles[k] - f_cycles[k];
+					if (c == 0) break;
+					if (k < NopBase) std::printf(" op%02x", k);
+					else if (k < Filler) std::printf(" nopR%02x", k - NopBase);
+					else if (k == Filler) std::printf(" fill");
+					else std::printf(" walk_sin_paquete");
+					std::printf("=%.1fms", static_cast<double>(c) * pc);
+				}
+				std::printf("\n");
+				std::fflush(stdout);
+			}
+		}
+		std::copy(std::begin(g_cycles), std::end(g_cycles), std::begin(f_cycles));
+		f_pre = g_pre_cycles;
+		f_tsc = tsc;
+	}
 	if (last_ns == 0) {
 		last_ns  = now_ns;
 		last_tsc = tsc;
