@@ -350,7 +350,7 @@ struct SpikeCounts {
 };
 SpikeCounts g_spike_prev;
 u32 g_spike_logged = 0;
-bool g_spike_menu = false; // F1 menu open (game paused): those frames are not spikes
+u32 g_spike_menu_changes = 0; // F1 menu opens/closes seen at the last flip (game paused)
 
 SpikeCounts ReadSpikeCounts() {
     const auto& c = BBPerf2::Get();
@@ -849,13 +849,11 @@ void OnGuestFlip(int flip_mode) {
     const SpikeCounts spike = Since(spike_now, g_spike_prev);
     g_spike_prev = spike_now;
     const u64 fault_max_us = BBPerf2::Get().fault_max_us.exchange(0, std::memory_order_relaxed);
-    const bool menu_open = BbMenu::IsOpen();
-    if (menu_open) {
-        g_spike_menu = true;
-    } else if (g_spike_menu) {
-        g_spike_menu = false; // the frame that closed the menu spans the pause
-    } else if (frame && std::isfinite(measured) && measured >= kSpikeSec &&
-               g_spike_logged < kSpikeLogMax) {
+    const u32 menu_changes = BbMenu::OpenChanges();
+    const bool menu_frame = BbMenu::IsOpen() || menu_changes != g_spike_menu_changes;
+    g_spike_menu_changes = menu_changes;
+    if (!menu_frame && frame && std::isfinite(measured) && measured >= kSpikeSec &&
+        g_spike_logged < kSpikeLogMax) {
         ++g_spike_logged;
         LOG_INFO(Lib_VideoOut,
                  "[spike] {:.1f} ms guest frame at {:.3f} s (monotonic): cpu-write faults {} "

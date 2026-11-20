@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include "common/types.h"
 
 union SDL_Event;
 struct SDL_Window;
@@ -26,6 +27,9 @@ void Init(SDL_Window* window);
 bool OnSdlEvent(SDL_Event& event);
 
 bool IsOpen();
+// Counts menu opens and closes (a frame that saw the menu open changes it, even with no flip
+// while the menu was up).
+u32 OpenChanges();
 
 // (bb-kbmcam-142) "Jugar con teclado y ratón" (bb_menu.ini kbm_play) is on.
 bool KbmPlay();
