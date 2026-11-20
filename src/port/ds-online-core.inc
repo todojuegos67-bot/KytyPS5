@@ -555,9 +555,13 @@ struct Server {
 			store.Save("senales.json", store.senales);
 			J ns = J::Obj();
 			ns.Set("signType", J::Int(st ? st->AsInt() : 0));
-			ns.Set("signList", sign); // (online9) Ghidra @0x6605b0 case 6: here signList is ONE object (newSigns.signList.accountId); an array crashed at 0x668af0
+			J list = J::Arr();
+			list.Push(sign);
+			ns.Set("signList", list);
+			J arr = J::Arr(); // (online9b) Ghidra @0x6605b0 case 6: newSigns[0].signList[0].accountId -- newSigns is an ARRAY (object crashed at 0x668af0)
+			arr.Push(ns);
 			J d = J::Obj();
-			d.Set("newSigns", ns);
+			d.Set("newSigns", arr);
 			return d;
 		}
 		if (cmd == "deleteSummonSign") {

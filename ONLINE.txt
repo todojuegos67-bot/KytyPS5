@@ -1,0 +1,52 @@
+DEMON'S SOULS PC - MULTIJUGADOR ONLINE
+=====================================
+
+El servidor online funciona en el PC del anfitrion (IP publica 84.79.155.54).
+Mensajes en el suelo, manchas de sangre, fantasmas y senales de invocacion
+pasan por ese servidor. Nadie mas tiene que abrir puertos en su router.
+
+---------------------------------------------------------------
+A) ANFITRION (el PC que hace de servidor)
+---------------------------------------------------------------
+Una sola vez:
+  1. Ejecutar Servidor-DS-instalar.cmd y aceptar el permiso de Windows.
+     Abre el firewall y deja el servidor encendiendose solo con Windows.
+  2. En el router, abrir hacia este PC (192.168.1.17):
+       TCP 31413 (cuentas)
+       TCP 31415 (juego y WebAPI)
+       UDP 3758  (paso de datos entre jugadores)
+
+Uso diario:
+  - ENCENDER-SERVIDOR.cmd : enciende el servidor (sin ventana).
+  - PARAR-SERVIDOR.cmd    : lo para (y cierra el juego). Usarlo SIEMPRE
+                            antes de compilar, o Windows no deja escribir el exe.
+  - El servidor tambien se enciende solo al abrir el juego.
+  - Logs: %LOCALAPPDATA%\Demon's Souls PC\servidor-online\servidor.log
+          y peticiones.log (todo lo que piden los jugadores).
+
+Para jugar el anfitrion: F2 -> Multijugador -> Servidor 127.0.0.1
+
+---------------------------------------------------------------
+B) JUGADORES (amigos)
+---------------------------------------------------------------
+  1. Abrir el juego y pulsar F2 -> Multijugador.
+  2. Servidor: 84.79.155.54
+  3. Nombre: el tuyo.  Contrasena: la que quieras (apuntala).
+     Cada jugador tiene SU cuenta; no hace falta la del anfitrion.
+     Se puede pegar con Ctrl+V.
+  4. Pulsar "Crear cuenta" (solo la primera vez).
+  5. Activar multijugador y pulsar "Reiniciar ahora".
+  6. La tarjeta debe poner "conectado".
+
+Si sale "nombre o contrasena incorrectos": la contrasena no coincide con la
+de la cuenta creada. Crear otra cuenta con nombre nuevo.
+Si sale el error (009): el servidor del anfitrion esta apagado.
+
+---------------------------------------------------------------
+C) COOPERATIVO (invocar / ser invocado)
+---------------------------------------------------------------
+  - Los dos en la misma zona y con nivel parecido.
+  - El que quiere ayudar pone su senal de invocacion.
+  - El otro ve la senal en el suelo y la toca para invocarlo.
+  - Estado: senales funcionando en servidor; la invocacion completa entre
+    dos jugadores aun esta EN PRUEBAS.
