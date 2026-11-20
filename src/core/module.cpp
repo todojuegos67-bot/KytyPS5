@@ -19,6 +19,7 @@
 #include "core/bb_respatch.h"
 #include "core/bb_cheats.h"
 #include "core/bb_shop.h"
+#include "core/bb_coop_trace.h"
 #include "core/bloodborne_re.h"
 #include "core/bb_vardt.h"
 #include "core/cpu_patches.h"
@@ -400,6 +401,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             // (BB_COOP_SEAMLESS / SHADPS4_BLOODBORNE_SEAMLESS_COOP, SHADPS4_BLOODBORNE_RE_TRACE).
             Core::Bloodborne::InstallSeamlessCoopPatches();
             Core::Bloodborne::InstallReverseEngineeringTrace();
+            Core::BBCoop::InstallHttpTrace(base_virtual_addr, base_size); // BB_COOP=1
 #endif
         }
     }
