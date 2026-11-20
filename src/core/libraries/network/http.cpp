@@ -9,7 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -698,6 +700,65 @@ bool IsFollowableRedirect(int status, s32 method) {
     if (method == ORBIS_HTTP_METHOD_POST && status != 303) {
         return false;
     }
+    return true;
+}
+
+// (bb-coop) Local copy of Bloodborne's server-info file (/bb-eu/ss.info and other regions),
+// so co-op keeps working when the community host that serves it is unreachable. Only a body
+// the game really downloaded (status 200) is stored; nothing is made up.
+bool IsBloodborneServerInfoPath(std::string_view path) {
+    const auto q = path.find('?');
+    const std::string_view p = path.substr(0, q);
+    return p.ends_with("/ss.info");
+}
+
+std::filesystem::path BloodborneServerInfoCachePath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "bb_coop_cache" / "ss.info";
+}
+
+void SaveBloodborneServerInfo(const HttpResponse& res) {
+    const auto path = BloodborneServerInfoCachePath();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    auto tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            LOG_WARNING(Lib_Http, "[coop] could not write {}", Common::FS::PathToUTF8String(tmp));
+            return;
+        }
+        out.write(reinterpret_cast<const char*>(res.body.data()),
+                  static_cast<std::streamsize>(res.body.size()));
+        if (!out) {
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec); // atomic replace on the same volume
+    if (ec) {
+        LOG_WARNING(Lib_Http, "[coop] could not store ss.info cache: {}", ec.message());
+        return;
+    }
+    LOG_INFO(Lib_Http, "[coop] ss.info cached ({} bytes)", res.body.size());
+}
+
+bool LoadBloodborneServerInfo(HttpResponse& res) {
+    std::ifstream in(BloodborneServerInfoCachePath(), std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::vector<u8> body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (body.empty()) {
+        return false;
+    }
+    res = HttpResponse{};
+    res.status_code = 200;
+    res.body = std::move(body);
+    res.content_length = res.body.size();
+    res.content_length_result = 0;
+    res.all_headers_blob = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                           "Content-Length: " +
+                           std::to_string(res.content_length) + "\r\n\r\n";
     return true;
 }
 
@@ -2003,6 +2064,23 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             worker_errno = ORBIS_HTTP_ERROR_RESOLVER_ENODNS;
         } else {
             worker_errno = RunRealHttpRequest(plan, local_res, success_event_bits);
+        }
+
+        if (Core::BBCoop::IsEnabled() && plan.method == ORBIS_HTTP_METHOD_GET &&
+            IsBloodborneServerInfoPath(plan.path)) {
+            if (worker_errno == 0 && local_res.status_code == 200 && !local_res.body.empty()) {
+                SaveBloodborneServerInfo(local_res);
+            } else if (HttpResponse cached; LoadBloodborneServerInfo(cached)) {
+                LOG_INFO(Lib_Http,
+                         "[coop] ss.info served from local cache ({} bytes; live request: "
+                         "status={} errno={:#x})",
+                         cached.body.size(), local_res.status_code,
+                         static_cast<u32>(worker_errno));
+                local_res = std::move(cached);
+                worker_errno = 0;
+                success_event_bits = ORBIS_HTTP_NB_EVENT_IN | ORBIS_HTTP_NB_EVENT_OUT |
+                                     ORBIS_HTTP_NB_EVENT_RESOLVED;
+            }
         }
 
 #ifdef ARCH_X86_64
