@@ -4160,7 +4160,9 @@ public:
     }
     void ShopBuy(const BB::Shop::Item& it) {
         std::string why;
-        if (!BB::Cheats::Read().in_game) {
+        if (BB::Shop::OwnsWeapon(it)) {
+            ShopSay("Ya la tienes");
+        } else if (!BB::Cheats::Read().in_game) {
             ShopSay("Carga una partida para comprar");
         } else if (BB::Cheats::Read().echoes < it.price) {
             ShopSay(fmt::format("No tienes ecos suficientes ({} de {})", BB::Cheats::Read().echoes,
@@ -4326,10 +4328,17 @@ public:
         Txt(dl, g_ft_italic, 19 * u, {rx, y}, Muted(0.8f),
             it.game_price ? "precio de la tienda del juego" : "precio fijo (el juego no lo vende)");
         y += 40 * u;
-        const bool can = st.in_game && BB::Shop::BuyAvailable() && st.echoes >= it.price;
-        if (CardButton("##shopbuy", {rx, y}, {rx + std::min(rw, 260 * u), y + 62 * u}, "COMPRAR", u,
-                       can) &&
-            BB::Shop::BuyAvailable()) {
+        const bool owned = BB::Shop::OwnsWeapon(it); // weapons: only once
+        const bool can = !owned && st.in_game && BB::Shop::BuyAvailable() && st.echoes >= it.price;
+        if (owned) {
+            const ImVec2 o0{rx, y}, o1{rx + std::min(rw, 260 * u), y + 62 * u};
+            dl->AddRectFilled(o0, o1, Col(20, 18, 17, 0.9f), 6 * u);
+            dl->AddRect(o0, o1, Bronze(0.5f), 6 * u, 0, std::max(1.0f, u));
+            TxtC(dl, g_ft_title, 24 * u, (o0.x + o1.x) * 0.5f, o0.y + 18 * u, Muted(0.8f),
+                 "YA LA TIENES");
+        } else if (CardButton("##shopbuy", {rx, y}, {rx + std::min(rw, 260 * u), y + 62 * u},
+                              "COMPRAR", u, can) &&
+                   BB::Shop::BuyAvailable()) {
             ShopBuy(it);
         }
         // the game's own text, scrollable
@@ -4533,9 +4542,25 @@ void WaitWhilePaused() {
     std::unique_lock lk{g_pause_mtx};
     if (!g_pause) return;
     const auto t0 = std::chrono::steady_clock::now();
-    g_pause_cv.wait(lk, [] { return !g_pause.load(); });
+    // (bb-shop) a purchase made in the menu runs here, on this guest thread parked at its flip
+    // (no lock held, the game's frame loop stopped), so the item arrives without unpausing.
+    for (;;) {
+        g_pause_cv.wait(lk, [] { return !g_pause.load() || BB::Shop::HasPending(); });
+        if (!g_pause.load()) break;
+        lk.unlock();
+        BB::Cheats::OnGuestFlip(); // validates the player and drains BB::Shop's queue
+        lk.lock();
+        if (BB::Shop::HasPending()) { // not in game yet: retry later, do not spin
+            g_pause_cv.wait_for(lk, std::chrono::milliseconds(250),
+                                [] { return !g_pause.load(); });
+        }
+    }
     LOG_INFO(Frontend, "[bb-menu] game paused {:.1f} s (F1 menu)",
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+void WakePause() {
+    { std::scoped_lock lk{g_pause_mtx}; }
+    g_pause_cv.notify_all();
 }
 bool GamePaused() {
     return g_pause.load(std::memory_order_relaxed);

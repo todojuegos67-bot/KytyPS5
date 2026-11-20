@@ -31,7 +31,14 @@
 // returns 0 on success. Lua "AddInventoryItem" (0x132FBE0) calls it with category 0 (weapon) /
 // 0x40000000 (goods); it checks the param row (0x1F1E3D0 goods, 0x1F29AA0 weapon), adds to the
 // inventory PlayerGameData+0x1D0 (0x14CDFD0) and queues the game's "obtained" message through
-// the manager at [0x5546C88] (null: nothing happens, so it is checked first).
+// the manager at [0x5546C88]. That manager is created on demand by 0x130FF20
+// BeginItemGet(0, 0, 0, 0x1e, 0, 1), which AddInventoryItem calls first (then sets
+// [manager]+0x8c = 7): without it the pointer is null and AddItem does nothing, which is why
+// every purchase failed with "el juego no está listo". The same sequence is used here.
+// Owned weapons: the inventory index PlayerGameData+0x328 (lookup 0x14D9F60): 2017 hash
+// buckets (s16 at [+0x68]), nodes [+0x78] {key, slot:12 | next+1:12}, slots of 16 bytes at
+// [+0x58] (index < [+0x24]) or [+0x48] (index - [+0x24]), first dword != 0 when used. A weapon's
+// key is its id (base + variant * 10000 + level * 100).
 #include "core/bb_shop.h"
 
 #include <algorithm>
@@ -50,12 +57,16 @@
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/np/np_handler/np_handler.h"
+#include "core/memory.h"
+#include "imgui/bb_menu.h"
 
 namespace BB::Shop {
 namespace {
 
 constexpr u64 AddItemVa = 0x1310370;
 constexpr u64 ItemGetManVa = 0x5546C88;
+constexpr u64 BeginItemGetVa = 0x130FF20;
+constexpr u32 PgdInvIndex = 0x328;
 constexpr u32 PgdEchoes = 0x94;
 constexpr s32 EchoesMax = 999999999;
 constexpr s32 CatWeapon = 0, CatGoods = 0x40000000;
@@ -66,6 +77,53 @@ constexpr u8 kAddItemSig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x
                               0x54, 0x53, 0x48, 0x81, 0xec, 0x38, 0x01, 0x00, 0x00, 0x45, 0x89,
                               0xc4, 0x41, 0x89, 0xce, 0x41, 0x89, 0xd7};
 using AddItemFn = s32(PS4_SYSV_ABI*)(u64, s32, s32, s32, s32);
+// BeginItemGet prologue (1.09) up to the argument moves.
+constexpr u8 kBeginSig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                            0x53, 0x48, 0x83, 0xec, 0x78, 0x44, 0x89, 0x4d, 0x80, 0x44, 0x89, 0x45,
+                            0x8c, 0x41, 0x89, 0xcc, 0x89, 0x55, 0x88, 0x89, 0x75, 0x84, 0x41, 0x89,
+                            0xfe};
+using BeginItemGetFn = void(PS4_SYSV_ABI*)(s32, s32, s32, s32, s32, s32);
+
+template <typename T>
+T Rd(u64 a) {
+    T v{};
+    std::memcpy(&v, reinterpret_cast<const void*>(a), sizeof(T));
+    return v;
+}
+// true when the inventory index has the key; reads only (any thread while the game is paused).
+void Put32(u64 a, u32 v) {
+    std::memcpy(reinterpret_cast<void*>(a), &v, 4);
+}
+bool HasKey(u64 pgd, u32 key) {
+    const u64 inv = pgd + PgdInvIndex;
+    const u64 buckets = Rd<u64>(inv + 0x68), nodes = Rd<u64>(inv + 0x78);
+    auto* mem = Core::Memory::Instance();
+    if (buckets == 0 || nodes == 0 || mem == nullptr || !mem->IsValidMapping(buckets, 2017 * 2) ||
+        !mem->IsValidMapping(nodes, 8)) {
+        return false;
+    }
+    s64 n = Rd<s16>(buckets + (key % 2017) * 2);
+    for (int guard = 0; n >= 0 && guard < 4096; ++guard) {
+        const u64 node = nodes + u64(n) * 8;
+        const u32 packed = Rd<u32>(node + 4);
+        if (Rd<u32>(node) == key) {
+            const u32 idx = packed & 0xfff, split = Rd<u32>(inv + 0x24);
+            const u64 slot = idx < split ? Rd<u64>(inv + 0x58) + u64(idx) * 16
+                                         : Rd<u64>(inv + 0x48) + u64(idx - split) * 16;
+            return Rd<u32>(slot) != 0;
+        }
+        n = s16(u16(((packed >> 12) & 0xfff) + 0xffff));
+    }
+    return false;
+}
+bool OwnsWeaponAt(u64 pgd, s32 base) {
+    for (s32 v = 0; v < 3; ++v) {
+        for (s32 lvl = 0; lvl <= 10; ++lvl) {
+            if (HasKey(pgd, u32(base + v * 10000 + lvl * 100))) return true;
+        }
+    }
+    return false;
+}
 
 uintptr_t g_base = 0;
 bool g_eboot_ok = false;
@@ -449,7 +507,9 @@ void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     if (g_eboot_ok) {
         s32 d = 0;
         std::memcpy(&d, reinterpret_cast<const void*>(eboot_base + AddItemVa + 0x2e + 3), 4);
-        g_eboot_ok = s64(AddItemVa) + 0x2e + 8 + d == s64(ItemGetManVa);
+        g_eboot_ok = s64(AddItemVa) + 0x2e + 8 + d == s64(ItemGetManVa) &&
+                     std::memcmp(reinterpret_cast<const void*>(eboot_base + BeginItemGetVa),
+                                 kBeginSig, sizeof(kBeginSig)) == 0;
     }
     if (!g_eboot_ok) {
         LOG_INFO(Frontend, "[shop] add-item function not found (not 1.09): buying off");
@@ -505,8 +565,24 @@ bool BuyAvailable(std::string* why) {
     return true;
 }
 
+bool OwnsWeapon(const Item& item) {
+    // PlayerGameData = [[GameDataMan 0x553B130] + 8] (see bb_cheats.cpp)
+    u64 pgd = 0;
+    auto* mem = Core::Memory::Instance();
+    const u64 gdm = g_eboot_ok ? Rd<u64>(g_base + 0x553B130) : 0;
+    if (gdm != 0 && mem != nullptr && mem->IsValidMapping(gdm + 8, 8)) {
+        const u64 p = Rd<u64>(gdm + 8);
+        if (mem->IsValidMapping(p, 0x400)) pgd = p;
+    }
+    return item.tab == Tab::Weapons && pgd != 0 && OwnsWeaponAt(pgd, item.id);
+}
+
 bool Buy(const Item& item, std::string& why) {
     if (!BuyAvailable(&why)) return false;
+    if (OwnsWeapon(item)) {
+        why = "Ya la tienes";
+        return false;
+    }
     std::scoped_lock lk{g_buy_mtx};
     if (g_queue.size() >= 32) {
         why = "Demasiadas compras pendientes";
@@ -515,6 +591,7 @@ bool Buy(const Item& item, std::string& why) {
     g_queue.push_back({item.id, item.tab == Tab::Weapons ? CatWeapon : CatGoods, item.price,
                        item.name});
     g_pending = true;
+    BbMenu::WakePause(); // applied now by the guest thread parked in the pause
     return true;
 }
 
@@ -536,13 +613,30 @@ void OnGuestFlip(u64 pgd) {
         q.swap(g_queue);
         g_pending = false;
     }
-    u64 man = 0;
-    std::memcpy(&man, reinterpret_cast<const void*>(g_base + ItemGetManVa), 8);
     for (const auto& p : q) {
-        if (man == 0) {
-            Result(fmt::format("{}: el juego no está listo, no se ha cobrado", p.name));
+        const s32 before = Rd<s32>(pgd + PgdEchoes);
+        const bool owned = p.category == CatWeapon && OwnsWeaponAt(pgd, p.id);
+        if (owned) {
+            Result(fmt::format("{}: ya la tienes, no se ha cobrado", p.name));
             continue;
         }
+        // as AddInventoryItem: open the item-get session (creates the manager)
+        const u64 man0 = Rd<u64>(g_base + ItemGetManVa);
+        if (before >= p.price) {
+            reinterpret_cast<BeginItemGetFn>(g_base + BeginItemGetVa)(0, 0, 0, 0x1e, 0, 1);
+        }
+        const u64 man = Rd<u64>(g_base + ItemGetManVa);
+        LOG_INFO(Frontend,
+                 "[shop] diag: {} id {} cat {:#x} price {} echoes {} pgd {:#x} manager {:#x} -> "
+                 "{:#x}",
+                 p.name, p.id, p.category, p.price, before, pgd, man0, man);
+        if (before >= p.price && man == 0) {
+            Result(fmt::format("{}: el gestor de objetos del juego no existe tras abrirlo "
+                               "(0x5546C88 = 0), no se ha cobrado",
+                               p.name));
+            continue;
+        }
+        if (man != 0) Put32(man + 0x8c, 7);
         // take the echoes (refused when there are not enough)
         std::atomic_ref<s32> echoes{*reinterpret_cast<s32*>(pgd + PgdEchoes)};
         s32 cur = echoes.load();
@@ -559,6 +653,8 @@ void OnGuestFlip(u64 pgd) {
         }
         const auto add = reinterpret_cast<AddItemFn>(g_base + AddItemVa);
         const s32 r = add(0, p.category, p.id, 1, -1);
+        LOG_INFO(Frontend, "[shop] diag: AddItem({:#x}, {}) = {}, echoes now {}", p.category,
+                 p.id, r, Rd<s32>(pgd + PgdEchoes));
         if (r != 0) {
             // refund (clamped as the game clamps)
             s32 c = echoes.load();

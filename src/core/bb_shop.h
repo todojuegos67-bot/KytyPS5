@@ -42,6 +42,8 @@ std::vector<const Item*> Items(Tab tab);
 // Queue a purchase (applied on the next game frame). false: refused now (with a reason).
 bool Buy(const Item& item, std::string& why);
 bool BuyAvailable(std::string* why = nullptr); // eboot recognised, not in a co-op room
+// A weapon the player already has (any level or uncanny / lost variant, inventory only).
+bool OwnsWeapon(const Item& item);
 // Last purchase result text (for the menu), and a counter that changes with each result.
 std::string LastResult(u32* serial = nullptr);
 
