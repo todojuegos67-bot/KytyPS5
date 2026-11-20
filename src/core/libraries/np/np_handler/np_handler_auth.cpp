@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/logging/log.h"
+#include "core/bb_coop_config.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_handler/np_handler.h"
@@ -70,6 +71,15 @@ void NpHandler::OnAuthReply(s32 user_id, ShadNet::CommandType /*cmd*/, u64 pkt_i
         return;
     }
 
+    if (error == ShadNet::ErrorType::Invalid && Core::BBCoop::IsEnabled()) {
+        // shadnet-p2p (the Bloodborne co-op server) has no GetAuthorizationCode command and
+        // answers Invalid. Bloodborne sends this code to its community server, which accepts
+        // the fixed code shadp2p always returns, so use that for BB co-op.
+        LOG_INFO(NpHandler, "user_id={} server has no auth-code command; BB co-op code used",
+                 user_id);
+        req->SetAuthorizationCode("AUTHCODE", NpAuthIssuerId);
+        return;
+    }
     if (error != ShadNet::ErrorType::NoError) {
         LOG_WARNING(NpHandler, "user_id={} error={}", user_id, static_cast<int>(error));
         req->SetResult(AuthErrorFromReply(error));
