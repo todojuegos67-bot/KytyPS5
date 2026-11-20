@@ -81,6 +81,35 @@ void InstallHttpTrace(uintptr_t base, u64 size) {
     }
     g_base = base;
     g_size = size;
+    // The common Bloodborne patch "Disable HTTP Requests" NOPs the two calls to the HTTP
+    // manager tick (eboot 0x1e7e2f0 and 0x1fe4d96), so a request such as ss.info is created
+    // but never sent and Online spins forever. Co-op needs that tick: put the calls back.
+    // (The same patch also NOPs a sceRtcGetDayOfWeek call at 0x20ee2a9; left as the user set.)
+    struct TickCall {
+        u64 offset;
+        std::array<u8, 5> original;
+    };
+    static constexpr std::array<TickCall, 2> kTickCalls{{
+        {0x1e7e2f0, {0xE8, 0xDB, 0x2D, 0x15, 0xFF}},
+        {0x1fe4d96, {0xE8, 0x35, 0xC3, 0xFE, 0xFE}},
+    }};
+    static constexpr std::array<u8, 5> kNops{0x90, 0x90, 0x90, 0x90, 0x90};
+    for (const auto& c : kTickCalls) {
+        auto* code = reinterpret_cast<u8*>(base + c.offset);
+        if (c.offset + 5 > size) {
+            continue;
+        }
+        if (std::memcmp(code, kNops.data(), 5) == 0) {
+            std::memcpy(code, c.original.data(), 5);
+            LOG_WARNING(Lib_Http,
+                        "[coop-http] HTTP manager tick call at {:#x} was NOPed by a patch "
+                        "(\"Disable HTTP Requests\"); restored for co-op",
+                        c.offset);
+        } else if (std::memcmp(code, c.original.data(), 5) != 0) {
+            LOG_WARNING(Lib_Http, "[coop-http] HTTP tick call at {:#x} has unexpected bytes",
+                        c.offset);
+        }
+    }
     int installed = 0;
     for (size_t i = 0; i < kSites.size(); ++i) {
         const auto& s = kSites[i];
