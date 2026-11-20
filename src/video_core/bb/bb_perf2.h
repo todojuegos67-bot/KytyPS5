@@ -6,9 +6,13 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include "common/thread.h"
 #include "common/types.h"
 
 namespace BBPerf2 {
@@ -89,5 +93,80 @@ inline bool NativeOn(const char* name) {
     const char* v = std::getenv(name);
     return !(v && v[0] == '0' && v[1] == '\0');
 }
+
+// bb-spikes: time each guest thread spends blocked in the HLE waits / sleeps / file calls below,
+// per thread (the [spike] line names the threads and calls that held a long frame).
+enum class Wait : u32 {
+    Equeue,
+    Sema,
+    PosixSem,
+    EventFlag,
+    CondWait,
+    MutexLock,
+    Sleep,
+    Join,
+    AudioOut,
+    FileOpen,
+    FileStat,
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<u32>(Wait::Count)> kWaitNames{
+    "sceKernelWaitEqueue",
+    "sceKernelWaitSema",
+    "sem_wait",
+    "sceKernelWaitEventFlag",
+    "pthread_cond_wait",
+    "pthread_mutex_lock",
+    "sleep",
+    "pthread_join",
+    "sceAudioOutOutput",
+    "open",
+    "stat",
+};
+inline constexpr u32 kWaitThreads = 64;
+inline constexpr u32 kWaitKinds = static_cast<u32>(Wait::Count);
+
+struct WaitTable {
+    std::array<std::array<std::atomic<u64>, kWaitKinds>, kWaitThreads> us{};
+    std::array<std::string, kWaitThreads> names{};
+    std::atomic<u32> threads{0};
+    std::mutex names_mutex;
+};
+
+inline WaitTable& Waits() {
+    static WaitTable t;
+    return t;
+}
+
+// This thread's row (kWaitThreads or more: not recorded).
+inline u32 WaitThreadSlot() {
+    thread_local const u32 slot = [] {
+        auto& t = Waits();
+        const u32 i = t.threads.fetch_add(1, std::memory_order_relaxed);
+        if (i < kWaitThreads) {
+            std::scoped_lock lk{t.names_mutex};
+            t.names[i] = Common::GetCurrentThreadName();
+        }
+        return i;
+    }();
+    return slot;
+}
+
+class WaitScope {
+public:
+    explicit WaitScope(Wait kind_) : kind{kind_}, started{std::chrono::steady_clock::now()} {}
+    ~WaitScope() {
+        const u32 slot = WaitThreadSlot();
+        if (slot < kWaitThreads) {
+            Add(Waits().us[slot][static_cast<u32>(kind)], MicrosSince(started));
+        }
+    }
+    WaitScope(const WaitScope&) = delete;
+    WaitScope& operator=(const WaitScope&) = delete;
+
+private:
+    Wait kind;
+    std::chrono::steady_clock::time_point started;
+};
 
 } // namespace BBPerf2

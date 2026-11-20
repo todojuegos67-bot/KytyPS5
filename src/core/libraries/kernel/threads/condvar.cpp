@@ -13,6 +13,7 @@
 #include "core/libraries/kernel/threads/sleepq.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Libraries::Kernel {
 
@@ -108,6 +109,7 @@ int PS4_SYSV_ABI posix_pthread_cond_destroy(PthreadCondT* cond) {
 }
 
 int PthreadCond::Wait(PthreadMutexT* mutex, const OrbisKernelTimespec* abstime, u64 usec) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::CondWait};
     PthreadMutex* mp = *mutex;
     if (const int error = mp->IsOwned(g_curthread); error != 0) {
         return error;

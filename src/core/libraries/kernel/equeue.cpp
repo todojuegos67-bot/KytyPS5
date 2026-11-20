@@ -17,6 +17,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/net/guest_net.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Libraries::Kernel {
 
@@ -598,6 +599,7 @@ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
 int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev, int num, int* out,
                                      OrbisKernelUseconds* timo) {
     HLE_TRACE;
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::Equeue};
     if (!kqueues.contains(eq)) {
         return ORBIS_KERNEL_ERROR_EBADF;
     }

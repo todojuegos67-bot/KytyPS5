@@ -153,6 +153,7 @@ void ReleaseFlockState(Core::FileSys::File* file) {
 } // anonymous namespace
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::FileOpen};
     BbMenu::OnGuestFileOpen(raw_path, flags); // (bb trophies: save slot tracking)
     if (raw_path == nullptr) {
         *__Error() = POSIX_EFAULT;
@@ -934,6 +935,7 @@ s32 PS4_SYSV_ABI posix_chdir(const char* path) {
 }
 
 s32 PS4_SYSV_ABI posix_stat(const char* path, OrbisKernelStat* sb) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::FileStat};
     if (path == nullptr || sb == nullptr) {
         *__Error() = POSIX_EFAULT;
         return -1;
