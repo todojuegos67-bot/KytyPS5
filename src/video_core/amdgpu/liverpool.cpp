@@ -3,7 +3,9 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <xxhash.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/debug.h"
@@ -311,9 +313,42 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+// bb-cmdbuf-guard: a submitted DCB is read later on this thread, from guest memory. submit_hash
+// is its XXH3 when the guest submitted it; a different hash here means the guest wrote the buffer
+// again before the GPU thread read it (the packets then are not the ones submitted).
+static bool BbDcbChangedSinceSubmit(std::span<const u32> dcb, u64 submit_hash) {
+    if (submit_hash == 0 || XXH3_64bits(dcb.data(), dcb.size_bytes()) == submit_hash) {
+        return false;
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "[cmdbuf] DCB {} ({} dwords) changed between the guest's submit and the GPU "
+                    "thread reading it",
+                    fmt::ptr(dcb.data()), dcb.size());
+    }
+    return true;
+}
+
+// bb-cmdbuf-guard: a packet header that is not PM4 type 2 or 3 cannot be executed. The rest of
+// this command buffer is dropped (logged) instead of stopping the emulator.
+static void BbLogMalformedDcb(std::span<const u32> dcb, uintptr_t base_addr, bool changed) {
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    const auto at = reinterpret_cast<uintptr_t>(dcb.data());
+    LOG_ERROR(Render_Vulkan,
+              "[cmdbuf] malformed PM4 header {:#010x} at {:#x} (dword {} of the buffer at {:#x}, "
+              "{} dwords left; buffer changed after submit: {}): rest of the buffer dropped",
+              dcb[0], at, (at - base_addr) / sizeof(u32), base_addr, dcb.size(),
+              changed ? "yes" : "no / not checked");
+}
+
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 submit_hash) {
     FIBER_ENTER(dcb_task_name);
 
+    const bool bb_changed = BbDcbChangedSinceSubmit(dcb, submit_hash);
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
@@ -324,12 +359,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+            BbLogMalformedDcb(dcb, base_addr, bb_changed);
+            dcb = {};
+            continue;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -1360,7 +1393,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     BB::SsrProbe::OnSubmit();
-    auto task = ProcessGraphics(dcb);
+    auto task = ProcessGraphics(dcb, XXH3_64bits(dcb.data(), dcb.size_bytes()));
     {
         std::scoped_lock lock{submit_mutex, queue.m_access};
         if (!ccb.empty()) {
