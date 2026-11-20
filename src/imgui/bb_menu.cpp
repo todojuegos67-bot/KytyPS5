@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <iterator>
 #include <cmath>
@@ -198,6 +199,27 @@ void SaveMenuSettings() {
     LOG_INFO(Frontend, "[bb-menu] bb_menu.ini: kbm_play={} invert_y={}", g_kbm_play, g_invert_y);
 }
 
+// ---------------------------------------------------------------- pause (bb-menu-pause)
+// While the menu is open the guest thread that flips is held at the start of its flip call
+// (WaitWhilePaused, before any lock is taken): the game's frame loop stops, the presenter keeps
+// re-presenting the last frame with the menu, guest audio output is muted. Not in co-op.
+std::atomic<bool> g_pause{false};       // hold the guest at its next flip
+std::atomic<bool> g_pause_coop{false};  // menu open in co-op: not paused (shown in the menu)
+std::mutex g_pause_mtx;
+std::condition_variable g_pause_cv;
+
+bool CoopActive() {
+    if (!Core::BBCoop::IsEnabled() || !EmulatorSettings.IsShadNetEnabled()) return false;
+    return Libraries::Np::NpHandler::GetInstance().GetCoopSnapshot().in_room;
+}
+void SetPause(bool on) {
+    {
+        std::scoped_lock lk{g_pause_mtx};
+        g_pause = on;
+    }
+    if (!on) g_pause_cv.notify_all();
+}
+
 // ---------------------------------------------------------------- open / close (main thread)
 void SetOpen(bool open) {
     if (open == g_open.load()) {
@@ -216,12 +238,15 @@ void SetOpen(bool open) {
             SDL_SetWindowRelativeMouseMode(g_window, false);
         }
         SDL_ShowCursor();
+        g_pause_coop = CoopActive();
+        SetPause(!g_pause_coop);
         g_open = true;
         g_open_changes.fetch_add(1);
         LOG_INFO(Frontend, "[bb-menu] F1 menu open: game input paused");
     } else {
         g_open = false;
         g_open_changes.fetch_add(1);
+        SetPause(false);
         g_test_mode = false;
         g_wiz_listen = false;
         {
@@ -2960,6 +2985,7 @@ public:
 
     static void Quit() {
         LOG_INFO(Frontend, "[bb-menu] Salir del juego: closing the emulator");
+        SetPause(false); // let the guest run to the shutdown
         SDL_Event e{};
         e.type = SDL_EVENT_QUIT;
         SDL_PushEvent(&e);
@@ -3180,6 +3206,10 @@ public:
             }
             g_a = e;
             Footer(disp, u);
+            if (g_pause_coop) {
+                TxtC(ImGui::GetWindowDrawList(), g_ft_italic, 22 * u, disp.x * 0.5f,
+                     disp.y - 120 * u, Muted(0.9f), "En multijugador el juego no se pausa");
+            }
             if (capturing) {
                 CaptureOverlay(disp, u);
             }
@@ -4218,6 +4248,19 @@ void LoadFonts() {
     if (g_ft_italic == nullptr) g_ft_italic = g_ft_text;
     LOG_INFO(Frontend, "[bb-menu] fonts: title {} text {} ui {}", g_ft_title != nullptr,
              g_ft_text != nullptr, g_ft_ui != nullptr);
+}
+
+void WaitWhilePaused() {
+    if (!g_pause.load()) return;
+    std::unique_lock lk{g_pause_mtx};
+    if (!g_pause) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    g_pause_cv.wait(lk, [] { return !g_pause.load(); });
+    LOG_INFO(Frontend, "[bb-menu] game paused {:.1f} s (F1 menu)",
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+bool GamePaused() {
+    return g_pause.load(std::memory_order_relaxed);
 }
 
 bool IsOpen() {

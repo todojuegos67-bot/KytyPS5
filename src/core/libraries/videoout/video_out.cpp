@@ -15,6 +15,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/bb_cheats.h"
 #include "core/bb_vardt.h"
+#include "imgui/bb_menu.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -158,6 +159,7 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
+    BbMenu::WaitWhilePaused(); // F1 menu open: the game waits here (bb-menu-pause)
     BB::NativeMv::OnGuestFlip();
     auto* port = driver->GetPort(handle);
     if (!port) {

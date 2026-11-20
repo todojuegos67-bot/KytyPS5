@@ -10,6 +10,7 @@
 // 1.21 (bb-menu-121): full-screen hub, one screen per section, DS4 game pad next to your pad,
 // exclusive rebind capture, OFL fonts. Also the trophy popup (slide-in card) and its synthesized chime.
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -30,6 +31,12 @@ bool IsOpen();
 // Counts menu opens and closes (a frame that saw the menu open changes it, even with no flip
 // while the menu was up).
 u32 OpenChanges();
+
+// (bb-menu-pause) The menu pauses the game (not in co-op: BB_COOP=1 with a Matching2 room).
+// Guest flip entry points call this first: it blocks while the menu holds the pause.
+void WaitWhilePaused();
+// The pause is on (audio out writes silence).
+bool GamePaused();
 
 // (bb-kbmcam-142) "Jugar con teclado y ratón" (bb_menu.ini kbm_play) is on.
 bool KbmPlay();
