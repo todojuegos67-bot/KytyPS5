@@ -455,12 +455,11 @@ bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& 
 
     if (target.port != 0) {
         port = target.port;
-    } else if (!target.scheme.empty() && target.scheme != orig_scheme) {
-        if (orig_scheme == "https" && port == 443) {
-            port = 80;
-        } else if (orig_scheme == "http" && port == 80) {
-            port = 443;
-        }
+    } else if (!target.scheme.empty()) {
+        // A value with a scheme and no port means that scheme's default port, as documented
+        // above. Keeping the original port sent e.g. "https://ss4.scej-network.jp:20443" ->
+        // "http://thehuntersdream.com" to plain HTTP on :20443, a TLS port (400 Bad Request).
+        port = target.scheme == "https" ? 443 : 80;
     }
 
     LOG_INFO(Lib_Http, "host override active: {}://{}:{} -> {}://{}:{} (matched key '{}')",
