@@ -1024,6 +1024,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/bb_cheats.cpp
          src/core/bb_coop_config.cpp
          src/core/bb_coop_config.h
+         src/core/bb_coop_register.cpp
          src/core/bb_cheats.h
          src/core/bb_shop.cpp
          src/core/bb_shop.h

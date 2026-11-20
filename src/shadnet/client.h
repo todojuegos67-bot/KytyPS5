@@ -307,6 +307,11 @@ public:
     void Start(const std::string& host, u16 port, const std::string& npid,
                const std::string& password, const std::string& token = {});
     void Stop();
+    // Account creation (shadnet-p2p "register"): connects and sends a Create request instead
+    // of Login. The reply arrives through onAsyncReply with cmd == CommandType::Create.
+    void StartRegister(const std::string& host, u16 port, const std::string& npid,
+                       const std::string& password, const std::string& email,
+                       const std::string& secret_key);
 
     ShadNetState WaitForConnection();
     ShadNetState WaitForAuthenticated();
@@ -408,6 +413,9 @@ private:
     std::string m_password;
     std::string m_token;
     bool m_appear_offline = false; // user's Appear-Offline preference (sent at login)
+    bool m_register_mode = false;  // StartRegister: send Create instead of Login
+    std::string m_email;
+    std::string m_secret_key;
 
     std::atomic<bool> m_terminate{false};
     std::atomic<bool> m_connected{false};

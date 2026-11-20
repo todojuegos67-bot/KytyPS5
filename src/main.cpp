@@ -27,6 +27,7 @@
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
+#include "core/bb_coop_config.h"
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
@@ -69,6 +70,8 @@ int main(int argc, char* argv[]) {
     std::optional<std::filesystem::path> cacheDir;
     std::optional<int> waitPid;
     std::optional<u32> userId;
+    bool coopRegister = false;
+    std::string regServer, regNpid, regPassword, regEmail, regKey;
     bool waitForDebugger = false;
     bool userfaultfd = false;
 
@@ -110,6 +113,13 @@ int main(int argc, char* argv[]) {
     app.add_flag("--wait-for-debugger", waitForDebugger);
     app.add_option("--wait-for-pid", waitPid);
     app.add_option("--user-id", userId, "Use a local user ID for this process only");
+    // Launcher "Crear cuenta": create a shadNet account and exit (no game, no window).
+    app.add_flag("--coop-register", coopRegister, "Create a shadNet account and exit");
+    app.add_option("--server", regServer, "shadNet server host:port (--coop-register)");
+    app.add_option("--npid", regNpid, "NP ID (--coop-register)");
+    app.add_option("--password", regPassword, "Password (--coop-register)");
+    app.add_option("--email", regEmail, "E-mail (--coop-register)");
+    app.add_option("--key", regKey, "Server registration key (--coop-register)");
 #ifdef __linux__
     app.add_flag("--userfaultfd", userfaultfd,
                  "Enable userfaultfd for tracking memory (Linux only)");
@@ -194,6 +204,10 @@ int main(int argc, char* argv[]) {
         }
     } catch (const CLI::ParseError& e) {
         return app.exit(e);
+    }
+
+    if (coopRegister) {
+        return Core::BBCoop::RunRegister(regServer, regNpid, regPassword, regEmail, regKey);
     }
 
     if (waitPid)

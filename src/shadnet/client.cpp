@@ -75,6 +75,15 @@ void ShadNetClient::Start(const std::string& host, u16 port, const std::string& 
     m_thread_connect = std::thread(&ShadNetClient::ConnectThread, this);
 }
 
+void ShadNetClient::StartRegister(const std::string& host, u16 port, const std::string& npid,
+                                  const std::string& password, const std::string& email,
+                                  const std::string& secret_key) {
+    m_register_mode = true;
+    m_email = email;
+    m_secret_key = secret_key;
+    Start(host, port, npid, password);
+}
+
 void ShadNetClient::Stop() {
     m_terminate = true;
     try {
@@ -196,6 +205,21 @@ void ShadNetClient::ConnectThread() {
     m_thread_reader = std::thread(&ShadNetClient::ReaderThread, this);
     m_thread_writer = std::thread(&ShadNetClient::WriterThread, this);
     m_sem_connected.release();
+
+    if (m_register_mode) {
+        shadnet::RegistrationRequest reg;
+        reg.set_npid(m_npid);
+        reg.set_password(m_password);
+        reg.set_email(m_email);
+        if (!m_secret_key.empty())
+            reg.set_secret_key(m_secret_key);
+        const u64 reg_id = m_pkt_counter.fetch_add(1);
+        if (!SendAll(BuildPacket(CommandType::Create, reg_id, MakeProtoPayload(reg)))) {
+            LOG_ERROR(ShadNet, "ShadNet: Failed to send Create packet");
+            m_state = ShadNetState::FailureOther;
+        }
+        return;
+    }
 
     // Build Login request as protobuf
     shadnet::LoginRequest req;

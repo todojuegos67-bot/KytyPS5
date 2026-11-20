@@ -2299,6 +2299,29 @@ int PS4_SYSV_ABI sceHttpWaitRequest(OrbisHttpEpollHandle eh, OrbisHttpNBEvent* n
     }
     auto epoll_ptr = it->second;
 
+    // (bb-coop) Diagnostics for a game that binds a request to an epoll and never sends it:
+    // log the first poll of each epoll, then once a minute which bound requests are still
+    // unsent. Cheap: only counters and a scan of this epoll's requests once a minute.
+    {
+        static std::unordered_map<int, std::chrono::steady_clock::time_point> last_report;
+        const auto now = std::chrono::steady_clock::now();
+        auto [rit, first] = last_report.try_emplace(epoll_id, now);
+        if (first) {
+            LOG_INFO(Lib_Http, "epoll id={} first sceHttpWaitRequest (timeout={})", epoll_id,
+                     timeout);
+        } else if (now - rit->second > std::chrono::seconds(60)) {
+            rit->second = now;
+            for (const auto& [req_id, req] : g_state.requests) {
+                if (req && req->epoll_id == epoll_id && req->state == HttpRequestState::Created) {
+                    LOG_WARNING(Lib_Http,
+                                "epoll id={} still polled; reqId={} bound to it was never sent "
+                                "(no sceHttpSendRequest)",
+                                epoll_id, req_id);
+                }
+            }
+        }
+    }
+
     // if the epoll's abort flag is
     // already set, return Aborted immediately without draining or waiting.
     if (epoll_ptr->abort_requested) {

@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <string>
+
 namespace Core::BBCoop {
 
 /// BB_COOP=1 (read once).
@@ -30,5 +32,11 @@ bool IsSeamlessEnabled();
 /// Applies the BB_COOP_* overrides to the loaded settings and the default user (in memory
 /// only). Call after the game's settings profile has been loaded. No-op unless BB_COOP=1.
 void ApplyToSettings();
+
+/// `--coop-register`: creates a shadNet account and prints one line to stdout ("OK" or the
+/// server's error name, ConnectionFailed, Timeout, InvalidServer, MissingArguments).
+/// Returns 0 OK, 1 server refused, 2 connection failed, 3 timeout, 4 bad arguments.
+int RunRegister(const std::string& server, const std::string& npid, const std::string& password,
+                const std::string& email, const std::string& key);
 
 } // namespace Core::BBCoop
