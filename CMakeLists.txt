@@ -359,6 +359,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# (render1 F2) KYTY_RENDER1=2: the native depth batch against the normal depth (src/local/render1-native.inc).
+set(render1_cmp_source "${KYTY_SOURCE_DIR}/local/render1-cmp.comp")
+set(render1_cmp_spv "${gpu_tiler_generated_dir}/render1_cmp.spv")
+set(render1_cmp_header "${gpu_tiler_generated_dir}/render1_cmp_spv.h")
+add_custom_command(
+	OUTPUT "${render1_cmp_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${render1_cmp_spv}" "${render1_cmp_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${render1_cmp_spv} -DOUTPUT=${render1_cmp_header}
+	        -DSYMBOL=RENDER1_CMP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${render1_cmp_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${render1_cmp_header}")
+
 # KYTY_UPSCALE_SHARPNESS: sharpening after DLSS or XeSS (src/local/frame-gen.cpp).
 set(sharpen_source "${KYTY_SOURCE_DIR}/local/sharpen.comp")
 set(sharpen_spv "${gpu_tiler_generated_dir}/sharpen.spv")
@@ -524,7 +540,7 @@ set(rt_reflections_header "${gpu_tiler_generated_dir}/rt_reflections_spv.h")
 add_custom_command(
 	OUTPUT "${rt_reflections_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3
 	        -o "${rt_reflections_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_spv} -DOUTPUT=${rt_reflections_header}
 	        -DSYMBOL=RT_REFLECTIONS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -539,7 +555,7 @@ set(rt_reflections_hw_header "${gpu_tiler_generated_dir}/rt_reflections_hw_spv.h
 add_custom_command(
 	OUTPUT "${rt_reflections_hw_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -DKYTY_HWRT
 	        -o "${rt_reflections_hw_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hw_spv} -DOUTPUT=${rt_reflections_hw_header}
 	        -DSYMBOL=RT_REFLECTIONS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -553,7 +569,7 @@ set(rt_reflections_hwm_header "${gpu_tiler_generated_dir}/rt_reflections_hwm_spv
 add_custom_command(
 	OUTPUT "${rt_reflections_hwm_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
 	        -o "${rt_reflections_hwm_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hwm_spv} -DOUTPUT=${rt_reflections_hwm_header}
 	        -DSYMBOL=RT_REFLECTIONS_HWM_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -578,6 +594,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gbuf_view_header}")
 
+# (pt1) BB_PATHTRACING: ray-traced sun shadows and reflections through the scene TLAS (src/local/pathtrace.cpp).
+set(pt_source "${KYTY_SOURCE_DIR}/local/pt.comp")
+set(pt_spv "${gpu_tiler_generated_dir}/pt.spv")
+set(pt_header "${gpu_tiler_generated_dir}/pt_spv.h")
+add_custom_command(
+	OUTPUT "${pt_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${pt_spv}" "${pt_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${pt_spv} -DOUTPUT=${pt_header}
+	        -DSYMBOL=PT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${pt_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${pt_header}")
 # KYTY_HWRT_LIGHTS: ray-traced local-light shadows through the scene TLAS (src/local/hw-lights.cpp).
 set(hwlights_source "${KYTY_SOURCE_DIR}/local/hw-lights.comp")
 set(hwlights_spv "${gpu_tiler_generated_dir}/hwlights.spv")
@@ -608,6 +639,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rtwater_header}")
+# (rtq2 b) KYTY_RTN: "Reflejos RT nuevos", the hardware trace where the game reflects (src/local/rt-nuevo.cpp).
+set(rtnuevo_source "${KYTY_SOURCE_DIR}/local/rt-nuevo.comp")
+set(rtnuevo_spv "${gpu_tiler_generated_dir}/rtnuevo.spv")
+set(rtnuevo_header "${gpu_tiler_generated_dir}/rtnuevo_spv.h")
+add_custom_command(
+	OUTPUT "${rtnuevo_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtnuevo_spv}" "${rtnuevo_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtnuevo_spv} -DOUTPUT=${rtnuevo_header}
+	        -DSYMBOL=RTNUEVO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtnuevo_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtnuevo_header}")
 # KYTY_RT_FLICKER: the RT passes' flicker self-check (src/local/rt-flicker.cpp).
 set(rtflicker_source "${KYTY_SOURCE_DIR}/local/rt-flicker.comp")
 set(rtflicker_spv "${gpu_tiler_generated_dir}/rtflicker.spv")
@@ -951,11 +997,19 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# (f5) The native renderer (src/native; KYTY_NATIVE_RENDER, off by default).
+file(GLOB kyty_native_src CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/native/*.cpp" "${KYTY_SOURCE_DIR}/native/*.h" "${KYTY_SOURCE_DIR}/native/*.inc")
+list(APPEND kyty_emulator_src ${kyty_native_src})
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
 	"${KYTY_SOURCE_DIR}/local/local-platform.h"
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/f0-measure.h"
+	"${KYTY_SOURCE_DIR}/local/f0-measure.cpp"
+	"${KYTY_SOURCE_DIR}/local/juego3.h"
+	"${KYTY_SOURCE_DIR}/local/juego3.cpp"
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
@@ -965,6 +1019,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
+	"${KYTY_SOURCE_DIR}/local/pathtrace.h"
+	"${KYTY_SOURCE_DIR}/local/pathtrace.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
@@ -983,6 +1039,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-capture.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-water.h"
 	"${KYTY_SOURCE_DIR}/local/rt-water.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-nuevo.h"
+	"${KYTY_SOURCE_DIR}/local/rt-nuevo.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-softsun.h"
@@ -1469,6 +1527,9 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-i18n.h"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.h"
+		"${KYTY_SOURCE_DIR}/port/ds-online.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-online.h"
+		"${KYTY_SOURCE_DIR}/port/ds-online-core.inc"
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.h"
 		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl2.cpp"
 		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdlrenderer2.cpp"
@@ -1478,7 +1539,7 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
 	if (KYTY_CLANG_CL)
 		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
-			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" "${KYTY_SOURCE_DIR}/port/ds-resume.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" "${KYTY_SOURCE_DIR}/port/ds-resume.cpp" "${KYTY_SOURCE_DIR}/port/ds-online.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 	endif()
 	# (The icon by name from resources/.)
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/ds-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
