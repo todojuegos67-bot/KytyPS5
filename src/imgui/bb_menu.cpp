@@ -2175,7 +2175,7 @@ std::vector<std::string> ScanSaves() {
 void UnlockCustom(CustomState& s, int i, const char* reason);
 int BeastHeurSeconds();
 bool AllUnlocked(const CustomState& s) {
-    return s.unlocked[0] && s.unlocked[1] && (s.unlocked[2] || BeastHeurSeconds() == 0);
+    return s.unlocked[0] && s.unlocked[1] && s.unlocked[2];
 }
 int BeastHeurSeconds() {
     if (const char* v = std::getenv("BB_BEAST_HEUR_SECONDS"); v != nullptr && v[0] != 0) {
@@ -2191,9 +2191,6 @@ void CustomWatcher() {
     }
     if (const char* v = std::getenv("BB_CUSTOM_TROPHY_TEST"); v != nullptr && v[0] == '1') {
         for (int i = 0; i < 3; i++) {
-            if (i == 2 && BeastHeurSeconds() == 0) {
-                break;
-            }
             std::this_thread::sleep_for(std::chrono::seconds(i == 0 ? 20 : 8));
             if (!s.unlocked[i]) {
                 UnlockCustom(s, i, "BB_CUSTOM_TROPHY_TEST=1");
@@ -2217,6 +2214,7 @@ void CustomWatcher() {
     std::string cur_map;
     bool any_map = s.yharnam_seen || s.dream_seen;
     int since_write = 0;
+    s32 echo_base = -1; // (bb-trophy-beast) lowest echoes seen this run (minus cheat echoes)
     const auto on_map = [&](const std::string& id) {
         cur_map = id;
         any_map = true;
@@ -2281,6 +2279,7 @@ void CustomWatcher() {
                      "map '{}', unlocked: {} {} {})",
                      added[0], ng_slot, cur_map, s.unlocked[0], s.unlocked[1], s.unlocked[2]);
             cur_map.clear();
+            echo_base = -1;
             WriteCustom(s);
         }
         // progress counts only while the run's own character is the active one
@@ -2300,6 +2299,26 @@ void CustomWatcher() {
         s.seconds += 5;
         if (cur_map == kMapYharnam) {
             s.yharnam_seconds += 5;
+        }
+        // (bb-trophy-beast) Ni la bestia, ni el miedo: a new game starts with 0 Blood Echoes and
+        // no weapon; the only thing that gives echoes in the clinic before the first Hunter's
+        // Dream is killing the clinic beast. Echoes going up in Central Yharnam before the
+        // first dream = the beast was killed. Echoes added by the F1 cheats are ignored.
+        if (!s.unlocked[2] && s.yharnam_seen && !s.dream_seen && cur_map == kMapYharnam) {
+            const BB::Cheats::Stats st = BB::Cheats::Read();
+            if (st.in_game) {
+                const s32 cheat_add = BB::Cheats::EchoesAddedByCheats();
+                const s32 now = st.echoes - cheat_add;
+                if (echo_base < 0 || now < echo_base) {
+                    echo_base = now;
+                } else if (now > echo_base) {
+                    LOG_INFO(Frontend, "[bbtrophy] echoes {} -> {} before the first dream", echo_base,
+                             now);
+                    UnlockCustom(s, 2, "Blood Echoes gained in Central Yharnam before the first "
+                                       "Hunter's Dream (clinic beast killed)");
+                    WriteCustom(s);
+                }
+            }
         }
         since_write += 5;
         if (!s.unlocked[0]) {
@@ -2341,7 +2360,7 @@ void UnlockCustom(CustomState& s, int i, const char* reason) {
 }
 void AddCustomTrophy() {
     const CustomState s = ReadCustom();
-    const int n = BeastHeurSeconds() > 0 ? 3 : 2; // heuristic trophy only when enabled
+    const int n = 3; // (bb-trophy-beast) the beast trophy is detected from the echoes now
     for (int i = 0; i < n; i++) {
         Trophy t;
         t.id = -100 - i;

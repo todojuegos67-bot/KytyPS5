@@ -34,6 +34,8 @@ void Set(Cheat c, bool on);
 // echoes 0..999,999,999, insight 0..99.
 void AddEchoes(s32 n);
 void AddInsight(s32 n);
+// Total echoes the F1 cheats added this session (so trophies can ignore them).
+s32 EchoesAddedByCheats();
 Stats Read(); // snapshot for the menu (any thread)
 // PlayerGameData of the loaded save (player and its data module validated); false: not in game.
 bool PlayerGameData(u64& pgd);

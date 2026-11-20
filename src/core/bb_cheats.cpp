@@ -89,6 +89,7 @@ std::atomic<bool> g_on[static_cast<u32>(Cheat::Count)] = {};
 bool g_applied[static_cast<u32>(Cheat::Count)] = {}; // guest thread only
 u64 g_items_data = 0;                                 // data module whose bit we set
 std::atomic<s64> g_add_echoes{0}, g_add_insight{0};
+std::atomic<s64> g_cheat_echoes_total{0};
 std::atomic<bool> g_want_stats{false}; // the menu asked for values (Read) since the last frame
 std::mutex g_stats_mtx;
 Stats g_stats;
@@ -182,8 +183,12 @@ void Set(Cheat c, bool on) {
     g_on[static_cast<u32>(c)] = on;
     LOG_INFO(Lib_VideoOut, "[cheats] {} {}", static_cast<u32>(c), on ? "on" : "off");
 }
+s32 EchoesAddedByCheats() {
+    return static_cast<s32>(std::clamp<s64>(g_cheat_echoes_total.load(), 0, EchoesMax));
+}
+
 void AddEchoes(s32 n) {
-    if (g_ok) g_add_echoes += n;
+    if (g_ok) { g_add_echoes += n; if (n > 0) g_cheat_echoes_total += n; }
 }
 void AddInsight(s32 n) {
     if (g_ok) g_add_insight += n;
