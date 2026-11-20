@@ -117,6 +117,7 @@ void SmoothScroll(float& target, float unit) {
 // ---------------------------------------------------------------- shared state
 SDL_Window* g_window = nullptr;
 std::atomic<bool> g_open{false};
+std::atomic<u32> g_open_changes{0};
 Uint32 g_wake_event = 0;
 std::atomic<bool> g_want_close{false};
 std::atomic<bool> g_want_reload{false};
@@ -216,9 +217,11 @@ void SetOpen(bool open) {
         }
         SDL_ShowCursor();
         g_open = true;
+        g_open_changes.fetch_add(1);
         LOG_INFO(Frontend, "[bb-menu] F1 menu open: game input paused");
     } else {
         g_open = false;
+        g_open_changes.fetch_add(1);
         g_test_mode = false;
         g_wiz_listen = false;
         {
@@ -4219,6 +4222,10 @@ void LoadFonts() {
 
 bool IsOpen() {
     return g_open;
+}
+
+u32 OpenChanges() {
+    return g_open_changes.load();
 }
 
 bool PushTrophyToast(const std::filesystem::path& icon, const std::string& name,

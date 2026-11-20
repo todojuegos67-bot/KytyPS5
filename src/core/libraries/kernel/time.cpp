@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_reflex.h"
 
 #ifdef _WIN64
@@ -57,6 +58,7 @@ u64 PS4_SYSV_ABI sceKernelReadTsc() {
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,
                                 const bool interruptible) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::Sleep};
     if (!rqtp || rqtp->tv_sec < 0 || rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1'000'000'000) {
         SetPosixErrno(EINVAL);
         return -1;

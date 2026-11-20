@@ -18,6 +18,7 @@
 #include "core/libraries/audio/audioout_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Libraries::AudioOut {
 
@@ -532,6 +533,7 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::AudioOut};
     LOG_TRACE(Lib_AudioOut, "(STUBBED) called, handle={:#x}, ptr={}", handle, fmt::ptr(ptr));
 
     if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
@@ -590,6 +592,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::AudioOut};
     if (param) {
         LOG_TRACE(Lib_AudioOut, "(STUBBED) called, param={}, num={}", fmt::ptr(param), num);
         for (u32 i = 0; i < num; i++) {

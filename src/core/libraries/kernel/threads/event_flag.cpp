@@ -11,6 +11,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "pthread.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Libraries::Kernel {
 
@@ -390,6 +391,7 @@ int PS4_SYSV_ABI sceKernelPollEventFlag(OrbisKernelEventFlag ef, u64 bitPattern,
 }
 int PS4_SYSV_ABI sceKernelWaitEventFlag(OrbisKernelEventFlag ef, u64 bitPattern, u32 waitMode,
                                         u64* pResultPat, OrbisKernelUseconds* pTimeout) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::EventFlag};
     LOG_DEBUG(Kernel_Event, "called bitPattern = {:#x} waitMode = {:#x}", bitPattern, waitMode);
     if (ef == nullptr) {
         return ORBIS_KERNEL_ERROR_ESRCH;

@@ -11,6 +11,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
+#include "video_core/bb/bb_perf2.h"
 
 namespace Libraries::Kernel {
 
@@ -271,6 +272,7 @@ s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex) {
 }
 
 s32 PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex) {
+    BBPerf2::WaitScope bb_wait{BBPerf2::Wait::MutexLock};
     CHECK_AND_INIT_MUTEX
     return (*mutex)->Lock(nullptr);
 }

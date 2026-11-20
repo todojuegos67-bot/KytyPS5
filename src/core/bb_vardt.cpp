@@ -41,6 +41,7 @@
 #include "core/bb_vardt.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,8 @@
 #include <initializer_list>
 #include <mutex>
 #include <string>
+#include <vector>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "imgui/bb_menu.h"
 #include "video_core/bb/bb_perf2.h"
@@ -354,7 +357,49 @@ struct SpikeCounts {
 };
 SpikeCounts g_spike_prev;
 u32 g_spike_logged = 0;
-bool g_spike_menu = false; // F1 menu open (game paused): those frames are not spikes
+u32 g_spike_menu_changes = 0; // F1 menu opens/closes seen at the last flip (game paused)
+
+// Per guest thread and HLE wait kind (bb_perf2.h WaitScope): microseconds since the last flip.
+using WaitRows = std::array<std::array<u64, BBPerf2::kWaitKinds>, BBPerf2::kWaitThreads>;
+WaitRows g_wait_prev{};
+
+void TakeWaitDeltas(WaitRows& delta) {
+    auto& t = BBPerf2::Waits();
+    for (u32 i = 0; i < BBPerf2::kWaitThreads; ++i) {
+        for (u32 k = 0; k < BBPerf2::kWaitKinds; ++k) {
+            const u64 now = t.us[i][k].load(std::memory_order_relaxed);
+            delta[i][k] = now - g_wait_prev[i][k];
+            g_wait_prev[i][k] = now;
+        }
+    }
+}
+
+// The longest waits of the frame, "thread call ms", longest first.
+std::string TopWaits(const WaitRows& delta) {
+    constexpr u32 kTop = 6;
+    constexpr u64 kMinUs = 500;
+    std::vector<std::pair<u64, std::pair<u32, u32>>> found;
+    for (u32 i = 0; i < BBPerf2::kWaitThreads; ++i) {
+        for (u32 k = 0; k < BBPerf2::kWaitKinds; ++k) {
+            if (delta[i][k] >= kMinUs) {
+                found.push_back({delta[i][k], {i, k}});
+            }
+        }
+    }
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (found.size() > kTop) {
+        found.resize(kTop);
+    }
+    auto& t = BBPerf2::Waits();
+    std::scoped_lock lk{t.names_mutex};
+    std::string out;
+    for (const auto& [us, where] : found) {
+        out += fmt::format("{}{} {} {:.1f} ms", out.empty() ? "" : ", ", t.names[where.first],
+                           BBPerf2::kWaitNames[where.second], us / 1e3);
+    }
+    return out.empty() ? std::string("none >= 0.5 ms") : out;
+}
 
 SpikeCounts ReadSpikeCounts() {
     const auto& c = BBPerf2::Get();
@@ -873,14 +918,14 @@ void OnGuestFlip(int flip_mode) {
     const SpikeCounts spike_now = ReadSpikeCounts();
     const SpikeCounts spike = Since(spike_now, g_spike_prev);
     g_spike_prev = spike_now;
+    static WaitRows wait_delta{};
+    TakeWaitDeltas(wait_delta);
     const u64 fault_max_us = BBPerf2::Get().fault_max_us.exchange(0, std::memory_order_relaxed);
-    const bool menu_open = BbMenu::IsOpen();
-    if (menu_open) {
-        g_spike_menu = true;
-    } else if (g_spike_menu) {
-        g_spike_menu = false; // the frame that closed the menu spans the pause
-    } else if (frame && std::isfinite(measured) && measured >= kSpikeSec &&
-               g_spike_logged < kSpikeLogMax) {
+    const u32 menu_changes = BbMenu::OpenChanges();
+    const bool menu_frame = BbMenu::IsOpen() || menu_changes != g_spike_menu_changes;
+    g_spike_menu_changes = menu_changes;
+    if (!menu_frame && frame && std::isfinite(measured) && measured >= kSpikeSec &&
+        g_spike_logged < kSpikeLogMax) {
         ++g_spike_logged;
         LOG_INFO(Lib_VideoOut,
                  "[spike] {:.1f} ms guest frame at {:.3f} s (monotonic): cpu-write faults {} "
@@ -889,7 +934,7 @@ void OnGuestFlip(int flip_mode) {
                  "reads {} ({:.2f} MiB requested, {:.1f} ms) | host commits {} ({:.1f} ms) | "
                  "guest blocked in gnm submit/flip {:.1f} ms | guest fault handlers {:.1f} ms "
                  "(longest {:.1f} ms) | GPU thread busy {:.1f} ms (Vulkan submit {:.1f} ms) | "
-                 "presenter {:.1f} ms",
+                 "presenter {:.1f} ms | guest waits: {}",
                  measured * 1e3, now, spike.faults, spike.fault_around,
                  static_cast<double>(spike.buf_up) / (1 << 20),
                  static_cast<double>(spike.tex_up) / (1 << 20), spike.tex_images, spike.pipelines,
@@ -897,7 +942,7 @@ void OnGuestFlip(int flip_mode) {
                  static_cast<double>(spike.file_read_bytes) / (1 << 20), spike.file_read_us / 1e3,
                  spike.commit_calls, spike.commit_us / 1e3, spike.gnm_wait_us / 1e3,
                  spike.fault_us / 1e3, fault_max_us / 1e3, spike.cp_busy_us / 1e3,
-                 spike.cp_submit_us / 1e3, spike.present_us / 1e3);
+                 spike.cp_submit_us / 1e3, spike.present_us / 1e3, TopWaits(wait_delta));
     }
     if (std::isfinite(havok_acc)) g_havok_acc.Add(havok_acc);
     if (g_ragdoll_fix) {
