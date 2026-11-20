@@ -7,6 +7,7 @@
 #include <imgui.h>
 
 #include "SDL3/SDL_log.h"
+#include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/debug_state.h"
@@ -482,6 +483,7 @@ void L::Draw() {
 
             if (IsKeyPressed(ImGuiKey_Enter, false) ||
                 (IsKeyPressed(ImGuiKey_GamepadFaceDown, false))) {
+                LOG_INFO(Frontend, "[exit-why] quit dialog confirmed (Enter / Cross)");
                 SDL_Event event;
                 SDL_memset(&event, 0, sizeof(event));
                 event.type = SDL_EVENT_QUIT;

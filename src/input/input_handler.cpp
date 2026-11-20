@@ -868,6 +868,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             }
             break;
         case HOTKEY_QUIT:
+            if (new_button_state) {
+                LOG_INFO(Input, "[exit-why] quit hotkey pressed: quit dialog");
+            }
             PushSDLEvent(SDL_EVENT_QUIT_DIALOG);
             break;
         case HOTKEY_OPEN_EMULATOR_SETTINGS:

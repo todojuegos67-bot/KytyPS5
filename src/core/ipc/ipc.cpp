@@ -8,6 +8,7 @@
 
 #include <SDL3/SDL.h>
 
+#include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/thread.h"
 #include "common/types.h"
@@ -142,6 +143,7 @@ void IPC::InputLoop() {
         } else if (cmd == "RESUME") {
             DebugState.ResumeGuestThreads();
         } else if (cmd == "STOP") {
+            LOG_INFO(Common, "[exit-why] IPC STOP command received");
             SDL_Event event;
             SDL_memset(&event, 0, sizeof(event));
             event.type = SDL_EVENT_QUIT;

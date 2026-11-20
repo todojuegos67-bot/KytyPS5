@@ -351,7 +351,13 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
         OnGamepadEvent(&event);
         break;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        // bb-exit-why: Windows asked the window to close (Alt+F4, the X button, taskbar close,
+        // or another program sending WM_CLOSE). SDL turns it into SDL_EVENT_QUIT below.
+        LOG_INFO(Frontend, "[exit-why] window close requested by Windows (Alt+F4 / X / WM_CLOSE)");
+        break;
     case SDL_EVENT_QUIT:
+        LOG_INFO(Frontend, "[exit-why] SDL_EVENT_QUIT received: closing the emulator");
         is_open = false;
         break;
     case SDL_EVENT_QUIT_DIALOG:
