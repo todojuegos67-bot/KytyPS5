@@ -31,7 +31,6 @@
 #include <cstring>
 #include <mutex>
 #include "common/logging/log.h"
-#include "core/bb_shop.h"
 #include "core/memory.h"
 
 namespace BB::Cheats {
@@ -192,6 +191,15 @@ void AddInsight(s32 n) {
 // Read straight from game memory (read only) with the same validation as the frame code: the
 // frame code only samples them while a cheat is on or the menu asked on an earlier frame, so the
 // shop could see in_game = false with a save loaded.
+bool PlayerGameData(u64& pgd) {
+    u64 player = 0, data = 0;
+    pgd = 0;
+    if (!g_ok) return false;
+    Resolve(player, data, pgd);
+    if (data == 0) pgd = 0;
+    return pgd != 0;
+}
+
 Stats Read() {
     g_want_stats = true;
     Stats st{};
@@ -230,8 +238,7 @@ void OnGuestFlip() {
     g_applied[idx(Cheat::OneHitKill)] = kill;
 
     // Nothing on, nothing queued and the menu not reading: do not touch game memory at all.
-    bool busy = g_items_data != 0 || g_add_echoes.load() != 0 || g_add_insight.load() != 0 ||
-                BB::Shop::HasPending();
+    bool busy = g_items_data != 0 || g_add_echoes.load() != 0 || g_add_insight.load() != 0;
     for (u32 i = 0; i < idx(Cheat::Count); i++) busy = busy || g_on[i].load();
     if (!g_want_stats.exchange(false) && !busy) return;
 
@@ -276,7 +283,6 @@ void OnGuestFlip() {
             AddClamped(pgd + PgdInsight, i, 0, InsightMax);
             LOG_INFO(Lib_VideoOut, "[cheats] insight {:+}", i);
         }
-        BB::Shop::OnGuestFlip(pgd); // purchases from F1 > ARMAS Y OBJETOS
         st.in_game = true;
         st.echoes = Get<s32>(pgd + PgdEchoes);
         st.insight = Get<s32>(pgd + PgdInsight);

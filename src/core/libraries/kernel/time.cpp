@@ -4,6 +4,7 @@
 #include <ctime>
 #include <thread>
 
+#include "core/bb_shop.h"
 #include "common/assert.h"
 #include "common/native_clock.h"
 #include "common/thread.h"
@@ -416,6 +417,7 @@ s32 PS4_SYSV_ABI sceKernelClockGetres(const u32 clock_id, OrbisKernelTimespec* r
 }
 
 s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
+    BB::Shop::OnMainThreadTick(); // F1 shop purchases, on Game:Main only (cheap when idle)
 #ifdef _WIN64
     if (tp) {
         FILETIME filetime;

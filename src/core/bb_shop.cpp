@@ -27,14 +27,15 @@
 // Prices: the lowest echoes price in ShopLineupParam; items the game does not sell for echoes
 // get a fixed price: weapons 15,000, items 2,000, tools 20,000, materials 10,000.
 //
-// Add-item (vaddr; Ghidra = +0x400000): 0x1310370 AddItem(unused, category, id, count, -1)
-// returns 0 on success. Lua "AddInventoryItem" (0x132FBE0) calls it with category 0 (weapon) /
-// 0x40000000 (goods); it checks the param row (0x1F1E3D0 goods, 0x1F29AA0 weapon), adds to the
-// inventory PlayerGameData+0x1D0 (0x14CDFD0) and queues the game's "obtained" message through
-// the manager at [0x5546C88]. That manager is created on demand by 0x130FF20
-// BeginItemGet(0, 0, 0, 0x1e, 0, 1), which AddInventoryItem calls first (then sets
-// [manager]+0x8c = 7): without it the pointer is null and AddItem does nothing, which is why
-// every purchase failed with "el juego no está listo". The same sequence is used here.
+// Giving the item (vaddr; Ghidra = +0x400000): the game's menu-side give-item routine
+// 0x1B5C8C0 (inventory/storage transfer) does exactly this: n = 0x1B5CA20(&key) (how many more the
+// player can carry: 0 at the max count), then 0x14CDFD0(PlayerGameData+0x1D0, key & 0xF0000000,
+// id, n, 1, 1, 0) which adds to the inventory and returns the slot or -1. The shop calls the same
+// two functions, on the game's main thread (Game:Main, from its own gettimeofday call each
+// frame), with key = category | id (0 weapons, 0x40000000 goods).
+// Not used any more: 0x1310370 AddItem (script AddInventoryItem): it needs the script's
+// item-get session (0x130FF20, manager [0x5546C88]); creating that session from outside the
+// script left a half-built object that crashed Game:Main after the next save.
 // Owned weapons: the inventory index PlayerGameData+0x328 (lookup 0x14D9F60): 2017 hash
 // buckets (s16 at [+0x68]), nodes [+0x78] {key, slot:12 | next+1:12}, slots of 16 bytes at
 // [+0x58] (index < [+0x24]) or [+0x48] (index - [+0x24]), first dword != 0 when used. A weapon's
@@ -53,6 +54,7 @@
 #include <zlib.h>
 #include "common/logging/log.h"
 #include "common/singleton.h"
+#include "core/bb_cheats.h"
 #include "core/bb_coop_config.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
@@ -62,26 +64,23 @@
 namespace BB::Shop {
 namespace {
 
-constexpr u64 AddItemVa = 0x1310370;
-constexpr u64 ItemGetManVa = 0x5546C88;
-constexpr u64 BeginItemGetVa = 0x130FF20;
+constexpr u64 InvAddVa = 0x14CDFD0;     // add to inventory (PGD+0x1D0, cat, id, n, 1, 1, 0)
+constexpr u64 CarryRoomVa = 0x1B5CA20; // how many more of &key the player can carry
 constexpr u32 PgdInvIndex = 0x328;
 constexpr u32 PgdEchoes = 0x94;
 constexpr s32 EchoesMax = 999999999;
 constexpr s32 CatWeapon = 0, CatGoods = 0x40000000;
 constexpr s32 kFallbackPrice[] = {15000, 2000, 20000, 10000};
 
-// AddItem prologue (1.09) and its "cmpq $0, [rip -> 0x5546C88]" at +0x2e.
-constexpr u8 kAddItemSig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
-                              0x54, 0x53, 0x48, 0x81, 0xec, 0x38, 0x01, 0x00, 0x00, 0x45, 0x89,
-                              0xc4, 0x41, 0x89, 0xce, 0x41, 0x89, 0xd7};
-using AddItemFn = s32(PS4_SYSV_ABI*)(u64, s32, s32, s32, s32);
-// BeginItemGet prologue (1.09) up to the argument moves.
-constexpr u8 kBeginSig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
-                            0x53, 0x48, 0x83, 0xec, 0x78, 0x44, 0x89, 0x4d, 0x80, 0x44, 0x89, 0x45,
-                            0x8c, 0x41, 0x89, 0xcc, 0x89, 0x55, 0x88, 0x89, 0x75, 0x84, 0x41, 0x89,
-                            0xfe};
-using BeginItemGetFn = void(PS4_SYSV_ABI*)(s32, s32, s32, s32, s32, s32);
+// prologues (1.09)
+constexpr u8 kInvAddSig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                             0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00, 0x41, 0x89,
+                             0xcd, 0x41, 0x89, 0xd4, 0x49, 0x89, 0xff};
+constexpr u8 kCarrySig[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53,
+                            0x48, 0x83, 0xec, 0x40, 0x49, 0x89, 0xfc};
+using InvAddFn = s32(PS4_SYSV_ABI*)(u64, s32, s32, s32, s32, s32, s32);
+using CarryRoomFn = s32(PS4_SYSV_ABI*)(const u32*);
+thread_local bool t_game_main = false;
 
 template <typename T>
 T Rd(u64 a) {
@@ -500,16 +499,12 @@ void Result(std::string s) {
 
 void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
     g_base = eboot_base;
-    g_eboot_ok = AddItemVa + 0x40 < image_size && ItemGetManVa + 8 < image_size &&
-                 std::memcmp(reinterpret_cast<const void*>(eboot_base + AddItemVa), kAddItemSig,
-                             sizeof(kAddItemSig)) == 0;
-    if (g_eboot_ok) {
-        s32 d = 0;
-        std::memcpy(&d, reinterpret_cast<const void*>(eboot_base + AddItemVa + 0x2e + 3), 4);
-        g_eboot_ok = s64(AddItemVa) + 0x2e + 8 + d == s64(ItemGetManVa) &&
-                     std::memcmp(reinterpret_cast<const void*>(eboot_base + BeginItemGetVa),
-                                 kBeginSig, sizeof(kBeginSig)) == 0;
-    }
+    const auto same = [&](u64 va, const u8* sig, size_t n) {
+        return va + n < image_size &&
+               std::memcmp(reinterpret_cast<const void*>(eboot_base + va), sig, n) == 0;
+    };
+    g_eboot_ok = same(InvAddVa, kInvAddSig, sizeof(kInvAddSig)) &&
+                 same(CarryRoomVa, kCarrySig, sizeof(kCarrySig));
     if (!g_eboot_ok) {
         LOG_INFO(Frontend, "[shop] add-item function not found (not 1.09): buying off");
     }
@@ -603,8 +598,14 @@ bool HasPending() {
     return g_pending.load();
 }
 
-void OnGuestFlip(u64 pgd) {
-    if (!g_pending.load() || !g_eboot_ok || pgd == 0) return;
+void MarkGameMainThread() {
+    t_game_main = true;
+}
+
+void OnMainThreadTick() {
+    if (!g_pending.load(std::memory_order_relaxed) || !t_game_main || !g_eboot_ok) return;
+    u64 pgd = 0;
+    if (!BB::Cheats::PlayerGameData(pgd)) return; // not in game: keep the queue
     std::deque<Purchase> q;
     {
         std::scoped_lock lk{g_buy_mtx};
@@ -612,30 +613,22 @@ void OnGuestFlip(u64 pgd) {
         g_pending = false;
     }
     for (const auto& p : q) {
+        const u32 key = u32(p.category) | u32(p.id);
         const s32 before = Rd<s32>(pgd + PgdEchoes);
         const bool owned = p.category == CatWeapon && OwnsWeaponAt(pgd, p.id);
+        const s32 room = owned ? 0 : reinterpret_cast<CarryRoomFn>(g_base + CarryRoomVa)(&key);
+        LOG_INFO(Frontend,
+                 "[shop] diag: {} key {:#x} price {} echoes {} pgd {:#x} owned {} room {} "
+                 "(Game:Main)",
+                 p.name, key, p.price, before, pgd, owned, room);
         if (owned) {
             Result(fmt::format("{}: ya la tienes, no se ha cobrado", p.name));
             continue;
         }
-        // as AddInventoryItem: open the item-get session (creates the manager)
-        const u64 man0 = Rd<u64>(g_base + ItemGetManVa);
-        if (before >= p.price) {
-            reinterpret_cast<BeginItemGetFn>(g_base + BeginItemGetVa)(0, 0, 0, 0x1e, 0, 1);
-        }
-        const u64 man = Rd<u64>(g_base + ItemGetManVa);
-        LOG_INFO(Frontend,
-                 "[shop] diag: {} id {} cat {:#x} price {} echoes {} pgd {:#x} manager {:#x} -> "
-                 "{:#x}",
-                 p.name, p.id, p.category, p.price, before, pgd, man0, man);
-        if (before >= p.price && man == 0) {
-            Result(fmt::format("{}: el gestor de objetos del juego no existe tras abrirlo "
-                               "(0x5546C88 = 0), no se ha cobrado",
-                               p.name));
+        if (room < 1) {
+            Result(fmt::format("{}: ya llevas el máximo, no se ha cobrado", p.name));
             continue;
         }
-        if (man != 0) Put32(man + 0x8c, 7);
-        // take the echoes (refused when there are not enough)
         std::atomic_ref<s32> echoes{*reinterpret_cast<s32*>(pgd + PgdEchoes)};
         s32 cur = echoes.load();
         bool paid = false;
@@ -649,19 +642,17 @@ void OnGuestFlip(u64 pgd) {
             Result(fmt::format("{}: no tienes ecos suficientes ({} de {})", p.name, cur, p.price));
             continue;
         }
-        const auto add = reinterpret_cast<AddItemFn>(g_base + AddItemVa);
-        const s32 r = add(0, p.category, p.id, 1, -1);
-        LOG_INFO(Frontend, "[shop] diag: AddItem({:#x}, {}) = {}, echoes now {}", p.category,
-                 p.id, r, Rd<s32>(pgd + PgdEchoes));
-        if (r != 0) {
-            // refund (clamped as the game clamps)
+        const s32 slot = reinterpret_cast<InvAddFn>(g_base + InvAddVa)(
+            pgd + 0x1D0, p.category, p.id, 1, 1, 1, 0);
+        LOG_INFO(Frontend, "[shop] diag: inventory add({:#x}, {}) = slot {}, echoes now {}",
+                 p.category, p.id, slot, Rd<s32>(pgd + PgdEchoes));
+        if (slot < 0) {
             s32 c = echoes.load();
             while (!echoes.compare_exchange_weak(
                 c, s32(std::min<s64>(s64(c) + p.price, EchoesMax)))) {
             }
-            Result(fmt::format("{}: el juego no lo ha aceptado (inventario lleno, código {}); "
-                               "ecos devueltos",
-                               p.name, r));
+            Result(fmt::format("{}: el juego no lo ha aceptado (inventario lleno); ecos devueltos",
+                               p.name));
             continue;
         }
         Result(fmt::format("Comprado: {} por {} ecos", p.name, p.price));

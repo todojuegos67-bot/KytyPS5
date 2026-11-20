@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/bb_shop.h"
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -161,6 +162,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
+        BB::Shop::MarkGameMainThread(); // F1 shop: purchases run on this thread
 
 #ifndef _WIN32 // Clear any existing signal mask for game threads.
         sigset_t emptyset;

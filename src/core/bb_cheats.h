@@ -35,5 +35,7 @@ void Set(Cheat c, bool on);
 void AddEchoes(s32 n);
 void AddInsight(s32 n);
 Stats Read(); // snapshot for the menu (any thread)
+// PlayerGameData of the loaded save (player and its data module validated); false: not in game.
+bool PlayerGameData(u64& pgd);
 
 } // namespace BB::Cheats

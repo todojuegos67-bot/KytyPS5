@@ -12,8 +12,8 @@
 // ShopLineupParam / ItemLotParam), msg/<lang>/item.msgbnd.dcx (names, captions, lore) and
 // menu/menu_knowledge_NNNNN.tpf.dcx (icons, BC7, PS4 tiled). Loaded on a worker thread when the
 // card opens, freed when it closes; nothing runs while the card has never been opened.
-// A purchase is applied on the game thread at the next frame: echoes are taken atomically
-// and the item is given by the game's own add-item function (the one the Lua AddInventoryItem command uses, with its "item obtained" log).
+// A purchase is applied on the game's main thread at its next frame: echoes are taken
+// atomically and the item is added with the game's own inventory functions (as its menu does).
 namespace BB::Shop {
 
 enum class Tab : u8 { Weapons, Items, Tools, Materials, Count };
@@ -46,8 +46,10 @@ bool OwnsWeapon(const Item& item);
 // Last purchase result text (for the menu), and a counter that changes with each result.
 std::string LastResult(u32* serial = nullptr);
 
-// Game thread (from Cheats::OnGuestFlip, with the validated PlayerGameData pointer).
+// Game:Main only: the linker marks the game's main thread; posix_gettimeofday (called by the
+// game's frame limiter on that thread every frame) drains the purchase queue there.
 bool HasPending();
-void OnGuestFlip(u64 player_game_data);
+void MarkGameMainThread();
+void OnMainThreadTick();
 
 } // namespace BB::Shop
