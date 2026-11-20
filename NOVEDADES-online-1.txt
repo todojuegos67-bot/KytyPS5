@@ -1,0 +1,35 @@
+DEMON'S SOULS PC - NOVEDADES (versión online 1, 20/11/2026)
+===========================================================
+
+NOVEDADES
+---------
+- Multijugador online propio: el PC del anfitrión hace de servidor.
+  Cuentas (nombre y contraseña), mensajes en el suelo, manchas de sangre
+  y fantasmas entre jugadores.
+- Campana de invocación (Piedra de Visión Azul): se ha corregido el cierre
+  del juego al poner la señal.
+- Trucos F2: invencibilidad, sin muerte, stamina infinita, golpe de un
+  toque, almas editables y peso sin límite.
+- Tienda "Armas y objetos" con armas, escudos, armaduras, anillos, objetos,
+  piedras de forja, magia y milagros. Se compra y va al inventario.
+- Menú F2 rediseñado (fondo de brasas, filigranas, iconos animados).
+- Menos tirones de compilación de shaders y mejor carga de texturas.
+
+INSTALACIÓN
+-----------
+1. Descarga el zip y descomprímelo en una carpeta aparte (no en la
+   carpeta buena del juego).
+2. Pon tu nvngx_dlssnr.dll (DLSS 5) junto al exe si lo usas.
+3. Lee ONLINE.txt para el servidor y el multijugador.
+
+ESTADO
+------
+- Online (conexión, mensajes, manchas, fantasmas): probado.
+- Invocación con la campana: arreglado, pendiente de probar entre dos jugadores.
+- Cooperativo entre dos jugadores (entrar en la partida del otro):
+  EN PRUEBAS. Puede fallar; si pasa, avisar con el log del servidor.
+
+COMPATIBILIDAD
+--------------
+- Solo PC, Windows 10/11, GPU con Vulkan.
+- El juego sin online funciona igual (botón "Continuar offline").
