@@ -124,6 +124,25 @@ void SetFlag(u64 va, bool on) {
     Put<u8>(Static(va), on ? 1 : 0);
 }
 
+// The local player, its data module (back pointer checked) and PlayerGameData; 0 when absent.
+void Resolve(u64& player, u64& data, u64& pgd) {
+    player = data = pgd = 0;
+    const u64 wcm = Get<u64>(Static(WorldChrManVa));
+    if (Valid(wcm + 0x60, 8)) player = Get<u64>(wcm + 0x60);
+    if (Valid(player + ChrModules, 8)) {
+        const u64 mods = Get<u64>(player + ChrModules);
+        if (Valid(mods + ModData, 8)) {
+            const u64 d = Get<u64>(mods + ModData);
+            if (Valid(d, DataStMax + 4) && Get<u64>(d + ModOwner) == player) data = d;
+        }
+    }
+    const u64 gdm = Get<u64>(Static(GameDataManVa));
+    if (Valid(gdm + 8, 8)) {
+        const u64 p = Get<u64>(gdm + 8);
+        if (Valid(p, PgdEchoes + 4)) pgd = p;
+    }
+}
+
 } // namespace
 
 void OnEbootLoaded(uintptr_t eboot_base, u64 image_size) {
@@ -170,10 +189,32 @@ void AddEchoes(s32 n) {
 void AddInsight(s32 n) {
     if (g_ok) g_add_insight += n;
 }
+// Read straight from game memory (read only) with the same validation as the frame code: the
+// F1 menu pauses the game, so values sampled by the guest frame are stale or empty while it is
+// open (the shop saw in_game = false whenever no stats had been sampled before the pause).
 Stats Read() {
     g_want_stats = true;
-    std::scoped_lock lk{g_stats_mtx};
-    return g_stats;
+    Stats st{};
+    if (!g_ok) return st;
+    u64 player = 0, data = 0, pgd = 0;
+    Resolve(player, data, pgd);
+    if (data != 0) {
+        st.hp = Get<s32>(data + DataHp), st.hp_max = Get<s32>(data + DataHpMax);
+        st.stamina = Get<s32>(data + DataSt), st.stamina_max = Get<s32>(data + DataStMax);
+    }
+    if (pgd != 0 && data != 0) {
+        st.in_game = true;
+        st.echoes = Get<s32>(pgd + PgdEchoes);
+        st.insight = Get<s32>(pgd + PgdInsight);
+    }
+    static u64 s_last = ~0ull; // diag: log when what the menu sees changes
+    const u64 sig = (player != 0) | (data != 0) << 1 | (pgd != 0) << 2;
+    if (sig != s_last) {
+        s_last = sig;
+        LOG_INFO(Lib_VideoOut, "[shop] diag: in-game check: player {:#x} data {:#x} pgd {:#x} -> {}",
+                 player, data, pgd, st.in_game ? "in game" : "no save loaded");
+    }
+    return st;
 }
 
 void OnGuestFlip() {
@@ -196,20 +237,7 @@ void OnGuestFlip() {
 
     // The local player and its data module.
     u64 player = 0, data = 0, pgd = 0;
-    const u64 wcm = Get<u64>(Static(WorldChrManVa));
-    if (Valid(wcm + 0x60, 8)) player = Get<u64>(wcm + 0x60);
-    if (Valid(player + ChrModules, 8)) {
-        const u64 mods = Get<u64>(player + ChrModules);
-        if (Valid(mods + ModData, 8)) {
-            const u64 d = Get<u64>(mods + ModData);
-            if (Valid(d, DataStMax + 4) && Get<u64>(d + ModOwner) == player) data = d;
-        }
-    }
-    const u64 gdm = Get<u64>(Static(GameDataManVa));
-    if (Valid(gdm + 8, 8)) {
-        const u64 p = Get<u64>(gdm + 8);
-        if (Valid(p, PgdEchoes + 4)) pgd = p;
-    }
+    Resolve(player, data, pgd);
 
     Stats st{};
     if (data != 0) {
