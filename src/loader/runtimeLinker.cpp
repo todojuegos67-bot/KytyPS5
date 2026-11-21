@@ -37,6 +37,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
+#include "native/g1-probe.h" // (g1)
 
 #include <algorithm>
 #include <atomic>
@@ -879,6 +880,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			DemonsSoulsWriteAudit::NoteFaultSite(info->exception_address, info->rsp);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
+			// (g1, KYTY_G1_PROBE: the CPU's reads of GPU-written pages by call site; one relaxed load when off)
+			G1::NoteGpuFault(access == GpuAccess::Read, info->exception_address, info->rsp, info->access_violation_vaddr);
 			return true;
 		}
 	}

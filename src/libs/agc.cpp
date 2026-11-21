@@ -25,6 +25,10 @@
 #include "libs/libs.h"
 #include "loader/demonsSoulsWriteAudit.h"
 #include "loader/demonsSoulsMemMap.h"
+#include "local/port1.h" // (port1, KYTY_PORT1)
+#include "local/port2.h" // (port2, KYTY_PORT2)
+#include "local/f0-measure.h" // (f0, KYTY_F0)
+#include "native/native-render.h" // (f5, KYTY_NATIVE_RENDER)
 
 #include <algorithm>
 #include <array>
@@ -321,13 +325,18 @@ struct CommandBuffer {
 	}
 
 	KYTY_SYSV_ABI uint32_t* AllocateDW(uint32_t size_dw) {
+		// (port2, KYTY_PORT2) A draw / dispatch of this layer (Port2::MarkDraw): its marker after it, the previous span sealed.
+		const bool port2_draw = Port2::Mode() != 0 && Port2::TakeDraw();
 		if (size_dw == 0 || !ReserveDW(size_dw)) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t command buffer AllocateDW failed: size_dw = %" PRIu32 "\n", size_dw);
 			return nullptr;
 		}
 		auto* ret_ptr = cursor_up;
+		if (Port1::Mode() != 0) Port1::OnAlloc(this, ret_ptr, size_dw); // (port1: the packets the API writes here)
+		if (Port2::Mode() != 0) Port2::OnAlloc(this, ret_ptr, port2_draw); // (port2: seal at a draw, segment check)
 		cursor_up += size_dw;
+		if (port2_draw) Port2::AfterDrawAlloc(this); // (port2: the next span's marker, right after the packet)
 		return ret_ptr;
 	}
 };
@@ -1564,7 +1573,9 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
+	F0Measure::GameSuspend(true); // (f0: the game's frame ends; what follows is its wait for the emulator)
 	g_renderer->GetGpu().Done();
+	F0Measure::GameSuspend(false); // (f0)
 
 	return OK;
 }
@@ -1780,6 +1791,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 		return nullptr;
 	}
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(5);
 
 	if (cmd == nullptr) {
@@ -2110,6 +2122,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	cmd[5] = static_cast<uint32_t>(packet_data & 0xffffffffu);
 	cmd[6] = static_cast<uint32_t>((packet_data >> 32u) & 0xffffffffu);
 	cmd[7] = interrupt_ctx_id & 0x07ffffffu;
+	NativeRender::NoteReleaseMem(cmd, reinterpret_cast<uint64_t>(address), action, data_sel); // (f5: a profiler scope's clock?)
 	return cmd;
 }
 
@@ -2596,6 +2609,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(6);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2639,6 +2653,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(9);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2708,6 +2723,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2738,6 +2754,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2795,6 +2812,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2822,6 +2840,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2864,6 +2883,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	constexpr uint32_t total_size_dw =
 	    AGC_INTERNAL_DATA_PACKET_SIZE_DW + draw_packet_size_dw +
 	    AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(total_size_dw);
 	if (cmd == nullptr) {
 		return nullptr;
@@ -2922,6 +2942,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(10);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -2961,6 +2982,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
@@ -3316,6 +3338,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
 
 	buf->DbgDump();
 
+	Port2::MarkDraw(); // (port2: this packet is a draw / dispatch)
 	auto* cmd = buf->AllocateDW(4);
 
 	if (cmd == nullptr) {
@@ -4203,12 +4226,15 @@ struct TessellationDriverState {
 static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	if (Port1::Mode() != 0) Port1::FlushPending(); // (port1: this thread's last API packet is complete)
+	if (Port2::Mode() != 0) Port2::OnSubmit();     // (port2: no span is sealed once the GPU may read it)
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	// (Measurement: the range goes to the [faults] report's "dcb" tag; KYTY_MEMMAP=0 turns it off.)
 	Loader::DemonsSoulsMemMap::NoteSubmit(dcb, uint64_t {size_in_dwords} * 4u);
 	// (policy6, KYTY_DS_WRITE_FRAME / KYTY_DS_FRAME_AUDIT; one relaxed load when off) Before the GPU thread is given it:
 	// the command buffer, its reservation and its context block are taken as written (what the HLE and the game wrote).
 	if (Loader::DemonsSoulsWriteAudit::On()) Loader::DemonsSoulsWriteAudit::NoteSubmitted(dcb, uint64_t {size_in_dwords} * 4u);
+	F0Measure::GameSubmit(false, size_in_dwords); // (f0)
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
@@ -4270,6 +4296,9 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	Loader::DemonsSoulsMemMap::NoteSubmit(acb, uint64_t {size_in_dwords} * 4u);
 	if (Loader::DemonsSoulsWriteAudit::On()) Loader::DemonsSoulsWriteAudit::NoteSubmitted(acb, uint64_t {size_in_dwords} * 4u); // (policy6)
 
+	if (Port1::Mode() != 0) Port1::FlushPending(); // (port1)
+	if (Port2::Mode() != 0) Port2::OnSubmit();     // (port2)
+	F0Measure::GameSubmit(true, size_in_dwords);   // (f0)
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }

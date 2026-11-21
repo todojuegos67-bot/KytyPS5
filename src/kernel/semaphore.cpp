@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "local/f0-measure.h" // (cpu1: the game thread's waits)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -287,6 +288,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -624,6 +626,7 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -639,11 +642,13 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
 int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	uint32_t micros = 0;
 	if (!AbsTimespecToMicros(abstime, &micros)) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -697,6 +702,7 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
@@ -712,6 +718,7 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
+	F0Measure::WaitScope f0w_(0, KYTY_F0_RET()); // (cpu1: the game thread's wait, KYTY_F0)
 	uint32_t  micros = usec;
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? OK : Posix::PosixToKernel(result));

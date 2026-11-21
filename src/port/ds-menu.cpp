@@ -116,6 +116,16 @@ std::atomic<bool>        g_kbm_capture {false};
 std::atomic<bool>        g_pages_reset {false}; // (ds-pc-port42) SetOpen: the pages' own state (capture row) cleared at their next frame
 std::mutex               g_capture_mutex;
 std::string              g_captured; // "" while waiting; "\x1b" cancelled
+// (remap-f2) "Mapear mando": a pad button being captured (5 s). The window thread (or the launcher's loop) writes the
+// pressed button's SDL name (a, b, leftshoulder, lefttrigger, dpup, ...) to g_pad_captured under g_capture_mutex and
+// clears g_pad_capture; "\x1b" = cancelled (Esc / right click), "" = no button (time out). While it waits, no pad,
+// key or click reaches the game or moves the menu.
+constexpr double         kPadCaptureSeconds = 5.0;
+std::atomic<bool>        g_pad_capture {false};
+std::atomic<double>      g_pad_capture_at {0.0};
+std::atomic<bool>        g_pad_trig_armed[2] {}; // a trigger counts once it was seen released (one held at the start does not)
+std::atomic<int>         g_pad_last {-1};        // the instance id of the pad that last pressed a button (its button names)
+std::string              g_pad_captured;
 std::atomic<bool>        g_focus_trophy_btn_request {false}; // (port34) window thread: back from it, focus its button
 int                      g_trophy_tab_delta = 0;     // (port34) present thread: L1/R1, Q/E on the trophy page
 bool                     g_focus_trophy_btn = false;
@@ -273,6 +283,10 @@ void SetOpen(bool open) {
 	// no queued scroll. A page or a capture left behind kept eating Esc / Circle and the menu looked stuck.
 	g_f1_page     = 0;
 	g_kbm_capture = false;
+	{
+		std::scoped_lock lock(g_capture_mutex); // (remap-f2) a pad capture waiting ends, cancelled
+		if (g_pad_capture.exchange(false)) g_pad_captured = "\x1b";
+	}
 	g_popup       = false;
 	g_page_scroll = 0;
 	g_pages_reset = true;
@@ -346,6 +360,53 @@ ImGuiKey KeyboardKey(SDL_Keycode key) {
 	}
 }
 
+// (remap-f2) The pad capture's end: `name` the button's SDL name, "\x1b" cancelled, "" no button in time.
+void PadCaptureEnd(const char* name) {
+	std::scoped_lock lock(g_capture_mutex);
+	if (g_pad_capture.exchange(false)) g_pad_captured = name;
+	Bump();
+}
+// (remap-f2) While a pad button is being captured: true when the event was taken (never passed to the game or the
+// menu's navigation). Window thread (OnEvent) and the launcher's own event loop.
+bool PadCaptureFeed(const SDL_Event& e) {
+	if (!g_pad_capture.load()) return false;
+	if (Anim::Now() - g_pad_capture_at.load() > kPadCaptureSeconds + 1.0) { // (the menu stopped drawing: never stuck)
+		PadCaptureEnd("");
+		return false;
+	}
+	switch (e.type) {
+		case SDL_CONTROLLERBUTTONDOWN: {
+			g_pad_last           = static_cast<int>(e.cbutton.which);
+			const char* name     = SDL_GameControllerGetStringForButton(static_cast<SDL_GameControllerButton>(e.cbutton.button));
+			PadCaptureEnd(name != nullptr && *name != '\0' ? name : "\x1b");
+			return true;
+		}
+		case SDL_CONTROLLERAXISMOTION: {
+			if (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+				const int   side = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? 0 : 1;
+				const float v    = e.caxis.value / 32767.0f;
+				if (v < 0.3f) g_pad_trig_armed[side] = true;
+				else if (v > 0.6f && g_pad_trig_armed[side].load()) {
+					g_pad_last = static_cast<int>(e.caxis.which);
+					PadCaptureEnd(side == 0 ? "lefttrigger" : "righttrigger");
+				}
+			}
+			return true; // (no stick navigation while it waits)
+		}
+		case SDL_KEYDOWN:
+			if (e.key.keysym.sym == SDLK_F2) return false; // (F2 closes the menu: the capture ends with it)
+			if (e.key.keysym.sym == SDLK_ESCAPE && e.key.repeat == 0) PadCaptureEnd("\x1b");
+			return true;
+		case SDL_MOUSEBUTTONDOWN:
+			if (e.button.button == SDL_BUTTON_RIGHT) PadCaptureEnd("\x1b");
+			return true;
+		case SDL_MOUSEWHEEL:
+		case SDL_TEXTINPUT:
+		case SDL_TEXTEDITING: return true;
+		default: return false; // (releases, mouse motion, window events: as usual)
+	}
+}
+
 // Window thread, before the game's handling: true when the event is the menu's.
 bool OnEvent(const SDL_Event& e) {
 	// (ds-pc-port8) While F2's save and quit runs, the game gets no input (it is closing).
@@ -363,6 +424,8 @@ bool OnEvent(const SDL_Event& e) {
 		}
 	}
 	const bool open = g_open.load();
+	if (open && PadCaptureFeed(e)) return true; // (remap-f2)
+	if (e.type == SDL_CONTROLLERBUTTONDOWN) g_pad_last = static_cast<int>(e.cbutton.which);
 	switch (e.type) {
 		case SDL_KEYDOWN:
 			// (ds-pc-port41) F8: the Metricas panel (metricas.ps1's, top-centre), not the emulator's overlay.
@@ -600,73 +663,41 @@ const ImVec4 kGold {0.87f, 0.77f, 0.55f, 1.0f};
 const ImVec4 kWarn {1.0f, 0.78f, 0.30f, 1.0f};
 const ImVec4 kDim {0.72f, 0.70f, 0.66f, 1.0f};
 
-// ---- (ds-pc-port37) "Mapear mando": the emulator launcher's pad mapper (Launcher-souls.ps1 Show-PadMapper) in the menu. ----
-// The same drawings (mando-ps5.png: the game's PS5 controls; mando-8bitdo.png: your controller's physical buttons, SDL names)
-// and the same button centres measured on them (350 px high). Pick a physical button (on the right drawing or in the list),
-// then the PS5 control it does (on the left drawing or in its list). Saved as mapa_mando (KYTY_PAD_MAP), empty = default.
+// ---- (remap-f2) "Mapear mando", simple: the game's actions in a list, each with the button of your controller that does
+// it. Choose an action (A / Cross, Enter or a click), then press the button you want for it within 5 s (a countdown
+// shows): it is saved to settings.ini at once and applies live in the game. The new button's old action goes to the
+// button the action had (a swap), so nothing is left without a button. Or press the button to change first ("Pulsar el
+// botón que quieres cambiar") and pick its action. Saved as before: mapa_mando (KYTY_PAD_MAP), "physical=PS5 control"
+// (SDL names), empty = default; the old values load as they are. (Before: two drawings to click on, applied at restart.)
 namespace PadMap {
-struct Spot {
-	const char* name;
-	float       x, y, d, h; // centre and size in the drawing's pixels (h = d but the touchpad's)
-};
+// Your controller's buttons (SDL names) and what each does by default (window.cpp's table): written in this order.
 const char* const kPhys[] = {"a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger",
                              "leftstick", "rightstick", "start", "back", "dpup", "dpdown", "dpleft", "dpright"};
 const char* const kDefault[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2",
                                 "L3", "R3", "Options", "None", "Up", "Down", "Left", "Right"};
-const char* const kPs5[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3",
-                            "Options", "TouchPad", "Up", "Down", "Left", "Right", "None"};
-const Spot kPsSpots[] = {{"Up", 96, 62, 29, 29},        {"Down", 96, 126, 29, 29},    {"Left", 65, 93, 29, 29},
-                         {"Right", 128, 93, 29, 29},    {"Triangle", 435, 60, 38, 38}, {"Circle", 472, 94, 38, 38},
-                         {"Cross", 435, 131, 38, 38},   {"Square", 398, 94, 38, 38},   {"L3", 178, 160, 67, 67},
-                         {"R3", 346, 160, 67, 67},      {"Options", 389, 32, 20, 20},  {"TouchPad", 265, 52, 150, 80}};
-const Spot kXbSpots[] = {{"y", 416, 58, 38, 38},        {"x", 377, 95, 38, 38},        {"b", 456, 95, 38, 38},
-                         {"a", 416, 132, 38, 38},       {"leftstick", 125, 86, 72, 72}, {"rightstick", 339, 156, 72, 72},
-                         {"dpup", 193, 140, 25, 25},    {"dpdown", 193, 192, 25, 25},  {"dpleft", 167, 166, 25, 25},
-                         {"dpright", 219, 166, 25, 25}, {"back", 226, 89, 22, 22},     {"start", 312, 89, 22, 22}};
+// The game's actions (the PS5 controls), in the list's order, with what they do in Demon's Souls.
+const std::pair<const char*, const char*> kActions[] = {
+    {"R1", "R1 (ataque)"}, {"R2", "R2 (ataque fuerte)"}, {"L1", "L1 (bloquear)"}, {"L2", "L2 (parry / fuerte izq.)"},
+    {"Circle", "Círculo (rodar / atrás)"}, {"Cross", "Cruz (interactuar)"}, {"Square", "Cuadrado (usar objeto)"},
+    {"Triangle", "Triángulo (dos manos)"}, {"R3", "R3 (fijar objetivo)"}, {"L3", "L3 (pulsar stick izquierdo)"},
+    {"Up", "Arriba (cambiar magia)"}, {"Down", "Abajo (cambiar objeto)"}, {"Left", "Izquierda (cambiar mano izq.)"},
+    {"Right", "Derecha (cambiar mano der.)"}, {"Options", "Options (menú)"}, {"TouchPad", "Panel táctil"}};
 
-const char* Label(const std::string& c) {
-	static const std::pair<const char*, const char*> names[] = {
-	    {"Cross", "Cruz"}, {"Circle", "Círculo"}, {"Square", "Cuadrado"}, {"Triangle", "Triángulo"}, {"Options", "Options"},
-	    {"TouchPad", "Panel táctil"}, {"Up", "Cruceta arriba"}, {"Down", "Cruceta abajo"}, {"Left", "Cruceta izquierda"},
-	    {"Right", "Cruceta derecha"}, {"None", "(nada)"}, {"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"},
-	    {"leftshoulder", "LB / L1"}, {"rightshoulder", "RB / R1"}, {"lefttrigger", "LT / L2"}, {"righttrigger", "RT / R2"},
-	    {"leftstick", "Stick izq. (L3)"}, {"rightstick", "Stick der. (R3)"}, {"start", "Start"}, {"back", "Select / Back"},
-	    {"dpup", "Cruceta arriba"}, {"dpdown", "Cruceta abajo"}, {"dpleft", "Cruceta izquierda"}, {"dpright", "Cruceta derecha"}};
-	for (const auto& [k, v]: names)
-		if (c == k) return I18n::T(v);
-	return c.c_str();
+using Map = std::map<std::string, std::string>;
+
+std::string DefaultFor(const std::string& phys) {
+	for (size_t i = 0; i < std::size(kPhys); i++)
+		if (phys == kPhys[i]) return kDefault[i];
+	return phys == "touchpad" ? "TouchPad" : "None"; // (window.cpp: the touchpad click is TouchPad, the others nothing)
 }
 
-struct Tex {
-	ImTextureData* tex = nullptr;
-	int            w = 0, h = 0;
-	ImGuiContext*  ctx = nullptr;
-	bool           tried = false;
-};
-Tex g_ps, g_xb;
-
-void Load(Tex& t, const wchar_t* file) {
-	if (t.tex != nullptr && t.ctx != ImGui::GetCurrentContext()) t = {}; // (another context: its backend owns the old one)
-	if (t.tried) return;
-	t.tried = true;
-	std::ifstream in(g_rt.exe_path.parent_path() / file, std::ios::binary);
-	const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-	int   channels = 0;
-	auto* px = bytes.empty() ? nullptr
-	                         : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &t.w,
-	                                                 &t.h, &channels, 4);
-	if (px == nullptr) return;
-	t.tex = IM_NEW(ImTextureData)();
-	t.tex->Create(ImTextureFormat_RGBA32, t.w, t.h);
-	std::memcpy(t.tex->GetPixels(), px, static_cast<size_t>(t.w) * t.h * 4);
-	t.tex->UseColors = true;
-	stbi_image_free(px);
-	ImGui::RegisterUserTexture(t.tex);
-	t.ctx = ImGui::GetCurrentContext();
+bool KnownPhys(const std::string& k) {
+	if (k == "lefttrigger" || k == "righttrigger") return true;
+	return SDL_GameControllerGetButtonFromString(k.c_str()) != SDL_CONTROLLER_BUTTON_INVALID;
 }
 
-std::map<std::string, std::string> Parse(const std::string& text) {
-	std::map<std::string, std::string> m;
+Map Parse(const std::string& text) {
+	Map m;
 	for (size_t i = 0; i < std::size(kPhys); i++) m[kPhys[i]] = kDefault[i];
 	size_t at = 0;
 	while (at <= text.size()) {
@@ -674,107 +705,340 @@ std::map<std::string, std::string> Parse(const std::string& text) {
 		const auto   item = text.substr(at, end - at);
 		at                = end + 1;
 		const size_t eq   = item.find('=');
-		if (eq != std::string::npos && m.contains(item.substr(0, eq))) m[item.substr(0, eq)] = item.substr(eq + 1);
+		if (eq != std::string::npos && KnownPhys(item.substr(0, eq))) m[item.substr(0, eq)] = item.substr(eq + 1);
 	}
 	return m;
 }
 
-std::string Format(const std::map<std::string, std::string>& m) {
+// The 16 buttons always (as before), then any other button (touchpad, paddles, misc1) not doing its default.
+std::string Format(const Map& m) {
 	bool same = true;
-	for (size_t i = 0; i < std::size(kPhys); i++) same = same && m.at(kPhys[i]) == kDefault[i];
+	for (const auto& [k, v]: m) same = same && v == DefaultFor(k);
 	if (same) return {};
 	std::string out;
 	for (const char* k: kPhys) out += (out.empty() ? "" : ";") + std::string(k) + "=" + m.at(k);
+	for (const auto& [k, v]: m) {
+		bool base = false;
+		for (const char* b: kPhys) base = base || k == b;
+		if (!base && v != DefaultFor(k)) out += ";" + k + "=" + v;
+	}
 	return out;
 }
 
-std::string g_sel = "a"; // the physical button being mapped
-
-// Draws one drawing with its spots at `at`, `scale`; returns the spot clicked ("" none). `hot(name)`: highlighted.
-template <typename Hot>
-std::string Drawing(const char* id, Tex& t, const Spot* spots, size_t n, ImVec2 at, float scale, Hot hot) {
-	auto*       dl = ImGui::GetWindowDrawList();
-	const float w = t.w > 0 ? t.w * scale : 540 * scale, h = 350 * scale;
-	if (t.tex != nullptr) dl->AddImage(t.tex->GetTexRef(), at, {at.x + w, at.y + h});
-	else dl->AddRectFilled(at, {at.x + w, at.y + h}, IM_COL32(40, 44, 54, 255), 12 * scale);
-	std::string clicked;
-	for (size_t i = 0; i < n; i++) {
-		const Spot& sp = spots[i];
-		const ImVec2 c {at.x + sp.x * scale, at.y + sp.y * scale};
-		const ImVec2 half {sp.d * scale * 0.5f, sp.h * scale * 0.5f};
-		ImGui::SetCursorScreenPos({c.x - half.x, c.y - half.y});
-		ImGui::PushID(id);
-		ImGui::PushID(static_cast<int>(i));
-		const bool pressed = ImGui::InvisibleButton("##spot", {std::max(1.0f, half.x * 2), std::max(1.0f, half.y * 2)});
-		const bool over    = ImGui::IsItemHovered();
-		ImGui::PopID();
-		ImGui::PopID();
-		const bool  on   = hot(sp.name);
-		const ImU32 ring = on ? IM_COL32(236, 200, 120, 255) : over ? IM_COL32(236, 200, 120, 200) : IM_COL32(236, 200, 120, 90);
-		if (on || over) {
-			if (sp.d != sp.h) dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, IM_COL32(236, 200, 120, 90), 8 * scale);
-			else dl->AddCircleFilled(c, half.x, IM_COL32(236, 200, 120, 90));
-		}
-		if (sp.d != sp.h) dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, ring, 8 * scale, 0, on ? 3.0f : 1.5f);
-		else dl->AddCircle(c, half.x, ring, 0, on ? 3.0f : 1.5f);
-		if (over) ImGui::SetTooltip("%s", Label(sp.name));
-		if (pressed) clicked = sp.name;
+// The controller whose button names are shown: the one that pressed a button last, else the first one open.
+SDL_GameController* ActivePad() {
+	if (const int last = g_pad_last.load(); last >= 0)
+		if (SDL_GameController* pad = SDL_GameControllerFromInstanceID(last); pad != nullptr) return pad;
+	for (int i = 0; i < SDL_NumJoysticks(); i++) {
+		if (SDL_IsGameController(i) == SDL_FALSE) continue;
+		if (SDL_GameController* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i)); pad != nullptr) return pad;
 	}
-	ImGui::SetCursorScreenPos({at.x, at.y + h});
-	return clicked;
+	return nullptr;
+}
+bool IsPlayStation(SDL_GameController* pad) {
+	if (pad == nullptr) return false;
+	const auto t = SDL_GameControllerGetType(pad);
+	return t == SDL_CONTROLLER_TYPE_PS3 || t == SDL_CONTROLLER_TYPE_PS4 || t == SDL_CONTROLLER_TYPE_PS5;
 }
 
-// The section; true when the mapping changed.
-bool Draw(Settings& s, float unit) {
-	Load(g_ps, L"mando-ps5.png");
-	Load(g_xb, L"mando-8bitdo.png");
-	auto m       = Parse(s.pad_map);
-	bool changed = false;
-	ImGui::TextWrapped("%s", I18n::T("1. Elige un botón de TU mando (dibujo de la derecha o la lista). 2. Elige qué botón del juego hace (dibujo de la izquierda). Se aplica al reiniciar el juego."));
-	const float avail = ImGui::GetContentRegionAvail().x;
-	const float scale = std::min(unit, (avail - 16 * unit) / (2 * 540.0f));
-	const ImVec2 at   = ImGui::GetCursorScreenPos();
-	ImGui::TextColored(kGold, "%s", I18n::T("Botón del juego (PS5)"));
-	ImGui::SetCursorScreenPos({at.x + 540 * scale + 16 * unit, at.y});
-	ImGui::TextColored(kGold, "%s", I18n::T("Tu mando"));
-	const float top = at.y + ImGui::GetTextLineHeightWithSpacing();
-	const std::string target = m[g_sel];
-	const std::string ps = Drawing("ps", g_ps, kPsSpots, std::size(kPsSpots), {at.x, top}, scale, [&](const char* n) { return target == n; });
-	const std::string xb = Drawing("xb", g_xb, kXbSpots, std::size(kXbSpots), {at.x + 540 * scale + 16 * unit, top}, scale,
-	                               [&](const char* n) { return g_sel == n; });
-	if (!xb.empty()) g_sel = xb;
-	if (!ps.empty() && m[g_sel] != ps) {
-		m[g_sel] = ps;
-		changed  = true;
+// A button of your controller by its printed name: PlayStation's, else Xbox's (Xbox 360 / One, 8BitDo in X-input...).
+std::string ButtonName(const std::string& phys, bool ps) {
+	struct Name {
+		const char* key;
+		const char* xbox;
+		const char* ps;
+	};
+	static const Name names[] = {
+	    {"a", "A", "Cruz"}, {"b", "B", "Círculo"}, {"x", "X", "Cuadrado"}, {"y", "Y", "Triángulo"},
+	    {"leftshoulder", "LB", "L1"}, {"rightshoulder", "RB", "R1"}, {"lefttrigger", "LT", "L2"}, {"righttrigger", "RT", "R2"},
+	    {"leftstick", "Stick izq. (L3)", "L3"}, {"rightstick", "Stick der. (R3)", "R3"}, {"start", "Start / Menu", "Options"},
+	    {"back", "Back / View", "Create / Share"}, {"guide", "Guide", "PS"}, {"dpup", "Cruceta arriba", "Cruceta arriba"},
+	    {"dpdown", "Cruceta abajo", "Cruceta abajo"}, {"dpleft", "Cruceta izquierda", "Cruceta izquierda"},
+	    {"dpright", "Cruceta derecha", "Cruceta derecha"}, {"touchpad", "Panel táctil", "Panel táctil"}, {"misc1", "Share", "Mic"},
+	    {"paddle1", "P1", "P1"}, {"paddle2", "P2", "P2"}, {"paddle3", "P3", "P3"}, {"paddle4", "P4", "P4"}};
+	for (const auto& n: names)
+		if (phys == n.key) return I18n::T(ps ? n.ps : n.xbox);
+	return phys;
+}
+
+std::string ActionName(const std::string& control) {
+	if (control == "None") return I18n::T("(ninguna)");
+	for (const auto& [k, v]: kActions)
+		if (control == k) return I18n::T(v);
+	return control;
+}
+
+// The buttons doing `control`, the 16 first: "B / RB".
+std::string ButtonsFor(const Map& m, const std::string& control, bool ps) {
+	std::string out;
+	for (const char* k: kPhys)
+		if (m.at(k) == control) out += (out.empty() ? "" : " / ") + ButtonName(k, ps);
+	for (const auto& [k, v]: m) {
+		bool base = false;
+		for (const char* b: kPhys) base = base || k == b;
+		if (!base && v == control) out += (out.empty() ? "" : " / ") + ButtonName(k, ps);
 	}
-	ImGui::SetCursorScreenPos({at.x, top + 350 * scale + 8 * unit});
-	// The shoulders and triggers (not on the drawings) and every button: the list.
-	if (ImGui::BeginTable("##padmap", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
-		for (const char* k: kPhys) {
-			ImGui::TableNextRow();
-			ImGui::TableSetColumnIndex(0);
-			if (ImGui::Selectable(Label(k), g_sel == k, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_sel = k;
-			ImGui::TableSetColumnIndex(1);
-			ImGui::PushID(k);
-			ImGui::SetNextItemWidth(-1);
-			if (ImGui::BeginCombo("##to", Label(m[k]))) {
-				for (const char* c: kPs5)
-					if (ImGui::Selectable(Label(c), m[k] == c)) {
-						m[k]    = c;
-						g_sel   = k;
-						changed = true;
-					}
-				ImGui::EndCombo();
+	return out;
+}
+
+enum class Mode { Idle, ForAction, ForButton, PickAction };
+Mode        g_mode = Mode::Idle;
+std::string g_action;          // ForAction: the action being changed
+std::string g_button;          // PickAction: the button pressed
+bool        g_pick_open = false;
+double      g_started = 0.0, g_quiet_until = 0.0;
+std::string g_msg;
+ImVec4      g_msg_col {0.72f, 0.70f, 0.66f, 1.0f};
+
+void StartCapture(Mode mode, const std::string& action) {
+	std::scoped_lock lock(g_capture_mutex);
+	g_pad_captured.clear();
+	// A trigger held right now counts only after it is released (an analog trigger resting a little in is not a press).
+	bool free_trig[2] {true, true};
+	for (int i = 0; i < SDL_NumJoysticks(); i++) {
+		if (SDL_IsGameController(i) == SDL_FALSE) continue;
+		SDL_GameController* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
+		if (pad == nullptr) continue;
+		free_trig[0] = free_trig[0] && SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) < 9830;
+		free_trig[1] = free_trig[1] && SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) < 9830;
+	}
+	g_pad_trig_armed[0] = free_trig[0];
+	g_pad_trig_armed[1] = free_trig[1];
+	g_started           = Anim::Now();
+	g_pad_capture_at    = g_started;
+	g_pad_capture       = true;
+	g_mode              = mode;
+	g_action            = action;
+	g_msg.clear();
+	Bump();
+}
+
+// `phys` does `control` now. The action it did goes to the buttons that did `control` (a swap); true when it changed.
+bool Assign(Map& m, const std::string& phys, const std::string& control, bool ps) {
+	if (!m.contains(phys)) m[phys] = DefaultFor(phys);
+	const std::string old = m[phys];
+	const std::string btn = ButtonName(phys, ps);
+	if (old == control) {
+		g_msg     = std::string(I18n::T("Sin cambios:")) + " " + btn + " = " + ActionName(control);
+		g_msg_col = kDim;
+		return false;
+	}
+	std::vector<std::string> moved;
+	if (control != "None")
+		for (auto& [k, v]: m)
+			if (k != phys && v == control) {
+				v = old;
+				moved.push_back(k);
 			}
+	m[phys]   = control;
+	g_msg_col = kGold;
+	g_msg     = std::string(I18n::T("Asignado:")) + " " + ActionName(control) + " = " + btn;
+	if (!moved.empty()) {
+		std::string others;
+		for (const auto& k: moved) others += (others.empty() ? "" : " / ") + ButtonName(k, ps);
+		g_msg += std::string("   ") + I18n::T("Intercambiado:") + " " + ActionName(old) + " = " + others;
+	} else if (old != "None" && ButtonsFor(m, old, ps).empty()) {
+		g_msg += std::string("   ") + I18n::T("Queda sin botón:") + " " + ActionName(old);
+		g_msg_col = kWarn;
+	}
+	return true;
+}
+
+// The game's map live (window.cpp), when it is not the one it has (not in the launcher: JUGAR starts with it).
+void SetLive(const std::string& map) {
+	static std::string live = g_rt.launched.pad_map; // (what the game started with: KYTY_PAD_MAP)
+	if (g_start_mode || map == live) return;
+	live = map;
+	Libs::Graphics::HostPadMapSetLive(map.c_str());
+}
+
+// settings.ini's mapa_mando now (only that key), and the game's map live.
+void Commit(const Settings& s) {
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	on_disk.pad_map = s.pad_map;
+	if (SaveSettings(g_rt.ini_path, on_disk)) g_saved.pad_map = s.pad_map;
+	else g_msg += std::string("   ") + I18n::T("No se pudo guardar settings.ini"), g_msg_col = kWarn;
+	SetLive(s.pad_map);
+}
+
+// The countdown: the screen dimmed, a panel in the middle, a ring and a bar that empty in 5 s and the seconds left.
+void Countdown(const std::string& what, double left, float unit) {
+	auto*         dl   = ImGui::GetForegroundDrawList();
+	const ImVec2  disp = ImGui::GetIO().DisplaySize;
+	ImFont*       font = FindFont("segoeui");
+	if (font == nullptr) font = ImGui::GetFont();
+	const float   frac = static_cast<float>(std::clamp(left / kPadCaptureSeconds, 0.0, 1.0));
+	const float   in   = static_cast<float>(std::clamp((kPadCaptureSeconds - left) / 0.15, 0.0, 1.0)); // (fade in)
+	const auto    a    = [&](int alpha) { return static_cast<int>(alpha * in); };
+	dl->AddRectFilled({0, 0}, disp, IM_COL32(0, 0, 0, a(150)));
+	const float  w = std::round(760 * unit), h = std::round(430 * unit);
+	const ImVec2 p0 {std::round((disp.x - w) * 0.5f), std::round((disp.y - h) * 0.5f)};
+	dl->AddRectFilled(p0, {p0.x + w, p0.y + h}, IM_COL32(10, 10, 12, a(242)), 14 * unit);
+	dl->AddRect(p0, {p0.x + w, p0.y + h}, IM_COL32(222, 196, 140, a(140)), 14 * unit, 0, std::max(1.0f, 1.5f * unit));
+	const auto centered = [&](float size, float y, ImU32 col, const std::string& text) {
+		const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+		dl->AddText(font, size, {std::round(p0.x + (w - ts.x) * 0.5f), std::round(y)}, col, text.c_str());
+	};
+	const bool for_button = g_mode == Mode::ForButton;
+	centered(28 * unit, p0.y + 26 * unit, IM_COL32(247, 245, 237, a(255)),
+	         I18n::T(for_button ? "Pulsa el botón del mando que quieres cambiar" : "Pulsa el botón del mando para:"));
+	if (!for_button) centered(38 * unit, p0.y + 66 * unit, IM_COL32(222, 196, 140, a(255)), what);
+	// The ring (empties clockwise from the top) and the whole seconds left in it.
+	const ImVec2 c {p0.x + w * 0.5f, p0.y + 210 * unit};
+	const float  r = 72 * unit, th = 9 * unit;
+	dl->AddCircle(c, r, IM_COL32(255, 255, 255, a(40)), 96, th);
+	if (frac > 0.0f) {
+		constexpr float kPi = 3.14159265f;
+		dl->PathArcTo(c, r, -kPi * 0.5f, -kPi * 0.5f + 2.0f * kPi * frac, 96);
+		dl->PathStroke(IM_COL32(236, 206, 146, a(255)), 0, th);
+	}
+	const std::string secs = std::to_string(static_cast<int>(std::ceil(std::max(0.0, left))));
+	const float       ns   = 84 * unit;
+	const ImVec2      nts  = font->CalcTextSizeA(ns, FLT_MAX, 0.0f, secs.c_str());
+	dl->AddText(font, ns, {std::round(c.x - nts.x * 0.5f), std::round(c.y - nts.y * 0.5f)}, IM_COL32(247, 245, 237, a(255)), secs.c_str());
+	// The bar.
+	const ImVec2 b0 {p0.x + 60 * unit, p0.y + 318 * unit};
+	const float  bw = w - 120 * unit, bh = 8 * unit;
+	dl->AddRectFilled(b0, {b0.x + bw, b0.y + bh}, IM_COL32(255, 255, 255, a(36)), bh * 0.5f);
+	if (frac > 0.0f) dl->AddRectFilled(b0, {b0.x + bw * frac, b0.y + bh}, IM_COL32(236, 206, 146, a(255)), bh * 0.5f);
+	centered(22 * unit, p0.y + 350 * unit, IM_COL32(184, 179, 168, a(255)), I18n::T("Esc o clic derecho: cancelar. Si no pulsas nada, no se cambia nada."));
+}
+
+// The section; true when the mapping changed (it is saved and applied already).
+bool Draw(Settings& s, float unit) {
+	Map         m       = Parse(s.pad_map);
+	bool        changed = false;
+	auto*       pad     = ActivePad();
+	const bool  ps      = IsPlayStation(pad);
+	const bool  waiting = g_mode == Mode::ForAction || g_mode == Mode::ForButton;
+	// A capture ended (a button, cancelled or out of time)?
+	if (waiting) {
+		bool        done = false;
+		std::string got;
+		{
+			std::scoped_lock lock(g_capture_mutex);
+			if (!g_pad_capture.load()) {
+				got  = g_pad_captured;
+				done = true;
+			} else if (Anim::Now() - g_started >= kPadCaptureSeconds) {
+				g_pad_capture = false;
+				done          = true;
+			}
+			g_pad_captured.clear();
+		}
+		if (done) {
+			const Mode mode = g_mode;
+			g_mode          = Mode::Idle;
+			g_quiet_until   = Anim::Now() + 0.35; // (the press that ended it does not start another one)
+			if (got.empty() || got == "\x1b") {
+				g_msg     = I18n::T(got.empty() ? "Se acabó el tiempo: no se ha cambiado nada." : "Cancelado: no se ha cambiado nada.");
+				g_msg_col = kDim;
+			} else if (mode == Mode::ForAction) {
+				changed = Assign(m, got, g_action, ps);
+			} else {
+				g_button    = got;
+				g_mode      = Mode::PickAction;
+				g_pick_open = true;
+			}
+		} else {
+			Countdown(ActionName(g_action), kPadCaptureSeconds - (Anim::Now() - g_started), unit);
+			Bump(); // (redrawn every frame while it counts)
+		}
+	}
+	const bool can_start = g_mode == Mode::Idle && Anim::Now() >= g_quiet_until;
+
+	ImGui::TextWrapped("%s", I18n::T("Elige una acción (A / Cruz, Intro o clic) y, en 5 segundos, pulsa el botón de tu mando que la hará. Si ese botón ya hacía otra acción, se intercambian. Se guarda y se aplica al momento."));
+	if (pad != nullptr) {
+		const char* name = SDL_GameControllerName(pad);
+		ImGui::TextColored(kDim, "%s %s", I18n::T("Mando:"), name != nullptr ? name : "?");
+	} else {
+		ImGui::TextColored(kWarn, "%s", I18n::T("No hay ningún mando conectado."));
+	}
+	ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, {0.0f, 0.5f});
+	if (ImGui::BeginTable("##padactions", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+		ImGui::TableSetupColumn(I18n::T("Acción del juego"), ImGuiTableColumnFlags_WidthStretch, 1.3f);
+		ImGui::TableSetupColumn(I18n::T("Botón de tu mando"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+		ImGui::TableSetupColumn("##chg", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+		ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+		ImGui::TableSetColumnIndex(0);
+		ImGui::TextColored(kGold, "%s", I18n::T("Acción del juego"));
+		ImGui::TableSetColumnIndex(1);
+		ImGui::TextColored(kGold, "%s", I18n::T("Botón de tu mando"));
+		const float row_h = std::round(40 * unit);
+		for (const auto& [control, label]: kActions) {
+			ImGui::TableNextRow(0, row_h);
+			ImGui::TableSetColumnIndex(0);
+			ImGui::PushID(control);
+			const bool busy    = g_mode == Mode::ForAction && g_action == control;
+			const bool clicked = ImGui::Selectable(I18n::T(label), busy, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap, {0, row_h});
+			Anim::Highlight(unit);
+			const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+			if (clicked && can_start) StartCapture(Mode::ForAction, control);
 			ImGui::PopID();
+			ImGui::TableSetColumnIndex(1);
+			ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetTextLineHeight()) * 0.5f);
+			const std::string buttons = ButtonsFor(m, control, ps);
+			if (buttons.empty()) ImGui::TextColored(kWarn, "%s", I18n::T("(sin asignar)"));
+			else ImGui::TextColored(kGold, "%s", buttons.c_str());
+			ImGui::TableSetColumnIndex(2);
+			ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (row_h - ImGui::GetTextLineHeight()) * 0.5f);
+			ImGui::TextColored(hot ? kGold : kDim, "%s", I18n::T("Cambiar"));
 		}
 		ImGui::EndTable();
 	}
-	if (ImGui::Button(I18n::T("Restablecer los botones de serie"))) {
-		m       = Parse("");
-		changed = true;
+	ImGui::PopStyleVar();
+	ImGui::Spacing();
+	const ImVec2 bs {0, std::round(50 * unit)};
+	if (Anim::Button(I18n::T("Pulsar el botón que quieres cambiar"), bs, unit) && can_start) StartCapture(Mode::ForButton, "");
+	ImGui::SameLine();
+	if (Anim::Button(I18n::T("Restaurar por defecto"), bs, unit) && can_start) {
+		if (!s.pad_map.empty()) m = Parse(""), changed = true;
+		g_msg     = I18n::T("Restaurados los botones por defecto.");
+		g_msg_col = kGold;
 	}
-	if (changed) s.pad_map = Format(m);
+	if (!g_msg.empty()) ImGui::TextColored(g_msg_col, "%s", g_msg.c_str());
+
+	// Its action for the button pressed ("Pulsar el botón que quieres cambiar"): a list in the middle (Circle / B, Esc
+	// or a click outside: cancel).
+	if (g_mode == Mode::PickAction) {
+		if (g_pick_open) {
+			ImGui::OpenPopup("##padpick");
+			g_pick_open = false;
+		}
+		ImGui::SetNextWindowPos({ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f}, ImGuiCond_Appearing, {0.5f, 0.5f});
+		if (ImGui::BeginPopup("##padpick", ImGuiWindowFlags_AlwaysAutoResize)) {
+			const std::string now = m.contains(g_button) ? m[g_button] : DefaultFor(g_button);
+			ImGui::TextColored(kGold, "%s %s", I18n::T("Botón:"), ButtonName(g_button, ps).c_str());
+			ImGui::TextUnformatted(I18n::T("¿Qué acción del juego hace?"));
+			ImGui::Separator();
+			std::string chosen;
+			for (const auto& [control, label]: kActions) {
+				if (ImGui::Selectable(I18n::T(label), now == control, 0, {std::round(520 * unit), 0})) chosen = control;
+				if (now == control) ImGui::SetItemDefaultFocus();
+			}
+			if (ImGui::Selectable(I18n::T("(ninguna)"), now == "None", 0, {std::round(520 * unit), 0})) chosen = "None";
+			ImGui::Separator();
+			if (ImGui::Button(I18n::T("Cancelar"), {std::round(520 * unit), 0})) {
+				g_msg     = I18n::T("Cancelado: no se ha cambiado nada.");
+				g_msg_col = kDim;
+				g_mode    = Mode::Idle;
+				ImGui::CloseCurrentPopup();
+			}
+			if (!chosen.empty()) {
+				changed = Assign(m, g_button, chosen, ps) || changed;
+				g_mode  = Mode::Idle;
+				ImGui::CloseCurrentPopup();
+			}
+			ImGui::EndPopup();
+		} else if (!g_pick_open) {
+			g_mode = Mode::Idle; // (closed from outside: nothing changed)
+		}
+	}
+	if (changed) {
+		s.pad_map = Format(m);
+		Commit(s);
+	}
 	return changed;
 }
 } // namespace PadMap
@@ -1569,6 +1833,7 @@ void ApplyLive(const Settings& s) {
 	const int level       = 0; // (ds-pc-port37) Metricas is the launcher's window (metricas.ps1); the in-game panel stays on F8
 	for (int i = 0; i < 3 && PerfOverlay::Level() != level; i++) PerfOverlay::CycleLevel();
 	PortLive::rt_off = LiveRtOff(g_rt.launched, s); // (10-28) RT passes off live
+	PadMap::SetLive(s.pad_map);                      // (remap-f2) e.g. Restablecer + Aplicar
 }
 
 // (10-28) What needs a restart: as NeedsRestart, but the ray tracing turned off live does not.
@@ -1585,6 +1850,7 @@ bool NeedsRestartLive(const Settings& launched, const Settings& now) {
 	if ((off & 1) != 0) n.rt_ss_refl = launched.rt_ss_refl;
 	// (11-10) The mouse's sensitivity and anti-dead-zone apply live with keyboard and mouse on.
 	if (launched.kbm && n.kbm) n.kbm_sens = launched.kbm_sens, n.kbm_antidz = launched.kbm_antidz;
+	n.pad_map = launched.pad_map; // (remap-f2) the pad map applies live (HostPadMapSetLive)
 	return NeedsRestart(launched, n);
 }
 
@@ -2395,25 +2661,27 @@ void Draw(float width, float height) {
 					ImGui::BeginDisabled(s.pure_game);
 					if (ChoiceRow("Reflejos RT", changed_not_live(l.rt_ss_refl != s.rt_ss_refl, 1),
 					              kRtReflLevels, kRtReflLevelCount, s.rt_ss_refl,
-					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta. Apagarlo es inmediato."))
+					              "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta. Apagarlo es inmediato."))
 						live_changed = true;
 					// (refl-sharp-1031)
 					ChoiceRow("Nitidez de reflejos RT", s.rt_refl_sharp != l.rt_refl_sharp, kRtReflSharp, kRtReflSharpCount, s.rt_refl_sharp,
 					          "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).");
 					ChoiceRow("Ondas del agua en reflejos", s.rt_refl_waves != l.rt_refl_waves, kRtReflWaves, kRtReflWavesCount, s.rt_refl_waves,
 					          "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.");
+					// (rtq1) No "Path tracing" row: path tracing is retired (forced off in ds-settings.cpp; its dormant code stays).
 					ChoiceRow("Luz RT", s.rt_ssgi != l.rt_ssgi, kRtLightLevels, kRtLightLevelCount, s.rt_ssgi,
 					          "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.");
 					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
 					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
 						live_changed = true;
 					ChoiceRow("Partículas volumétricas", s.motes != l.motes, kMotesLevels, kMotesLevelCount, s.motes, "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms."); // (motes-1031)
-					// (ds-pc-port9 / ds-pc-port10) No Path tracing, Luz de antorchas RT or Destellos de lente in the port.
+					// (ds-pc-port9 / ds-pc-port10) No Luz de antorchas RT or Destellos de lente in the port (the old screen-space "Path tracing" is gone; pt1 adds the hardware one above).
 					ChoiceRow("Humo y partículas", s.smoke != l.smoke, kSmokeLevels, kSmokeLevelCount, s.smoke,
 					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.");
 					// (ds-pc-port9) No Sombras RT in the port.
 					ImGui::EndDisabled();
-					// (11-16 release) "RT por hardware" removed (s.rt_hw_exp always off).
+					CheckRow("RT por hardware (experimental)", s.rt_hw_exp != l.rt_hw_exp, s.rt_hw_exp,
+					         "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
 					if (s.rt_hw_exp) {
 						ImGui::BeginDisabled(s.pure_game);
 						{
@@ -2595,11 +2863,7 @@ void Draw(float width, float height) {
 					if (CheckRow("Vibración", false, s.rumble, "Vibración del mando (en vivo).")) live_changed = true;
 					if (SliderRow("Fuerza de la vibración", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
 					ImGui::Spacing();
-					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) {
-						(void)PadMap::Draw(s, unit);
-						if (s.pad_map != l.pad_map && !g_start_mode)
-							ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", I18n::T("   (requiere reinicio)"));
-					}
+					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) (void)PadMap::Draw(s, unit); // (remap-f2: saved and live at once)
 					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? I18n::T("Mando: botones de serie.") : I18n::T("Mando: remapeado."));
 					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
 					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
@@ -3436,7 +3700,7 @@ void LauncherImage(Settings& s) {
 		ImGui::PushFont(g_font_semi, U(14));
 		ImGui::TextColored(kGoldL, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
 		ImGui::PopFont();
-		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciones: modo rendimiento.");
+		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciónes: modo rendimiento.");
 		RowEnd(my, 22);
 	}
 	{
@@ -3450,7 +3714,7 @@ void LauncherImage(Settings& s) {
 		}
 		LRow("Reescalado", static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 		     [](const ResMode& m) { return m.label; },
-		     "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
+		     "Reescalado: dibuja el 3D a menos resolución y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
 		     146, 260, true);
 	}
 	ImGui::BeginDisabled(!nvidia);
@@ -3458,7 +3722,7 @@ void LauncherImage(Settings& s) {
 	        nvidia ? "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)" : "Sin DLSS: tu grafica no es NVIDIA.");
 	ImGui::EndDisabled();
 	LChoice("Nitidez", kSharpness, kSharpnessCount, s.sharpness,
-	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido.");
+	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolución de la pantalla. Más alto: mas nitido, pero puede marcar bordes y ruido.");
 	// (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering on the foveated grid) and which nvngx_dlssnr.dll it may load.
 	ImGui::BeginDisabled(!nvidia);
 	LChoice("DLSS 5", kDlss5Levels, kDlss5LevelCount, s.dlss5, nvidia ? kDlss5Tip : "Sin DLSS 5: tu grafica no es NVIDIA.");
@@ -3566,13 +3830,14 @@ void LauncherRayTracing(Settings& s) {
 	ImGui::BeginDisabled(s.pure_game);
 	const float fx = 154, fw = 252;
 	LRow("Reflejos RT", kRtReflLevelCount, kRtReflLevels, s.rt_ss_refl, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Beta.",
+	     "Reflejos trazados por rayos guiados por los del propio juego: solo donde el juego refleja y con su intensidad, más nítidos (agua como espejo). Donde el rayo no encuentra nada queda el reflejo del juego. Solo con DLSS, XeSS o FSR. Bajo ~0,6 ms, Medio ~1 ms, Alto ~2 ms, Ultra ~3 ms (rayos a resolución completa y más fuertes). Híbrido: Alto + rayos por hardware (RT real) solo donde el rayo de pantalla no encuentra nada. Necesita GPU con RT. Beta.",
 	     fx, fw);
 	// (refl-sharp-1031)
 	LRow("Nitidez reflejos RT", kRtReflSharpCount, kRtReflSharp, s.rt_refl_sharp, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).", fx, fw);
 	LRow("Ondas agua reflejos", kRtReflWavesCount, kRtReflWaves, s.rt_refl_waves, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.", fx, fw);
+	// (rtq1) No "Path tracing" row (retired, forced off).
 	LRow("Luz RT", kRtLightLevelCount, kRtLightLevels, s.rt_ssgi, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
 	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
@@ -3584,7 +3849,8 @@ void LauncherRayTracing(Settings& s) {
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.",
 	     fx, fw);
 	ImGui::EndDisabled();
-	// (11-16 release) "RT por hardware" removed (s.rt_hw_exp always off).
+	LCheckRow("RT por hardware (experimental)", s.rt_hw_exp,
+	          "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
 	if (s.rt_hw_exp) {
 		ImGui::BeginDisabled(s.pure_game);
 		{
@@ -3724,7 +3990,8 @@ void LauncherPerformance(Settings& s) {
 		RowEnd(y);
 	}
 	// (11-14) Pruebas: la gráfica limitada a 8 GB de memoria de vídeo (KYTY_SIMULATE_VRAM_MB=8192).
-	// (11-16 release) "Simular gráfica de 8 GB" removed from the public build (simulate_vram8 always off).
+	LCheckRow("Simular gráfica de 8 GB (pruebas)", s.simulate_vram8,
+	          "Solo para pruebas: el juego usa como mucho 8 GB de memoria de vídeo, como en una gráfica de 8 GB, aunque la tuya tenga más. Se aplica al iniciar el juego.");
 	{
 		// (perfopts-1107) Opciones de rendimiento: upstream KytyPS5's opt-in switches, off = as before.
 		const float y = RowY() + U(4);
@@ -4044,73 +4311,735 @@ void LauncherUpdateBox() {
 	BoxEnd();
 }
 
-// Trofeos: the count and % and, opened, the list (inside the options).
-void LauncherTrophiesBox() {
-	static std::vector<TrophyRow> rows;
-	static double                 loaded_at = -100.0;
-	if (ImGui::GetTime() - loaded_at > 3.0) {
-		rows      = LoadTrophyRows();
-		loaded_at = ImGui::GetTime();
-		std::stable_sort(rows.begin(), rows.end(), [](const TrophyRow& a, const TrophyRow& b) { return a.earned && !b.earned; });
-	}
-	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
-	int  total = 0, have = 0, earned = 0;
-	for (const auto& r: rows) {
-		total += points(r.grade);
-		if (r.earned) {
-			have += points(r.grade);
-			earned++;
-		}
-	}
-	const int pct = total > 0 ? have * 100 / total : 0;
-	char      title[128];
-	if (!rows.empty())
-		std::snprintf(title, sizeof(title), "%s   %d / %d   (%d%%)  %s", I18n::T("Trofeos"), earned, static_cast<int>(rows.size()), pct, g_show_trophies ? "^" : "v");
-	else std::snprintf(title, sizeof(title), "%s  %s", I18n::T("Trofeos"), g_show_trophies ? "^" : "v");
-	const float y = RowY();
-	ImGui::SetCursorScreenPos({g_lbox.at.x, y});
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.92f});
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.95f});
-	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.55f, 0.53f, 0.48f, 1.0f});
-	ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(48), U(4)});
-	ImGui::PushFont(g_font_semi, U(16));
-	if (ImGui::Button((std::string(title) + "###trophies").c_str(), {U(420), U(40)})) g_show_trophies = !g_show_trophies;
-	ImGui::PopFont();
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
-	Libs::Trophy::DrawCup(ImGui::GetWindowDrawList(), g_lbox.at.x + U(10), y + U(6), U(28), Libs::Trophy::CupColor(2));
-	RowEnd(y, 46);
-	if (!g_show_trophies) return;
-	const float ly = RowY();
-	ImGui::SetCursorScreenPos({g_lbox.at.x, ly});
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.04f, 0.045f, 0.06f, 0.95f});
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(4)});
-	ImGui::BeginChild("##trophylist", {U(420), U(300)}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
-	if (rows.empty()) {
-		ImGui::TextWrapped("%s", I18n::T("Aún no hay trofeos: aparecen al jugar."));
-	} else {
-		ImGui::TextColored(kGoldL, I18n::T("%d%% completado   -   %d / %d"), pct, earned, static_cast<int>(rows.size()));
-		ImGui::ProgressBar(total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f, {-1.0f, U(8)}, "");
-		static const ImVec4 grade_col[5] = {{0.7f, 0.7f, 0.7f, 1.0f}, {0.72f, 0.82f, 0.95f, 1.0f}, {0.96f, 0.80f, 0.32f, 1.0f},
-		                                    {0.84f, 0.86f, 0.88f, 1.0f}, {0.86f, 0.56f, 0.32f, 1.0f}};
-		static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
-		for (const auto& r: rows) {
-			const int  g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
-			const bool secret = r.hidden && !r.earned;
-			ImGui::PushID(r.id);
-			ImGui::TextColored(r.earned ? grade_col[g] : ImVec4 {0.62f, 0.62f, 0.62f, 1.0f}, "%s", I18n::T(grade_txt[g]));
-			ImGui::SameLine(U(96));
-			ImGui::TextColored(r.earned ? kInkL : ImVec4 {0.66f, 0.66f, 0.66f, 1.0f}, "%s", secret ? I18n::T("Trofeo oculto") : r.name.c_str());
-			if (!secret) Tip(r.detail.c_str());
-			ImGui::PopID();
-		}
-	}
-	ImGui::EndChild();
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor();
-	RowEnd(ly, 306);
+// ---- (trofeos-exe) TROFEOS at the launcher's bottom left: a tab (the cup, TROFEOS in Cinzel, earned / total, the
+// percent by PS5 points and a fine progress line) that unfolds a panel upwards (a curtain revealed from the tab, the
+// rows entering one after another, a gold glow on the row under the mouse or the pad's focus). Each trophy: its icon
+// (trophy-icons/tropNNN.png; greyed when not earned), its name in Cinzel, its grade and the date and time it was earned
+// (trophies.json keeps the unix time of each unlock); hidden ones not earned as "Trofeo oculto". Clicking or pressing A
+// on a row unfolds its description. Data: LoadTrophyRows (trophies-list.json, the same as F2), read once when the
+// launcher opens (two small JSON files) and again each time the panel opens; the icons are decoded and scaled on a
+// worker thread the first time the panel opens, into one atlas texture (colour and grey versions), so the launcher's
+// start costs nothing more. Pad: View / Share opens and closes it, the D-pad moves, A unfolds, B closes; Esc closes. ----
+namespace TrophyPage {
+std::string DateText(int64_t t); // ("Obtenido el 18/11/2026 20:43", below)
+} // namespace TrophyPage
+
+namespace LauncherTrophy {
+
+struct Row {
+	TrophyRow t;
+	int64_t   when = 0; // unix time of the unlock (0: unknown)
+};
+
+struct IconJob {
+	std::mutex            mutex;
+	bool                  done = false;
+	std::atomic<bool>     cancel {false};
+	int                   cell = 0, pad = 2, stride = 0, cols = 0, width = 0, height = 0;
+	std::vector<uint8_t>  pixels; // RGBA8
+	std::map<int, int>    slots;  // trophy id -> slot (colour at 2 * slot, grey at 2 * slot + 1)
+};
+
+std::vector<Row>         g_rows;
+int                      g_earned = 0, g_pct = 0;
+int                      g_grade_have[5] = {}, g_grade_all[5] = {};
+bool                     g_loaded = false;
+std::filesystem::path    g_dir;
+bool                     g_open = false;
+double                   g_changed_at = -100.0, g_opened_at = -100.0;
+float                    g_k = 0.0f, g_k_from = 0.0f; // 0 closed .. 1 open (eased)
+int                      g_sel = -1;                 // the row whose description is unfolded
+std::map<int, float>     g_expand;
+bool                     g_focus_panel = false, g_focus_first = false, g_focus_back = false, g_scroll_top = false;
+std::shared_ptr<IconJob> g_job;
+std::thread              g_worker;
+ImTextureData*           g_atlas = nullptr;
+std::shared_ptr<IconJob> g_art; // g_atlas' geometry and slots
+double                   g_atlas_at = 0.0;
+ImTextureID              g_linear_id = ImTextureID_Invalid;
+
+ImU32 Ca(int r, int g, int b, float a) {
+	return IM_COL32(r, g, b, static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f));
 }
+
+float Px(float v) {
+	return std::round(U(v));
+}
+
+std::filesystem::path FindDir() {
+	std::error_code       ec;
+	std::filesystem::path best;
+	for (const auto& d: std::filesystem::directory_iterator("_SaveData", ec)) {
+		const auto f = d.path() / "trophies-list.json";
+		if (std::filesystem::exists(f, ec) && (best.empty() || f < best)) best = f;
+	}
+	return best.empty() ? best : best.parent_path();
+}
+
+void Reload() {
+	g_loaded = true;
+	g_dir    = FindDir();
+	std::map<int, int64_t> times;
+	if (!g_dir.empty()) {
+		if (std::ifstream f(g_dir / "trophies.json", std::ios::binary); f) {
+			const auto j = nlohmann::json::parse(f, nullptr, false);
+			if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
+				for (const auto& [k, v]: j["unlocked"].items()) times[std::atoi(k.c_str())] = v.is_number() ? v.get<int64_t>() : 0;
+		}
+	}
+	auto rows = LoadTrophyRows();
+	g_rows.clear();
+	g_rows.reserve(rows.size());
+	for (auto& r: rows) {
+		Row x;
+		if (r.earned)
+			if (auto it = times.find(r.id); it != times.end()) x.when = it->second;
+		x.t = std::move(r);
+		g_rows.push_back(std::move(x));
+	}
+	// Earned first, the most recent on top; then the rest in the game's order.
+	std::stable_sort(g_rows.begin(), g_rows.end(), [](const Row& a, const Row& b) {
+		if (a.t.earned != b.t.earned) return a.t.earned;
+		if (a.t.earned) return a.when > b.when;
+		return a.t.id < b.t.id;
+	});
+	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
+	int  total = 0, have = 0;
+	g_earned   = 0;
+	for (int g = 0; g < 5; g++) g_grade_have[g] = g_grade_all[g] = 0;
+	for (const auto& r: g_rows) {
+		const int g = r.t.grade >= 1 && r.t.grade <= 4 ? r.t.grade : 0;
+		total += points(g);
+		g_grade_all[g]++;
+		if (r.t.earned) {
+			have += points(g);
+			g_earned++;
+			g_grade_have[g]++;
+		}
+	}
+	g_pct = total > 0 ? have * 100 / total : (g_rows.empty() ? 0 : g_earned * 100 / static_cast<int>(g_rows.size()));
+}
+
+// One icon into its cell: an area average (premultiplied, so the edges keep no dark fringe), then the gutter.
+void PutIcon(IconJob& job, int slot, const unsigned char* src, int sw, int sh, bool grey) {
+	const int c  = job.cell;
+	const int x0 = (slot % job.cols) * job.stride + job.pad, y0 = (slot / job.cols) * job.stride + job.pad;
+	for (int y = 0; y < c; y++) {
+		const float fy0 = static_cast<float>(y) * sh / c, fy1 = static_cast<float>(y + 1) * sh / c;
+		for (int x = 0; x < c; x++) {
+			const float fx0 = static_cast<float>(x) * sw / c, fx1 = static_cast<float>(x + 1) * sw / c;
+			float       acc[4] = {0, 0, 0, 0}, wsum = 0;
+			for (int sy = static_cast<int>(fy0); sy < std::min(sh, static_cast<int>(std::ceil(fy1))); sy++) {
+				const float wy = std::min(fy1, sy + 1.0f) - std::max(fy0, static_cast<float>(sy));
+				for (int sx = static_cast<int>(fx0); sx < std::min(sw, static_cast<int>(std::ceil(fx1))); sx++) {
+					const float          w = wy * (std::min(fx1, sx + 1.0f) - std::max(fx0, static_cast<float>(sx)));
+					const unsigned char* p = src + (static_cast<size_t>(sy) * sw + sx) * 4;
+					const float          a = p[3] / 255.0f;
+					acc[0] += p[0] * a * w;
+					acc[1] += p[1] * a * w;
+					acc[2] += p[2] * a * w;
+					acc[3] += a * w;
+					wsum += w;
+				}
+			}
+			float r = 0, g = 0, b = 0, a = 0;
+			if (wsum > 0 && acc[3] > 0) {
+				r = acc[0] / acc[3];
+				g = acc[1] / acc[3];
+				b = acc[2] / acc[3];
+				a = acc[3] / wsum;
+			}
+			if (grey) {
+				// Not earned: desaturated and darkened, a little warm (old stone).
+				const float l = (0.30f * r + 0.59f * g + 0.11f * b) * 0.58f;
+				r = l * 1.04f;
+				g = l;
+				b = l * 0.90f;
+			}
+			unsigned char* d = job.pixels.data() + (static_cast<size_t>(y0 + y) * job.width + x0 + x) * 4;
+			d[0] = static_cast<unsigned char>(std::clamp(r, 0.0f, 255.0f));
+			d[1] = static_cast<unsigned char>(std::clamp(g, 0.0f, 255.0f));
+			d[2] = static_cast<unsigned char>(std::clamp(b, 0.0f, 255.0f));
+			d[3] = static_cast<unsigned char>(std::clamp(a * 255.0f, 0.0f, 255.0f));
+		}
+	}
+	// The gutter: the cell's edge pixels repeated (the linear filter never reads a neighbour).
+	for (int y = -job.pad; y < c + job.pad; y++)
+		for (int x = -job.pad; x < c + job.pad; x++) {
+			if (x >= 0 && x < c && y >= 0 && y < c) continue;
+			const int      cx = std::clamp(x, 0, c - 1), cy = std::clamp(y, 0, c - 1);
+			const uint8_t* s  = job.pixels.data() + (static_cast<size_t>(y0 + cy) * job.width + x0 + cx) * 4;
+			uint8_t*       d  = job.pixels.data() + (static_cast<size_t>(y0 + y) * job.width + x0 + x) * 4;
+			std::memcpy(d, s, 4);
+		}
+}
+
+// The worker: every trophy's PNG decoded and scaled to the size it is drawn at (colour and grey), in one atlas.
+void BuildIcons(std::shared_ptr<IconJob> job, std::filesystem::path dir, std::vector<int> ids) {
+	const int n     = static_cast<int>(ids.size());
+	job->stride     = job->cell + 2 * job->pad;
+	job->cols       = std::max(1, static_cast<int>(std::ceil(std::sqrt(2.0 * std::max(1, n)))));
+	const int lines = (2 * std::max(1, n) + job->cols - 1) / job->cols;
+	job->width      = job->cols * job->stride;
+	job->height     = lines * job->stride;
+	job->pixels.assign(static_cast<size_t>(job->width) * job->height * 4, 0);
+	int loaded = 0;
+	for (int i = 0; i < n && !job->cancel.load(); i++) {
+		std::string bytes;
+		for (int pick: {ids[i], ids[i] == Libs::Trophy::kNexusTrophyId ? 1 : -1}) {
+			if (pick < 0) break;
+			char name[32];
+			std::snprintf(name, sizeof(name), "trop%03d.png", pick);
+			std::ifstream in(dir / "trophy-icons" / name, std::ios::binary);
+			if (!in) continue;
+			bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+			if (!bytes.empty()) break;
+		}
+		if (bytes.empty()) continue;
+		int  w = 0, h = 0, ch = 0;
+		auto px = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &w, &h, &ch, 4);
+		if (px == nullptr || w <= 0 || h <= 0) {
+			if (px != nullptr) stbi_image_free(px);
+			continue;
+		}
+		PutIcon(*job, 2 * i, px, w, h, false);
+		PutIcon(*job, 2 * i + 1, px, w, h, true);
+		stbi_image_free(px);
+		job->slots[ids[i]] = i;
+		loaded++;
+	}
+	std::printf("[port] launcher trophies: %d of %d icons loaded (%dx%d atlas)\n", loaded, n, job->width, job->height);
+	std::fflush(stdout);
+	std::scoped_lock lock(job->mutex);
+	job->done = true;
+}
+
+void EnsureIcons() {
+	if (g_atlas != nullptr) {
+		// (the SDL renderer's texture: bilinear; set again if the texture was created again after a device reset)
+		if (g_atlas->Status == ImTextureStatus_OK && g_atlas->GetTexID() != ImTextureID_Invalid && g_atlas->GetTexID() != g_linear_id) {
+			SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(g_atlas->GetTexID())), SDL_ScaleModeLinear);
+			g_linear_id = g_atlas->GetTexID();
+		}
+		return;
+	}
+	if (g_job == nullptr) {
+		if (g_art != nullptr || g_dir.empty() || g_rows.empty()) return; // (g_art without an atlas: no icon files, the cups)
+		std::vector<int> ids;
+		for (const auto& r: g_rows) ids.push_back(r.t.id);
+		g_job       = std::make_shared<IconJob>();
+		g_job->cell = std::clamp(static_cast<int>(Px(54)), 32, 192);
+		g_worker    = std::thread(BuildIcons, g_job, g_dir, std::move(ids));
+		return;
+	}
+	{
+		std::scoped_lock lock(g_job->mutex);
+		if (!g_job->done) return;
+	}
+	if (g_worker.joinable()) g_worker.join();
+	auto job = std::move(g_job);
+	g_job    = nullptr;
+	if (job->slots.empty() || job->width <= 0 || job->height <= 0) {
+		g_art = job; // (no icon: the cups are drawn; not tried again)
+		g_art->pixels.clear();
+		g_atlas = nullptr;
+		return;
+	}
+	auto* tex = IM_NEW(ImTextureData)();
+	tex->Create(ImTextureFormat_RGBA32, job->width, job->height);
+	std::memcpy(tex->GetPixels(), job->pixels.data(), job->pixels.size());
+	tex->UseColors = true;
+	ImGui::RegisterUserTexture(tex);
+	job->pixels.clear();
+	job->pixels.shrink_to_fit();
+	g_atlas    = tex;
+	g_art      = std::move(job);
+	g_atlas_at = ImGui::GetTime();
+}
+
+// The launcher closes (before the renderer goes): the worker stopped, the atlas freed, everything as at the start.
+void Shutdown() {
+	if (g_job != nullptr) g_job->cancel = true;
+	if (g_worker.joinable()) g_worker.join();
+	g_job = nullptr;
+	FreeTexture(g_atlas);
+	g_art.reset();
+	g_linear_id = ImTextureID_Invalid;
+	g_rows.clear();
+	g_expand.clear();
+	g_loaded = g_open = false;
+	g_k = g_k_from = 0.0f;
+	g_sel        = -1;
+	g_changed_at = g_opened_at = -100.0;
+	g_focus_panel = g_focus_first = g_focus_back = false;
+}
+
+bool IsOpen() {
+	return g_open;
+}
+
+void Open(bool by_pad) {
+	if (g_open) return;
+	Reload();
+	g_k_from      = g_k;
+	g_open        = true;
+	g_changed_at  = ImGui::GetTime();
+	if (g_k < 0.05f) { // (the rows enter again, from the top, only from closed)
+		g_opened_at  = g_changed_at;
+		g_scroll_top = true;
+	}
+	g_focus_panel = true;
+	g_focus_first = by_pad;
+}
+
+void Close(bool by_pad) {
+	if (!g_open) return;
+	g_k_from     = g_k;
+	g_open       = false;
+	g_changed_at = ImGui::GetTime();
+	g_focus_back = by_pad;
+}
+
+void Toggle(bool by_pad) {
+	if (g_open) Close(by_pad);
+	else Open(by_pad);
+}
+
+// Text with extra letter spacing (the inscriptions): drawn glyph by glyph. Returns its width.
+float Spaced(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* text, float spacing) {
+	if (font == nullptr) font = ImGui::GetFont();
+	float       x = at.x;
+	const char* p = text;
+	const char* e = text + std::strlen(text);
+	while (p < e) {
+		unsigned int c = 0;
+		const int    n = ImTextCharFromUtf8(&c, p, e);
+		if (n <= 0) break;
+		if (dl != nullptr) dl->AddText(font, size, {std::floor(x), at.y}, col, p, p + n);
+		x += font->CalcTextSizeA(size, FLT_MAX, 0.0f, p, p + n).x + spacing;
+		p += n;
+	}
+	return x - at.x - (p > text ? spacing : 0.0f);
+}
+
+// The text cut with "..." to fit `max_w`.
+std::string Fit(ImFont* font, float size, const std::string& text, float max_w) {
+	if (font == nullptr) font = ImGui::GetFont();
+	if (font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str()).x <= max_w) return text;
+	const float dots = font->CalcTextSizeA(size, FLT_MAX, 0.0f, "...").x;
+	std::string out  = text;
+	while (!out.empty()) {
+		size_t cut = out.size() - 1;
+		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) cut--; // (a whole UTF-8 character)
+		out.resize(cut);
+		while (!out.empty() && out.back() == ' ') out.pop_back();
+		if (font->CalcTextSizeA(size, FLT_MAX, 0.0f, out.c_str()).x + dots <= max_w) break;
+	}
+	return out + "...";
+}
+
+void Lozenge(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+	dl->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, col);
+}
+
+// A chevron (^ at angle 0) centred at c, turned by `angle` radians.
+void Chevron(ImDrawList* dl, ImVec2 c, float s, float angle, ImU32 col, float thick) {
+	const float cs = std::cos(angle), sn = std::sin(angle);
+	const auto  P  = [&](float x, float y) { return ImVec2 {c.x + x * cs - y * sn, c.y + x * sn + y * cs}; };
+	const ImVec2 pts[3] = {P(-s, s * 0.5f), P(0, -s * 0.5f), P(s, s * 0.5f)};
+	dl->AddPolyline(pts, 3, col, ImDrawFlags_None, thick);
+}
+
+// A small padlock (not earned) with its centre at c.
+void Padlock(ImDrawList* dl, ImVec2 c, float s, float a) {
+	dl->AddCircleFilled(c, s * 1.05f, Ca(8, 8, 10, 0.92f * a));
+	dl->AddCircle(c, s * 1.05f, Ca(150, 136, 110, 0.65f * a), 0, std::max(1.0f, s * 0.10f));
+	const ImU32 col = Ca(196, 184, 160, a);
+	dl->PathArcTo({c.x, c.y - s * 0.12f}, s * 0.30f, 3.14159265f, 2.0f * 3.14159265f, 10);
+	dl->PathStroke(col, ImDrawFlags_None, std::max(1.0f, s * 0.13f));
+	dl->AddLine({c.x - s * 0.30f, c.y - s * 0.12f}, {c.x - s * 0.30f, c.y + s * 0.05f}, col, std::max(1.0f, s * 0.13f));
+	dl->AddLine({c.x + s * 0.30f, c.y - s * 0.12f}, {c.x + s * 0.30f, c.y + s * 0.05f}, col, std::max(1.0f, s * 0.13f));
+	dl->AddRectFilled({c.x - s * 0.46f, c.y + s * 0.02f}, {c.x + s * 0.46f, c.y + s * 0.56f}, col, s * 0.10f);
+}
+
+// The panel's reveal: every command clipped to below `top` (the curtain rising from the tab) and the vertices faded.
+void Reveal(ImDrawList* dl, int first_vtx, float top, float alpha) {
+	if (dl == nullptr) return;
+	for (auto& cmd: dl->CmdBuffer) {
+		cmd.ClipRect.y = std::max(cmd.ClipRect.y, top);
+		if (cmd.ClipRect.w < cmd.ClipRect.y) cmd.ClipRect.w = cmd.ClipRect.y;
+	}
+	if (alpha >= 0.999f) return;
+	for (int i = first_vtx; i < dl->VtxBuffer.Size; i++) {
+		ImU32&      c = dl->VtxBuffer[i].col;
+		const float a = static_cast<float>((c >> IM_COL32_A_SHIFT) & 0xFF) * alpha;
+		c             = (c & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a + 0.5f) << IM_COL32_A_SHIFT);
+	}
+}
+
+const char* GradeName(int g) {
+	static const char* names[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
+	return g >= 1 && g <= 4 ? I18n::T(names[g]) : "";
+}
+
+// The tab (always) and, open or closing, the panel above it. column_x: the left edge of the launcher's column.
+void Draw(float width, float height, float column_x) {
+	if (!g_loaded) Reload();
+	auto&        io  = ImGui::GetIO();
+	const double now = ImGui::GetTime();
+	if (!g_popup.load()) {
+		if (ImGui::IsKeyPressed(ImGuiKey_GamepadBack, false)) Toggle(true);
+		else if (g_open && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) Close(true);
+	}
+	{
+		const float t = static_cast<float>((now - g_changed_at) / (g_open ? 0.38 : 0.24));
+		g_k = g_open ? g_k_from + (1.0f - g_k_from) * Anim::EaseOutQuint(t) : g_k_from * (1.0f - Anim::EaseOut(t));
+	}
+	if (g_open || g_k > 0.0f) EnsureIcons();
+
+	ImFont*      cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	ImFont*      serif  = g_font_serif != nullptr ? g_font_serif : ImGui::GetFont();
+	ImFont*      semi   = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont();
+	const ImU32  gold   = IM_COL32(222, 196, 140, 255);
+	const float  tx = Px(16), tw = Px(400), th = Px(60);
+	const float  ty = std::round(height - U(34) - th);
+	const float  frac = static_cast<float>(g_pct) / 100.0f;
+
+	// ---- The tab ----
+	bool tab_hovered = false;
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##trophy-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse |
+	                                          ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##trophy-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		tab_hovered        = ImGui::IsItemHovered();
+		if (tab_hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const bool  on  = tab_hovered || ImGui::IsItemFocused() || ImGui::IsItemActive();
+		const float hot = std::max(Anim::Hot(ImGui::GetItemID(), on), g_k * 0.6f);
+		Tip("Tus trofeos: los obtenidos con su fecha y hora, y los que faltan. En el mando, el bot\xC3\xB3n View / Share los abre y los cierra.");
+		if (clicked) Toggle(!ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) { // the glow around it
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(240, 200, 120, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(70, 56, 32, 0.30f + 0.25f * hot),
+		                            Ca(70, 56, 32, 0.10f), Ca(70, 56, 32, 0.0f), Ca(70, 56, 32, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		// The medallion with the cup.
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		dl->AddCircleFilled(mc, mr, IM_COL32(22, 18, 12, 255), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		dl->AddCircle(mc, mr - Px(3), Ca(222, 196, 140, 0.18f), 32, 1.0f);
+		const float cs = std::round(mr * 1.25f);
+		Libs::Trophy::DrawCup(dl, mc.x - cs * 0.5f, mc.y - cs * 0.48f, cs, Libs::Trophy::CupColor(g_earned > 0 ? 2 : 0));
+		// TROFEOS, then the counter and the percent.
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), I18n::T("TROFEOS"), U(2.5f));
+		char count[64];
+		if (!g_rows.empty()) std::snprintf(count, sizeof(count), "%d / %d", g_earned, static_cast<int>(g_rows.size()));
+		else std::snprintf(count, sizeof(count), "-");
+		const float cw = Spaced(dl, cinzel, Px(16), {lx, a.y + Px(32)}, IM_COL32(236, 226, 204, 240), count, U(1));
+		if (!g_rows.empty()) {
+			char pct[16];
+			std::snprintf(pct, sizeof(pct), "%d%%", g_pct);
+			Lozenge(dl, {std::round(lx + cw + Px(12)), std::round(a.y + Px(32) + Px(16) * 0.55f)}, Px(3), Ca(204, 176, 122, 0.8f));
+			Spaced(dl, cinzel, Px(16), {lx + cw + Px(24), a.y + Px(32)}, gold, pct, U(1));
+		}
+		// The fine progress line along the bottom.
+		const float px0 = lx, px1 = b.x - Px(46), py = std::round(b.y - Px(8));
+		dl->AddRectFilled({px0, py}, {px1, py + Px(2)}, IM_COL32(255, 255, 255, 28));
+		if (frac > 0.0f)
+			dl->AddRectFilledMultiColor({px0, py}, {px0 + (px1 - px0) * frac, py + Px(2)}, IM_COL32(150, 112, 52, 255), IM_COL32(240, 206, 136, 255),
+			                            IM_COL32(240, 206, 136, 255), IM_COL32(150, 112, 52, 255));
+		// The chevron: up (the panel opens upwards), turned down when open.
+		Chevron(dl, {std::round(b.x - Px(24)), std::round(a.y + th * 0.5f)}, Px(7), 3.14159265f * g_k, Ca(222, 196, 140, 0.7f + 0.3f * hot),
+		        std::max(1.5f, U(1.8f)));
+	}
+	ImGui::End();
+
+	// ---- The panel ----
+	if (!g_open && g_k <= 0.0f) {
+		if (g_focus_back) {
+			g_focus_back = false;
+			ImGui::SetWindowFocus("##launcher-bottom");
+		}
+		return;
+	}
+	const float pw  = std::clamp(column_x - tx - Px(24), Px(340), Px(580));
+	const float pb  = std::round(ty - Px(10));
+	const float ph  = std::round(std::min(U(720), pb - Px(18)));
+	const float pt  = pb - ph;
+	const bool  closing = !g_open;
+	if (g_focus_panel) ImGui::SetNextWindowFocus();
+	ImGui::SetNextWindowPos({tx, pt});
+	ImGui::SetNextWindowSize({pw, ph});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##trophy-panel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse |
+	                                            ImGuiWindowFlags_NoFocusOnAppearing | (closing ? ImGuiWindowFlags_NoInputs : 0));
+	ImGui::PopStyleVar();
+	g_focus_panel     = false;
+	auto*  dl         = ImGui::GetWindowDrawList();
+	const ImVec2 a {tx, pt}, b {tx + pw, pb};
+	const float  rr   = Px(8);
+	// Shadow, body, the warm light from above, the double gold edge and the corner brackets.
+	dl->PushClipRect({0, 0}, {width, height}, false);
+	for (int k = 1; k <= 4; k++) {
+		const float g = static_cast<float>(k) * U(4);
+		dl->AddRectFilled({a.x - g, a.y - g + U(4)}, {b.x + g, b.y + g + U(4)}, IM_COL32(0, 0, 0, 26), rr + g);
+	}
+	dl->PopClipRect();
+	dl->AddRectFilled(a, b, IM_COL32(11, 10, 10, 238), rr);
+	dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + Px(170)}, IM_COL32(64, 50, 28, 92), IM_COL32(64, 50, 28, 60),
+	                            IM_COL32(64, 50, 28, 0), IM_COL32(64, 50, 28, 0));
+	dl->AddRect(a, b, IM_COL32(204, 176, 122, 160), rr, 0, std::max(1.0f, U(1.25f)));
+	dl->AddRect({a.x + Px(5), a.y + Px(5)}, {b.x - Px(5), b.y - Px(5)}, IM_COL32(204, 176, 122, 38), Px(5), 0, 1.0f);
+	{
+		const float in = Px(10), len = Px(20), th2 = std::max(1.0f, U(1.5f));
+		const ImU32 c  = IM_COL32(222, 196, 140, 190);
+		const ImVec2 corners[4] = {{a.x + in, a.y + in}, {b.x - in, a.y + in}, {a.x + in, b.y - in}, {b.x - in, b.y - in}};
+		for (int k = 0; k < 4; k++) {
+			const float sx = (k % 2 == 0) ? 1.0f : -1.0f, sy = (k < 2) ? 1.0f : -1.0f;
+			const ImVec2 p = corners[k];
+			dl->AddLine(p, {p.x + sx * len, p.y}, c, th2);
+			dl->AddLine(p, {p.x, p.y + sy * len}, c, th2);
+			Lozenge(dl, {p.x + sx * Px(5), p.y + sy * Px(5)}, Px(2.5f), c);
+		}
+	}
+	// The header: TROFEOS and the percent, how many, the bar, each grade's count, a rule.
+	const float hx = a.x + Px(26), hw = pw - Px(52);
+	Spaced(dl, cinzel, Px(27), {hx, a.y + Px(20)}, gold, I18n::T("TROFEOS"), U(4));
+	{
+		char pct[16];
+		std::snprintf(pct, sizeof(pct), "%d%%", g_pct);
+		const float w = Spaced(nullptr, cinzel, Px(30), {0, 0}, 0, pct, U(1.5f));
+		Spaced(dl, cinzel, Px(30), {hx + hw - w, a.y + Px(17)}, IM_COL32(240, 230, 208, 255), pct, U(1.5f));
+	}
+	{
+		char line[128];
+		std::snprintf(line, sizeof(line), I18n::T("%d de %d trofeos obtenidos"), g_earned, static_cast<int>(g_rows.size()));
+		dl->AddText(serif, Px(15), {hx, a.y + Px(58)}, IM_COL32(206, 196, 176, 230), line);
+	}
+	{
+		const float by = std::round(a.y + Px(86)), bh = Px(8);
+		const float fill = frac * Anim::EaseOut(static_cast<float>((now - g_opened_at - 0.15) / 0.9));
+		dl->AddRectFilled({hx, by}, {hx + hw, by + bh}, IM_COL32(255, 255, 255, 18), bh * 0.5f);
+		dl->AddRect({hx, by}, {hx + hw, by + bh}, IM_COL32(204, 176, 122, 70), bh * 0.5f, 0, 1.0f);
+		if (fill > 0.0f) {
+			const float fx = hx + hw * fill;
+			dl->AddRectFilledMultiColor({hx + 1, by + 1}, {fx, by + bh - 1}, IM_COL32(128, 92, 40, 255), IM_COL32(236, 200, 128, 255),
+			                            IM_COL32(200, 160, 92, 255), IM_COL32(100, 72, 30, 255));
+			// A slow shimmer running along the filled part.
+			const float sw = Px(60), sx = hx + std::fmod(static_cast<float>(now) * U(110), hw + sw) - sw;
+			dl->PushClipRect({hx, by}, {fx, by + bh}, true);
+			dl->AddRectFilledMultiColor({sx, by}, {sx + sw * 0.5f, by + bh}, IM_COL32(255, 240, 200, 0), IM_COL32(255, 240, 200, 90),
+			                            IM_COL32(255, 240, 200, 90), IM_COL32(255, 240, 200, 0));
+			dl->AddRectFilledMultiColor({sx + sw * 0.5f, by}, {sx + sw, by + bh}, IM_COL32(255, 240, 200, 90), IM_COL32(255, 240, 200, 0),
+			                            IM_COL32(255, 240, 200, 0), IM_COL32(255, 240, 200, 90));
+			dl->PopClipRect();
+			Lozenge(dl, {std::round(fx), by + bh * 0.5f}, Px(6), IM_COL32(250, 226, 170, 255));
+			Lozenge(dl, {std::round(fx), by + bh * 0.5f}, Px(3), IM_COL32(120, 86, 36, 255));
+		}
+	}
+	{
+		const float gy = std::round(a.y + Px(108)), cell = hw / 4.0f;
+		for (int g = 1; g <= 4; g++) {
+			const float x = hx + cell * (g - 1);
+			Libs::Trophy::DrawCup(dl, x, gy, Px(20), Libs::Trophy::CupColor(g, g_grade_have[g] > 0 ? 1.0f : 0.45f));
+			char n[32];
+			std::snprintf(n, sizeof(n), "%d/%d", g_grade_have[g], g_grade_all[g]);
+			dl->AddText(semi, Px(14), {x + Px(26), gy + Px(2)}, Libs::Trophy::CupColor(g, g_grade_have[g] > 0 ? 1.0f : 0.6f), n);
+		}
+	}
+	{
+		const float ry = std::round(a.y + Px(140)) + 0.5f, mid = hx + hw * 0.5f;
+		dl->AddRectFilledMultiColor({hx, ry - 0.5f}, {mid, ry + 0.5f}, IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 170),
+		                            IM_COL32(204, 176, 122, 170), IM_COL32(204, 176, 122, 0));
+		dl->AddRectFilledMultiColor({mid, ry - 0.5f}, {hx + hw, ry + 0.5f}, IM_COL32(204, 176, 122, 170), IM_COL32(204, 176, 122, 0),
+		                            IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 170));
+		Lozenge(dl, {std::round(mid), ry}, Px(4), IM_COL32(222, 196, 140, 220));
+	}
+	// The list (a child: ImGui scrolls it to the pad's focus; the wheel eases).
+	const float  list_top = std::round(a.y + Px(152)), list_bottom = std::round(b.y - Px(40));
+	ImDrawList*  list_dl  = nullptr;
+	ImGui::SetCursorScreenPos({a.x + Px(12), list_top});
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the rows draw their own focus glow)
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, Px(2)});
+	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, Px(8));
+	if (g_scroll_top) ImGui::SetNextWindowScroll({0.0f, 0.0f}); // (opened from closed: the list from the top)
+	g_scroll_top = false;
+	ImGui::BeginChild("##trophy-list", {pw - Px(24), list_bottom - list_top}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+	Anim::SmoothScroll();
+	list_dl = ImGui::GetWindowDrawList();
+	if (g_rows.empty()) {
+		const char*  msg = I18n::T("A\xC3\xBAn no hay trofeos: aparecen al jugar.");
+		const float  w   = ImGui::GetContentRegionAvail().x;
+		const ImVec2 ts  = serif->CalcTextSizeA(Px(17), FLT_MAX, w - Px(20), msg);
+		list_dl->AddText(serif, Px(17), {ImGui::GetCursorScreenPos().x + (w - ts.x) * 0.5f, ImGui::GetCursorScreenPos().y + Px(40)},
+		                 IM_COL32(206, 196, 176, 230), msg, nullptr, w - Px(20));
+		ImGui::Dummy({w, Px(120)});
+	}
+	const float dt   = std::clamp(io.DeltaTime, 0.0f, 0.1f);
+	const float isz  = std::round(U(54));
+	const float h0   = Px(80);
+	for (int i = 0; i < static_cast<int>(g_rows.size()); i++) {
+		const Row&  r      = g_rows[static_cast<size_t>(i)];
+		const bool  secret = r.t.hidden && !r.t.earned;
+		const int   g      = r.t.grade >= 1 && r.t.grade <= 4 ? r.t.grade : 0;
+		const float lw     = ImGui::GetContentRegionAvail().x;
+		const float tx0    = Px(12) + isz + Px(18); // the text's left, from the row's
+		const float wrap   = std::max(Px(80), lw - tx0 - Px(40));
+		const std::string desc = secret ? std::string(I18n::T("Se revelar\xC3\xA1 al obtenerlo.")) : r.t.detail;
+		const float desc_size  = Px(16);
+		const float desc_h     = desc.empty() ? 0.0f : serif->CalcTextSizeA(desc_size, FLT_MAX, wrap, desc.c_str()).y + Px(14);
+		float&      e          = g_expand[r.t.id];
+		{
+			const float to = g_sel == r.t.id ? 1.0f : 0.0f;
+			e += (to - e) * std::min(1.0f, dt * 11.0f);
+			if (std::fabs(to - e) < 0.002f) e = to;
+		}
+		const float  ee = e * e * (3.0f - 2.0f * e); // (smoothstep)
+		const float  h  = std::round(h0 + desc_h * ee);
+		const ImVec2 at = ImGui::GetCursorScreenPos();
+		ImGui::PushID(r.t.id);
+		if (g_focus_first && i == 0) ImGui::SetKeyboardFocusHere();
+		const bool pressed = ImGui::InvisibleButton("##row", {lw, h}, ImGuiButtonFlags_EnableNav); // (EnableNav: the pad reaches it)
+		const bool hovered = ImGui::IsItemHovered();
+		const bool on      = hovered || ImGui::IsItemFocused();
+		const float hot    = Anim::Hot(ImGui::GetItemID(), on);
+		if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		if (pressed && !closing) g_sel = g_sel == r.t.id ? -1 : r.t.id;
+		ImGui::PopID();
+		if (at.y > list_bottom + Px(10) || at.y + h < list_top - Px(10)) continue; // (out of view: only its space)
+		// The entrance: each row a little after the one above (0.045 s), sliding in from the left and fading in.
+		const float delay = 0.12f + 0.045f * static_cast<float>(std::min(i, 16));
+		const float ein   = Anim::EaseOut(static_cast<float>((now - g_opened_at - delay) / 0.34));
+		if (ein <= 0.0f) continue;
+		const float  al = ein;
+		const float  ox = std::round((1.0f - ein) * -U(28));
+		const ImVec2 ra {at.x + ox, at.y}, rb {at.x + ox + lw, at.y + h};
+		// The glow (hover / focus) and the selected row's steady light.
+		const float lit = std::max(hot, g_sel == r.t.id ? 0.45f : 0.0f);
+		if (lit > 0.0f) {
+			for (int k = 1; k <= 2; k++) {
+				const float gg = static_cast<float>(k) * U(1.5f);
+				list_dl->AddRect({ra.x + gg, ra.y + gg}, {rb.x - gg, rb.y - gg}, Ca(240, 200, 120, 0.10f / k * hot * al), Px(6));
+			}
+			list_dl->AddRectFilledMultiColor(ra, rb, Ca(222, 196, 140, 0.16f * lit * al), Ca(222, 196, 140, 0.03f * lit * al),
+			                                 Ca(222, 196, 140, 0.03f * lit * al), Ca(222, 196, 140, 0.16f * lit * al));
+			list_dl->AddRect(ra, rb, Ca(236, 206, 146, 0.55f * hot * al), Px(5), 0, std::max(1.0f, U(1.25f)));
+			const float bar = (rb.y - ra.y) * (0.5f - 0.40f * lit);
+			list_dl->AddRectFilled({ra.x, ra.y + bar}, {ra.x + Px(3), rb.y - bar}, Ca(244, 214, 150, lit * al), Px(2));
+		} else if (r.t.earned) {
+			list_dl->AddRectFilledMultiColor(ra, {ra.x + lw * 0.5f, rb.y}, Ca(70, 56, 32, 0.22f * al), Ca(70, 56, 32, 0.0f), Ca(70, 56, 32, 0.0f),
+			                                 Ca(70, 56, 32, 0.22f * al));
+		}
+		// The icon in its frame.
+		const ImVec2 i0 {std::floor(ra.x + Px(12)), std::floor(ra.y + (h0 - isz) * 0.5f)}, i1 {i0.x + isz, i0.y + isz};
+		list_dl->AddRectFilled({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Ca(6, 6, 8, al), Px(4));
+		if (r.t.earned)
+			list_dl->AddRect({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Libs::Trophy::CupColor(g, (0.75f + 0.25f * hot) * al), Px(4), 0,
+			                 std::max(1.0f, U(1.5f)));
+		else list_dl->AddRect({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Ca(110, 102, 88, 0.6f * al), Px(4), 0, 1.0f);
+		bool drew_icon = false;
+		if (!secret && g_atlas != nullptr && g_art != nullptr) {
+			if (auto it = g_art->slots.find(r.t.id); it != g_art->slots.end()) {
+				const int    slot = 2 * it->second + (r.t.earned ? 0 : 1);
+				const float  u0   = static_cast<float>((slot % g_art->cols) * g_art->stride + g_art->pad) / g_art->width;
+				const float  v0   = static_cast<float>((slot / g_art->cols) * g_art->stride + g_art->pad) / g_art->height;
+				const float  u1   = u0 + static_cast<float>(g_art->cell) / g_art->width;
+				const float  v1   = v0 + static_cast<float>(g_art->cell) / g_art->height;
+				const float  fade = std::clamp(static_cast<float>((now - g_atlas_at) / 0.3), 0.0f, 1.0f);
+				const float  lum  = r.t.earned ? 1.0f : 0.85f + 0.15f * hot;
+				list_dl->AddImage(g_atlas->GetTexRef(), i0, i1, {u0, v0}, {u1, v1}, Ca(static_cast<int>(255 * lum), static_cast<int>(255 * lum),
+				                                                                      static_cast<int>(255 * lum), fade * al));
+				drew_icon = fade >= 1.0f;
+			}
+		}
+		if (secret) {
+			const ImVec2 qs = cinzel->CalcTextSizeA(Px(30), FLT_MAX, 0.0f, "?");
+			list_dl->AddText(cinzel, Px(30), {std::round(i0.x + (isz - qs.x) * 0.5f), std::round(i0.y + (isz - qs.y) * 0.5f)}, Ca(150, 140, 120, al), "?");
+		} else if (!drew_icon) {
+			const float cs = std::round(isz * 0.62f);
+			Libs::Trophy::DrawCup(list_dl, i0.x + (isz - cs) * 0.5f, i0.y + (isz - cs) * 0.5f, cs, Libs::Trophy::CupColor(r.t.earned ? g : 0, al * 0.9f));
+		}
+		if (!r.t.earned && !secret) Padlock(list_dl, {i1.x - Px(2), i1.y - Px(2)}, Px(9), al);
+		// The name, the grade and the date.
+		const float  nx    = ra.x + tx0;
+		const float  ns    = Px(18);
+		const std::string name = Fit(cinzel, ns, secret ? std::string(I18n::T("Trofeo oculto")) : r.t.name, lw - tx0 - Px(40));
+		list_dl->AddText(cinzel, ns, {nx, ra.y + Px(15)}, r.t.earned ? Ca(240, 230, 208, al) : Ca(150, 144, 134, al), name.c_str());
+		{
+			const float ly = ra.y + Px(46);
+			Lozenge(list_dl, {std::round(nx + Px(4)), std::round(ly + Px(8))}, Px(4), Libs::Trophy::CupColor(g, (r.t.earned ? 1.0f : 0.5f) * al));
+			const char* gname = GradeName(g);
+			list_dl->AddText(semi, Px(14), {nx + Px(14), ly}, Libs::Trophy::CupColor(g, (r.t.earned ? 1.0f : 0.6f) * al), gname);
+			const float gw   = semi->CalcTextSizeA(Px(14), FLT_MAX, 0.0f, gname).x;
+			const std::string when = r.t.earned ? TrophyPage::DateText(r.when) : std::string(I18n::T("Sin obtener"));
+			list_dl->AddText(semi, Px(14), {nx + Px(14) + gw + Px(8), ly}, Ca(150, 140, 120, al), "\xC2\xB7");
+			list_dl->AddText(serif, Px(14), {nx + Px(14) + gw + Px(20), ly}, r.t.earned ? Ca(206, 196, 176, al) : Ca(130, 124, 114, al), when.c_str());
+		}
+		Chevron(list_dl, {std::round(rb.x - Px(20)), std::round(ra.y + h0 * 0.5f)}, Px(5), 3.14159265f * (1.0f - ee),
+		        Ca(222, 196, 140, (0.35f + 0.6f * std::max(hot, ee)) * al), std::max(1.2f, U(1.4f)));
+		// The description, unfolding under the row.
+		if (ee > 0.01f && !desc.empty()) {
+			const float dy = ra.y + h0 - Px(4);
+			list_dl->PushClipRect({ra.x, ra.y}, {rb.x, rb.y}, true);
+			list_dl->AddRectFilled({nx - Px(10), dy}, {nx - Px(9), dy + desc_h - Px(12)}, Ca(204, 176, 122, 0.6f * ee * al));
+			list_dl->AddText(serif, desc_size, {nx, dy + (1.0f - ee) * -Px(6)}, secret ? Ca(170, 160, 140, ee * al) : Ca(224, 214, 194, ee * al),
+			                 desc.c_str(), nullptr, wrap);
+			list_dl->PopClipRect();
+		}
+		// A fine rule under the row.
+		list_dl->AddRectFilledMultiColor({ra.x + Px(10), rb.y + Px(1)}, {rb.x - Px(10), rb.y + Px(2)}, Ca(204, 176, 122, 0.22f * al),
+		                                 Ca(204, 176, 122, 0.0f), Ca(204, 176, 122, 0.0f), Ca(204, 176, 122, 0.22f * al));
+	}
+	g_focus_first = false;
+	ImGui::EndChild();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+	{
+		const char*  hint = I18n::T("Clic o A: ver la descripci\xC3\xB3n   \xC2\xB7   B o Esc: cerrar");
+		const ImVec2 hs   = semi->CalcTextSizeA(Px(13), FLT_MAX, 0.0f, hint);
+		dl->AddText(semi, Px(13), {std::round(a.x + (pw - hs.x) * 0.5f), std::round(b.y - Px(28))}, IM_COL32(200, 188, 164, 170), hint);
+	}
+	const bool panel_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+	ImGui::End();
+	// A click anywhere else closes it.
+	if (g_open && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !panel_hovered && !tab_hovered) Close(false);
+	// The reveal: the curtain rises from the tab (and falls back when closing), with a gold edge on its way.
+	const float top = pb - ph * g_k;
+	const float alpha = std::clamp(g_k * 1.6f, 0.0f, 1.0f);
+	Reveal(dl, 0, top, alpha);
+	Reveal(list_dl, 0, top, alpha);
+	if (g_k < 0.999f) {
+		auto*       fg = ImGui::GetForegroundDrawList();
+		const float e  = std::sin(3.14159265f * g_k); // (brightest mid-way)
+		fg->AddRectFilledMultiColor({a.x, top - Px(10)}, {b.x, top}, Ca(240, 200, 120, 0.0f), Ca(240, 200, 120, 0.0f), Ca(240, 200, 120, 0.22f * e),
+		                            Ca(240, 200, 120, 0.22f * e));
+		fg->AddLine({a.x + Px(4), top}, {b.x - Px(4), top}, Ca(250, 224, 160, 0.9f * e), std::max(1.0f, U(1.5f)));
+	}
+	if (closing && g_k <= 0.0f && g_focus_back) {
+		g_focus_back = false;
+		ImGui::SetWindowFocus("##launcher-bottom");
+	}
+}
+
+} // namespace LauncherTrophy
 
 // (ds-pc-port11) Text with a dark outline (shadow) for the shaders' panel: legible over the panel and over the gold bar.
 void ShadowText(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* text, float wrap, bool outline = false) {
@@ -4277,7 +5206,8 @@ void DrawLauncher(float width, float height) {
 	Settings& s = g_edit;
 	// Esc: the open list, then the options, then the launcher (as Salir).
 	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !g_popup.load()) {
-		if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
+		if (LauncherTrophy::IsOpen()) LauncherTrophy::Close(true); // (trofeos-exe) the trophy panel first
+		else if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
 		else if (g_show_settings) g_show_settings = false;
 		else g_start_result = -1;
 	}
@@ -4550,7 +5480,7 @@ void DrawLauncher(float width, float height) {
 		{
 			g_lbox.at = {origin.x + U(8), RowY()};
 			g_lbox.w  = U(420);
-			LauncherTrophiesBox();
+			// (trofeos-exe) Trofeos left the options: the tab at the bottom left (LauncherTrophy::Draw, below).
 			const float by = RowY();
 			ImGui::BeginDisabled(g_upd.busy.load());
 			if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(40)}, false, g_font_semi, U(15),
@@ -4581,6 +5511,9 @@ void DrawLauncher(float width, float height) {
 		ImGui::PopStyleVar();
 		ImGui::End();
 	}
+
+	// (trofeos-exe) TROFEOS at the bottom left, above the version line; its panel unfolds upwards.
+	LauncherTrophy::Draw(width, height, px);
 
 	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
 	{
@@ -5907,7 +6840,7 @@ bool Footer(float unit) {
 	const ImVec2 bs {std::round(240 * unit), std::round(54 * unit)};
 	if (Anim::Button(I18n::T("Guardar"), bs, unit)) SaveNow();
 	ImGui::SameLine();
-	if (g_saved.pad_map != g_rt.launched.pad_map || g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map ||
+	if (g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map || // (remap-f2: the pad map is live)
 	    g_saved.kbm_sens != g_rt.launched.kbm_sens || g_saved.kbm_antidz != g_rt.launched.kbm_antidz ||
 	    g_saved.kbm_camera != g_rt.launched.kbm_camera || g_saved.kbm_warp != g_rt.launched.kbm_warp) {
 		if (Anim::Button(I18n::T("Reiniciar ahora"), bs, unit)) RequestRestart();
@@ -5934,6 +6867,7 @@ bool DrawPad(float width, float height, float unit) {
 	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); Anim::SmoothScroll(); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
 	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
 	(void)PadMap::Draw(g_edit, unit);
+	g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId); // (remap-f2) Circle / B closes its action list, not the page
 	ImGui::EndChild();
 	return Footer(unit);
 }
@@ -6519,6 +7453,8 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	while (g_start_result == 0) {
 		SDL_Event e;
 		while (SDL_PollEvent(&e) == 1) {
+			if (PadCaptureFeed(e)) continue; // (remap-f2) a pad button being captured for "Mapear mando"
+			if (e.type == SDL_CONTROLLERBUTTONDOWN) g_pad_last = static_cast<int>(e.cbutton.which);
 			ImGui_ImplSDL2_ProcessEvent(&e);
 			if (e.type == SDL_QUIT) g_start_result = -1;
 			if (e.type == SDL_RENDER_DEVICE_RESET || e.type == SDL_RENDER_TARGETS_RESET) {
@@ -6632,6 +7568,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	Ambience::Shutdown(); // (des-fog-hq) fog and ash freed before the game starts
 	FreeTexture(g_knight);
 	g_knight_tried = false;
+	LauncherTrophy::Shutdown(); // (trofeos-exe) its icon worker stopped, its atlas freed
 	// (11-10) g_font_display too: it was left pointing into the destroyed launcher context, and the in-game menu (F2:
 	// headers and cards through DisplayFont()) then used a freed ImFont - ImGui wrote through it into freed memory
 	// (heap corruption: the game crashing in its job worker or the GPU lost right after the menu opened, or a crash

@@ -3186,6 +3186,11 @@ bool RenderExecutor::NativeXprEmitTargets(const NativeXprDrawState& draw_state, 
 	}
 	// (Not a speculation's answer: it holds as after holes the commit may not reach.)
 	if (spec == nullptr) draw_state.meta_epoch = meta_epoch;
+	// (f5b) A verified pass's targets (KYTY_NATIVE_PASSES ..:2; one load otherwise).
+	if (spec == nullptr && NativeRender::NoteTargetsWanted()) // (pt1: BB_PATHTRACING's GBuffer / ResolveLighting targets too)
+		for (const auto& target: draw_state.targets)
+			NativeRender::NoteTarget(target.id.index, target.id.generation, target.range.base_level, target.range.base_layer,
+			                         target.requested.IsDepth());
 	for (const auto& target: draw_state.targets) {
 		auto& image = textures.GetImage(target.id); // LRU, as acquisition does
 		// (The whole image's layout stands for its subresources while they share one state. Else, as after a
@@ -3330,6 +3335,28 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 		++groups;
 		first += count;
 	}
+	// (render1 F2c) What the draw's shaders read of its own depth target (its set's images: the program's bindings).
+	if (Render1::Mode() == 2 && Render1::t_current.native) {
+		auto& read = Render1::t_read;
+		read       = {};
+		read.known = true;
+		for (const auto& target: draw_state.targets) {
+			if (!target.requested.IsDepth()) continue;
+			for (const auto& image: record.images) {
+				++read.images;
+				if (!(image.id == target.id)) continue;
+				read.reads_depth = true;
+				read.base_layer  = image.range.base_layer;
+				read.layers      = image.range.layer_count;
+				read.base_level  = image.range.base_level;
+				read.levels      = image.range.level_count;
+			}
+			break;
+		}
+	}
+	// (render1 F2, KYTY_RENDER1=2: a p0/p1 depth draw into the native batch; before anything is bound or compared)
+	const bool render1 = Render1::Mode() == 2 && Render1::t_current.native &&
+	                     Render1Begin(buffer, draw_state, direct != nullptr || commands.empty() ? Render1::RDirect : Render1::Reasons);
 	auto&      emit       = cache.emit;
 	const bool same_index = emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
 	                        emit.index_base == index_base && emit.index_bytes == index_bytes &&
@@ -3397,6 +3424,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 			vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second,
 			                              group_sizes[group], static_cast<uint32_t>(stride));
 	}
+	if (render1 && (debug & 2u) == 0)
+		Render1Add(buffer, draw_state, pipeline, record.set, {offsets.data(), offset_count}, record.push_stages,
+		           record.has_push ? std::span<const uint32_t> {push_data.dwords.data(), push_data.dwords.size()}
+		                           : std::span<const uint32_t> {},
+		           !same_index, !same_index ? indices.first->Handle() : vk::Buffer {}, !same_index ? indices.second : 0,
+		           index_base, index_bytes, index_type, {arguments.data(), groups}, {group_sizes.data(), groups}, commands);
 	// (render5: KYTY_DRAW_FLAGS, Render5Flags)
 	if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 2);
@@ -3419,6 +3452,8 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	}
 	if (HwScene::Active() && record.stage_count > 0 && record.stages[0].program != nullptr) // (KYTY_HWRT: the camera)
 		HwScene::NoteCamera(record.stages[0].program->shader_hash, record.stages[0].flattened);
+	if (PathTrace::Requested() && record.stage_count > 0 && record.stages[0].program != nullptr) // (pt1: the sun)
+		PathTrace::OnDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (Render5Flags::Wanted(Render5Flags::Ssr) && record.stage_count > 0 && record.stages[0].program != nullptr)
 		FrameGen::OnSsrDraw(record.stages[0].program->shader_hash, record.stages[0].flattened);
 	if (Render5Flags::Wanted(Render5Flags::Contact) && record.stage_count > 0 && record.stages[0].program != nullptr)

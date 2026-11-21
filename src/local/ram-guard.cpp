@@ -5,6 +5,7 @@
 #include "guest-lazy-commit.h"
 #include "local-platform.h"
 #include "mem-guard.h"
+#include "mem1.h" // (mem1: KYTY_MEM1)
 #include "soft-release.h"
 #include "texture-offload.h" // (ram16: the native offload's numbers for the "[ram16]" line)
 
@@ -82,6 +83,7 @@ struct BudgetFlush {
 };
 std::vector<BudgetFlush> g_budget_flushes;
 std::atomic<bool>        g_periodic {false};
+std::atomic<uint64_t>    g_mem1_ring {0}; // (mem1: the upload ring's bytes KYTY_MEM1 took off, 256 -> 128 MiB; 0 when set)
 
 const char* Env(const char* name) {
 	const char* value = std::getenv(name);
@@ -193,10 +195,19 @@ static bool Ram16On() {
 }
 static void StartRam16Line(); // (below: the "[ram16]" line's thread)
 static void StartRam18();     // (ram18, below: the cold-range thread)
+static void StartMem1();      // (mem1, below: the heap passes and the VirtualMemo census)
 
 void ApplyLowRamDefaults() {
 	static std::once_flag once;
 	std::call_once(once, [] {
+		// (mem1) KYTY_MEM1=1 (mem1.h): implies KYTY_RAM16=1 (the native offload's window hook stamps VirtualMemo, the
+		// "[ram16]" thread prints "[mem1]") and sets the upload ring to 128 MiB unless KYTY_STAGING_RING_MB is set.
+		std::string mem1_set;
+		if (Mem1::On()) {
+			(void)Mem1::Epoch();
+			SetDefault("KYTY_RAM16", "1", &mem1_set);
+			if (SetDefault("KYTY_STAGING_RING_MB", "128", &mem1_set)) g_mem1_ring.store(128 * MiB, std::memory_order_relaxed);
+		}
 		// (ram18) KYTY_RAM18=1: the game's cold memory to the disk store (texture-offload.h); implies KYTY_RAM17=1.
 		const char* ram18    = Env("KYTY_RAM18");
 		const bool  ram18_on = ram18 != nullptr && ram18[0] == '1';
@@ -208,6 +219,11 @@ void ApplyLowRamDefaults() {
 		const bool  ram20_on = ram20 != nullptr && ram20[0] == '1' && ram20[1] == '\0';
 		std::string ram20_set;
 		if (ram20_on) SetDefault("KYTY_RAM17", "1", &ram20_set);
+		// (ram1b) KYTY_RAM_NATIVE_TEX=1: the guest copy of the arrays' layers and the render targets to the disk store (the
+		// RAM18 cold-range path, texture-offload.h); implies KYTY_RAM17=1 (and RAM16). =2 drops nothing.
+		const bool  rnt_on = TextureOffload::RntAsked();
+		std::string rnt_set;
+		if (rnt_on) SetDefault("KYTY_RAM17", "1", &rnt_set);
 		// (ram17) KYTY_RAM17=1: the disk store of the native offload (texture-offload.h); implies KYTY_RAM16=1.
 		const char* ram17 = Env("KYTY_RAM17");
 		const bool  ram17_on = ram17 != nullptr && ram17[0] == '1';
@@ -249,6 +265,19 @@ void ApplyLowRamDefaults() {
 				            Env("KYTY_RAM20_COLD_S") != nullptr ? Env("KYTY_RAM20_COLD_S") : "10",
 				            Env("KYTY_RAM20_MB") != nullptr ? Env("KYTY_RAM20_MB") : "256",
 				            Env("KYTY_RAM20_LINE_S") != nullptr ? Env("KYTY_RAM20_LINE_S") : "10");
+				StartRam18();
+			}
+			if (Mem1::On()) {
+				std::printf("MEM1: on (KYTY_MEM1=1%s%s): the C++ heap's free blocks given back at 60 s, 120 s, then every 180 s "
+				            "(KYTY_MEM1_HEAP=0 off; periodic passes stop if the heap's lock is held over KYTY_MEM1_HEAP_MAX_MS, "
+				            "default 20); \"[mem1-vm]\" VirtualMemo census every 30 s; \"[mem1]\" line every 10 s\n",
+				            mem1_set.empty() ? "" : ", ", mem1_set.c_str());
+				StartMem1();
+			}
+			if (rnt_on) { // (ram1b)
+				std::printf("[rnt] RAM: copia guest de capas de arrays y render targets con imagen al almacen en disco y fuera de RAM "
+				            "(KYTY_RAM_NATIVE_TEX=1%s%s; ruta RAM18 en frio: cualquier toque la lee de vuelta del disco y se cuenta)\n",
+				            rnt_set.empty() ? "" : ", ", rnt_set.c_str());
 				StartRam18();
 			}
 			std::fflush(stdout);
@@ -1854,6 +1883,324 @@ void Ram18Line(char* out, size_t size, const RamLineProcesses& procs) {
 // (ram16) KYTY_RAM16=1: "[ram16]" every 5 s, what the RAM cuts save now and where the PC's RAM is, from system calls and
 // the cuts' own counters (no lock of the emulator's waited for: the offload's state is only tried), and every
 // KYTY_RAM16_CENSUS_S (default 30, 0 off) the census of the game's memory in RAM ("[ram16-censo]").
+// ---- (mem1) KYTY_MEM1=1 (mem1.h): the C++ heap's free blocks given back, the VirtualMemo census, the "[mem1]" line ----
+struct Mem1Heap {
+	std::atomic<uint64_t> passes {0}, committed {0}, busy {0}, free_bytes {0}, given {0}, given_resident {0}, given_total {0};
+	std::atomic<uint64_t> refused {0}, spans {0}, lock_us {0}, lock_us_max {0}, over_8ms {0};
+	std::atomic<bool>     stopped {false};
+};
+Mem1Heap g_mem1_heap;
+
+// One pass over the process heap (malloc/new): under its lock (this thread raised to the highest priority meanwhile, so
+// no thread waits on a descheduled holder), its free blocks of 64 KiB or more past their first 64 bytes and page-aligned
+// (the heap's header and free-list links stay) reset and taken out of the working set: their RAM and any page-file or
+// compression copy given back, the heap's commit unchanged (a block given out again gets pages as malloc would: content
+// undefined). Every buffer it uses is made before the lock (no heap call while holding it).
+void Mem1HeapPass() {
+	struct Span {
+		uint64_t begin, end;
+	};
+	constexpr size_t   MaxSpans = 65536, MaxSamples = 131072, Batch = 4096;
+	constexpr uint64_t Page = 4096, Min = uint64_t {64} << 10u, Step = uint64_t {64} << 10u;
+	static auto* spans = static_cast<Span*>(VirtualAlloc(nullptr, MaxSpans * sizeof(Span), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	static auto* ws    = static_cast<PSAPI_WORKING_SET_EX_INFORMATION*>(
+        VirtualAlloc(nullptr, MaxSamples * sizeof(PSAPI_WORKING_SET_EX_INFORMATION), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+	if (spans == nullptr || ws == nullptr) return;
+	HANDLE   heap      = GetProcessHeap();
+	uint64_t committed = 0, busy = 0, free_bytes = 0, given = 0, resident = 0, refused = 0;
+	size_t   count = 0, samples = 0;
+	HANDLE   self     = GetCurrentThread();
+	const int priority = GetThreadPriority(self);
+	(void)SetThreadPriority(self, THREAD_PRIORITY_HIGHEST);
+	const auto t0 = std::chrono::steady_clock::now();
+	if (!HeapLock(heap)) {
+		(void)SetThreadPriority(self, priority);
+		return;
+	}
+	PROCESS_HEAP_ENTRY entry {};
+	while (HeapWalk(heap, &entry)) {
+		if ((entry.wFlags & PROCESS_HEAP_REGION) != 0) {
+			committed += entry.Region.dwCommittedSize;
+			continue;
+		}
+		if ((entry.wFlags & PROCESS_HEAP_UNCOMMITTED_RANGE) != 0) continue;
+		if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0) {
+			busy += entry.cbData;
+			continue;
+		}
+		free_bytes += entry.cbData;
+		const uint64_t data  = reinterpret_cast<uint64_t>(entry.lpData);
+		const uint64_t begin = (data + 64 + Page - 1) & ~(Page - 1);
+		const uint64_t end   = (data + entry.cbData) & ~(Page - 1);
+		if (end > begin && end - begin >= Min && count < MaxSpans) spans[count++] = {begin, end};
+	}
+	// What of them is in RAM now (a page each 64 KiB): the RAM given back now; the rest was in the compression store or
+	// the page file (given back too: no copy kept).
+	for (size_t i = 0; i < count; i++)
+		for (uint64_t at = spans[i].begin; at < spans[i].end && samples < MaxSamples; at += Step) {
+			ws[samples]                = {};
+			ws[samples].VirtualAddress = reinterpret_cast<PVOID>(at);
+			samples++;
+		}
+	for (size_t begin = 0; begin < samples; begin += Batch) {
+		const size_t n = std::min(Batch, samples - begin);
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), ws + begin, static_cast<DWORD>(n * sizeof(ws[0]))) == 0) break;
+		for (size_t k = 0; k < n; k++) resident += (ws[begin + k].VirtualAttributes.Flags & 1u) != 0 ? Step : 0;
+	}
+	// Reset: committed private read-write pages only (as memory.cpp's NativeOffloadDrop: MEM_RESET, then VirtualUnlock -
+	// "not locked" - out of the working set).
+	for (size_t i = 0; i < count; i++) {
+		for (uint64_t at = spans[i].begin; at < spans[i].end;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+			const uint64_t stop = std::min(spans[i].end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+			if (stop <= at) break;
+			if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && (info.Protect & 0xffu) == PAGE_READWRITE &&
+			    (info.Protect & PAGE_GUARD) == 0) {
+				if (VirtualAlloc(reinterpret_cast<void*>(at), stop - at, MEM_RESET, PAGE_READWRITE) != nullptr) {
+					given += stop - at;
+					(void)VirtualUnlock(reinterpret_cast<void*>(at), stop - at);
+				} else {
+					refused += stop - at;
+				}
+			}
+			at = stop;
+		}
+	}
+	(void)HeapUnlock(heap);
+	const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+	(void)SetThreadPriority(self, priority);
+	auto& h = g_mem1_heap;
+	h.passes.fetch_add(1, std::memory_order_relaxed);
+	h.committed.store(committed, std::memory_order_relaxed);
+	h.busy.store(busy, std::memory_order_relaxed);
+	h.free_bytes.store(free_bytes, std::memory_order_relaxed);
+	h.given.store(given, std::memory_order_relaxed);
+	h.given_resident.store(std::min(resident, given), std::memory_order_relaxed);
+	h.given_total.fetch_add(given, std::memory_order_relaxed);
+	h.refused.store(refused, std::memory_order_relaxed);
+	h.spans.store(count, std::memory_order_relaxed);
+	h.lock_us.store(us, std::memory_order_relaxed);
+	if (us > h.lock_us_max.load(std::memory_order_relaxed)) h.lock_us_max.store(us, std::memory_order_relaxed);
+	if (us > 8000) h.over_8ms.fetch_add(1, std::memory_order_relaxed);
+	constexpr double MiBd = 1024.0 * 1024.0;
+	std::printf("[mem1-heap] pasada %llu: monton C++ comprometido %.0f MiB, en uso %.0f, libre %.0f; soltado %.0f MiB en %zu bloques "
+	            "(de ello en RAM %.0f; el resto estaba en la compresion o en el archivo de paginacion), rechazado %.0f; candado %.2f ms\n",
+	            static_cast<unsigned long long>(h.passes.load()), static_cast<double>(committed) / MiBd,
+	            static_cast<double>(busy) / MiBd, static_cast<double>(free_bytes) / MiBd, static_cast<double>(given) / MiBd, count,
+	            static_cast<double>(std::min(resident, given)) / MiBd, static_cast<double>(refused) / MiBd,
+	            static_cast<double>(us) / 1000.0);
+	std::fflush(stdout);
+}
+
+// The VirtualMemo census (every 30 s): each 64 KiB granule of the zone's committed private pages, by where it is (in
+// RAM: a working-set sample at its first page; taken: no access - RAM16/17/18's watchers -; out of RAM but accessible:
+// compression store, page file or never written), whether an image of the GPU caches lies over it (the last GPU residency
+// pass: sampled textures, render targets, GPU-written images), and when an emulator window last covered it (mem1.h's
+// stamps) against when this census first saw it committed (its load, to 30 s). Read-only: no protection change, no read
+// of guest bytes.
+struct Mem1Vm {
+	std::atomic<uint64_t> passes {0}, committed {0}, ram {0}, ram_image {0}, ram_lt10 {0}, ram_10_60 {0}, ram_gt60 {0};
+	std::atomic<uint64_t> ram_never {0}, ram_young {0}, taken {0}, out {0}, out_image {0}, residency_pass {0}, pass_us {0};
+	std::atomic<uint64_t> windows_10s {0};
+};
+Mem1Vm g_mem1_vm;
+
+void Mem1VmCensus() {
+	using namespace GpuResidency;
+	const auto         t0 = std::chrono::steady_clock::now();
+	constexpr size_t   MaxPairs = 16384, Batch = 1024;
+	static std::vector<uint64_t> pairs(MaxPairs * 2);
+	static std::vector<uint8_t>  covered(Mem1::Granules);
+	static std::vector<uint32_t> first_seen(Mem1::Granules, 0);
+	static std::vector<uint32_t> seen_pass(Mem1::Granules, 0);
+	static uint32_t              pass = 0;
+	pass++;
+	const char*  labels[] = {"VirtualMemo"};
+	const size_t n        = Loader::DemonsSoulsMemMap::RangesOf(labels, 1, pairs.data(), MaxPairs);
+	if (n == SIZE_MAX) return;
+	// The images over the zone (last residency pass).
+	std::fill(covered.begin(), covered.end(), uint8_t {0});
+	uint64_t residency = 0;
+	{
+		auto&           snap = Ram20Ranges();
+		std::lock_guard lock(snap.mutex);
+		residency = snap.pass;
+		for (const auto& range: snap.ranges) {
+			if (range.kind != Texture && range.kind != Target && range.kind != Storage) continue;
+			const uint64_t lo = std::max(range.address, Mem1::VmBase), hi = std::min(range.address + range.size, Mem1::VmEnd);
+			if (lo >= hi) continue;
+			for (uint64_t g = (lo - Mem1::VmBase) >> Mem1::GranuleBits; g <= (hi - 1 - Mem1::VmBase) >> Mem1::GranuleBits; g++)
+				covered[g] = 1;
+		}
+	}
+	// The committed granules (bytes of each, a region may start or end inside one).
+	struct Item {
+		uint64_t at, bytes;
+	};
+	std::vector<Item> items;
+	uint64_t          committed = 0, taken = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> spans;
+	for (size_t i = 0; i < n; i++)
+		if (pairs[2 * i + 1] > pairs[2 * i]) spans.emplace_back(std::max(pairs[2 * i], Mem1::VmBase), std::min(pairs[2 * i + 1], Mem1::VmEnd));
+	std::sort(spans.begin(), spans.end());
+	const uint32_t now = Mem1::NowStamp();
+	for (const auto& [lo, hi]: spans) {
+		for (uint64_t at = lo; at < hi;) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+			const uint64_t stop = std::min(hi, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+			if (stop <= at) break;
+			if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+				committed += stop - at;
+				const bool noaccess = (info.Protect & 0xffu) == PAGE_NOACCESS;
+				for (uint64_t g_at = at; g_at < stop;) {
+					const uint64_t g_end = std::min(stop, (g_at & ~(Mem1::Granule - 1)) + Mem1::Granule);
+					const uint64_t g     = (g_at - Mem1::VmBase) >> Mem1::GranuleBits;
+					if (first_seen[g] == 0 || seen_pass[g] + 1 < pass) first_seen[g] = now;
+					seen_pass[g] = pass;
+					if (noaccess) taken += g_end - g_at;
+					else items.push_back({g_at, g_end - g_at});
+					g_at = g_end;
+				}
+			}
+			at = stop;
+		}
+		if (items.size() > (size_t {1} << 20u)) break;
+	}
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> ws(items.size());
+	for (size_t i = 0; i < items.size(); i++) ws[i].VirtualAddress = reinterpret_cast<PVOID>(items[i].at);
+	for (size_t begin = 0; begin < ws.size(); begin += Batch) {
+		const size_t count = std::min(Batch, ws.size() - begin);
+		if (begin != 0) SwitchToThread();
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), ws.data() + begin, static_cast<DWORD>(count * sizeof(ws[0]))) == 0) return;
+	}
+	uint64_t ram = 0, ram_image = 0, lt10 = 0, mid = 0, gt60 = 0, never = 0, young = 0, out = 0, out_image = 0;
+	auto*    stamps = Mem1::WindowStamps();
+	for (size_t i = 0; i < items.size(); i++) {
+		const uint64_t g     = (items[i].at - Mem1::VmBase) >> Mem1::GranuleBits;
+		const uint64_t bytes = items[i].bytes;
+		if ((ws[i].VirtualAttributes.Flags & 1u) == 0) {
+			out += bytes;
+			if (covered[g] != 0) out_image += bytes;
+			continue;
+		}
+		ram += bytes;
+		if (covered[g] != 0) {
+			ram_image += bytes;
+			continue;
+		}
+		if (now - first_seen[g] < 60) young += bytes;
+		const uint32_t stamp = stamps[g].load(std::memory_order_relaxed);
+		if (stamp == 0 || stamp < first_seen[g]) never += bytes;
+		else if (now - stamp < 10) lt10 += bytes;
+		else if (now - stamp <= 60) mid += bytes;
+		else gt60 += bytes;
+	}
+	auto& v = g_mem1_vm;
+	v.passes.fetch_add(1, std::memory_order_relaxed);
+	v.committed.store(committed, std::memory_order_relaxed);
+	v.ram.store(ram, std::memory_order_relaxed);
+	v.ram_image.store(ram_image, std::memory_order_relaxed);
+	v.ram_lt10.store(lt10, std::memory_order_relaxed);
+	v.ram_10_60.store(mid, std::memory_order_relaxed);
+	v.ram_gt60.store(gt60, std::memory_order_relaxed);
+	v.ram_never.store(never, std::memory_order_relaxed);
+	v.ram_young.store(young, std::memory_order_relaxed);
+	v.taken.store(taken, std::memory_order_relaxed);
+	v.out.store(out, std::memory_order_relaxed);
+	v.out_image.store(out_image, std::memory_order_relaxed);
+	v.residency_pass.store(residency, std::memory_order_relaxed);
+	const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+	v.pass_us.store(us, std::memory_order_relaxed);
+	constexpr double GiBd = 1024.0 * 1024.0 * 1024.0;
+	std::printf("[mem1-vm] 30 s, GB: VirtualMemo comprometido %.2f; en RAM %.2f = bajo una imagen de la GPU %.2f + sin imagen %.2f "
+	            "(ventana del emulador hace <10 s %.2f, 10-60 s %.2f, >60 s %.2f, ninguna desde que se cargo %.2f; cargada hace "
+	            "<60 s %.2f); sacada (sin acceso: RAM16-18) %.2f; fuera de RAM accesible %.2f (bajo imagen %.2f); etapa 2 "
+	            "(VirtualMemo en la VRAM) sacaria de RAM %.2f mas lo comprimido de %.2f; residencia #%llu, %.1f ms\n",
+	            static_cast<double>(committed) / GiBd, static_cast<double>(ram) / GiBd, static_cast<double>(ram_image) / GiBd,
+	            static_cast<double>(ram - ram_image) / GiBd, static_cast<double>(lt10) / GiBd, static_cast<double>(mid) / GiBd,
+	            static_cast<double>(gt60) / GiBd, static_cast<double>(never) / GiBd, static_cast<double>(young) / GiBd,
+	            static_cast<double>(taken) / GiBd, static_cast<double>(out) / GiBd, static_cast<double>(out_image) / GiBd,
+	            static_cast<double>(ram) / GiBd, static_cast<double>(out) / GiBd, static_cast<unsigned long long>(residency),
+	            static_cast<double>(us) / 1000.0);
+	std::fflush(stdout);
+}
+
+// The mem1 thread (lowest priority; the heap pass raises itself while it holds the heap's lock).
+void Mem1Thread() {
+	SetThreadDescription(GetCurrentThread(), L"Kyty.Mem1");
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+	const char*  heap_env = Env("KYTY_MEM1_HEAP");
+	const bool   heap_on  = heap_env != nullptr && heap_env[0] == '1'; // (11-17) off unless asked: a pass froze the game 1.8-2.5 s in the PC
+	const double max_ms   = [] {
+        const char* v = Env("KYTY_MEM1_HEAP_MAX_MS");
+        return v == nullptr ? 20.0 : std::clamp(std::atof(v), 1.0, 1000.0);
+	}();
+	const auto start   = std::chrono::steady_clock::now();
+	int64_t    next_heap = 60, next_vm = 30;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		const int64_t s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+		if (heap_on && !g_mem1_heap.stopped.load(std::memory_order_relaxed) && s >= next_heap) {
+			Mem1HeapPass();
+			next_heap = next_heap < 120 ? 120 : next_heap + 180;
+			const double ms = static_cast<double>(g_mem1_heap.lock_us.load(std::memory_order_relaxed)) / 1000.0;
+			if (ms > max_ms && next_heap > 120) { // (the passes at 60 s and 120 s - loading - always run)
+				g_mem1_heap.stopped.store(true, std::memory_order_relaxed);
+				std::printf("[mem1-heap] el candado duro %.1f ms (mas de %.0f, KYTY_MEM1_HEAP_MAX_MS): sin mas pasadas periodicas\n", ms, max_ms);
+				std::fflush(stdout);
+			}
+		}
+		if (s >= next_vm) {
+			next_vm = s + 30;
+			Mem1VmCensus();
+		}
+	}
+}
+
+// The "[mem1]" line (every 10 s, from the "[ram16]" thread): what each measure gives back now, the RAM the user counts,
+// reads back and their time, losses, and the hitches it may cause (the heap's lock).
+void Mem1Line(char* out, size_t size, const RamLineProcesses& procs, const TextureOffload::Ram16View* view, uint64_t freed,
+              const MEMORYSTATUSEX& status) {
+	static TextureOffload::Ram16View last;
+	static bool                      have_last = false;
+	constexpr double                 GiBd = 1024.0 * 1024.0 * 1024.0, MiBd = 1024.0 * 1024.0;
+	const auto& h      = g_mem1_heap;
+	const uint64_t heap = h.given.load(std::memory_order_relaxed);
+	const uint64_t ring = g_mem1_ring.load(std::memory_order_relaxed);
+	const uint64_t tex  = view != nullptr ? view->saved + view->cold_now : 0;
+	uint64_t       reads = 0, read_bytes = 0, read_us = 0, lost = 0, read_max = 0;
+	if (view != nullptr) {
+		const auto d = [&](uint64_t TextureOffload::Ram16View::*field) { return have_last ? view->*field - last.*field : view->*field; };
+		reads      = d(&TextureOffload::Ram16View::restores) + d(&TextureOffload::Ram16View::file_reads);
+		read_bytes = d(&TextureOffload::Ram16View::restore_bytes) + d(&TextureOffload::Ram16View::file_read_bytes);
+		read_us    = d(&TextureOffload::Ram16View::restore_us) + d(&TextureOffload::Ram16View::file_read_us);
+		read_max   = view->file_read_us_max;
+		lost       = view->missed + view->file_failed;
+		last       = *view;
+		have_last  = true;
+	}
+	const double emu  = procs.ok ? static_cast<double>(procs.own_private) / GiBd : 0.0;
+	const double comp = procs.ok ? static_cast<double>(procs.compression_ws) / GiBd : 0.0;
+	std::snprintf(out, size,
+	              "[mem1] 10 s: ahorrado ahora %.2f GB = monton C++ %.2f (ultima pasada: libre %.2f de %.2f comprometido, soltado "
+	              "%.2f, de ello estaba en RAM %.2f; %llu pasadas) + anillo de subida %.2f + texturas y memoria fria (RAM16-18) "
+	              "%.2f + bloques libres del juego %.2f; RAM real: emulador %.2f + compresion de Windows %.2f = %.2f GB, "
+	              "disponible %.2f GB; lecturas de vuelta +%llu (%.0f MiB, %.1f ms; la mayor del fichero %.1f ms); PERDIDAS "
+	              "%llu; tirones atribuibles: candado del monton %.1f ms el ultimo, %.1f ms el mayor, %llu de mas de 8 ms%s",
+	              static_cast<double>(heap + ring + tex + freed) / GiBd, static_cast<double>(heap) / GiBd,
+	              static_cast<double>(h.free_bytes.load()) / GiBd, static_cast<double>(h.committed.load()) / GiBd,
+	              static_cast<double>(heap) / GiBd, static_cast<double>(h.given_resident.load()) / GiBd,
+	              static_cast<unsigned long long>(h.passes.load()), static_cast<double>(ring) / GiBd, static_cast<double>(tex) / GiBd,
+	              static_cast<double>(freed) / GiBd, emu, comp, emu + comp, static_cast<double>(status.ullAvailPhys) / GiBd,
+	              static_cast<unsigned long long>(reads), static_cast<double>(read_bytes) / MiBd, static_cast<double>(read_us) / 1000.0,
+	              static_cast<double>(read_max) / 1000.0, static_cast<unsigned long long>(lost),
+	              static_cast<double>(h.lock_us.load()) / 1000.0, static_cast<double>(h.lock_us_max.load()) / 1000.0,
+	              static_cast<unsigned long long>(h.over_8ms.load()),
+	              h.stopped.load(std::memory_order_relaxed) ? " (pasadas periodicas paradas)" : "");
+}
+
 void Ram16Thread() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.Ram16");
 	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -1961,10 +2308,18 @@ void Ram16Thread() {
 			line20_tick = 0;
 			Ram20Line(line20, sizeof(line20), procs, line20_s);
 		}
+		// (mem1, KYTY_MEM1=1) Every 10 s.
+		char       line_m1[1200] {};
+		static int mem1_tick = 0;
+		if (Mem1::On() && (mem1_tick += 5) >= 10) {
+			mem1_tick = 0;
+			Mem1Line(line_m1, sizeof(line_m1), procs, have_view ? &view : nullptr, freed, status);
+		}
 		std::printf("%s\n", line);
 		if (line17[0] != '\0') std::printf("%s\n", line17);
 		if (line18[0] != '\0') std::printf("%s\n", line18);
 		if (line20[0] != '\0') std::printf("%s\n", line20);
+		if (line_m1[0] != '\0') std::printf("%s\n", line_m1);
 		if (census_s > 0 && std::chrono::steady_clock::now() - census_at >= std::chrono::seconds(census_s)) {
 			census_at = std::chrono::steady_clock::now();
 			char     text[768];
@@ -1993,6 +2348,13 @@ static void StartRam16Line() {
 #if defined(_WIN32)
 	static std::once_flag once;
 	std::call_once(once, [] { std::thread(Ram16Thread).detach(); });
+#endif
+}
+
+static void StartMem1() {
+#if defined(_WIN32)
+	static std::once_flag once;
+	std::call_once(once, [] { std::thread(Mem1Thread).detach(); });
 #endif
 }
 
@@ -2498,7 +2860,7 @@ void Watch() {
 			buffers = exchange.buffers;
 			copy_ms = exchange.copy_ms;
 		}
-		if (Ram20On()) { // (ram20: the RAM20 pass's map, a copy)
+		if (Ram20On() || Mem1::On()) { // (ram20: the RAM20 pass's map, a copy; mem1: its VirtualMemo census reads it too)
 			auto&           snap = Ram20Ranges();
 			std::lock_guard lock(snap.mutex);
 			snap.ranges = ranges;

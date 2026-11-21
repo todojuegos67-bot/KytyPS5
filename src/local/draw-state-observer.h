@@ -57,7 +57,10 @@ inline void WriteRegister(uint32_t space, uint32_t raw_offset, uint32_t value) {
 		}
 	};
 	if (space == 1) {
-		if (offset < Pm4::SH_NUM && ShFree(offset)) return;
+		if (offset < Pm4::SH_NUM && ShFree(offset)) {
+			s.sh[offset] = s.generation | value; // (gancho1: known for ShHolds; a free register never dirties the gap)
+			return;
+		}
 		update(s.sh);
 	} else if (space == 0) {
 		update(s.cx);
@@ -75,6 +78,11 @@ inline void WriteIndirectBlock(uint32_t space, const uint32_t* packet) {
 		if (block[2 * i] == 0xffffffffu) continue;
 		WriteRegister(space, block[2 * i], block[2 * i + 1]);
 	}
+}
+
+// (gancho1) Whether SH register `offset` is known to hold `value` (written in this generation with it).
+[[nodiscard]] inline bool ShHolds(uint32_t offset, uint32_t value) {
+	return offset < Pm4::SH_NUM && g_shadow.sh[offset] == (g_shadow.generation | value);
 }
 
 // The registers changed in bulk (context clear/push/pop, a register reset): nothing the

@@ -1,3 +1,6 @@
+#include "local/pathtrace.h" // (pt1: F9)
+#include "local/rtq.h"       // (rtq1: F10)
+#include "local/rt-reflections.h" // (rpost1: F10)
 #include "local/port-live.h"
 #include "local/skip-shader.h"
 #include "graphics/presentation/window.h"
@@ -46,6 +49,8 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <atomic>
+#include <mutex>
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
 #include "kytyGitVersion.h"
@@ -138,37 +143,59 @@ static uint32_t PadTargetFromName(std::string_view name, bool* ok) {
 	return 0;
 }
 
-static PadRemap& GetPadRemap() {
-	static PadRemap remap = [] {
-		PadRemap r;
-		for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) r.button[i] = ControllerButtonToPadButton(i);
-		const char* env = std::getenv("KYTY_PAD_MAP");
-		if (env == nullptr || *env == '\0') return r;
-		r.active              = true;
-		std::string_view list = env;
-		while (!list.empty()) {
-			const auto end   = list.find(';');
-			const auto entry = list.substr(0, end);
-			list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
-			const auto eq    = entry.find('=');
-			if (eq == std::string_view::npos) continue;
-			const std::string source(entry.substr(0, eq));
-			bool              ok     = false;
-			const uint32_t    target = PadTargetFromName(entry.substr(eq + 1), &ok);
-			if (!ok) {
-				LOGF("KYTY_PAD_MAP: unknown target in '%s'\n", std::string(entry).c_str());
-			} else if (source == "lefttrigger" || source == "righttrigger") {
-				r.trigger[source == "lefttrigger" ? 0 : 1] = target;
-			} else if (const auto b = SDL_GameControllerGetButtonFromString(source.c_str());
-			           b != SDL_CONTROLLER_BUTTON_INVALID) {
-				r.button[b] = target;
-			} else {
-				LOGF("KYTY_PAD_MAP: unknown input in '%s'\n", std::string(entry).c_str());
-			}
+static PadRemap BuildPadRemap(const char* text) {
+	PadRemap r;
+	for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) r.button[i] = ControllerButtonToPadButton(i);
+	if (text == nullptr || *text == '\0') return r;
+	r.active              = true;
+	std::string_view list = text;
+	while (!list.empty()) {
+		const auto end   = list.find(';');
+		const auto entry = list.substr(0, end);
+		list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
+		const auto eq    = entry.find('=');
+		if (eq == std::string_view::npos) continue;
+		const std::string source(entry.substr(0, eq));
+		bool              ok     = false;
+		const uint32_t    target = PadTargetFromName(entry.substr(eq + 1), &ok);
+		if (!ok) {
+			LOGF("KYTY_PAD_MAP: unknown target in '%s'\n", std::string(entry).c_str());
+		} else if (source == "lefttrigger" || source == "righttrigger") {
+			r.trigger[source == "lefttrigger" ? 0 : 1] = target;
+		} else if (const auto b = SDL_GameControllerGetButtonFromString(source.c_str());
+		           b != SDL_CONTROLLER_BUTTON_INVALID) {
+			r.button[b] = target;
+		} else {
+			LOGF("KYTY_PAD_MAP: unknown input in '%s'\n", std::string(entry).c_str());
 		}
-		LOGF("KYTY_PAD_MAP: %s\n", env);
-		return r;
-	}();
+	}
+	LOGF("KYTY_PAD_MAP: %s\n", text);
+	return r;
+}
+
+// (remap-f2) The F2 menu's "Mapear mando" changes the map live (HostPadMapSetLive, present thread): the window thread
+// (the only one that reads the map) takes the new text at its next pad event.
+static std::mutex        g_pad_live_mutex;
+static std::string       g_pad_live_text;
+static std::atomic<bool> g_pad_live_pending {false};
+
+void HostPadMapSetLive(const char* map) {
+	std::scoped_lock lock(g_pad_live_mutex);
+	g_pad_live_text = map != nullptr ? map : "";
+	g_pad_live_pending.store(true, std::memory_order_release);
+}
+
+static PadRemap& GetPadRemap() {
+	static PadRemap remap = BuildPadRemap(std::getenv("KYTY_PAD_MAP"));
+	if (g_pad_live_pending.exchange(false, std::memory_order_acquire)) {
+		std::string text;
+		{
+			std::scoped_lock lock(g_pad_live_mutex);
+			text = g_pad_live_text;
+		}
+		remap = BuildPadRemap(text.c_str());
+		if (!remap.active) LOGF("KYTY_PAD_MAP: (default buttons)\n");
+	}
 	return remap;
 }
 
@@ -342,8 +369,30 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				// KYTY_KBM: Space is a game key (roll), not pause.
 				if (!HostInputKbmEnabled()) SetPause(game, !game.paused.load(std::memory_order_acquire));
 				break;
+			// (rtq1) F10 with KYTY_RTQ: the ray-traced effects' debug view on / off (rtq.h).
+			case SDLK_F10:
+				// (rpost1) KYTY_REFL_POST: F10 the reflection's light after the upscaler ON / OFF (same place, A/B by eye).
+				if (Libs::Graphics::FrameGen::RtReflPostWanted() && !key.repeat) {
+					const bool v = Libs::Graphics::FrameGen::RtReflPostToggle();
+					std::printf("RT reflections: post-upscale %s (F10)\n", v ? "ON" : "OFF");
+					std::fflush(stdout);
+					Loader::DemonsSoulsWarp::ShowNotice(v ? "Reflejos tras el reescalado: ON (F10)" : "Reflejos tras el reescalado: OFF (F10)", 3);
+				} else if (Rtq::Wanted() && !key.repeat) {
+					const bool v = !Rtq::debug_view.load(std::memory_order_relaxed);
+					Rtq::debug_view.store(v, std::memory_order_relaxed);
+					Loader::DemonsSoulsWarp::ShowNotice(v ? "RTQ: vista de depuracion ON (F10)" : "RTQ: vista de depuracion OFF (F10)", 2);
+				}
+				break;
 			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
 			case SDLK_F9:
+				// (pt1) BB_PATHTRACING=1: F9 turns the path tracing on / off (A/B); the snapshot keeps F9 otherwise.
+				if (Libs::Graphics::PathTrace::Requested()) {
+					if (!key.repeat) {
+						Libs::Graphics::PathTrace::ToggleLive();
+						Loader::DemonsSoulsWarp::ShowNotice("Path tracing: F9 (ver [pt] en el log)", 2);
+					}
+					break;
+				}
 				if (!key.repeat) {
 					if (!game.paused.load(std::memory_order_acquire)) {
 						const auto folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);

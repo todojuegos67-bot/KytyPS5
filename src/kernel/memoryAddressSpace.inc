@@ -2285,6 +2285,7 @@ public:
 				hooks.excluded    = &ColdExcluded;
 				hooks.forget      = &ColdForget;
 				ColdStore::Start(hooks);
+				F0Measure::SetGate(&ColdGateLock, &ColdGateUnlock); // (f0: the read sampler's guards, gate alone)
 			}
 			return;
 		}
@@ -5316,6 +5317,7 @@ private:
 			bool                                  on    = Raiz::On();
 			bool                                  gpu   = on && Graphics::GuestGpu::IsGpuThread();
 			uint64_t                              pages = 0;
+			uint64_t                              range_vaddr = 0, range_size = 0; // (g1)
 			std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 			~GpuProtectTimer() {
 				if (!on) return;
@@ -5323,6 +5325,7 @@ private:
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 				const auto us = ns / 1000u;
 				Raiz::NoteProtect(gpu, pages, us);
+				G1::NoteProtect(gpu, Raiz::t_protect_origin, range_vaddr, range_size, ns); // (g1, KYTY_G1_PROBE: by label and pass)
 				auto& cost = Raiz::g_cost[Raiz::ClassOf(gpu)]; // (raiz9: in ns - a change is a few us -)
 				cost.calls.fetch_add(1, std::memory_order_relaxed);
 				cost.ns.fetch_add(ns, std::memory_order_relaxed);
@@ -5332,11 +5335,14 @@ private:
 			}
 		} gpu_timer;
 		gpu_timer.pages = (size + 0xfffu) >> 12u;
+		gpu_timer.range_vaddr = vaddr; // (g1)
+		gpu_timer.range_size  = size;
 		// (raiz1: the gate, shared - alone with KYTY_RAIZ_VERIFY -: NativeProtectLock.)
 		NativeProtectLock guard(NativeReadFaultsRequested());
 		// (ram11; ram12: with the gate held - the cold store probes and evicts with it alone -, so nothing of the range
 		// can be probed or evicted between this and the change below.)
 		ColdStore::Ensure(vaddr, size);
+		F0Measure::Ensure(vaddr, size); // (f0: our guards off first)
 #endif
 		const auto end = vaddr + size;
 		auto       it  = m_mapped.upper_bound(vaddr);

@@ -107,6 +107,12 @@
 // pixel (chist), reprojected by the motion vector, averaged and limited to a change of 6 % of the pixel's light a frame on a
 // still camera (36 % moving); no added darkening (it moves only between two results that both keep MaxDarken). Every 10 s
 // "RT reflections: flash fix:" with the shares where each limit acted (stats 30 / 31).
+//
+// (pt1e) BB_PATHTRACING=1 with these reflections on: its hardware fill (pathtrace.cpp RecordReflFill, pt.comp modes 9..11)
+// takes the hybrid's place between the trace and the temporal pass: only on the pixels this path reflects (its mask and
+// strength) whose screen-space ray missed, one ray per block of trace pixels, the hit's colour from this frame's screen,
+// else the last composite, else the hit mesh's learned radiance, else nothing (the game's own fill stays). Off (F9, no TLAS
+// this frame): exactly this path alone. The whole chain's GPU ms with and without it go to pathtrace.cpp's A/B line.
 #include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/rt-reflections.h"
 
@@ -114,10 +120,14 @@
 #include "gpu_tiler_shaders/rt_reflections_spv.h"
 #include "gpu_tiler_shaders/rt_refl_hw_spv.h"
 #include "local/hwrt-scene.h"
+#include "local/pathtrace.h"
 #include "local/rt-flicker.h"
+#include "local/rtq.h"              // (rtq1)
+#include "loader/demonsSoulsWarp.h" // (rtq1: the A/B window notice in the debug view)
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -129,8 +139,8 @@
 namespace Libs::Graphics::FrameGen {
 namespace {
 
-constexpr uint32_t Bindings      = 22;
-constexpr uint32_t HeaderBytes   = 208;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams, yparams
+constexpr uint32_t Bindings      = 24;            // (rt4: 22 the game's specular IBL copy; rpost1: 23 the post-upscale image)
+constexpr uint32_t HeaderBytes   = 224;           // view_rot[3], clip_prev[4], up_view, fparams, mparams, gparams, xparams, yparams, rparams (rt4)
 // calib[] (after the header; the shader's CALIB_* / STATS): samples, normal sums per layer x layout x space x screen
 // y convention, byte statistics, floor votes, then the cumulative stats counters (never cleared).
 constexpr uint32_t NLayouts      = 13;
@@ -152,6 +162,20 @@ constexpr uint32_t PStatsCount   = 20;
 // 10 s, "RT reflections: reprojection:"): see the shader's RStat
 constexpr uint32_t RStatsIndex   = 1424;
 constexpr uint32_t RStatsCount   = 8;
+// (rt4) the shader's R4STATS: rays by outcome, the IBL fill, water / not water, the fill's calibration, the shown change frame
+// to frame, the motion vectors against the camera, the smoothed normal (see the shader's R4Stat; "[rt4]" every 10 s)
+constexpr uint32_t R4StatsIndex  = 1432;
+constexpr uint32_t R4StatsCount  = 32;
+// (rt5) the shader's R5STATS: history accepted / its weight / its distance by camera motion class, the shown change by class,
+// reflective surfaces by source, rays and hits by angle, the half-rate rough lobes, the pixels changed (see R5Stat; "[rt5]")
+constexpr uint32_t R5StatsIndex  = 1464;
+constexpr uint32_t R5StatsCount  = 32;
+static_assert(HeaderBytes + (R5StatsIndex + R5StatsCount) * 4 <= 8192);
+// (rtq1) the shader's QSTATS (KYTY_RTQ): the ray budget's bands and rays, the composite's early out and its exactness, the
+// temporal pass's holes, the shown change on a still camera (see the shader's QStat; "[rtq] reflejos" every 10 s)
+constexpr uint32_t QStatsIndex   = 1496;
+constexpr uint32_t QStatsCount   = 16;
+static_assert(R5StatsIndex + R5StatsCount <= QStatsIndex && HeaderBytes + (QStatsIndex + QStatsCount) * 4 <= 8192);
 // (refl9) The metal survey (the shader's SURVEY, mode 8; never cleared): static / moving sample counts, set-bit counts
 // per class x layer x bit, byte histograms per class x field x 16 bins.
 constexpr uint32_t SurveyIndex   = 600;
@@ -176,6 +200,7 @@ static_assert(SurveyIndex + SurveyCount <= WStatsIndex && HeaderBytes + (WStatsI
 static_assert(StatsIndex + StatsCount <= SurveyIndex && HeaderBytes + (SurveyIndex + SurveyCount) * 4 <= FrameBytes);
 static_assert(WStatsIndex + WStatsCount <= PStatsIndex && HeaderBytes + (PStatsIndex + PStatsCount) * 4 <= FrameBytes);
 static_assert(PStatsIndex + PStatsCount <= RStatsIndex && HeaderBytes + (RStatsIndex + RStatsCount) * 4 <= FrameBytes);
+static_assert(RStatsIndex + RStatsCount <= R4StatsIndex && HeaderBytes + (R4StatsIndex + R4StatsCount) * 4 <= FrameBytes);
 static_assert(SurveyHist == SurveyBits + 2 * 128 && SurveyHist + 2 * 256 == SurveyCount);
 
 struct RtPush {
@@ -220,6 +245,10 @@ struct RtPass {
 	RtImage                 gb[2], hist[2], meta[2];
 	RtImage                 rad2, fhist[2]; // (refl-hybrid-1028) the trace's result with the fill, the fill's history
 	RtImage                 chist[2];       // (rtfly-1029) the composite's contribution per render pixel (+ distance)
+	RtImage                 post_add;       // (rpost1) this frame's added reflection light, put on after the upscaler
+	bool                    post_pending = false, post_broken = false; // (rpost1) set by the composite, taken by PostAdd
+	float                   post_jx = 0.0f, post_jy = 0.0f;           // (rpost1) the frame's jitter (render pixels)
+	uint64_t                post_frames = 0;                          // (rpost1) frames the light went on after the upscale
 	bool                    stable = true;  // (rtfly-1029) KYTY_RT_REFLECTIONS_STABLE
 	bool                    water_stable = true; // (water-1030) KYTY_RT_REFLECTIONS_WATER_STABLE
 	bool                    water_max_clear = false;
@@ -236,6 +265,33 @@ struct RtPass {
 	std::array<uint32_t, RStatsCount> rep_last {};
 	std::array<uint64_t, RStatsCount> rep_sum {};
 	std::chrono::steady_clock::time_point rep_time = std::chrono::steady_clock::now();
+	// (rt4) the [rt4] counters: last values, sums per A/B phase (1 on, 0 off) since the last line; the fill's calibration
+	// (a decaying window of the log2 hit / IBL ratios, both models) and its verdict; the IBL copy this frame
+	std::array<uint32_t, R4StatsCount>                r4_last {};
+	std::array<std::array<uint64_t, R4StatsCount>, 2> r4_sum {};
+	std::array<uint32_t, 2>                           r4_frames {};
+	double                  cal_n = 0.0;
+	std::array<double, 2>   cal_s {}, cal_ss {};
+	int                     cal_model = -1;  // (-1: not decided yet; 0 the IBL as radiance, 1 divided by the BRDF)
+	float                   cal_gain  = 1.0f;
+	uint32_t                cal_other_better = 0;
+	// (rt5) the [rt5] counters: last values, sums since the last line
+	std::array<uint32_t, R5StatsCount> r5_last {};
+	// (rtq1) KYTY_RTQ: per phase (0 old, 1 new) the GPU time of the timed frames, per pass, and the counters' sums since the
+	// last line (QSTATS and the composite's pixel count, STATS + 0); the phase of each timed ring entry; the window seen.
+	std::array<uint8_t, 8>                     rtq_of {};
+	std::array<double, 2>                      rtq_ms {};
+	std::array<uint32_t, 2>                    rtq_n {};
+	std::array<std::array<double, 12>, 2>      rtq_stage_ms {};
+	std::array<uint32_t, QStatsCount + 1>      rtq_last {};
+	std::array<std::array<uint64_t, QStatsCount + 1>, 2> rtq_sum {};
+	std::array<uint64_t, 2>                    rtq_frames {};
+	long long                                  rtq_window = -1;
+	uint32_t                                   rtq_settle = 0; // frames left to skip after a window change (in flight)
+	std::array<uint64_t, R5StatsCount> r5_sum {};
+	uint64_t                           r5_frames = 0;
+	bool                    have_ibl = false;
+	uint64_t                ibl_frames = 0;
 	RtImage                 dummy; // 1x1 R32_UINT stand-in for absent G-buffer layers
 	std::vector<Retired>    retired;
 	VkBuffer                frame_buf = VK_NULL_HANDLE; // device-local: the shader's header, sums and counters
@@ -286,8 +342,17 @@ struct RtPass {
 	uint32_t                samples = 0;
 	std::array<std::array<uint8_t, 16>, 8> stage_of {}; // the pass each interval timed (Stage), per ring entry
 	std::array<uint32_t, 8>               stamps_in {};  // timestamps written per ring entry
-	std::array<double, 11>                stage_ms {};   // sums since the last line
-	std::array<uint32_t, 11>              stage_frames {};
+	std::array<double, 12>                stage_ms {};   // sums since the last line (pt1e: 12 stages)
+	std::array<uint32_t, 12>              stage_frames {};
+	std::array<uint8_t, 8>                fill_of {};    // (pt1e) per ring entry: BB_PATHTRACING's fill ran in that frame
+	// (rt3) The trace-sized images' allocation (rt2's trace size; the trace in use, `trace`, may be smaller), the phase each
+	// timed ring entry ran with (1 rt3 on, 0 off) and the GPU time per phase since the last line (KYTY_RT3_AB).
+	vk::Extent2D                          trace_alloc {};
+	std::array<uint8_t, 8>                phase_of {};
+	std::array<double, 2>                 ab_ms {};
+	std::array<uint32_t, 2>               ab_n {};
+	std::array<std::array<double, 12>, 2> ab_stage_ms {};
+	std::array<std::array<uint32_t, 12>, 2> ab_stage_n {};
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 	// (refl-hybrid-1028) The hybrid's ray query pipeline, buffer and counters.
 	vk::DescriptorSetLayout hw_set_layout = nullptr;
@@ -419,10 +484,10 @@ void Barrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stage, vk::A
 	command.pipelineBarrier2(dependency);
 }
 
-std::array<RtImage*, 18> Sized() {
+std::array<RtImage*, 19> Sized() {
 	return {&g_rt.hiz, &g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.out, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0],
 	        &g_rt.hist[1], &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1], &g_rt.chist[0],
-	        &g_rt.chist[1], &g_rt.dummy};
+	        &g_rt.chist[1], &g_rt.post_add, &g_rt.dummy};
 }
 
 bool EnsurePipeline(GraphicContext& graphics) {
@@ -434,7 +499,7 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	for (uint32_t i = 0; i < Bindings; ++i) {
 		bindings[i].binding         = i;
 		bindings[i].descriptorType  = (i == 18 || i == 19)                       ? vk::DescriptorType::eStorageBuffer
-		                              : (i == 4 || i == 11 || i == 12 || i == 13) ? vk::DescriptorType::eStorageImage
+		                              : (i == 4 || i == 11 || i == 12 || i == 13 || i == 23) ? vk::DescriptorType::eStorageImage
 		                                                                          : vk::DescriptorType::eCombinedImageSampler;
 		bindings[i].descriptorCount = 1;
 		bindings[i].stageFlags      = vk::ShaderStageFlagBits::eCompute;
@@ -561,9 +626,93 @@ vk::Extent2D TraceExtent(vk::Extent2D render, vk::Extent2D output, int level) {
 	return TraceFull(level) ? render : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
 }
 
+} // namespace (rt3: Rt3Wanted is the header's)
+// (rt4) KYTY_RT4=1: see rt-reflections.h (implies rt3 and rt2).
+// (rt5) KYTY_RT5=1: see rt-reflections.h (implies rt4, rt3 and rt2).
+bool Rt5Wanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT5");
+		const bool  v = e != nullptr && e[0] == '1';
+		if (v) {
+			std::printf("[rt5] on (KYTY_RT5=1, implies KYTY_RT4, KYTY_RT3 and KYTY_RT2): G-buffer surfaces reflect by their material; "
+			            "the composite replaces the game's specular IBL term at its split-sum weight (EnvBRDF x (ours - the game's "
+			            "reflected radiance)), the fill at the game's own scale (a miss changes nothing); rough lobes (> 0.25) "
+			            "traced on half the pixels a frame; static surfaces: the reflection's history at its virtual image point "
+			            "(temporal and stabilisation), let go by disagreement, not by speed; water unchanged\n");
+			std::fflush(stdout);
+		}
+		return v;
+	}();
+	return on;
+}
+bool Rt4Wanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT4");
+		const bool  v = (e != nullptr && e[0] == '1') || Rt5Wanted(); // (rt5 implies rt4)
+		if (v) {
+			std::printf("[rt4] on (KYTY_RT4=1, implies KYTY_RT3 and KYTY_RT2): misses / screen edges / occlusions filled with the "
+			            "game's own specular IBL (kRTT_SpecularIBL_HalfResX: its SSR + local box cubemaps + distant cubemap) by the "
+			            "ray's confidence, the fill's scale calibrated from confident hits; not water: the reflection ray along "
+			            "the footprint's smoothed normal (normal-map spread as lobe width, KYTY_RT4_TOKSVIG), the camera's own "
+			            "reprojection on static surfaces, R2 + hash samples instead of interleaved gradient noise; water unchanged%s\n",
+			            [] {
+				            const char* ab = std::getenv("KYTY_RT4_AB");
+				            return ab != nullptr && ab[0] == '1' ? " (KYTY_RT4_AB=1: 5 s on / 5 s off)" : "";
+			            }());
+			std::fflush(stdout);
+		}
+		return v;
+	}();
+	return on;
+}
+bool Rt3Wanted() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT3");
+		return (e != nullptr && e[0] == '1') || Rt4Wanted(); // (rt4 implies rt3)
+	}();
+	return on;
+}
+namespace {
+// (rt4) KYTY_RT4_AB=1 with KYTY_RT4=1: rt4 on for 5 s, off for 5 s, in turn (rt3 / rt2 stay on; the [rt4] counters run in
+// both phases, so the line compares them in the same run and places).
+bool Rt4Ab() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT4_AB");
+		return Rt4Wanted() && e != nullptr && e[0] == '1';
+	}();
+	return on;
+}
+bool Rt4On() {
+	if (!Rt4Wanted()) return false;
+	if (!Rt4Ab()) return true;
+	static const auto t0 = std::chrono::steady_clock::now();
+	return (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count() / 5) % 2 == 0;
+}
+// (rt3) KYTY_RT3_AB=1 with KYTY_RT3=1: rt3 on for 5 s, off for 5 s, in turn (the same run, the same places).
+bool Rt3Ab() {
+	static const bool on = [] {
+		const char* e = std::getenv("KYTY_RT3_AB");
+		return Rt3Wanted() && e != nullptr && e[0] == '1';
+	}();
+	return on;
+}
+bool Rt3On() {
+	if (!Rt3Wanted()) return false;
+	if (!Rt3Ab()) return true;
+	static const auto t0 = std::chrono::steady_clock::now();
+	return (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count() / 5) % 2 == 0;
+}
+// (rt3) The trace in use: the render size wherever rt2 traced at the full (render) or larger (Maxima: the output) size;
+// half as before on the half-resolution levels. Never larger than the images (rt2's size).
+vk::Extent2D Rt3TraceExtent(vk::Extent2D render, int level, vk::Extent2D alloc) {
+	const vk::Extent2D t = TraceFull(level) ? render
+	                                        : vk::Extent2D {std::max(1u, (render.width + 1) / 2), std::max(1u, (render.height + 1) / 2)};
+	return {std::min(t.width, alloc.width), std::min(t.height, alloc.height)};
+}
+
 bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level, vk::Extent2D output) {
 	const vk::Extent2D trace = TraceExtent(render, output, level);
-	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level && g_rt.trace == trace) return true;
+	if (g_rt.out.image != VK_NULL_HANDLE && g_rt.render == render && g_rt.level == level && g_rt.trace_alloc == trace) return true;
 	for (auto* img: Sized())
 		if (img != &g_rt.dummy) Retire(*img);
 	uint32_t levels = 1;
@@ -571,7 +720,8 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level, vk::
 	const auto f16 = vk::Format::eR16G16B16A16Sfloat;
 	bool ok = MakeImage(graphics, g_rt.hiz, vk::Format::eR32Sfloat, render, levels, true) &&
 	          MakeImage(graphics, g_rt.out, f16, render, 1, true) && MakeImage(graphics, g_rt.chist[0], f16, render, 1, true) &&
-	          MakeImage(graphics, g_rt.chist[1], f16, render, 1, true);
+	          MakeImage(graphics, g_rt.chist[1], f16, render, 1, true) &&
+	          MakeImage(graphics, g_rt.post_add, f16, render, 1, true); // (rpost1)
 	for (auto* img: {&g_rt.rad, &g_rt.aux, &g_rt.tmp_a, &g_rt.tmp_b, &g_rt.gb[0], &g_rt.gb[1], &g_rt.hist[0], &g_rt.hist[1],
 	                 &g_rt.meta[0], &g_rt.meta[1], &g_rt.rad2, &g_rt.fhist[0], &g_rt.fhist[1]})
 		ok = ok && MakeImage(graphics, *img, f16, trace, 1, true);
@@ -583,6 +733,7 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D render, int level, vk::
 	}
 	g_rt.render        = render;
 	g_rt.trace         = trace;
+	g_rt.trace_alloc   = trace; // (rt3: the images' size; RtReflectionsApply picks the trace in use each frame)
 	g_rt.level         = level;
 	g_rt.history_valid = false;
 	g_rt.hw_ran_last   = false;
@@ -623,10 +774,10 @@ void PrepareImages(vk::CommandBuffer command) {
 	}
 }
 
-enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey, StHybrid };
-constexpr uint32_t NStages = 11;
+enum Stage : uint8_t { StHiz, StCalib, StTrace, StTemporal, StAtrous0, StAtrous1, StAtrous2, StAtrous3, StComposite, StSurvey, StHybrid, StPtFill };
+constexpr uint32_t NStages = 12;
 const char* const StageNames[NStages] = {"hi-z", "calib", "trace", "temporal", "a-trous 1", "a-trous 2", "a-trous 3", "a-trous 4",
-                                         "composite", "metal survey", "hybrid (TLAS fill)"};
+                                         "composite", "metal survey", "hybrid (TLAS fill)", "PT fill (TLAS)"};
 
 void ReadTiming(GraphicContext& graphics) {
 	if (g_rt.pool == nullptr) return;
@@ -640,11 +791,23 @@ void ReadTiming(GraphicContext& graphics) {
 		if (n >= 2 && stamps[n - 1] > stamps[0]) {
 			g_rt.sum_ms += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
 			++g_rt.samples;
+			const int ph = g_rt.phase_of[entry] != 0 ? 1 : 0; // (rt3)
+			const int qp = g_rt.rtq_of[entry] != 0 ? 1 : 0;   // (rtq1)
+			g_rt.rtq_ms[qp] += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
+			++g_rt.rtq_n[qp];
+			g_rt.ab_ms[ph] += static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6;
+			++g_rt.ab_n[ph];
+			// (pt1e) the whole chain with / without BB_PATHTRACING's fill: its A/B line
+			if (PathTrace::Requested())
+				PathTrace::NoteReflectionsMs(static_cast<double>(stamps[n - 1] - stamps[0]) * g_rt.period_ns / 1e6, g_rt.fill_of[entry] != 0);
 			std::array<bool, NStages> seen {};
 			for (uint32_t k = 1; k < n; ++k) {
 				const uint8_t st = g_rt.stage_of[entry][k];
 				if (st >= NStages || stamps[k] < stamps[k - 1]) continue;
 				g_rt.stage_ms[st] += static_cast<double>(stamps[k] - stamps[k - 1]) * g_rt.period_ns / 1e6;
+				g_rt.ab_stage_ms[ph][st] += static_cast<double>(stamps[k] - stamps[k - 1]) * g_rt.period_ns / 1e6;
+				g_rt.rtq_stage_ms[qp][st] += static_cast<double>(stamps[k] - stamps[k - 1]) * g_rt.period_ns / 1e6; // (rtq1)
+				++g_rt.ab_stage_n[ph][st];
 				seen[st] = true;
 			}
 			for (uint32_t st = 0; st < NStages; ++st)
@@ -894,7 +1057,7 @@ bool ReprojWanted() {
 	static const bool on = [] {
 		const char* e  = std::getenv("KYTY_RT_REFLECTIONS_REPROJ");
 		const char* e1 = std::getenv("KYTY_RTREFL1"); // (rtrefl1: the master switch turns this on too)
-		const bool  v  = (e != nullptr && e[0] == '1') || (e1 != nullptr && e1[0] == '1');
+		const bool  v  = (e != nullptr && e[0] == '1') || (e1 != nullptr && e1[0] == '1') || Rt2Wanted(); // (rt2 implies it)
 		std::printf("RT reflections: reprojection fix (rtrefl1) %s (KYTY_RT_REFLECTIONS_REPROJ=%s): %s\n", v ? "on" : "off",
 		            e != nullptr ? e : "(unset)",
 		            v ? "history at the best of surface / reflected-point (own and 3x3 hit distance) positions, Catmull-Rom in "
@@ -929,6 +1092,266 @@ void LogReproj() {
 	g_rt.rep_time = now;
 }
 
+// (rt4) The fill's strength (KYTY_RT4_FILL, 1.0; 0: no fill, the rest of rt4 kept) and the normal-variance share added to
+// the reflection lobe on surfaces that are not water (KYTY_RT4_TOKSVIG, 0.5; 0: the smoothed normal without widening).
+float Rt4FillStrength() {
+	static const float v = EnvFloat("KYTY_RT4_FILL", 1.0f, 0.0f, 1.0f);
+	return v;
+}
+float Rt4Toksvig() {
+	static const float v = EnvFloat("KYTY_RT4_TOKSVIG", 0.5f, 0.0f, 2.0f);
+	return v;
+}
+// (rt4) Every frame: the counters' difference into the phase's sums (the phase at read time: a few frames of a switch may
+// land on the other side), and the fill's calibration. The calibration compares, on confident mirror-like hits on the
+// G-buffer's surfaces, what our ray saw with the game's specular IBL at that pixel, under two models: the IBL image as the
+// reflected radiance, or that divided by the split-sum BRDF it was multiplied with. The model whose log2 ratio spreads
+// less wins (it predicts the hits better; the other must be clearly better, 20 % less variance, for 10 s to switch) and
+// the scale is 2^(mean log2 ratio): no assumption on what the game stored, the data decides. The fill starts after 400
+// samples in the window (decaying x0.99 per frame that has samples, so the off phase of an A/B does not empty it).
+void Rt4Accumulate() {
+	if (!Rt4Wanted() || g_rt.mapped == nullptr) return;
+	const auto* c  = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + R4StatsIndex);
+	const int   ph = Rt4On() ? 1 : 0;
+	std::array<uint32_t, R4StatsCount> d {};
+	for (uint32_t k = 0; k < R4StatsCount; ++k) {
+		d[k]            = static_cast<uint32_t>(c[k] - g_rt.r4_last[k]);
+		g_rt.r4_last[k] = c[k];
+	}
+	if (g_rt.frame <= 8) return;
+	for (uint32_t k = 0; k < R4StatsCount; ++k) g_rt.r4_sum[ph][k] += d[k];
+	++g_rt.r4_frames[ph];
+	if (d[10] == 0) return;
+	const double decay = 0.99;
+	g_rt.cal_n = g_rt.cal_n * decay + static_cast<double>(d[10]);
+	for (int m = 0; m < 2; ++m) {
+		const double sv  = static_cast<double>(static_cast<int32_t>(d[11 + m * 2])) / 64.0;   // (sum of log2)
+		const double svv = static_cast<double>(d[12 + m * 2]) * 4.0 / 4096.0;                // (sum of log2^2)
+		g_rt.cal_s[m]    = g_rt.cal_s[m] * decay + sv;
+		g_rt.cal_ss[m]   = g_rt.cal_ss[m] * decay + svv;
+	}
+	if (g_rt.cal_n < 400.0) return;
+	std::array<double, 2> mean {}, var {};
+	for (int m = 0; m < 2; ++m) {
+		mean[m] = g_rt.cal_s[m] / g_rt.cal_n;
+		var[m]  = std::max(g_rt.cal_ss[m] / g_rt.cal_n - mean[m] * mean[m], 0.0);
+	}
+	if (g_rt.cal_model < 0) {
+		g_rt.cal_model = var[1] < var[0] ? 1 : 0;
+		std::printf("[rt4] fill calibrated: model %s (log2 spread %.2f vs %.2f), scale %.3f, %.0f samples\n",
+		            g_rt.cal_model == 1 ? "IBL / BRDF" : "IBL as radiance", std::sqrt(var[g_rt.cal_model]), std::sqrt(var[1 - g_rt.cal_model]),
+		            std::exp2(mean[g_rt.cal_model]), g_rt.cal_n);
+		std::fflush(stdout);
+	} else {
+		const int o = 1 - g_rt.cal_model;
+		g_rt.cal_other_better = var[o] < 0.8 * var[g_rt.cal_model] ? g_rt.cal_other_better + 1 : 0;
+		if (g_rt.cal_other_better > 600) {
+			g_rt.cal_model        = o;
+			g_rt.cal_other_better = 0;
+			std::printf("[rt4] fill model switched to %s (log2 spread %.2f vs %.2f)\n", o == 1 ? "IBL / BRDF" : "IBL as radiance",
+			            std::sqrt(var[o]), std::sqrt(var[1 - o]));
+			std::fflush(stdout);
+		}
+	}
+	g_rt.cal_gain = static_cast<float>(std::clamp(std::exp2(mean[g_rt.cal_model]), 1.0 / 64.0, 64.0));
+}
+// (rt5) Every frame: the counters' difference into the sums.
+void Rt5Accumulate() {
+	if (!Rt5Wanted() || g_rt.mapped == nullptr) return;
+	const auto* c = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + R5StatsIndex);
+	std::array<uint32_t, R5StatsCount> d {};
+	for (uint32_t k = 0; k < R5StatsCount; ++k) {
+		d[k]            = static_cast<uint32_t>(c[k] - g_rt.r5_last[k]);
+		g_rt.r5_last[k] = c[k];
+	}
+	if (g_rt.frame <= 8) return;
+	for (uint32_t k = 0; k < R5StatsCount; ++k) g_rt.r5_sum[k] += d[k];
+	++g_rt.r5_frames;
+}
+// (rt5) The [rt5] line (every 10 s, before [rt3] resets the GPU times): reflective G-buffer surfaces by source, rays and
+// hits by angle, the history by camera motion class (still / rotation / translation: accepted, its weight, its distance in
+// sigmas) and the shown change frame to frame by class, the half-rate share, the GPU ms per pass (the on phase).
+void Rt5Line(double seconds) {
+	if (!Rt5Wanted()) return;
+	const auto& s   = g_rt.r5_sum;
+	const auto  pct = [](uint64_t v, uint64_t n) { return n > 0 ? 100.0 * static_cast<double>(v) / static_cast<double>(n) : 0.0; };
+	const auto  avg = [](uint64_t v, uint64_t n, double scale) { return n > 0 ? static_cast<double>(v) / scale / static_cast<double>(n) : 0.0; };
+	std::string cls;
+	const char* const names[3] = {"quieto", "rotacion", "traslacion"};
+	for (int c = 0; c < 3; ++c) {
+		char buf[256];
+		std::snprintf(buf, sizeof(buf), "%s%s: historial aceptado %.1f%% (%llu), su peso %.2f, distancia %.2f sigma; cambio mostrado %.2f%% (%llu)",
+		              c > 0 ? "; " : "", names[c], pct(s[c * 4 + 1], s[c * 4]), static_cast<unsigned long long>(s[c * 4]),
+		              avg(s[c * 4 + 2], s[c * 4], 1000.0), avg(s[c * 4 + 3], s[c * 4], 100.0), avg(s[13 + c * 2], s[12 + c * 2], 10.0),
+		              static_cast<unsigned long long>(s[12 + c * 2]));
+		cls += buf;
+	}
+	std::string gpu;
+	if (g_rt.ab_n[1] > 0) {
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "%.3f ms/frame:", g_rt.ab_ms[1] / g_rt.ab_n[1]);
+		gpu = buf;
+		for (uint32_t st = 0; st < NStages; ++st) {
+			if (g_rt.ab_stage_n[1][st] == 0) continue;
+			std::snprintf(buf, sizeof(buf), " %s %.3f", StageNames[st], g_rt.ab_stage_ms[1][st] / g_rt.ab_n[1]);
+			gpu += buf;
+		}
+	} else {
+		gpu = "-";
+	}
+	std::printf("[rt5] %.0f s (%llu frames): superficies reflectantes (G-buffer, no agua; %llu muestras): reflejo propio %.1f%%, "
+	            "relleno del juego %.1f%%, nada %.1f%%; pixeles cambiados > 1%% %.1f%%, peso medio %.3f; rayos por angulo (acierto): "
+	            "rasante %.1f%% (%llu), medio %.1f%% (%llu), frontal %.1f%% (%llu); lobulos rugosos a media tasa %.1f%% de los pixeles "
+	            "con rayo; %s; GPU %s\n",
+	            seconds, static_cast<unsigned long long>(g_rt.r5_frames), static_cast<unsigned long long>(s[18]), pct(s[19], s[18]),
+	            pct(s[20], s[18]), pct(s[21], s[18]), pct(s[30], s[18]), avg(s[31], s[18], 1000.0), pct(s[23], s[22]),
+	            static_cast<unsigned long long>(s[22]), pct(s[25], s[24]), static_cast<unsigned long long>(s[24]), pct(s[27], s[26]),
+	            static_cast<unsigned long long>(s[26]), pct(s[28], s[28] + s[29]), cls.c_str(), gpu.c_str());
+	std::fflush(stdout);
+	g_rt.r5_sum.fill(0);
+	g_rt.r5_frames = 0;
+}
+// (rt4) The [rt4] lines, from the periodic block (every 10 s): per A/B phase, the rays by outcome, the fill, water / not
+// water, the shown change frame to frame on static surfaces, the motion vectors against the camera, the smoothed normal,
+// the GPU time; then the fill's calibration.
+void Rt4Line(double seconds) {
+	if (!Rt4Wanted()) return;
+	for (int ph = 1; ph >= 0; --ph) {
+		const auto& s = g_rt.r4_sum[ph];
+		if (g_rt.r4_frames[ph] == 0 || (ph == 0 && !Rt4Ab())) continue;
+		const double rays = static_cast<double>(std::max<uint64_t>(s[0], 1));
+		const double refl = static_cast<double>(std::max<uint64_t>(s[8] + s[9], 1));
+		const auto   pct  = [&](uint64_t v, uint64_t n) { return n > 0 ? 100.0 * static_cast<double>(v) / static_cast<double>(n) : 0.0; };
+		const auto   avg  = [&](uint64_t v, uint64_t n, double scale) { return n > 0 ? static_cast<double>(v) / scale / static_cast<double>(n) : 0.0; };
+		std::printf("[rt4] %.0f s %s (%llu frames, GPU %.3f ms/frame): rays %llu (1 px in 16): hit %.1f%% (+ faded %.1f%%), off screen "
+		            "%.1f%%, occluded / rejected %.1f%%, sky %.1f%%, nothing %.1f%%; filled from the game's IBL %.1f%% of the rays; "
+		            "reflective pixels: water %.1f%% / not water %.1f%%; stability (mean shown change frame to frame on static "
+		            "surfaces with a reflection, %% of their light): not water camera still %.2f%% (%llu) / moving %.2f%% (%llu), "
+		            "water still %.2f%% (%llu) / moving %.2f%% (%llu); motion vectors vs the camera on static surfaces: not water "
+		            "%.3f px (%llu), water %.3f px (%llu), camera reprojection taken %.1f%%; smoothed normal on %.1f%% of the rays "
+		            "(mean %.1f deg from the normal map's, lobe widened on %.1f%%)\n",
+		            seconds, ph == 1 ? "ON" : "OFF", static_cast<unsigned long long>(g_rt.r4_frames[ph]),
+		            g_rt.ab_n[ph] > 0 ? g_rt.ab_ms[ph] / g_rt.ab_n[ph] : 0.0, static_cast<unsigned long long>(s[0]),
+		            100.0 * s[1] / rays, 100.0 * s[2] / rays, 100.0 * s[3] / rays, 100.0 * s[4] / rays, 100.0 * s[5] / rays,
+		            100.0 * s[6] / rays, 100.0 * s[7] / rays, 100.0 * s[8] / refl, 100.0 * s[9] / refl, avg(s[16], s[15], 10.0),
+		            static_cast<unsigned long long>(s[15]), avg(s[18], s[17], 10.0), static_cast<unsigned long long>(s[17]),
+		            avg(s[20], s[19], 10.0), static_cast<unsigned long long>(s[19]), avg(s[22], s[21], 10.0),
+		            static_cast<unsigned long long>(s[21]), avg(s[24], s[23], 100.0), static_cast<unsigned long long>(s[23]),
+		            avg(s[26], s[25], 100.0), static_cast<unsigned long long>(s[25]), pct(s[27], s[23] + s[25]), pct(s[28], s[0] > 0 ? s[0] : 1),
+		            avg(s[29], s[28], 10.0), pct(s[30], s[0] > 0 ? s[0] : 1));
+	}
+	{
+		std::array<double, 2> sd {};
+		for (int m = 0; m < 2; ++m) {
+			const double mean = g_rt.cal_n > 0.0 ? g_rt.cal_s[m] / g_rt.cal_n : 0.0;
+			sd[m]             = g_rt.cal_n > 0.0 ? std::sqrt(std::max(g_rt.cal_ss[m] / g_rt.cal_n - mean * mean, 0.0)) : 0.0;
+		}
+		std::printf("[rt4] fill: the game's specular IBL %s (copied in %llu frames), model %s, scale %.3f, %.0f samples in the "
+		            "window, log2 spread %.2f (IBL as radiance) / %.2f (IBL / BRDF), strength %.2f; lobe from the normal map's "
+		            "spread x %.2f\n",
+		            Rt4IblStatus(), static_cast<unsigned long long>(g_rt.ibl_frames),
+		            g_rt.cal_model < 0 ? "not decided (no fill yet)" : g_rt.cal_model == 1 ? "IBL / BRDF" : "IBL as radiance", g_rt.cal_gain,
+		            g_rt.cal_n, sd[0], sd[1], Rt4FillStrength(), Rt4Toksvig());
+	}
+	for (auto& a: g_rt.r4_sum) a.fill(0);
+	g_rt.r4_frames.fill(0);
+	g_rt.ibl_frames = 0;
+}
+
+// (rtq1) The counters' change since the last frame, added to the phase in use (the first frames after a window change
+// skipped: frames in flight still ran the other phase).
+void RtqAccumulate() {
+	if (!Rtq::Wanted() || g_rt.mapped == nullptr) return;
+	const auto* q = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + QStatsIndex);
+	const auto* c = reinterpret_cast<const uint32_t*>(g_rt.mapped + HeaderBytes / 4 + StatsIndex);
+	std::array<uint32_t, QStatsCount + 1> d {};
+	for (uint32_t k = 0; k <= QStatsCount; ++k) {
+		const uint32_t v = k < QStatsCount ? q[k] : c[0];
+		d[k]             = static_cast<uint32_t>(v - g_rt.rtq_last[k]);
+		g_rt.rtq_last[k] = v;
+	}
+	const long long w = Rtq::WindowIndex();
+	if (w != g_rt.rtq_window) g_rt.rtq_window = w, g_rt.rtq_settle = 6;
+	if (g_rt.frame <= 8) return;
+	if (g_rt.rtq_settle > 0) {
+		--g_rt.rtq_settle;
+		return;
+	}
+	const int ph = Rtq::NewPhase() ? 1 : 0;
+	for (uint32_t k = 0; k <= QStatsCount; ++k) g_rt.rtq_sum[ph][k] += d[k];
+	++g_rt.rtq_frames[ph];
+}
+// (rtq1) "[rtq] reflejos A/B": per phase the GPU ms per frame (the whole chain and per pass), the rays (share of the
+// candidates marched, and of the non-sky pixels), the bands, the holes, the early out's exactness, the shown change on a
+// still camera; then the new phase against the old (the ms difference and the checks' verdicts).
+void RtqLine(int level) {
+	if (!Rtq::Wanted()) return;
+	struct Ph {
+		double ms = 0, trace = 0, temporal = 0, atrous = 0, composite = 0, rays_c = 0, rays_px = 0, full = 0, half = 0,
+		       quarter = 0, holes = 0, still_ch = 0;
+		uint64_t eo = 0, eo_bad = 0, still_n = 0, frames = 0;
+		bool   have = false;
+	} ph[2];
+	for (int i = 0; i < 2; ++i) {
+		const auto& q  = g_rt.rtq_sum[i];
+		Ph&         p  = ph[i];
+		const double n = g_rt.rtq_n[i];
+		p.frames       = g_rt.rtq_frames[i];
+		p.have         = n > 0 && p.frames > 0;
+		if (n > 0) {
+			p.ms       = g_rt.rtq_ms[i] / n;
+			p.trace    = g_rt.rtq_stage_ms[i][StTrace] / n;
+			p.temporal = g_rt.rtq_stage_ms[i][StTemporal] / n;
+			for (int a = StAtrous0; a <= StAtrous3; ++a) p.atrous += g_rt.rtq_stage_ms[i][a] / n;
+			p.composite = g_rt.rtq_stage_ms[i][StComposite] / n;
+		}
+		const double cand = static_cast<double>(std::max<uint64_t>(q[0], 1));
+		const double px   = static_cast<double>(std::max<uint64_t>(q[QStatsCount], 1)); // (STATS + 0: the composite's pixels)
+		p.rays_c  = 100.0 * q[4] / cand;
+		p.rays_px = 100.0 * q[4] / px;
+		p.full = 100.0 * q[1] / cand, p.half = 100.0 * q[2] / cand, p.quarter = 100.0 * q[3] / cand;
+		p.holes    = q[8] > 0 ? 100.0 * q[9] / static_cast<double>(q[8]) : 0.0;
+		p.eo       = q[6], p.eo_bad = q[7];
+		p.still_n  = q[10];
+		p.still_ch = q[10] > 0 ? 100.0 * (q[11] / 1000.0) / static_cast<double>(q[10]) : 0.0;
+	}
+	char buf[2][320];
+	for (int i = 0; i < 2; ++i) {
+		const Ph& p = ph[i];
+		if (!p.have) {
+			std::snprintf(buf[i], sizeof(buf[i]), "%s: sin frames", i == 0 ? "VIEJO" : "NUEVO");
+			continue;
+		}
+		std::snprintf(buf[i], sizeof(buf[i]),
+		              "%s %.3f ms/frame (traza %.3f, temporal %.3f, a-trous %.3f, composicion %.3f), rayos %.1f%% de los candidatos "
+		              "(%.1f%% de los pixeles), bandas completa/media/cuarto %.0f/%.0f/%.0f%%, huecos %.2f%%, cambio en reposo %.3f%% "
+		              "(%llu px)",
+		              i == 0 ? "VIEJO" : "NUEVO", p.ms, p.trace, p.temporal, p.atrous, p.composite, p.rays_c, p.rays_px, p.full, p.half,
+		              p.quarter, p.holes, p.still_ch, static_cast<unsigned long long>(p.still_n));
+	}
+	std::printf("[rtq] reflejos A/B (%s, %s): %s | %s\n", Cfg(level).name, Rtq::Ab() ? "5 s viejo / 5 s nuevo" : "solo nuevo",
+	            buf[0], buf[1]);
+	if (ph[0].have && ph[1].have) {
+		const double d   = ph[1].ms - ph[0].ms;
+		const double eo  = static_cast<double>(std::max<uint64_t>(ph[1].eo, 1));
+		const double bad = 100.0 * ph[1].eo_bad / eo;
+		// (verdicts: cost no higher; early out exact on >= 99.9 % of its pixels; the shimmer at rest no worse than +10 %
+		// relative (+0.05 points absolute); holes below 2 %)
+		const bool cost_ok  = d <= 0.0;
+		const bool exact_ok = ph[1].eo == 0 || bad <= 0.1;
+		const bool still_ok = ph[0].still_n == 0 || ph[1].still_n == 0 || ph[1].still_ch <= ph[0].still_ch * 1.10 + 0.05;
+		const bool holes_ok = ph[1].holes < 2.0;
+		std::printf("[rtq] reflejos: NUEVO - VIEJO = %+.3f ms/frame (%+.0f%%): %s; early out exacto en %.3f%% de %llu px: %s; "
+		            "reposo %.3f%% frente a %.3f%%: %s; huecos %.2f%%: %s\n",
+		            d, ph[0].ms > 0 ? 100.0 * d / ph[0].ms : 0.0, cost_ok ? "OK" : "MAS CARO", 100.0 - bad,
+		            static_cast<unsigned long long>(ph[1].eo), exact_ok ? "OK" : "FALLA", ph[1].still_ch, ph[0].still_ch,
+		            still_ok ? "OK" : "MAS INESTABLE", ph[1].holes, holes_ok ? "OK" : "DEMASIADOS");
+	}
+	g_rt.rtq_ms.fill(0.0), g_rt.rtq_n.fill(0), g_rt.rtq_frames.fill(0);
+	for (auto& a: g_rt.rtq_stage_ms) a.fill(0.0);
+	for (auto& a: g_rt.rtq_sum) a.fill(0);
+}
+
 void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	if (g_rt.mapped == nullptr) return;
 	(void)vmaInvalidateAllocation(graphics.allocator, g_rt.frame_mem, 0, VK_WHOLE_SIZE);
@@ -953,6 +1376,9 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 	}
 	LogFloorPaths(); // (des-refl2-1108)
 	LogReproj();     // (rtrefl1)
+	Rt4Accumulate(); // (rt4)
+	Rt5Accumulate(); // (rt5)
+	RtqAccumulate(); // (rtq1)
 	++g_rt.stat_frames;
 	if (have_gbuf) ++g_rt.stat_gbuf_frames;
 	if (g_rt.have_guide) ++g_rt.stat_guide_frames;
@@ -1026,6 +1452,35 @@ void ReadStats(GraphicContext& graphics, bool have_gbuf, int level) {
 		passes += buf;
 	}
 	if (!passes.empty()) std::printf("RT reflections: GPU ms per pass (%s): %s\n", Cfg(level).name, passes.c_str());
+	Rt4Line(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (rt4: before the [rt3] line resets the phase times)
+	Rt5Line(std::chrono::duration<double>(now - g_rt.stat_time).count()); // (rt5: likewise)
+	RtqLine(level);                                                          // (rtq1)
+	if (Rt3Wanted()) {
+		// (rt3) The reflections' GPU time by phase (KYTY_RT3_AB: 5 s on / 5 s off; else on only), per frame, and per pass.
+		std::string ab;
+		for (int ph = 1; ph >= 0; --ph) {
+			char buf[96];
+			if (g_rt.ab_n[ph] == 0) {
+				std::snprintf(buf, sizeof(buf), "%s%s -", ph == 1 ? "" : " / ", ph == 1 ? "ON" : "OFF");
+				ab += buf;
+				continue;
+			}
+			std::snprintf(buf, sizeof(buf), "%s%s %.3f (%u frames:", ph == 1 ? "" : " / ", ph == 1 ? "ON" : "OFF",
+			              g_rt.ab_ms[ph] / g_rt.ab_n[ph], g_rt.ab_n[ph]);
+			ab += buf;
+			for (uint32_t st = 0; st < NStages; ++st) {
+				if (g_rt.ab_stage_n[ph][st] == 0) continue;
+				std::snprintf(buf, sizeof(buf), " %s %.3f", StageNames[st], g_rt.ab_stage_ms[ph][st] / g_rt.ab_n[ph]);
+				ab += buf;
+			}
+			ab += ")";
+		}
+		std::printf("[rt3] GPU ms reflejos %s; trace %ux%u of %ux%u (images %ux%u)\n", ab.c_str(), g_rt.trace.width, g_rt.trace.height,
+		            g_rt.render.width, g_rt.render.height, g_rt.trace_alloc.width, g_rt.trace_alloc.height);
+		g_rt.ab_ms.fill(0.0), g_rt.ab_n.fill(0);
+		for (auto& a: g_rt.ab_stage_ms) a.fill(0.0);
+		for (auto& a: g_rt.ab_stage_n) a.fill(0);
+	}
 	if (RtReflGuideWanted()) {
 		// (refl8) The one line on the guide: where the game reflects (its SSR confident) and where we sharpened it.
 		const auto        pc = [&](uint32_t k) { return 100.0 * sm[k] / px; };
@@ -1378,6 +1833,82 @@ bool RtReflGuideWanted() {
 	return wanted;
 }
 
+// ---- (rpost1) KYTY_REFL_POST: the reflection's added light after the upscaler ----
+namespace {
+std::atomic<bool> g_post_live {true}; // F10 (window.cpp): ON / OFF in the same session
+} // namespace
+bool RtReflPostWanted() {
+	static const bool v = [] {
+		const char* e = std::getenv("KYTY_REFL_POST");
+		const char* u = std::getenv("KYTY_UPSCALER");
+		const bool  on = e != nullptr && e[0] == '1';
+		const bool  fsr4 = u != nullptr && std::string(u) == "fsr4";
+		if (on) {
+			std::printf("RT reflections: post-upscale (rpost1) %s (KYTY_UPSCALER=%s): F10 turns it ON / OFF\n",
+			            fsr4 ? "wanted" : "not available with this upscaler (only FSR 4 yet)", u != nullptr ? u : "(unset)");
+			std::fflush(stdout);
+		}
+		return on && fsr4;
+	}();
+	return v;
+}
+bool RtReflPostLive() { return g_post_live.load(std::memory_order_relaxed); }
+bool RtReflPostToggle() {
+	const bool v = !g_post_live.load(std::memory_order_relaxed);
+	g_post_live.store(v, std::memory_order_relaxed);
+	return v;
+}
+
+// After the upscaler (fsr4-sr.cpp): `target` (R16G16B16A16_SFLOAT, storage, general layout, the upscaler's result at
+// `size`) += this frame's reflection light. False (nothing recorded) when the composite did not keep it apart.
+bool RtReflectionsPostAdd(vk::CommandBuffer command, vk::ImageView target, vk::Extent2D size) {
+	if (!g_rt.post_pending || g_rt.pipeline == nullptr || target == nullptr || g_rt.post_add.view == nullptr) return false;
+	g_rt.post_pending = false;
+	auto&                   g   = g_rt;
+	const auto              gen = vk::ImageLayout::eGeneral;
+	vk::DescriptorImageInfo infos[Bindings] {};
+	for (uint32_t i = 0; i < Bindings; ++i) infos[i] = {g.point, g.hiz.view, gen}; // (samplers never read in mode 9)
+	for (uint32_t i = 14; i < 18; ++i) infos[i] = {g.point, g.dummy.view, gen};    // (the packed layers: R32_UINT)
+	infos[4]  = {nullptr, g.hiz.mips[0], gen};
+	infos[5]  = {g.linear, g.post_add.view, gen}; // the light, linear
+	infos[11] = {nullptr, g.out.view, gen};
+	infos[12] = {nullptr, g.out.view, gen};
+	infos[13] = {nullptr, g.out.view, gen};
+	infos[23] = {nullptr, target, gen};
+	const vk::DescriptorBufferInfo frame_info {vk::Buffer(g.frame_buf), 0, VK_WHOLE_SIZE};
+	vk::WriteDescriptorSet         writes[Bindings] {};
+	for (uint32_t i = 0; i < Bindings; ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = (i == 18 || i == 19)                                  ? vk::DescriptorType::eStorageBuffer
+		                            : (i == 4 || i == 11 || i == 12 || i == 13 || i == 23) ? vk::DescriptorType::eStorageImage
+		                                                                                   : vk::DescriptorType::eCombinedImageSampler;
+		if (i == 18 || i == 19) writes[i].pBufferInfo = &frame_info;
+		else writes[i].pImageInfo = &infos[i];
+	}
+	static const float sign = [] {
+		const char* e = std::getenv("KYTY_REFL_POST_JITTER");
+		return e != nullptr ? static_cast<float>(std::atof(e)) : 1.0f;
+	}();
+	RtPush push {};
+	push.misc[0]   = 9;
+	push.params[0] = g.post_jx * sign, push.params[1] = g.post_jy * sign, push.params[2] = 1.0f;
+	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::PipelineStageFlagBits2::eComputeShader,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, g.layout, 0, Bindings, writes);
+	command.pushConstants(g.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+	Barrier(command, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite, vk::PipelineStageFlagBits2::eAllCommands,
+	        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+	if (++g.post_frames == 1) {
+		std::printf("RT reflections: post-upscale: first frame, the light (%ux%u) put on the upscaler's %ux%u result\n",
+		            g.render.width, g.render.height, size.width, size.height);
+		std::fflush(stdout);
+	}
+	return true;
+}
+
 bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const int level = RtReflectionsLevel();
 	if (level == 0) return false; // off: nothing created or recorded
@@ -1424,6 +1955,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const bool  have_guide = guide_mode && RtReflGetGuide(guide) && guide.view != nullptr;
 	if (have_guide) g_rt.guide_last = guide;
 	g_rt.have_guide = have_guide;
+	// (rt4) The game's specular IBL (kRTT_SpecularIBL_HalfResX), copied after the same lighting dispatch as the guide.
+	RtReflGuide ibl;
+	const bool  have_ibl = Rt4Wanted() && have_guide && Rt4GetIbl(ibl) && ibl.view != nullptr;
+	g_rt.have_ibl        = have_ibl;
+	if (have_ibl) ++g_rt.ibl_frames;
 	ReadHwStats(*graphics); // (refl-hybrid-1028; before ReadStats: its periodic line logs the hybrid's too)
 	ReadStats(*graphics, have_gbuf, level);
 	{
@@ -1594,6 +2130,57 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		}
 	}
 
+	// (rt3) The trace in use this frame (the images keep rt2's size); a change of grid restarts the history.
+	const bool rt3_on = Rt3On();
+	// (rpost1) KYTY_REFL_POST=1: the light the reflection adds goes on after the upscaler (RtReflectionsPostAdd), so the
+	// temporal upscaler never reprojects it with the floor's motion vectors. Only where the upscaler calls PostAdd (FSR 4
+	// today); a frame whose light was not put on turns it off for the session (else the reflection would be lost).
+	if (g_rt.post_pending && !g_rt.post_broken) {
+		g_rt.post_broken = true;
+		std::printf("RT reflections: post-upscale (KYTY_REFL_POST) off: the upscaler did not take the reflection's light "
+		            "(only FSR 4 does): the reflection back in the upscaler's input\n");
+		std::fflush(stdout);
+	}
+	const bool post_on = RtReflPostWanted() && !g_rt.post_broken && RtReflPostLive();
+	g_rt.post_pending  = post_on;
+	g_rt.post_jx = inputs.jitter_x, g_rt.post_jy = inputs.jitter_y;
+	{
+		static int said = -1;
+		if (RtReflPostWanted() && said != (post_on ? 1 : 0)) {
+			said = post_on ? 1 : 0;
+			std::printf("RT reflections: post-upscale (rpost1, KYTY_REFL_POST) %s: the reflection's added light %s\n",
+			            post_on ? "ON" : "OFF",
+			            post_on ? "put on after the upscaler (not reprojected by it)" : "in the upscaler's input, as before");
+			std::fflush(stdout);
+		}
+	}
+	// (rtq1) KYTY_RTQ: this frame's phase; in the debug view a notice at each A/B window (screenshots name their phase)
+	const bool rtq_on = Rtq::NewPhase();
+	if (Rtq::Wanted()) {
+		static bool said = false;
+		if (!said) {
+			said = true;
+			std::printf("[rtq] on (KYTY_RTQ=1%s): Reflejos RT nivel %s: rayos por contribucion (peso >= 0.10 todos, 0.05-0.10 la "
+			            "mitad, < 0.05 un cuarto; agua todos), un hilo por bloque 2x2, salida temprana de la composicion donde la "
+			            "traza no marco nada (y su comprobacion de exactitud); F10: vista de depuracion\n",
+			            Rtq::Ab() ? ", KYTY_RTQ_AB=1: 5 s VIEJO / 5 s NUEVO" : "", Cfg(level).name);
+			std::fflush(stdout);
+		}
+		static long long shown = -1;
+		const long long  w     = Rtq::WindowIndex();
+		if (Rtq::DebugView() && Rtq::Ab() && w != shown) {
+			shown = w;
+			::Loader::DemonsSoulsWarp::ShowNotice(rtq_on ? "Reflejos RT: NUEVO (RTQ)" : "Reflejos RT: VIEJO", 5);
+		}
+	}
+	const bool rt4_on = Rt4On(); // (rt4: KYTY_RT4_AB alternates it; rt3 stays on)
+	{
+		const vk::Extent2D want = rt3_on ? Rt3TraceExtent(color.extent, level, g_rt.trace_alloc) : g_rt.trace_alloc;
+		if (want != g_rt.trace) {
+			g_rt.trace         = want;
+			g_rt.history_valid = false;
+		}
+	}
 	RtPush push {};
 	push.proj[0] = m[0], push.proj[1] = m[5], push.proj[2] = m[8], push.proj[3] = m[9];
 	push.depth_map[0] = m[10], push.depth_map[1] = m[14], push.depth_map[2] = m[11], push.depth_map[3] = m[15];
@@ -1611,7 +2198,18 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	               (g_rt.stable ? 1024 : 0) | // (rtfly-1029: the firefly limit and the contribution's stabilisation)
 	               (g_rt.water_stable ? 2048 : 0) | (RtFlicker::CameraStill() ? 4096 : 0) | // (water-1030)
 	               (FlatFloorWanted() ? 8192 : 0) | // (des-refl2-1108)
-	               (ReprojWanted() ? 16384 : 0);    // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ)
+	               (ReprojWanted() ? 16384 : 0) |   // (rtrefl1: KYTY_RT_REFLECTIONS_REPROJ)
+	               (Rt2Wanted() ? 32768 : 0) |      // (rt2: the history candidate by the material, not per-pixel scores)
+	               (rt3_on ? 65536 : 0) |           // (rt3: the composite's early out from the trace's mask)
+	               (rt4_on ? 131072 : 0) |          // (rt4: the fill, the smoothed normal, the camera reprojection, R2 samples)
+	               (Rt4Wanted() ? 262144 : 0) |     // (rt4: its counters, both phases of the A/B)
+	               (rt4_on && have_ibl ? 524288 : 0) | // (rt4: binding 22 holds the game's specular IBL)
+	               (rt4_on && Rt5Wanted() ? 1048576 : 0) | // (rt5: the material response, the reflection's reprojection)
+	               (Rt5Wanted() ? 2097152 : 0) |          // (rt5: its counters)
+	               (rtq_on ? 4194304 : 0) |               // (rtq1: the new version this frame)
+	               (Rtq::Wanted() ? 8388608 : 0) |        // (rtq1: its counters, both phases of the A/B)
+	               (Rtq::DebugView() ? 16777216 : 0) |    // (rtq1: the debug view, F10)
+	               (post_on ? 33554432 : 0);              // (rpost1: the added light after the upscaler)
 	// (combo19: guided only while the guide is there; without it the material mask, refl6, instead of water only: the
 	// guide never found in play was the whole reason nothing changed)
 	push.dec[0] = use_normal ? dec_normal : -1, push.dec[1] = use_normal ? dec_rough : -1;
@@ -1626,7 +2224,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	vk::AccelerationStructureKHR hw_tlas = nullptr;
 	std::array<float, HwHeaderBytes / 4> hw_header {};
 	bool hw_on = false;
-	if (HybridWanted()) {
+	// (pt1e) BB_PATHTRACING's fill this frame (F9 on, this frame's TLAS): it replaces the hybrid's
+	const bool pt_fill = PathTrace::Requested() && PathTrace::ReflFillReady();
+	if (HybridWanted() && !pt_fill) {
 		const char* why = nullptr;
 		bool        built = false;
 		std::array<float, 16> vp {};
@@ -1682,6 +2282,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		++stamp_n;
 	};
 	if (timed) command.resetQueryPool(g_rt.pool, entry * 16, 16);
+	if (timed) g_rt.phase_of[entry] = (Rt4Wanted() ? rt4_on : rt3_on) ? 1 : 0; // (rt3; rt4: its own A/B)
+	if (timed) g_rt.fill_of[entry] = 0; // (pt1e: set below when the fill is recorded)
+	if (timed) g_rt.rtq_of[entry] = rtq_on ? 1 : 0; // (rtq1)
 	stamp(0xff); // (the start)
 	// (What wrote the game's images, and our last frame's reads of the buffer and images.)
 	Barrier(command, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -1738,6 +2341,10 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// 720-line render, scaled to this one) and the large pools' boost
 		header[48] = g_rt.min_area * static_cast<float>(color.extent.height) / 720.0f, header[49] = g_rt.pool_boost;
 		header[50] = static_cast<float>(SharpLevel()), header[51] = static_cast<float>(WaterWaves()); // (refl-sharp-1031)
+		// (rt4, rparams) the fill's scale and model (from the calibration; strength 0 until it has decided), the lobe's
+		// normal-variance share
+		header[52] = g_rt.cal_gain, header[53] = g_rt.cal_model == 1 ? 1.0f : 0.0f;
+		header[54] = g_rt.cal_model >= 0 ? Rt4FillStrength() : 0.0f, header[55] = Rt4Toksvig();
 		command.updateBuffer(vk::Buffer(g_rt.frame_buf), 0, HeaderBytes, header.data());
 	}
 	if (hw_on) {
@@ -1790,6 +2397,11 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		// (binding 21, refl8: the game's SSR, linear; without it the hi-z stands in, never read: misc.w & 256 unset)
 		infos[21] = have_guide ? vk::DescriptorImageInfo {lin, guide.view, vk::ImageLayout::eShaderReadOnlyOptimal}
 		                       : vk::DescriptorImageInfo {pt, g.hiz.view, gen};
+		// (binding 22, rt4: the game's specular IBL, linear; without it the hi-z stands in, never read: misc.w & 524288 unset)
+		infos[22] = have_ibl ? vk::DescriptorImageInfo {lin, ibl.view, vk::ImageLayout::eShaderReadOnlyOptimal}
+		                     : vk::DescriptorImageInfo {pt, g.hiz.view, gen};
+		// (binding 23, rpost1: the post-upscale image; written by the composite only with misc.w & 33554432)
+		infos[23] = {nullptr, g.post_add.view, gen};
 		const vk::DescriptorBufferInfo frame_info {vk::Buffer(g.frame_buf), 0, VK_WHOLE_SIZE};
 		const vk::DescriptorBufferInfo exposure_info = game_exposure
 		                                                   ? vk::DescriptorBufferInfo {inputs.exposure_buffer, inputs.exposure_base, inputs.exposure_range}
@@ -1799,7 +2411,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 			writes[i].dstBinding      = i;
 			writes[i].descriptorCount = 1;
 			writes[i].descriptorType  = (i == 18 || i == 19)                       ? vk::DescriptorType::eStorageBuffer
-			                            : (i == 4 || i == 11 || i == 12 || i == 13) ? vk::DescriptorType::eStorageImage
+			                            : (i == 4 || i == 11 || i == 12 || i == 13 || i == 23) ? vk::DescriptorType::eStorageImage
 			                                                                        : vk::DescriptorType::eCombinedImageSampler;
 			if (i == 18) writes[i].pBufferInfo = &frame_info;
 			else if (i == 19) writes[i].pBufferInfo = &exposure_info;
@@ -1841,7 +2453,9 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		Set s = base;
 		s.oa = &g.rad, s.ob = &g.gb[cur], s.oc = &g.aux;
 		// (checkerboard: a thread per pair of horizontal neighbours)
-		run(0, s, TraceChecker(level) ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
+		// (rtq1: a thread per 2x2 block, the checkerboard decided in the shader)
+		run(0, s, rtq_on ? vk::Extent2D {(g.trace.width + 1) / 2, (g.trace.height + 1) / 2}
+		          : TraceChecker(level) ? vk::Extent2D {(g.trace.width + 1) / 2, g.trace.height} : g.trace);
 		stamp(StTrace);
 	}
 	if (hw_on) {
@@ -1890,9 +2504,34 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 		++g.hw_frames;
 		stamp(StHybrid);
 	}
+	bool pt_ran = false;
+	if (pt_fill && !hw_on) {
+		// (pt1e) rad -> rad2: BB_PATHTRACING's fill where this path reflects and its screen-space ray missed; g.out still holds
+		// the previous frame's composite here (the composite below rewrites it)
+		PathTrace::ReflFillIo io;
+		io.rad = g.rad.view, io.aux = g.aux.view, io.gb_cur = g.gb[cur].view, io.gb_prev = g.gb[prev].view;
+		io.prev_screen = g.out.view, io.rad_out = g.rad2.view;
+		io.depth = inputs.depth.view, io.depth_layout = inputs.depth.layout;
+		io.color = color.view, io.color_layout = color.layout;
+		io.render = color.extent, io.trace = g.trace;
+		if (game_exposure) {
+			io.exposure = inputs.exposure_buffer, io.exposure_base = inputs.exposure_base, io.exposure_range = inputs.exposure_range;
+			io.exposure_index = inputs.exposure_index;
+		}
+		io.row0_up      = g.row0_up;
+		io.history      = g.history_valid && !inputs.reset;
+		io.view_to_clip = m;
+		io.rough_cutoff = cutoff;
+		pt_ran = PathTrace::RecordReflFill(command, io);
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, g.pipeline);
+		if (pt_ran) {
+			if (timed) g.fill_of[entry] = 1;
+			stamp(StPtFill);
+		}
+	}
 	{
 		Set s = base;
-		s.a = hw_on ? &g.rad2 : &g.rad, s.b = &g.hist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[prev], s.aux = &g.aux, s.meta = &g.meta[prev];
+		s.a = hw_on || pt_ran ? &g.rad2 : &g.rad, s.b = &g.hist[prev], s.gcur = &g.gb[cur], s.gprev = &g.gb[prev], s.aux = &g.aux, s.meta = &g.meta[prev];
 		s.oa = &g.hist[cur], s.ob = &g.meta[cur], s.oc = &g.tmp_b;
 		run(1, s, g.trace);
 		stamp(StTemporal);
@@ -1921,7 +2560,7 @@ bool RtReflectionsApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead);
 	{
 		// The sums, counters and the metal survey to the host (the CPU reads them a few frames late; the copy is 5.5 KB).
-		vk::BufferCopy region {HeaderBytes, HeaderBytes, (RStatsIndex + RStatsCount) * 4}; // (water2-1030 + des-refl2-1108 + rtrefl1: the water / floor / reprojection stats)
+		vk::BufferCopy region {HeaderBytes, HeaderBytes, (R5StatsIndex + R5StatsCount) * 4}; // (rt5: through its counters) // (water2-1030 + des-refl2-1108 + rtrefl1 + rt4: the water / floor / reprojection / rt4 stats)
 		command.copyBuffer(vk::Buffer(g.frame_buf), vk::Buffer(g.read_buf), 1, &region);
 		if (hw_on) {
 			const vk::BufferCopy hw_region {HwHeaderBytes, HwHeaderBytes, HwStatsCount * 4};

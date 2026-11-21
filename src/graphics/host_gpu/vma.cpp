@@ -29,6 +29,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/image/sparseImage.h" // (ram1b)
 #include "live-counters.h"
 #include "local-platform.h"
 #include "soft-release.h"
@@ -772,6 +773,11 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 
 void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
+	// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse image: no VMA allocation, never pooled; its layers' memory freed with it.
+	if (image.sparse != nullptr) {
+		DestroySparseImage(*this, image);
+		return;
+	}
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
 	if (kyty_local_image_pool_mode.load(std::memory_order_relaxed) != 0) {

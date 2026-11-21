@@ -315,8 +315,9 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	switch (tile) {
 		case Prospero::TileMode::kLinear: supported_tile = true; break;
 		case Prospero::TileMode::kDepth:
+			// (No atomics. Read, it is a pixel shader's image it stores to as well: TrackResources' `storage_reads`.)
 			supported_tile =
-			    !resource.read && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
+			    !resource.atomic && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
 			    (is_2d || is_2d_array) &&
 			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
 			break;
@@ -336,10 +337,10 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 			break;
 		default: break;
 	}
-	const auto swizzle = descriptor.DstSelXYZW();
-	const bool supported_swizzle =
-	    IsValidImageSwizzle(swizzle) &&
-	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	// (A storage image's view takes no swizzle: the shader applies it to what it stores, and to what it reads of one it
+	// reads, TrackResources' `storage_reads`.)
+	const auto swizzle           = descriptor.DstSelXYZW();
+	const bool supported_swizzle = IsValidImageSwizzle(swizzle);
 	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
@@ -384,7 +385,7 @@ std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& reso
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	                              resource.written && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
 	    raw_sint_storage ||

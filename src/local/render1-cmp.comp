@@ -1,0 +1,54 @@
+#version 450
+// (render1 F2, KYTY_RENDER1=2; local/render1-native.inc) The native depth of a batch against the normal one: per
+// texel |normal - native|, counted when over the epsilon; the largest difference as its float bits (a difference is
+// never negative, so its bits order as the values do: atomicMax on them). One slot of 4 uints per batch:
+// [0] texels over epsilon, [1] largest difference's bits, [2] texels compared, [3] texels where either is NaN.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D normal_depth;
+layout(set = 0, binding = 1) uniform sampler2D native_depth;
+layout(set = 0, binding = 2, std430) buffer Results {
+	uint results[];
+};
+
+layout(push_constant) uniform Push {
+	uint  width;
+	uint  height;
+	uint  base;    // the slot's first uint
+	float epsilon;
+} p;
+
+shared uint s_over;
+shared uint s_max;
+shared uint s_count;
+shared uint s_nan;
+
+void main() {
+	if (gl_LocalInvocationIndex == 0u) {
+		s_over  = 0u;
+		s_max   = 0u;
+		s_count = 0u;
+		s_nan   = 0u;
+	}
+	barrier();
+	const uvec2 at = gl_GlobalInvocationID.xy;
+	if (at.x < p.width && at.y < p.height) {
+		const float a = texelFetch(normal_depth, ivec2(at), 0).r;
+		const float b = texelFetch(native_depth, ivec2(at), 0).r;
+		atomicAdd(s_count, 1u);
+		if (isnan(a) || isnan(b)) {
+			atomicAdd(s_nan, 1u);
+		} else {
+			const float d = abs(a - b);
+			if (d > p.epsilon) atomicAdd(s_over, 1u);
+			if (d > 0.0) atomicMax(s_max, floatBitsToUint(d));
+		}
+	}
+	barrier();
+	if (gl_LocalInvocationIndex == 0u) {
+		if (s_over != 0u) atomicAdd(results[p.base + 0u], s_over);
+		if (s_max != 0u) atomicMax(results[p.base + 1u], s_max);
+		if (s_count != 0u) atomicAdd(results[p.base + 2u], s_count);
+		if (s_nan != 0u) atomicAdd(results[p.base + 3u], s_nan);
+	}
+}

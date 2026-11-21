@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "local/frame-gen.h"
+#include "local/pathtrace.h"
 #include "local/rt-water.h"
 #if defined(KYTY_LOCAL_VULKAN_RECORDING)
 #include "local/vulkan-recording.h"
@@ -42,7 +43,11 @@ namespace {
 constexpr uint32_t Slots            = 4;           // frame slots of the CPU-written rings
 constexpr uint32_t MaxRecords       = 16384;       // per slot (records 0..63 of a slot capture nothing)
 constexpr uint32_t NullRecords      = 64;
-constexpr uint32_t MaxCapture       = 6u << 20u;   // captured vertices per frame (16 B each: 96 MiB)
+// Captured vertices per frame (16 B each): 6 Mi (96 MiB); (pt1) BB_PATHTRACING sizes it by its preset (low 2 Mi, 32 MiB).
+uint32_t MaxCaptureVertices() {
+	static const uint32_t v = PathTrace::CaptureVertices() != 0 ? PathTrace::CaptureVertices() : (6u << 20u);
+	return v;
+}
 constexpr uint32_t MaxMeshVertices  = 1u << 20u;   // window * instances of one mesh
 constexpr uint32_t MaxMeshIndices   = 3u << 20u;   // index count * instances of one mesh
 constexpr uint32_t MaxEntries       = 24576;
@@ -63,9 +68,20 @@ uint32_t EnvU32(const char* name, uint32_t fallback) {
 uint32_t BuildsPerFrame() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_BUILDS", 48)); return v; }
 uint32_t BuildTrisPerFrame() { static const uint32_t v = std::max(1000u, EnvU32("KYTY_HWRT_BUILD_TRIS", 400000)); return v; }
 // KYTY_HWRT_KEEP (600): frames a mesh not drawn stays in the TLAS (out of view); 4x that: its BLAS is freed.
-uint32_t KeepFrames() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_KEEP", 600)); return v; }
+uint32_t KeepFrames() {
+	static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_KEEP", PathTrace::KeepFrames() != 0 ? PathTrace::KeepFrames() : 600));
+	return v;
+}
 // KYTY_HWRT_DEBUG=1: instance colours shaded by distance in place of the TAA's output; 2: blended 50 %. Add 4: y flipped.
-uint32_t RefitInterval() { static const uint32_t v = std::max(1u, EnvU32("KYTY_HWRT_REFIT_EVERY", 4)); return v; }
+// (pt1) BB_PATHTRACING: every frame (a character's traced shadow must not lag its body), unless KYTY_HWRT_REFIT_EVERY says.
+// (pt1e) BB_PATHTRACING: its live preset's (bajo 3, medio 2, alto / ultra 1): the refits were most of the scene's GPU and
+// render-thread time (logs 073624 / 074330: 150-190 refits a frame, 0.3-0.9 ms GPU, ~1 ms CPU); on bajo / medio the
+// moving meshes cast no traced shadow (the game's cascades keep theirs), only the reflections' fill sees them.
+uint32_t RefitInterval() {
+	static const uint32_t env = EnvU32("KYTY_HWRT_REFIT_EVERY", 0);
+	if (env != 0) return env;
+	return PathTrace::Requested() ? std::max(1u, PathTrace::RefitEvery()) : 4u;
+}
 // (rtstab) KYTY_HWRT_REFITS (192): refits a frame at most, oldest positions first (the 64 cap was hit every frame with
 // 800-1450 dynamic meshes: positions 14-23 frames old, some never refreshed).
 uint32_t RefitsPerFrame() { static const uint32_t v = EnvU32("KYTY_HWRT_REFITS", 192); return v; }
@@ -155,6 +171,8 @@ struct Entry {
 	uint64_t albedo_key = 0;
 	uint32_t albedo_binding = 0, albedo_element = 0;
 	bool     water = false; // (KYTY_HWRT_WATER) drawn by a water pixel shader: the water TLAS only
+	bool     discard = false; // (pt1) its pixel shader can discard (alpha test): kept out of the traced rays' mask
+	uint64_t bytes = 0;       // (pt1) its vertex + index + BLAS buffers (the mesh budget)
 };
 
 struct Job {
@@ -263,6 +281,15 @@ struct State {
 	std::unordered_map<uint32_t, vk::DeviceAddress> prev_instances;
 	uint64_t st_frames = 0, st_added = 0, st_removed = 0, st_blas_swaps = 0, st_mask_flips = 0, st_dyn = 0, st_age_sum = 0;
 	uint64_t st_stale = 0, st_votes_rejected = 0, st_refit_starved = 0;
+	// (pt1, BB_PATHTRACING) never reset (its 5 s log takes differences): CPU / GPU time, frames, budget, discard meshes
+	double   cum_cpu_ms = 0.0, cum_gpu_ms = 0.0;
+	uint64_t cum_timed = 0, cum_frames = 0, cum_budget_skips = 0, cum_new = 0, cum_refits = 0, cum_captured = 0, cum_draws = 0;
+	uint64_t mesh_bytes = 0, fixed_bytes = 0, cum_reorders = 0, cum_gpu_written = 0, cum_no_variant = 0;
+	uint64_t cum_gw_args = 0, cum_gw_indices = 0; // (pt1e)
+	uint32_t ps_alpha = 0, ps_discard_other = 0; // (pt1b) pixel shaders: discard on a texture's alpha / discard on something else
+	uint32_t last_instances = 0;
+	bool     scope_call = false; // (pt1) EndFrameAtScope is the caller
+	std::unordered_map<VkShaderModule, bool> ps_discard;
 	uint32_t st_add_max = 0, st_rem_max = 0, st_age_max = 0;
 	std::chrono::steady_clock::time_point last_log = std::chrono::steady_clock::now();
 } g;
@@ -311,7 +338,7 @@ bool MaterialEnv() {
 // (hwrt3) The texcoord capture, the albedo words, the albedo array and its copy pipelines. False: no material (logged);
 // the reflections keep their flat shading.
 bool InitMaterial(GraphicContext& graphics) {
-	bool ok = MakeBuffer(graphics, g.uvcap, vk::DeviceSize {MaxCapture} * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+	bool ok = MakeBuffer(graphics, g.uvcap, vk::DeviceSize {MaxCaptureVertices()} * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
 	for (uint32_t s = 0; s < Slots && ok; ++s)
 		ok = MakeBuffer(graphics, g.albedo_words[s], vk::DeviceSize {MaxInstances} * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 	if (ok) {
@@ -396,14 +423,16 @@ bool Init(GraphicContext& graphics) {
 	g.init_tried = true;
 	if (!g_supported) return false;
 	const VkBufferUsageFlags as_input = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
-	bool ok = MakeBuffer(graphics, g.capture, vk::DeviceSize {MaxCapture} * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+	bool ok = MakeBuffer(graphics, g.capture, vk::DeviceSize {MaxCaptureVertices()} * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
 	ok = ok && MakeBuffer(graphics, g.records, vk::DeviceSize {MaxRecords} * Slots * sizeof(Record), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 	for (uint32_t s = 0; s < Slots && ok; ++s) {
 		ok = ok && MakeBuffer(graphics, g.instances[s], vk::DeviceSize {MaxInstances} * sizeof(VkAccelerationStructureInstanceKHR), as_input, true);
 		ok = ok && MakeBuffer(graphics, g.materials[s], vk::DeviceSize {MaxInstances} * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 		ok = ok && MakeBuffer(graphics, g.rayinfo[s], sizeof(RayInfo), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 		g_host_readback = true;
-		ok = ok && MakeBuffer(graphics, g.results[s], vk::DeviceSize {MaxChecks} * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+		// (pt1b: 16 words a compare under BB_PATHTRACING: the move and both bounds)
+		ok = ok && MakeBuffer(graphics, g.results[s], vk::DeviceSize {MaxChecks} * 4 * (PathTrace::Requested() ? 16u : 1u),
+		                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 		g_host_readback = false;
 	}
 	if (ok) {
@@ -462,9 +491,13 @@ bool Init(GraphicContext& graphics) {
 	}
 	if (MaterialEnv()) InitMaterial(graphics);
 	g.ready = true;
+	// (pt1) the fixed buffers' size, for BB_PATHTRACING's VRAM line
+	g.fixed_bytes = g.capture.size + g.records.size + g.uvcap.size;
+	for (uint32_t s = 0; s < Slots; ++s)
+		g.fixed_bytes += g.instances[s].size + g.materials[s].size + g.rayinfo[s].size + g.results[s].size + g.albedo_words[s].size;
 	std::printf("HWRT: ready (capture %u vertices at 0x%llx, records at 0x%llx; builds/frame %u, build tris/frame %u, keep %u "
 	            "frames, debug %u)\n",
-	            MaxCapture, static_cast<unsigned long long>(g.capture.address), static_cast<unsigned long long>(g.records.address),
+	            MaxCaptureVertices(), static_cast<unsigned long long>(g.capture.address), static_cast<unsigned long long>(g.records.address),
 	            BuildsPerFrame(), BuildTrisPerFrame(), KeepFrames(), DebugMode());
 	std::fflush(stdout);
 	return true;
@@ -948,6 +981,8 @@ bool MakeAs(GraphicContext& graphics, Buffer& buf, vk::AccelerationStructureKHR&
 }
 
 void Bury(Entry& e) {
+	g.mesh_bytes -= std::min(g.mesh_bytes, e.bytes); // (pt1)
+	e.bytes = 0;
 	Pending p;
 	p.as    = e.blas;
 	p.a     = e.vb;
@@ -1066,6 +1101,14 @@ void MaybeLog() {
 		g.st_add_max = g.st_rem_max = g.st_age_max = 0;
 	}
 	std::fflush(stdout);
+	// (pt1) the 10 s figures into the running totals BB_PATHTRACING's 5 s line takes differences of (PtTotals)
+	g.cum_cpu_ms += g.cpu_note_ms + g.cpu_after_ms;
+	g.cum_gpu_ms += g.build_ms;
+	g.cum_timed += g.timed;
+	g.cum_frames += g.frames;
+	g.cum_draws += g.draws_seen;
+	g.cum_gpu_written += g.skips[static_cast<uint32_t>(Skip::GpuWritten)];
+	g.cum_no_variant += g.skips[static_cast<uint32_t>(Skip::NoVariant)];
 	g.draws_seen = g.draws_captured = g.draws_reused = g.frames = g.frames_no_camera = 0;
 	std::fill(std::begin(g.skips), std::end(g.skips), 0);
 	g.scene_states = g.scene_states_capturable = g.new_meshes = g.rebuilt = g.refits = g.compares = g.became_dynamic = 0;
@@ -1100,6 +1143,8 @@ bool CreateEntry(GraphicContext& graphics, Entry& e, const Draw& d) {
 		FreeBuffer(graphics, e.ib);
 		return false;
 	}
+	e.bytes = e.ib.size + e.vb.size; // (pt1, the mesh budget; the BLAS is added when it is made)
+	g.mesh_bytes += e.bytes;
 	auto* dst = static_cast<uint32_t*>(e.ib.mapped);
 	for (uint32_t inst = 0; inst < d.instance_count; ++inst) {
 		const uint32_t add = inst * e.window;
@@ -1338,6 +1383,164 @@ std::shared_ptr<const std::vector<PsSample>> AnalyzePs(vk::ShaderModule module) 
 	return result;
 }
 
+// (pt1b, BB_PATHTRACING) Whether a pixel shader discards ON A TEXTURE'S ALPHA (an alpha-tested mesh: foliage, grates,
+// cloth cards): its BLAS would be the whole quads, so it is kept out of the traced rays and keeps the game's shadow.
+// pt1 counted any OpKill / OpTerminateInvocation / OpDemoteToHelperInvocation: on the PC every G-buffer shader had one
+// (log 20261118-062608-715: 965 of 965 meshes), so the rays saw nothing. Now: the conditional branches that lead to the
+// discard block (up to 4 blocks back) give the conditions; their backward slice (through loads and the stores to the
+// same variable) must contain an OpCompositeExtract of component 3 (alpha) of an image sample / fetch / gather result.
+// Anything else (a dither of the object fade, a clip plane, a constant) is opaque for the rays. Classified once per
+// module; the first 24 are logged with the reason.
+namespace {
+struct SpvIns {
+	uint32_t op = 0, at = 0, count = 0;
+};
+bool SpvHasTypeAndId(uint32_t op) {
+	if (op <= 17 && op != 12) return false;       // debug, extensions, capability, entry points (12 OpExtInst has them)
+	if (op >= 19 && op <= 39) return false;       // types (id only)
+	if (op == 56 || op == 62 || op == 63 || op == 64) return false; // function end, store, copy memory
+	if (op >= 71 && op <= 76) return false;       // decorations
+	if (op >= 246 && op <= 255) return false;     // merges, label, branches, kill, return, unreachable
+	if (op == 4416 || op == 5380) return false;   // terminate, demote
+	return true;
+}
+bool SpvIsSample(uint32_t op) { return (op >= 87 && op <= 98) || (op >= 305 && op <= 315); }
+} // namespace
+
+bool PsDiscards(vk::ShaderModule module) {
+	const auto key = static_cast<VkShaderModule>(module);
+	if (auto found = g.ps_discard.find(key); found != g.ps_discard.end()) return found->second;
+	bool        alpha  = false;
+	uint32_t    kills  = 0;
+	const char* reason = "sin descarte";
+	const auto  spirv  = module != nullptr && ModuleStore::Holds(module) ? ModuleStore::Load(module) : nullptr;
+	if (spirv == nullptr || spirv->size() <= 5) {
+		reason = "SPIR-V no legible (se trata como opaco)";
+	} else {
+		const auto& w = *spirv;
+		std::unordered_map<uint32_t, SpvIns>                def;      // result id -> its instruction
+		std::unordered_map<uint32_t, uint32_t>              chain;    // access chain id -> its base variable
+		std::unordered_map<uint32_t, std::vector<uint32_t>> stored;   // variable -> values stored to it (anywhere)
+		std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> preds; // block -> (pred block, condition or 0)
+		std::vector<uint32_t> kill_blocks;
+		uint32_t              block = 0;
+		const auto base_of = [&](uint32_t id) {
+			for (int n = 0; n < 16; ++n) {
+				const auto c = chain.find(id);
+				if (c == chain.end()) break;
+				id = c->second;
+			}
+			return id;
+		};
+		for (size_t i = 5; i < w.size();) {
+			const uint32_t count = w[i] >> 16u, op = w[i] & 0xffffu;
+			if (count == 0 || i + count > w.size()) break;
+			if (op == 248 && count >= 2) block = w[i + 1];
+			if (op == 252 || op == 4416 || op == 5380) {
+				++kills;
+				kill_blocks.push_back(block);
+			}
+			if (op == 249 && count >= 2) preds[w[i + 1]].emplace_back(block, 0u);
+			if (op == 250 && count >= 4) {
+				preds[w[i + 2]].emplace_back(block, w[i + 1]);
+				preds[w[i + 3]].emplace_back(block, w[i + 1]);
+			}
+			if (op == 62 && count >= 3) stored[base_of(w[i + 1])].push_back(w[i + 2]);
+			if (op == 59 && count >= 3) def[w[i + 2]] = {op, static_cast<uint32_t>(i), count};
+			if (SpvHasTypeAndId(op) && count >= 3) {
+				def[w[i + 2]] = {op, static_cast<uint32_t>(i), count};
+				if ((op == 65 || op == 66 || op == 67 || op == 70) && count >= 4) chain[w[i + 2]] = w[i + 3];
+			}
+			i += count;
+		}
+		// The conditions that lead to a discard block.
+		std::vector<uint32_t> conds;
+		for (uint32_t kb: kill_blocks) {
+			std::vector<uint32_t> frontier {kb};
+			for (int depth = 0; depth < 4 && !frontier.empty(); ++depth) {
+				std::vector<uint32_t> next;
+				for (uint32_t b: frontier) {
+					const auto p = preds.find(b);
+					if (p == preds.end()) continue;
+					for (const auto& [pb, cond]: p->second) {
+						if (cond != 0) conds.push_back(cond);
+						else next.push_back(pb);
+					}
+				}
+				frontier.swap(next);
+			}
+		}
+		// Does the value `id` come (backward, bounded) from an image sample result?
+		const auto from_sample = [&](uint32_t start) {
+			std::vector<uint32_t>        work {start};
+			std::unordered_map<uint32_t, bool> seen;
+			while (!work.empty() && seen.size() < 4096) {
+				const uint32_t id = work.back();
+				work.pop_back();
+				if (seen[id]) continue;
+				seen[id] = true;
+				const auto d = def.find(id);
+				if (d == def.end()) continue;
+				const SpvIns& in = d->second;
+				if (SpvIsSample(in.op)) return true;
+				if (in.op == 61) { // OpLoad: the values stored to its variable
+					const auto s = stored.find(base_of(w[in.at + 3]));
+					if (s != stored.end()) work.insert(work.end(), s->second.begin(), s->second.end());
+					continue;
+				}
+				for (uint32_t k = 3; k < in.count; ++k) work.push_back(w[in.at + k]);
+			}
+			return false;
+		};
+		// The conditions' slice: an alpha component (index 3) taken from a sample result.
+		bool any_extract = false;
+		for (uint32_t c: conds) {
+			std::vector<uint32_t>        work {c};
+			std::unordered_map<uint32_t, bool> seen;
+			while (!work.empty() && seen.size() < 8192 && !alpha) {
+				const uint32_t id = work.back();
+				work.pop_back();
+				if (seen[id]) continue;
+				seen[id] = true;
+				const auto d = def.find(id);
+				if (d == def.end()) continue;
+				const SpvIns& in = d->second;
+				if (in.op == 81 && in.count == 5 && w[in.at + 4] == 3u) { // OpCompositeExtract composite, 3
+					any_extract = true;
+					if (from_sample(w[in.at + 3])) alpha = true;
+					continue;
+				}
+				if (in.op == 79 && in.count >= 6) { // OpVectorShuffle v1 v2 components: component 3 of v1
+					bool three = false;
+					for (uint32_t k = 5; k < in.count; ++k) three |= w[in.at + k] == 3u;
+					if (three && from_sample(w[in.at + 3])) alpha = true;
+				}
+				if (in.op == 61) {
+					const auto s = stored.find(base_of(w[in.at + 3]));
+					if (s != stored.end()) work.insert(work.end(), s->second.begin(), s->second.end());
+					continue;
+				}
+				for (uint32_t k = 3; k < in.count; ++k) work.push_back(w[in.at + k]);
+			}
+			if (alpha) break;
+		}
+		reason = kills == 0 ? "sin descarte"
+		         : alpha    ? "descarta segun el alfa de una textura"
+		         : conds.empty() ? "descarte sin condicion encontrada (opaco)"
+		         : any_extract   ? "descarta con una componente .w que no viene de textura (opaco)"
+		                         : "descarta por otra condicion (dither / recorte; opaco)";
+	}
+	if (kills > 0) ++(alpha ? g.ps_alpha : g.ps_discard_other);
+	static int said = 0;
+	if (kills > 0 && said < 24) {
+		++said;
+		std::printf("[pt] PS %p: %u descartes, %s\n", static_cast<void*>(key), kills, reason);
+		std::fflush(stdout);
+	}
+	g.ps_discard[key] = alpha;
+	return alpha;
+}
+
 // A view format's rank as a base colour: 2 sRGB colour, 1 a 3-4 channel unorm colour, 0 not one (normal / mask maps,
 // integers, depth).
 int AlbedoRank(vk::Format f) {
@@ -1465,6 +1668,12 @@ bool RtHwExperimental() {
 bool Requested() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HWRT");
+		// (pt1) BB_PATHTRACING=1 asks for the scene by itself (its own switch; the other hardware-RT passes stay off).
+		if (PathTrace::Requested()) {
+			std::printf("HWRT: the scene TLAS asked for by BB_PATHTRACING=1 (path tracing pt1)\n");
+			std::fflush(stdout);
+			return true;
+		}
 		// (ds-rt1026-restore) The hardware-RT effects (TLAS: reflections, sun, lamps, GI, water, volumetric) are out of the
 		// default build again: KYTY_HWRT=1 is honoured only with KYTY_RT_HW_EXPERIMENTAL=1 ("RT real (experimental)").
 		const bool  asked = value != nullptr && *value == '1';
@@ -1565,7 +1774,7 @@ vk::ShaderModule CaptureModule(GraphicContext& graphics, vk::ShaderModule origin
 	} else {
 		std::vector<uint32_t> patched;
 		SpirvPatcher          patcher(*spirv);
-		if (!patcher.Run(patched, g.capture.address, g.records.address, MaxRecords * Slots, MaxCapture, g.material ? g.uvcap.address : 0)) {
+		if (!patcher.Run(patched, g.capture.address, g.records.address, MaxRecords * Slots, MaxCaptureVertices(), g.material ? g.uvcap.address : 0)) {
 			++g.patch_failed;
 			static int said = 0;
 			if (said++ < 8) {
@@ -1593,7 +1802,7 @@ vk::ShaderModule CaptureModule(GraphicContext& graphics, vk::ShaderModule origin
 uint64_t VariantId(uint64_t program_id) {
 	uint64_t h = Mix(program_id ^ 0x48575254ULL, g.capture.address);
 	h          = Mix(h, g.records.address);
-	h          = Mix(h, uint64_t {MaxRecords * Slots} << 32u | MaxCapture);
+	h          = Mix(h, uint64_t {MaxRecords * Slots} << 32u | MaxCaptureVertices());
 	if (g.material) h = Mix(h, g.uvcap.address ^ 0x4d41544cULL); // (hwrt3: the texcoord store; nothing mixed without it)
 	return h | (uint64_t {1} << 63u);
 }
@@ -1610,6 +1819,11 @@ void NoteSceneState(bool capturable) {
 	++g.scene_states;
 	MaybeLog();
 	if (capturable) ++g.scene_states_capturable;
+}
+
+void NoteGpuWrittenKind(bool args) {
+	if (!g.ready) return;
+	++(args ? g.cum_gw_args : g.cum_gw_indices);
 }
 
 uint32_t Reserve(uint32_t count) {
@@ -1656,8 +1870,10 @@ bool Note(uint32_t record, const Draw& d) {
 		}
 		found = g.entries.emplace(key, Entry {}).first;
 		auto& e = found->second;
-		e.key = key, e.id = g.next_id++ & 0xffffffu, e.vs = d.vs, e.ps = d.ps;
+		// (pt1) BB_PATHTRACING keeps bit 23 of the custom index for "moving mesh": ids within 23 bits.
+		e.key = key, e.id = g.next_id++ & (PathTrace::Requested() ? 0x7fffffu : 0xffffffu), e.vs = d.vs, e.ps = d.ps;
 		e.water = water;
+		if (PathTrace::Requested() && d.ps_module != nullptr) e.discard = PsDiscards(d.ps_module);
 		e.next_check = g.frame + 32 + (e.id & 31u);
 	}
 	auto& e     = found->second;
@@ -1673,6 +1889,14 @@ bool Note(uint32_t record, const Draw& d) {
 	if (!e.built) {
 		// A new mesh: within the frame's build budget only.
 		const uint32_t tris = d.index_count / 3 * d.instance_count;
+		// (pt1) BB_PATHTRACING's mesh memory budget (vertices + indices + BLAS; meshes out of the TLAS go first, EndFrame)
+		const uint64_t budget = PathTrace::MeshBudgetBytes();
+		if (budget != 0 && g.mesh_bytes >= budget) {
+			++g.skips[static_cast<uint32_t>(Skip::Budget)];
+			++g.cum_budget_skips;
+			g.cpu_note_ms += Ms(start);
+			return false;
+		}
 		if (g.builds >= BuildsPerFrame() || g.build_tris + tris > BuildTrisPerFrame()) {
 			++g.skips[static_cast<uint32_t>(Skip::Budget)];
 			g.cpu_note_ms += Ms(start);
@@ -1709,7 +1933,7 @@ bool Note(uint32_t record, const Draw& d) {
 		return false;
 	}
 	const uint32_t need = e.window * e.instances;
-	if (g.captured + need > MaxCapture) {
+	if (g.captured + need > MaxCaptureVertices()) {
 		if (job.build) --g.builds, g.build_tris -= e.tris;
 		if (job.mode == Mode::Compare) --g.checks;
 		++g.skips[static_cast<uint32_t>(Skip::Records)];
@@ -1727,6 +1951,8 @@ bool Note(uint32_t record, const Draw& d) {
 	if (job.mode == Mode::Write && (job.build || job.refit)) e.write_frame = g.frame;
 	g.jobs.push_back(job);
 	++g.draws_captured;
+	++g.cum_captured; // (pt1)
+	if (job.build) ++g.cum_new;
 	g.cpu_note_ms += Ms(start);
 	return true;
 }
@@ -1896,6 +2122,9 @@ void BuildWaterTlas(GraphicContext& graphics, FramePayload& p, uint32_t slot, co
 
 void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* where) {
 	if (!Active()) return;
+	// (pt1) BB_PATHTRACING builds the scene once a frame at the end of the game's GBuffer scope (EndFrameAtScope), before
+	// the lighting its passes feed; the TAA / PS5 Pro packet hooks would build a second one a frame later.
+	if (PathTrace::Requested() && !g.scope_call) return;
 	std::lock_guard lock(g.mutex);
 	g_graphics = &graphics;
 	if (!Init(graphics)) return;
@@ -1915,9 +2144,35 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		const auto found = g.entries.find(key);
 		if (found == g.entries.end()) continue;
 		float delta = 0.0f;
-		std::memcpy(&delta, static_cast<const uint32_t*>(g.results[(slot + 1) % Slots].mapped) + index, 4);
+		const bool pt = PathTrace::Requested();
+		const auto* words = static_cast<const uint32_t*>(g.results[(slot + 1) % Slots].mapped) + (pt ? index * 16u : index);
+		std::memcpy(&delta, words, 4);
 		auto& fe = found->second;
 		if (fe.dynamic) continue;
+		// (pt1b) Moved per vertex but the same bounds: the same geometry in another order (instances drawn in a per-frame
+		// order); its BLAS still holds it. Static, unless the bounds moved by more than the tolerance (5 cm + 0.2 % of the
+		// distance), as the per-vertex test.
+		if (pt && delta > 1.0f) {
+			const auto un = [](uint32_t e) {
+				const uint32_t u = (e & 0x80000000u) != 0u ? (e & 0x7fffffffu) : ~e;
+				float f = 0.0f;
+				std::memcpy(&f, &u, 4);
+				return f;
+			};
+			float nb[6], ob[6];
+			for (int k = 0; k < 6; ++k) nb[k] = un(words[1 + k]), ob[k] = un(words[7 + k]);
+			float diff = 0.0f, dist2 = 0.0f;
+			for (int k = 0; k < 6; ++k) diff = std::max(diff, std::fabs(nb[k] - ob[k]));
+			for (int k = 0; k < 3; ++k) {
+				const float c = 0.5f * (ob[k] + ob[k + 3]) - g_cam[k];
+				dist2 += c * c;
+			}
+			const bool finite = std::isfinite(diff) && std::isfinite(dist2);
+			if (finite && diff <= 0.05f + 0.002f * std::sqrt(dist2)) {
+				++g.cum_reorders;
+				delta = 0.0f;
+			}
+		}
 		// (rtstab) Hysteresis: DynVotes() compares in a row must see it move; one still compare clears the votes. A single
 		// noisy compare used to flip a static mesh to dynamic for good: out of the static-only reflection rays, rebuilt,
 		// then refit at the starved rate.
@@ -1961,13 +2216,19 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 			if (!e.created) continue;
 			push.src_base = job.src;
 			push.count    = e.window * e.instances;
-			push.mode     = static_cast<uint32_t>(job.mode);
+			push.mode     = job.mode == Mode::Compare && PathTrace::Requested() ? 2u : static_cast<uint32_t>(job.mode); // (pt1b: + bounds)
 			push.result   = job.result;
 			push.dst      = e.vb.address;
 			push.uv       = job.uv ? g.uvcap.address : 0;
 			if (job.uv) e.uv_written = true;
 			if (job.mode == Mode::Compare) {
-				results[job.result] = 0;
+				if (PathTrace::Requested()) { // (pt1b) the move, then the bounds' min (all ones) and max (0) words
+					uint32_t* r = results + job.result * 16u;
+					r[0] = 0;
+					for (int k = 0; k < 3; ++k) r[1 + k] = r[7 + k] = 0xffffffffu, r[4 + k] = r[10 + k] = 0u;
+				} else {
+					results[job.result] = 0;
+				}
 				g.check_keys[slot].emplace_back(e.key, job.result);
 				++g.compares;
 			}
@@ -2011,6 +2272,9 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 					p.c     = e.as_buf;
 					p.frame = g.frame;
 					g.graveyard.push_back(p);
+					const uint64_t old_bytes = std::min(e.bytes, uint64_t {e.as_buf.size}); // (pt1)
+					e.bytes -= old_bytes;
+					g.mesh_bytes -= std::min(g.mesh_bytes, old_bytes);
 					e.blas   = nullptr;
 					e.as_buf = {};
 					++g.rebuilt;
@@ -2024,9 +2288,12 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				address.accelerationStructure = e.blas;
 				e.blas_address                = graphics.device.getAccelerationStructureAddressKHR(address);
 				e.updatable                   = e.dynamic;
+				e.bytes += e.as_buf.size; // (pt1)
+				g.mesh_bytes += e.as_buf.size;
 				if (job.build && !e.dynamic) ++g.new_meshes;
 			} else {
 				++g.refits;
+				++g.cum_refits; // (pt1)
 			}
 			info.srcAccelerationStructure = update ? e.blas : nullptr;
 			info.dstAccelerationStructure = e.blas;
@@ -2109,7 +2376,9 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		water_order.clear();
 		for (auto it = g.entries.begin(); it != g.entries.end();) {
 			auto& e = it->second;
-			if (e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame && e.last_seen + KeepFrames() < g.frame) {
+			// (pt1) Over BB_PATHTRACING's mesh budget: meshes out of the TLAS (unseen for KeepFrames) go at once.
+			const bool over = PathTrace::MeshBudgetBytes() != 0 && g.mesh_bytes > PathTrace::MeshBudgetBytes();
+			if ((e.last_seen + uint64_t {KeepFrames()} * 4 < g.frame || over) && e.last_seen + KeepFrames() < g.frame) {
 				Bury(e);
 				++g.evicted;
 				it = g.entries.erase(it);
@@ -2139,6 +2408,12 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 				// (0x03) saw the character's shadow strobe and every other pass saw it pop.
 				const uint32_t age = static_cast<uint32_t>(std::min<uint64_t>(g.frame - std::min(e.write_frame, g.frame), 1u << 20u));
 				instance.mask = e.tris <= 24 ? 0x08 : !e.dynamic ? 0x01 : age <= StaleFrames() ? 0x02 : 0x04;
+				// (pt1, BB_PATHTRACING: pt.comp traces 0x03) alpha-tested meshes 0x10 (their quads would cast boxes); a
+				// moving mesh carries bit 23 of the custom index (its shadow gets a short history: no trail).
+				if (PathTrace::Requested()) {
+					if (e.discard) instance.mask = 0x10;
+					if (e.dynamic) instance.instanceCustomIndex = (e.id & 0x7fffffu) | 0x800000u;
+				}
 				if (e.dynamic) {
 					++g.st_dyn;
 					g.st_age_sum += age;
@@ -2196,6 +2471,7 @@ void EndFrame(GraphicContext& graphics, vk::CommandBuffer command, const char* w
 		}
 	}
 	g.tlas_instances_sum += instance_count;
+	g.last_instances = instance_count; // (pt1)
 	if (instance_count > 0) {
 		vk::AccelerationStructureGeometryInstancesDataKHR instances_data {};
 		instances_data.arrayOfPointers         = VK_FALSE;
@@ -2469,6 +2745,48 @@ void AfterTaa(GraphicContext& graphics, TextureCache& cache, vk::CommandBuffer c
 		DebugView(graphics, command, images[6].image_view, output.backing.format,
 		          vk::Extent2D {output.backing.extent.width, output.backing.extent.height});
 	}
+}
+
+// (pt1) BB_PATHTRACING's build point: the end of the game's GBuffer scope (pathtrace.cpp RunWork).
+void EndFrameAtScope(GraphicContext& graphics, vk::CommandBuffer command) {
+	if (!Active()) return;
+	g.scope_call = true;
+	EndFrame(graphics, command, "the end of the game's GBuffer scope (BB_PATHTRACING)");
+	g.scope_call = false;
+}
+
+// (pt1) Running totals for BB_PATHTRACING's 5 s line.
+PtTotals GetPtTotals() {
+	PtTotals t;
+	if (!Active()) return t;
+	std::lock_guard lock(g.mutex);
+	t.cpu_ms          = g.cum_cpu_ms + g.cpu_note_ms + g.cpu_after_ms;
+	t.gpu_ms          = g.cum_gpu_ms + g.build_ms;
+	t.timed           = g.cum_timed + g.timed;
+	t.frames          = g.cum_frames + g.frames;
+	t.draws           = g.cum_draws + g.draws_seen;
+	t.captured        = g.cum_captured;
+	t.new_meshes      = g.cum_new;
+	t.refits          = g.cum_refits;
+	t.budget_skips    = g.cum_budget_skips;
+	t.reorders        = g.cum_reorders;
+	t.gpu_written     = g.cum_gpu_written + g.skips[static_cast<uint32_t>(Skip::GpuWritten)];
+	t.no_variant      = g.cum_no_variant + g.skips[static_cast<uint32_t>(Skip::NoVariant)];
+	t.gpu_written_args    = g.cum_gw_args;
+	t.gpu_written_indices = g.cum_gw_indices;
+	t.ps_alpha        = g.ps_alpha;
+	t.ps_discard_other = g.ps_discard_other;
+	t.mesh_bytes      = g.mesh_bytes;
+	t.fixed_bytes     = g.fixed_bytes + g.tlas_buf.size + g.scratch.size;
+	t.instances       = g.last_instances;
+	for (const auto& [key, e]: g.entries) {
+		if (!e.built) continue;
+		++t.meshes;
+		t.dynamic += e.dynamic ? 1u : 0u;
+		t.discard += e.discard ? 1u : 0u;
+		t.blas_bytes += e.as_buf.size;
+	}
+	return t;
 }
 
 // (hwrt2g, KYTY_HWRT_AO / KYTY_HWRT_GI: hwrt-gi.cpp) The scene just built, for a pass recorded after it in this frame.

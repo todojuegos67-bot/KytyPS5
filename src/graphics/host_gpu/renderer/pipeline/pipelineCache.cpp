@@ -4039,6 +4039,15 @@ static bool StaticBlobsFromCache() {
 	return on;
 }
 
+// (up1118, upstream 8fd86d4) As InitializeStaticCache takes them: none of the store's files, all.
+uint32_t PipelineCache::StaticStoreFeatures() {
+	std::error_code error;
+	for (const auto& path: {StaticFeaturesPath(), StaticCachePath(), StaticBinariesPath(), StaticBlobsPath()}) {
+		if (std::filesystem::exists(path, error)) return ReadStaticFeatures();
+	}
+	return ~0u;
+}
+
 // A static pipeline cache of this GPU and driver exists (its file begins with their signature).
 static bool StaticCacheFileMatches(const vk::PhysicalDeviceProperties& properties) {
 	const auto    signature = StaticCacheSignature(properties);

@@ -6,6 +6,7 @@
 #include "frame-gen.h"
 #include "local-platform.h"
 #include "local-pass-cache.h" // (ds-perf-1031)
+#include "rt-reflections.h"   // (rpost1: the reflection's light after the model)
 #include "gpu_tiler_shaders/fsr4_prep_spv.h"
 
 #include <nlohmann/json.hpp>
@@ -1176,6 +1177,9 @@ bool Upscale(GraphicContext& graphics, const UpscaleDesc& desc) {
 		g.failed = true;
 		return false;
 	}
+	// (rpost1, KYTY_REFL_POST) The RT reflection's added light on the model's result (final_view, RGBA16F storage, the
+	// model's own space: the input's), so the model never reprojects it with the floor's motion vectors.
+	(void)FrameGen::RtReflectionsPostAdd(command, final_view, target);
 	// The sharpening's measured effect (frame-gen.h SharpenProbeDue): the model's result (rcas_temp) and RCAS's.
 	if (FrameGen::SharpenProbeDue()) {
 		if (rcas) {

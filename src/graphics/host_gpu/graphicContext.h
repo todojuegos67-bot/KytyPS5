@@ -15,6 +15,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+struct SparseImageMemory; // (ram1b: renderer/image/sparseImage.cpp)
 class PipelineBinaries;
 class PipelineBinaryWriter;
 class PlayedPipelines;
@@ -44,6 +45,9 @@ struct GraphicContext {
 	// guest lanes an invocation). VulkanInitSubgroupSizeControl decides it (KYTY_COMPUTE_WAVE64).
 	bool                               compute_wave64_native                 = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// (up1118) VK_EXT_fragment_shader_interlock's pixel interlock and storage image reads without a format enabled
+	// (PixelInterlockExtension in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock).
+	bool                               fragment_shader_pixel_interlock       = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
@@ -189,6 +193,9 @@ struct GraphicContext {
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
 	// (MemoryUsage::SparseDeviceLocal).
 	bool                          sparse_residency_buffers = false;
+	// (ram1b, KYTY_RAM_NATIVE_TEX=1|2 only) Sparse residency 2D images bound on the graphics queue (the game's texture
+	// arrays: video memory for their committed layers only, renderer/image/sparseImage.cpp).
+	bool                          sparse_residency_images = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
@@ -240,6 +247,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// (ram1b) A sparse image's layers' memory (renderer/image/sparseImage.cpp; null: a VMA image, `allocation`).
+	SparseImageMemory*           sparse     = nullptr;
 };
 
 

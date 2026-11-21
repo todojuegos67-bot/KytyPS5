@@ -1,4 +1,5 @@
 #include "local/skip-shader.h"
+#include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
 #include "local/envio1.h"
 #include "local/rt-local-lights.h"
 #include "local/hwrt-scene.h"
@@ -45,6 +46,7 @@
 #include "speculation-state.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "p7-compat.h" // (p7, KYTY_P7: C1)
 
 #include <algorithm>
 #include <cinttypes>
@@ -1445,6 +1447,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// (p7b, C1 precise: local/p7-compat.h) A chained dispatch's hazards against its chain's earlier dispatches, from
+	// the guest ranges of its V#s (what CommitBindings bound); one barrier only where there is one. Counted in any mode
+	// but KYTY_P7=0, recorded with KYTY_P7_C1=1.
+	if (chain && P7::Tracking()) {
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count = 0;
+		for (size_t i = 0; i < bindings.buffer_sources.size() && i < program.info.buffers.size(); ++i) {
+			const auto& source   = bindings.buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (source.size == 0 || source.address == 0) continue;
+			if (count == accesses.size()) {
+				// (More buffers than room: everything this one touches unknown - counted as reads of anything.)
+				count = SIZE_MAX;
+				break;
+			}
+			accesses[count++] = {.begin  = source.address,
+			                     .end    = source.address + source.size,
+			                     .read   = resource.read,
+			                     .write  = resource.written,
+			                     .atomic = resource.atomic};
+		}
+		const bool unknown = count == SIZE_MAX || program.info.uses_dma;
+		const auto hazard  = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(),
+		                                   count == SIZE_MAX ? accesses.size() : count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -1463,7 +1500,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always) {
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
@@ -1505,6 +1545,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                               std::span<const TextureBinding> {bindings.images}, written);
 		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                                   std::span<const TextureBinding> {bindings.images}, written);
+	}
+	// (pt1, BB_PATHTRACING: the images of the dispatches inside the scopes it reads: ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && PathTrace::WantDispatchHook()) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::AfterDispatch(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
+	}
+	// (pt1c, BB_PATHTRACING: the colour the game's TAA reads = the lit HDR image)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && FrameGen::IsTaaShader(program.shader_hash)) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::NoteTaaInput(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
 	}
 	// (KYTY_RT_SUN: the first dispatch of a flip sampling the sun cascades' array copies their layers)
 	if (FrameGen::RtSunWanted() && !bindings.images.empty())

@@ -26,6 +26,13 @@
 #include "ds-linear-copy-hook.h"
 #include "copia1.h" // (copia1)
 #include "live-census.h"
+#include "otros2.h" // (otros2)
+#include "gancho2.h" // (gancho2)
+#include "port1.h" // (port1)
+#include "port2-report.h" // (port2)
+#include "p7-report.h" // (p7, KYTY_P7)
+#include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
+#include "f0-measure.h" // (f0)
 #include "live-counters.h"
 #include "tiron1.h" // (tiron1)
 #include "lane-sync.h"
@@ -38,6 +45,7 @@
 #include "slow-log.h"
 #include "time-census.h"
 #include "trusted-depth.h" // (trust1)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE)
 
 #include <algorithm>
 #include <array>
@@ -455,6 +463,19 @@ inline void Flip() {
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
 	RenderStats(flip_ns); // (render2, KYTY_RENDER_STATS)
 	if (LiveCensus::RenderStatsOn()) Otros1::Report(flip_ns, 0.0); // (otros1, KYTY_OTROS1)
+	if (LiveCensus::RenderStatsOn()) Otros2::Report(flip_ns);      // (otros2, KYTY_OTROS2)
+	if (LiveCensus::RenderStatsOn()) Gancho2::Report(flip_ns);     // (gancho2, KYTY_GANCHO2)
+	Port1::Report(flip_ns);                                         // (port1, KYTY_PORT1; one load when off)
+	Port2::Report(flip_ns);                                         // (port2, KYTY_PORT2; one load when off)
+	P7::Report(flip_ns);                                            // (p7, KYTY_P7; one load when off)
+	G1::Flip(flip_ns);                                              // (g1, KYTY_G1_PROBE / KYTY_G1_STATE; one load when off)
+	if (F5p1Techo::On()) // (f5p1 techo, KYTY_F5P1_TECHO)
+		F5p1Techo::Report(flip_ns, g_render_idle_ns, LiveCensus::g_kind_cycles[LiveCensus::Submission]);
+	if (F0Measure::On()) // (f0, KYTY_F0)
+		F0Measure::Flip(flip_ns, g_render_idle_ns,
+		                LiveCensus::g_waits_ns[LiveCensus::WaitGpu] + LiveCensus::g_waits_ns[LiveCensus::WaitReadback] +
+		                    LiveCensus::g_waits_ns[LiveCensus::WaitDownload],
+		                Port2::Mode() == 1 ? (Port2::g_window_on.load(std::memory_order_relaxed) ? 1 : 2) : G1::AbWindow()); // (g1: STATE=1's windows)
 	LiveCensus::Par2::Flipped(); // (trust1: the two-thread what-if's frame ends at this flip)
 	TrustedDepth::OnFlip(flip_ns); // (trust1: the [trust1] line, KYTY_RENDER_STATS / KYTY_DS_TRUSTED_DEPTH)
 	Render5Report(flip_ns); // (render5)
@@ -537,7 +558,9 @@ inline void Flip() {
 				using G = LiveCounters::Id;
 				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
 				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
-				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs,
+				                                   G::ProtectCallsRender, G::ProtectCallsGfx, G::RenderReadFaults, G::SyncReadsRender,
+				                                   G::AddressSpaceWaitKtRender, G::TimelineQueriesRender, G::QueueLockUs, G::TranslateUs};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {

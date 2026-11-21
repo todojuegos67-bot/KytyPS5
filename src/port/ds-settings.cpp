@@ -88,7 +88,11 @@ const Choice kAntiLagDlssg[] = {{"reflex", "Reflex (NVIDIA)"}, {"normal", "Anti-
 const int    kAntiLagDlssgCount = 3;
 const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
                               {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
-const int    kRtReflLevelCount = 6; // (11-16 release) Hibrido (hardware RT) no longer offered
+const int    kRtReflLevelCount = 7;
+// (pt1) Path tracing (BB_PATHTRACING): sombras del sol trazadas por hardware y (pt1e) el relleno de "Reflejos RT" donde su rayo
+// de pantalla falla; No = nada cambia.
+const Choice kPathTracingLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}};
+const int    kPathTracingLevelCount = 5;
 const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
 const int    kRtReflSharpCount = 3;
 const Choice kMotesLevels[] = {{"0", "No"}, {"1", "Sutil"}, {"2", "Media"}, {"3", "Densa"}}; // (motes-1031)
@@ -258,7 +262,6 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
-	s->simulate_vram8 = false; // (11-16 release) test option, not in the public build
 	// (11-14) Option back in the launcher (Simular gráfica de 8 GB, pruebas): the file's value counts.
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
@@ -328,7 +331,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rend_feedback_agrupado", s->perf_feedback_batch);
 	boo("rend_shaders_lane_local", s->perf_lane_wide);
 	str("reflejos_rt", s->rt_ss_refl);
-	if (s->rt_ss_refl == "6") s->rt_ss_refl = "3"; // (11-16 release) Hibrido gone: its screen-space part, Alto
+	str("path_tracing", s->path_tracing); // (pt1)
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
 	str("luz_rt_pantalla", s->rt_ssgi);
@@ -338,13 +341,14 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("luz_antorchas", s->torch);
 	boo("destellos_lente", s->lens_flare);
 	boo("rt_experimental", s->rt_hw_exp);
-	s->rt_hw_exp = false; // (11-16 release) hardware RT removed from the port (the owner: of no use)
 	// (Out of range: No.)
 	const auto clamp_level = [](std::string& v, int max) {
 		const int n = std::atoi(v.c_str());
 		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
 	};
 	clamp_level(s->rt_ss_refl, 6);
+	clamp_level(s->path_tracing, 4); // (pt1)
+	s->path_tracing = "0"; // (rtq1) Path tracing retired: always off (no launcher or menu row; the dormant code stays)
 	clamp_level(s->rt_refl_sharp, 2);
 	clamp_level(s->motes, 3);
 	clamp_level(s->rt_refl_waves, 2);
@@ -892,6 +896,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_RT_REFLECTIONS_SHARP", "");
 		sets.emplace_back("KYTY_RT_REFLECTIONS_WATER_WAVES", "");
 	}
+	// (pt1) Path tracing: BB_PATHTRACING=1 + its preset; No (or Juego original): both empty, nothing of it runs.
+	{
+		static const char* quality[] = {"", "low", "medium", "high", "ultra"};
+		const int          level     = s.pure_game ? 0 : std::clamp(std::atoi(s.path_tracing.c_str()), 0, 4);
+		sets.emplace_back("BB_PATHTRACING", level > 0 ? "1" : "");
+		sets.emplace_back("BB_PATHTRACING_QUALITY", quality[level]);
+	}
 	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
 	sets.emplace_back("KYTY_DS_SIXTY_STEP", "0");    // (10-22) cinematic as on PS5
@@ -1249,21 +1260,6 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
-	// (11-16 release) The configuration validated with JUGAR.cmd (native memory, parpadeo6, rend1, ram16/ram17), on by
-	// default; [Avanzado] extra (below) can still change any of them (KEY=0).
-	{
-		std::stringstream list(
-		    "KYTY_FG_PARTICLE_MV=1;KYTY_TEXTURE_OFFLOAD=1;KYTY_GPU_ONLY_OFFLOAD=1;KYTY_OFFLOAD_PAGEOUT=1;KYTY_BIG_WINDOW=1;"
-		    "KYTY_VOLATILE_EXTRA_ALLOCATORS=HeapAllocator,PageAllocator,Bucket;KYTY_FAULT_STATS=0;KYTY_TEXTURE_PROBE=0;"
-		    "KYTY_BUFFER_PROBE=0;KYTY_RESIDENCY_LOG=0;KYTY_RAM_GUARD=0;KYTY_RAM_LINE=1;KYTY_RENDER_STATS=0;KYTY_RAIZ=1;"
-		    "KYTY_DS_FREED_RELEASE=1;KYTY_PM_LOCK_HOLDERS=1;KYTY_REG_LANE=1;KYTY_DRAW_FLAGS=1;KYTY_CENSUS_LIGHT=1;"
-		    "KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1;KYTY_RAM18=1;KYTY_CAM1=1");
-		std::string pair;
-		while (std::getline(list, pair, ';')) {
-			const auto eq = pair.find('=');
-			env.Set(pair.substr(0, eq), pair.substr(eq + 1));
-		}
-	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
 	{
 		std::stringstream list(s.extra);
@@ -1282,6 +1278,16 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		if (const std::string pool_mb = env.Get("KYTY_DS_TEXTURE_POOL_MB"); !pool_mb.empty() && pool_mb != "0")
 			env.AppendConvars("texturePoolSizeMiBs=" + pool_mb);
 	}
+	// (ibl0) KYTY_DS_IBL_TEMPORAL=0 in [Avanzado] extra: the game's IBL / SSR temporal off (convar r_enableIBLTemporal,
+	// render config +0x770). [G] RenderIBL FUN_009d66d0 reads it (with r_iblResolution +0x76c) to alternate the half-width
+	// columns frame to frame and blend with the previous frame; the frame setup FUN_00a14886 keeps it only with the
+	// game's TAA (r_aaMethod +0xaa0 == 1). The doubled reflection while turning: the reflections' own history. Off unless set.
+	if (demons && env.Get("KYTY_DS_IBL_TEMPORAL") == "0") env.AppendConvars("r_enableIBLTemporal=false");
+	// (ssr0) KYTY_DS_SSR_OFF=1 in [Avanzado] extra: the game's own SSR off (r_ssrEnableOverrides with no ray: cutoff and
+	// length ~0, one iteration). Its normal-mapped blobs move as the camera turns (the "wave" on level floors); with our RT
+	// reflections on, ours replaces it (needs KYTY_RT_REFLECTIONS_GUIDE=0: the guide is that SSR). Off unless set.
+	if (demons && env.Get("KYTY_DS_SSR_OFF") == "1")
+		env.AppendConvars("r_ssrEnableOverrides=true;r_ssrMaxIterations=1;r_ssrMaxRayLength=0.01;r_ssrCutoffDistance=0.01");
 	// (11-13) The fire and particle blending as before: with KYTY_FG_PARTICLE_MV=1 the native particle vectors always on
 	// (a run came up with KYTY_FG_PARTICLE_NATIVE=0 from outside the settings and ghosting around fire); only an explicit
 	// KYTY_FG_PARTICLE_NATIVE in [Avanzado] extra changes it.
@@ -1369,7 +1375,7 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.perf_pm4_regfile != n.perf_pm4_regfile || l.perf_upload_lanes != n.perf_upload_lanes || l.perf_upload_help != n.perf_upload_help || l.perf_spin_gate != n.perf_spin_gate || l.perf_eager_feedback != n.perf_eager_feedback || l.perf_feedback_batch != n.perf_feedback_batch || l.perf_lane_wide != n.perf_lane_wide || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.shader_turbo != n.shader_turbo || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.path_tracing != n.path_tracing || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
 	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
@@ -1383,6 +1389,7 @@ void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
 	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = s->motes = "0";
+	s->path_tracing = "0"; // (pt1)
 	s->lens_flare = false;
 }
 

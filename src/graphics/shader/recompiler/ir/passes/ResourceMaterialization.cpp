@@ -1152,6 +1152,18 @@ uint32_t BufferDescriptorWord(const DescriptorValue& value) {
 	       descriptor.DstSelXYZW() << BufferWord::DstSelShift;
 }
 
+// (TrackResources' `storage_reads`) A storage image the shader reads as well as stores: its loads take each component the
+// swizzle gives, so the swizzle stays as the descriptor has it.
+static bool KeepsIdentitySwizzleShortcut(const ImageResource& base, bool storage) {
+	return !(storage && base.read && !base.atomic);
+}
+
+// An image read by atomics (TrackResources' `storage_reads` reads a raw 32-bit signed storage image as its bits, as it
+// stores them).
+static bool ReadByAtomics(const ImageResource& base) {
+	return base.read && base.atomic;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializeWorkspace& workspace,
                                         ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization,
@@ -1333,10 +1345,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 			// Loads of a format the device converts apply no swizzle, and a store writes each channel
 			// of the format the component the swizzle routes to it first: one that routes every channel
-			// its own component (X001, XXXX, XY00...) writes what an identity one does.
+			// its own component (X001, XXXX, XY00...) writes what an identity one does. Not a storage image
+			// the shader reads (KeepsIdentitySwizzleShortcut; a call and &, the function's PGO profile kept).
 			const auto count    = Format::GetFormatInfo(format).component_count;
 			bool       identity = image.conversion_format == Prospero::BufferFormat::kInvalid && count >= 1u &&
 			                count <= 4u;
+			identity &= KeepsIdentitySwizzleShortcut(base, storage);
 			for (uint32_t channel = 0; identity && channel < count; channel++) {
 				uint32_t source = 0;
 				while (source < 4u && ((image.shader_swizzle >> (source * 3u)) & 7u) != 4u + channel) source++;
@@ -1344,8 +1358,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			}
 			if (identity) image.shader_swizzle = ShaderImageIdentitySwizzle;
 		}
+		// (Read too, but not by atomics: ReadByAtomics.)
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
+		                              base.written && !ReadByAtomics(base) && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||

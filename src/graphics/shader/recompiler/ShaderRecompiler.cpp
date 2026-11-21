@@ -754,7 +754,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
 		     IR::ProgramToString(ir).c_str());
 	}
-	IR::TrackResources(ir);
+	IR::TrackResources(ir, options.stage == ShaderType::Pixel &&
+	                           (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelInterlock) != 0);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

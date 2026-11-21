@@ -7,6 +7,8 @@
 #include "writeback-verify.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
+#include "f0-measure.h" // (f0, KYTY_F0: memoryAddressSpace.inc)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE: memoryAddressSpace.inc)
 #include "mem-guard.h"
 #include "ram-guard.h"
 #include "common/guardedCopy.h" // (raiz2: NativeGuardedRead, the read probes)

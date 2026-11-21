@@ -198,6 +198,10 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	// (port2, KYTY_PORT2; local/port2.h) A marker of the emulator's Agc at `packet`: the dwords to pass over (the marker
+	// alone, or the marker and the span its flow was applied for). `can_apply`: outside speculation, state passes, chunks,
+	// stops and captures.
+	uint32_t Port2Marker(const uint32_t* packet, uint32_t remaining_dw, bool can_apply);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

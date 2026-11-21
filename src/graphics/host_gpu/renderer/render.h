@@ -20,6 +20,9 @@
 
 namespace Libs::Graphics {
 
+class Image;  // (render1 F2)
+class Buffer; // (render1 F2)
+
 namespace HW {
 class Context;
 class UserConfig;
@@ -392,6 +395,16 @@ private:
 	                                 uint64_t index_bytes, vk::IndexType index_type, bool keep_clears,
 	                                 const NativeXprDirect* direct = nullptr);
 	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
+	// (render1 F2) Before a table / native record emission binds anything: whether this draw goes into the native batch
+	// (`refuse` < Render1::Reasons: it cannot, for that reason); after the emission: its item.
+	[[nodiscard]] bool Render1Begin(CommandBuffer& buffer, const NativeXprDrawState& draw_state, uint32_t refuse);
+	[[nodiscard]] bool Render1Begin2(CommandBuffer& buffer, const NativeXprDrawState& draw_state, Image& image, uint32_t depth_index);
+	void Render1Add(CommandBuffer& buffer, const NativeXprDrawState& draw_state, const PipelineCache::Pipeline& pipeline,
+	                vk::DescriptorSet set, std::span<const uint32_t> offsets, vk::ShaderStageFlags push_stages,
+	                std::span<const uint32_t> push, bool index_bound, vk::Buffer index_buffer, uint64_t index_offset,
+	                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                std::span<const std::pair<Buffer*, uint64_t>> arguments, std::span<const uint32_t> group_sizes,
+	                std::span<const uint64_t> commands);
 
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
@@ -411,6 +424,16 @@ public:
 	// caller's ShaderReadObserver fills with the SRT evaluation's reads.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>* NativeXprReadLog();
 	void NativeXprEndPacket();
+	// (render1 F2, KYTY_RENDER1=2; local/render1-native.inc) The native depth batch: open, ended (drawn natively into
+	// the shadow image and compared; `why`: Render1::End), and a draw of it not reproduced (`reason`: Render1::Reason).
+	[[nodiscard]] bool Render1BatchOpen() const noexcept;
+	void               Render1EndBatch(CommandBuffer& buffer, uint32_t why);
+	void               Render1Taint(uint32_t reason);
+	// (render1 F3, KYTY_RENDER1=3; local/render1-native.inc) A p0/p1 depth draw run (paired, Render1::t_current) drawn
+	// ONLY the native way, into the game's own targets, where the packet is: true when drawn (the normal path then
+	// neither translates nor records it); false: the normal path draws it, the reason counted.
+	[[nodiscard]] bool Render1Draw(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands, uint64_t index_base,
+	                               uint64_t index_bytes, vk::IndexType index_type);
 	// Graphics registers may have changed without the observer seeing it.
 	void NativeXprForgetState();
 	// A clean draw (only user data and index state changed) after a table draw whose bindings still stand:

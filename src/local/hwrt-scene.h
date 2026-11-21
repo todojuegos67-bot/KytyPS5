@@ -68,6 +68,9 @@ enum class Skip : uint32_t {
 	Count
 };
 void NoteSkip(Skip why, uint32_t draws = 1);
+// (pt1e) Which part of a GPU-written draw the GPU wrote (after NoteSkip(GpuWritten)): its indirect arguments (args) or
+// its index range (the counts known on the CPU): BB_PATHTRACING's 5 s line, the data for capturing them.
+void NoteGpuWrittenKind(bool args);
 // A G-buffer draw state seen at the table store (counted once per state, for the log).
 void NoteSceneState(bool capturable);
 
@@ -155,6 +158,21 @@ struct GiSceneInfo {
 	std::array<float, 4>         cam {};
 };
 [[nodiscard]] bool GiScene(GiSceneInfo& out);
+
+// (pt1, BB_PATHTRACING: pathtrace.cpp) The scene built at the end of the game's GBuffer scope (the TAA / PS5 Pro packet
+// builds do nothing while BB_PATHTRACING=1), and the running totals of its 5 s line (never reset: it takes differences).
+void EndFrameAtScope(GraphicContext& graphics, vk::CommandBuffer command);
+struct PtTotals {
+	double   cpu_ms = 0.0, gpu_ms = 0.0;   // render-thread ms (draw notes + build), GPU ms (gather + BLAS + TLAS, timed frames)
+	uint64_t timed = 0, frames = 0, draws = 0, captured = 0, new_meshes = 0, refits = 0, budget_skips = 0;
+	uint64_t mesh_bytes = 0, fixed_bytes = 0, blas_bytes = 0;
+	uint32_t instances = 0, meshes = 0, dynamic = 0, discard = 0;
+	uint64_t reorders = 0;                       // (pt1b) compares that moved per vertex but not as a whole (kept static)
+	uint64_t gpu_written = 0, no_variant = 0;    // (pt1c) draws not captured: GPU-written arguments / indices, no capture pipeline
+	uint64_t gpu_written_args = 0, gpu_written_indices = 0; // (pt1e) of those: the arguments, the indices (counts on the CPU)
+	uint32_t ps_alpha = 0, ps_discard_other = 0; // (pt1b) pixel shaders seen: discard on texture alpha / other discards
+};
+[[nodiscard]] PtTotals GetPtTotals();
 
 } // namespace HwScene
 } // namespace Libs::Graphics

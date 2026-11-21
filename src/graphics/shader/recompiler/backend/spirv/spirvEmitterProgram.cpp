@@ -90,6 +90,26 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
 }
 
+// UsesPixelInterlock: the entry point runs the guest program (its function, where it kills and returns) as one critical
+// section, OpBeginInvocationInterlockEXT and OpEndInvocationInterlockEXT once each in its only block, outside any branch
+// (SPV_EXT_fragment_shader_interlock); a fragment the program kills leaves it there. The image memory of earlier
+// invocations' sections made visible after the begin, this one's made available before the end.
+void EmitInterlockEntryPoint(EmitterState& state) {
+	const auto barrier = [&] {
+		state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, ScopeDevice),
+		                           ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsImageMemory)});
+	};
+	state.builder.AddFunction({OpFunction, TypeVoid(state), state.main_func, FunctionControlNone, TypeFunction(state)});
+	EmitLabel(state, state.builder.AllocateId());
+	state.builder.AddFunction({OpBeginInvocationInterlockEXT});
+	barrier();
+	state.builder.AddFunction({OpFunctionCall, TypeVoid(state), state.builder.AllocateId(), state.interlock_guest_func});
+	barrier();
+	state.builder.AddFunction({OpEndInvocationInterlockEXT});
+	state.builder.AddFunction({OpReturn});
+	state.builder.AddFunction({OpFunctionEnd});
+}
+
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction({OpReturn});
@@ -703,7 +723,9 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	state.builder.AddFunction({OpFunction, TypeVoid(state),
-	                           state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
+	                           state.mesh_guest_func != 0        ? state.mesh_guest_func
+	                           : state.interlock_guest_func != 0 ? state.interlock_guest_func
+	                                                             : state.main_func,
 	                           FunctionControlNone, TypeFunction(state)});
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
@@ -765,6 +787,9 @@ void EmitProgram(EmitterState& state) {
 	state.builder.AddFunction({OpFunctionEnd});
 	if (state.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
+	}
+	if (state.interlock_guest_func != 0) {
+		EmitInterlockEntryPoint(state);
 	}
 }
 

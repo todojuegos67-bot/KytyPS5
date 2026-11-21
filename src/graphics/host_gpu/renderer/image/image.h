@@ -89,6 +89,10 @@ public:
 	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
 	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
 	void PrepareReuse(const ImageInfo& image_info);
+	// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse image (backing.sparse): its layers whose guest slices meet [begin, end) bound
+	// while committed, unbound when not; [gone_begin, gone_end) about to be unmapped (GPU thread; nothing for a dense one).
+	void SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin = 0, uint64_t gone_end = 0);
+	[[nodiscard]] bool IsSparse() const noexcept { return backing.sparse != nullptr; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -96,6 +100,8 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// (p7, KYTY_P7_C7) A new image's contents cleared to 0 before its first use that may read them (Transit).
+	bool ClearUndefined(vk::CommandBuffer command_buffer);
 	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
 	// own once it used the image: speculation-state.h).
 	[[nodiscard]] const VulkanImageState& CurrentState() const;
@@ -391,6 +397,9 @@ public:
 	uint64_t         lru_tick           = 0; // the collection tick of its last use (TextureCache)
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
+	// (p7b, C2) The recording thread's count of writing commands (LocalVulkanRecording::RecordedWrites) when the
+	// whole-image state was last set: a repeat in the same transit group is proven redundant only while it is unchanged.
+	uint64_t         transit_writes     = UINT64_MAX;
 	// The staging copy of the last whole-image upload (null: none or not refillable) and the command buffer it was
 	// recorded in (CommandScheduler::CommandSerial): TextureCache::InitializeImage.
 	const Buffer*    staged_ring        = nullptr;

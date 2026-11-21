@@ -79,11 +79,21 @@ constexpr uint32_t TranslatorFeatureNativeFloatMinMax = 4u;
 // the halves apart refused. Off unless KYTY_LANE_LOCAL_WIDE=1 (not in TranslatorFeatures until measured: it
 // changes those programs' SPIR-V).
 constexpr uint32_t TranslatorFeatureLaneLocalWide = 128u;
-constexpr uint32_t TranslatorFeatures =
-    TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse | TranslatorFeatureNativeFloatMinMax;
+// (up1118, upstream 8fd86d4) A pixel shader that loads an image it also stores through the same descriptor (Demon's
+// Souls' deferred decals: they read the G-buffer and write it back, no colour target, no barrier between them) reads it
+// as the storage image it writes (coherent), its whole body one critical section of VK_EXT_fragment_shader_interlock,
+// ordered per pixel: two overlapping decals run one after the other, as the PS5 runs them. Without it, a GPU that runs
+// consecutive draws' pixels together lets the next decal read before the last one's write lands and write back over it:
+// holes of 2x2 pixels in the candle wax and wall marks, different every frame (upstream issues #315, #341). Only where
+// the device has the pixel interlock and storage reads without a format (TranslatorDeviceFeatures: AMD's Windows driver
+// has no interlock). In TranslatorFeatures, but a store made without it keeps it off until KYTY_PIXEL_INTERLOCK=1.
+constexpr uint32_t TranslatorFeaturePixelInterlock = 512u;
+constexpr uint32_t TranslatorFeatures = TranslatorFeatureCooperativeHalves | TranslatorFeatureTableSlotsAtUse |
+                                        TranslatorFeatureNativeFloatMinMax | TranslatorFeaturePixelInterlock;
 // Those the translation uses (default: all; the emulator sets those its static store was made with before it translates
 // anything). KYTY_LANE_LOCAL_COOP=0/1 overrides the cooperative halves either way, KYTY_TABLE_SLOTS_AT_USE=0/1 the
-// table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max.
+// table slots' loads, KYTY_NATIVE_FLOAT_MIN_MAX=0/1 the float min/max, KYTY_PIXEL_INTERLOCK=0/1 the pixel interlock
+// (1 only where the device has it: whatever the store was made with).
 void                   SetTranslatorFeatures(uint32_t features);
 [[nodiscard]] uint32_t TranslatorFeatureSet();
 // Those this GPU's translation may use (default: all) and those it uses whatever the store was made with (`required`,

@@ -958,6 +958,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	const bool full  = !own || textures.GcTick() >= set.touched_tick + TableImageSet::TouchTicks ||
 	                  textures.CurrentFrame() >= set.touched_frame + TableImageSet::TouchTicks ||
 	                  m_context.GetCommandScheduler().Current().IsInvalid();
+	G1::NoteSetCheck(full); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
 	// Registrations since: their pages say which proofs they reach (none, when the log of the latest has none over the
 	// views' span: the game moves registrations every frame somewhere).
 	bool moved = set.resolution_epoch[Role()] != resolution;
@@ -982,6 +983,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		const bool held = !full && dep.proven && image->validity == dep.validity &&
 		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
 		                                                          set.resolution_epoch[0]));
+		G1::NoteSetUse(held); // (g1 NP1)
 		if (held && mode != 2) continue;
 		const auto refuse = [&] {
 			if (held) {
@@ -998,6 +1000,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
 		// as the normal path's FindTexture does.
 		if (TableRefreshPending(*image, dep.desc)) {
+			G1::NoteSetRefresh(); // (g1 NP1)
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
@@ -1062,6 +1065,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		set.touched_tick  = textures.GcTick();
 		set.touched_frame = textures.CurrentFrame();
 	}
+	G1::NoteSetOk(); // (g1 NP1)
 	return true;
 }
 
@@ -1977,6 +1981,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
 					if (block_stats) ++LiveCensus::g_table_blocks[4];
 					current = range_clean(held.address, held.size);
+					G1::NoteReprove(current); // (g1 NP1)
 					if (current) held.cpu_epoch = epoch;
 				}
 			}
@@ -2021,6 +2026,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
 							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							F0Measure::NoteRingCopy(address, size); // (f0)
 							if (shared != nullptr && cpu != 0)
 								*shared = {.address     = address,
 								           .size        = size,
@@ -2626,6 +2632,10 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (Render5Flags::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
+	// (pt1) BB_PATHTRACING: the sun's light matrix from the draws inside a RenderShadowCascade scope
+	if (PathTrace::Requested() && Spec::Current() == nullptr)
+		PathTrace::OnDraw(pair.programs[0]->shader_hash,
+		                  std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
 	if (Render5Flags::Wanted(Render5Flags::Ssr) && Spec::Current() == nullptr)
 		FrameGen::OnSsrDraw(pair.programs[0]->shader_hash,
 		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
@@ -2657,6 +2667,33 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		++groups;
 		first += count;
 	}
+	// (render1 F2c) What the draw's shaders read of its own depth target (its set's images: the program's bindings).
+	if (Render1::Mode() == 2 && Render1::t_current.native) {
+		auto& read = Render1::t_read;
+		read       = {};
+		read.known = true;
+		for (const auto& target: draw_state.targets) {
+			if (!target.requested.IsDepth()) continue;
+			for (const auto& image: set->images) {
+				++read.images;
+				if (!(image.id == target.id)) continue;
+				read.reads_depth = true;
+				read.base_layer  = image.range.base_layer;
+				read.layers      = image.range.layer_count;
+				read.base_level  = image.range.base_level;
+				read.levels      = image.range.level_count;
+			}
+			break;
+		}
+	}
+	// (render1 F2, KYTY_RENDER1=2: a p0/p1 depth draw into the native batch; before anything is bound or compared with
+	// what is bound: a new batch starts by copying the depth and invalidates the graphics state)
+	const bool render1 = Render1::Mode() == 2 && Render1::t_current.native &&
+	                     Render1Begin(buffer, draw_state,
+	                                  direct != nullptr || commands.empty() ? Render1::RDirect
+	                                  : writes                              ? Render1::RWrites
+	                                  : variant.hwrt_scene && HwScene::Active() ? Render1::RHwrt
+	                                                                            : Render1::Reasons);
 	auto&      emit       = cache.emit;
 	const bool indexed    = direct == nullptr || direct->indexed; // (a draw of vertices binds no indices)
 	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
@@ -2685,6 +2722,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool own           = Spec::Current() == nullptr;
+	// (f5b) A verified pass's targets (KYTY_NATIVE_PASSES ..:2; one load otherwise).
+	if (own && NativeRender::NoteTargetsWanted()) // (pt1: BB_PATHTRACING's GBuffer / ResolveLighting targets too)
+		for (const auto& target: draw_state.targets)
+			NativeRender::NoteTarget(target.id.index, target.id.generation, target.range.base_level, target.range.base_layer,
+			                         target.requested.IsDepth());
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own;
 	if (!in_place) {
@@ -2711,7 +2753,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's draws take its capturing pipeline (same layout), on this
 	// render thread only; the first record of each draw call goes in push constant dword HwScene::CursorDword.
 	bool hwrt_capture = false;
-	if (variant.hwrt_scene && HwScene::Active()) {
+	// (pt1) BB_PATHTRACING: only inside the game's capture scopes (GBuffer, VirtualGeo: the frame map); CaptureHere is
+	// true when it is off.
+	if (variant.hwrt_scene && HwScene::Active() && PathTrace::CaptureHere()) {
 		const uint32_t draws = direct != nullptr ? 1u : static_cast<uint32_t>(commands.size());
 		if (Role() != 0 || Spec::Current() != nullptr) {
 			HwScene::NoteSkip(HwScene::Skip::Speculation, draws);
@@ -2753,6 +2797,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 				d.ps_module = variant.hwrt_ps_module;
 				d.ps_images = &set->hwrt_ps_images;
 				d.cache     = &texture_cache;
+			} else if (PathTrace::Requested()) {
+				d.ps_module = variant.hwrt_ps_module; // (pt1: whether it discards - alpha-tested meshes stay out of the rays)
 			}
 			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
 			d.index_count    = index_count;
@@ -2761,6 +2807,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
 			if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
 				HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+				HwScene::NoteGpuWrittenKind(false); // (pt1e: the indices)
 				return false;
 			}
 			d.index_address = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
@@ -2787,6 +2834,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
 				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
 					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					HwScene::NoteGpuWrittenKind(true); // (pt1e: the indirect arguments)
 					continue;
 				}
 				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
@@ -2853,6 +2901,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
 	}
+	if (render1 && !hwrt_capture)
+		Render1Add(buffer, draw_state, pipeline, set->set, {}, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		           {push_data.dwords.data(), push_dwords}, !same_index, !same_index ? indices.first->Handle() : vk::Buffer {},
+		           !same_index ? indices.second : 0, index_base, index_bytes, index_type, {arguments.data(), groups},
+		           {group_sizes.data(), groups}, commands);
 	if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
 	if (Render5Flags::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
@@ -3299,6 +3352,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (KYTY_HWRT: the TAA's dispatch is where the scene's acceleration structures are built, on the normal path.)
 	if (HwScene::Active() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: hardware ray tracing (TAA)", false;
+	// (pt1) BB_PATHTRACING reads the images of the dispatches in a few scopes (ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR: ~45 a frame): the normal path, whose bindings reach PathTrace::AfterDispatch.
+	if (PathTrace::Requested() && Role() == 0 && PathTrace::WantDispatchHook())
+		return m_dispatch_declined = "table: path tracing (scope images)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
@@ -3499,6 +3556,45 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// (p7b, C1 precise: local/p7-compat.h) As DispatchDirect's: the hazards against the chain's earlier dispatches,
+	// from the guest ranges of its V#s (the words TableBlocks resolved); one barrier only where there is one.
+	if (chain && P7::Tracking()) {
+		const auto&                     shader  = *pair.programs[0];
+		const auto&                     entries = OwnTable().entries[0];
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count   = 0;
+		bool                            unknown = shader.info.uses_dma || shader.table_plan.global_memory ||
+		                                          shader.table_plan.dynamic_reads;
+		for (size_t i = 0; i < entries.size() && i < shader.info.buffers.size(); ++i) {
+			ShaderBufferResource descriptor;
+			std::copy_n(entries[i].first.begin(), 4, descriptor.fields);
+			const auto address = descriptor.Base48();
+			const auto bytes   = descriptor.Stride() != 0 ? uint64_t {descriptor.Stride()} * descriptor.NumRecords()
+			                                              : uint64_t {descriptor.NumRecords()};
+			if (descriptor.Type() != 0 || address == 0 || bytes == 0) continue;
+			if (count == accesses.size()) {
+				unknown = true;
+				break;
+			}
+			const auto& resource = shader.info.buffers[i];
+			accesses[count++]    = {.begin  = address,
+			                        .end    = address + bytes,
+			                        .read   = resource.read,
+			                        .write  = resource.written,
+			                        .atomic = resource.atomic};
+		}
+		const auto hazard = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(), count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -3516,7 +3612,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always)
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7)
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);

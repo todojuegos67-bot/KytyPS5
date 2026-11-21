@@ -271,6 +271,28 @@ void SaveList(State& s) {
 	if (f) f << j.dump(1, '\t');
 }
 
+// (trofeos-2) For the launcher's trophy panel: each trophy's icon as _SaveData/<title>/trophy-icons/tropNNN.png, the
+// PNG bytes from the game's own .ucp as they are (the launcher does not read the .ucp). Written once: a file already
+// there is kept, so later starts only check that the files exist.
+const Bytes* IconFile(const std::map<std::string, Bytes>& files, int id);
+void SaveIcons(State& s, const std::map<std::string, Bytes>& files) {
+	std::error_code ec;
+	const auto      dir = s.store.parent_path() / "trophy-icons";
+	std::filesystem::create_directories(dir, ec);
+	if (ec) return;
+	for (const auto& [id, e]: s.trophies) {
+		char name[32];
+		std::snprintf(name, sizeof(name), "trop%03d.png", id);
+		const auto out = dir / name;
+		if (std::filesystem::exists(out, ec)) continue;
+		const Bytes* png = IconFile(files, id);
+		if (png == nullptr && id == kNexusTrophyId) png = IconFile(files, 1); // (the port's own: trophy 1's icon, as the popup)
+		if (png == nullptr || png->empty()) continue;
+		std::ofstream f(out, std::ios::binary | std::ios::trunc);
+		if (f) f.write(reinterpret_cast<const char*>(png->data()), static_cast<std::streamsize>(png->size()));
+	}
+}
+
 bool SoundWanted();
 bool PopupWanted();
 void SyncFromSave(State& s);
@@ -397,6 +419,7 @@ void Load(State& s) {
 	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
 	            s.unlocked.size(), Common::PathToString(s.store).c_str());
 	SaveList(s);
+	SaveIcons(s, files); // (trofeos-2)
 	SyncFromSave(s); // (1109) the trophies the game's save already proves
 }
 

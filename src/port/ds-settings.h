@@ -70,6 +70,8 @@ extern const int     kAntiLagDlssgCount;
 // (10-28, ds-torch-1028's launcher) The screen-space RT set (c3e58bd5) and the new passes: their rows' levels.
 extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5), Hibrido (6: Alto + KYTY_RT_REFLECTIONS_HYBRID)
 extern const int     kRtReflLevelCount;
+extern const Choice  kPathTracingLevels[]; // (pt1) Path tracing: No, Bajo, Medio, Alto, Ultra (BB_PATHTRACING + _QUALITY)
+extern const int     kPathTracingLevelCount;
 extern const Choice  kRtReflSharp[];   // (refl-sharp-1031) Nitidez de reflejos RT: Normal, Alta, Maxima
 extern const int     kRtReflSharpCount;
 extern const Choice  kMotesLevels[];   // (motes-1031) Particulas volumetricas: No, Sutil, Media, Densa
@@ -164,6 +166,7 @@ struct Settings {
 	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
+	std::string path_tracing = "0";  // (pt1) path_tracing: 0 No, 1 Bajo, 2 Medio, 3 Alto, 4 Ultra (BB_PATHTRACING=1 + BB_PATHTRACING_QUALITY)
 	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-6 (KYTY_RT_REFLECTIONS; 4-5: more presence; 6 Hibrido)
 	std::string rt_refl_sharp = "0"; // (refl-sharp-1031) nitidez_reflejos_rt: 0 Normal, 1 Alta, 2 Maxima (KYTY_RT_REFLECTIONS_SHARP)
 	std::string rt_refl_waves = "0"; // (refl-sharp-1031) ondas_agua_reflejos: 0 Como ahora, 1 Suaves, 2 Espejo (KYTY_RT_REFLECTIONS_WATER_WAVES)
