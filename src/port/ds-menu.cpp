@@ -97,6 +97,17 @@ Settings                 g_saved;      // what settings.ini holds now
 // (ds-pc-port13) Preparar shaders: all CPU threads or relaxed (asked the first time, then settings.ini's
 // precompilar_hilos; Opciones > Sistema changes it), then the precompile.
 void StartShaders() {
+	// (precomp-fix) No game folder yet: ask for it first (the precompile needs it; it is saved to settings.ini).
+	if (g_saved.game.empty() && g_rt.pick_folder) {
+		const std::string picked = g_rt.pick_folder();
+		if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+			g_edit.game = g_saved.game = picked;
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
+			on_disk.game = picked;
+			(void)SaveSettings(g_rt.ini_path, on_disk);
+		}
+	}
 	Precompile::Choose(g_rt.ini_path, &g_edit);
 	g_saved.precompile_threads = g_edit.precompile_threads;
 	Precompile::Start();
@@ -150,7 +161,8 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 7; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
+constexpr int            kTabCount = 8; // (online11) + Conexión online
+// // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -2160,7 +2172,7 @@ int ForSection(const char* title) {
 	    {"Imagen", Monitor},        {"Frame generation", Layers}, {"Calidad gráfica", Sliders}, {"Ray tracing", Sun},
 	    {"Modos Souls", Flame},     {"Pantalla", Monitor},        {"Rendimiento", Gauge},       {"Controles", Pad},
 	    {"Tu equipo", Chip},        {"Configurador", Gear},       {"Ajustes del juego", Gear},  {"Sonido", Speaker},
-	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip}};
+	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip},  {"Conexión online", Soul}};
 	for (const auto& [name, kind]: map)
 		if (std::strcmp(name, title) == 0) return kind;
 	return -1;
@@ -3181,6 +3193,7 @@ void ResolutionRow(Settings& s) {
 // (10-28b) `in_tab`: inside the launcher's Sistema tab (no title, no "Continuar").
 namespace Multiplayer { // (online5) below
 void SettingsBlock(float unit);
+void Card(float unit); // (online11) the launcher's / F2's "Conexión online" section
 }
 void DrawConfigurator(float unit, bool in_tab = false) {
 	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
@@ -3247,11 +3260,6 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F2."
 		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
 	}
-	// (online5) Multijugador (also in F2 > Multijugador).
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::TextColored(kGold, "%s", "Multijugador");
-	Multiplayer::SettingsBlock(unit);
 }
 
 // (ds-pc-port10) The DLSS 5 rows' tooltips (launcher and F2).
@@ -3345,14 +3353,14 @@ void Draw(float width, float height) {
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
 	// folded in) and Trofeos; the same sections and rows as F2, so both write the same settings.ini the same way.
-	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
-	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
-	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}}; // (10-28) no Modos Souls
-	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}};
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {11}, {10}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {11}, {10}};
 	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
-	static const char* section_names[11] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
-	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego"};
+	static const char* section_names[12] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego", "Conexión online"};
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
@@ -3520,8 +3528,6 @@ void Draw(float width, float height) {
 					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Ultra: volumen a media resolución (rayos más definidos), más muestras y la niebla del propio juego más densa y más dirigida hacia la luz (~+1 ms). Apagarla es inmediato."))
 						live_changed = true;
 					ChoiceRow("Partículas volumétricas", s.motes != l.motes, kMotesLevels, kMotesLevelCount, s.motes, "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms."); // (motes-1031)
-					ChoiceRow("Suelo estable", s.floor_stable != l.floor_stable, kRtq2OnOff, kRtq2OnOffCount, s.floor_stable, "El reflejo del suelo, la piedra y el metal sigue la forma de la superficie y no su relieve fino: deja de ondular al mover la cámara. El agua no cambia (es otro pase del juego). Sin coste. Necesita reiniciar."); // (rtq2)
-					ChoiceRow("Reflejos RT nuevos", s.rt_nuevo != l.rt_nuevo, kRtnLevels, kRtnLevelCount, s.rt_nuevo, "Ray tracing por hardware solo donde el propio juego pone reflejo (suelo mojado, piedra pulida, metal), con la normal de la superficie (como Suelo estable); el agua no cambia. El juego compone el resultado con su propio brillo y Fresnel. Depuración: encima, al 50 %, verde donde se usa el rayo y azul la zona del juego sin acierto. Coste ~1 ms. Necesita reiniciar."); // (rtq2 b)
 					// (ds-pc-port9 / ds-pc-port10) No Luz de antorchas RT or Destellos de lente in the port (the old screen-space "Path tracing" is gone; pt1 adds the hardware one above).
 					ChoiceRow("Humo y partículas", s.smoke != l.smoke, kSmokeLevels, kSmokeLevelCount, s.smoke,
 					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.");
@@ -3726,6 +3732,7 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
+				case 11: Multiplayer::Card(unit); break; // (online11) its own section in the launcher and F2
 				default: break;
 			}
 			}
@@ -4667,10 +4674,6 @@ void LauncherRayTracing(Settings& s) {
 	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Ultra: volumen a media resolución (rayos más definidos), más muestras y la niebla del propio juego más densa y más dirigida hacia la luz (~+1 ms).", fx, fw);
 	LRow("Partículas volum.", kMotesLevelCount, kMotesLevels, s.motes, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms.", fx, fw); // (motes-1031)
-	LRow("Suelo estable", kRtq2OnOffCount, kRtq2OnOff, s.floor_stable, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "El reflejo del suelo, la piedra y el metal sigue la forma de la superficie y no su relieve fino: deja de ondular al mover la cámara. El agua no cambia (es otro pase del juego). Sin coste. Necesita reiniciar.", fx, fw); // (rtq2)
-	LRow("Reflejos RT nuevos", kRtnLevelCount, kRtnLevels, s.rt_nuevo, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Ray tracing por hardware solo donde el propio juego pone reflejo (suelo mojado, piedra pulida, metal), con la normal de la superficie (como Suelo estable); el agua no cambia. El juego compone el resultado con su propio brillo y Fresnel. Depuración: encima, al 50 %, verde donde se usa el rayo y azul la zona del juego sin acierto. Coste ~1 ms. Necesita reiniciar.", fx, fw); // (rtq2 b)
 	// (ds-pc-port10) Luz de antorchas RT and Destellos de lente are gone from the port (always off).
 	LRow("Humo y partículas", kSmokeLevelCount, kSmokeLevels, s.smoke, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.",
@@ -4937,7 +4940,9 @@ void LauncherSoulsModes(Settings& s) {
 	    {"ligero-plus", "Modo Souls ligero +",
 	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 40 FPS estables y frame generation de AMD x2 (80 en pantalla): mas fluido y algo menos de latencia."},
 	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
-	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."}};
+	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."},
+	    {"sin-tirones", "Demon's Souls optimizado",
+	     "Sirve para mejorar el framerate a costa de sacrificar un poco la calidad: menos carga para el hilo grafico, mas FPS y menos tirones. Quita las calcomanias proyectadas (sangre y suciedad en paredes y suelo, casi la mitad de los objetos de cada frame), deja el desvanecimiento y los reflejos en Normal, el teselado en Bajo y sin desenfoque de movimiento; texturas, sombras y distancia siguen altas. FSR 4 Calidad."}};
 	const auto pick = [&](float y, const Mode& m, float x) {
 		bool on = s.souls_mode == m.id;
 		if (!LCheck(y, m.label, on, m.tip, x)) return;
@@ -4955,6 +4960,11 @@ void LauncherSoulsModes(Settings& s) {
 		const float y = RowY();
 		pick(y, modes[4], 12);
 		pick(y, modes[5], 216);
+		RowEnd(y);
+	}
+	{
+		const float y = RowY();
+		pick(y, modes[6], 12); // (sintirones)
 		RowEnd(y);
 	}
 	if (FixedFg(s)) {
@@ -5844,6 +5854,72 @@ void Draw(float width, float height, float column_x) {
 	}
 }
 
+// (online12) ONLINE beside TROFEOS at the launcher's bottom left: same tab look (medallion with a pulsing soul, ONLINE in
+// Cinzel); a click opens the "Conexión online" panel (account, password, server state) over the launcher.
+bool g_online_open = false;
+void DrawOnline(float width, float height) {
+	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	const float th = Px(60), tw = Px(300);
+	const float tx = Px(16) + Px(400) + Px(14);
+	const float ty = std::round(height - U(34) - th);
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##online-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##online-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		const bool hov     = ImGui::IsItemHovered();
+		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || g_online_open);
+		Tip("Conexi\xC3\xB3n online: tu cuenta y contrase\xC3\xB1" "a para jugar con tus amigos (mensajes, manchas, fantasmas, invocaciones).");
+		if (clicked) g_online_open = !g_online_open;
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(150, 190, 255, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(40, 56, 90, 0.30f + 0.25f * hot),
+		                            Ca(40, 56, 90, 0.10f), Ca(40, 56, 90, 0.0f), Ca(40, 56, 90, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
+		dl->AddCircleFilled(mc, mr, IM_COL32(12, 16, 26, 255), 32);
+		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.45f + 0.12f * k + 0.05f * pl), Ca(150, 190, 255, 0.05f * k), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "ONLINE", U(2.5f));
+		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), I18n::T("Cuenta y amigos"), U(1));
+	}
+	ImGui::End();
+	if (!g_online_open) return;
+	const ImVec2 ps {std::min(width * 0.9f, Px(980)), std::min(height * 0.8f, Px(860))};
+	ImGui::SetNextWindowPos({std::round((width - ps.x) * 0.5f), std::round((height - ps.y) * 0.5f)});
+	ImGui::SetNextWindowSize(ps);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.05f, 0.05f, 0.06f, 0.96f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.80f, 0.69f, 0.48f, 0.7f});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, Px(10));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {Px(28), Px(24)});
+	ImGui::Begin("##online-panel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::BeginChild("##online-body", {0, -Px(64)});
+	Multiplayer::Card(U(1));
+	ImGui::EndChild();
+	if (Anim::Button(I18n::T("Cerrar"), {Px(220), Px(48)}, U(1))) g_online_open = false;
+	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) g_online_open = false;
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
 } // namespace LauncherTrophy
 
 // (ds-pc-port11) Text with a dark outline (shadow) for the shaders' panel: legible over the panel and over the gold bar.
@@ -6340,6 +6416,7 @@ void DrawLauncher(float width, float height) {
 
 	// (trofeos-exe) TROFEOS at the bottom left, above the version line; its panel unfolds upwards.
 	LauncherTrophy::Draw(width, height, px);
+	LauncherTrophy::DrawOnline(width, height); // (online12) ONLINE beside TROFEOS
 
 	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
 	{
@@ -7159,7 +7236,7 @@ void Sample(LogState& L,
 	const std::string souls = s.souls_mode;
 	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
-	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
+	                        : souls == "low" ? "Modo Souls PC low profile" : souls == "sin-tirones" ? "Demon's Souls optimizado" : "Personalizado";
 	const bool  fixed = souls == "ligero" || souls == "ligero-plus" || souls == "equilibrado" || souls == "low";
 	std::string fg_label = fixed ? modo : FrameGenLabel(s.framegen);
 	std::string al       = "No";
@@ -8885,10 +8962,8 @@ void Note(const std::string& s) {
 	std::lock_guard lock(g_m);
 	g_note = s;
 }
-std::string Host() {
-	std::string h = g_server;
-	if (const auto c = h.find(':'); c != std::string::npos) h = h.substr(0, c);
-	return h.empty() ? std::string("127.0.0.1") : h;
+std::string Host() { // (online10) fixed server: this PC's own when it runs it, else the owner's via DuckDNS
+	return g_local_up ? std::string("127.0.0.1") : std::string(On::kPublicServer);
 }
 bool IsLocal() {
 	const auto h = Host();
@@ -8975,15 +9050,12 @@ void SettingsBlock(float unit) {
 	}
 	const ImVec2 bs {std::round(300 * unit), std::round(50 * unit)};
 	bool         on = g_saved.multiplayer;
-	if (ImGui::Checkbox(I18n::T("Multijugador (online con el servidor propio)"), &on)) {
+	if (ImGui::Checkbox(I18n::T("Conexión online"), &on)) {
 		Save(on);
 		Note(on ? I18n::T("Multijugador activado. Se aplica al reiniciar el juego.") : I18n::T("Multijugador apagado: el juego vuelve a ser sin conexión al reiniciar."));
 	}
 	Anim::Highlight(unit);
-	ImGui::SetNextItemWidth(std::round(420 * unit));
-	ImGui::InputTextWithHint(I18n::T("Servidor"), "127.0.0.1  /  bloodbornetdj67.duckdns.org", g_server, sizeof(g_server));
-	Anim::Highlight(unit);
-	FieldTools("##g_server", g_server, sizeof(g_server)); // (online6) Pegar
+	ImGui::TextColored(kDim, "%s", (std::string(I18n::T("Servidor: ")) + On::kPublicServer + I18n::T(" (todos los jugadores al mismo)")).c_str()); // (online10)
 	ImGui::SetNextItemWidth(std::round(420 * unit));
 	ImGui::InputTextWithHint(I18n::T("Cuenta"), I18n::T("nombre (letras y números)"), g_name, sizeof(g_name));
 	Anim::Highlight(unit);
@@ -9018,21 +9090,9 @@ void SettingsBlock(float unit) {
 	if (!note.empty()) ImGui::TextColored(kGold, "%s", note.c_str());
 }
 
-bool Page(float width, float height, float unit) {
-	using namespace F1Pages;
-	Begin("Multijugador", width, height, unit);
-	ImGui::BeginChild("##multi", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
-	Anim::SmoothScroll();
-	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
-	Bump();
-	std::string st, pub, lan;
-	bool        up, local, fw, as;
-	{
-		std::lock_guard lock(g_m);
-		st = g_state_json, pub = g_public_ip, lan = g_lan_ip;
-		up = g_server_up, local = g_local_up, fw = g_firewall, as = g_autostart;
-	}
-	// The server's state: a pulsing seal (soul blue: connected; ember: no answer), players and sessions.
+// (online11) The server's state as a pulsing seal: soul blue connected, ember no answer.
+void Seal(float unit, bool up) {
+	// the server's state: a pulsing seal (soul blue: connected; ember: no answer), players and sessions.
 	{
 		ImDrawList*  dl   = ImGui::GetWindowDrawList();
 		const float  side = std::round(54 * unit);
@@ -9054,6 +9114,53 @@ bool Page(float width, float height, float unit) {
 		ImGui::TextColored(kDim, "%s", mode.c_str());
 		ImGui::EndGroup();
 	}
+}
+// (online11) "Conexión online" in the launcher and F2: title, seal, players, then account and password.
+void Card(float unit) {
+	Bump();
+	bool up, local;
+	std::string st;
+	{
+		std::lock_guard lock(g_m);
+		up = g_server_up, local = g_local_up, st = g_state_json;
+	}
+	(void)local;
+	ImGui::PushFont(DisplayFont(), 40.0f * unit);
+	ImGui::TextColored(kGold, "%s", I18n::T("Conexión online"));
+	ImGui::PopFont();
+	ImGui::TextColored(kDim, "%s", I18n::T("Mensajes, manchas de sangre, fantasmas e invocaciones con tus amigos. Todos en el mismo servidor."));
+	ImGui::Spacing();
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.10f, 0.11f, 0.14f, 0.85f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
+	ImGui::BeginChild("##oncard", {0, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+	Seal(unit, up);
+	if (up) {
+		const auto players = Strings(st, "jugadores");
+		ImGui::TextColored(kDimL, "%s", (std::string(I18n::T("Jugadores conectados: ")) + std::to_string(players.size())).c_str());
+		for (const auto& name: players) ImGui::BulletText("%s", name.c_str()); // (online12) who is online, by account name
+	}
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor();
+	ImGui::Spacing();
+	SettingsBlock(unit);
+}
+
+bool Page(float width, float height, float unit) {
+	using namespace F1Pages;
+	Begin("Multijugador", width, height, unit);
+	ImGui::BeginChild("##multi", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
+	Anim::SmoothScroll();
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
+	Bump();
+	std::string st, pub, lan;
+	bool        up, local, fw, as;
+	{
+		std::lock_guard lock(g_m);
+		st = g_state_json, pub = g_public_ip, lan = g_lan_ip;
+		up = g_server_up, local = g_local_up, fw = g_firewall, as = g_autostart;
+	}
+	Seal(unit, up);
 	if (up) {
 		const auto players = Strings(st, "jugadores");
 		std::string list;

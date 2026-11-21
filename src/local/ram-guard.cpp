@@ -363,7 +363,7 @@ namespace {
 bool StoreCounterEnabled() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_RAM_STORE_COUNTER");
-		return v != nullptr && v[0] == '1';
+		return v == nullptr || v[0] != '0'; // (tiron14) on by default
 	}();
 	return on;
 }

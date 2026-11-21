@@ -1,6 +1,7 @@
 #include "port/ds-settings.h"
 
 #include "port/ds-tables.h"
+#include "port/ds-online.h"
 
 #include <algorithm>
 #include <thread>
@@ -102,8 +103,8 @@ const int    kRtReflWavesCount = 3;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
-const Choice kVolLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
-const int    kVolLevelCount = 5;
+extern const Choice kVolLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
+extern const int    kVolLevelCount = 5;
 const Choice kRtx1Levels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
 const int    kRtx1LevelCount = 5;
 const Choice kRtq2OnOff[] = {{"0", "No"}, {"1", "Sí"}}; // (rtq2) Suelo estable
@@ -131,8 +132,9 @@ const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
                               {"equilibrado", "Modo Souls equilibrado"},
                               {"ultra", "Modo Souls ultra"},
                               {"extremo", "Modo Souls extremo"},
-                              {"low", "Modo Souls PC low profile (900p, todo en bajo)"}};
-const int    kSoulsModeCount = 7;
+                              {"low", "Modo Souls PC low profile (900p, todo en bajo)"},
+                              {"sin-tirones", "Demon's Souls optimizado"}};
+const int    kSoulsModeCount = 8;
 const Choice kMetrics[] = {{"0", "No"}, {"1", "FPS"}, {"2", "FPS + detalle"}};
 const int    kMetricsCount = 3;
 const Choice kLanguages[] = {{"3", "Espanol (Espana)"}, {"20", "Espanol (Latinoamerica)"}, {"1", "English (US)"},
@@ -1329,8 +1331,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	// (online5) [Multijugador]: the online switches (libs/network.cpp, libs/libNet.cpp, loader/gameArgs.cpp). Our server:
 	// TCP 31415 (game server + WebAPI), TCP 31413 (accounts), UDP 3758 (P2P relay). Off: offline as before.
 	if (s.multiplayer) {
-		std::string host = s.online_server.empty() ? std::string("127.0.0.1") : s.online_server;
-		if (const auto c = host.find(':'); c != std::string::npos) host = host.substr(0, c);
+		const std::string host = Port::Online::ServerHost(); // (online10) one server for everyone (DuckDNS; 127.0.0.1 on the owner's PC)
 		env.Set("KYTY_ONLINE", "1");
 		env.Set("KYTY_ONLINE_SERVER", host + ":31415");
 		env.Set("KYTY_ONLINE_NAME", s.online_name);
@@ -1377,6 +1378,8 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 			const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA");
 			env.Set("KYTY_GAME_CONVARS_EXTRA", old.empty() ? cv : old + ";" + cv);
 		};
+		// (sintirones) Demon's Souls optimizado: the projected decals (blood, dirt) off, last so it wins.
+		if (s.souls_mode == "sin-tirones") last_cv("r_projectedDecalEnable=false");
 		const auto rt_refl_on = [&] {
 			const std::string r = env.Get("KYTY_RT_REFLECTIONS");
 			return !r.empty() && r != "0";
@@ -1480,6 +1483,8 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	const float sens = (s.kbm_sens > 0 ? s.kbm_sens : 1.0f) * (fixed_fg ? 0.92f : 1.0f);
 	env.Set("KYTY_KBM_SENS", s.kbm ? Num(sens) : "");
 	env.Set("KYTY_KBM_ANTIDZ", s.kbm ? Num(s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f) : "");
+	// (raton3) Native mouse camera by default (yaw and pitch written where the game reads the stick, no stick inertia), as Bloodborne; KYTY_CAM1=0 in the environment: as before.
+	if (s.kbm) env.Default("KYTY_CAM1", "1");
 	// (raton2) Only when not 1, so a KYTY_CAM1_SENS_X / _Y of the environment still wins at 1.
 	if (s.kbm && s.kbm_sens_x > 0 && s.kbm_sens_x != 1.0f) env.Set("KYTY_CAM1_SENS_X", Num(s.kbm_sens_x));
 	if (s.kbm && s.kbm_sens_y > 0 && s.kbm_sens_y != 1.0f) env.Set("KYTY_CAM1_SENS_Y", Num(s.kbm_sens_y));
@@ -1619,6 +1624,20 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->aa_sharp    = "ultra";
 		s->af16        = true;
 		if (s->texture_sharpness == "0") s->texture_sharpness = "1";
+	} else if (preset == "sin-tirones") {
+		// (sintirones) Ultra-like image with what loads the render thread trimmed: the projected decals off (convar in ApplyEnv:
+		// ~4860 of ~11000 draws a frame at 1-1, measured 45 -> 60 fps there), object fade / reflections Normal (fewer far
+		// objects and passes), tessellation Bajo (below), no motion blur; textures, shadows and distance kept high.
+		max();
+		s->shadows     = "alto";
+		s->detail      = "alto";
+		s->object_fade = "normal";
+		s->reflections = "normal";
+		s->af16        = true;
+		post_on();
+		s->motion_blur = false;
+		// (the upscaler: the user's choice, untouched)
+		s->pure_game   = false;
 	} else if (preset == "low") {
 		// Set-PresetLowProfile: 900p-ish with FSR Calidad, everything low; what costs nearly nothing at its best.
 		s->texture_reduce    = "2";
@@ -1647,7 +1666,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->tess = "alto";
 	} else {
 		s->ibl  = "mitad";
-		s->tess = (preset == "ligero" || preset == "ligero-plus") ? "bajo" : "medio"; // (11-12) ligero / + : Teselado Bajo
+		s->tess = (preset == "ligero" || preset == "ligero-plus" || preset == "sin-tirones") ? "bajo" : "medio"; // (11-12) ligero / + : Teselado Bajo
 	}
 	// (10-28, the emulator launcher's rule) Every mode / preset: every RT effect No (Reflejos RT, Luz RT, Luz volumetrica,
 	// Oclusion ambiental, Luz de antorchas RT, Destellos de lente, Sombras RT and the hardware rows); enabled by hand after.

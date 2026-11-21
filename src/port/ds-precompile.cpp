@@ -388,6 +388,18 @@ void Work() {
 		SetText("Preparando shaders: la carpeta del juego...");
 		g_setup.refresh(g_setup);
 	}
+	{ // (precomp-fix) No game folder (a new install chooses it at JUGAR): every shard failed with exit 2 (--game "").
+		std::error_code gec;
+		if (g_setup.game.empty() || !fs::exists(fs::u8path(g_setup.game) / "eboot.bin", gec)) {
+			std::printf("[port] precompile: no game folder (%s); not started\n", g_setup.game.c_str());
+			std::fflush(stdout);
+			std::scoped_lock lock(g_mutex);
+			g_view.failed  = true;
+			g_view.running = false;
+			g_view.text    = "Primero elige la carpeta del juego (boton \"Elegir carpeta del juego...\") y vuelve a pulsar Preparar shaders.";
+			return;
+		}
+	}
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
 	const std::string& id = g_setup.id;

@@ -560,7 +560,9 @@ inline void Flip() {
 				using G = LiveCounters::Id;
 				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
 				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
-				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs,
+				                                   G::ProtectCallsRender, G::ProtectCallsGfx, G::RenderReadFaults, G::SyncReadsRender,
+				                                   G::AddressSpaceWaitKtRender, G::TimelineQueriesRender, G::QueueLockUs, G::TranslateUs};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {
