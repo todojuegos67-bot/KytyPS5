@@ -97,6 +97,17 @@ Settings                 g_saved;      // what settings.ini holds now
 // (ds-pc-port13) Preparar shaders: all CPU threads or relaxed (asked the first time, then settings.ini's
 // precompilar_hilos; Opciones > Sistema changes it), then the precompile.
 void StartShaders() {
+	// (precomp-fix) No game folder yet: ask for it first (the precompile needs it; it is saved to settings.ini).
+	if (g_saved.game.empty() && g_rt.pick_folder) {
+		const std::string picked = g_rt.pick_folder();
+		if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+			g_edit.game = g_saved.game = picked;
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
+			on_disk.game = picked;
+			(void)SaveSettings(g_rt.ini_path, on_disk);
+		}
+	}
 	Precompile::Choose(g_rt.ini_path, &g_edit);
 	g_saved.precompile_threads = g_edit.precompile_threads;
 	Precompile::Start();
