@@ -711,6 +711,12 @@ void NoteCinematic(const char* name) noexcept {
 	// (11-11) The intro's cinematic skip patch is only for the opening voidwalk: any other cinematic's files (the
 	// Nexus arrival, scn000001_maidentravel, came while it was still armed and was cut, breaking the Nexus floor
 	// effect) remove it before that cinematic plays.
+	// (picos3) The opening voidwalk is skipped by the game patch: it does not play, so it holds nothing (it held the
+	// first minutes at 60 fps until the player moved the mouse or a stick, log 21-11 09:38). KYTY_VOIDWALK_HOLD=1: as before.
+	if (name != nullptr && std::strstr(name, "voidwalk") != nullptr && Loader::DemonsSoulsSkipIntro::CinematicSkipArmed()) {
+		const char* keep = std::getenv("KYTY_VOIDWALK_HOLD");
+		if (keep == nullptr || keep[0] != '1') return;
+	}
 	if (name != nullptr && std::strstr(name, "voidwalk") == nullptr && Loader::DemonsSoulsSkipIntro::CinematicSkipArmed())
 		Loader::DemonsSoulsSkipIntro::Disarm("another cinematic started (only the opening one is skipped)");
 	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();

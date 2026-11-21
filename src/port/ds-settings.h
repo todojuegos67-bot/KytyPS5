@@ -215,7 +215,7 @@ struct Settings {
 	bool        ram16_boost = false; // (11-13) on by default on every PC: less RAM // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// (perfopts-1107) Opciones de rendimiento: upstream's opt-in switches (all off = the behaviour before them).
 	bool        perf_pm4_regfile = false;   // KYTY_PM4_REGFILE=1
-	bool        perf_upload_lanes = false;  // KYTY_UPLOAD_LANES=2
+	bool        perf_upload_lanes = true;   // KYTY_UPLOAD_LANES=2 (on by default: 21-11 log, upload thread -29%, fewer >50 ms seconds)
 	bool        perf_upload_help = false;   // KYTY_UPLOAD_HELP=2
 	bool        perf_spin_gate = false;     // KYTY_SPIN_GATE=1
 	bool        perf_eager_feedback = false; // KYTY_EAGER_FEEDBACK=1

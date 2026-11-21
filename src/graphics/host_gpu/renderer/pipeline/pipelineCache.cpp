@@ -661,7 +661,7 @@ struct PipelineCache::ProgramCache {
 	[[nodiscard]] static bool Tiron11On() {
 		static const bool on = [] {
 			const char* v   = std::getenv("KYTY_TIRON11");
-			const bool  set = v != nullptr && v[0] == '1';
+			const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
 			std::printf("[tiron11] busqueda de permutaciones de shader por hash: %s\n", set ? "ON (KYTY_TIRON11=1)" : "off");
 			std::fflush(stdout);
 			return set;
@@ -1115,7 +1115,7 @@ struct PipelineCache::ProgramCache {
 		// A diagnostic only: the "[ram]" line (system calls) stays.
 		static const bool skip = [] {
 			const char* v = std::getenv("KYTY_TIRON13");
-			const bool  set = v != nullptr && v[0] == '1';
+			const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
 			std::printf("[tiron13] censo de la cache de pipelines en el hilo de render: %s\n", set ? "QUITADO (KYTY_TIRON13=1)" : "cada 60 s");
 			std::fflush(stdout);
 			return set;
@@ -2668,6 +2668,13 @@ public:
 		for (uint32_t i = 0; i < count; i++)
 			m_threads.emplace_back([this] {
 				if (m_background) LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
+				// (picos2) Off the game's CPUs (KYTY_GAME_CPUS, the V-Cache CCD) when the port set them: ~20 translators on
+				// every CPU took the game threads' cores (tiron3 21-11: a 125 ms frame, game threads at 46-62%).
+				// KYTY_SHADER_OFF_GAME=0: every CPU, as before.
+				if (m_background) {
+					const char* off = std::getenv("KYTY_SHADER_OFF_GAME");
+					if (off == nullptr || off[0] != '0') LocalPlatform::AvoidCpuList(std::getenv("KYTY_GAME_CPUS"));
+				}
 				Run();
 			});
 	}

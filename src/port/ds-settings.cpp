@@ -1263,6 +1263,10 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	// the emulator's own defaults, no shader gate, and no SPIR-V disk store (the emulator has none: off). The warmup on 16
 	// threads, launch.json's KYTY_SHADER_WARMUP_THREADS.
 	env.Set("KYTY_SPIRV_DISK", "0");
+	// (velas1) The deferred decals (candle light, blood, dirt) need the pixel interlock or they flicker; it was turned off
+	// whenever the static store had been precompiled without it (a clean install: "the static pipeline store was made
+	// without it"). On by default except on AMD's Windows driver (issue #355, faces), which keeps its own check.
+	if (!pc.amd) env.Default("KYTY_PIXEL_INTERLOCK", "1");
 	// (ds-pc-port47) Root cause of the port-only hitches: ds-perf-1031's V-Cache pin (not in the emulator, de604751) set
 	// KYTY_RENDER_CPUS to CPUs 2-15 of the 16 the port's process ran on, and every background thread keeps off those
 	// (AvoidCpuList): the shader prefetch, warmup and every async pipeline worker squeezed onto CPUs 0-1 (port logs:
