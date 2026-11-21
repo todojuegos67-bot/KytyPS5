@@ -150,7 +150,8 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 7; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
+constexpr int            kTabCount = 8; // (online11) + Conexión online
+// // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -2160,7 +2161,7 @@ int ForSection(const char* title) {
 	    {"Imagen", Monitor},        {"Frame generation", Layers}, {"Calidad gráfica", Sliders}, {"Ray tracing", Sun},
 	    {"Modos Souls", Flame},     {"Pantalla", Monitor},        {"Rendimiento", Gauge},       {"Controles", Pad},
 	    {"Tu equipo", Chip},        {"Configurador", Gear},       {"Ajustes del juego", Gear},  {"Sonido", Speaker},
-	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip}};
+	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip},  {"Conexión online", Soul}};
 	for (const auto& [name, kind]: map)
 		if (std::strcmp(name, title) == 0) return kind;
 	return -1;
@@ -3247,11 +3248,6 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F2."
 		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
 	}
-	// (online5) Multijugador (also in F2 > Multijugador).
-	ImGui::Spacing();
-	ImGui::Separator();
-	ImGui::TextColored(kGold, "%s", "Conexión online");
-	Multiplayer::SettingsBlock(unit);
 }
 
 // (ds-pc-port10) The DLSS 5 rows' tooltips (launcher and F2).
@@ -3345,14 +3341,14 @@ void Draw(float width, float height) {
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
 	// folded in) and Trofeos; the same sections and rows as F2, so both write the same settings.ini the same way.
-	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
-	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego", "Conexión online"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego", "Conexión online"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
-	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}}; // (10-28) no Modos Souls
-	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}};
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}, {11}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}, {11}};
 	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
-	static const char* section_names[11] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
-	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego"};
+	static const char* section_names[12] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego", "Conexión online"};
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
@@ -3726,6 +3722,7 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
+				case 11: Multiplayer::SettingsBlock(unit); break; // (online11) its own section in the launcher and F2
 				default: break;
 			}
 			}
