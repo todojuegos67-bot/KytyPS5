@@ -3182,6 +3182,7 @@ void ResolutionRow(Settings& s) {
 // (10-28b) `in_tab`: inside the launcher's Sistema tab (no title, no "Continuar").
 namespace Multiplayer { // (online5) below
 void SettingsBlock(float unit);
+void Card(float unit); // (online11) the launcher's / F2's "Conexión online" section
 }
 void DrawConfigurator(float unit, bool in_tab = false) {
 	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
@@ -3341,11 +3342,11 @@ void Draw(float width, float height) {
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
 	// folded in) and Trofeos; the same sections and rows as F2, so both write the same settings.ini the same way.
-	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego", "Conexión online"};
-	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego", "Conexión online"};
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
-	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}, {11}}; // (10-28) no Modos Souls
-	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}, {11}};
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {11}, {10}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {11}, {10}};
 	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
 	static const char* section_names[12] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
 	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego", "Conexión online"};
@@ -3722,7 +3723,7 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
-				case 11: Multiplayer::SettingsBlock(unit); break; // (online11) its own section in the launcher and F2
+				case 11: Multiplayer::Card(unit); break; // (online11) its own section in the launcher and F2
 				default: break;
 			}
 			}
@@ -9010,21 +9011,9 @@ void SettingsBlock(float unit) {
 	if (!note.empty()) ImGui::TextColored(kGold, "%s", note.c_str());
 }
 
-bool Page(float width, float height, float unit) {
-	using namespace F1Pages;
-	Begin("Multijugador", width, height, unit);
-	ImGui::BeginChild("##multi", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
-	Anim::SmoothScroll();
-	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
-	Bump();
-	std::string st, pub, lan;
-	bool        up, local, fw, as;
-	{
-		std::lock_guard lock(g_m);
-		st = g_state_json, pub = g_public_ip, lan = g_lan_ip;
-		up = g_server_up, local = g_local_up, fw = g_firewall, as = g_autostart;
-	}
-	// The server's state: a pulsing seal (soul blue: connected; ember: no answer), players and sessions.
+// (online11) The server's state as a pulsing seal: soul blue connected, ember no answer.
+void Seal(float unit, bool up) {
+	// the server's state: a pulsing seal (soul blue: connected; ember: no answer), players and sessions.
 	{
 		ImDrawList*  dl   = ImGui::GetWindowDrawList();
 		const float  side = std::round(54 * unit);
@@ -9046,6 +9035,52 @@ bool Page(float width, float height, float unit) {
 		ImGui::TextColored(kDim, "%s", mode.c_str());
 		ImGui::EndGroup();
 	}
+}
+// (online11) "Conexión online" in the launcher and F2: title, seal, players, then account and password.
+void Card(float unit) {
+	Bump();
+	bool up, local;
+	std::string st;
+	{
+		std::lock_guard lock(g_m);
+		up = g_server_up, local = g_local_up, st = g_state_json;
+	}
+	(void)local;
+	ImGui::PushFont(DisplayFont(), 40.0f * unit);
+	ImGui::TextColored(kGold, "%s", I18n::T("Conexión online"));
+	ImGui::PopFont();
+	ImGui::TextColored(kDim, "%s", I18n::T("Mensajes, manchas de sangre, fantasmas e invocaciones con tus amigos. Todos en el mismo servidor."));
+	ImGui::Spacing();
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.10f, 0.11f, 0.14f, 0.85f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
+	ImGui::BeginChild("##oncard", {0, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+	Seal(unit, up);
+	if (up) {
+		const auto players = Strings(st, "jugadores");
+		ImGui::TextColored(kDimL, "%s", (std::string(I18n::T("Jugadores conectados: ")) + std::to_string(players.size())).c_str());
+	}
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor();
+	ImGui::Spacing();
+	SettingsBlock(unit);
+}
+
+bool Page(float width, float height, float unit) {
+	using namespace F1Pages;
+	Begin("Multijugador", width, height, unit);
+	ImGui::BeginChild("##multi", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
+	Anim::SmoothScroll();
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
+	Bump();
+	std::string st, pub, lan;
+	bool        up, local, fw, as;
+	{
+		std::lock_guard lock(g_m);
+		st = g_state_json, pub = g_public_ip, lan = g_lan_ip;
+		up = g_server_up, local = g_local_up, fw = g_firewall, as = g_autostart;
+	}
+	Seal(unit, up);
 	if (up) {
 		const auto players = Strings(st, "jugadores");
 		std::string list;
