@@ -13,7 +13,7 @@ namespace Tiron8 {
 [[nodiscard]] inline bool On() {
 	static const bool on = [] {
 		const char* v   = std::getenv("KYTY_TIRON8");
-		const bool  set = v != nullptr && v[0] == '1';
+		const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
 		std::printf("[tiron8] %s: copias de textura contiguas de 1 MiB o mas en una ventana por tramo (max 64 MiB), 8 hilos "
 		            "copiando dentro%s\n",
 		            set ? "ON (KYTY_TIRON8=1)" : "off", set ? "" : " - KYTY_TIRON8=1 lo enciende");

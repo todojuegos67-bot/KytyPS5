@@ -19,7 +19,7 @@ namespace Tiron6 {
 inline bool On() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_TIRON6");
-		return value != nullptr && value[0] == '1';
+		return value == nullptr || value[0] != '0'; // (picos) on by default
 	}();
 	return on;
 }
@@ -69,7 +69,7 @@ inline void LoadLocked(Seeds& s) {
 inline bool GraphicsOn() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_TIRON10");
-		const bool  set   = value != nullptr && value[0] == '1';
+		const bool  set   = value == nullptr || value[0] != '0'; // (picos) on by default
 		std::printf("[tiron10] pipelines graficos en la precarga (semillas de sesiones anteriores): %s\n",
 		            set ? "ON (KYTY_TIRON10=1)" : "off");
 		std::fflush(stdout);

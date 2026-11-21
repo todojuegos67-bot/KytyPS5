@@ -630,7 +630,7 @@ private:
 	static uint64_t Tiron8WindowBytesNow() {
 		static const uint64_t bytes = [] {
 			const char* v   = std::getenv("KYTY_TIRON12");
-			const bool  set = v != nullptr && v[0] == '1';
+			const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
 			std::printf("[tiron12] ventanas de copia de TIRON8 de %s MiB como maximo%s\n", set ? "8" : "64",
 			            set ? " (KYTY_TIRON12=1): esperas del hilo de render al candado de ~1 ms" : "");
 			std::fflush(stdout);

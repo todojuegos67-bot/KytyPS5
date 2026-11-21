@@ -1778,7 +1778,7 @@ uint64_t BufferCacheStagingRingSize() {
 		// (tiron9, KYTY_TIRON9=1) 768 MiB: 20261120-011558, the 622.7 ms frame uploaded 362 MB of images through the 256 MiB
 		// ring - the render thread waited in StreamBuffer::Map <- CommandScheduler::Wait (gpu_wait 124 ms, 22% of its samples)
 		// for the GPU to free ring space, and the GPU's submissions waited for the upload copies (upload_wait 253 ms).
-		if (const char* t9 = std::getenv("KYTY_TIRON9"); t9 != nullptr && t9[0] == '1') {
+		if (const char* t9 = std::getenv("KYTY_TIRON9"); t9 == nullptr || t9[0] != '0') {
 			std::printf("[tiron9] KYTY_TIRON9=1: anillo de subida de imagenes 768 MiB (antes 256)\n");
 			std::fflush(stdout);
 			return uint64_t {768} * MiB;

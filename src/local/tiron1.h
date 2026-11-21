@@ -29,7 +29,7 @@ namespace Tiron1 {
 inline bool On() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_TIRON1");
-		const bool  is    = value != nullptr && std::string_view(value) == "1";
+		const bool  is    = value == nullptr || std::string_view(value) != "0"; // (picos) on by default
 		if (is) {
 			std::printf("Tiron1: on (KYTY_TIRON1=1): table stores by time, compute pipelines before play on a low-RAM PC, "
 			            "a [tiron1] line every 5 s\n");
