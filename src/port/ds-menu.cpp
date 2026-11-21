@@ -5842,6 +5842,72 @@ void Draw(float width, float height, float column_x) {
 	}
 }
 
+// (online12) ONLINE beside TROFEOS at the launcher's bottom left: same tab look (medallion with a pulsing soul, ONLINE in
+// Cinzel); a click opens the "Conexión online" panel (account, password, server state) over the launcher.
+bool g_online_open = false;
+void DrawOnline(float width, float height) {
+	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	const float th = Px(60), tw = Px(300);
+	const float tx = Px(16) + Px(400) + Px(14);
+	const float ty = std::round(height - U(34) - th);
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##online-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##online-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		const bool hov     = ImGui::IsItemHovered();
+		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || g_online_open);
+		Tip("Conexi\xC3\xB3n online: tu cuenta y contrase\xC3\xB1" "a para jugar con tus amigos (mensajes, manchas, fantasmas, invocaciones).");
+		if (clicked) g_online_open = !g_online_open;
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(150, 190, 255, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(40, 56, 90, 0.30f + 0.25f * hot),
+		                            Ca(40, 56, 90, 0.10f), Ca(40, 56, 90, 0.0f), Ca(40, 56, 90, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
+		dl->AddCircleFilled(mc, mr, IM_COL32(12, 16, 26, 255), 32);
+		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.45f + 0.12f * k + 0.05f * pl), Ca(150, 190, 255, 0.05f * k), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "ONLINE", U(2.5f));
+		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), I18n::T("Cuenta y amigos"), U(1));
+	}
+	ImGui::End();
+	if (!g_online_open) return;
+	const ImVec2 ps {std::min(width * 0.9f, Px(980)), std::min(height * 0.8f, Px(860))};
+	ImGui::SetNextWindowPos({std::round((width - ps.x) * 0.5f), std::round((height - ps.y) * 0.5f)});
+	ImGui::SetNextWindowSize(ps);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.05f, 0.05f, 0.06f, 0.96f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.80f, 0.69f, 0.48f, 0.7f});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, Px(10));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {Px(28), Px(24)});
+	ImGui::Begin("##online-panel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::BeginChild("##online-body", {0, -Px(64)});
+	Multiplayer::Card(U(1));
+	ImGui::EndChild();
+	if (Anim::Button(I18n::T("Cerrar"), {Px(220), Px(48)}, U(1))) g_online_open = false;
+	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) g_online_open = false;
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
 } // namespace LauncherTrophy
 
 // (ds-pc-port11) Text with a dark outline (shadow) for the shaders' panel: legible over the panel and over the gold bar.
@@ -6338,6 +6404,7 @@ void DrawLauncher(float width, float height) {
 
 	// (trofeos-exe) TROFEOS at the bottom left, above the version line; its panel unfolds upwards.
 	LauncherTrophy::Draw(width, height, px);
+	LauncherTrophy::DrawOnline(width, height); // (online12) ONLINE beside TROFEOS
 
 	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
 	{
