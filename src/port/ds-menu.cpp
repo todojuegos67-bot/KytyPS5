@@ -9125,6 +9125,7 @@ void Card(float unit) {
 	if (up) {
 		const auto players = Strings(st, "jugadores");
 		ImGui::TextColored(kDimL, "%s", (std::string(I18n::T("Jugadores conectados: ")) + std::to_string(players.size())).c_str());
+		for (const auto& name: players) ImGui::BulletText("%s", name.c_str()); // (online12) who is online, by account name
 	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
