@@ -1,6 +1,7 @@
 #include "port/ds-settings.h"
 
 #include "port/ds-tables.h"
+#include "port/ds-online.h"
 
 #include <algorithm>
 #include <thread>
@@ -1329,8 +1330,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	// (online5) [Multijugador]: the online switches (libs/network.cpp, libs/libNet.cpp, loader/gameArgs.cpp). Our server:
 	// TCP 31415 (game server + WebAPI), TCP 31413 (accounts), UDP 3758 (P2P relay). Off: offline as before.
 	if (s.multiplayer) {
-		std::string host = s.online_server.empty() ? std::string("127.0.0.1") : s.online_server;
-		if (const auto c = host.find(':'); c != std::string::npos) host = host.substr(0, c);
+		const std::string host = Port::Online::ServerHost(); // (online10) one server for everyone (DuckDNS; 127.0.0.1 on the owner's PC)
 		env.Set("KYTY_ONLINE", "1");
 		env.Set("KYTY_ONLINE_SERVER", host + ":31415");
 		env.Set("KYTY_ONLINE_NAME", s.online_name);

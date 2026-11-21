@@ -25,19 +25,18 @@ Uso diario:
   - Logs: %LOCALAPPDATA%\Demon's Souls PC\servidor-online\servidor.log
           y peticiones.log (todo lo que piden los jugadores).
 
-Para jugar el anfitrion: F2 -> Multijugador -> Servidor 127.0.0.1
+En el PC del anfitrion el juego usa solo su propio servidor (127.0.0.1).
 
 ---------------------------------------------------------------
-B) JUGADORES (amigos)
+B) JUGADORES (amigos y anfitrion)
 ---------------------------------------------------------------
-  1. Abrir el juego y pulsar F2 -> Multijugador.
-  2. Servidor: bloodbornetdj67.duckdns.org
-  3. Nombre: el tuyo.  Contrasena: la que quieras (apuntala).
-     Cada jugador tiene SU cuenta; no hace falta la del anfitrion.
-     Se puede pegar con Ctrl+V.
-  4. Pulsar "Crear cuenta" (solo la primera vez).
-  5. Activar multijugador y pulsar "Reiniciar ahora".
-  6. La tarjeta debe poner "conectado".
+Todos se conectan al MISMO servidor (bloodbornetdj67.duckdns.org); no hay
+que escribir ninguna direccion.
+  1. En el lanzador (o en el juego con F2): apartado "Conexion online".
+  2. Activar "Conexion online".
+  3. Cuenta: tu nombre.  Contrasena: la que quieras (apuntala).
+     Cada jugador tiene SU cuenta. Se puede pegar con Ctrl+V.
+  4. Pulsar "Crear cuenta" (solo la primera vez) y JUGAR.
 
 Si sale "nombre o contrasena incorrectos": la contrasena no coincide con la
 de la cuenta creada. Crear otra cuenta con nombre nuevo.

@@ -43,6 +43,11 @@
 #include <vector>
 
 namespace Port::Online {
+
+std::string ServerHost() { // (online10)
+	std::string info;
+	return Probe("127.0.0.1:" + std::to_string(kDefaultPort), &info) ? std::string("127.0.0.1") : std::string(kPublicServer);
+}
 #include "port/ds-online-core.inc"
 
 namespace {

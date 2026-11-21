@@ -3250,7 +3250,7 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	// (online5) Multijugador (also in F2 > Multijugador).
 	ImGui::Spacing();
 	ImGui::Separator();
-	ImGui::TextColored(kGold, "%s", "Multijugador");
+	ImGui::TextColored(kGold, "%s", "Conexión online");
 	Multiplayer::SettingsBlock(unit);
 }
 
@@ -8885,10 +8885,8 @@ void Note(const std::string& s) {
 	std::lock_guard lock(g_m);
 	g_note = s;
 }
-std::string Host() {
-	std::string h = g_server;
-	if (const auto c = h.find(':'); c != std::string::npos) h = h.substr(0, c);
-	return h.empty() ? std::string("127.0.0.1") : h;
+std::string Host() { // (online10) fixed server: this PC's own when it runs it, else the owner's via DuckDNS
+	return g_local_up ? std::string("127.0.0.1") : std::string(On::kPublicServer);
 }
 bool IsLocal() {
 	const auto h = Host();
@@ -8975,15 +8973,12 @@ void SettingsBlock(float unit) {
 	}
 	const ImVec2 bs {std::round(300 * unit), std::round(50 * unit)};
 	bool         on = g_saved.multiplayer;
-	if (ImGui::Checkbox(I18n::T("Multijugador (online con el servidor propio)"), &on)) {
+	if (ImGui::Checkbox(I18n::T("Conexión online"), &on)) {
 		Save(on);
 		Note(on ? I18n::T("Multijugador activado. Se aplica al reiniciar el juego.") : I18n::T("Multijugador apagado: el juego vuelve a ser sin conexión al reiniciar."));
 	}
 	Anim::Highlight(unit);
-	ImGui::SetNextItemWidth(std::round(420 * unit));
-	ImGui::InputTextWithHint(I18n::T("Servidor"), "127.0.0.1  /  bloodbornetdj67.duckdns.org", g_server, sizeof(g_server));
-	Anim::Highlight(unit);
-	FieldTools("##g_server", g_server, sizeof(g_server)); // (online6) Pegar
+	ImGui::TextColored(kDim, "%s", (std::string(I18n::T("Servidor: ")) + On::kPublicServer + I18n::T(" (todos los jugadores al mismo)")).c_str()); // (online10)
 	ImGui::SetNextItemWidth(std::round(420 * unit));
 	ImGui::InputTextWithHint(I18n::T("Cuenta"), I18n::T("nombre (letras y números)"), g_name, sizeof(g_name));
 	Anim::Highlight(unit);

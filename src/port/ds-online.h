@@ -8,6 +8,10 @@ namespace Port::Online {
 constexpr int kDefaultPort = 31415; // (online5) TCP: the game server (/dsmaster, /dsgame) and the PSN-like WebAPI
 constexpr int kAccountPort = 31413; // TCP: accounts (register / login)
 constexpr int kRelayPort   = 3758;  // UDP: the P2P relay
+// (online10) Everyone uses the same server: the owner's PC through DuckDNS (always its current public IP).
+constexpr const char* kPublicServer = "bloodbornetdj67.duckdns.org";
+// 127.0.0.1 when this PC runs the server (the owner: no router loop), else kPublicServer. Blocking up to ~3 s.
+std::string ServerHost();
 
 bool IsServerCommand(int argc, char* argv[]); // --servidor [port]
 int  ServerMain(int argc, char* argv[]);      // the server process (tray icon); returns at "Cerrar el servidor"
