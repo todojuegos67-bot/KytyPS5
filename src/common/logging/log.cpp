@@ -179,6 +179,9 @@ void Flush() {
 
 void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
+    // bb-perf-medir: BB_LOG_ASYNC=1 writes the log from a background thread even with Log sync on.
+    const char* async_env = std::getenv("BB_LOG_ASYNC");
+    const bool log_sync = EmulatorSettings.IsLogSync() && !(async_env && async_env[0] == '1');
 
     std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
         spdlog::sinks::async_sink::config{.sinks = sinks})};
@@ -186,12 +189,12 @@ void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> dup_filter{
         std::make_shared<spdlog::sinks::dup_filter_sink_mt>(
             std::chrono::milliseconds(EmulatorSettings.GetLogMaxSkipDuration()),
-            EmulatorSettings.IsLogSync() ? sinks : async_sink)};
+            log_sync ? sinks : async_sink)};
 
     for (auto& logger : ALL_LOGGERS) {
         logger->sinks() = EmulatorSettings.IsLogSkipDuplicate()
                               ? dup_filter
-                              : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
+                              : (log_sync ? sinks : async_sink);
     }
 }
 

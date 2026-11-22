@@ -56,6 +56,13 @@ struct Counters {
     std::atomic<u64> fault_max_us{};
     std::atomic<u64> cp_submit_us{};
     std::atomic<u64> present_us{};
+    // bb-perf-medir: GPU command thread cost per call (Rasterizer draw/dispatch, image refresh).
+    std::atomic<u64> draws{};
+    std::atomic<u64> draw_us{};
+    std::atomic<u64> dispatches{};
+    std::atomic<u64> dispatch_us{};
+    std::atomic<u64> refreshes{};
+    std::atomic<u64> refresh_us{};
 };
 
 inline Counters& Get() {
@@ -77,6 +84,27 @@ inline u64 MicrosSince(std::chrono::steady_clock::time_point started) {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count());
+}
+
+// bb-perf-medir: counts one call and its time (us) when it goes out of scope.
+struct ScopeUs {
+    std::atomic<u64>& n;
+    std::atomic<u64>& us;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ScopeUs() {
+        n.fetch_add(1, std::memory_order_relaxed);
+        us.fetch_add(MicrosSince(start), std::memory_order_relaxed);
+    }
+};
+
+// Seconds between "[perf2]" lines: BB_PERF_SEC (1..60), default 5.
+inline double PeriodSec() {
+    static const double sec = [] {
+        const char* v = std::getenv("BB_PERF_SEC");
+        const int n = v ? std::atoi(v) : 0;
+        return n >= 1 && n <= 60 ? double(n) : 5.0;
+    }();
+    return sec;
 }
 
 // BB_PERF2=1 enables the behavior changes of bb-perf-2 (default off). Counters/logging are always on.

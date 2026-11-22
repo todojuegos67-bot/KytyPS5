@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/bb/bb_perf2.h"
 #include "video_core/bb/bb_gpu_profile.h"
 #include "video_core/bb/bb_mv_engine.h"
 #include "video_core/bb/bb_objmv2.h"
@@ -1272,6 +1273,7 @@ void Rasterizer::BbVolFogDraw(const GraphicsPipeline& pipeline) {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    BBPerf2::ScopeUs perf_scope{BBPerf2::Get().draws, BBPerf2::Get().draw_us}; // bb-perf-medir
 
     scheduler.PopPendingOperations();
 
@@ -1362,6 +1364,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    BBPerf2::ScopeUs perf_scope{BBPerf2::Get().draws, BBPerf2::Get().draw_us}; // bb-perf-medir
 
     scheduler.PopPendingOperations();
 
@@ -1476,6 +1479,7 @@ static u32 BbProfComputeLabel(u64 hash) {
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    BBPerf2::ScopeUs perf_scope{BBPerf2::Get().dispatches, BBPerf2::Get().dispatch_us}; // bb-perf-medir
 
     scheduler.PopPendingOperations();
 
@@ -1520,6 +1524,7 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    BBPerf2::ScopeUs perf_scope{BBPerf2::Get().dispatches, BBPerf2::Get().dispatch_us}; // bb-perf-medir
 
     scheduler.PopPendingOperations();
 

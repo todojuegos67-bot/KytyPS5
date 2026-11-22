@@ -859,6 +859,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     RENDERER_TRACE;
+    BBPerf2::ScopeUs perf_scope{BBPerf2::Get().refreshes, BBPerf2::Get().refresh_us}; // bb-perf-medir
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&

@@ -1109,7 +1109,7 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     }
     ++a.frames;
     const double el = std::chrono::duration<double>(now - a.start).count();
-    if (el < 10.0) {
+    if (el < BBPerf2::PeriodSec()) {
         return;
     }
     auto& c = BBPerf2::Get();
@@ -1132,15 +1132,27 @@ static void NotePerf2(std::chrono::steady_clock::time_point now, double cpu_ms, 
     const double cp_busy = take(c.cp_busy_us) / 1000.0 / el; // ms per second
     const double cp_game = take(c.cp_guest_wait_us) / 1000.0 / el;
     const double cp_vo = take(c.cp_vo_wait_us) / 1000.0 / el;
+    // bb-perf-medir: GPU command thread cost per call x calls per frame.
+    const u64 dr_n = take(c.draws), dr_us = take(c.draw_us);
+    const u64 ds_n = take(c.dispatches), ds_us = take(c.dispatch_us);
+    const u64 rf_n = take(c.refreshes), rf_us = take(c.refresh_us);
+    const double fr = double(a.frames);
     LOG_INFO(Render_Vulkan,
-             "[perf2] 10s: fps {:.1f} frame {:.2f} ms (worst {:.1f}, >50ms {}) cpu {:.2f} gpu "
+             "[cpcost] {:.0f}s: per frame draws {:.0f} ({:.1f} us each, {:.2f} ms) dispatches "
+             "{:.0f} ({:.1f} us each, {:.2f} ms) image refresh {:.1f} ({:.0f} us each, {:.2f} ms; "
+             "inside draws/dispatches)",
+             el, dr_n / fr, dr_n ? double(dr_us) / dr_n : 0.0, dr_us / 1000.0 / fr, ds_n / fr,
+             ds_n ? double(ds_us) / ds_n : 0.0, ds_us / 1000.0 / fr, rf_n / fr,
+             rf_n ? double(rf_us) / rf_n : 0.0, rf_us / 1000.0 / fr);
+    LOG_INFO(Render_Vulkan,
+             "[perf2] {:.0f}s: fps {:.1f} frame {:.2f} ms (worst {:.1f}, >50ms {}) cpu {:.2f} gpu "
              "{:.2f} fence {:.2f} | compiles {} gfx {} cs {} shaders ({:.0f} ms) | cpu-write "
              "faults {:.0f}/s (fault-around {:.0f} pages/s) | uploads buf {:.1f} tex {:.1f} "
              "MiB/s ({:.0f} img/s) readback {:.2f} MiB/s | sparse binds {} | gpu waits {:.0f}/s {:.1f} ms/s (stream buffer {:.1f}, "
              "fault buffer {:.1f}) | BB_PERF2={} | tex from GPU data {:.0f} img/s, unchanged "
              "skipped {:.0f} img/s {:.1f} MiB/s | gpu thread awake {:.0f} ms/s: waits on game {:.0f}, "
              "on flip {:.0f}, work {:.0f} ms/s ({:.2f} ms/frame)",
-             a.frames / el, el * 1000.0 / a.frames, a.worst, a.slow, a.cpu / a.frames,
+             el, a.frames / el, el * 1000.0 / a.frames, a.worst, a.slow, a.cpu / a.frames,
              a.gpu_n ? a.gpu / a.gpu_n : 0.0, a.wait / a.frames, gp, cp, sh, comp_ms,
              faults / el, fa_pages / el, up, tex, tex_n / el, down, binds, waits / el,
              wait_total / el, wait_stream / el, wait_fbuf / el, BBPerf2::Enabled() ? 1 : 0,
