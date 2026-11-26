@@ -7477,8 +7477,17 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 	if (tiles.empty()) return fallback();
 	// (NEGRAS) Un mip sin memoria ligada (por debajo de MinLevel, desligado o sin memoria): la subida se perderia y el
 	// rango quedaria "solo en la GPU" con su RAM soltada = negro para siempre. A la RAM como siempre.
+	// (MIP0-NATIVA) Antes de ir a la RAM: si el juego ya comprometio ese rango, se liga ahora (hilo de la GPU; el ligado
+	// queda pendiente y SparseFlushPendingBinds lo envia antes de la entrega que lleva esta subida) y se vuelve a mirar.
+	// Solo lo que de verdad no esta comprometido (o sin memoria de video) cae a la RAM.
+	bool tried_bind = false;
 	for (const auto& region: regions)
 		if (!SparseLevelBound(image.backing, region.imageSubresource.mipLevel)) {
+			if (!tried_bind && GuestGpu::IsGpuThread()) {
+				tried_bind = true;
+				image.SparseUpdate(address, end);
+				if (SparseLevelBound(image.backing, region.imageSubresource.mipLevel)) continue;
+			}
 			TexNativa::c_unbound_fallback.fetch_add(size, std::memory_order_relaxed);
 			return fallback();
 		}

@@ -653,7 +653,10 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	    full.type == Prospero::ImageType::kColor2D && !full.IsVolume() && !full.IsDepth() && !full.HasStencil() &&
 	    !full.HasMetadata() && full.samples == 1) {
 		// (NEGRAS) El nivel fijado de la CTexture (no el `drop` de este T#): la vista nunca incluye un mip sin ligar.
-		const uint32_t held_min = TexNativa::SetMinLevel(full.data.address, drop);
+		// (MIP0-NATIVA) Nunca se deja fuera ningun mip de una textura nativa: KYTY_TEXTURE_REDUCE no se aplica aqui (la
+		// memoria de video sigue a lo que el juego compromete). Con el nivel fijado >0 el mip 0 que el juego comprometia
+		// no se ligaba y sus trozos iban a la RAM (log 205533: 2492 MB 'a un mip sin ligar', cobertura 19,3 %).
+		const uint32_t held_min = TexNativa::SetMinLevel(full.data.address, 0u);
 		const uint32_t fh       = std::min(std::max(static_cast<uint32_t>(base), held_min), full.resources.levels - 1u);
 		desc.view_info.base_level  = fh;
 		desc.view_info.level_count = std::max(static_cast<uint32_t>(last), fh) - fh + 1u;
