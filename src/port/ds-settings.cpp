@@ -1008,7 +1008,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		plan.notes.emplace_back(cine_limit ? "cine60: off (KYTY_CINE_LIMIT=1): the game's cutscene step, Cinematic mode cutscenes at 30"
 		                                   : "cine60: on: cutscenes and loading at 60 in every graphics mode (KYTY_CINE_LIMIT=1: as before)");
 	}
-	sets.emplace_back("KYTY_DS_VARIABLE_STEP", "1"); // (10-21) physics at each frame's real time
+	sets.emplace_back("KYTY_DS_VARIABLE_STEP", "0"); // (11-26) fixed physics step like the PS5 (variable step suspected of immortal enemies)
 	// Upscaler sharpness: (10-24) ligero 75 %, (10-24) PC low profile 100 %.
 	std::string sharp = s.sharpness == "auto" ? std::string() : s.sharpness;
 	if (s.souls_mode == "low") sharp = "1";
