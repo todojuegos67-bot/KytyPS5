@@ -1353,6 +1353,121 @@ void RamEmuThread() {
 	}
 }
 
+
+// (ramx) KYTY_RAMX=1 (off by default, read once, read-only): one "[ramx]" line every 10 s saying WHAT the emulator's
+// RAM is. One K32QueryWorkingSet (every resident page of the process, ~16 MB list for 8 GB) matched against a
+// VirtualQuery walk: resident MiB by kind (private / mapped section / image), shared (share count > 1) vs alone, split
+// at 0x10000000000 (below: guest and host mixed; the line's top list says which), and the 12 allocations with most
+// pages in RAM (base, reserved size, type, protection, resident MiB). Also the process heaps' committed bytes
+// (HeapSummary). No lock of the emulator's, nothing written; ~20-60 ms every 10 s on its own thread.
+bool RamXEnabled() {
+	static const bool on = [] {
+		const char* v = Env("KYTY_RAMX");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+void RamXThread() {
+	std::printf("RAMX: on (KYTY_RAMX=1): a \"[ramx]\" line every 10 s (working set by allocation; read-only)\n");
+	std::vector<uint8_t> buffer(size_t {32} << 20u);
+	struct Alloc {
+		uint64_t base = 0, reserved = 0, resident = 0, shared = 0;
+		DWORD    type = 0, protect = 0;
+	};
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(10));
+		const auto t0 = std::chrono::steady_clock::now();
+		auto*      info = reinterpret_cast<PSAPI_WORKING_SET_INFORMATION*>(buffer.data());
+		bool       ok   = false;
+		for (int tries = 0; tries < 3 && !ok; tries++) {
+			if (K32QueryWorkingSet(GetCurrentProcess(), buffer.data(), static_cast<DWORD>(buffer.size())) != 0) {
+				ok = true;
+			} else if (GetLastError() == ERROR_BAD_LENGTH) {
+				buffer.resize(sizeof(ULONG_PTR) * (info->NumberOfEntries + (size_t {1} << 18u)) + 64);
+				info = reinterpret_cast<PSAPI_WORKING_SET_INFORMATION*>(buffer.data());
+			} else {
+				break;
+			}
+		}
+		if (!ok) continue;
+		const size_t          n = info->NumberOfEntries;
+		std::vector<uint64_t> pages(n);
+		for (size_t i = 0; i < n; i++) {
+			const auto& e = info->WorkingSetInfo[i];
+			pages[i]      = (static_cast<uint64_t>(e.VirtualPage) << 1u) | (e.ShareCount > 1 ? 1u : 0u);
+		}
+		std::sort(pages.begin(), pages.end());
+		std::vector<Alloc> allocs;
+		// kind x (low/high) x (alone/shared), MiB
+		uint64_t kind[3][2][2] {};
+		size_t   at = 0;
+		uint8_t* address = nullptr;
+		MEMORY_BASIC_INFORMATION mbi {};
+		while (at < n && VirtualQuery(address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+			const uint64_t begin = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+			const uint64_t end   = begin + mbi.RegionSize;
+			uint64_t       res = 0, sh = 0;
+			while (at < n && ((pages[at] >> 1u) << 12u) < end) {
+				if (((pages[at] >> 1u) << 12u) >= begin) {
+					res++;
+					sh += pages[at] & 1u;
+				}
+				at++;
+			}
+			if (res != 0 && mbi.State == MEM_COMMIT) {
+				const int k  = mbi.Type == MEM_IMAGE ? 2 : (mbi.Type == MEM_MAPPED ? 1 : 0);
+				const int hi = begin >= 0x10000000000ull ? 1 : 0;
+				kind[k][hi][0] += res - sh;
+				kind[k][hi][1] += sh;
+				const uint64_t ab = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+				if (allocs.empty() || allocs.back().base != ab) {
+					Alloc a;
+					a.base    = ab;
+					a.type    = mbi.Type;
+					a.protect = mbi.AllocationProtect;
+					allocs.push_back(a);
+				}
+				allocs.back().resident += res;
+				allocs.back().shared += sh;
+				allocs.back().reserved = end - ab;
+			}
+			address = reinterpret_cast<uint8_t*>(end);
+		}
+		uint64_t heaps_commit = 0, heaps = 0;
+		{
+			HANDLE handles[256];
+			const DWORD count = GetProcessHeaps(256, handles);
+			for (DWORD i = 0; i < count && i < 256; i++) {
+				HEAP_SUMMARY sum {};
+				sum.cb = sizeof(sum);
+				if (HeapSummary(handles[i], 0, &sum)) heaps_commit += sum.cbCommitted;
+				heaps++;
+			}
+		}
+		std::sort(allocs.begin(), allocs.end(), [](const Alloc& a, const Alloc& b) { return a.resident > b.resident; });
+		const auto mibp = [](uint64_t p) { return static_cast<unsigned long long>((p * 4096u) >> 20u); };
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		char   line[4096];
+		size_t used = 0;
+		RamLineAdd(line, sizeof(line), &used,
+		           "[ramx] 10 s, MiB (%.1f ms): en RAM %llu; privada bajo/alto %llu/%llu (compartida %llu/%llu); seccion "
+		           "bajo/alto %llu/%llu (compartida %llu/%llu); imagenes %llu; montones %llu con commit %llu; mayores:",
+		           ms, mibp(n), mibp(kind[0][0][0]), mibp(kind[0][1][0]), mibp(kind[0][0][1]), mibp(kind[0][1][1]),
+		           mibp(kind[1][0][0]), mibp(kind[1][1][0]), mibp(kind[1][0][1]), mibp(kind[1][1][1]),
+		           mibp(kind[2][0][0] + kind[2][0][1] + kind[2][1][0] + kind[2][1][1]), static_cast<unsigned long long>(heaps),
+		           static_cast<unsigned long long>(heaps_commit >> 20u));
+		for (size_t i = 0; i < allocs.size() && i < 12; i++) {
+			const auto& a = allocs[i];
+			RamLineAdd(line, sizeof(line), &used, " 0x%llx+%lluM %s p%lx %llu (comp %llu);",
+			           static_cast<unsigned long long>(a.base), static_cast<unsigned long long>(a.reserved >> 20u),
+			           a.type == MEM_IMAGE ? "img" : (a.type == MEM_MAPPED ? "sec" : "priv"), static_cast<unsigned long>(a.protect),
+			           mibp(a.resident), mibp(a.shared));
+		}
+		std::printf("%s\n", line);
+	}
+}
+
 void RamLineThread() {
 	SetThreadDescription(GetCurrentThread(), L"Kyty.RamLine");
 	std::printf("RAM line: on (KYTY_RAM_LINE=1): a \"[ram]\" line every 10 s (system calls only: no lock of the emulator's, "
@@ -2776,6 +2891,7 @@ void Start() {
 	static std::once_flag once;
 	std::call_once(once, [] {
 		if (RamLineEnabled()) std::thread(RamLineThread).detach(); // (ram2; its own switch, with the guard off too)
+		if (RamXEnabled()) std::thread(RamXThread).detach(); // (ramx: KYTY_RAMX=1, read-only)
 		if (const char* v = Env("KYTY_RAM_EMU"); v != nullptr && v[0] == '1') std::thread(RamEmuThread).detach(); // (ram-emu)
 		if (const char* value = Env("KYTY_RAM_GUARD"); value != nullptr && value[0] == '0') {
 			std::printf("RAM guard: off (KYTY_RAM_GUARD=0)\n");
