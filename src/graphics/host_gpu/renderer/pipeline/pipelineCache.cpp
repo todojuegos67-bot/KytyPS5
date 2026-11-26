@@ -3160,6 +3160,10 @@ PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
 
 vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline) {
 	pipeline.last_flip = g_pipeline_flip.load(std::memory_order_relaxed);
+	if (pipeline.recipe != 0 && !pipeline.use_noted) { // (solo-usados: once per pipeline)
+		pipeline.use_noted = true;
+		Tiron6::NoteBound(pipeline.recipe);
+	}
 	if (pipeline.recipe != 0) {
 		if (const auto generation = SceneTags::Generation(); pipeline.scene_noted != generation) {
 			pipeline.scene_noted = generation;
@@ -4117,6 +4121,9 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 	// (ram16-t6) 16 GB profile: only the seeds (Tiron6::SeedsOnly, tiron6-seeds.h), when there are enough of them.
 	const bool seeds_only    = Tiron6::On() && Tiron6::SeedsOnly() && Tiron6::SeedCount() >= Tiron6::SeedsOnlyMin();
 	size_t     seeds_skipped = 0;
+	// (solo-usados) Of the seeds, only those bound in the last sessions (tiron6-seeds.h); none known yet: all, as before.
+	const bool used_only     = Tiron6::UsedKnown();
+	size_t     unused_skipped = 0;
 	for (auto recorded = recipes.rbegin(); recorded != recipes.rend() && compute.size() < cap; ++recorded) {
 		LocalShaderWarmup::PipelineRecord recipe;
 		LocalShaderWarmup::Reader         reader {*recorded};
@@ -4127,6 +4134,7 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 			if (!Tiron6::On() || !Tiron6::GraphicsOn() || !Tiron6::IsSeed(key) || recipe.vertex >= records.size() ||
 			    (recipe.pixel != LocalShaderWarmup::NoShader && recipe.pixel >= records.size()))
 				continue;
+			if (used_only && !Tiron6::WasUsed(key)) { ++unused_skipped; continue; }
 			if (!only.insert(key).second) continue;
 			needed[recipe.vertex] = 1;
 			if (recipe.pixel != LocalShaderWarmup::NoShader) needed[recipe.pixel] = 1;
@@ -4136,6 +4144,7 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 		if (recipe.compute >= records.size()) continue;
 		if (ArranqueLigeroModo() == 2) continue; // (arranque-ligero 2: compute made on use, as with 1)
 		if (seeds_only && !Tiron6::IsSeed(LocalShaderWarmup::RecipeKey(*recorded))) { ++seeds_skipped; continue; }
+		if (used_only && !Tiron6::WasUsed(LocalShaderWarmup::RecipeKey(*recorded))) { ++unused_skipped; continue; }
 		if (!only.insert(LocalShaderWarmup::RecipeKey(*recorded)).second) continue;
 		needed[recipe.compute] = 1;
 		compute.push_back(std::move(*recorded));
@@ -4146,6 +4155,11 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 		                 "recetas sin semilla saltadas {} (se hacen al usarse)",
 		                 seeds_only ? "solo semillas" : "todas las recetas", Tiron6::SeedsOnly() ? 1 : 0, Tiron6::SeedCount(),
 		                 Tiron6::SeedsOnlyMin(), seeds_skipped);
+	if (Tiron6::On() && Tiron6::SoloUsados())
+		PipelineCacheLog("[solo-usados] precarga: {} ({} pipelines usados en {} sesiones guardadas); no usados saltados {} "
+		                 "(se hacen al usarse)",
+		                 used_only ? "solo usados" : "todas las semillas (aun sin datos de uso)", Tiron6::UsedCount(),
+		                 Tiron6::UsedSessionsKnown(), unused_skipped);
 	if (compute.empty()) {
 		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
 		PipelineCacheLog("Tiron1: compute pipelines before play: none recorded yet");
@@ -4215,6 +4229,7 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i)
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			Tiron6::Flush();
+			Tiron6::UsedFlush(); // (solo-usados)
 		}
 	}
 }
@@ -5063,6 +5078,7 @@ bool PipelineCache::Save() {
 	}
 	if (m_played != nullptr) saved &= m_played->Save();
 	Tiron6::Flush(); // (tiron6)
+	Tiron6::UsedFlush(); // (solo-usados)
 	return saved;
 }
 

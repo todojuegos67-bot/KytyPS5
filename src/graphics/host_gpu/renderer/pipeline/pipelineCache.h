@@ -218,6 +218,7 @@ public:
 		// last bound in (local/scene-tags.h: noted once per scene).
 		uint64_t         recipe      = 0;
 		mutable uint64_t scene_noted = 0;
+		mutable bool     use_noted   = false; // (solo-usados: bound once, Tiron6::NoteBound)
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Immutable encoding plan; queued packets keep their own shared ownership.
 		mutable std::shared_ptr<const LocalDescriptorPlan> local_descriptor_plan;

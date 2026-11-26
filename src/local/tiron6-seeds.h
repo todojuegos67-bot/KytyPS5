@@ -210,4 +210,133 @@ inline uint32_t Threads(uint32_t cpus, uint64_t available_bytes) {
 	const uint64_t by_ram  = mib > 1536 ? (mib - 1536) / 256 : 0;
 	return static_cast<uint32_t>(std::max<uint64_t>(4, std::min<uint64_t>(cpus, by_ram)));
 }
+// (solo-usados, 11-26, KYTY_TIRON6_SOLO_USADOS=1, default off) Log 20261126-222050: the warm of every seed made 4041
+// pipelines, +3868 MiB resident in the NVIDIA driver, and evicting them later gives none of it back (the driver keeps its
+// heap). So fewer are made: each session notes the seeds it really BOUND (BindPipelineHandle, once per pipeline) in
+// _PipelineCache/local/tiron6-usados.seeds (the last Sessions() sessions, each a block); the warm then makes only the
+// seeds bound in any of them. The others are made on use from the driver's VkPipelineCache (0.4-6.5 ms each). No usage
+// recorded yet (first session with it on) or too few: every seed, as before. A session that bound fewer than
+// UsedSessionMin() pipelines (a crash at the menu) is not kept.
+inline bool SoloUsados() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TIRON6_SOLO_USADOS");
+		const bool  set   = value != nullptr && value[0] == '1';
+		std::printf("[solo-usados] precarga solo de pipelines usados en las ultimas sesiones: %s\n",
+		            set ? "ON (KYTY_TIRON6_SOLO_USADOS=1)" : "off");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+inline size_t EnvSize(const char* name, size_t fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && *value != 0 ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : fallback;
+}
+inline size_t Sessions() {
+	static const size_t n = std::max<size_t>(1, std::min<size_t>(16, EnvSize("KYTY_TIRON6_USADOS_SESIONES", 3)));
+	return n;
+}
+inline size_t UsedSessionMin() {
+	static const size_t n = EnvSize("KYTY_TIRON6_USADOS_MIN", 200);
+	return n;
+}
+struct Used {
+	std::mutex                          mutex;
+	bool                                loaded = false;
+	std::vector<std::vector<uint64_t>>  past;   // (oldest first, at most Sessions())
+	std::unordered_set<uint64_t>        warm;   // (the union of `past`: what the warm makes)
+	std::vector<uint64_t>               now;    // (this session's, in binding order)
+	std::unordered_set<uint64_t>        now_set;
+	size_t                              written = 0; // (now[0, written) on the disk)
+};
+inline Used& UsedState() {
+	static Used used;
+	return used;
+}
+inline const std::filesystem::path& UsedPath() {
+	static const std::filesystem::path path = std::filesystem::path("_PipelineCache") / "local" / "tiron6-usados.seeds";
+	return path;
+}
+constexpr uint64_t UsedMagic = 0x3155363654594b54ull; // "TKYT66U1"
+inline void UsedLoadLocked(Used& u) {
+	if (u.loaded) return;
+	u.loaded = true;
+	std::FILE* file = std::fopen(UsedPath().string().c_str(), "rb");
+	if (file == nullptr) return;
+	uint64_t magic = 0, count = 0;
+	if (std::fread(&magic, sizeof(magic), 1, file) == 1 && magic == UsedMagic) {
+		while (std::fread(&count, sizeof(count), 1, file) == 1 && count <= (1u << 24u)) {
+			std::vector<uint64_t> keys(static_cast<size_t>(count));
+			if (count != 0 && std::fread(keys.data(), sizeof(uint64_t), keys.size(), file) != keys.size()) break;
+			u.past.push_back(std::move(keys));
+		}
+	}
+	std::fclose(file);
+	while (u.past.size() > Sessions()) u.past.erase(u.past.begin());
+	for (const auto& session: u.past) u.warm.insert(session.begin(), session.end());
+}
+// The warm's filter: true when usage is known (solo-usados on, and the last sessions bound at least SeedsOnlyMin()).
+inline bool UsedKnown() {
+	if (!On() || !SoloUsados()) return false;
+	auto&           u = UsedState();
+	std::lock_guard lock(u.mutex);
+	UsedLoadLocked(u);
+	return u.warm.size() >= std::min<size_t>(SeedsOnlyMin(), 300);
+}
+inline bool WasUsed(uint64_t key) {
+	auto&           u = UsedState();
+	std::lock_guard lock(u.mutex);
+	UsedLoadLocked(u);
+	return u.warm.contains(key);
+}
+inline size_t UsedCount() {
+	auto&           u = UsedState();
+	std::lock_guard lock(u.mutex);
+	UsedLoadLocked(u);
+	return u.warm.size();
+}
+inline size_t UsedSessionsKnown() {
+	auto&           u = UsedState();
+	std::lock_guard lock(u.mutex);
+	UsedLoadLocked(u);
+	return u.past.size();
+}
+// Render/GPU threads (BindPipelineHandle), once per pipeline object: no disk here.
+inline void NoteBound(uint64_t key) {
+	if (key == 0 || !On() || !SoloUsados()) return;
+	auto&           u = UsedState();
+	std::lock_guard lock(u.mutex);
+	if (u.now_set.insert(key).second) u.now.push_back(key);
+}
+// Warmup thread every 5 s and PipelineCache::Save: the file rewritten (past sessions but the oldest, then this one).
+inline void UsedFlush() {
+	if (!On() || !SoloUsados()) return;
+	auto&                              u = UsedState();
+	std::vector<std::vector<uint64_t>> keep;
+	std::vector<uint64_t>              current;
+	{
+		std::lock_guard lock(u.mutex);
+		UsedLoadLocked(u);
+		if (u.written >= u.now.size() || u.now.size() < UsedSessionMin()) return;
+		u.written = u.now.size();
+		const size_t skip = u.past.size() >= Sessions() ? u.past.size() - (Sessions() - 1) : 0;
+		keep.assign(u.past.begin() + static_cast<std::ptrdiff_t>(skip), u.past.end());
+		current = u.now;
+	}
+	std::error_code error;
+	std::filesystem::create_directories(UsedPath().parent_path(), error);
+	auto       temporary = UsedPath();
+	temporary += ".tmp";
+	std::FILE* file      = std::fopen(temporary.string().c_str(), "wb");
+	if (file == nullptr) return;
+	bool ok = std::fwrite(&UsedMagic, sizeof(UsedMagic), 1, file) == 1;
+	keep.push_back(std::move(current));
+	for (const auto& session: keep) {
+		const uint64_t count = session.size();
+		ok = ok && std::fwrite(&count, sizeof(count), 1, file) == 1;
+		if (count != 0) ok = ok && std::fwrite(session.data(), sizeof(uint64_t), session.size(), file) == session.size();
+	}
+	ok = std::fclose(file) == 0 && ok;
+	if (ok) std::filesystem::rename(temporary, UsedPath(), error);
+}
 } // namespace Tiron6
