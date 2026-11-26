@@ -365,6 +365,28 @@ void Audio::CloseSdlDevice(PortOut* port) {
 // A 7.1 (or 7.1.4) port on a stereo device is downmixed here: the front pair at full level, the
 // centre, surrounds and heights at -3 dB, the LFE left out (the usual downmix). SDL's own matrix keeps
 // even all eight channels at full scale unclipped, so it plays the front pair at 0.21 (-13.5 dB).
+// (11-26) Volumen extra del port: KYTY_AUDIO_GANANCIA_DB (por defecto +6 dB; 0 = como antes; de -12 a +12) con un
+// limitador suave: por debajo de 0,7 el sonido pasa tal cual (x ganancia); por encima se curva hacia 1,0 sin recortar,
+// para que los golpes fuertes no se rajen. Solo en la salida mezclada a 2 canales y en la de coma flotante.
+static float AudioGain() {
+	static const float gain = [] {
+		const char* v  = std::getenv("KYTY_AUDIO_GANANCIA_DB");
+		const float db = (v != nullptr && *v != '\0') ? std::clamp(static_cast<float>(std::atof(v)), -12.0f, 12.0f) : 6.0f;
+		const float g  = std::pow(10.0f, db / 20.0f);
+		std::printf("[audio-ganancia] KYTY_AUDIO_GANANCIA_DB=%.1f: volumen x%.2f con limitador suave (0 = como antes)\n", db, g);
+		std::fflush(stdout);
+		return g;
+	}();
+	return gain;
+}
+static inline float AudioSoftLimit(float x) {
+	constexpr float knee = 0.7f;
+	const float     a    = std::fabs(x);
+	if (a <= knee) return x;
+	const float over = (a - knee) / (1.0f - knee);
+	const float y    = knee + (1.0f - knee) * (over / (1.0f + over));
+	return x < 0 ? -y : y;
+}
 bool Audio::DownmixesToStereo(const PortOut& port) {
 	return port.channels_num >= 8 && port.audio_spec.channels == 2;
 }
@@ -403,6 +425,13 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			if (channels == 12) {
 				left += SIDE * (sample(frame, 8) + sample(frame, 10));
 				right += SIDE * (sample(frame, 9) + sample(frame, 11));
+			}
+			{
+				const float g = AudioGain();
+				if (g != 1.0f) {
+					left  = AudioSoftLimit(left * g);
+					right = AudioSoftLimit(right * g);
+				}
 			}
 			if (is_float) {
 				reinterpret_cast<float*>(buffer->data())[frame * 2]     = left;
