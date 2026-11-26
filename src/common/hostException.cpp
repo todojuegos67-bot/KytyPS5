@@ -99,6 +99,11 @@ void SetGuardPageHandler(GuardPageHandler handler) {
 }
 
 static std::atomic<ProbeHandler> g_probe_handler {nullptr};
+static std::atomic<WriteGuardHandler> g_write_guard_handler {nullptr}; // (TEX-GUARDA)
+
+void SetWriteGuardHandler(WriteGuardHandler handler) {
+	g_write_guard_handler.store(handler, std::memory_order_release);
+}
 
 void SetProbeHandler(ProbeHandler handler) {
 	g_probe_handler.store(handler, std::memory_order_release);
@@ -240,6 +245,14 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
 		           ? EXCEPTION_CONTINUE_EXECUTION
 		           : EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	// (TEX-GUARDA) A write over a page whose bytes are only on the GPU: its ownership is taken back before the write.
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && exception_record->NumberParameters >= 2 &&
+	    exception_record->ExceptionInformation[0] == 1) {
+		if (const auto wg = g_write_guard_handler.load(std::memory_order_acquire);
+		    wg != nullptr && wg(exception_record->ExceptionInformation[1]))
+			return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
 	// A guarded copy reached a page without access: it stops there (never the guest's fault).
@@ -514,6 +527,7 @@ bool HandlerInstalled() noexcept {
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void SetProbeHandler(ProbeHandler /*handler*/) {}
+void SetWriteGuardHandler(WriteGuardHandler /*handler*/) {}
 #endif
 
 } // namespace Common::HostException

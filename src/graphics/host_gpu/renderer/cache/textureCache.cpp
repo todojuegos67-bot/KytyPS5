@@ -7281,6 +7281,20 @@ int TextureCache::DirectUploadRange(uint64_t address, uint64_t size, uint64_t /*
 
 void TextureCache::NativeGuardDirty(Image& image) {
 	NativeApplyPending(image); // (11-25) los trozos de su rango que aun esperan en el anillo, antes de usarla
+	// (AGUA segura, TEX-GUARDA) Imagen NO nativa (otro formato/forma/vista sobre la memoria de una CTexture nativa) que se
+	// va a subir de la RAM: los bytes "solo en la GPU" no estan ahi (glitch de los charcos). La imagen nativa los devuelve
+	// antes a la RAM (NativeRestoreBeforeDelete, sin borrarla; keep_on_fail: si no se puede, nada cambia). Seguro ahora:
+	// solo se escriben rangos aun en el registro, sin cambio de epoca y con todas sus paginas protegidas contra escritura
+	// de la CPU desde entonces (una reutilizacion por el juego hace fault y los saca antes). La 9f2fee5 escribia sin eso
+	// (crash 20261126-220519). Una imagen ajena que escribe la GPU no la recibe (la RAM no es su origen).
+	if (TexNativa::On() && image.IsCpuDirty() && !image.IsGpuModified() && !image.IsBufferModified() &&
+	    !SparseIsPerLevel(image.backing) && TexNativa::AnyOwned(image.info.data.address, image.info.data.End())) {
+		for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto* o = m_slot_images.try_get(other);
+			if (o == nullptr || o == &image || !o->registered || !SparseIsPerLevel(o->backing)) continue;
+			if (NativeRestoreBeforeDelete(*o, true)) TexNativa::c_agua.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	// (NEGRAS-LOG a) Imagen no nativa sobre bytes "solo en la GPU": se sube de la RAM soltada (ceros).
 	if (TexNativa::NegrasLog() && TexNativa::On() && image.IsCpuDirty() && !SparseIsPerLevel(image.backing) &&
 	    TexNativa::AnyOwned(image.info.data.address, image.info.data.End())) {
@@ -7660,18 +7674,32 @@ bool TextureCache::NativeRestoreBeforeDelete(Image& image, bool keep_on_fail, ui
 	// (WB-EPOCA) Bajo OwnedMutex (el free 0x802f90 y el unmap esperan): solo lo que nadie libero/reutilizo desde OwnedIn.
 	// Lo descartado es ya de quien lo libero o reutilizo: ni se escribe ni se quita del registro (una textura nueva en
 	// esa memoria conserva sus rangos "solo en la GPU").
-	std::vector<std::pair<uint64_t, uint64_t>> escritos;
+	// (TEX-GUARDA) Y solo lo que sigue protegido contra escritura de la CPU desde que fue "solo en la GPU": una escritura
+	// del juego (reutilizacion sin free ni unmap) ya lo habria sacado del registro (epoca nueva). Lo no protegible (sin
+	// commit) no se escribe nunca: se pierde (sale del registro), jamas pisa la RAM del juego.
+	std::vector<std::pair<uint64_t, uint64_t>> escritos, sin_guarda;
 	{
 		std::lock_guard<std::mutex> olock(TexNativa::OwnedMutex());
+		TexGuarda::EmulatorWrite emulator_write; // (memoria nativa: la escritura va a la direccion del juego)
 		for (const auto& [b, e]: owned) {
 			if (TexNativa::TocadoDesdeLocked(b, e, epoca)) {
 				TexNativa::c_wb_descartado_n.fetch_add(1, std::memory_order_relaxed);
 				TexNativa::c_wb_descartado_bytes.fetch_add(e - b, std::memory_order_relaxed);
 				continue;
 			}
+			if (!TexGuarda::Intact(b, e)) {
+				TexGuarda::c_wb_unguarded.fetch_add(1, std::memory_order_relaxed);
+				TexGuarda::c_wb_unguarded_bytes.fetch_add(e - b, std::memory_order_relaxed);
+				sin_guarda.emplace_back(b, e);
+				continue;
+			}
 			LibKernel::Memory::WriteBacking(b, mapped + (b - base), e - b, "tex-nativa");
 			escritos.emplace_back(b, e);
 		}
+	}
+	for (const auto& [b, e]: sin_guarda) {
+		TexNativa::c_lost_bytes.fetch_add(e - b, std::memory_order_relaxed);
+		TexNativa::RemoveOwned(b, e);
 	}
 	for (const auto& [b, e]: escritos) {
 		(void)TexNativa::ForgetReleased(b, e, true); // (N5) bytes de la VRAM escritos: respaldo fisico otra vez

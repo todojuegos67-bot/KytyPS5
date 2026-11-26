@@ -3,6 +3,7 @@
 
 #include "cold-store.h" // (ram11, KYTY_COLD_STORE)
 #include "nativo-cubierto.h" // (VIGILANCIA-DOBLE: KYTY_SIN_VIGILANCIA_DOBLE)
+#include "tex-guarda.h" // (TEX-GUARDA: paginas solo en la GPU protegidas contra escritura)
 #include "lock-watch.h" // (ram13b: who waits for which lock, KYTY_LOCK_WATCH)
 
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
@@ -5531,6 +5532,9 @@ private:
 			if (audit) NativeAuditProtect(range_start, range_end - range_start, false, now_protected);
 #endif
 		}
+		// (TEX-GUARDA) Paginas "solo en la GPU" a las que esto dio escritura: sin ella otra vez (y si no, ya no son nuestras).
+		TexGuarda::AfterProtect(vaddr, size, (static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0,
+		                        VirtualMemory::IsExecute(mode));
 		return true;
 	}
 

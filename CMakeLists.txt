@@ -1011,6 +1011,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
 	"${KYTY_SOURCE_DIR}/local/f0-measure.h"
 	"${KYTY_SOURCE_DIR}/local/f0-measure.cpp"
+	"${KYTY_SOURCE_DIR}/local/tex-guarda.h"
+	"${KYTY_SOURCE_DIR}/local/tex-guarda.cpp"
 	"${KYTY_SOURCE_DIR}/local/juego3.h"
 	"${KYTY_SOURCE_DIR}/local/juego3.cpp"
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
