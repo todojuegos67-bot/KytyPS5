@@ -3919,12 +3919,23 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 	if (!prefetch_started && !m_warmup_stop.load(std::memory_order_relaxed)) StartShaderPrefetch(std::move(recorded_inputs));
 }
 
-void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory) {
+void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory, bool missing_seeds) {
 	auto& programs = *m_program_cache;
 	m_scenes_warmed.insert(scene);
 	bool known = scene != SceneTags::None && SceneTags::Knows(scene);
 	std::unordered_set<uint64_t> only;
 	if (known) only = SceneTags::Recipes(scene);
+	if (missing_seeds) {
+		// (tiron6-zona) Of the scene's pipelines, the seeds the start-up warm left out (not bound in the last sessions):
+		// the ones the render thread would otherwise make itself in this scene.
+		const size_t tagged = only.size();
+		std::erase_if(only, [](uint64_t key) { return !Tiron6::IsSeed(key) || Tiron6::WasUsed(key); });
+		PipelineCacheLog("[tiron6-zona] {}: {} ({} pipelines de la zona, {} semillas no precargadas se hacen ahora en "
+		                 "hilos de fondo)",
+		                 SceneTags::Name(scene), known ? "zona conocida" : "zona nueva: nada (se apunta para la proxima)",
+		                 tagged, only.size());
+		if (!known || only.empty()) return;
+	}
 	// (Later scenes: the recording read again, records and recipes only appended to it, so the indices hold; each
 	// input's permutation looked up: none, the program left or the game made its own, its pipelines made where needed.
 	// warm_records views `records` until the pipelines are made.)
@@ -3962,7 +3973,7 @@ void PipelineCache::WarmScene(uint32_t scene, uint64_t compute_video, bool in_me
 	size_t present = 0;
 	if (known) {
 		for (const auto& words: programs.warm_recipes) present += only.contains(LocalShaderWarmup::RecipeKey(words)) ? 1 : 0;
-		if (present * 2 < only.size()) {
+		if (present * 2 < only.size() && !missing_seeds) {
 			PipelineCacheLog("Scene warmup: {}: {} of its {} pipelines recorded, the recording's taken", SceneTags::Name(scene),
 			                 present, only.size());
 			known = false;
@@ -4224,12 +4235,47 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 		                 (static_cast<int64_t>(memory_after.working_set) - static_cast<int64_t>(tiron6_memory.working_set)) >> 20,
 		                 LocalPlatform::AvailablePhysicalMemory() >> 20u);
 		Tiron6::g_done.store(true, std::memory_order_release);
+		// (tiron6-zona, KYTY_TIRON6_ZONA=1, default off) Logs 20261126-230735: 949 compute pipelines made on the render
+		// thread (1266 ms, 55 frames, up to 255 ms) after the map loads (m01, m02, m03_01): seeds solo-usados skipped. Each
+		// map the game loads (SceneTags, libAmpr's .arealoadlist) gets, here on the warmup's below-normal workers, the
+		// skipped seeds it bound in earlier sessions: only that map's (the RAM stays bounded; the worlds left are evicted
+		// as before), the render thread never waits for them (it makes its own if it gets there first).
+		static const bool zona = [] {
+			const char* value = std::getenv("KYTY_TIRON6_ZONA");
+			const bool  on    = value != nullptr && value[0] == '1';
+			std::printf("[tiron6-zona] semillas no precargadas hechas al cargar cada zona (de fondo): %s\n",
+			            on ? "ON (KYTY_TIRON6_ZONA=1)" : "off");
+			std::fflush(stdout);
+			return on;
+		}();
+		const bool zone_warm = zona && m_scene_warmup && Tiron6::SoloUsados() && Tiron6::UsedKnown();
+		const auto zone_video = Tiron6::VideoCap(compute_video, m_graphics.GetTotalMemoryBudget());
+		uint64_t   zone_seen  = 0;
+		auto       zone_saved = std::chrono::steady_clock::now();
 		// (The seeds this session adds go to the disk every 5 s, from this thread: none from the render thread.)
 		while (!m_warmup_stop.load(std::memory_order_relaxed)) {
-			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i)
+			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				if (!zone_warm) continue;
+				if (const auto generation = SceneTags::Generation(); generation != zone_seen && generation != 0) {
+					zone_seen        = generation;
+					const auto scene = SceneTags::Current();
+					if (scene != SceneTags::None && !m_scenes_warmed.contains(scene)) {
+						const auto zone_begin = std::chrono::steady_clock::now();
+						WarmScene(scene, zone_video, false, true);
+						PipelineCacheLog("[tiron6-zona] {}: hecho en {} ms", SceneTags::Name(scene),
+						                 std::chrono::duration_cast<std::chrono::milliseconds>(
+						                     std::chrono::steady_clock::now() - zone_begin)
+						                     .count());
+					}
+				}
+			}
 			Tiron6::Flush();
 			Tiron6::UsedFlush(); // (solo-usados)
+			if (zone_warm && std::chrono::steady_clock::now() - zone_saved >= std::chrono::seconds(15)) {
+				(void)SceneTags::Save(); // (a session that ends without Save still teaches its maps)
+				zone_saved = std::chrono::steady_clock::now();
+			}
 		}
 	}
 }

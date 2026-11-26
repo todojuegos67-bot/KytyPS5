@@ -499,7 +499,9 @@ private:
 	bool                         m_warm_cache_only  = false;
 	bool                         m_scene_warmed_all = false;
 	std::unordered_set<uint32_t> m_scenes_warmed;
-	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);
+	// (tiron6-zona) `missing_seeds`: only the Tiron6 seeds of a known scene the start-up warm skipped (solo-usados), else
+	// nothing; never every recorded pipeline.
+	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory, bool missing_seeds = false);
 	void                         SceneLoop(uint64_t compute_video);
 	// (tiron1, KYTY_TIRON1=1) A PC under 30 GB of RAM (no pipeline warmup): once the shader prefetch is done, the
 	// recording's compute recipes (newest first, at most KYTY_TIRON1_COMPUTE_MAX) made beside the game on
