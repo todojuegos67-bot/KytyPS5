@@ -161,7 +161,6 @@ inline bool AnyOwned(uint64_t b, uint64_t e) {
 struct Pending {
 	uint64_t dest = 0, size = 0, ring_offset = 0, seq = 0;
 	uint64_t base = 0; // (11-25c) base del T# de su CTexture (tl_chunk_base): su imagen nativa sin FindImagesInRegion
-	uint64_t tex  = 0; // (cov2) su CTexture si llego SIN imagen: el drenaje la crea justo antes de subirlo
 };
 // (11-25d) La espera en el anillo de los trozos sin imagen (t_us, kWaitNoImageUs) se quito: desde la 11-25b NativeChunkCopy
 // los manda a la RAM antes de encolar, t_us era siempre 0 (log 075201: "subidos al crearse la imagen 0 MB"). Ahora el
@@ -244,7 +243,6 @@ inline std::atomic<uint64_t> c_soltado_bytes {0}, c_soltado_fallo {0};
 // se compromete al tocarla, y el trozo directo no la toca nunca: esa RAM no llego a usarse (log 075201: "soltada 0 MB,
 // rechazadas 0 MB" con 1053 MB directos = NativeOffloadDrop no encontro nada comprometido que soltar).
 inline std::atomic<uint64_t> c_sin_commit_bytes {0};
-inline std::atomic<uint64_t> c_decommit_bytes {0}; // (tex-decommit) MEM_DECOMMIT: compromiso privado devuelto (acumulado)
 // (11-25d) Imagenes con bytes "solo en la GPU" borradas/aparcadas desde el grabador: recuperadas despues (textureCache.cpp).
 inline std::atomic<uint64_t> c_later_n {0}, c_later_ok {0};
 
@@ -325,34 +323,6 @@ inline std::atomic<uint64_t> c_direct_bytes {0}, c_fallback_bytes {0}, c_lost_by
 inline std::atomic<uint64_t> c_unbound_fallback {0}; // (NEGRAS) trozos a un mip sin ligar: a la RAM en vez de perderse
 // (11-25) Trozos de 0x901330 que llegan a NativeChunkCopy: todos / CTexture no registrada / sin imagen todavia.
 inline std::atomic<uint64_t> c_chunk_all_bytes {0}, c_chunk_nonative_bytes {0}, c_chunk_noimage_bytes {0};
-
-// (cov2, 11-26) Trozo sin imagen al llegar: ya NO va a la RAM. Va al anillo como uno directo (Pending.tex) y el hilo de
-// render, al drenarlo, crea la imagen dispersa de su CTexture (sin memoria: solo vkCreateImage + registro) y lo sube.
-// Asi la imagen ya no tiene que ganar la carrera al trozo (log 20261126-200221: 9485 MB "sin imagen al llegar", latencia de
-// creacion media 26,9 s en la cola anticipada). KYTY_TEX_NATIVA_DIFERIDA=0 vuelve a lo de antes.
-inline bool Diferida() {
-	static const bool on = [] {
-		const char* v = std::getenv("KYTY_TEX_NATIVA_DIFERIDA");
-		return v == nullptr || v[0] != '0';
-	}();
-	return on;
-}
-inline std::atomic<uint64_t> c_dif_bytes {0}, c_dif_made {0}, c_dif_fail {0}, c_dif_us {0}, c_dif_max_us {0};
-// (cov2) Por que una subida directa no fue posible (NativeUploadHostLocked -> fallback), en bytes.
-enum Fallo : int {
-	kFRamWrite,  // el juego escribio el trozo en la RAM (anillo lleno / sin imagen)
-	kFRango,     // rango no valido / tamano 0
-	kFSinImagen, // ninguna imagen (o varias) en el rango
-	kFNoApta,    // no dispersa por mip / modificada por la GPU / fuera de la imagen
-	kFProf,      // profundidad
-	kFPlan,      // plan de destilado no valido
-	kFPartido,   // tile partido entre dos trozos
-	kFSinTiles,  // ningun tile en el trozo
-	kFSinLigar,  // mip sin memoria ligada
-	kFSinAnillo, // anillo de la GPU sin crear
-	kFN
-};
-inline std::atomic<uint64_t> c_fallo[kFN] {};
 
 inline std::atomic<uint64_t> c_registered {0}, c_images {0}, c_refused {0}, c_levels_bound {0}, c_levels_unbound {0},
     c_bound_bytes {0}, c_alloc_failed {0}, c_freed_bytes {0}, c_views {0};
@@ -523,10 +493,6 @@ inline void TakeUrgent(std::vector<std::shared_ptr<Urgente>>& out) {
 	out.swap(UQueue());
 	g_urgent.store(false, std::memory_order_release);
 }
-inline void MarkBadBase(uint64_t base) {
-	std::lock_guard<std::mutex> lock(Mutex());
-	BadBases().insert(base);
-}
 inline void Responder(const std::shared_ptr<Urgente>& r, bool ok) {
 	if (!ok && r->base != 0) {
 		std::lock_guard<std::mutex> lock(Mutex());
@@ -613,17 +579,6 @@ inline void MaybeLog() {
 		            ln ? static_cast<double>(c_create_lat_us.load()) / 1000.0 / static_cast<double>(ln) : 0.0,
 		            static_cast<double>(c_create_lat_max.load()) / 1000.0, static_cast<unsigned long long>(ln));
 	}
-	std::printf("[tex-nativa] (cov2) trozos sin imagen al anillo (imagen creada al drenar) %llu MB: imagenes creadas %llu, no "
-	            "creables %llu, coste %.1f ms (max %.2f ms una); subida no posible MB: RAM %llu rango %llu sin-imagen %llu "
-	            "no-apta %llu prof %llu plan %llu tile-partido %llu sin-tiles %llu sin-ligar %llu sin-anillo %llu\n",
-	            static_cast<unsigned long long>(c_dif_bytes.load() >> 20u), static_cast<unsigned long long>(c_dif_made.load()),
-	            static_cast<unsigned long long>(c_dif_fail.load()), static_cast<double>(c_dif_us.load()) / 1000.0,
-	            static_cast<double>(c_dif_max_us.load()) / 1000.0,
-	            static_cast<unsigned long long>(c_fallo[kFRamWrite].load() >> 20u), static_cast<unsigned long long>(c_fallo[kFRango].load() >> 20u),
-	            static_cast<unsigned long long>(c_fallo[kFSinImagen].load() >> 20u), static_cast<unsigned long long>(c_fallo[kFNoApta].load() >> 20u),
-	            static_cast<unsigned long long>(c_fallo[kFProf].load() >> 20u), static_cast<unsigned long long>(c_fallo[kFPlan].load() >> 20u),
-	            static_cast<unsigned long long>(c_fallo[kFPartido].load() >> 20u), static_cast<unsigned long long>(c_fallo[kFSinTiles].load() >> 20u),
-	            static_cast<unsigned long long>(c_fallo[kFSinLigar].load() >> 20u), static_cast<unsigned long long>(c_fallo[kFSinAnillo].load() >> 20u));
 	std::printf("[tex-nativa] RAM reservada liberada %llu MB; re-respaldada %llu MB (alias saltados %llu MB); borradas desde "
 	            "el grabador con bytes solo en la GPU %llu (recuperadas despues %llu)\n",
 	            static_cast<unsigned long long>(c_liberada_bytes.load() >> 20u),
@@ -631,10 +586,9 @@ inline void MaybeLog() {
 	            static_cast<unsigned long long>(c_liberada_alias.load() >> 20u),
 	            static_cast<unsigned long long>(c_later_n.load()), static_cast<unsigned long long>(c_later_ok.load()));
 	std::printf("[tex-nativa] RAM real soltada (paginas de texturas solo en la GPU devueltas a Windows) %llu MB; rechazadas %llu MB; "
-	            "nunca comprometidas (KYTY_COMMIT_REAL: el trozo directo no las toco, RAM que no llego a usarse) %llu MB; de ello descomprometidas (MEM_DECOMMIT, KYTY_TEX_NATIVA_DECOMMIT) %llu MB\n",
+	            "nunca comprometidas (KYTY_COMMIT_REAL: el trozo directo no las toco, RAM que no llego a usarse) %llu MB\n",
 	            static_cast<unsigned long long>(c_soltado_bytes.load() >> 20u), static_cast<unsigned long long>(c_soltado_fallo.load() >> 20u),
-	            static_cast<unsigned long long>(c_sin_commit_bytes.load() >> 20u),
-	            static_cast<unsigned long long>(c_decommit_bytes.load() >> 20u));
+	            static_cast<unsigned long long>(c_sin_commit_bytes.load() >> 20u));
 	std::printf("[tex-nativa] gancho de free 0x802f90 %s: bloques solo-GPU liberados por el juego %llu (%llu MB, sacados del registro antes de que escriba)\n",
 	            g_free_hook_ok.load() ? "instalado" : "NO instalado", static_cast<unsigned long long>(c_free_hits.load()),
 	            static_cast<unsigned long long>(c_free_bytes.load() >> 20u));

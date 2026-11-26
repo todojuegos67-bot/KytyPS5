@@ -99,13 +99,6 @@ struct State {
 	std::atomic<uint64_t>         decommitted {0};     // (commit-real) bytes of freed game blocks decommitted, in total
 	std::atomic<uint64_t>         decommit_calls {0};
 	std::atomic_bool              enabled {false};
-	// (tex-decommit) Global (commit at touch for all game memory) or only texture mode (committed at map; only the
-	// intervals below, decommitted by NativeOffloadDecommit, are recommitted at touch).
-	bool                          global = false;
-	SRWLOCK                       tex_lock = SRWLOCK_INIT;
-	std::map<uint64_t, uint64_t>  tex_ranges;          // begin -> end, decommitted by tex-nativa (page aligned)
-	std::atomic<uint64_t>         tex_count {0};       // tex_ranges.size(): fast "nothing to do"
-	std::atomic<uint64_t>         tex_faults {0};
 	BOOL(WINAPI* real_protect)(LPVOID, SIZE_T, DWORD, PDWORD) = nullptr;
 	BOOL(WINAPI* real_lock)(LPVOID, SIZE_T)                    = nullptr;
 };
@@ -127,89 +120,12 @@ inline bool CommitRealRequested() {
 	return on;
 }
 
-// (tex-decommit) KYTY_TEX_NATIVA_DECOMMIT (por defecto encendido con KYTY_TEX_NATIVA=1; =0 lo apaga): las paginas de
-// texturas servidas solo desde la VRAM (TexNativa "solo en la GPU") se descomprometen (MEM_DECOMMIT) en vez de MEM_RESET.
-// La memoria del juego SIGUE comprometida al mapear (log 20261126-202448-066: el compromiso-al-tocar global costaba
-// 54306 fallos en 30 s y gpu_wait = texture_unmap_us de 50-220 ms); solo los intervalos descomprometidos aqui
-// (tex_ranges) se vuelven a comprometer al tocarlos (pagina a cero, como MEM_RESET). KYTY_TEX_NATIVA_LAZY=1: el
-// comportamiento anterior (compromiso-al-tocar de toda la memoria del juego).
-inline bool TexDecommitRequested() {
-	static const bool on = [] {
-		const char* t = std::getenv("KYTY_TEX_NATIVA");
-		const char* v = std::getenv("KYTY_TEX_NATIVA_DECOMMIT");
-		const bool  tex = t != nullptr && t[0] == '1';
-		return tex && (v == nullptr || v[0] != '0');
-	}();
-	return on;
-}
-
-// Commit-at-touch for ALL the game's memory (reserved at map).
-inline bool GlobalRequested() {
+inline bool Requested() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_COMMIT_AL_TOCAR");
-		const char* l = std::getenv("KYTY_TEX_NATIVA_LAZY");
-		return (v != nullptr && v[0] == '1') || CommitRealRequested() || (TexDecommitRequested() && l != nullptr && l[0] == '1');
+		return (v != nullptr && v[0] == '1') || CommitRealRequested();
 	}();
 	return on;
-}
-
-// The module on (handler, hooks, mapping registry): global mode, or texture-only mode.
-inline bool Requested() {
-	static const bool on = GlobalRequested() || TexDecommitRequested();
-	return on;
-}
-
-// Whether a new mapping is left reserved (committed at touch). False in texture-only mode: committed at map as before.
-inline bool LazyMapping() {
-	return Get().global;
-}
-
-// (tex-decommit) tex_ranges helpers (tex_lock held exclusive).
-inline void TexAddLocked(State& state, uint64_t b, uint64_t e) {
-	auto it = state.tex_ranges.upper_bound(b);
-	if (it != state.tex_ranges.begin() && std::prev(it)->second >= b) {
-		--it;
-		b  = it->first;
-		e  = std::max(e, it->second);
-		it = state.tex_ranges.erase(it);
-	}
-	while (it != state.tex_ranges.end() && it->first <= e) {
-		e  = std::max(e, it->second);
-		it = state.tex_ranges.erase(it);
-	}
-	state.tex_ranges[b] = e;
-	state.tex_count.store(state.tex_ranges.size(), std::memory_order_relaxed);
-}
-
-inline void TexRemoveLocked(State& state, uint64_t b, uint64_t e) {
-	auto it = state.tex_ranges.upper_bound(b);
-	if (it != state.tex_ranges.begin()) --it;
-	while (it != state.tex_ranges.end() && it->first < e) {
-		const uint64_t rb = it->first, re = it->second;
-		if (re <= b) {
-			++it;
-			continue;
-		}
-		it = state.tex_ranges.erase(it);
-		if (rb < b) state.tex_ranges[rb] = b;
-		if (re > e) {
-			state.tex_ranges[e] = re;
-			break;
-		}
-	}
-	state.tex_count.store(state.tex_ranges.size(), std::memory_order_relaxed);
-}
-
-// Whether [b, e) overlaps a decommitted texture interval (cheap: no lock when there is none).
-inline bool TexOverlaps(State& state, uint64_t b, uint64_t e) {
-	if (state.tex_count.load(std::memory_order_relaxed) == 0) return false;
-	AcquireSRWLockShared(&state.tex_lock);
-	bool hit = false;
-	auto it  = state.tex_ranges.upper_bound(b);
-	if (it != state.tex_ranges.begin() && std::prev(it)->second > b) hit = true;
-	else if (it != state.tex_ranges.end() && it->first < e) hit = true;
-	ReleaseSRWLockShared(&state.tex_lock);
-	return hit;
 }
 
 inline bool Enabled() {
@@ -292,7 +208,7 @@ inline uint64_t CommittedBytes(uint64_t begin, uint64_t end) {
 //    it), so no tracker ever sees a protection it did not set.
 // Called under the game's allocator lock (the block checked free). Returns the bytes decommitted; *rest: the bytes
 // committed but left to MEM_RESET.
-inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest, bool texture = false) {
+inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest) {
 	*rest       = 0;
 	auto& state = Get();
 	// (KYTY_FRAME_NATIVO2 on: arenas imported into Vulkan as host memory; nothing decommitted then, MEM_RESET as before.)
@@ -300,9 +216,7 @@ inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest, bool
 		const char* v = std::getenv("KYTY_FRAME_NATIVO2");
 		return v != nullptr && v[0] != '\0' && v[0] != '0';
 	}();
-	if (imports || !(CommitRealRequested() || (texture && TexDecommitRequested())) || !state.enabled.load(std::memory_order_relaxed) ||
-	    size == 0)
-		return 0;
+	if (imports || !CommitRealRequested() || !state.enabled.load(std::memory_order_relaxed) || size == 0) return 0;
 	const uint64_t end  = vaddr + size;
 	uint64_t       done = 0;
 	AcquireSRWLockExclusive(&state.lock);
@@ -317,21 +231,8 @@ inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest, bool
 		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
 			const DWORD mapping = info.AllocationProtect & 0xffu;
 			const bool  same    = mapping != 0 && (info.Protect & 0xffu) == mapping && (info.Protect & (PAGE_GUARD | PAGE_NOCACHE)) == 0;
-			// (tex-decommit: the interval known to the handler BEFORE the decommit, so a touch from another thread right
-			// after it is recommitted; taken out again if the decommit is refused.)
-			const bool tex = inside && same && texture && !state.global;
-			if (tex) {
-				AcquireSRWLockExclusive(&state.tex_lock);
-				TexAddLocked(state, at, stop);
-				ReleaseSRWLockExclusive(&state.tex_lock);
-			}
 			if (inside && same && VirtualFree(reinterpret_cast<void*>(at), stop - at, MEM_DECOMMIT) != 0) {
 				done += stop - at;
-			} else if (tex) {
-				AcquireSRWLockExclusive(&state.tex_lock);
-				TexRemoveLocked(state, at, stop);
-				ReleaseSRWLockExclusive(&state.tex_lock);
-				*rest += stop - at;
 			} else {
 				*rest += stop - at;
 			}
@@ -354,8 +255,6 @@ inline bool Ensure(const void* address, uint64_t size) {
 	if (!state.enabled.load(std::memory_order_relaxed) || address == nullptr || size == 0) return true;
 	const uint64_t begin = reinterpret_cast<uint64_t>(address) & ~uint64_t {0xfff};
 	const uint64_t end   = (reinterpret_cast<uint64_t>(address) + size + 0xfff) & ~uint64_t {0xfff};
-	// (tex-decommit, texture-only mode: everything else is committed since its mapping; nothing to look up.)
-	if (!state.global && !TexOverlaps(state, begin, end)) return true;
 	AcquireSRWLockShared(&state.lock);
 	const bool ours = OverlapsLocked(state, begin, end);
 	ReleaseSRWLockShared(&state.lock);
@@ -364,11 +263,6 @@ inline bool Ensure(const void* address, uint64_t size) {
 	bool       any = false;
 	const bool ok  = CommitReservedLocked(state, begin, end, &any);
 	ReleaseSRWLockExclusive(&state.lock);
-	if (!state.global && ok) {
-		AcquireSRWLockExclusive(&state.tex_lock);
-		TexRemoveLocked(state, begin, end);
-		ReleaseSRWLockExclusive(&state.tex_lock);
-	}
 	if (any) state.protect_commits.fetch_add(1, std::memory_order_relaxed);
 	return ok;
 }
@@ -390,9 +284,6 @@ inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
 	    pointers->ExceptionRecord->NumberParameters < 2)
 		return EXCEPTION_CONTINUE_SEARCH;
 	const auto address = static_cast<uint64_t>(pointers->ExceptionRecord->ExceptionInformation[1]);
-	// (tex-decommit, texture-only mode: only a decommitted texture interval is ours; any other fault - GPU watches,
-	// guards - goes on to the other handlers without a VirtualQuery or a lock.)
-	if (!state.global && !TexOverlaps(state, address, address + 1)) return EXCEPTION_CONTINUE_SEARCH;
 	MEMORY_BASIC_INFORMATION info {};
 	if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info) || info.State != MEM_RESERVE ||
 	    info.Type != MEM_PRIVATE)
@@ -403,15 +294,9 @@ inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
 		ReleaseSRWLockExclusive(&state.lock);
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
-	const bool committed = CommitReservedLocked(state, begin, begin + Granule, nullptr);
+	(void)CommitReservedLocked(state, begin, begin + Granule, nullptr);
 	ReleaseSRWLockExclusive(&state.lock);
 	state.faults.fetch_add(1, std::memory_order_relaxed);
-	if (!state.global && committed) {
-		AcquireSRWLockExclusive(&state.tex_lock);
-		TexRemoveLocked(state, begin, begin + Granule);
-		ReleaseSRWLockExclusive(&state.tex_lock);
-		state.tex_faults.fetch_add(1, std::memory_order_relaxed);
-	}
 	MEMORY_BASIC_INFORMATION after {};
 	if (VirtualQuery(reinterpret_cast<void*>(address), &after, sizeof(after)) == sizeof(after) && after.State == MEM_COMMIT)
 		return EXCEPTION_CONTINUE_EXECUTION; // (a no-access mapping faults again, committed: the other handlers)
@@ -498,8 +383,7 @@ inline DWORD WINAPI ReportThread(LPVOID) {
 		std::printf("[commit-real] %d s, MiB (KYTY_COMMIT_REAL=1; =0 lo apaga): commit del emulador %llu (juego %llu + resto del "
 		            "emulador %llu + lastre de VRAM simulada %llu), RAM privada %llu; comprometido evitado %llu (juego mapeado %llu, "
 		            "comprometido solo lo tocado; bloques libres del juego descomprometidos %llu en total en %llu pasadas); fallos "
-		            "de pagina atendidos %llu, rangos comprometidos antes de proteger %llu, fallidos %llu; "
-		            "modo %s, fallos en texturas descomprometidas %llu, intervalos descomprometidos %llu\n",
+		            "de pagina atendidos %llu, rangos comprometidos antes de proteger %llu, fallidos %llu\n",
 		            seconds, static_cast<unsigned long long>(priv), static_cast<unsigned long long>(game),
 		            static_cast<unsigned long long>(rest), static_cast<unsigned long long>(ballast),
 		            static_cast<unsigned long long>(ProcessPrivateRamMiB()), static_cast<unsigned long long>(avoided >> 20u),
@@ -508,9 +392,7 @@ inline DWORD WINAPI ReportThread(LPVOID) {
 		            static_cast<unsigned long long>(state.decommit_calls.load(std::memory_order_relaxed)),
 		            static_cast<unsigned long long>(state.faults.load(std::memory_order_relaxed)),
 		            static_cast<unsigned long long>(state.protect_commits.load(std::memory_order_relaxed)),
-		            static_cast<unsigned long long>(state.failures.load(std::memory_order_relaxed)),
-		            state.global ? "global" : "solo texturas", static_cast<unsigned long long>(state.tex_faults.load(std::memory_order_relaxed)),
-		            static_cast<unsigned long long>(state.tex_count.load(std::memory_order_relaxed)));
+		            static_cast<unsigned long long>(state.failures.load(std::memory_order_relaxed)));
 		std::fflush(stdout);
 	}
 }
@@ -520,7 +402,6 @@ inline bool Start() {
 	static const bool started = [] {
 		auto& state = Get();
 		if (!Requested()) return false;
-		state.global = GlobalRequested();
 		if (AddVectoredExceptionHandler(1, Handler) == nullptr) {
 			std::printf("[commit-real] sin manejador de excepciones: apagado (se compromete al mapear)\n");
 			std::fflush(stdout);
@@ -535,16 +416,6 @@ inline bool Start() {
 		}
 		if (state.real_lock == nullptr) state.real_lock = &::VirtualLock;
 		state.enabled.store(true, std::memory_order_release);
-		if (!state.global) {
-			std::printf("[commit-real] SOLO TEXTURAS (KYTY_TEX_NATIVA_DECOMMIT; KYTY_TEX_NATIVA_LAZY=1 = compromiso-al-tocar global): "
-			            "memoria del juego comprometida al mapear como siempre; solo las paginas de texturas descomprometidas "
-			            "(MEM_DECOMMIT) se vuelven a comprometer al tocarlas; VirtualProtect redirigido en %d sitio(s), VirtualLock "
-			            "en %d; linea [commit-real] cada 10 s\n",
-			            p, l);
-			std::fflush(stdout);
-			if (HANDLE t = CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr); t != nullptr) CloseHandle(t);
-			return true;
-		}
 		std::printf("[commit-real] ON (KYTY_COMMIT_REAL=1 por defecto, =0 lo apaga): memoria del juego reservada al mapear y "
 		            "comprometida al tocarla por granulos de 64 KiB; bloques que el juego libera descomprometidos (MEM_DECOMMIT); "
 		            "VirtualProtect redirigido en %d sitio(s), VirtualLock en %d; proceso al empezar: comprometido %llu MiB, en "
@@ -565,7 +436,6 @@ inline void Register(uint64_t vaddr, uint64_t size) {
 	state.ranges[vaddr] = vaddr + size;
 	ReleaseSRWLockExclusive(&state.lock);
 	state.reserved.fetch_add(size, std::memory_order_relaxed);
-	if (!state.global) state.committed.fetch_add(size, std::memory_order_relaxed); // (committed at map)
 }
 
 // [vaddr, vaddr + size) unmapped: no longer ours (ranges crossing its edges split).
@@ -594,11 +464,6 @@ inline void Unregister(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	ReleaseSRWLockExclusive(&state.lock);
-	if (!state.global) {
-		AcquireSRWLockExclusive(&state.tex_lock);
-		TexRemoveLocked(state, vaddr, end);
-		ReleaseSRWLockExclusive(&state.tex_lock);
-	}
 	// (The counters: mapped bytes and their committed bytes back out - the line shows what is mapped now.)
 	state.reserved.fetch_sub(std::min(removed, state.reserved.load(std::memory_order_relaxed)), std::memory_order_relaxed);
 	state.committed.fetch_sub(std::min(removed_committed, state.committed.load(std::memory_order_relaxed)), std::memory_order_relaxed);

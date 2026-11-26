@@ -1525,22 +1525,6 @@ uint64_t NativeOffloadDrop(uint64_t vaddr, uint64_t size, uint64_t* refused) {
 	return done;
 }
 
-// (tex-decommit) Paginas de texturas servidas solo desde la VRAM: MEM_DECOMMIT (baja el compromiso privado, no solo el
-// working set). Solo dentro de un mapeo registrado por el compromiso-al-tocar y con la proteccion del mapeo (si no, 0 y
-// queda a NativeOffloadDrop / MEM_RESET). Un toque posterior lo compromete a cero el manejador.
-uint64_t NativeOffloadDecommit(uint64_t vaddr, uint64_t size) {
-#if defined(_WIN32)
-	if (size == 0 || g_guest_address_space == nullptr || !g_guest_address_space->IsNative() ||
-	    !NativeLazyCommit::TexDecommitRequested())
-		return 0;
-	uint64_t rest = 0;
-	return NativeLazyCommit::DecommitFree(vaddr, size, &rest, true);
-#else
-	(void)vaddr, (void)size;
-	return 0;
-#endif
-}
-
 bool NativeOffloadWrite(uint64_t vaddr, const void* data, uint64_t size) {
 	if (size == 0) return true;
 #if defined(_WIN32)

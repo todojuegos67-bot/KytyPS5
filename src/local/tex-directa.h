@@ -341,14 +341,7 @@ inline bool NativeChunkCopy(void* dest, const void* src, size_t n) {
 	// uno (cubrir y volver a vigilar sus paginas) con FAULT 582 -> 1270/s.
 	// (11-25d) Sin imagen todavia: creacion urgente de ESTA CTexture en el hilo de render y espera solo a ella (TexNativa::
 	// Urgente). Si no se puede crear, o la seguridad anti-bloqueo salta, a la RAM como siempre.
-	// (cov2) Sin imagen todavia pero CTexture nativa valida: al anillo igual; el drenaje crea su imagen antes de subirlo.
-	uint64_t lazy_tex = 0;
-	if (!HasImage(d, n) && TexNativa::Diferida() && tl_chunk_tex != 0 && (tl_chunk_tex & 7) == 0 &&
-	    !TexNativa::IsBadBase(tl_chunk_base)) {
-		(void)TexNativa::NoteNoImage(tl_chunk_tex, n); // (cov1) solo diagnostico ("aun en cola" / "ya creada")
-		TexNativa::c_dif_bytes.fetch_add(n, std::memory_order_relaxed);
-		lazy_tex = tl_chunk_tex;
-	} else if (!HasImage(d, n)) {
+	if (!HasImage(d, n)) {
 		// (cov1) Una sola peticion por CTexture mientras siga pendiente (antes una por trozo: 11774 para 4273 CTexture).
 		if (!TexNativa::NoteNoImage(tl_chunk_tex, n)) PedirImagen(); // (11-25e) sin espera: este trozo a la RAM
 		TexNativa::c_chunk_noimage_bytes.fetch_add(n, std::memory_order_relaxed);
@@ -363,7 +356,7 @@ inline bool NativeChunkCopy(void* dest, const void* src, size_t n) {
 		}
 		return false;
 	}
-	if (lazy_tex == 0) TexNativa::NoteDirect(tl_chunk_tex, n); // (cov1) bytes directos gracias a una creacion urgente
+	TexNativa::NoteDirect(tl_chunk_tex, n); // (cov1) bytes directos gracias a una creacion urgente
 	uint64_t           offset = 0, seq = 0;
 	TexNativa::Coste   coste(TexNativa::kCCopy); // (N2+N3f) incluye la espera de PMutex y la copia al anillo
 	TexNativa::c_copy_bytes.fetch_add(n, std::memory_order_relaxed);
@@ -391,7 +384,7 @@ inline bool NativeChunkCopy(void* dest, const void* src, size_t n) {
 	std::memcpy(TexNativa::TheRing().base.load(std::memory_order_relaxed) + offset, src, n); // origen -> memoria de subida
 	{
 		std::lock_guard<std::mutex> lock(TexNativa::PMutex());
-		TexNativa::PQueue().push_back({d, static_cast<uint64_t>(n), offset, seq, tl_chunk_base, lazy_tex});
+		TexNativa::PQueue().push_back({d, static_cast<uint64_t>(n), offset, seq, tl_chunk_base});
 	}
 	TexNativa::g_pending.store(true, std::memory_order_release);
 	return true;
