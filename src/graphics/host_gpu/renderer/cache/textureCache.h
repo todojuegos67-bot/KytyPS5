@@ -213,7 +213,7 @@ public:
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	// Record deferred DCC state while the original guest dispatch writes the metadata.
-	void               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
+	bool               TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value); // (spec6: cleared a DCC surface)
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t fill_value);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
@@ -298,7 +298,7 @@ private:
 		// pending for the target bind's stencil (bit 0: one-layer surfaces only), and the clears applied (the line's count).
 		uint32_t sample_depth_done = 0;
 		uint64_t sample_clears     = 0;
-		uint8_t  clear_origin      = 0; // (spec5: Spec::t_clear_origin, +4 in a speculation's hole)
+		uint8_t  clear_origin      = 0; // (spec5/6: Spec::ClearOriginNow)
 	};
 
 	struct OverlapResult {

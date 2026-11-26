@@ -621,7 +621,8 @@ static bool ResolveComputePatternFill(const ShaderComputeInputInfo& input, uint3
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
                                                 CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                                uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                                uint64_t* dcc_cleared) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -681,7 +682,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
 		// Track deferred DCC state while the original dispatch writes the metadata allocation.
-		cache.TrackDccFill(descriptor.Base48(), size, packed_clear);
+		if (cache.TrackDccFill(descriptor.Base48(), size, packed_clear) && dcc_cleared != nullptr)
+			*dcc_cleared = descriptor.Base48(); // (spec6)
 		static std::atomic<uint32_t> logged_metadata_clears {0};
 		if (logged_metadata_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: metadata fill shader=0x%016" PRIx64
@@ -1290,8 +1292,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
-	                                                      thread_group_y, thread_group_z, mode)) {
+	if (uint64_t dcc_cleared = 0; indirect_args == 0 && TryConsumeComputeImageClear(input_info, buffer, thread_group_x,
+	                                                                                thread_group_y, thread_group_z, mode,
+	                                                                                &dcc_cleared)) {
+		// (spec6, KYTY_SPECULATE_DCC_PREDICT=1) A DCC fill that cleared its surface: learned as a meta clear, so a
+		// speculation's hole of the same dispatch predicts it (PredictDispatch) instead of its commit stopping.
+		if (dcc_cleared != 0 && Spec::DccPredict()) {
+			const auto write                            = CatalogWrite();
+			m_meta_clears[MetaClearKey(sh_ctx.GetCs())] = dcc_cleared;
+		}
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "image_clear";
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: image clear", use_thread_dimensions);
 		ResetBindings();

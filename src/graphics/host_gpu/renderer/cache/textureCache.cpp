@@ -5511,15 +5511,17 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		image.info.metadata = desc.info.metadata;
 		auto [metadata, inserted] =
 		    m_surface_metas.try_emplace(desc.info.metadata.range.address,
-		                                MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                              .clear_mask = image.info.htile_clear_mask});
+		                                MetaDataInfo {.type         = MetaDataInfo::Type::HTile,
+		                                              .clear_mask   = image.info.htile_clear_mask,
+		                                              .clear_origin = Spec::ClearOriginNow(5)}); // (spec6)
 		MetaFilterAdd(desc.info.metadata.range.address);
 		changed |= inserted;
 		if (!inserted && metadata->second.type != MetaDataInfo::Type::HTile) {
 			// PS5 allocations can reuse DCC storage as HTile while the old color image is cached.
 			// The depth binding defines the new type; incompatible fill state cannot carry over.
-			metadata->second = {.type       = MetaDataInfo::Type::HTile,
-			                    .clear_mask = image.info.htile_clear_mask};
+			metadata->second = {.type         = MetaDataInfo::Type::HTile,
+			                    .clear_mask   = image.info.htile_clear_mask,
+			                    .clear_origin = Spec::ClearOriginNow(5)}; // (spec6)
 			changed          = true;
 		}
 		if (changed) m_meta_epoch.fetch_add(1, std::memory_order_release);
@@ -7976,7 +7978,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	found->second.clear_mask        = UINT32_MAX;
 	found->second.fill_known        = false;
 	found->second.sample_depth_done = 0;
-	found->second.clear_origin      = static_cast<uint8_t>(Spec::t_clear_origin + (Spec::t_effect_source == Spec::EffectSource::Hole ? 4u : 0u));
+	found->second.clear_origin      = Spec::ClearOriginNow(Spec::t_clear_origin);
 	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
 	return true;
 }
@@ -7993,12 +7995,12 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.fill_value        = fill_value;
 	found->second.fill_known        = true;
 	found->second.sample_depth_done = 0;
-	found->second.clear_origin      = static_cast<uint8_t>(Spec::t_clear_origin + (Spec::t_effect_source == Spec::EffectSource::Hole ? 4u : 0u));
+	found->second.clear_origin      = Spec::ClearOriginNow(Spec::t_clear_origin);
 	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	return true;
 }
 
-void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
+bool TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_value) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid DCC fill range\n");
 	}
@@ -8030,7 +8032,9 @@ void TextureCache::TrackDccFill(uint64_t address, uint64_t size, uint32_t fill_v
 		found->second.fill_value = fill_value;
 		found->second.fill_size  = size;
 		found->second.fill_known = true;
+		if (dcc_clear_mask != 0) found->second.clear_origin = Spec::ClearOriginNow(4); // (spec6)
 	}
+	return dcc_clear_mask != 0 && found->second.type == MetaDataInfo::Type::Dcc;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

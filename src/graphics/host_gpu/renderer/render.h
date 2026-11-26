@@ -351,7 +351,8 @@ private:
 	                                                     uint32_t mode, uint64_t& cleared);
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode,
+	                                              uint64_t* dcc_cleared = nullptr); // (spec6)
 
 	// XPR draw capture for the offline replay tests (xpr-capture.h).
 	void CaptureXprDraw(CommandBuffer& buffer, const DrawRenderState& state, const DrawIndexArgs& args);

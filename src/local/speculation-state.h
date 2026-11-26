@@ -468,6 +468,17 @@ inline thread_local State* t_record = nullptr;
 // (spec5) Who clears surface metadata (TextureCache::ClearMeta notes it with the surface): 1 a compute meta clear, 2 a
 // draw's depth clear, 3 a CP fill; 0 other. The commit's "a surface cleared" stop names it.
 inline thread_local uint8_t t_clear_origin = 0;
+// (spec6) The origin noted with the surface: bits 0-2 who (1 compute meta clear, 2 depth clear draw, 3 CP fill, 4 DCC
+// fill of a compute image clear, 5 a depth bind's first metadata record or retype; 0 other), bit 3 in a speculation's hole.
+// (spec6, KYTY_SPECULATE_DCC_PREDICT=1, off by default) A DCC fill of a compute image clear (the AGC toolkit's metadata
+// fill) is learned like a compute meta clear: its dispatch hole predicts its surface cleared (the draws over it are holes).
+[[nodiscard]] inline bool DccPredict() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SPECULATE_DCC_PREDICT");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
 struct ClearOriginScope {
 	uint8_t saved;
 	explicit ClearOriginScope(uint8_t origin) noexcept: saved(t_clear_origin) { t_clear_origin = origin; }
@@ -526,6 +537,9 @@ struct EffectSourceScope {
 	EffectSourceScope& operator=(const EffectSourceScope&) = delete;
 	EffectSource       saved;
 };
+[[nodiscard]] inline uint8_t ClearOriginNow(uint8_t origin) noexcept {
+	return static_cast<uint8_t>((origin & 7u) | (t_effect_source == EffectSource::Hole ? 8u : 0u));
+}
 
 // What the translation of the thread that commits does (the normal translation, holes) that a speculation translated
 // before it must see, in order (each speculation is checked against what was logged since it began): the ranges its

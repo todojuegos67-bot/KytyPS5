@@ -919,12 +919,17 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 
 // (spec5) The commit's "a surface cleared" stop by who cleared it (TextureCache::MetaClearOrigin).
 static const char* ClearedWhy(uint8_t origin) {
-	static constexpr const char* names[8] = {
+	// (spec6: Spec::ClearOriginNow - bit 3 in a hole)
+	static constexpr const char* names[16] = {
 	    "commit: a surface cleared (other)",           "commit: a surface cleared (compute clear)",
 	    "commit: a surface cleared (depth clear draw)", "commit: a surface cleared (CP fill)",
+	    "commit: a surface cleared (DCC fill)",         "commit: a surface cleared (depth bind record)",
+	    "commit: a surface cleared (?6)",               "commit: a surface cleared (?7)",
 	    "commit: a surface cleared (other, in a hole)", "commit: a surface cleared (compute clear, in a hole)",
-	    "commit: a surface cleared (depth clear draw, in a hole)", "commit: a surface cleared (CP fill, in a hole)"};
-	return names[origin & 7u];
+	    "commit: a surface cleared (depth clear draw, in a hole)", "commit: a surface cleared (CP fill, in a hole)",
+	    "commit: a surface cleared (DCC fill, in a hole)", "commit: a surface cleared (depth bind record, in a hole)",
+	    "commit: a surface cleared (?6, in a hole)",   "commit: a surface cleared (?7, in a hole)"};
+	return names[origin & 15u];
 }
 
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
