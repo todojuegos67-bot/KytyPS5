@@ -1176,6 +1176,122 @@ bool WaitDisplayVblank(uint64_t& seen, uint32_t timeout_us) {
 	return true;
 }
 
+namespace {
+// (spirv-sin-cache) KYTY_SPIRV_SIN_CACHE=1 (off by default): the scratch files (the shader prefetch's ~1.6 GB of
+// compressed SPIR-V and its plans, written in the first ~15 s, during the map load) opened with FILE_FLAG_NO_BUFFERING:
+// their pages never enter the Windows file cache (log 11-26 23:50: "cache de archivos" 120 -> 2304 MiB in the first 60
+// s, beside the game's own +2.7 GB). Every transfer goes through an aligned bounce buffer (4 KiB: any sector size up to
+// it); the partial sectors at the edges of a write are read, merged and written back with one lock per process held, so
+// two writes sharing a sector cannot lose each other's bytes. Reads take no lock (the bytes they ask for are written
+// before anyone reads them; a merge rewrites them unchanged). Cost: each read goes to the disk (no cache).
+bool ScratchNoCacheRequested() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SPIRV_SIN_CACHE");
+		const bool  r = v != nullptr && v[0] == '1';
+		std::printf("[spirv-sin-cache] ficheros temporales de shaders sin cache de Windows: %s (KYTY_SPIRV_SIN_CACHE=1 lo enciende)\n",
+		            r ? "ON" : "apagado");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+
+struct ScratchNoCacheSet {
+	std::mutex         mutex; // (the set only: short)
+	std::mutex         merge; // (every edge merge of a write: held over its disk reads and write)
+	std::set<uint64_t> files;
+};
+ScratchNoCacheSet& ScratchNoCache() {
+	static auto* set = new ScratchNoCacheSet; // (never destroyed: files may be closed after static destructors)
+	return *set;
+}
+
+bool IsScratchNoCache(uint64_t file) {
+	if (!ScratchNoCacheRequested()) return false;
+	std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
+	return ScratchNoCache().files.count(file) != 0;
+}
+
+constexpr uint64_t ScratchSector = 4096;
+
+// Aligned [begin, end) read into `buffer` (aligned); bytes past the end of the file are zero.
+bool ScratchAlignedRead(HANDLE file, uint64_t begin, uint8_t* buffer, uint64_t size) {
+	std::memset(buffer, 0, size);
+	uint64_t at = 0;
+	while (at < size) {
+		OVERLAPPED o {};
+		o.Offset          = static_cast<DWORD>(begin + at);
+		o.OffsetHigh      = static_cast<DWORD>((begin + at) >> 32u);
+		DWORD      done   = 0;
+		const auto length = static_cast<DWORD>(std::min<uint64_t>(size - at, uint64_t {1} << 30u));
+		if (ReadFile(file, buffer + at, length, &done, &o) == 0) {
+			if (GetLastError() == ERROR_HANDLE_EOF) return true;
+			return false;
+		}
+		if (done == 0) return true; // (end of the file)
+		at += done;
+	}
+	return true;
+}
+
+bool ScratchAlignedWrite(HANDLE file, uint64_t begin, const uint8_t* buffer, uint64_t size) {
+	uint64_t at = 0;
+	while (at < size) {
+		OVERLAPPED o {};
+		o.Offset          = static_cast<DWORD>(begin + at);
+		o.OffsetHigh      = static_cast<DWORD>((begin + at) >> 32u);
+		DWORD      done   = 0;
+		const auto length = static_cast<DWORD>(std::min<uint64_t>(size - at, uint64_t {1} << 30u));
+		if (WriteFile(file, buffer + at, length, &done, &o) == 0 || done == 0) return false;
+		at += done;
+	}
+	return true;
+}
+
+struct ScratchBounce {
+	uint8_t* data = nullptr;
+	explicit ScratchBounce(uint64_t size) {
+		data = static_cast<uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	}
+	~ScratchBounce() {
+		if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+	}
+	ScratchBounce(const ScratchBounce&)            = delete;
+	ScratchBounce& operator=(const ScratchBounce&) = delete;
+};
+
+bool ScratchNoCacheRead(uint64_t file, uint64_t offset, void* data, size_t size) {
+	if (size == 0) return true;
+	const uint64_t begin = offset & ~(ScratchSector - 1);
+	const uint64_t end   = (offset + size + ScratchSector - 1) & ~(ScratchSector - 1);
+	ScratchBounce  bounce(end - begin);
+	if (bounce.data == nullptr || !ScratchAlignedRead(reinterpret_cast<HANDLE>(file), begin, bounce.data, end - begin)) return false;
+	std::memcpy(data, bounce.data + (offset - begin), size);
+	return true;
+}
+
+bool ScratchNoCacheWrite(uint64_t file, uint64_t offset, const void* data, size_t size) {
+	if (size == 0) return true;
+	const auto     handle = reinterpret_cast<HANDLE>(file);
+	const uint64_t begin  = offset & ~(ScratchSector - 1);
+	const uint64_t end    = (offset + size + ScratchSector - 1) & ~(ScratchSector - 1);
+	ScratchBounce  bounce(end - begin);
+	if (bounce.data == nullptr) return false;
+	const bool head = offset != begin, tail = offset + size != end;
+	if (!head && !tail) {
+		std::memcpy(bounce.data, data, size);
+		return ScratchAlignedWrite(handle, begin, bounce.data, end - begin);
+	}
+	std::lock_guard<std::mutex> lock(ScratchNoCache().merge);
+	if (head && !ScratchAlignedRead(handle, begin, bounce.data, ScratchSector)) return false;
+	if (tail && (end - ScratchSector != begin || !head) &&
+	    !ScratchAlignedRead(handle, end - ScratchSector, bounce.data + (end - ScratchSector - begin), ScratchSector))
+		return false;
+	std::memcpy(bounce.data + (offset - begin), data, size);
+	return ScratchAlignedWrite(handle, begin, bounce.data, end - begin);
+}
+} // namespace
+
 uint64_t OpenScratchFile() {
 	wchar_t directory[MAX_PATH + 1] {}, path[MAX_PATH + 1] {};
 	if (GetTempPathW(MAX_PATH + 1, directory) == 0 || GetTempFileNameW(directory, L"kyt", 0, path) == 0) return 0;
@@ -1188,12 +1304,18 @@ uint64_t OpenScratchFile() {
 		const char* value = std::getenv("KYTY_SCRATCH_IN_MEMORY");
 		return value != nullptr && *value != '\0' && *value != '0';
 	}();
+	const bool no_cache = !in_memory && ScratchNoCacheRequested();
 	HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-	                          (in_memory ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL) | FILE_FLAG_DELETE_ON_CLOSE,
+	                          (in_memory ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL) | FILE_FLAG_DELETE_ON_CLOSE |
+	                              (no_cache ? FILE_FLAG_NO_BUFFERING : 0u),
 	                          nullptr);
 	if (file == INVALID_HANDLE_VALUE) {
 		(void)DeleteFileW(path);
 		return 0;
+	}
+	if (no_cache) {
+		std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
+		ScratchNoCache().files.insert(reinterpret_cast<uint64_t>(file));
 	}
 	return reinterpret_cast<uint64_t>(file);
 }
@@ -1216,14 +1338,20 @@ static bool ScratchTransfer(uint64_t file, uint64_t offset, Byte* data, size_t s
 }
 
 bool WriteScratchFile(uint64_t file, uint64_t offset, const void* data, size_t size) {
+	if (file != 0 && IsScratchNoCache(file)) return ScratchNoCacheWrite(file, offset, data, size);
 	return file != 0 && ScratchTransfer(file, offset, static_cast<const uint8_t*>(data), size, WriteFile);
 }
 
 bool ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size) {
+	if (file != 0 && IsScratchNoCache(file)) return ScratchNoCacheRead(file, offset, data, size);
 	return file != 0 && ScratchTransfer(file, offset, static_cast<uint8_t*>(data), size, ReadFile);
 }
 
 void CloseScratchFile(uint64_t file) {
+	if (file != 0 && ScratchNoCacheRequested()) {
+		std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
+		ScratchNoCache().files.erase(file);
+	}
 	if (file != 0) CloseHandle(reinterpret_cast<HANDLE>(file));
 }
 
