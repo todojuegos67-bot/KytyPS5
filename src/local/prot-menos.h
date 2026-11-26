@@ -115,6 +115,9 @@ inline std::atomic<uint64_t> g_gate_skip {0}; // (V7) lazy checks skipped: no cl
 inline std::atomic<uint64_t> g_bda_lazy {0};  // (V7) BDA prepares that ran the lazy check
 inline std::atomic<uint64_t> g_banned {0};    // (V7) regions demoted whole for not paying
 inline std::atomic<uint64_t> g_other_thread {0}; // (V7) lazy HotSteps done off the GPU thread
+inline std::atomic<uint64_t> g_recheck {0};     // (PROT-MENOS8) write-watch re-reads of a query's clean hot pages
+inline std::atomic<uint64_t> g_recheck_hit {0}; // (PROT-MENOS8) pages they found written (missed before: stale)
+inline std::atomic<uint64_t> g_nopromo {0};     // (PROT-MENOS8) promotions refused: page demoted < 10-20 s ago
 
 [[nodiscard]] inline uint64_t NowMs() noexcept {
 	return static_cast<uint64_t>(
@@ -231,7 +234,7 @@ inline void Release(int64_t pages) noexcept { g_hot_pages.fetch_sub(pages, std::
 // (PROT-MENOS4) One thread (HotRedirty, GPU thread). Every 5 s, independent of the write audit.
 inline void Report() noexcept {
 	struct Snap {
-		uint64_t frames, calls, redirty_us, step_us, ww, peek, pages, cpu_writes, promoted, demoted, kept, late, failed, unchanged, scans, lazy, lazy_ns, skip, other, bda, banned;
+		uint64_t frames, calls, redirty_us, step_us, ww, peek, pages, cpu_writes, promoted, demoted, kept, late, failed, unchanged, scans, lazy, lazy_ns, skip, other, bda, banned, recheck, rhit, nopromo;
 	};
 	static uint64_t last_ms = 0;
 	static Snap     last {};
@@ -245,14 +248,14 @@ inline void Report() noexcept {
 	const Snap cur {ld(g_frames), ld(g_hot_calls), ld(g_redirty_us), ld(g_step_us), ld(g_ww_calls), ld(g_peek_calls),
 	                ld(g_redirty_pages), ld(g_cpu_writes), ld(g_promoted), ld(g_demoted), ld(g_kept), ld(g_ww_late),
 	                ld(g_ww_failed), ld(g_ww_unchanged), ld(g_scans), ld(g_lazy_calls), ld(g_lazy_ns), ld(g_gate_skip),
-	                ld(g_other_thread), ld(g_bda_lazy), ld(g_banned)};
+	                ld(g_other_thread), ld(g_bda_lazy), ld(g_banned), ld(g_recheck), ld(g_recheck_hit), ld(g_nopromo)};
 	const double secs   = static_cast<double>(now - last_ms) / 1000.0;
 	const double frames = cur.frames > last.frames ? static_cast<double>(cur.frames - last.frames) : 1.0;
 	const auto   pf     = [&](uint64_t a, uint64_t b) { return static_cast<double>(a - b) / frames; };
 	std::printf("[prot-menos] %.1f s: %.0f frames, envios/frame %.1f, HotRedirty %.0f us/frame (HotStep %.0f), GetWriteWatch "
 	            "%.1f/frame (lecturas %.1f + reset %.1f, fallidas %llu), calientes %lld pag (%.1f MiB, %zu regiones), "
 	            "resubido %.2f MiB/frame, sin escribir %.0f pag/frame, fallos escritura CPU %.0f/s, promovidas %llu, "
-	            "degradadas %llu, mantenidas %llu, tardias %llu, ww=%d, lecturas completas/frame %.1f (gap %llu us), perezosas %.1f/frame %.0f us/frame (lazy=%d); v7=%d: saltadas por rango %.1f/frame, fuera del hilo GPU %.1f/frame, BDA %.1f/frame, regiones sin beneficio %llu\n",
+	            "degradadas %llu, mantenidas %llu, tardias %llu, ww=%d, lecturas completas/frame %.1f (gap %llu us), perezosas %.1f/frame %.0f us/frame (lazy=%d); v7=%d: saltadas por rango %.1f/frame, fuera del hilo GPU %.1f/frame, BDA %.1f/frame, regiones sin beneficio %llu; v8: relecturas %.1f/frame (paginas escritas halladas %llu), re-promociones evitadas %llu\n",
 	            secs, frames, pf(cur.calls, last.calls), pf(cur.redirty_us, last.redirty_us), pf(cur.step_us, last.step_us),
 	            pf(cur.ww + cur.peek, last.ww + last.peek), pf(cur.peek, last.peek), pf(cur.ww, last.ww),
 	            static_cast<unsigned long long>(cur.failed - last.failed),
@@ -265,7 +268,8 @@ inline void Report() noexcept {
 	            static_cast<unsigned long long>(cur.late - last.late), WatchOn() ? 1 : 0,
 	            pf(cur.scans, last.scans), static_cast<unsigned long long>(GapUs()), pf(cur.lazy, last.lazy),
 	            pf(cur.lazy_ns, last.lazy_ns) / 1000.0, LazyOn() ? 1 : 0, V7() ? 1 : 0, pf(cur.skip, last.skip),
-	            pf(cur.other, last.other), pf(cur.bda, last.bda), static_cast<unsigned long long>(cur.banned - last.banned));
+	            pf(cur.other, last.other), pf(cur.bda, last.bda), static_cast<unsigned long long>(cur.banned - last.banned), pf(cur.recheck, last.recheck),
+	            static_cast<unsigned long long>(cur.rhit - last.rhit), static_cast<unsigned long long>(cur.nopromo - last.nopromo));
 	if (const char* v = std::getenv("KYTY_PROT_MENOS_V7"); v != nullptr && v[0] == '2')
 		std::printf("[prot-menos] COMPROBACION (V7=2): usos con datos viejos %llu desde el arranque (paginas sin vigilancia y "
 		            "calientes, muestreo 1/64; tiene que ser 0)\n",

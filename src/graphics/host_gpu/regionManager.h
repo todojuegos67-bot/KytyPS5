@@ -400,6 +400,57 @@ public:
 		m_nosplit.Unset(start);
 		return true;
 	}
+	// (PROT-MENOS8, region lock held) The clean hot pages of [first, last) (not no-watch, not native: as HotStep) whose
+	// write watch says written since the last read become CPU-dirty. One peek over their span; a reset only on a hit.
+	size_t HotRecheck(size_t first, size_t last, uint64_t now_ms) {
+		RegionBits want(m_hot & ~m_gpu_dirty, first, last);
+		want &= ~m_cpu_dirty;
+		want &= ~m_nowatch;
+		want &= ~m_native;
+		if (want.None()) return 0;
+		size_t lo = TRACKER_REGION_PAGES, hi = 0;
+		for (const auto [a, b]: want) {
+			if (a < lo) lo = a;
+			if (b > hi) hi = b;
+		}
+		thread_local uint64_t peek[TRACKER_REGION_PAGES];
+		bool                  failed = false;
+		const uint64_t        count  = ::Libs::LibKernel::Memory::NativePeekWritten(
+            m_cpu_addr + lo * TRACKER_PAGE_SIZE, (hi - lo) * TRACKER_PAGE_SIZE, peek, TRACKER_REGION_PAGES, &failed);
+		ProtMenos::g_peek_calls.fetch_add(1, std::memory_order_relaxed);
+		ProtMenos::g_recheck.fetch_add(1, std::memory_order_relaxed);
+		m_bn_calls++;
+		RegionBits add;
+		if (failed || count > TRACKER_REGION_PAGES) {
+			for (const auto [a, b]: want) TakeHotWritten(a, b, want, add);
+		} else if (count != 0) {
+			RegionBits hit;
+			for (uint64_t i = 0; i < count; ++i) {
+				if (peek[i] < m_cpu_addr) continue;
+				const auto page = static_cast<size_t>((peek[i] - m_cpu_addr) / TRACKER_PAGE_SIZE);
+				if (page >= lo && page < hi && want.Get(page) && !hit.Get(page)) hit.Set(page);
+			}
+			for (const auto [a, b]: hit) TakeHotWritten(a, b, want, add);
+		}
+		if (add.None()) return 0;
+		{
+			RegionBits w = add & ~m_hot_written;
+			m_hot_written ^= w; // (an OR)
+		}
+		m_bn_events += add.Count();
+		{
+			RegionBits& sub = HotSub(now_ms);
+			RegionBits  w   = add & ~sub;
+			sub ^= w; // (an OR)
+		}
+		const size_t pages = add.Count();
+		ProtMenos::g_recheck_hit.fetch_add(pages, std::memory_order_relaxed);
+		m_cpu_dirty ^= add; // (disjoint: an OR)
+		m_cpu_epoch.fetch_add(1, std::memory_order_release);
+		m_last_dirty.store(NextCpuDirtyClock(), std::memory_order_release);
+		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
+		return pages;
+	}
 	// (Region lock held.) The range is no tracked memory any more (MemoryTracker::UntrackMemory made it CPU-dirty and
 	// unwatched): its pages forget the policy's state.
 	void ForgetNoWatch(uint64_t offset, uint64_t size) {
@@ -583,6 +634,16 @@ public:
 				m_hot ^= drop;
 				ProtMenos::Release(static_cast<int64_t>(n));
 				ProtMenos::g_demoted.fetch_add(n, std::memory_order_relaxed);
+				if (ProtMenos::V7()) { // (PROT-MENOS8) no re-promotion for 1-2 kBanMs epochs
+					const uint64_t ep = now_ms / ProtMenos::kBanMs;
+					const auto     i  = static_cast<size_t>(ep % 2u);
+					if (m_np_ep[i] != ep) {
+						m_np[i].Clear();
+						m_np_ep[i] = ep;
+					}
+					RegionBits w = drop & ~m_np[i];
+					m_np[i] ^= w; // (an OR)
+				}
 				if (watch) pages += DemoteClean(drop); // (PROT-MENOS2)
 			}
 			m_hot_since.store(now_ms, std::memory_order_relaxed);
@@ -597,10 +658,25 @@ public:
 	void HotLazy(uint64_t gen, uint64_t offset = 0, uint64_t bytes = TRACKER_REGION_SIZE) {
 		if (!m_has_hot.load(std::memory_order_acquire)) return;
 		if (!m_hot_clean.load(std::memory_order_acquire)) return; // (every hot page dirty already: uploaded as dirty)
-		if (m_hot_gen.load(std::memory_order_relaxed) == gen) return;
+		const bool v7 = ProtMenos::V7() && ProtMenos::WatchOn();
+		if (!v7 && m_hot_gen.load(std::memory_order_relaxed) == gen) return;
 		const auto       s0 = std::chrono::steady_clock::now();
 		std::scoped_lock guard(lock);
-		if (m_hot_gen.load(std::memory_order_relaxed) == gen) return;
+		if (!v7 && m_hot_gen.load(std::memory_order_relaxed) == gen) return;
+		// (PROT-MENOS8) Already read for this submission: before, nothing more until the next one, so a game write to a
+		// clean hot page AFTER that read (or to one an upload of this same submission made clean) went unseen by the
+		// later queries of the submission (log 20261127-004742-367, V7=2: 3 stale uses). A write-protected page faults
+		// at once; to match, the query's own clean hot pages have their write watch read again (one call, only them).
+		if (v7 && m_hot_gen.load(std::memory_order_relaxed) == gen) {
+			const size_t first = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+			size_t       last  = static_cast<size_t>((offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+			if (last > TRACKER_REGION_PAGES) last = TRACKER_REGION_PAGES;
+			if (first < last) {
+				const size_t pages = HotRecheck(first, last, ProtMenos::NowMs());
+				if (pages != 0) ProtMenos::g_redirty_pages.fetch_add(pages, std::memory_order_relaxed);
+			}
+			return;
+		}
 		if (ProtMenos::V7() && bytes != 0) {
 			const size_t first = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
 			size_t       last  = static_cast<size_t>((offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
@@ -650,10 +726,26 @@ private:
 			m_seen.Clear();
 			m_seen_window = window;
 		}
-		const RegionBits promote = prot & m_seen;
+		const RegionBits promote_all = prot & m_seen;
 		m_seen ^= prot & ~m_seen; // (an OR)
-		if (promote.None()) return;
+		if (promote_all.None()) return;
 		if (ProtMenos::V7() && now < m_hot_ban_until) return; // (PROT-MENOS7: did not pay; normal watch for kBanMs)
+		// (PROT-MENOS8) A page demoted in this or the previous kBanMs epoch is not promoted again (log 004742: promoted
+		// ~= demoted, 11K per 5 s: pages written ~1/s promoted, dropped by the 2-of-4 rule, promoted again).
+		RegionBits promote = promote_all;
+		if (ProtMenos::V7()) {
+			const uint64_t ep = now / ProtMenos::kBanMs;
+			for (int i = 0; i < 2; ++i) {
+				if (m_np_ep[i] + 2 > ep && m_np_ep[i] <= ep) {
+					RegionBits blocked = promote & m_np[i];
+					if (!blocked.None()) {
+						ProtMenos::g_nopromo.fetch_add(blocked.Count(), std::memory_order_relaxed);
+						promote &= ~m_np[i];
+					}
+				}
+			}
+			if (promote.None()) return;
+		}
 		const auto want = static_cast<int64_t>(promote.Count());
 		if (!m_hot_listed) {
 			m_hot_listed = ProtMenos::ListRegion(this);
@@ -930,6 +1022,8 @@ private:
 	// (PROT-MENOS7) Benefit of the region's hot pages since the last demotion pass, ban, sustained-writer bits.
 	uint64_t   m_bn_events = 0, m_bn_calls = 0, m_hot_ban_until = 0;
 	RegionBits m_hot_new; // (promoted since the last demotion pass)
+	RegionBits m_np[2];   // (PROT-MENOS8: demoted in kBanMs epoch m_np_ep[i], i = epoch % 2: not promoted again)
+	uint64_t   m_np_ep[2] {~0ull, ~0ull};
 	RegionBits m_hw[4];   // (hot pages found written in the 500 ms sub-window m_hw_win[i], i = window % 4)
 	uint64_t   m_hw_win[4] {};
 	RegionBits& HotSub(uint64_t now_ms) {
