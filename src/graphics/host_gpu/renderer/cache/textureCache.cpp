@@ -7281,17 +7281,6 @@ int TextureCache::DirectUploadRange(uint64_t address, uint64_t size, uint64_t /*
 
 void TextureCache::NativeGuardDirty(Image& image) {
 	NativeApplyPending(image); // (11-25) los trozos de su rango que aun esperan en el anillo, antes de usarla
-	// (AGUA) Imagen NO nativa (otro formato/forma/vista sobre la memoria de una CTexture nativa) que se va a subir de la RAM:
-	// los bytes "solo en la GPU" no estan en la RAM (soltada: ceros o basura). Antes de subirla, la imagen nativa devuelve
-	// esos bytes a la RAM (NativeRestoreBeforeDelete, sin borrarla; keep_on_fail: si no se puede, nada cambia).
-	if (TexNativa::On() && image.IsCpuDirty() && !SparseIsPerLevel(image.backing) &&
-	    TexNativa::AnyOwned(image.info.data.address, image.info.data.End())) {
-		for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
-			auto* o = m_slot_images.try_get(other);
-			if (o == nullptr || o == &image || !o->registered || !SparseIsPerLevel(o->backing)) continue;
-			(void)NativeRestoreBeforeDelete(*o, true);
-		}
-	}
 	// (NEGRAS-LOG a) Imagen no nativa sobre bytes "solo en la GPU": se sube de la RAM soltada (ceros).
 	if (TexNativa::NegrasLog() && TexNativa::On() && image.IsCpuDirty() && !SparseIsPerLevel(image.backing) &&
 	    TexNativa::AnyOwned(image.info.data.address, image.info.data.End())) {
