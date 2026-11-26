@@ -365,13 +365,13 @@ void Audio::CloseSdlDevice(PortOut* port) {
 // A 7.1 (or 7.1.4) port on a stereo device is downmixed here: the front pair at full level, the
 // centre, surrounds and heights at -3 dB, the LFE left out (the usual downmix). SDL's own matrix keeps
 // even all eight channels at full scale unclipped, so it plays the front pair at 0.21 (-13.5 dB).
-// (11-26) Volumen extra del port: KYTY_AUDIO_GANANCIA_DB (por defecto +6 dB; 0 = como antes; de -12 a +12) con un
+// (11-26) Volumen extra del port: KYTY_AUDIO_GANANCIA_DB (por defecto 0 dB = como antes; de -12 a +12) con un
 // limitador suave: por debajo de 0,7 el sonido pasa tal cual (x ganancia); por encima se curva hacia 1,0 sin recortar,
 // para que los golpes fuertes no se rajen. Solo en la salida mezclada a 2 canales y en la de coma flotante.
 static float AudioGain() {
 	static const float gain = [] {
 		const char* v  = std::getenv("KYTY_AUDIO_GANANCIA_DB");
-		const float db = (v != nullptr && *v != '\0') ? std::clamp(static_cast<float>(std::atof(v)), -12.0f, 12.0f) : 6.0f;
+		const float db = (v != nullptr && *v != '\0') ? std::clamp(static_cast<float>(std::atof(v)), -12.0f, 12.0f) : 0.0f;
 		const float g  = std::pow(10.0f, db / 20.0f);
 		std::printf("[audio-ganancia] KYTY_AUDIO_GANANCIA_DB=%.1f: volumen x%.2f con limitador suave (0 = como antes)\n", db, g);
 		std::fflush(stdout);
@@ -792,6 +792,42 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	if (Libs::VideoOut::IntroHidden() && queue_size > 0) {
 		if (hush.size() < queue_size) hush.assign(queue_size, 0);
 		queue_data = hush.data();
+	}
+	// (11-26 audiodiag) Lo que de verdad se entrega a Windows en los puertos principales (tipo 0), cada 5 s: pico y
+	// RMS ya con el volumen del puerto y la ganancia, el volumen que el juego puso en el puerto, si el silencio de la
+	// intro estaba activo, el estado del dispositivo SDL y lo encolado. Solo mide, no cambia nada.
+	if (port->type == 0 && queue_size > 0) {
+		static std::atomic<uint64_t> diag_last {0};
+		thread_local double          d_sum = 0.0;
+		thread_local uint64_t        d_n   = 0;
+		thread_local float           d_pk  = 0.0f;
+		thread_local uint32_t        d_hush = 0, d_blocks = 0;
+		if (FormatIsFloat(port->format)) {
+			const auto* f = static_cast<const float*>(queue_data);
+			const size_t n = queue_size / sizeof(float);
+			for (size_t i = 0; i < n; i += 4) {
+				const float v = f[i] < 0 ? -f[i] : f[i];
+				d_pk = v > d_pk ? v : d_pk;
+				d_sum += static_cast<double>(f[i]) * f[i];
+				d_n++;
+			}
+		}
+		d_blocks++;
+		if (queue_data != data && Libs::VideoOut::IntroHidden()) d_hush++;
+		const uint64_t t = now;
+		uint64_t       last = diag_last.load(std::memory_order_relaxed);
+		if (last == 0) diag_last.store(t, std::memory_order_relaxed);
+		else if (t - last >= 5000000 && diag_last.compare_exchange_strong(last, t)) {
+			const char* st = SDL_GetAudioDeviceStatus(port->audio_device) == SDL_AUDIO_PLAYING ? "playing"
+			                 : SDL_GetAudioDeviceStatus(port->audio_device) == SDL_AUDIO_PAUSED  ? "PAUSED" : "STOPPED";
+			std::printf("[audiodiag] puerto principal: entregado a Windows pico %.3f rms %.4f; volumen del juego en el puerto %d %d "
+			            "(32768 = 100%%); silencio de intro %u/%u bloques; SDL %s; encolado %u bytes\n",
+			            static_cast<double>(d_pk), d_n ? std::sqrt(d_sum / static_cast<double>(d_n)) : 0.0,
+			            static_cast<int>(port->volume[0]), static_cast<int>(port->volume[1]), d_hush, d_blocks, st,
+			            static_cast<unsigned>(SDL_GetQueuedAudioSize(port->audio_device)));
+			std::fflush(stdout);
+			d_sum = 0.0; d_n = 0; d_pk = 0.0f; d_hush = 0; d_blocks = 0;
+		}
 	}
 	if (SDL_QueueAudio(port->audio_device, queue_data, queue_size) < 0) {
 		LOGF("AudioOut: SDL_QueueAudio failed: %s\n", SDL_GetError());
