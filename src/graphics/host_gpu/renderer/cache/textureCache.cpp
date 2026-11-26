@@ -7294,7 +7294,10 @@ static void NativeDropRam(uint64_t address, uint64_t end) {
 	if (native_memory) {
 		// Privada, una sola direccion (memoria nativa: sin alias). Reset + fuera del working set, un MiB cada vez.
 		uint64_t refused = 0;
-		const uint64_t done = LibKernel::Memory::NativeOffloadDrop(b, e - b, &refused);
+		// (tex-decommit) Primero MEM_DECOMMIT (baja la memoria privada comprometida); el resto, MEM_RESET como antes.
+		const uint64_t dec  = LibKernel::Memory::NativeOffloadDecommit(b, e - b);
+		TexNativa::c_decommit_bytes.fetch_add(dec, std::memory_order_relaxed);
+		const uint64_t done = dec + LibKernel::Memory::NativeOffloadDrop(b, e - b, &refused);
 		TexNativa::c_soltado_bytes.fetch_add(done, std::memory_order_relaxed);
 		TexNativa::c_soltado_fallo.fetch_add(refused, std::memory_order_relaxed);
 		// (11-25d) Lo que NativeOffloadDrop no toco ni rechazo no estaba comprometido (KYTY_COMMIT_REAL: se compromete al

@@ -243,6 +243,7 @@ inline std::atomic<uint64_t> c_soltado_bytes {0}, c_soltado_fallo {0};
 // se compromete al tocarla, y el trozo directo no la toca nunca: esa RAM no llego a usarse (log 075201: "soltada 0 MB,
 // rechazadas 0 MB" con 1053 MB directos = NativeOffloadDrop no encontro nada comprometido que soltar).
 inline std::atomic<uint64_t> c_sin_commit_bytes {0};
+inline std::atomic<uint64_t> c_decommit_bytes {0}; // (tex-decommit) MEM_DECOMMIT: compromiso privado devuelto (acumulado)
 // (11-25d) Imagenes con bytes "solo en la GPU" borradas/aparcadas desde el grabador: recuperadas despues (textureCache.cpp).
 inline std::atomic<uint64_t> c_later_n {0}, c_later_ok {0};
 
@@ -586,9 +587,10 @@ inline void MaybeLog() {
 	            static_cast<unsigned long long>(c_liberada_alias.load() >> 20u),
 	            static_cast<unsigned long long>(c_later_n.load()), static_cast<unsigned long long>(c_later_ok.load()));
 	std::printf("[tex-nativa] RAM real soltada (paginas de texturas solo en la GPU devueltas a Windows) %llu MB; rechazadas %llu MB; "
-	            "nunca comprometidas (KYTY_COMMIT_REAL: el trozo directo no las toco, RAM que no llego a usarse) %llu MB\n",
+	            "nunca comprometidas (KYTY_COMMIT_REAL: el trozo directo no las toco, RAM que no llego a usarse) %llu MB; de ello descomprometidas (MEM_DECOMMIT, KYTY_TEX_NATIVA_DECOMMIT) %llu MB\n",
 	            static_cast<unsigned long long>(c_soltado_bytes.load() >> 20u), static_cast<unsigned long long>(c_soltado_fallo.load() >> 20u),
-	            static_cast<unsigned long long>(c_sin_commit_bytes.load() >> 20u));
+	            static_cast<unsigned long long>(c_sin_commit_bytes.load() >> 20u),
+	            static_cast<unsigned long long>(c_decommit_bytes.load() >> 20u));
 	std::printf("[tex-nativa] gancho de free 0x802f90 %s: bloques solo-GPU liberados por el juego %llu (%llu MB, sacados del registro antes de que escriba)\n",
 	            g_free_hook_ok.load() ? "instalado" : "NO instalado", static_cast<unsigned long long>(c_free_hits.load()),
 	            static_cast<unsigned long long>(c_free_bytes.load() >> 20u));

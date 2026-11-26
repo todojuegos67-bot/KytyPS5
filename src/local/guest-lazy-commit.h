@@ -120,10 +120,24 @@ inline bool CommitRealRequested() {
 	return on;
 }
 
+// (tex-decommit) KYTY_TEX_NATIVA_DECOMMIT (por defecto encendido con KYTY_TEX_NATIVA=1; =0 lo apaga): las paginas de
+// texturas servidas solo desde la VRAM (TexNativa "solo en la GPU") se descomprometen (MEM_DECOMMIT) en vez de MEM_RESET,
+// y la memoria del juego pasa a comprometerse al tocarla (este modulo): el trozo directo nunca toca la RAM, asi sus
+// paginas no llegan a comprometerse. Cualquier toque posterior lo cubre el manejador (pagina a cero, como MEM_RESET).
+inline bool TexDecommitRequested() {
+	static const bool on = [] {
+		const char* t = std::getenv("KYTY_TEX_NATIVA");
+		const char* v = std::getenv("KYTY_TEX_NATIVA_DECOMMIT");
+		const bool  tex = t != nullptr && t[0] == '1';
+		return tex && (v == nullptr || v[0] != '0');
+	}();
+	return on;
+}
+
 inline bool Requested() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_COMMIT_AL_TOCAR");
-		return (v != nullptr && v[0] == '1') || CommitRealRequested();
+		return (v != nullptr && v[0] == '1') || CommitRealRequested() || TexDecommitRequested();
 	}();
 	return on;
 }
@@ -208,7 +222,7 @@ inline uint64_t CommittedBytes(uint64_t begin, uint64_t end) {
 //    it), so no tracker ever sees a protection it did not set.
 // Called under the game's allocator lock (the block checked free). Returns the bytes decommitted; *rest: the bytes
 // committed but left to MEM_RESET.
-inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest) {
+inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest, bool texture = false) {
 	*rest       = 0;
 	auto& state = Get();
 	// (KYTY_FRAME_NATIVO2 on: arenas imported into Vulkan as host memory; nothing decommitted then, MEM_RESET as before.)
@@ -216,7 +230,9 @@ inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest) {
 		const char* v = std::getenv("KYTY_FRAME_NATIVO2");
 		return v != nullptr && v[0] != '\0' && v[0] != '0';
 	}();
-	if (imports || !CommitRealRequested() || !state.enabled.load(std::memory_order_relaxed) || size == 0) return 0;
+	if (imports || !(CommitRealRequested() || (texture && TexDecommitRequested())) || !state.enabled.load(std::memory_order_relaxed) ||
+	    size == 0)
+		return 0;
 	const uint64_t end  = vaddr + size;
 	uint64_t       done = 0;
 	AcquireSRWLockExclusive(&state.lock);

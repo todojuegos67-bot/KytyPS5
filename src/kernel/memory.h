@@ -167,6 +167,8 @@ void                   NativeForgetWrites(uint64_t vaddr, uint64_t size);
 // page-file or compression copy kept; commit unchanged) and taken out of the working set, a MiB at a time with the
 // guest memory quiet (RunQuietWith, as KYTY_DS_FREED_RELEASE). Returns the bytes reset; *refused: those not reset.
 uint64_t               NativeOffloadDrop(uint64_t vaddr, uint64_t size, uint64_t* refused);
+// (tex-decommit, KYTY_TEX_NATIVA_DECOMMIT) MEM_DECOMMIT de las paginas de [vaddr, vaddr + size) (bytes descomprometidos).
+uint64_t               NativeOffloadDecommit(uint64_t vaddr, uint64_t size);
 // NativeOffloadWrite: `data` written over guest [vaddr, vaddr + size) whatever its pages' protection, through a write
 // window (NativeGuardedAccess, as the emulator's other writes; no map lock taken). False: a part was not written.
 bool                   NativeOffloadWrite(uint64_t vaddr, const void* data, uint64_t size);
