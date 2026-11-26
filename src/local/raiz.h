@@ -242,6 +242,31 @@ inline std::atomic<uint64_t> g_rel_pending_pages {0}; // gauge: marked, not appl
 	return on;
 }
 
+// ---- (ESCRITURA-DIFERIDA) KYTY_ESCRITURA_DIFERIDA=1 (apagado por defecto; sin ella todo igual) ------------------------
+// Log 20261126-054643-285 (Boletaria, [raiz] PROTECT BY ORIGIN): el hilo de render hace 240 "write-release" por frame
+// (681 paginas, 0.82 ms/frame; 303 cambios y 1.79 ms en total): paginas que pasan a CPU-modificadas (devoluciones de la
+// GPU, descartes, lecturas de vuelta para escribir) pierden su vigilante de escritura y el hilo de render llama a
+// VirtualProtect para hacerlas escribibles. Es una SUBIDA de permisos (sin IPI que importe): dejarla para despues solo
+// deja la pagina mas protegida un rato. Con esto esas subidas siguen el mismo camino que las lecturas de raiz8
+// (DeferRelease): el hilo de render solo marca la pagina; la aplica el hilo de liberacion, el hilo del juego que
+// esperaba esa devolucion (ApplyDeferredReleases) o un fault en la pagina (HandleFault, lo primero). Las escrituras del
+// kernel sin fault (lectura de archivo directa, PrepareHostOverwrite / InvalidateMemoryForWrite) aplican antes las
+// marcas de su rango. Necesita KYTY_RAIZ_ASYNC_RELEASE (encendido por defecto).
+[[nodiscard]] inline bool WriteReleaseDeferOn() noexcept {
+	static const bool on = [] {
+		const char* v   = std::getenv("KYTY_ESCRITURA_DIFERIDA");
+		const bool  set = v != nullptr && v[0] == '1' && AsyncReleaseOn();
+		std::printf("[escritura-diferida] KYTY_ESCRITURA_DIFERIDA=%s: %s\n", v == nullptr ? "(no puesta)" : v,
+		            set ? "ENCENDIDO: las subidas a escribible del hilo de render (write-release) las aplica el hilo de "
+		                  "liberacion / el hilo del juego / un fault"
+		                : "apagado (como antes)");
+		std::fflush(stdout);
+		return set;
+	}();
+	return on;
+}
+inline std::atomic<uint64_t> g_wrel_deferred_runs {0}, g_wrel_deferred_pages {0}, g_wrel_kernel_applies {0};
+
 // ---- (raiz9) What a protection change of guest memory costs, by thread class ---------------------------------------
 // 20261116-034739 (raiz8) against the old memory (203605, 215649) at the same load: the upload worker's protection jobs
 // (upload_call_us) 2.3-3.2 ms/frame against 1.0-1.3 for about as many re-armed pages (reprotect_pages 14-19 k/frame both),
@@ -762,6 +787,15 @@ inline void Report(uint64_t write_faults, uint64_t window_faults, uint64_t read_
 			prev_a[0][a] = runs;
 			prev_a[1][a] = pages;
 			prev_a[2][a] = us;
+		}
+		if (WriteReleaseDeferOn()) { // (ESCRITURA-DIFERIDA)
+			static uint64_t prev_w[3] = {};
+			const uint64_t  w[3]      = {g_wrel_deferred_runs.load(), g_wrel_deferred_pages.load(), g_wrel_kernel_applies.load()};
+			std::printf(" [ESCRITURA-DIFERIDA: de ellas write-release %.1f/frame (%.0f pages/frame); aplicadas antes de "
+			            "escrituras del kernel %.0f/s]",
+			            static_cast<double>(w[0] - prev_w[0]) / frames, static_cast<double>(w[1] - prev_w[1]) / frames,
+			            static_cast<double>(w[2] - prev_w[2]) * ps);
+			for (int i = 0; i < 3; ++i) prev_w[i] = w[i];
 		}
 		const uint64_t s = g_rel_skipped_pages.load();
 		std::printf("; watched again before applied %.0f pages/s; pending now %llu pages", static_cast<double>(s - prev_s) * ps,

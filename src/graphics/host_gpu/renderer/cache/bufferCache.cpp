@@ -3822,6 +3822,89 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+// (SUBIDA-LOTE, 11-26, KYTY_SUBIDA_LOTE=1; apagado = como antes) Las copias de subida que van al prologo (paginas sucias
+// desde antes del command buffer abierto: todas corren antes de sus comandos, entre las dos barreras del prologo) sin la
+// via indirecta (sin VK_NV_copy_memory_indirect o con alineacion impar) eran una vkCmdCopyBuffer por cada
+// SynchronizeBuffer. Ahora se juntan en una lista y al cerrar el prologo salen como UNA vkCmdCopyBuffer por pareja
+// (anillo, bufer) con todas sus regiones. Los bytes ya estan copiados al staging en el momento de la traduccion (como
+// antes: UploadCopies), asi que lo que ve cada comando no cambia; solo se agrupan las llamadas. Dos regiones del mismo
+// destino que se solapan nunca van en la misma llamada (orden indefinido en Vulkan): la segunda abre una llamada nueva
+// que sale despues. Las subidas en orden (in-order: dentro del command buffer, entre draws) NO se tocan: su posicion
+// entre los draws es la semantica (el draw anterior ve el valor viejo).
+namespace SubidaLote {
+inline bool On() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SUBIDA_LOTE");
+		const bool  r = v != nullptr && v[0] == '1';
+		std::printf("[subida-lote] KYTY_SUBIDA_LOTE=%d: %s\n", r ? 1 : 0,
+		            r ? "copias del prologo agrupadas: una vkCmdCopyBuffer por bufer destino al cerrar el prologo"
+		              : "apagado (una vkCmdCopyBuffer por cada sincronizacion, como antes)");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
+struct Group {
+	vk::Buffer                  src, dst;
+	std::vector<vk::BufferCopy> regions;
+};
+// (Hilo de la GPU: UploadDirtyRanges y el gancho del prologo corren en el.)
+std::vector<Group> g_groups;
+uint64_t           g_queued_calls = 0, g_regions = 0, g_emitted = 0, g_indirect = 0, g_inorder = 0, g_flush_ns = 0;
+uint64_t           g_frames_mark = 0;
+std::chrono::steady_clock::time_point g_since = std::chrono::steady_clock::now();
+inline bool Overlaps(const Group& group, const vk::BufferCopy& copy) {
+	for (const auto& r: group.regions)
+		if (r.dstOffset < copy.dstOffset + copy.size && copy.dstOffset < r.dstOffset + r.size) return true;
+	return false;
+}
+inline void Queue(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies) {
+	++g_queued_calls;
+	g_regions += copies.size();
+	// The last group of this pair (a later one if an overlap opened one): its regions are emitted in order after the
+	// earlier groups.
+	Group* group = nullptr;
+	for (auto it = g_groups.rbegin(); it != g_groups.rend(); ++it) {
+		if (it->src == src && it->dst == dst) { group = &*it; break; }
+	}
+	for (const auto& copy: copies) {
+		if (group == nullptr || Overlaps(*group, copy)) {
+			g_groups.push_back({src, dst, {}});
+			group = &g_groups.back();
+		}
+		group->regions.push_back(copy);
+	}
+}
+inline void Flush(vk::CommandBuffer command) {
+	if (g_groups.empty()) return;
+	const auto start = std::chrono::steady_clock::now();
+	for (const auto& group: g_groups) {
+		command.copyBuffer(group.src, group.dst, static_cast<uint32_t>(group.regions.size()), group.regions.data());
+		++g_emitted;
+	}
+	g_groups.clear();
+	g_flush_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+inline void Report() {
+	const auto now = std::chrono::steady_clock::now();
+	const double s = std::chrono::duration<double>(now - g_since).count();
+	if (s < 5.0) return;
+	const uint64_t flips  = LiveControl::g_flips.load(std::memory_order_relaxed);
+	const double   frames = std::max<double>(1.0, static_cast<double>(flips - g_frames_mark));
+	std::printf("[subida-lote] %.1f s, por frame: copias agrupadas %.1f regiones de %.1f sincronizaciones -> %.1f "
+	            "vkCmdCopyBuffer (evitadas %.1f); ya por la via indirecta %.1f regiones; en orden (sin tocar) %.1f; "
+	            "grabar el lote %.3f ms\n",
+	            s, g_regions / frames, g_queued_calls / frames, g_emitted / frames,
+	            (static_cast<double>(g_queued_calls) - static_cast<double>(g_emitted)) / frames, g_indirect / frames,
+	            g_inorder / frames, g_flush_ns / 1e6 / frames);
+	std::fflush(stdout);
+	g_queued_calls = g_regions = g_emitted = g_indirect = g_inorder = g_flush_ns = 0;
+	g_frames_mark = flips;
+	g_since       = now;
+}
+} // namespace SubidaLote
+
 // The CPU-dirty pages of a mapped range copied into the buffer (the written ones then GPU-owned).
 void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written) {
 	const Envio1::Scope envio1_dirty(Envio1::Dirty); // (envio1)
@@ -3907,14 +3990,20 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 				if ((bits & 3u) == 0) {
 					for (const auto& copy: copies)
 						m_prologue_copies.push_back({from + copy.srcOffset, to + copy.dstOffset, copy.size});
+					if (SubidaLote::On()) SubidaLote::g_indirect += copies.size();
 					return;
 				}
+			}
+			if (SubidaLote::On()) {
+				SubidaLote::Queue(source, buffer.Handle(), copies);
+				return;
 			}
 			prologue.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()), copies.data());
 			return;
 		}
 		LiveCounters::Add(LiveCounters::InOrderUploads);
 		LiveCounters::Add(LiveCounters::InOrderUploadBytes, total_size);
+		if (SubidaLote::On()) ++SubidaLote::g_inorder;
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -3958,6 +4047,11 @@ void ReplayIndirectCopies(std::span<const LocalVulkanRecording::Segment> segment
 // The closing upload prologue's copies (UploadDirtyRanges), from a list in the table ring, as one command recorded in
 // order with the prologue's other commands (the recording worker replays it).
 void BufferCache::FlushPrologueCopies(vk::CommandBuffer command) {
+	if (SubidaLote::On()) {
+		// (SUBIDA-LOTE) Las agrupadas primero: antes salian en el momento, delante de las indirectas del cierre.
+		SubidaLote::Flush(command);
+		SubidaLote::Report();
+	}
 	if (m_prologue_copies.empty()) return;
 	const auto bytes          = m_prologue_copies.size() * sizeof(VkCopyMemoryIndirectCommandNV);
 	auto [mapped, offset]     = m_table_upload.Map(bytes, 16);

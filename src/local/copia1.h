@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "local/dispatch-rapido.h" // (proto-B)
+
 namespace Copia1 {
 
 constexpr uint32_t MaxRun = 64;
@@ -26,7 +28,8 @@ constexpr uint32_t MaxRun = 64;
 [[nodiscard]] inline bool On() {
 	static const bool on = [] {
 		const char* text = std::getenv("KYTY_COPIA1");
-		return text != nullptr && text[0] == '1' && text[1] == '\0';
+		// (proto-B) KYTY_DISPATCH_RAPIDO=1 turns the runs on too (dispatch-rapido.h, point 1).
+		return (text != nullptr && text[0] == '1' && text[1] == '\0') || DispatchRapido::On();
 	}();
 	return on;
 }
@@ -47,6 +50,7 @@ inline void NoteFrame() { g_frames.fetch_add(1, std::memory_order_relaxed); }
 
 inline void NoteRun(uint32_t copies, uint64_t ns, Flush why) {
 	auto& s = g_stats;
+	if (DispatchRapido::On()) DispatchRapido::NoteCopies(copies); // (proto-B)
 	s.copies += copies;
 	++s.runs;
 	s.ns += ns;

@@ -49,6 +49,7 @@
 #include "live-counters.h"
 #include "p7-compat.h" // (p7, KYTY_P7: C1)
 #include "local/juego3.h" // (juego3, KYTY_JUEGO3)
+#include "local/dispatch-rapido.h" // (proto-B, KYTY_DISPATCH_RAPIDO)
 
 #include <algorithm>
 #include <cinttypes>
@@ -1047,10 +1048,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			std::optional<RenderLockGuard> vgeo_lock;
 			if (Role() == 0) vgeo_lock.emplace(m_context.GetMutex());
 			m_dispatch_declined = nullptr;
+			const uint64_t rapido_t0 = DispatchRapido::On() ? DispatchRapido::NowNs() : 0; // (proto-B)
 			if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, false)) {
+				if (rapido_t0 != 0) DispatchRapido::NoteTable(DispatchRapido::NowNs() - rapido_t0);
 				vgeo_timer.count = &VgeoNativo::g_fast; vgeo_timer.ns = &VgeoNativo::g_fast_ns;
 				return;
 			}
+			DispatchRapido::g_rescued_now = false;
 			table_tried      = true; // (its refusal stands: the normal path below does not ask the table again)
 			vgeo_timer.count = &VgeoNativo::g_normal; vgeo_timer.ns = &VgeoNativo::g_normal_ns;
 		} else {
@@ -1129,7 +1133,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (!thread_dimensions || indirect_args == 0) &&
 	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
 		LiveCensus::Scope census_table(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10);
-		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) return;
+		const uint64_t rapido_t0 = DispatchRapido::On() ? DispatchRapido::NowNs() : 0; // (proto-B)
+		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) {
+			if (rapido_t0 != 0) DispatchRapido::NoteTable(DispatchRapido::NowNs() - rapido_t0);
+			return;
+		}
+		DispatchRapido::g_rescued_now = false;
 	}
 	// A direct dispatch of no thread groups (with thread dimensions: no threads) runs nothing: skipped before its
 	// program is prepared (about 60 a frame at 1-1, each evaluating its resource tables first).
@@ -1194,6 +1203,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	if (spec) return Spec::Refuse("linear copy");
+	// (proto-B, KYTY_DISPATCH_RAPIDO) Census of the normal path: its reason (the table's refusal) and its time.
+	DispatchRapido::NormalTimer rapido_normal;
+	rapido_normal.Start(&m_dispatch_declined);
 
 	NativePreparationScratch<ShaderComputeInputInfo> input_storage;
 	auto& input_info = input_storage.Get();

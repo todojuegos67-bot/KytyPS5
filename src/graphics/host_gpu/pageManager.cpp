@@ -1323,6 +1323,20 @@ struct PageManager::Impl {
 					if (g_defer_read_protect)
 						FlushReadProtectOverlapping(base_addr + range_begin * PAGE_SIZE, base_addr + range_begin * PAGE_SIZE + range_bytes);
 					DeferRelease(region, base_addr, static_cast<size_t>(range_begin), static_cast<size_t>(range_bytes / PAGE_SIZE));
+				} else if (!track && !is_read && !offload && perms != NO_ACCESS_PROTECTION && Raiz::WriteReleaseDeferOn() &&
+				           DeferReleasesHere()) {
+					// (ESCRITURA-DIFERIDA, KYTY_ESCRITURA_DIFERIDA=1; raiz.h) A write release of the GPU thread (read-only ->
+					// its state's protection, a raise): left to others as the read releases above. Until it is applied the
+					// page is only MORE protected than its state: a store to it faults and HandleFault applies the mark
+					// first (ApplyDeferredReleaseAt); host writes with no fault (PrepareHostOverwrite,
+					// InvalidateMemoryForWrite) apply the marks of their range first (kernel/memory.cpp). The applier gives
+					// the page the protection of its state THEN (PermsOf under its lock): watched again meanwhile, it stays
+					// read-only. The release thread joins adjacent marked pages of one protection into one call.
+					if (g_defer_read_protect)
+						FlushReadProtectOverlapping(base_addr + range_begin * PAGE_SIZE, base_addr + range_begin * PAGE_SIZE + range_bytes);
+					Raiz::g_wrel_deferred_runs.fetch_add(1, std::memory_order_relaxed);
+					Raiz::g_wrel_deferred_pages.fetch_add(range_bytes / PAGE_SIZE, std::memory_order_relaxed);
+					DeferRelease(region, base_addr, static_cast<size_t>(range_begin), static_cast<size_t>(range_bytes / PAGE_SIZE));
 				} else {
 					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
 					// (raiz8: marked pages this protected have their state's protection now.)

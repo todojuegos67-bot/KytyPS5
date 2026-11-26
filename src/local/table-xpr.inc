@@ -2416,7 +2416,22 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 		// An image the shader writes is GPU-modified, CPU-clean and current with buffer writes (as the normal path's
 		// FindTexture leaves a storage image: it acquires it again otherwise). One written since the set was proven this
 		// frame (by the CPU, a GPU buffer write, or into its stencil plane) is uploaded by the normal path's FindTexture.
-		if ((dep.storage && !image->SafeToDownload()) || TableRefreshPending(*image, dep.desc)) return false;
+		if (dep.storage && !image->SafeToDownload()) return false;
+		if (TableRefreshPending(*image, dep.desc)) {
+			// (proto-B, KYTY_DISPATCH_RAPIDO, dispatch-rapido.h point 2) A dispatch's sampled image written since its set
+			// was proven: the upload the normal path's FindTexture would make, made here (as TableValidateSet does), and
+			// the dispatch stays on the table path instead of paying the normal path's program and rebinds. Only the
+			// main executor, outside a speculation, into this very command buffer; anything else refuses as before.
+			if (!DispatchRapido::On() || draw_state != nullptr || dep.storage || Role() != 0 || Spec::Current() != nullptr ||
+			    !image->registered || image->depth_id || image->binding.needs_rebind)
+				return false;
+			(void)textures.FindTexture(dep.id, dep.desc);
+			image = textures.m_slot_images.try_get(dep.id);
+			if (image == nullptr || image->serial != dep.serial || TableRefreshPending(*image, dep.desc) ||
+			    m_context.GetCommandScheduler().Current().RawHandle() != vk_buffer)
+				return false;
+			DispatchRapido::g_rescued_now = true;
+		}
 		if (dep.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 			if (image->info.IsVolume()) return false;
 			const auto address = dep.desc.info.metadata.range.address;

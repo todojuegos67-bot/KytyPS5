@@ -552,6 +552,7 @@ inline void Flip() {
 	Render5Report(flip_ns); // (render5)
 	DsSombrasAb::OnFlip(flip_ns, g_render_idle_ns, LiveCensus::g_waits_ns[LiveCensus::WaitCompile]); // (sombras-ab; nada si apagado)
 	Copia1::NoteFrame();    // (copia1: the [copia1] line's frames)
+	DispatchRapido::NoteFrame(); // (proto-B: the [dispatch-rapido] line's frames)
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,

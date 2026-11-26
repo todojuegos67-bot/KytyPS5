@@ -2401,15 +2401,27 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+// (ESCRITURA-DIFERIDA, KYTY_ESCRITURA_DIFERIDA=1; local/raiz.h) A host write into guest memory about to happen (a kernel
+// write reaches no fault, ReadFile into a read-only page fails silently): the write releases the GPU thread left marked
+// over the range are applied first, so its pages have their state's protection. Off: one static bool read.
+static void ApplyWriteReleasesBeforeHostWrite(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Raiz::WriteReleaseDeferOn() || size == 0) return;
+	if (Raiz::g_rel_pending_pages.load(std::memory_order_relaxed) == 0) return;
+	Raiz::g_wrel_kernel_applies.fetch_add(1, std::memory_order_relaxed);
+	Graphics::PageManager::ApplyDeferredReleases(vaddr, size);
+}
+
 void InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	ApplyWriteReleasesBeforeHostWrite(vaddr, size); // (ESCRITURA-DIFERIDA)
 	(void)GetGpuResources().InvalidateMemoryForWrite(vaddr, size);
 }
 
 bool PrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || UINT64_MAX - vaddr < size || g_gpu_resources == nullptr) return false;
+	ApplyWriteReleasesBeforeHostWrite(vaddr, size); // (ESCRITURA-DIFERIDA)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// From the first page a store would fault on to the end of the last one, of those the trackers protect: by the
 	// pages' state. (A VirtualQuery walk cost more than the reads at start-up - the kernel scans a region's page table to

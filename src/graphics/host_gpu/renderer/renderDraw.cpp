@@ -2165,6 +2165,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 #undef MemoryBarrier
 #endif
 #include "native-xpr.inc"
+#include "local/dispatch-rapido.h" // (proto-B, KYTY_DISPATCH_RAPIDO)
 #include "table-xpr.inc"
 #include "render1-native.inc" // (render1 F2, KYTY_RENDER1=2)
 #endif
