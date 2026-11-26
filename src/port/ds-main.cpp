@@ -10,6 +10,7 @@
 #undef main
 
 #include "port/ds-port.h"
+#include "port/ds-online.h"
 #include "port/ds-update.h"
 #include "port/ds-precompile.h"
 #include "port/ds-steam.h"
@@ -46,6 +47,7 @@
 #include <vector>
 
 #include "stb_image.h"
+#include "local/tiron6-seeds.h" // (tiron6 v2: the compute pipelines' bar on this splash)
 
 namespace fs = std::filesystem;
 
@@ -234,6 +236,18 @@ struct Splash {
 
 LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
+		case WM_DISPLAYCHANGE: {
+			// (11-22) The game switched the display to its resolution: the loading picture follows it, whole, on the
+			// new screen (it stayed at the old size, enlarged and cut).
+			MONITORINFO mi {};
+			mi.cbSize = sizeof(mi);
+			if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+				const RECT& r = mi.rcMonitor;
+				SetWindowPos(hwnd, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+			}
+			InvalidateRect(hwnd, nullptr, TRUE);
+			return 0;
+		}
 		case WM_PAINT: {
 			PAINTSTRUCT ps;
 			HDC         dc = BeginPaint(hwnd, &ps);
@@ -248,7 +262,18 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				bi.bmiHeader.biBitCount    = 32;
 				bi.bmiHeader.biCompression = BI_RGB;
 				SetStretchBltMode(dc, HALFTONE);
-				StretchDIBits(dc, 0, 0, rc.right, rc.bottom, 0, 0, g_splash.w, g_splash.h, g_splash.bgra.data(), &bi,
+				SetBrushOrgEx(dc, 0, 0, nullptr);
+				// Full screen: scale the image to cover the window, keeping its aspect (the excess is cropped).
+				int sx = 0, sy = 0, sw = g_splash.w, sh = g_splash.h;
+				if (static_cast<int64_t>(rc.right) * g_splash.h > static_cast<int64_t>(rc.bottom) * g_splash.w) {
+					sh = static_cast<int>(static_cast<int64_t>(g_splash.w) * rc.bottom / std::max<LONG>(1, rc.right));
+					sy = (g_splash.h - sh) / 2;
+				} else {
+					sw = static_cast<int>(static_cast<int64_t>(g_splash.h) * rc.right / std::max<LONG>(1, rc.bottom));
+					sx = (g_splash.w - sw) / 2;
+				}
+				// StretchDIBits counts the source rows from the bottom for a top-down DIB's y: flip it.
+				StretchDIBits(dc, 0, 0, rc.right, rc.bottom, sx, g_splash.h - sy - sh, sw, sh, g_splash.bgra.data(), &bi,
 				              DIB_RGB_COLORS, SRCCOPY);
 			} else {
 				FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
@@ -258,18 +283,20 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 				std::scoped_lock lock(g_splash.mutex);
 				status = g_splash.status;
 			}
-			const int height = std::max<int>(16, rc.bottom / 36);
+			const int height = std::max<int>(16, rc.bottom * 18 / 1000); // ~1.8% of the screen's height
 			HFONT     font   = CreateFontW(height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
 			                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 			HGDIOBJ   old    = SelectObject(dc, font);
 			SetBkMode(dc, TRANSPARENT);
-			RECT text = {rc.left + height, rc.bottom - height * 3, rc.right - height, rc.bottom - height};
+			// Bottom centre: the bar and the status line take the middle 60% of the width.
+			const LONG side = (rc.right - rc.left) / 5;
+			RECT text = {rc.left + side, rc.bottom - height * 4, rc.right - side, rc.bottom - height};
 			RECT shade = text;
 			OffsetRect(&shade, 2, 2);
 			SetTextColor(dc, RGB(0, 0, 0));
-			DrawTextW(dc, status.c_str(), -1, &shade, DT_RIGHT | DT_WORDBREAK);
+			DrawTextW(dc, status.c_str(), -1, &shade, DT_CENTER | DT_WORDBREAK);
 			SetTextColor(dc, RGB(222, 196, 140));
-			DrawTextW(dc, status.c_str(), -1, &text, DT_RIGHT | DT_WORDBREAK);
+			DrawTextW(dc, status.c_str(), -1, &text, DT_CENTER | DT_WORDBREAK);
 			float        progress;
 			std::wstring hint;
 			{
@@ -303,7 +330,7 @@ LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			}
 			if (progress >= 0.0f) {
 				// (10-27c) The precompile's progress bar above the status line.
-				RECT bar = {rc.left + height, rc.bottom - height * 4, rc.right - height, rc.bottom - height * 3 - height / 3};
+				RECT bar = {rc.left + side, rc.bottom - height * 5 - height / 2, rc.right - side, rc.bottom - height * 5};
 				HBRUSH back = CreateSolidBrush(RGB(30, 26, 20)), fill = CreateSolidBrush(RGB(222, 196, 140));
 				FillRect(dc, &bar, back);
 				RECT done = bar;
@@ -346,12 +373,41 @@ void ShowSplash(const std::string& image) {
 		wc.hCursor       = LoadCursorW(nullptr, MAKEINTRESOURCEW(32650)); // IDC_APPSTARTING
 		wc.hIcon         = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
 		RegisterClassW(&wc);
-		// 60% of the screen's width, the image's aspect.
-		const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-		const int w  = sw * 6 / 10;
-		const int h  = g_splash.w > 0 ? w * g_splash.h / g_splash.w : w * 9 / 16;
-		HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Demon's Souls", WS_POPUP | WS_VISIBLE, (sw - w) / 2,
-		                            (sh - h) / 2, w, h, nullptr, nullptr, wc.hInstance, nullptr);
+		// (fix7) The process is not DPI-aware yet (SDL sets permonitorv2 later, for the launcher and the game's window):
+		// at 150 % the monitor came back in logical units (2560x1440 -> 1707x960) and the splash was stretched short of
+		// the screen. Per-monitor v2 for this thread only: real pixels here, nothing else in the process changes.
+		using SetThreadDpiFn = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+		if (auto set_dpi = reinterpret_cast<SetThreadDpiFn>(
+		        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext")));
+		    set_dpi != nullptr) {
+			set_dpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+		}
+		// Full screen, borderless, on top of everything while it lasts: the whole primary monitor (where the game goes).
+		MONITORINFO mi {};
+		mi.cbSize = sizeof(mi);
+		RECT mon = {0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+		if (GetMonitorInfoW(MonitorFromPoint(POINT {0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi)) mon = mi.rcMonitor;
+		HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, wc.lpszClassName, L"Demon's Souls", WS_POPUP | WS_VISIBLE,
+		                            mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top, nullptr, nullptr, wc.hInstance,
+		                            nullptr);
+		// (11-21) The window's own DPI mode decides its coordinates: if it did not get per-monitor v2 (a process whose DPI mode
+		// was already set, or Windows ignoring the thread's), the monitor taken above is in the other units and the splash
+		// came out cut and enlarged (only its top-left 2/3 at 150 %). The monitor again in the window's own mode, and the
+		// window resized to it: it always covers the screen exactly.
+		using GetWinCtxFn = DPI_AWARENESS_CONTEXT(WINAPI*)(HWND);
+		using SetThreadDpiFn2 = DPI_AWARENESS_CONTEXT(WINAPI*)(DPI_AWARENESS_CONTEXT);
+		HMODULE user32 = GetModuleHandleW(L"user32.dll");
+		auto get_ctx = reinterpret_cast<GetWinCtxFn>(reinterpret_cast<void*>(GetProcAddress(user32, "GetWindowDpiAwarenessContext")));
+		auto set_ctx = reinterpret_cast<SetThreadDpiFn2>(reinterpret_cast<void*>(GetProcAddress(user32, "SetThreadDpiAwarenessContext")));
+		if (hwnd != nullptr && get_ctx != nullptr && set_ctx != nullptr) {
+			const DPI_AWARENESS_CONTEXT old_ctx = set_ctx(get_ctx(hwnd));
+			MONITORINFO wm {};
+			wm.cbSize = sizeof(wm);
+			if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &wm))
+				SetWindowPos(hwnd, HWND_TOPMOST, wm.rcMonitor.left, wm.rcMonitor.top, wm.rcMonitor.right - wm.rcMonitor.left,
+				             wm.rcMonitor.bottom - wm.rcMonitor.top, SWP_NOACTIVATE);
+			if (old_ctx != nullptr) set_ctx(old_ctx);
+		}
 		g_splash.window = hwnd;
 		MSG msg;
 		while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -618,8 +674,8 @@ void StartMetricsWindow(const fs::path& root, const Port::Settings& s, const Por
 	const std::string souls = s.souls_mode;
 	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
-	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
-	const bool  fixed = souls == "ligero" || souls == "ligero-plus" || souls == "equilibrado" || souls == "low";
+	                        : souls == "low" ? "Modo Souls PC low profile" : souls == "sin-tirones" ? "Optimizado 16 GB / 8 GB" : "Personalizado";
+	const bool  fixed = Port::FixedFg(s); // (11-22) the optimizado mode too: its x2 counted as generated
 	std::string fg    = fixed ? modo : Port::FrameGenLabel(s.framegen);
 	std::string al    = "No";
 	if (fixed) al = "Ultra";
@@ -1038,6 +1094,8 @@ void RequestRestart(bool to_launcher) {
 int main(int argc, char* argv[]) {
 	// (10-27) The update's helper mode (run elevated when the folder cannot be written): only that, then out.
 	if (const int helper = Port::Update::HelperMain(0, nullptr); helper >= 0) return helper;
+	// (online5) "Demon's Souls.exe" --servidor: the online server only (TCP 31413 + 31415, UDP 3758; icon by the clock).
+	if (Port::Online::IsServerCommand(argc, argv)) return Port::Online::ServerMain(argc, argv);
 	g_exe               = ExePath();
 	const fs::path root = g_exe.parent_path();
 	SetCurrentDirectoryW(root.c_str());
@@ -1091,7 +1149,13 @@ int main(int argc, char* argv[]) {
 		SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr))));
 	SetEnv("KYTY_RUN_LOG", log_out);
 	// (ds-pc-port29) Unbuffered: a crash no longer loses the last lines.
-	setvbuf(stdout, nullptr, _IONBF, 0);
+	// (agente2) stdout fully buffered (64 KiB) instead: with _IONBF and a file or pipe (not a console) the C runtime
+	// writes every character with its own _write/WriteFile (its temporary buffering is for consoles only): the GPU
+	// thread's 6 KB "[raiz]" + "Write watch" report every 5 s cost a 30-52 ms frame (12 a minute, 66-324 ms/min of
+	// hitches, logs 11-22 05:08-05:34), and each ~1 KB SLOW Frame line ~0.5-1 ms of the render thread. The lines
+	// still reach the file at once: LiveControl::Flip flushes stdout at every flip, the report lines flush
+	// themselves, and the fatal paths (DbgExit, ReportFatal, DrainStdout) flush before the process ends.
+	setvbuf(stdout, nullptr, _IOFBF, 64u << 10u);
 	setvbuf(stderr, nullptr, _IONBF, 0);
 	if (fg_relaunch) g_back_to_launcher = true; // (11-09) started by the launcher's JUGAR: its end opens it again
 	if (fg_relaunch) std::printf("[port] DLSS / Streamline: the game in its own process (no launcher window or D3D before Streamline)\n");
@@ -1165,6 +1229,8 @@ int main(int argc, char* argv[]) {
 	runtime.game_info  = (param.name.empty() ? std::string("Demon's Souls") : param.name) +
 	                    (param.title_id.empty() ? std::string() : "  " + version);
 	runtime.launched   = settings;
+	if (settings.randomizer) runtime.launched.multiplayer = false; // (rando1) the randomizer plays offline (ds-settings BuildLaunch)
+	if (Port::CheatsUsed()) runtime.launched.multiplayer = false; // (trucos-online) launched offline: cheats were used
 	runtime.notes      = plan.notes;
 	runtime.pc         = pc;
 	runtime.exe_path   = g_exe;
@@ -1416,6 +1482,8 @@ int main(int argc, char* argv[]) {
 		SetEnv("KYTY_GAME_CPUS", list);
 	}
 	SplashStatus("Iniciando...");
+	// (tiron6 v2, KYTY_TIRON6=1) The emulator's start-up reports its compute pipelines here (bar and status line).
+	Tiron6::g_splash.store(+[](const char* text, float bar) { SplashStatus(text); SplashProgress(bar); });
 
 	{
 		// (ds-pc-port43) No Windows power throttling (EcoQoS) for the game, normal priority (a relaxed precompile left
@@ -1428,6 +1496,26 @@ int main(int argc, char* argv[]) {
 		SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 		timeBeginPeriod(1);
 		std::printf("[port] CPU: power throttling %s, priority normal, timer 1 ms\n", off ? "off" : "unchanged (not supported)");
+		std::fflush(stdout);
+	}
+	// (online5) Multijugador on with the server on this PC (127.0.0.1): its server is up before the game asks (started
+	// in the background if it does not answer; it stays on after the game closes).
+	// (trucos-online) Cheats used in this process: offline, no server started (BuildLaunch left KYTY_ONLINE out too).
+	if (settings.multiplayer && Port::CheatsUsed()) {
+		std::printf("[port] online: desactivado porque hay trucos activos\n");
+		std::fflush(stdout);
+	} else if (settings.multiplayer) {
+		std::string host = settings.online_server;
+		if (const auto c = host.find(':'); c != std::string::npos) host = host.substr(0, c);
+		if (host.empty() || host == "127.0.0.1" || host == "localhost") {
+			const bool up = Port::Online::EnsureHost(Port::Online::kDefaultPort);
+			std::printf("[port] multijugador: anfitrion, servidor %s; cuenta %s\n",
+			            up ? "activo (TCP 31413 y 31415 responden; UDP 3758)" : "NO RESPONDE en 31413/31415 (mira servidor.log en %LOCALAPPDATA%\\Demon's Souls PC\\servidor-online)",
+			            settings.online_name.empty() ? "VACIA (F2 > Multijugador: escribe cuenta y contrasena)" : settings.online_name.c_str());
+		} else {
+			std::printf("[port] multijugador: servidor %s, cuenta %s\n", host.c_str(),
+			            settings.online_name.empty() ? "VACIA (F2 > Multijugador: escribe cuenta y contrasena)" : settings.online_name.c_str());
+		}
 		std::fflush(stdout);
 	}
 	Port::Runtime runtime = make_runtime(plan);

@@ -196,14 +196,22 @@ public:
 
 	// Reads [offset, offset + size) of the member into `data` (copied on this thread): the bytes read.
 	uint32_t Read(ArchiveReader& reader, uint64_t id, uint64_t offset, uint32_t size, uint8_t* data) {
-		constexpr uint32_t                chunk_size = 1u << 20u;
-		constexpr uint32_t                window     = ArchiveReader::Lanes * 2; // chunks in flight
-		thread_local std::vector<uint8_t> buffers;
-		const uint32_t                    chunks = static_cast<uint32_t>((uint64_t {size} + chunk_size - 1) / chunk_size);
-		const uint32_t                    slots  = std::min(window, chunks);
-		const size_t                      needed = slots <= 1 ? size : size_t {slots} * chunk_size;
-		if (buffers.size() < needed) {
-			buffers.resize(needed);
+		const uint32_t chunks = static_cast<uint32_t>((uint64_t {size} + chunk_size - 1) / chunk_size);
+		const uint32_t slots  = std::min(window, chunks);
+		// One chunk in this thread's buffer (at most a chunk), more in a window of the shared pool (TakeWindow): a buffer
+		// of each thread kept the biggest window it had used, 8 MiB on every guest thread that once read a file of 8 MiB
+		// or more (1-1 of a .zar game: 95 MiB on 11 threads), while few such reads run at a time.
+		thread_local std::vector<uint8_t> single;
+		std::unique_ptr<uint8_t[]>        pooled;
+		uint8_t*                          buffers = nullptr;
+		if (slots <= 1) {
+			if (single.size() < size) {
+				single.resize(size);
+			}
+			buffers = single.data();
+		} else {
+			pooled  = TakeWindow();
+			buffers = pooled.get();
 		}
 		Batch    batch;
 		Request  requests[window];
@@ -215,7 +223,7 @@ public:
 			request.id     = id;
 			request.offset = offset + uint64_t {index} * chunk_size;
 			request.size   = std::min(chunk_size, size - index * chunk_size);
-			request.data   = buffers.data() + size_t {index % window} * chunk_size;
+			request.data   = buffers + size_t {index % window} * chunk_size;
 			request.next   = nullptr;
 			request.result = 0;
 			request.done   = false;
@@ -243,12 +251,42 @@ public:
 				submit(submitted++);
 			}
 		}
+		// (Every request is done: no lane writes into the window any more.)
+		if (pooled != nullptr) {
+			ReturnWindow(std::move(pooled));
+		}
 		return read;
 	}
 
 	KYTY_CLASS_NO_COPY(ArchiveIo);
 
 private:
+	static constexpr uint32_t chunk_size = 1u << 20u;
+	static constexpr uint32_t window     = ArchiveReader::Lanes * 2; // chunks in flight
+	static constexpr size_t   PoolKeep   = 2;                        // idle windows kept
+
+	std::unique_ptr<uint8_t[]> TakeWindow() {
+		{
+			std::lock_guard lock(m_pool_mutex);
+			if (!m_pool.empty()) {
+				auto taken = std::move(m_pool.back());
+				m_pool.pop_back();
+				return taken;
+			}
+		}
+		return std::unique_ptr<uint8_t[]>(new uint8_t[size_t {window} * chunk_size]);
+	}
+
+	void ReturnWindow(std::unique_ptr<uint8_t[]> buffer) {
+		{
+			std::lock_guard lock(m_pool_mutex);
+			if (m_pool.size() < PoolKeep) {
+				m_pool.push_back(std::move(buffer));
+				return;
+			}
+		}
+		buffer.reset(); // (freed outside the lock)
+	}
 	struct Batch {
 		std::mutex              mutex;
 		std::condition_variable ready;
@@ -319,7 +357,9 @@ private:
 		}
 	}
 
-	Lane m_lanes[ArchiveReader::Lanes];
+	Lane                                    m_lanes[ArchiveReader::Lanes];
+	std::mutex                              m_pool_mutex;
+	std::vector<std::unique_ptr<uint8_t[]>> m_pool; // idle windows of window * chunk_size bytes (TakeWindow)
 };
 
 } // namespace

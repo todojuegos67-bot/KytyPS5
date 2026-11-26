@@ -21,6 +21,11 @@
 // gr4: every stage sanitized (NaN / Inf -> 0, a bad depth -> far), the history restarted on a gap or never-written
 // texels, invalid motion vectors rejected, the sky's history short, our light never blackens a pixel; boosts lowered.
 // Every 10 s: "GODRAYS: stats" with the GPU ms, the sun on / off screen and the lights used.
+// (rtx1) Ultra (4, "Luz volumetrica" Ultra): Alto's passes on a HALF-resolution volume (4x the texels of the quarter
+// grid: shafts with sharp edges instead of quarter-res blobs), 96 radial taps, 24 view-ray steps (each shadowed toward
+// the sun against the depth: more, thinner shafts), stronger in-scattering (sun 1.3, halos 1.15, cap 0.40). The game's
+// own froxel fog is made denser and more forward-scattering at the same level by rtx1-convars.h (KYTY_RTX1_FOG=4).
+// Cost (estimate from Alto's 0.19 ms measured at 1704x960, rtq1): 4x texels x 1.5x taps / steps ~ 1.0-1.2 ms.
 #include "local/local-pass-cache.h" // (ds-perf-1031: the passes' pipelines in the disk cache)
 #include "local/godrays.h"
 
@@ -272,8 +277,9 @@ bool EnsurePipeline(GraphicContext& graphics) {
 	return true;
 }
 
-bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent) {
-	if (g_gr.out.image != VK_NULL_HANDLE && g_gr.extent == extent) return true;
+bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent, uint32_t div) {
+	const vk::Extent2D q {(extent.width + div - 1) / div, (extent.height + div - 1) / div};
+	if (g_gr.out.image != VK_NULL_HANDLE && g_gr.extent == extent && g_gr.qextent == q) return true;
 	Retire(graphics, g_gr.out);
 	Retire(graphics, g_gr.vol[0]);
 	Retire(graphics, g_gr.vol[1]);
@@ -281,7 +287,7 @@ bool EnsureImages(GraphicContext& graphics, vk::Extent2D extent) {
 	Retire(graphics, g_gr.filt);
 	g_gr.ready = false, g_gr.history_valid = false;
 	g_gr.extent  = extent;
-	g_gr.qextent = vk::Extent2D {(extent.width + 3) / 4, (extent.height + 3) / 4};
+	g_gr.qextent = q; // (quarter resolution; rtx1 Ultra: half)
 	return MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, extent, g_gr.out) &&
 	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.vol[0]) &&
 	       MakeImage(graphics, vk::Format::eR16G16B16A16Sfloat, g_gr.qextent, g_gr.vol[1]) &&
@@ -329,7 +335,7 @@ void Log(int level, bool have_sun) {
 int GodraysEnvLevel() {
 	static const int level = [] {
 		const char* value = std::getenv("KYTY_GODRAYS");
-		return value != nullptr ? std::clamp(std::atoi(value), 0, 3) : 0;
+		return value != nullptr ? std::clamp(std::atoi(value), 0, 4) : 0; // (rtx1: 4 Ultra)
 	}();
 	return level;
 }
@@ -368,7 +374,7 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	const auto& m = inputs.view_to_clip;
 	if (!(m[0] != 0.0f && m[5] != 0.0f && m[11] != 0.0f) || !std::all_of(m.begin(), m.end(), [](float v) { return std::isfinite(v); }))
 		return false;
-	if (!EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent)) {
+	if (!EnsurePipeline(*graphics) || !EnsureImages(*graphics, color.extent, level >= 4 ? 2u : 4u)) {
 		static bool said = false;
 		if (!said) {
 			said = true;
@@ -429,12 +435,12 @@ bool GodraysApply(vk::CommandBuffer command, UpscaleInputs& inputs) {
 	}
 
 	const int   slots  = level >= 3 ? 8 : level == 2 ? 4 : 2;
-	const int   taps   = level >= 3 ? 64 : level == 2 ? 48 : 32;
-	const int   steps  = level >= 3 ? 16 : level == 2 ? 12 : 0;
-	// (10-25: Bajo / Medio raised a little: 0.10 / 0.18 cap, 0.5 / 0.75 halos, 0.45 / 0.7 sun before)
-	const float cap    = (level >= 3 ? 0.28f : level == 2 ? 0.22f : 0.14f) * strength;
-	const float lstr   = (level >= 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength;
-	const float sstr   = (level >= 3 ? 1.0f : level == 2 ? 0.8f : 0.55f) * strength; // (gr4: 0.85 / 0.6 in gr3: noisy shafts)
+	const int   taps   = level >= 4 ? 96 : level == 3 ? 64 : level == 2 ? 48 : 32;
+	const int   steps  = level >= 4 ? 24 : level == 3 ? 16 : level == 2 ? 12 : 0;
+	// (10-25: Bajo / Medio raised a little: 0.10 / 0.18 cap, 0.5 / 0.75 halos, 0.45 / 0.7 sun before; rtx1: Ultra 4)
+	const float cap    = (level >= 4 ? 0.40f : level == 3 ? 0.28f : level == 2 ? 0.22f : 0.14f) * strength;
+	const float lstr   = (level >= 4 ? 1.15f : level == 3 ? 1.0f : level == 2 ? 0.95f : 0.7f) * strength;
+	const float sstr   = (level >= 4 ? 1.3f : level == 3 ? 1.0f : level == 2 ? 0.8f : 0.55f) * strength; // (gr4: 0.85 / 0.6 in gr3: noisy shafts)
 	static const bool debug = [] {
 		const char* v = std::getenv("KYTY_GODRAYS_DEBUG");
 		return v != nullptr && *v == '1';

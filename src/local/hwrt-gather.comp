@@ -16,6 +16,12 @@ layout(push_constant) uniform Push {
 } p;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer Vec2s { vec2 v[]; };
 
+// (pt1b) An order-preserving uint of a float (atomicMin / atomicMax compare it as the float).
+uint Ord(float f) {
+	uint u = floatBitsToUint(f);
+	return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
 void main() {
 	const uint i = gl_GlobalInvocationID.x;
 	if (i >= p.count) return;
@@ -38,5 +44,18 @@ void main() {
 	const vec3 old = Vec4s(p.dst).v[i].xyz;
 	if (!ok || any(isnan(old)) || any(isnan(w))) return;
 	const float d = length(w - old) / (0.05 + 0.002 * length(old - p.cam.xyz));
+	if (p.mode == 2u) {
+		// (pt1b, BB_PATHTRACING) 16 words per compare: the per-vertex move, then the mesh's bounds now (1..6) and as built
+		// (7..12). Instanced meshes whose instances come in another order each frame move per vertex but not as a whole.
+		const uint b = p.result * 16u;
+		atomicMax(Uints(p.results).u[b], floatBitsToUint(min(d, 1e30)));
+		for (int k = 0; k < 3; ++k) {
+			atomicMin(Uints(p.results).u[b + 1u + uint(k)], Ord(w[k]));
+			atomicMax(Uints(p.results).u[b + 4u + uint(k)], Ord(w[k]));
+			atomicMin(Uints(p.results).u[b + 7u + uint(k)], Ord(old[k]));
+			atomicMax(Uints(p.results).u[b + 10u + uint(k)], Ord(old[k]));
+		}
+		return;
+	}
 	atomicMax(Uints(p.results).u[p.result], floatBitsToUint(min(d, 1e30)));
 }

@@ -1,14 +1,21 @@
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "local/envio1.h"
 
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/sparseImage.h" // (ram1b)
+#include "tex-nativa.h" // (N1, KYTY_TEX_NATIVA)
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 #include "live-trace.h"
 #include "speculation-state.h"
+#include "p7-compat.h" // (p7, KYTY_P7: C2, C7)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h" // (p7b, C2: RecordedWrites)
+#endif
 
 #include <algorithm>
 #include <array>
@@ -16,6 +23,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex> // (RT-ALIAS-MEM)
+#include <set>   // (RT-ALIAS-MEM)
+#include <utility>
 #include <xxhash.h>
 
 extern "C" {
@@ -37,8 +47,38 @@ std::atomic<uint64_t> g_image_serial_next {1};
 
 std::atomic<uint64_t> g_image_state_epoch {1};
 
+// (M7, TEX-DEDUP) La imagen de la que el siguiente constructor de este hilo se hace alias, y los contadores.
+thread_local Image*   t_share_source = nullptr;
+std::atomic<uint64_t> g_dedup_ahora_n {0}, g_dedup_ahora_bytes {0}, g_dedup_unidas {0}, g_dedup_unidas_bytes {0},
+    g_dedup_separadas {0}, g_dedup_tarde {0};
+
 [[nodiscard]] inline bool DedupeTransitGroups() {
 	return kyty_local_image_barrier_dedupe.load(std::memory_order_relaxed) != 0;
+}
+
+// (p7b, C2) This thread's writing commands recorded so far (draws, dispatches, copies, fills, clears, blits, resolves,
+// updates; not barriers); UINT64_MAX - never equal to a stored count - where it is not known.
+[[nodiscard]] inline uint64_t RecordedWritesNow() noexcept {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	return LocalVulkanRecording::RecordedWrites();
+#else
+	return UINT64_MAX;
+#endif
+}
+
+// (p7b, C2) The stages a barrier made `previous` (its destination stages) cover `wanted`: all commands, or every
+// stage of `wanted` among them (all graphics standing for each graphics stage).
+[[nodiscard]] inline bool StagesCover(vk::PipelineStageFlags2 previous, vk::PipelineStageFlags2 wanted) noexcept {
+	using S                  = vk::PipelineStageFlagBits2;
+	constexpr auto graphics  = S::eDrawIndirect | S::eIndexInput | S::eVertexAttributeInput | S::eVertexInput |
+	                          S::eVertexShader | S::eTessellationControlShader | S::eTessellationEvaluationShader |
+	                          S::eGeometryShader | S::ePreRasterizationShaders | S::eFragmentShader |
+	                          S::eEarlyFragmentTests | S::eLateFragmentTests | S::eColorAttachmentOutput |
+	                          S::eAllGraphics;
+	if (static_cast<bool>(previous & S::eAllCommands)) return true;
+	if (static_cast<bool>(previous & S::eAllGraphics)) previous |= graphics;
+	if (static_cast<bool>(wanted & S::eAllGraphics)) wanted |= graphics;
+	return !static_cast<bool>(wanted & ~previous);
 }
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
@@ -121,6 +161,323 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
+// (M7, TEX-DEDUP) Grupo de imagenes que comparten una VkImage. Orden de cerrojos: el del grupo y despues el StateLock de
+// un miembro; nunca al reves (PushSharedState se llama sin StateLock propio tomado).
+struct Image::Share {
+	std::atomic<bool>   busy {false};
+	std::atomic<int>    refs {0};
+	std::vector<Image*> members; // bajo busy
+	uint64_t            bytes = 0;
+	void Lock() noexcept {
+		while (busy.exchange(true, std::memory_order_acquire)) _mm_pause();
+	}
+	void Unlock() noexcept { busy.store(false, std::memory_order_release); }
+};
+
+// (RT-ALIAS-MEM) Grupo de imagenes (VkImage distintas) ligadas a la misma VkDeviceMemory: la asignacion es la de `host`
+// (creada por VMA con su VkImage). Si `host` se destruye antes que los demas, su VkImage se destruye y la asignacion la
+// libera el ultimo miembro (vmaFreeMemory). Orden de cerrojos: el del grupo y despues el StateLock; nunca al reves.
+struct Image::MemAlias {
+	std::atomic<bool>   busy {false};
+	std::vector<Image*> members; // bajo busy
+	Image*              host       = nullptr; // bajo busy; nullptr: destruido, la memoria es del grupo
+	VmaAllocation       allocation = nullptr;
+	VmaAllocator        allocator  = nullptr;
+	void Lock() noexcept {
+		while (busy.exchange(true, std::memory_order_acquire)) _mm_pause();
+	}
+	void Unlock() noexcept { busy.store(false, std::memory_order_release); }
+};
+
+namespace {
+thread_local Image*   t_alias_host   = nullptr;
+thread_local uint64_t t_alias_offset = 0;
+thread_local bool     t_alias_capable = false;
+thread_local uint64_t t_alias_for     = 0;
+std::atomic<uint64_t> g_ma_ahora_n {0}, g_ma_ahora_bytes {0}, g_ma_unidas {0}, g_ma_rechazadas {0}, g_ma_reinicios {0},
+    g_ma_malas {0};
+std::mutex                                 g_ma_block_mutex;
+std::set<std::pair<uint64_t, uint64_t>>    g_ma_block; // (direccion, tamano) del juego que no vuelven a compartir
+} // namespace
+
+void Image::SetMemAliasHost(Image* host, uint64_t offset, bool capable, uint64_t for_address) noexcept {
+	t_alias_for     = for_address;
+	t_alias_host    = host;
+	t_alias_offset  = offset;
+	t_alias_capable = capable;
+}
+
+void Image::FillMemAliasBacking(const vk::ImageCreateInfo& create, vk::Image image, VmaAllocation allocation) {
+	backing.format     = create.format;
+	backing.image_type = create.imageType;
+	backing.extent     = create.extent;
+	backing.layers     = create.arrayLayers;
+	backing.mip_levels = create.mipLevels;
+	backing.samples    = static_cast<uint32_t>(create.samples);
+	backing.usage      = create.usage;
+	backing.flags      = create.flags;
+	backing.image      = image;
+	backing.allocation = allocation;
+	backing.sparse     = nullptr;
+	backing.state      = {.layout = vk::ImageLayout::eUndefined};
+	backing.subresource_states.clear();
+}
+
+// Un RT de las arenas con memoria propia que admite alias: VkImage + vmaAllocateMemory(CAN_ALIAS) + vmaBindImageMemory.
+// Se libera como cualquier otra (GraphicContext::DeleteImage: vmaDestroyImage). Falla: false, y se crea como siempre.
+bool Image::CreateAliasCapable(const vk::ImageCreateInfo& create) {
+	if (m_graphics.allocator == nullptr) return false;
+	vk::Image img = nullptr;
+	if (m_graphics.device.createImage(&create, nullptr, &img) != vk::Result::eSuccess || img == nullptr) return false;
+	const VkMemoryRequirements req = static_cast<VkMemoryRequirements>(m_graphics.device.getImageMemoryRequirements(img));
+	VmaAllocationCreateInfo    ci {};
+	ci.flags                 = VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT;
+	ci.requiredFlags         = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VmaAllocation allocation = nullptr;
+	if (vmaAllocateMemory(m_graphics.allocator, &req, &ci, &allocation, nullptr) != VK_SUCCESS || allocation == nullptr) {
+		m_graphics.device.destroyImage(img, nullptr);
+		return false;
+	}
+	if (vmaBindImageMemory(m_graphics.allocator, allocation, static_cast<VkImage>(img)) != VK_SUCCESS) {
+		vmaFreeMemory(m_graphics.allocator, allocation);
+		m_graphics.device.destroyImage(img, nullptr);
+		return false;
+	}
+	FillMemAliasBacking(create, img, allocation);
+	mem_alias_capable = true;
+	return true;
+}
+
+bool Image::MemAliasGuest() const noexcept {
+	return mem_alias.load(std::memory_order_acquire) != nullptr && backing.allocation == nullptr && backing.image != nullptr;
+}
+
+bool Image::MemAliasBlocked(uint64_t address, uint64_t size) {
+	std::lock_guard lock(g_ma_block_mutex);
+	return g_ma_block.contains({address, size});
+}
+
+Image::MemAliasStats Image::MemAliasCounters() noexcept {
+	MemAliasStats s;
+	s.ahora_n     = g_ma_ahora_n.load(std::memory_order_relaxed);
+	s.ahora_bytes = g_ma_ahora_bytes.load(std::memory_order_relaxed);
+	s.unidas      = g_ma_unidas.load(std::memory_order_relaxed);
+	s.rechazadas  = g_ma_rechazadas.load(std::memory_order_relaxed);
+	s.reinicios   = g_ma_reinicios.load(std::memory_order_relaxed);
+	s.malas       = g_ma_malas.load(std::memory_order_relaxed);
+	return s;
+}
+
+bool Image::TryJoinMemAlias(Image& host, uint64_t offset, const vk::ImageCreateInfo& create) {
+	const auto& hb = host.backing;
+	if (&host == this || !host.mem_alias_capable || hb.image == nullptr || hb.allocation == nullptr || hb.sparse != nullptr ||
+	    host.share != nullptr || m_graphics.allocator == nullptr) {
+		g_ma_rechazadas.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	VmaAllocationInfo ai {};
+	vmaGetAllocationInfo(m_graphics.allocator, hb.allocation, &ai);
+	vk::Image img = nullptr;
+	if (m_graphics.device.createImage(&create, nullptr, &img) != vk::Result::eSuccess || img == nullptr) {
+		g_ma_rechazadas.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	const vk::MemoryRequirements req   = m_graphics.device.getImageMemoryRequirements(img);
+	const uint64_t               align = req.alignment == 0 ? 1 : req.alignment;
+	const uint64_t               off   = offset - offset % align;
+	if ((req.memoryTypeBits & (1u << ai.memoryType)) == 0 || off + req.size > ai.size ||
+	    vmaBindImageMemory2(m_graphics.allocator, hb.allocation, off, static_cast<VkImage>(img), nullptr) != VK_SUCCESS) {
+		m_graphics.device.destroyImage(img, nullptr);
+		g_ma_rechazadas.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+	MemAlias* g = host.mem_alias.load(std::memory_order_acquire);
+	if (g == nullptr) {
+		g                  = new MemAlias;
+		g->host            = &host;
+		g->allocation      = hb.allocation;
+		g->allocator       = m_graphics.allocator;
+		g->members.push_back(&host);
+		host.mem_alias_off  = 0;
+		host.mem_alias_size = ai.size;
+		host.mem_alias.store(g, std::memory_order_release);
+	}
+	mem_alias_off  = off;
+	mem_alias_size = req.size;
+	g->Lock();
+	g->members.push_back(this);
+	g->Unlock();
+	mem_alias.store(g, std::memory_order_release);
+	FillMemAliasBacking(create, img, nullptr); // (la memoria es del grupo: ~Image no llama a DeleteImage con ella)
+	g_ma_ahora_n.fetch_add(1, std::memory_order_relaxed);
+	g_ma_ahora_bytes.fetch_add(req.size, std::memory_order_relaxed);
+	g_ma_unidas.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+// Antes de cada transicion de un miembro: si otro miembro escribio en memoria que solapa la suya desde su ultimo uso, su
+// contenido y su layout ya no valen (Vulkan, aliasing de memoria): se parte de UNDEFINED con dependencia completa
+// (todas las etapas, escritura de memoria). Si ademas este uso solo lee, el juego necesitaba ese contenido: se marca mala.
+// Una escritura propia deja pisados a los demas miembros que solapan.
+void Image::MemAliasBeforeUse(vk::AccessFlags2 destination_access, VulkanImageState* spec_state,
+                              std::vector<VulkanImageState>* spec_subresources) {
+	MemAlias* g = mem_alias.load(std::memory_order_acquire);
+	if (g == nullptr) return;
+	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+	                        vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+	                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+	const bool write  = static_cast<bool>(destination_access & writes);
+	const bool pisada = mem_alias_pisada.exchange(false, std::memory_order_acq_rel);
+	if (write) {
+		const uint64_t lo = mem_alias_off, hi = mem_alias_off + mem_alias_size;
+		g->Lock();
+		for (Image* m: g->members)
+			if (m != this && m->mem_alias_off < hi && lo < m->mem_alias_off + m->mem_alias_size)
+				m->mem_alias_pisada.store(true, std::memory_order_release);
+		g->Unlock();
+	}
+	if (!pisada) return;
+	g_ma_reinicios.fetch_add(1, std::memory_order_relaxed);
+	if (!write && !mem_alias_mala.exchange(true, std::memory_order_acq_rel)) {
+		g_ma_malas.fetch_add(1, std::memory_order_relaxed);
+		{
+			std::lock_guard lock(g_ma_block_mutex);
+			g_ma_block.insert({info.data.address, info.data.size});
+		}
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("[rt-alias-mem] leida tras pisarla otra imagen del grupo: 0x%llx+0x%llx %ux%u fmt=%d -> se recrea "
+			            "con memoria propia y ese rango ya no comparte\n",
+			            static_cast<unsigned long long>(info.data.address), static_cast<unsigned long long>(info.data.size),
+			            info.extent.width, info.extent.height, static_cast<int>(info.pixel_format));
+			std::fflush(stdout);
+		}
+	}
+	const VulkanImageState reset {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite,
+	                              vk::ImageLayout::eUndefined, false};
+	if (spec_state != nullptr) {
+		*spec_state = reset;
+		if (spec_subresources != nullptr) spec_subresources->clear();
+	} else {
+		const StateLock lock(*this);
+		backing.state = reset;
+		backing.subresource_states.clear();
+		MoveImageStateEpoch();
+	}
+}
+
+bool Image::SharedWithOthers() const noexcept {
+	return share != nullptr && share->refs.load(std::memory_order_acquire) > 1;
+}
+
+void Image::SetShareSource(Image* source) noexcept {
+	t_share_source = source;
+}
+
+Image::DedupStats Image::Dedup() noexcept {
+	DedupStats d;
+	d.ahora_n          = g_dedup_ahora_n.load(std::memory_order_relaxed);
+	d.ahora_bytes      = g_dedup_ahora_bytes.load(std::memory_order_relaxed);
+	d.unidas           = g_dedup_unidas.load(std::memory_order_relaxed);
+	d.unidas_bytes     = g_dedup_unidas_bytes.load(std::memory_order_relaxed);
+	d.separadas        = g_dedup_separadas.load(std::memory_order_relaxed);
+	d.escrituras_tarde = g_dedup_tarde.load(std::memory_order_relaxed);
+	return d;
+}
+
+void Image::NoteDedupSeparated() noexcept {
+	g_dedup_separadas.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Image::NoteLateWrite() noexcept {
+	// Escritura en una VkImage compartida que FindImage no separo antes (p. ej. la CPU escribio entre FindImage y la
+	// subida): se cuenta, y los demas miembros quedan sucios, asi su siguiente FindImage los separa (copy-on-write) y
+	// se vuelven a crear desde su propia RAM. (Bajo m_lock de la cache, como toda subida o copia.)
+	Share* g = share;
+	if (g == nullptr || g->refs.load(std::memory_order_acquire) < 2) return;
+	g_dedup_tarde.fetch_add(1, std::memory_order_relaxed);
+	g->Lock();
+	for (Image* m: g->members)
+		if (m != this) m->InvalidateCpuWrite(m->info.data.address, m->info.data.size);
+	g->Unlock();
+}
+
+bool Image::TryJoinShare(Image& source, const vk::ImageCreateInfo& create) {
+	const auto& b = source.backing;
+	if (&source == this || b.image == nullptr || b.allocation == nullptr || b.sparse != nullptr ||
+	    b.format != create.format || b.image_type != create.imageType || b.extent != create.extent ||
+	    b.layers != create.arrayLayers || b.mip_levels != create.mipLevels ||
+	    b.samples != static_cast<uint32_t>(create.samples) || b.usage != create.usage || b.flags != create.flags)
+		return false;
+	if (source.share == nullptr) {
+		auto* g = new Share;
+		g->members.push_back(&source);
+		g->refs.store(1, std::memory_order_release);
+		g->bytes     = info.data.size;
+		source.share = g;
+	}
+	Share* g = source.share;
+	g->Lock();
+	{
+		const StateLock lock(source);
+		backing.state              = b.state;
+		backing.subresource_states = b.subresource_states;
+		transit_group              = source.transit_group;
+	}
+	backing.format     = b.format;
+	backing.image_type = b.image_type;
+	backing.extent     = b.extent;
+	backing.layers     = b.layers;
+	backing.mip_levels = b.mip_levels;
+	backing.samples    = b.samples;
+	backing.usage      = b.usage;
+	backing.flags      = b.flags;
+	backing.image      = b.image;
+	backing.allocation = b.allocation;
+	backing.sparse     = nullptr;
+	g->members.push_back(this);
+	g->refs.fetch_add(1, std::memory_order_acq_rel);
+	g->Unlock();
+	share       = g;
+	share_fresh = true;
+	g_dedup_ahora_n.fetch_add(1, std::memory_order_relaxed);
+	g_dedup_ahora_bytes.fetch_add(g->bytes, std::memory_order_relaxed);
+	g_dedup_unidas.fetch_add(1, std::memory_order_relaxed);
+	g_dedup_unidas_bytes.fetch_add(g->bytes, std::memory_order_relaxed);
+	return true;
+}
+
+void Image::PushSharedState() {
+	Share* g = share;
+	if (g == nullptr || g->refs.load(std::memory_order_acquire) < 2) return;
+	g->Lock();
+	bool moved = false;
+	for (Image* m: g->members) {
+		if (m == this) continue;
+		const StateLock lock(*m);
+		m->backing.state              = backing.state;
+		m->backing.subresource_states = backing.subresource_states;
+		m->transit_group              = transit_group;
+		moved                         = true;
+	}
+	g->Unlock();
+	if (moved) MoveImageStateEpoch();
+}
+
+namespace {
+// (M7) Al salir de una transicion (por cualquier return, ya soltado el StateLock propio): el estado al resto del grupo.
+struct SharePush {
+	explicit SharePush(Image& i, bool on) noexcept: image(i), active(on && i.share != nullptr) {}
+	~SharePush() {
+		if (active) image.PushSharedState();
+	}
+	Image& image;
+	bool   active;
+	SharePush(const SharePush&)            = delete;
+	SharePush& operator=(const SharePush&) = delete;
+};
+} // namespace
+
 // A speculative translation's image state (speculation-state.h): its own, from the image's when it first used it;
 // the open segment notes how it found it.
 Spec::ImageEntry* Image::SpeculativeEntry() {
@@ -162,6 +519,10 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
 	auto* const entry = SpeculativeEntry();
+	const SharePush share_push(*this, entry == nullptr); // (M7) declarado antes del StateLock: corre despues de soltarlo
+	if (mem_alias.load(std::memory_order_relaxed) != nullptr) // (RT-ALIAS-MEM)
+		MemAliasBeforeUse(destination_access, entry != nullptr ? &entry->state : nullptr,
+		                  entry != nullptr ? &entry->subresources : nullptr);
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
@@ -182,17 +543,38 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	const bool     guest        = g_transit_group != 0;
 	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
 	                              vk::AccessFlagBits2::eMemoryWrite;
-	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group) {
+	// (p7b, C2: local/p7-compat.h) A transition is dropped only where it is redundant: the same layout and access, the
+	// destination stages covered by the last barrier's (StageUncovered otherwise), and a repeated write in one transit
+	// group (the dedupe) only while no writing command was recorded on this thread since this image's last transition,
+	// for a whole-image state that is not a speculation's (DedupeUnproven otherwise). Counted in any mode but
+	// KYTY_P7=0; with KYTY_P7_C2 the barrier is recorded. `is_final`: the caller takes a false as the answer (the fast path
+	// asks again under the lock: counted there).
+	const bool     precise      = P7::PreciseBarriers();
+	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group, bool is_final) {
+		if (state.layout != destination_layout || state.access_mask != destination_access) return false;
+		// The old rule's answer first.
 		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
-		return state.layout == destination_layout && state.access_mask == destination_access &&
-		       (!repeated_write || (guest && state.guest) ||
-		        (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group));
+		const bool by_guest       = !repeated_write || (guest && state.guest);
+		const bool by_dedupe      = !by_guest && DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group;
+		if (!by_guest && !by_dedupe) return false;
+		const bool     uncovered = !StagesCover(state.pl_stage, destination_stage);
+		const uint64_t now       = by_dedupe ? RecordedWritesNow() : 0;
+		const bool     unproven  = by_dedupe && !(entry == nullptr && !partial && now != UINT64_MAX && transit_writes == now);
+		const bool     in        = !(precise && (uncovered || unproven));
+		// (Counted once: where the answer is true, or final.)
+		if ((in || is_final) && P7::Tracking()) {
+			if (by_dedupe) P7::Add(P7::DedupeDrops);
+			if (uncovered) P7::Add(P7::StageUncovered);
+			if (unproven) P7::Add(P7::DedupeUnproven);
+			if (!in) P7::Add(P7::PreciseAdded);
+		}
+		return in;
 	};
 	// An image already in the layout and access as a whole (a table draw's textures, every draw): nothing changes, so
 	// neither the state lock nor the state epoch, which moving made every table draw after it check and transit its
 	// images again. The barrier state's writer is this thread (the presentation's own transitions run under the
 	// renderer's lock); a speculation's thread only reads it, under the lock.
-	if (entry == nullptr && !partial && backing.subresource_states.empty() && in_place(backing.state, transit_group))
+	if (entry == nullptr && !partial && backing.subresource_states.empty() && in_place(backing.state, transit_group, false))
 		return barriers;
 	// The same for a part of it (a view's levels or layers: textures streamed in from their small levels, sampled from
 	// a base level above 0), read only: the image, as a whole or in each subresource of the part, already in the layout
@@ -200,14 +582,16 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 	// (every table draw after it checked and transited its images again) and split a uniform image into subresource
 	// states for good, which every later transition of it walked.
 	if (entry == nullptr && partial && !static_cast<bool>(destination_access & write_access) &&
-	    backing.state.layout == destination_layout && backing.state.access_mask == destination_access) {
+	    backing.state.layout == destination_layout && backing.state.access_mask == destination_access &&
+	    (!precise || StagesCover(backing.state.pl_stage, destination_stage))) {
 		bool all = true;
 		for (uint32_t level = range->base_level;
 		     all && !backing.subresource_states.empty() && level < range->base_level + range->level_count; ++level)
 			for (uint32_t layer = range->base_layer; layer < range->base_layer + range->layer_count; ++layer) {
 				const auto index = level * info.resources.layers + layer;
 				if (index >= backing.subresource_states.size() || backing.subresource_states[index].layout != destination_layout ||
-				    backing.subresource_states[index].access_mask != destination_access) {
+				    backing.subresource_states[index].access_mask != destination_access ||
+				    (precise && !StagesCover(backing.subresource_states[index].pl_stage, destination_stage))) {
 					all = false;
 					break;
 				}
@@ -241,8 +625,18 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 				const bool repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access) &&
 				    !(guest && subresource_state.guest);
+				// (p7b, C2: the destination stages covered, as in_place's.)
+				bool uncovered = false;
+				if (subresource_state.layout == destination_layout && subresource_state.access_mask == destination_access &&
+				    !repeated_write && !StagesCover(subresource_state.pl_stage, destination_stage)) {
+					if (P7::Tracking()) P7::Add(P7::StageUncovered);
+					if (precise) {
+						uncovered = true;
+						P7::Add(P7::PreciseAdded);
+					}
+				}
 				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				    subresource_state.access_mask != destination_access || repeated_write || uncovered) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -268,7 +662,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 			subresource_states.clear();
 		}
 	} else {
-		if (in_place(state, group)) return barriers;
+		if (in_place(state, group, true)) return barriers;
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;
@@ -290,6 +684,7 @@ const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      d
 
 	state = {destination_stage, destination_access, destination_layout, guest};
 	group = g_transit_group;
+	if (entry == nullptr) transit_writes = RecordedWritesNow(); // (p7b, C2)
 	return barriers;
 }
 
@@ -304,6 +699,7 @@ const VulkanImageState& Image::CurrentState() const {
 
 void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
                          vk::CommandBuffer command_buffer) {
+	const SharePush       share_push(*this, true); // (M7) tras soltar el StateLock
 	const StateLock       lock(*this);
 	MoveImageStateEpoch();
 	thread_local Barriers barriers;
@@ -371,6 +767,7 @@ void EndTransitGroup() noexcept {
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	Envio1::Scope  envio1_layout(Envio1::TexLayout); // (envio1: a transition that records a barrier)
 	constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
 	                        vk::AccessFlagBits2::eColorAttachmentWrite |
 	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
@@ -392,11 +789,23 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
+	// (p7, C7: local/p7-compat.h) The first use of a new image (fresh or from the pool: undefined contents) that may read
+	// it: counted in any mode; with KYTY_P7_C7 the image is cleared to 0 first (AMD's DCC metadata undefined otherwise).
+	constexpr auto reads = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderSampledRead |
+	                       vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eColorAttachmentRead |
+	                       vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eTransferRead |
+	                       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eInputAttachmentRead;
+	if (backing.state.layout == vk::ImageLayout::eUndefined && backing.subresource_states.empty() &&
+	    backing.image != nullptr && static_cast<bool>(destination_access & reads) && SpeculativeEntry() == nullptr) {
+		P7::Add(P7::UndefinedReads);
+		if (P7::ClearNewImages()) P7::Add(ClearUndefined(command_buffer) ? P7::ImagesCleared : P7::UndefinedSkipped);
+	}
 	const auto& barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	// KYTY_ASYNC_COMPUTE: a layout transition is a write of the image too (the other lane must be done with it).
 	LaneSync::Note(lane_marks, static_cast<bool>(destination_access & writes) || !barriers.empty());
 	if (barriers.empty()) {
+		envio1_layout.Drop();
 		return;
 	}
 	m_scheduler.EndRendering();
@@ -406,8 +815,40 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	command_buffer.pipelineBarrier2(dependency);
 }
 
+// (p7, C7) The whole image cleared to 0 (color) or depth 0 / stencil 0, leaving it in TRANSFER_DST_OPTIMAL (its state
+// says so: the caller's transition goes on from there). False when it cannot be cleared that way (no transfer
+// destination use, a block-compatible view format).
+bool Image::ClearUndefined(vk::CommandBuffer command_buffer) {
+	if (!(backing.usage & vk::ImageUsageFlagBits::eTransferDst) ||
+	    static_cast<bool>(backing.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) || info.IsBlock())
+		return false;
+	const auto aspect = FullAspectMask(backing.format);
+	const bool color  = aspect == vk::ImageAspectFlagBits::eColor;
+	if (!color && !(backing.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment)) return false;
+	const auto& to_transfer = GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                                      vk::PipelineStageFlagBits2::eTransfer, {});
+	m_scheduler.EndRendering();
+	if (!to_transfer.empty()) {
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = static_cast<uint32_t>(to_transfer.size());
+		dependency.pImageMemoryBarriers    = to_transfer.data();
+		command_buffer.pipelineBarrier2(dependency);
+	}
+	const vk::ImageSubresourceRange whole {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+	if (color) {
+		const vk::ClearColorValue zero {};
+		command_buffer.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	} else {
+		const vk::ClearDepthStencilValue zero {0.0f, 0};
+		command_buffer.clearDepthStencilImage(backing.image, vk::ImageLayout::eTransferDstOptimal, &zero, 1, &whole);
+	}
+	return true;
+}
+
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
+	NoteLateWrite(); // (M7, TEX-DEDUP)
+	const Envio1::Scope envio1_dirty(Envio1::Dirty); // (envio1: a texture's dirty data)
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
@@ -506,6 +947,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 }
 
 void Image::CopyImage(Image& source) {
+	NoteLateWrite(); // (M7, TEX-DEDUP)
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -559,6 +1001,7 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	NoteLateWrite(); // (M7, TEX-DEDUP)
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
@@ -624,6 +1067,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 }
 
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
+	NoteLateWrite(); // (M7, TEX-DEDUP)
 	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 || backing.samples != 1);
 	m_scheduler.EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
@@ -715,6 +1159,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	NoteLateWrite(); // (M7, TEX-DEDUP)
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -888,6 +1333,29 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0;
 	}();
 	const bool test_fail = test_fail_above != 0 && info.data.size > test_fail_above;
+	// (M7, TEX-DEDUP) Alias de la VkImage de otra imagen con el mismo contenido (TextureCache::FindImage lo pide).
+	if (Image* source = t_share_source; source != nullptr) {
+		t_share_source = nullptr;
+		if (within_limits && !test_fail && TryJoinShare(*source, create)) return;
+	}
+	// (RT-ALIAS-MEM) Ligada a la memoria de otra imagen de la arena RT del juego que contiene su rango; si no, un RT de
+	// las arenas con memoria que admite alias (para que otros puedan ligarse a ella).
+	if (t_alias_for != 0 && t_alias_for == info.data.address) {
+		Image* const   host    = t_alias_host;
+		const uint64_t offset  = t_alias_offset;
+		const bool     capable = t_alias_capable;
+		t_alias_host           = nullptr;
+		t_alias_capable        = false;
+		t_alias_for            = 0;
+		if (host != nullptr && within_limits && !test_fail && TryJoinMemAlias(*host, offset, create)) return;
+		if (capable && within_limits && !test_fail && create.pNext == nullptr && CreateAliasCapable(create)) return;
+	}
+	// (ram1b, KYTY_RAM_NATIVE_TEX=1|2) A texture array of the game's VirtualMemoryGPU zone: sparse, video memory for the
+	// layers the game has committed (sparseImage.cpp); refused there, dense as before.
+	if (within_limits && !test_fail && SparseImageWanted(graphics, info, create) && CreateSparseImage(graphics, create, backing)) {
+		SparseUpdate(info.data.address, info.data.End());
+		return;
+	}
 	if ((may_fail && (!within_limits || test_fail)) || !graphics.CreateImage(create, backing)) {
 		m_create_failed = true;
 		static std::atomic<uint32_t> reports {0};
@@ -931,6 +1399,27 @@ void Image::PrepareReuse(const ImageInfo& image_info) {
 	level_begin         = 0;
 	level_end           = 0;
 	++validity;
+	// (ram1b) A sparse image reused for another description (TakeParkedImage, the GPU thread): its layers bound as its
+	// new memory is committed.
+	if (IsSparse()) SparseUpdate(0, UINT64_MAX);
+}
+
+void Image::SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin, uint64_t gone_end) {
+	if (backing.sparse == nullptr || info.data.Empty() || info.resources.layers == 0) return;
+	// (N1, KYTY_TEX_NATIVA) Textura nativa: memoria de video por mip, la de los mips que el juego tiene comprometidos.
+	if (SparseIsPerLevel(backing)) {
+		const uint32_t levels = std::min<uint32_t>(info.resources.levels, static_cast<uint32_t>(info.mip_layout.size()));
+		uint64_t       offsets[16] {}, sizes[16] {};
+		for (uint32_t level = 0; level < levels && level < 16; level++) {
+			offsets[level] = info.mip_layout[level].offset;
+			sizes[level]   = info.mip_layout[level].size;
+		}
+		SparseUpdateLevels(m_graphics, m_scheduler, backing, info.data.address, offsets, sizes, levels,
+		                   TexNativa::MinLevel(info.data.address), begin, end, gone_begin, gone_end);
+		return;
+	}
+	const uint64_t stride = info.data.size / info.resources.layers;
+	SparseUpdateLayers(m_graphics, m_scheduler, backing, info.data.address, stride, begin, end, gone_begin, gone_end);
 }
 
 uint64_t Image::HashGuestEdges() const {
@@ -956,6 +1445,53 @@ Image::~Image() {
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
+		}
+	}
+	if (MemAlias* g = mem_alias.exchange(nullptr, std::memory_order_acq_rel); g != nullptr) { // (RT-ALIAS-MEM)
+		g->Lock();
+		std::erase(g->members, this);
+		const bool was_host = g->host == this;
+		if (was_host) g->host = nullptr;
+		const bool last = g->members.empty();
+		g->Unlock();
+		if (!was_host) {
+			// Sin asignacion propia: solo su VkImage (la cache la retira cuando la GPU ya no la usa).
+			if (backing.image != nullptr) m_graphics.device.destroyImage(backing.image, nullptr);
+			backing.image = nullptr;
+			g_ma_ahora_n.fetch_sub(1, std::memory_order_relaxed);
+			g_ma_ahora_bytes.fetch_sub(std::min(mem_alias_size, g_ma_ahora_bytes.load(std::memory_order_relaxed)),
+			                           std::memory_order_relaxed);
+			if (last) {
+				// El dueno ya se fue: la memoria es del grupo.
+				vmaFreeMemory(g->allocator, g->allocation);
+				delete g;
+			}
+		} else if (!last) {
+			// Quedan miembros ligados a esta memoria: se destruye la VkImage y la asignacion la suelta el ultimo.
+			if (backing.image != nullptr) m_graphics.device.destroyImage(backing.image, nullptr);
+			backing.image      = nullptr;
+			backing.allocation = nullptr;
+		} else {
+			delete g; // solo quedaba el dueno: DeleteImage normal abajo
+		}
+	}
+	if (Share* g = share; g != nullptr) { // (M7, TEX-DEDUP) la VkImage se libera con el ultimo miembro
+		share = nullptr;
+		g->Lock();
+		std::erase(g->members, this);
+		const int  left = g->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+		const bool last = g->members.empty();
+		g->Unlock();
+		if (left >= 1) { // el grupo tenia >= 2: una copia menos ahorrada
+			g_dedup_ahora_n.fetch_sub(1, std::memory_order_relaxed);
+			g_dedup_ahora_bytes.fetch_sub(std::min(g->bytes, g_dedup_ahora_bytes.load(std::memory_order_relaxed)),
+			                              std::memory_order_relaxed);
+		}
+		if (last) {
+			delete g;
+		} else {
+			backing.image      = nullptr; // de los demas
+			backing.allocation = nullptr;
 		}
 	}
 	if (backing.image != nullptr) {

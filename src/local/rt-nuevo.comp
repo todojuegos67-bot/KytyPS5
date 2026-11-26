@@ -1,0 +1,323 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// (rtq2 b, compilacion 2) KYTY_RTN (rt-nuevo.cpp): hardware ray-traced reflections where the game reflects, composited by
+// the GAME: the result is blended into the game's specular IBL image (kRTT_SpecularIBL, the output of CS 9fb5cc274b5e4f82)
+// right after that dispatch of the NEXT frame (mode 4), so the game's own Fresnel / BRDF / occlusion / albedo apply.
+// Modes (push.misc.x):
+//   0 trace     (half the render size; a quarter of the pixels a frame, 2x2 pattern over 4 frames): mask = the game's SSR
+//               tiles (bilinear over the 16 px tiles: no block edges) x roughness (nothing from 0.6: the cubemap rules
+//               there) x screen-edge fade; N = geometric normal (bent towards the camera when it faces away); one ray
+//               query (<= p0.y m); the hit's colour = this frame's screen at the hit when it is visible there (depth
+//               check), else nothing (the game's IBL stays). out_a: rgb colour, a confidence; out_b: x view distance,
+//               y 1 traced this frame, z roughness.
+//   1 temporal  reprojection of the history by the pixel's world point (camera motion), distance check; traced pixels
+//               blend in (0.3), untraced keep the history or take their 2x2 block's traced pixel.
+//   2 spatial   3x3 depth-aware blur of the history (no tile blocks, less noise) -> the result read by mode 4 next frame.
+//   3 debug     (render size, KYTY_RTN=2) after the game's exposure, 50 % overlay: green confidence, blue the game's mask.
+//   4 inject    (the IBL image's size) ibl.rgb = mix(ibl.rgb, result(previous frame, reprojected), confidence).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D  depth_tex; // point, render size
+layout(binding = 1) uniform sampler2D  color_tex; // linear, render size (trace: hit colour; debug)
+layout(binding = 2) uniform usampler2D gb1;       // layer 1 (12+12 shading normal, byte 3 roughness)
+layout(binding = 3) uniform usampler2D gb2;       // layer 2 (bit 0 flag, bits 2-3 class)
+layout(binding = 4) uniform usampler2D gb3;       // layer 3 (geometric normal)
+layout(binding = 5) uniform usampler2D tiles;     // the game's SSR tile mask (R8_UINT)
+layout(binding = 6, rgba16f) uniform writeonly image2D out_a;
+layout(binding = 7, rgba16f) uniform writeonly image2D out_b;
+layout(binding = 8) uniform sampler2D src_a;      // linear: the mode's colour input
+layout(binding = 9) uniform sampler2D src_b;      // point: the mode's aux input
+layout(binding = 10, std430) readonly buffer Params {
+	vec4 ivp[4]; // clip -> world rows (this frame)
+	vec4 vp[4];  // world -> clip rows (this frame)
+	vec4 pvp[4]; // world -> clip rows (the history's frame)
+	vec4 cam;    // xyz camera
+	vec4 p0;     // x sign of row 0 (-1: NDC y +1), y max ray distance, z ray start offset, w strength
+} pb;
+layout(binding = 11) uniform accelerationStructureEXT scene_tlas;
+layout(binding = 12, std430) buffer Stats { uint s[]; } stats;
+layout(binding = 13, rgba16f) uniform image2D ibl_img; // mode 4: the game's specular IBL (read + write)
+layout(binding = 14, std430) readonly buffer Exposure { float e[]; } exposure;
+
+layout(push_constant) uniform Push {
+	vec4  size; // render size xy, trace size zw
+	ivec4 misc; // mode, frame, tile size (render px), flags (1 history valid, 2 tiles valid)
+	ivec4 tsz;  // tile image size xy, z exposure index, w unused
+	vec4  isz;  // xy the IBL image's size (mode 4)
+} push;
+
+const int NStat = 10;
+uint g_st[NStat];
+// stats: 0 sampled (1 in 16 trace px), 1 in the mask, 2 traced this frame, 3 rays, 4 on-screen hits, 5 normals bent,
+// 6 rough skipped, 7 injected pixels (1 in 16), 8 injected weight x1000, 9 history kept
+
+vec2 RenderSize() { return push.size.xy; }
+vec2 TraceSize() { return push.size.zw; }
+bool Flag(int f) { return (push.misc.w & f) != 0; }
+bool IsSky(float d) { return d <= 1e-7 || d >= 0.9999999; }
+bool BadV(vec3 v) { return any(isnan(v)) || any(isinf(v)); }
+float Max3(vec3 c) { return max(c.r, max(c.g, c.b)); }
+
+vec3 WorldPos(vec2 uv, float d) {
+	vec4 c = vec4(uv.x * 2.0 - 1.0, pb.p0.x * (uv.y * 2.0 - 1.0), d, 1.0);
+	vec4 w = vec4(dot(pb.ivp[0], c), dot(pb.ivp[1], c), dot(pb.ivp[2], c), dot(pb.ivp[3], c));
+	return w.xyz / (abs(w.w) > 1e-20 ? w.w : 1e-20);
+}
+vec4 ToScreen(vec4 m0, vec4 m1, vec4 m2, vec4 m3, vec3 p) {
+	vec4 q = vec4(p, 1.0);
+	vec4 c = vec4(dot(m0, q), dot(m1, q), dot(m2, q), dot(m3, q));
+	if (c.w <= 1e-6) return vec4(-1.0, -1.0, 0.0, 0.0);
+	return vec4(c.x / c.w * 0.5 + 0.5, pb.p0.x * (c.y / c.w) * 0.5 + 0.5, c.z / c.w, 1.0);
+}
+vec4 Project(vec3 p) { return ToScreen(pb.vp[0], pb.vp[1], pb.vp[2], pb.vp[3], p); }
+vec4 ProjectPrev(vec3 p) { return ToScreen(pb.pvp[0], pb.pvp[1], pb.pvp[2], pb.pvp[3], p); }
+bool InScreen(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0))); }
+ivec2 ClampPx(ivec2 p) { return clamp(p, ivec2(0), ivec2(RenderSize()) - 1); }
+float DepthAt(ivec2 p) { return texelFetch(depth_tex, ClampPx(p), 0).r; }
+
+vec3 Oct(float x, float y) {
+	float z = 1.0 - abs(x) - abs(y);
+	if (z < 0.0) {
+		float fx = (x >= 0.0 ? 1.0 : -1.0) * (1.0 - abs(y));
+		float fy = (y >= 0.0 ? 1.0 : -1.0) * (1.0 - abs(x));
+		x = fx;
+		y = fy;
+	}
+	vec3 n = vec3(x, y, z);
+	float l = length(n);
+	return l > 1e-12 ? n / l : vec3(0.0, 1.0, 0.0);
+}
+vec3 Oct12(uint w) { return Oct(float(w & 0xfffu) * (1.0 / 1023.5) - 1.0, float((w >> 12u) & 0xfffu) * (1.0 / 1023.5) - 1.0); }
+vec3 Oct8(uint w) { return Oct(float(w & 0xffu) * (1.0 / 127.5) - 1.0, float((w >> 8u) & 0xffu) * (1.0 / 127.5) - 1.0); }
+
+// The game's SSR tiles, bilinear over the tile grid (0..1): tile edges fade over one tile instead of a 16 px step.
+float TileMask(vec2 rpix) {
+	if (!Flag(2) || push.misc.z <= 0) return 0.0;
+	vec2  t  = rpix / float(push.misc.z) - 0.5;
+	ivec2 t0 = ivec2(floor(t));
+	vec2  f  = t - vec2(t0);
+	ivec2 hi = push.tsz.xy - 1;
+	float a = texelFetch(tiles, clamp(t0, ivec2(0), hi), 0).r != 0u ? 1.0 : 0.0;
+	float b = texelFetch(tiles, clamp(t0 + ivec2(1, 0), ivec2(0), hi), 0).r != 0u ? 1.0 : 0.0;
+	float c = texelFetch(tiles, clamp(t0 + ivec2(0, 1), ivec2(0), hi), 0).r != 0u ? 1.0 : 0.0;
+	float d = texelFetch(tiles, clamp(t0 + ivec2(1, 1), ivec2(0), hi), 0).r != 0u ? 1.0 : 0.0;
+	return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+bool TracedThisFrame(ivec2 tp) {
+	if (!Flag(1)) return true; // (no history: every pixel)
+	int k = (tp.x & 1) | ((tp.y & 1) << 1);
+	return k == (push.misc.y & 3);
+}
+
+void Trace(ivec2 tp, bool st) {
+	vec4 a = vec4(0.0), b = vec4(0.0);
+	ivec2 rp  = ClampPx(tp * 2);
+	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
+	float d   = DepthAt(rp);
+	vec3  P   = WorldPos(ruv, d);
+	b.x       = IsSky(d) ? 0.0 : length(P - pb.cam.xyz);
+	if (!TracedThisFrame(tp)) {
+		imageStore(out_a, tp, a);
+		imageStore(out_b, tp, b);
+		return;
+	}
+	b.y = 1.0;
+	if (st) g_st[2] += 1u;
+	float m = IsSky(d) ? 0.0 : TileMask(vec2(rp) + 0.5);
+	if (m > 0.001) {
+		if (st) g_st[1] += 1u;
+		uint w1 = texelFetch(gb1, rp, 0).r;
+		uint w2 = texelFetch(gb2, rp, 0).r;
+		uint w3 = texelFetch(gb3, rp, 0).r;
+		uint cls = (w2 >> 2u) & 3u;
+		vec3 N;
+		if (cls == 1u) N = Oct12(w3);
+		else if (cls == 2u || (cls == 0u && (w2 & 1u) != 0u)) N = Oct8(w3);
+		else N = Oct12(w1);
+		float rough = float((w1 >> 24u) & 0xffu) * (1.0 / 255.0);
+		b.z = rough;
+		vec3 V = P - pb.cam.xyz;
+		float dist = length(V);
+		V = dist > 1e-6 ? V / dist : vec3(0.0, 0.0, 1.0);
+		// (an interpolated vertex normal can face away at grazing angles: bent just towards the camera)
+		float nv = dot(N, V);
+		if (nv > -0.02) {
+			N = normalize(N - V * (nv + 0.02));
+			if (st) g_st[5] += 1u;
+		}
+		float rw = 1.0 - smoothstep(0.35, 0.6, rough);
+		if (rw <= 0.0) {
+			if (st) g_st[6] += 1u;
+		} else {
+			vec3 R = reflect(V, N);
+			if (!BadV(P) && !BadV(R) && dot(R, R) > 0.5) {
+				if (st) g_st[3] += 1u;
+				vec3 o = P + N * (pb.p0.z * (1.0 + dist * 0.002));
+				rayQueryEXT rq;
+				rayQueryInitializeEXT(rq, scene_tlas, gl_RayFlagsOpaqueEXT, 0xff, o, 0.01, R, pb.p0.y);
+				while (rayQueryProceedEXT(rq)) {}
+				if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+					float t  = rayQueryGetIntersectionTEXT(rq, true);
+					vec3  H  = o + R * t;
+					vec4  hs = Project(H);
+					if (hs.w > 0.5 && InScreen(hs.xy)) {
+						ivec2 hp  = ClampPx(ivec2(hs.xy * RenderSize()));
+						float hd  = DepthAt(hp);
+						vec3  HS  = WorldPos((vec2(hp) + 0.5) / RenderSize(), hd);
+						float err = length(HS - H);
+						float vis = 1.0 - smoothstep(0.03 * t + 0.08, 0.06 * t + 0.25, err);
+						if (vis > 0.0 && !IsSky(hd)) {
+							vec3 col = textureLod(color_tex, hs.xy, 0.0).rgb;
+							if (!BadV(col)) {
+								vec2  e    = min(hs.xy, 1.0 - hs.xy);
+								float edge = smoothstep(0.0, 0.06, min(e.x, e.y));
+								a = vec4(clamp(col, vec3(0.0), vec3(6.0e4)), m * rw * vis * edge);
+								if (st) g_st[4] += 1u;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	imageStore(out_a, tp, a);
+	imageStore(out_b, tp, b);
+}
+
+// mode 1: src_a = raw (this frame, point), src_b = raw aux (point), color_tex = the previous history (linear),
+// ibl_img = the previous history's aux (imageLoad); out_a / out_b = the new history and its aux.
+void Temporal(ivec2 tp, bool st) {
+	vec4 raw  = texelFetch(src_a, tp, 0);
+	vec4 rawb = texelFetch(src_b, tp, 0);
+	ivec2 rp  = ClampPx(tp * 2);
+	vec2  ruv = (vec2(rp) + 0.5) / RenderSize();
+	float d   = DepthAt(rp);
+	float dist = rawb.x;
+	vec4 outa = raw, outb = vec4(dist, 1.0, rawb.z, 0.0);
+	bool valid = false;
+	vec4 hist = vec4(0.0);
+	if (Flag(1) && !IsSky(d)) {
+		vec3 P  = WorldPos(ruv, d);
+		vec4 ps = ProjectPrev(P);
+		if (ps.w > 0.5 && InScreen(ps.xy)) {
+			ivec2 hp = clamp(ivec2(ps.xy * TraceSize()), ivec2(0), ivec2(TraceSize()) - 1);
+			vec4 ha  = imageLoad(ibl_img, hp);
+			if (ha.y > 0.5 && abs(ha.x - dist) < 0.05 * dist + 0.1) {
+				hist  = textureLod(color_tex, ps.xy, 0.0);
+				valid = !BadV(hist.rgb) && !isnan(hist.a);
+			}
+		}
+	}
+	if (rawb.y > 0.5) {
+		outa = valid ? mix(hist, raw, 0.3) : raw;
+	} else if (valid) {
+		outa = hist;
+		if (st) g_st[9] += 1u;
+	} else {
+		// (not traced this frame and no history: the 2x2 block's pixel traced this frame)
+		ivec2 base = tp & ~1;
+		int   k    = push.misc.y & 3;
+		ivec2 q    = clamp(base + ivec2(k & 1, k >> 1), ivec2(0), ivec2(TraceSize()) - 1);
+		outa       = texelFetch(src_a, q, 0);
+	}
+	if (IsSky(d)) outb.y = 0.0;
+	imageStore(out_a, tp, outa);
+	imageStore(out_b, tp, outb);
+}
+
+// mode 2: src_a = history (point use), src_b = history aux; 3x3 depth-aware.
+void Spatial(ivec2 tp) {
+	vec4  c0 = texelFetch(src_a, tp, 0);
+	float d0 = texelFetch(src_b, tp, 0).x;
+	vec4  sum = vec4(0.0);
+	float ws  = 0.0;
+	for (int y = -1; y <= 1; ++y)
+		for (int x = -1; x <= 1; ++x) {
+			ivec2 q = clamp(tp + ivec2(x, y), ivec2(0), ivec2(TraceSize()) - 1);
+			vec4  c = texelFetch(src_a, q, 0);
+			float d = texelFetch(src_b, q, 0).x;
+			float w = (x == 0 && y == 0 ? 2.0 : 1.0) * exp(-abs(d - d0) / (0.02 * d0 + 0.05));
+			// (colour weighted by confidence: misses do not darken the hits around them)
+			sum.rgb += c.rgb * c.a * w;
+			sum.a += c.a * w;
+			ws += w;
+		}
+	vec4 o = vec4(sum.a > 1e-4 ? sum.rgb / sum.a : c0.rgb, ws > 0.0 ? sum.a / ws : 0.0);
+	if (BadV(o.rgb) || isnan(o.a)) o = vec4(0.0);
+	imageStore(out_a, tp, o);
+}
+
+float GameExposure() {
+	float x = exposure.e[push.tsz.z];
+	return (x > 1e-12 && x < 1e12) ? x : 1.0;
+}
+// mode 3: src_a = the result (linear); colour, tiles.
+void Debug(ivec2 p) {
+	vec2 uv = (vec2(p) + 0.5) / RenderSize();
+	vec3 c  = textureLod(color_tex, uv, 0.0).rgb;
+	float e = GameExposure();
+	vec3 t  = c * e;
+	t       = t / (1.0 + Max3(t));
+	vec4 r  = textureLod(src_a, uv, 0.0);
+	float m = TileMask(vec2(p) + 0.5);
+	vec3 o  = mix(t, vec3(0.05, 0.2, 0.9), 0.35 * m * (1.0 - clamp(r.a, 0.0, 1.0)));
+	o       = mix(o, vec3(0.1, 0.95, 0.2), 0.5 * clamp(r.a, 0.0, 1.0));
+	o       = clamp(o, vec3(0.0), vec3(0.95));
+	o       = o / max(1.0 - Max3(o), 0.05) / e;
+	if (BadV(o)) o = c;
+	imageStore(out_a, p, vec4(o, 1.0));
+}
+
+// mode 4: src_a = the result of the previous frame (linear), src_b = its aux (point).
+void Inject(ivec2 ip, bool st) {
+	vec2  isz = push.isz.xy;
+	vec2  uv  = (vec2(ip) + 0.5) / isz;
+	ivec2 rp  = ClampPx(ivec2(uv * RenderSize()));
+	float d   = DepthAt(rp);
+	if (IsSky(d)) return;
+	vec3 P  = WorldPos((vec2(rp) + 0.5) / RenderSize(), d);
+	vec4 ps = ProjectPrev(P);
+	if (ps.w < 0.5 || !InScreen(ps.xy)) return;
+	ivec2 hp   = clamp(ivec2(ps.xy * TraceSize()), ivec2(0), ivec2(TraceSize()) - 1);
+	vec4  aux  = texelFetch(src_b, hp, 0);
+	float dist = length(P - pb.cam.xyz);
+	if (aux.y < 0.5 || abs(aux.x - dist) > 0.05 * dist + 0.1) return;
+	vec4 r = textureLod(src_a, ps.xy, 0.0);
+	float w = clamp(r.a * pb.p0.w, 0.0, 1.0);
+	if (w <= 0.002 || BadV(r.rgb)) return;
+	vec4 g = imageLoad(ibl_img, ip);
+	if (BadV(g.rgb)) return;
+	imageStore(ibl_img, ip, vec4(mix(g.rgb, r.rgb, w), g.a));
+	if (st) {
+		g_st[7] += 1u;
+		g_st[8] += uint(w * 1000.0);
+	}
+}
+
+void main() {
+	for (int i = 0; i < NStat; ++i) g_st[i] = 0u;
+	ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+	bool  st   = (p.x & 3) == 0 && (p.y & 3) == 0;
+	int   mode = push.misc.x;
+	if (mode == 0) {
+		if (all(lessThan(p, ivec2(TraceSize())))) {
+			if (st) g_st[0] += 1u;
+			Trace(p, st);
+		}
+	} else if (mode == 1) {
+		if (all(lessThan(p, ivec2(TraceSize())))) Temporal(p, st);
+	} else if (mode == 2) {
+		if (all(lessThan(p, ivec2(TraceSize())))) Spatial(p);
+	} else if (mode == 3) {
+		if (all(lessThan(p, ivec2(RenderSize())))) Debug(p);
+	} else {
+		if (all(lessThan(p, ivec2(push.isz.xy)))) Inject(p, st);
+	}
+	for (int i = 0; i < NStat; ++i) {
+		uint s = subgroupAdd(g_st[i]);
+		if (subgroupElect() && s > 0u) atomicAdd(stats.s[i], s);
+	}
+}

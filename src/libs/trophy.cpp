@@ -14,7 +14,9 @@
 #include <cctype>
 #include <atomic>
 #include <chrono>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -174,6 +176,351 @@ struct Entry {
 	std::vector<uint32_t> icon;
 };
 
+// (rando1) The randomizer's bosses: the game's boss-fight activity (uds00.ucp, DsActivityStart/End activityId; "completed"
+// = the archdemon defeated, as Tut2Van for the Vanguard) and its trophy, in the game's order (1-1 .. 5-3, then the Old One).
+struct RandoBoss {
+	const char* activity;
+	const char* name_es;
+	const char* detail_es;
+	const char* name_en;
+	const char* detail_en;
+};
+const RandoBoss kRandoBosses[] = {
+	{"Phlx", "Muro de escudos roto", "Randomizer: derrota a la Falange.", "Shieldwall Broken", "Randomizer: defeat the Phalanx."},
+	{"ToKn", "La torre se inclina", "Randomizer: derrota al Caballero de la Torre.", "The Tower Kneels", "Randomizer: defeat the Tower Knight."},
+	{"Pent", "Acero contra acero", "Randomizer: derrota al Penetrador.", "Steel Against Steel", "Randomizer: defeat the Penetrator."},
+	{"FalK", "Corona de ceniza", "Randomizer: derrota al Falso Rey.", "Crown of Ash", "Randomizer: defeat the False King."},
+	{"ArmS", "Telar de fuego", "Randomizer: derrota a la Arañ" "a Acorazada.", "Loom of Fire", "Randomizer: defeat the Armor Spider."},
+	{"FlmL", "Brasa apagada", "Randomizer: derrota al Acechador de Fuego.", "Ember Quenched", "Randomizer: defeat the Flamelurker."},
+	{"DrgG", "El dios caí" "do", "Randomizer: derrota al Dios Dragón.", "The Fallen God", "Randomizer: defeat the Dragon God."},
+	{"Fool", "Reflejo quebrado", "Randomizer: derrota al Í" "dolo Necio.", "Broken Reflection", "Randomizer: defeat the Fool's Idol."},
+	{"ManE", "Alas en la niebla", "Randomizer: derrota al Devorahombres.", "Wings in the Mist", "Randomizer: defeat the Maneater."},
+	{"OldM", "Voz sin rostro", "Randomizer: derrota al Viejo Monje.", "Faceless Voice", "Randomizer: defeat the Old Monk."},
+	{"Adju", "Veredicto final", "Randomizer: derrota al Juez.", "Final Verdict", "Randomizer: defeat the Adjudicator."},
+	{"OldH", "Ojos cerrados", "Randomizer: derrota al Viejo Héroe.", "Eyes Shut", "Randomizer: defeat the Old Hero."},
+	{"StrK", "Fin de la tormenta", "Randomizer: derrota al Rey de las Tormentas.", "Storm's End", "Randomizer: defeat the Storm King."},
+	{"Lmon", "Sangre sin dueño", "Randomizer: derrota al Monstruo Sanguijuela.", "Ownerless Blood", "Randomizer: defeat the Leechmonger."},
+	{"DCol", "Enjambre disperso", "Randomizer: derrota al Coloso Sucio.", "Swarm Scattered", "Randomizer: defeat the Dirty Colossus."},
+	{"MAst", "Luto en el valle", "Randomizer: derrota a la Doncella Astraea.", "Mourning in the Valley", "Randomizer: defeat Maiden Astraea."},
+	{"Allant", "El rey verdadero", "Randomizer: derrota al Rey Allant.", "The True King", "Randomizer: defeat King Allant."},
+};
+constexpr int kRandoBossCount = static_cast<int>(sizeof(kRandoBosses) / sizeof(kRandoBosses[0]));
+static_assert(kRandoFirst + kRandoBossCount == kRandoAll, "one trophy per boss, then the last one");
+
+// (rando3) The "Trofeos Randomizer" medals, drawn in code in the style of the game's own trophy icons (original art: no
+// game or company artwork): a worn bronze coin with a ring of studs on a black ground and, in the middle, an emblem in
+// relief for each trophy (`which`: 0..16 the bosses in kRandoBosses' order, 17 the last one, on a gold coin). Lit from
+// the top left from a height field. RGBA8, size x size.
+inline void DrawRandoMedal(int size, int which, std::vector<uint8_t>* out) {
+	out->assign(static_cast<size_t>(size) * size * 4, 0);
+	constexpr float kPi = 3.14159265f;
+	auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+	auto smooth  = [&](float e0, float e1, float x) { const float t = clamp01((x - e0) / (e1 - e0)); return t * t * (3.0f - 2.0f * t); };
+	auto hash    = [](int x, int y) {
+		uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u;
+		h          = (h ^ (h >> 13u)) * 1274126177u;
+		return static_cast<float>((h ^ (h >> 16u)) & 0xffffu) / 65535.0f;
+	};
+	auto vnoise = [&](float x, float y) {
+		const int   xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y));
+		const float fx = x - static_cast<float>(xi), fy = y - static_cast<float>(yi);
+		const float sx = fx * fx * (3.0f - 2.0f * fx), sy = fy * fy * (3.0f - 2.0f * fy);
+		const float a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+		return (a + (b - a) * sx) + ((c + (d - c) * sx) - (a + (b - a) * sx)) * sy;
+	};
+	auto fbm = [&](float x, float y) { return 0.55f * vnoise(x, y) + 0.3f * vnoise(x * 2.1f, y * 2.1f) + 0.15f * vnoise(x * 4.3f, y * 4.3f); };
+	// Distance to a segment.
+	auto seg = [](float px, float py, float ax, float ay, float bx, float by) {
+		const float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+		float       t  = (wx * vx + wy * vy) / (vx * vx + vy * vy);
+		t              = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+		const float dx = wx - vx * t, dy = wy - vy * t;
+		return std::sqrt(dx * dx + dy * dy);
+	};
+	// Signed distance to a polygon (negative inside), points as x0,y0,x1,y1...
+	auto poly = [](float px, float py, const float* p, int n) {
+		float d = 1e9f, s = 1.0f;
+		for (int i = 0, j = n - 1; i < n; j = i++) {
+			const float ax = p[i * 2], ay = p[i * 2 + 1], bx = p[j * 2], by = p[j * 2 + 1];
+			const float ex = bx - ax, ey = by - ay, wx = px - ax, wy = py - ay;
+			float       t  = (wx * ex + wy * ey) / (ex * ex + ey * ey);
+			t              = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+			const float dx = wx - ex * t, dy = wy - ey * t;
+			d              = std::min(d, dx * dx + dy * dy);
+			const bool c1 = py >= ay, c2 = py < by, c3 = ex * wy > ey * wx;
+			if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) s = -s;
+		}
+		return s * std::sqrt(d);
+	};
+	auto len = [](float x, float y) { return std::sqrt(x * x + y * y); };
+	// Relief helpers: a raised area from a signed distance, a raised line from a distance, an engraved line.
+	auto area   = [&](float sd, float amt) { return amt * smooth(0.0f, 0.03f, -sd); };
+	auto ridge  = [&](float d, float w, float amt) { return amt * (1.0f - smooth(w, w + 0.016f, d)); };
+	auto groove = [&](float d, float w, float amt) { return -amt * (1.0f - smooth(w, w + 0.01f, d)); };
+	const bool gold = which >= 17;
+	auto coin_r = [&](float a) { return 0.90f * (1.0f + 0.005f * std::sin(5.0f * a + 0.7f) + 0.004f * std::sin(13.0f * a + 2.1f)); };
+	// The heater shield (gold medal): margin inside it (>0 inside).
+	auto shield = [&](float x, float y, float cx, float cy, float s) {
+		x = (x - cx) / s, y = (y - cy) / s;
+		const float top = -0.46f, mid = 0.02f, tip = 0.58f, half = 0.34f;
+		float       w   = half;
+		if (y > mid) {
+			const float k = (y - mid) / (tip - mid);
+			w             = k >= 1.0f ? 0.0f : half * std::sqrt(1.0f - k * k);
+		}
+		return std::min(std::min(w - std::fabs(x), y - top), (tip - y) * 0.6f) * s;
+	};
+	// Each trophy's emblem as a height (y down; the field inside the studs is about 0.62 across).
+	auto emblem = [&](float x, float y) -> float {
+		float h = 0.0f;
+		switch (which) {
+			case 0: { // Phalanx, "Muro de escudos roto": three shields in a row, the middle one split
+				for (int i = -1; i <= 1; i++) {
+					const float m = shield(x, y, 0.36f * static_cast<float>(i), 0.0f, 0.56f);
+					h += 0.05f * smooth(-0.004f, 0.03f, m);
+				}
+				const float crack[] = {0.01f, -0.27f, -0.05f, -0.12f, 0.05f, -0.01f, -0.04f, 0.13f, 0.02f, 0.32f};
+				float       d       = 1e9f;
+				for (int i = 0; i < 4; i++) d = std::min(d, seg(x, y, crack[i * 2], crack[i * 2 + 1], crack[i * 2 + 2], crack[i * 2 + 3]));
+				h += groove(d, 0.014f, 0.06f);
+				break;
+			}
+			case 1: { // Tower Knight, "La torre se inclina": a tower, leaning
+				const float a = 0.2f, c = std::cos(a), s = std::sin(a);
+				const float tx = c * x + s * (y - 0.45f), ty = -s * x + c * (y - 0.45f) + 0.45f;
+				const float body[] = {-0.15f, -0.22f, 0.15f, -0.22f, 0.19f, 0.45f, -0.19f, 0.45f};
+				float       sd     = poly(tx, ty, body, 4);
+				for (int i = -1; i <= 1; i++) {
+					const float mer[] = {0.11f * i - 0.05f, -0.36f, 0.11f * i + 0.05f, -0.36f, 0.11f * i + 0.05f, -0.21f, 0.11f * i - 0.05f, -0.21f};
+					sd                = std::min(sd, poly(tx, ty, mer, 4));
+				}
+				h += area(sd, 0.06f);
+				const float door = std::max(std::max(std::fabs(tx) - 0.06f, 0.26f - ty), ty - 0.45f);
+				h -= area(std::min(door, len(tx, ty - 0.26f) - 0.06f), 0.04f);
+				h -= area(std::max(std::fabs(tx) - 0.02f, std::fabs(ty + 0.05f) - 0.06f), 0.03f);
+				break;
+			}
+			case 2: { // Penetrator, "Acero contra acero": two long swords crossed, in relief
+				const float bl = std::min(seg(x, y, -0.36f, 0.40f, 0.30f, -0.42f), seg(x, y, 0.36f, 0.40f, -0.30f, -0.42f));
+				const float gu = std::min(seg(x, y, -0.36f, 0.20f, -0.16f, 0.36f), seg(x, y, 0.36f, 0.20f, 0.16f, 0.36f));
+				const float po = std::min(len(x + 0.38f, y - 0.44f), len(x - 0.38f, y - 0.44f));
+				h += ridge(bl, 0.022f, 0.05f) + ridge(gu, 0.02f, 0.05f) + ridge(po, 0.035f, 0.05f);
+				h += groove(std::min(seg(x, y, -0.30f, 0.33f, 0.26f, -0.37f), seg(x, y, 0.30f, 0.33f, -0.26f, -0.37f)), 0.004f, 0.015f);
+				break;
+			}
+			case 3: { // False King, "Corona de ceniza": a crown, with ash below
+				const float crown[] = {-0.38f, 0.18f, 0.38f, 0.18f, 0.38f, -0.20f, 0.20f, 0.0f, 0.0f, -0.30f, -0.20f, 0.0f, -0.38f, -0.20f};
+				h += area(poly(x, y, crown, 7), 0.06f);
+				h += ridge(std::min(std::min(len(x + 0.38f, y + 0.25f), len(x - 0.38f, y + 0.25f)), len(x, y + 0.36f)), 0.045f, 0.06f);
+				h += groove(seg(x, y, -0.34f, 0.08f, 0.34f, 0.08f), 0.01f, 0.03f);
+				for (int i = 0; i < 9; i++) {
+					const float ax = -0.3f + 0.075f * i + 0.03f * (hash(i, 7) - 0.5f), ay = 0.32f + 0.12f * hash(i, 3);
+					h += groove(len(x - ax, y - ay), 0.012f, 0.03f);
+				}
+				break;
+			}
+			case 4: { // Armor Spider, "Telar de fuego": a web
+				const float r = len(x, y), a = std::atan2(y, x);
+				float       d = 1e9f;
+				for (int i = 0; i < 8; i++) {
+					const float b = static_cast<float>(i) * (kPi / 4.0f);
+					d             = std::min(d, seg(x, y, 0.0f, 0.0f, 0.52f * std::cos(b), 0.52f * std::sin(b)));
+				}
+				const float sect = std::cos(kPi / 8.0f) / std::cos(std::fmod(a + kPi * 2.0f, kPi / 4.0f) - kPi / 8.0f);
+				for (float rr: {0.14f, 0.28f, 0.42f}) d = std::min(d, std::fabs(r - rr * sect));
+				h += ridge(r < 0.54f ? d : 1.0f, 0.012f, 0.045f);
+				h += area(len(x, y) - 0.07f, 0.05f);
+				break;
+			}
+			case 5: { // Flamelurker, "Brasa apagada": a flame
+				const float fl[] = {0.0f, -0.48f, 0.12f, -0.22f, 0.24f, -0.05f, 0.25f, 0.18f, 0.12f, 0.36f, -0.12f, 0.36f, -0.25f, 0.18f, -0.22f, -0.04f, -0.10f, -0.18f, -0.06f, -0.06f};
+				const float sd   = std::min(poly(x, y, fl, 10), len(x, y - 0.17f) - 0.21f);
+				h += area(sd, 0.06f);
+				const float in[] = {0.0f, -0.18f, 0.08f, 0.02f, 0.10f, 0.20f, 0.0f, 0.30f, -0.10f, 0.20f, -0.08f, 0.04f};
+				h -= area(poly(x, y, in, 6), 0.035f);
+				break;
+			}
+			case 6: { // Dragon God, "El dios caído": a dragon's claw
+				h += area(len(x, y + 0.20f) - 0.17f, 0.06f);
+				const float tal[3][6] = {{-0.12f, -0.12f, -0.30f, 0.12f, -0.20f, 0.44f}, {0.0f, -0.06f, -0.02f, 0.20f, 0.04f, 0.48f}, {0.12f, -0.12f, 0.30f, 0.12f, 0.22f, 0.44f}};
+				for (const auto& t: tal) {
+					const float d1 = seg(x, y, t[0], t[1], t[2], t[3]), d2 = seg(x, y, t[2], t[3], t[4], t[5]);
+					const float k  = clamp01((y - t[1]) / (t[5] - t[1]));
+					h              = std::max(h, ridge(std::min(d1, d2), 0.06f * (1.0f - 0.85f * k), 0.065f));
+				}
+				break;
+			}
+			case 7: { // Fool's Idol, "Reflejo quebrado": a cracked mirror
+				const float e = len(x / 0.30f, y / 0.42f);
+				h += 0.05f * (1.0f - smooth(1.0f, 1.04f, e)) + 0.03f * (1.0f - smooth(0.86f, 0.9f, e));
+				const float cr[] = {0.06f, -0.06f, -0.14f, -0.30f, 0.06f, -0.06f, 0.20f, -0.26f, 0.06f, -0.06f, 0.22f, 0.12f, 0.06f, -0.06f, -0.08f, 0.32f, 0.06f, -0.06f, -0.24f, 0.04f};
+				float       d    = 1e9f;
+				for (int i = 0; i < 5; i++) d = std::min(d, seg(x, y, cr[i * 4], cr[i * 4 + 1], cr[i * 4 + 2], cr[i * 4 + 3]));
+				if (e < 0.88f) h += groove(d, 0.008f, 0.035f);
+				h += ridge(seg(x, y, 0.0f, 0.42f, 0.0f, 0.52f), 0.03f, 0.05f);
+				break;
+			}
+			case 8: { // Maneater, "Alas en la niebla": wings
+				for (int side = -1; side <= 1; side += 2) {
+					for (int i = 0; i < 5; i++) {
+						const float a  = (-0.15f + 0.22f * i) * kPi / 2.0f;
+						const float l  = 0.46f - 0.05f * i;
+						const float bx = side * (0.06f + l * std::cos(a)), by = -0.10f + l * std::sin(a);
+						h              = std::max(h, ridge(seg(x, y, side * 0.06f, -0.12f + 0.03f * i, bx, by), 0.04f - 0.004f * i, 0.055f));
+					}
+				}
+				for (int i = 0; i < 3; i++) h += groove(std::fabs(y - 0.30f - 0.07f * i) + 0.0f * x, 0.004f, 0.012f) * (std::fabs(x) < 0.45f ? 1.0f : 0.0f);
+				break;
+			}
+			case 9: { // Old Monk, "Voz sin rostro": a hood with no face
+				const float hood[] = {0.0f, -0.42f, 0.22f, -0.30f, 0.30f, -0.02f, 0.34f, 0.40f, -0.34f, 0.40f, -0.30f, -0.02f, -0.22f, -0.30f};
+				h += area(poly(x, y, hood, 7), 0.06f);
+				h -= 0.07f * (1.0f - smooth(0.95f, 1.0f, len(x / 0.15f, (y + 0.06f) / 0.22f)));
+				h += groove(seg(x, y, 0.0f, 0.18f, 0.0f, 0.40f), 0.006f, 0.02f);
+				break;
+			}
+			case 10: { // Adjudicator, "Veredicto final": scales
+				float d = seg(x, y, 0.0f, -0.36f, 0.0f, 0.34f);
+				d       = std::min(d, seg(x, y, -0.36f, -0.24f, 0.36f, -0.24f));
+				d       = std::min(d, std::min(seg(x, y, -0.36f, -0.24f, -0.42f, 0.02f), seg(x, y, -0.36f, -0.24f, -0.24f, 0.02f)));
+				d       = std::min(d, std::min(seg(x, y, 0.36f, -0.24f, 0.42f, 0.02f), seg(x, y, 0.36f, -0.24f, 0.24f, 0.02f)));
+				h += ridge(d, 0.016f, 0.05f);
+				for (int side = -1; side <= 1; side += 2) {
+					const float pan = std::max(len(x - side * 0.33f, y - 0.0f) - 0.12f, -(y - 0.02f));
+					h += area(pan, 0.05f);
+				}
+				const float base[] = {-0.16f, 0.42f, 0.16f, 0.42f, 0.0f, 0.30f};
+				h += area(poly(x, y, base, 3), 0.05f);
+				h += ridge(len(x, y + 0.38f), 0.03f, 0.05f);
+				break;
+			}
+			case 11: { // Old Hero, "Ojos cerrados": a helm with closed eyes
+				const float helm = std::max(len(x, y + 0.02f) - 0.36f, y - 0.36f);
+				h += area(helm, 0.06f);
+				for (int side = -1; side <= 1; side += 2) {
+					const float ex = x - side * 0.14f, ey = y + 0.02f;
+					const float arc = std::fabs(len(ex, ey + 0.10f) - 0.11f);
+					if (ey > -0.03f) h += groove(arc, 0.008f, 0.05f);
+					for (int k = -1; k <= 1; k++) h += groove(seg(x, y, side * 0.14f + k * 0.05f, 0.075f, side * 0.14f + k * 0.065f, 0.12f), 0.005f, 0.04f);
+				}
+				h += groove(seg(x, y, 0.0f, -0.36f, 0.0f, -0.12f), 0.01f, 0.03f);
+				break;
+			}
+			case 12: { // Storm King, "Fin de la tormenta": a lightning bolt
+				const float bolt[] = {0.10f, -0.48f, -0.18f, 0.02f, 0.0f, 0.02f, -0.12f, 0.48f, 0.20f, -0.08f, 0.02f, -0.08f, 0.16f, -0.48f};
+				h += area(poly(x, y, bolt, 7), 0.065f);
+				break;
+			}
+			case 13: { // Leechmonger, "Sangre sin dueño": a drop
+				const float sd = std::min(len(x, y - 0.12f) - 0.26f, poly(x, y, std::array<float, 6> {0.0f, -0.46f, 0.24f, 0.02f, -0.24f, 0.02f}.data(), 3));
+				h += area(sd, 0.065f);
+				h -= area(len(x + 0.09f, y - 0.06f) - 0.05f, 0.025f);
+				break;
+			}
+			case 14: { // Dirty Colossus, "Enjambre disperso": flies
+				const float fx[] = {-0.25f, 0.18f, 0.02f, -0.12f, 0.30f, 0.20f, -0.32f};
+				const float fy[] = {-0.24f, -0.30f, 0.02f, 0.30f, 0.12f, 0.38f, 0.10f};
+				for (int i = 0; i < 7; i++) {
+					const float s  = i == 2 ? 1.6f : 1.0f;
+					const float dx = (x - fx[i]) / s, dy = (y - fy[i]) / s;
+					h              = std::max(h, area(len(dx / 0.04f, dy / 0.07f) * 0.04f - 0.04f, 0.06f));
+					h              = std::max(h, area(std::min(len(dx - 0.05f, dy + 0.04f), len(dx + 0.05f, dy + 0.04f)) - 0.045f, 0.035f));
+				}
+				break;
+			}
+			case 15: { // Maiden Astraea, "Luto en el valle": tears
+				for (int i = 0; i < 2; i++) {
+					const float s = i == 0 ? 1.0f : 0.55f, cx = i == 0 ? -0.06f : 0.22f, cy = i == 0 ? 0.04f : 0.24f;
+					const float dx = (x - cx) / s, dy = (y - cy) / s;
+					const float sd = std::min(len(dx, dy - 0.10f) - 0.20f, poly(dx, dy, std::array<float, 6> {0.0f, -0.36f, 0.18f, 0.04f, -0.18f, 0.04f}.data(), 3)) * s;
+					h              = std::max(h, area(sd, 0.06f));
+				}
+				h -= area(len(x + 0.12f, y - 0.06f) - 0.04f, 0.02f);
+				break;
+			}
+			case 16: { // King Allant, "El rey verdadero": a crown under a soul
+				const float crown[] = {-0.30f, 0.38f, 0.30f, 0.38f, 0.30f, 0.08f, 0.15f, 0.24f, 0.0f, 0.02f, -0.15f, 0.24f, -0.30f, 0.08f};
+				h += area(poly(x, y, crown, 7), 0.06f);
+				h += groove(seg(x, y, -0.27f, 0.31f, 0.27f, 0.31f), 0.008f, 0.03f);
+				h += 0.07f * (1.0f - smooth(0.0f, 0.17f, len(x, y + 0.20f)));
+				const float wisp = std::fabs(len(x, y + 0.20f) - 0.20f);
+				if (y < -0.12f) h += ridge(wisp, 0.008f, 0.025f);
+				break;
+			}
+			default: { // The last one, "Señor del caos": the shield and the crossed swords
+				const float m = shield(x, y, 0.0f, 0.0f, 1.0f);
+				h += 0.06f * smooth(-0.004f, 0.035f, m);
+				h -= 0.018f * (1.0f - smooth(0.0f, 0.012f, std::fabs(m - 0.06f)));
+				const float b1 = seg(x, y, -0.17f, 0.28f, 0.15f, -0.30f), b2 = seg(x, y, 0.17f, 0.28f, -0.15f, -0.30f);
+				const float g1 = seg(x, y, -0.18f, 0.14f, -0.06f, 0.21f), g2 = seg(x, y, 0.18f, 0.14f, 0.06f, 0.21f);
+				const float p  = std::min(len(x + 0.19f, y - 0.32f), len(x - 0.19f, y - 0.32f));
+				if (m > 0.0f) {
+					h -= 0.02f * (1.0f - smooth(0.009f, 0.02f, std::min(std::min(b1, b2), std::min(g1, g2))));
+					h -= 0.02f * (1.0f - smooth(0.018f, 0.03f, p));
+				}
+				break;
+			}
+		}
+		return h;
+	};
+	// Height of the surface: dome, rim, studs and the emblem.
+	auto height = [&](float x, float y, float* in_coin) {
+		const float r = std::sqrt(x * x + y * y), a = std::atan2(y, x), R = coin_r(a);
+		*in_coin      = 1.0f - smooth(R - 0.012f, R + 0.004f, r);
+		float h       = 0.06f * (1.0f - r * r * 0.35f);
+		h += 0.05f * smooth(R - 0.10f, R - 0.07f, r) * (1.0f - smooth(R - 0.03f, R, r));
+		const float sr = R * 0.83f;
+		for (int i = 0; i < 18; i++) {
+			const float sa = static_cast<float>(i) * (2.0f * kPi / 18.0f) + 0.09f;
+			h += 0.035f * (1.0f - smooth(0.012f, 0.03f, len(x - sr * std::cos(sa), y - sr * std::sin(sa))));
+		}
+		if (r < R * 0.76f) h += emblem(x, y);
+		h += 0.006f * (fbm(x * 9.0f + 3.0f, y * 9.0f + 7.0f) - 0.5f);
+		return h;
+	};
+	const float lx = -0.55f, ly = -0.62f, lz = 0.56f;
+	const float base_c[3] = {gold ? 0.62f : 0.47f, gold ? 0.45f : 0.27f, gold ? 0.16f : 0.18f};
+	const float tint[3]   = {gold ? 1.0f : 0.78f, gold ? 0.86f : 0.55f, gold ? 0.45f : 0.40f};
+	for (int py = 0; py < size; py++) {
+		for (int px = 0; px < size; px++) {
+			const float x = (static_cast<float>(px) + 0.5f) / static_cast<float>(size) * 2.0f - 1.0f;
+			const float y = (static_cast<float>(py) + 0.5f) / static_cast<float>(size) * 2.0f - 1.0f;
+			float       in_coin = 0.0f, dummy = 0.0f;
+			const float e  = 2.0f / static_cast<float>(size);
+			const float h0 = height(x, y, &in_coin);
+			const float hx = height(x + e, y, &dummy) - h0, hy = height(x, y + e, &dummy) - h0;
+			float       nx = -hx / e * 1.6f, ny = -hy / e * 1.6f, nz = 1.0f;
+			const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+			nx /= nl, ny /= nl, nz /= nl;
+			const float ndl  = nx * lx + ny * ly + nz * lz;
+			const float diff = std::max(0.0f, ndl);
+			const float spec = std::pow(std::max(0.0f, 2.0f * ndl * nz - lz), 14.0f);
+			const float n    = fbm(x * 5.0f + 11.0f, y * 5.0f + 2.0f);
+			const float wear = fbm(x * 2.0f - 4.0f, y * 2.0f + 9.0f);
+			const float hi   = clamp01((h0 - 0.05f) * 9.0f);
+			float       col[3];
+			for (int k = 0; k < 3; k++) {
+				const float c  = base_c[k] * (0.80f + 0.35f * n) * (1.0f - hi * 0.3f) + tint[k] * hi * 0.3f * wear;
+				const float sp = k == 0 ? 1.0f : (k == 1 ? 0.82f : 0.62f);
+				col[k]         = c * (0.30f + 0.95f * diff) + sp * spec * (gold ? 0.45f : 0.30f);
+			}
+			const float r   = std::sqrt(x * x + y * y);
+			const float bgv = 0.035f + 0.05f * (1.0f - smooth(0.85f, 1.25f, r)) * (1.0f - in_coin);
+			float       rgb[3];
+			for (int k = 0; k < 3; k++) rgb[k] = col[k] * in_coin + bgv * (1.0f - in_coin) * (k == 0 ? 1.0f : (k == 1 ? 0.8f : 0.7f));
+			const float sx = x - 0.03f, sy = y - 0.04f, sr = coin_r(std::atan2(sy, sx));
+			const float sh = (1.0f - in_coin) * (1.0f - smooth(sr - 0.04f, sr + 0.05f, std::sqrt(sx * sx + sy * sy)));
+			for (int k = 0; k < 3; k++) rgb[k] *= 1.0f - 0.7f * sh;
+			const float qx = std::fabs(x), qy = std::fabs(y), cr = 0.18f;
+			const float ox = std::max(qx - (1.0f - cr), 0.0f), oy = std::max(qy - (1.0f - cr), 0.0f);
+			const float corner = 1.0f - smooth(cr - e, cr + e, std::sqrt(ox * ox + oy * oy));
+			uint8_t*    p      = out->data() + (static_cast<size_t>(py) * size + px) * 4;
+			for (int k = 0; k < 3; k++) p[k] = static_cast<uint8_t>(std::lround(clamp01(rgb[k]) * 255.0f));
+			p[3] = static_cast<uint8_t>(std::lround(corner * 255.0f));
+		}
+	}
+}
+
 struct State {
 	std::mutex                             mutex;
 	bool                                   loaded = false;
@@ -269,6 +616,28 @@ void SaveList(State& s) {
 	std::filesystem::create_directories(s.store.parent_path(), dir_ec); // (1030d) a new _SaveData: the folder first
 	std::ofstream f(s.store.parent_path() / "trophies-list.json", std::ios::binary | std::ios::trunc);
 	if (f) f << j.dump(1, '\t');
+}
+
+// (trofeos-2) For the launcher's trophy panel: each trophy's icon as _SaveData/<title>/trophy-icons/tropNNN.png, the
+// PNG bytes from the game's own .ucp as they are (the launcher does not read the .ucp). Written once: a file already
+// there is kept, so later starts only check that the files exist.
+const Bytes* IconFile(const std::map<std::string, Bytes>& files, int id);
+void SaveIcons(State& s, const std::map<std::string, Bytes>& files) {
+	std::error_code ec;
+	const auto      dir = s.store.parent_path() / "trophy-icons";
+	std::filesystem::create_directories(dir, ec);
+	if (ec) return;
+	for (const auto& [id, e]: s.trophies) {
+		char name[32];
+		std::snprintf(name, sizeof(name), "trop%03d.png", id);
+		const auto out = dir / name;
+		if (std::filesystem::exists(out, ec)) continue;
+		const Bytes* png = IconFile(files, id);
+		if (png == nullptr && id == kNexusTrophyId) png = IconFile(files, 1); // (the port's own: trophy 1's icon, as the popup)
+		if (png == nullptr || png->empty()) continue;
+		std::ofstream f(out, std::ios::binary | std::ios::trunc);
+		if (f) f.write(reinterpret_cast<const char*>(png->data()), static_cast<std::streamsize>(png->size()));
+	}
 }
 
 bool SoundWanted();
@@ -392,11 +761,37 @@ void Load(State& s) {
 		}
 		s.trophies[kNexusTrophyId] = std::move(e);
 	}
+	// (rando1) The randomizer trophies, with their own medal (outside the game's set: not for the platinum).
+	if (!s.trophies.empty() && s.trophies.count(kRandoFirst) == 0) {
+		const bool           es = s.language.rfind("es", 0) == 0;
+		for (int i = 0; i <= kRandoBossCount; i++) {
+			// (rando3) Each trophy its own medal (its emblem; the last one on a gold coin).
+			std::vector<uint8_t> medal;
+			DrawRandoMedal(128, i, &medal);
+			std::vector<uint32_t> icon(128 * 128);
+			for (size_t k = 0; k < icon.size(); k++)
+				icon[k] = static_cast<uint32_t>(medal[k * 4]) | (static_cast<uint32_t>(medal[k * 4 + 1]) << 8u) |
+				          (static_cast<uint32_t>(medal[k * 4 + 2]) << 16u) | (static_cast<uint32_t>(medal[k * 4 + 3]) << 24u);
+			Entry e;
+			e.info.id    = kRandoFirst + i;
+			e.info.grade = i == kRandoBossCount ? 2 : 4;
+			if (i < kRandoBossCount) {
+				e.info.name   = es ? kRandoBosses[i].name_es : kRandoBosses[i].name_en;
+				e.info.detail = es ? kRandoBosses[i].detail_es : kRandoBosses[i].detail_en;
+			} else {
+				e.info.name   = es ? "Señor del caos" : "Lord of Chaos";
+				e.info.detail = es ? "Randomizer: derrota a todos los archidemonios." : "Randomizer: defeat every archdemon.";
+			}
+			e.icon_w = 128, e.icon_h = 128, e.icon = icon;
+			s.trophies[e.info.id] = std::move(e);
+		}
+	}
 	LOGF("Trophy: %zu trophies (%s), %zu unlocked\n", s.trophies.size(), s.language.c_str(), s.unlocked.size());
 	std::printf("Trophy: opened %s: %zu trophies, language %s (console language %u), %zu unlocked (%s)\n",
 	            Common::PathToString(ucp.filename()).c_str(), s.trophies.size(), s.language.c_str(), lang,
 	            s.unlocked.size(), Common::PathToString(s.store).c_str());
 	SaveList(s);
+	SaveIcons(s, files); // (trofeos-2)
 	SyncFromSave(s); // (1109) the trophies the game's save already proves
 }
 
@@ -532,6 +927,22 @@ void Resample(const uint8_t* px, int w, int h, int size, uint32_t* dst, int stri
 			    c(acc[0]) | (c(acc[1]) << 8u) | (c(acc[2]) << 16u) | (static_cast<uint32_t>(a + 0.5f) << 24u);
 		}
 	}
+}
+
+// (rando1) RGBA8 pixels into an atlas cell (the medal drawn in code), as DecodeInto does with a PNG.
+bool PlaceRgba(const unsigned char* px, int w, int h, Art& art, int slot) {
+	const int ox = (slot % art.cols) * art.stride, oy = (slot / art.cols) * art.stride;
+	uint32_t* base = art.pixels.data() + static_cast<size_t>(oy) * art.width + ox;
+	Resample(px, w, h, art.cell, base + static_cast<size_t>(art.pad) * art.width + art.pad, art.width);
+	for (int y = 0; y < art.stride; y++) {
+		const int sy = std::clamp(y - art.pad, 0, art.cell - 1) + art.pad;
+		for (int x = 0; x < art.stride; x++) {
+			const int sx = std::clamp(x - art.pad, 0, art.cell - 1) + art.pad;
+			if (sx == x && sy == y) continue;
+			base[static_cast<size_t>(y) * art.width + x] = base[static_cast<size_t>(sy) * art.width + sx];
+		}
+	}
+	return true;
 }
 
 bool DecodeInto(const Bytes& png, Art& art, int slot) {
@@ -826,7 +1237,7 @@ void SyncFromSave(State& s) {
 	bool rest     = !s.trophies.empty();
 	for (const auto& [id, e]: s.trophies) {
 		if (e.info.grade == 1) platinum = id;
-		else if (id != kNexusTrophyId && s.unlocked.count(id) == 0) rest = false;
+		else if (id < kNexusTrophyId && s.unlocked.count(id) == 0) rest = false; // (rando1: the port's own never count)
 	}
 	if (platinum >= 0 && rest && s.unlocked.count(platinum) == 0) {
 		Record(s, platinum, kToastSeconds);
@@ -851,7 +1262,7 @@ bool Unlock(int trophy_id, int* platinum_id) {
 	bool rest     = !s.trophies.empty();
 	for (const auto& [id, e]: s.trophies) {
 		if (e.info.grade == 1) platinum = id;
-		else if (id != kNexusTrophyId && s.unlocked.count(id) == 0) rest = false;
+		else if (id < kNexusTrophyId && s.unlocked.count(id) == 0) rest = false; // (rando1: the port's own never count)
 	}
 	if (platinum >= 0 && rest && s.unlocked.count(platinum) == 0) {
 		Record(s, platinum);
@@ -859,6 +1270,29 @@ bool Unlock(int trophy_id, int* platinum_id) {
 	}
 	SaveStore(s);
 	return true;
+}
+
+int RandoTrophyForActivity(const std::string& activity) {
+	for (int i = 0; i < kRandoBossCount; i++)
+		if (activity == kRandoBosses[i].activity) return kRandoFirst + i;
+	return -1;
+}
+
+bool RandoAllBosses() {
+	auto&           s = S();
+	std::lock_guard lock(s.mutex);
+	Load(s);
+	for (int i = 0; i < kRandoBossCount; i++)
+		if (s.unlocked.count(kRandoFirst + i) == 0) return false;
+	return true;
+}
+
+void RandoMedal(int size, std::vector<uint8_t>* rgba) {
+	DrawRandoMedal(size, kRandoAll - kRandoFirst, rgba);
+}
+
+void RandoMedal(int size, int trophy_id, std::vector<uint8_t>* rgba) { // (rando3) that trophy's own medal
+	DrawRandoMedal(size, IsRando(trophy_id) ? trophy_id - kRandoFirst : kRandoAll - kRandoFirst, rgba);
 }
 
 bool IsUnlocked(int trophy_id) {
@@ -955,6 +1389,12 @@ bool BuildArt(int cell, Art* art) {
 	art->pixels.assign(static_cast<size_t>(art->width) * art->height, 0);
 	int next = 0;
 	for (const int id: ids) {
+		if (IsRando(id)) { // (rando1) the medal, drawn in code
+			std::vector<uint8_t> medal;
+			DrawRandoMedal(256, id - kRandoFirst, &medal);
+			if (PlaceRgba(medal.data(), 256, 256, *art, next)) art->slots[id] = next++;
+			continue;
+		}
 		const Bytes* png = IconFile(files, id);
 		if (png == nullptr && id == kNexusTrophyId) png = IconFile(files, 1); // (the port's own: trophy 1's icon, as the popup)
 		if (png != nullptr && DecodeInto(*png, *art, next)) art->slots[id] = next++;

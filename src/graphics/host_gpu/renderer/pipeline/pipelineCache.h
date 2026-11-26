@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/shader.h"
+#include "local/tiron1.h" // (tiron1: also where renderDraw.cpp's table-xpr.inc and native-xpr.inc find it)
 
 #include <array>
 #include <atomic>
@@ -187,6 +188,10 @@ public:
 	static bool MergeDriverCacheShards(GraphicContext& graphics, uint32_t shards);
 	static bool DriverCacheWarm(GraphicContext& graphics, uint32_t shards, uint32_t* done = nullptr);
 #endif
+	// (up1118) The translation features the static store was made with (ShaderRecompiler::Frontend::TranslatorFeatures,
+	// the precompile's stamp; all without a store), before the device is made: the emulator enables the pixel interlock's
+	// extension only where the store's translation may use it (vulkanWindow.cpp).
+	static uint32_t StaticStoreFeatures();
 
 	// A pipeline no cache holds, compiled without optimization so its draw or dispatch need not wait:
 	// a worker compiles the optimized one, which then replaces it (PromoteOptimized).
@@ -278,6 +283,19 @@ public:
 	// (native bindings, for table mode programs).
 	[[nodiscard]] Pipeline* TryCreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                                 const ShaderProgram&          compute_program);
+	// (render2, KYTY_ASYNC_COMPUTE_PIPELINES) The normal path's compute pipeline, as CreateComputePipeline makes it
+	// (the same build, driver cache, remake, optimized build and recording), compiled on a compile worker ahead of the
+	// workers' other jobs. GPU thread. Find: the pipeline when it is made (one a worker finished is taken in), null
+	// otherwise, nothing started; Queue: as Find, and a pipeline neither made nor compiling goes to a worker (null:
+	// PipelineWaiting is its completion); Block: waits for the worker (nothing compiling: CreateComputePipeline), null
+	// only while the cache shuts down. `compiling`: whether a worker has it.
+	enum class AsyncCompute { Find, Queue, Block };
+	[[nodiscard]] Pipeline* TryCreateComputePipelineAsync(const ShaderComputeInputInfo& input_info,
+	                                                      const ShaderProgram& compute_program, AsyncCompute how,
+	                                                      bool* compiling = nullptr);
+	// Its workers' compiles so far: how many, and their time (microseconds). Any thread.
+	[[nodiscard]] uint64_t AsyncComputeCompiled() const { return m_async_compute_done.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t AsyncComputeCompileUs() const { return m_async_compute_us.load(std::memory_order_relaxed); }
 	// The optimized builds finished since replace their unoptimized pipelines (at each flip: the draws of native
 	// XPR records hold their pipelines and look nothing up). GPU thread.
 	// Each flip (from the CPU or the GPU's commands): optimized builds in place, shader plans unused for a while out of
@@ -413,6 +431,11 @@ private:
 	                                m_pending_graphics_pipelines;
 	struct PendingComputePipeline;
 	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_compute_pipelines;
+	// (render2) TryCreateComputePipelineAsync: the normal path's compute pipelines a worker is still compiling, by
+	// program (a map of their own: the table dispatches' above are other pipelines, with native bindings).
+	std::unordered_map<uint64_t, std::shared_ptr<PendingComputePipeline>> m_pending_normal_compute_pipelines;
+	std::atomic<uint64_t>                                                 m_async_compute_done {0};
+	std::atomic<uint64_t>                                                 m_async_compute_us {0};
 	std::unique_ptr<CompileWorkers> m_compile_workers;
 	std::shared_ptr<const std::atomic<bool>> m_pipeline_waiting; // (PipelineWaiting)
 	// Table mode programs and pipelines (src/local/table-xpr.inc): a new area brings hundreds, which ahead of the
@@ -477,6 +500,13 @@ private:
 	std::unordered_set<uint32_t> m_scenes_warmed;
 	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory);
 	void                         SceneLoop(uint64_t compute_video);
+	// (tiron1, KYTY_TIRON1=1) A PC under 30 GB of RAM (no pipeline warmup): once the shader prefetch is done, the
+	// recording's compute recipes (newest first, at most KYTY_TIRON1_COMPUTE_MAX) made beside the game on
+	// m_warmup_thread, their programs translated first (local/tiron1.h). m_tiron1_quiet: GetPrefetchProgress leaves
+	// that warmup's phase out (no "Preparing" line on screen while playing).
+	void              Tiron1WarmCompute(uint64_t compute_video);
+	void              Tiron6WaitInFront(); // (tiron6 v2: start-up waits for Tiron1WarmCompute)
+	std::atomic<bool> m_tiron1_quiet {false};
 	// Pipelines made where first needed (CreateGraphicsPipeline, CreateComputePipeline), and the time it took.
 	uint64_t m_render_pipelines   = 0;
 	double   m_render_pipeline_ms = 0.0;

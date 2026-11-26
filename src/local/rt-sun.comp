@@ -76,6 +76,19 @@ layout(binding = 13, std430) readonly buffer SunBuf {
 layout(binding = 14) uniform accelerationStructureEXT tlas;
 #endif
 
+// (rt2: KYTY_RT2=1, misc.w & 32) see SunL, SunVis
+bool Rt2() { return (push.misc.w & 32) != 0; }
+// (rt2) The light the trace and the composite use: the game's own, the finest cascade's light clip z axis (its shadow
+// maps are drawn along it), signed like the latched sun; before, the latched sun (smoothed over ~1 s, from the lighting)
+// set N.L, the receiver tilt bias and the contact ray, off the maps' axis by what "RT2: sun:" logs.
+vec3 SunL() {
+	vec3 l0 = normalize(push.extra.yzw);
+	if (!Rt2() || sun.hdr.x < 0.5) return l0;
+	float n = length(sun.c[0].r2.xyz);
+	if (!(n > 1e-9)) return l0;
+	vec3 a = sun.c[0].r2.xyz / n;
+	return dot(a, l0) < 0.0 ? -a : a;
+}
 vec2 RenderSize() { return push.motion.zw; }
 vec2 TraceSize() { return push.trace.xy; }
 float YSign() { return (push.misc.w & 4) != 0 ? -1.0 : 1.0; }
@@ -292,21 +305,30 @@ float SunVis(vec3 p, vec3 n, float ndl, vec3 l, ivec2 pixel, out int ci) {
 		vec2  u    = CascUv(LightClip(ci, p), h);
 		float edge = min(min(u.x, 1.0 - u.x), min(u.y, 1.0 - u.y));
 		float pr   = 1.0 - smoothstep(4.0 / MapSize(), sun.opt.z, edge);
-		if (Ign(vec2(pixel) + fr * 3.17 + 41.0) < pr) {
+		// (rt2: the blend's choice anchored on the light's map (a quarter texel), not the screen: it stays on the surface)
+		float rb = Rt2() ? Ign(floor(u * MapSize() * 4.0) + 41.0) : Ign(vec2(pixel) + fr * 3.17 + 41.0);
+		if (rb < pr) {
 			vec2 u2 = CascUv(LightClip(ci + 1, p), h);
 			if (all(greaterThan(u2, vec2(4.0 / MapSize()))) && all(lessThan(u2, vec2(1.0 - 4.0 / MapSize())))) ci = ci + 1;
 		}
 	}
 	float t     = sun.c[ci].info.y;
 	float layer = sun.c[ci].info.x;
-	vec3  lc    = LightClip(ci, Offset(ci, p, n));
+	// (rt2) the normal offset scaled by the receiver's tilt (sin of the angle to the light; at least 0.35 texel): one full
+	// texel on every surface lifted lit receivers facing the sun off their casters (light leaking at contact, shadows
+	// detached); the receiver-plane and measured biases below are unchanged (no acne: they already cover the facing case)
+	vec3  po    = Rt2() ? p + n * (t * max(sqrt(max(1.0 - ndl * ndl, 0.0)), 0.35)) : Offset(ci, p, n);
+	vec3  lc    = LightClip(ci, po);
 	vec2  uv    = CascUv(lc, h);
 	float tl    = TowardLight(ci, l);
 	float tilt  = TanTilt(ndl);
 	float k     = sun.hdr.y;
 	float uvm   = 1.0 / (t * MapSize()); // (uv per metre)
 	float base  = sun.hyp.y + t * 0.5;
-	float a0    = 6.2831853 * Ign(vec2(pixel) + fr * 5.588238);
+	// (rt2) the Vogel disc's rotation anchored on the shadow map (a quarter texel of this cascade), not on the screen
+	// pixel: the PCSS noise was fixed to the screen and slid over the ground while walking (a crawling penumbra the
+	// temporal pass could not hold); on the map it stays with the surface and accumulates
+	float a0    = 6.2831853 * (Rt2() ? Ign(floor(uv * MapSize() * 4.0) + layer * 31.0) : Ign(vec2(pixel) + fr * 5.588238));
 	// Blockers within the penumbra cone of the farthest occluder that matters (opt2.x metres above the receiver).
 	float rs   = clamp(k * sun.opt2.x, 1.5 * t, 24.0 * t);
 	float bsum = 0.0, bn = 0.0;
@@ -412,7 +434,7 @@ void Trace(ivec2 pixel) {
 	vec3 p = ViewPos(uv, d);
 	vec3 n = NormalAt(uv, p);
 	imageStore(gbuf_out, pixel, vec4(n, abs(p.z)));
-	vec3  l   = normalize(push.extra.yzw);
+	vec3  l   = SunL(); // (rt2: the cascades' axis; else the latched sun as before)
 	float ndl = dot(n, l);
 	// Facing away: the sun term is zero there (the composite leaves it); nothing to trace.
 	if (Hyp() < 0 || ndl <= 0.02) {
@@ -623,7 +645,7 @@ void Composite(ivec2 pixel, out float dark, out float lift) {
 	vec3  p   = ViewPos(uv, d);
 	float z   = abs(p.z);
 	vec3  n   = NormalAt(uv, p);
-	vec3  l   = normalize(push.extra.yzw);
+	vec3  l   = SunL(); // (rt2: the cascades' axis; else the latched sun as before)
 	float ndl = dot(n, l);
 	float vis = TraceSize().x == RenderSize().x ? texelFetch(src_a, pixel, 0).r : Upsample(uv, z);
 	vis = (isnan(vis) || isinf(vis)) ? 1.0 : clamp(vis, 0.0, 1.0);

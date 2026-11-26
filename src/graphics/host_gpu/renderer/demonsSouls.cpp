@@ -3,9 +3,13 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "ds-linear-copy-hook.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 #include "sync-stats.h"
+#include "parpadeo.h"          // (parpadeo2)
+#include "speculation-state.h" // (parpadeo2: Spec::Current)
+#include "f0-measure.h"        // (f0: KYTY_F0)
 
 #include <algorithm>
 #include <array>
@@ -157,11 +161,91 @@ void NoteCopy(std::atomic<uint32_t>& counter, const char* reason = nullptr) {
 }
 } // namespace
 
+namespace {
+// (render4, KYTY_DS_LINEAR_COPY_HOOK=2) The copy the last announcement makes (ExpectLinearCopy), until the next
+// dispatch of the copy shader compares with it. Render thread.
+struct ExpectedCopy {
+	bool       pending = false, valid = false;
+	LinearCopy copy {};
+};
+ExpectedCopy g_expected_copy;
+void CompareExpectedCopy(const std::optional<LinearCopy>& copy) {
+	if (!g_expected_copy.pending) return;
+	g_expected_copy.pending = false;
+	const auto& expected    = g_expected_copy;
+	// (Both refuse, or both copy the same bytes: the same.)
+	const bool same = copy.has_value() == expected.valid &&
+	                  (!copy || (copy->src == expected.copy.src && copy->dst == expected.copy.dst &&
+	                             copy->bytes == expected.copy.bytes));
+	if (same) return DsLinearCopyHook::Count(copy ? DsLinearCopyHook::VerifySame : DsLinearCopyHook::VerifyRefused);
+	DsLinearCopyHook::Count(DsLinearCopyHook::VerifyDifferent);
+	static std::atomic<uint32_t> printed {0};
+	if (printed.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("[ds-copy-hook] DIFFERENT: announced %s src 0x%llx dst 0x%llx bytes 0x%llx; the dispatch %s src 0x%llx "
+		            "dst 0x%llx bytes 0x%llx\n",
+		            expected.valid ? "copy" : "refusal", static_cast<unsigned long long>(expected.copy.src),
+		            static_cast<unsigned long long>(expected.copy.dst), static_cast<unsigned long long>(expected.copy.bytes),
+		            copy ? "copies" : "refuses", static_cast<unsigned long long>(copy ? copy->src : 0),
+		            static_cast<unsigned long long>(copy ? copy->dst : 0), static_cast<unsigned long long>(copy ? copy->bytes : 0));
+		std::fflush(stdout);
+	}
+}
+} // namespace
+
+void ExpectLinearCopy(uint64_t dst, uint64_t src, uint32_t count, uint32_t period, uint64_t commands,
+                      uint64_t commands_bytes) {
+	// (An announcement no dispatch followed: counted as different.)
+	if (g_expected_copy.pending) DsLinearCopyHook::Count(DsLinearCopyHook::VerifyDifferent);
+	bool       aliased = false;
+	const auto copy    = LinearCopyOfRanges(dst, src, count, period, commands, commands_bytes, nullptr, &aliased);
+	g_expected_copy    = {.pending = true, .valid = copy.has_value(), .copy = copy ? *copy : LinearCopy {}};
+}
+
+// (parpadeo2, KYTY_PARPADEO; local/parpadeo.h) The shader's fill form (a period shorter than the count: the copy
+// path refuses it, the shader runs): the index cull's zeroing of its draw arguments is one. Seen (and, with
+// KYTY_PARPADEO_FIX=1, made as a GPU fill of zeros) when its destination is a known indirect argument range. The same
+// register and descriptor checks as LinearCopyOf. True: done here.
+static bool ParpadeoFill(const LinearCopyDispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
+                         uint32_t mode) {
+	if (!Parpadeo::On() || Spec::Current() != nullptr) return false;
+	const auto& data = dispatch.user_data;
+	if (data.size() != 12 || dispatch.thread_dimensions || mode != 0x41 || dispatch.threads[0] != 64 ||
+	    dispatch.threads[1] != 1 || dispatch.threads[2] != 1 || !dispatch.group_id[0] || dispatch.group_id[1] ||
+	    dispatch.group_id[2] || dispatch.thread_ids != 1 || dispatch.workgroup_register != 12 || dispatch.tg_size ||
+	    y != 1 || z != 1 || x == 0)
+		return false;
+	ShaderBufferResource source, destination, parameters;
+	std::memcpy(source.fields, data.data(), 16);
+	std::memcpy(destination.fields, data.data() + 4, 16);
+	std::memcpy(parameters.fields, data.data() + 8, 16);
+	for (const auto* d: {&source, &destination})
+		if (d->fields[3] != 0x00014004 || (d->fields[1] & 0xffff0000u) != 0x00040000u || d->Base48() == 0 ||
+		    (d->Base48() & 3) != 0)
+			return false;
+	if (parameters.fields[3] != 0x0004dfac || (parameters.fields[1] & 0xffff0000u) != 0x00100000u ||
+	    parameters.NumRecords() != 1 || (parameters.Base48() & 3) != 0)
+		return false;
+	std::array<uint32_t, 2> controls {};
+	if (!Libs::LibKernel::Memory::TryReadGpuCleanBackingToHost(parameters.Base48(), controls.data(), sizeof(controls)))
+		return false;
+	const uint64_t count = controls[0], period = controls[1];
+	if (count == 0 || period == 0 || period >= count || count > destination.NumRecords() || period > source.NumRecords() ||
+	    x != (count + 63) / 64 || count * 4 > 16 * 1024 * 1024)
+		return false;
+	const uint64_t src = source.Base48(), dst = destination.Base48();
+	if (src < dst + count * 4 && dst < src + period * 4) return false;
+	if (!LibKernel::Memory::IsFullyMapped(dst, count * 4) || !LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, count * 4))
+		return false;
+	return Parpadeo::OnFill(cache, dst, src, count, period);
+}
+
 bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint32_t x, uint32_t y, uint32_t z,
                    uint32_t mode) {
+	if (ParpadeoFill(dispatch, cache, x, y, z, mode)) return true; // (parpadeo2)
 	const char* reason  = nullptr;
 	bool        aliased = false;
 	const auto  copy    = LinearCopyOf(dispatch, x, y, z, mode, &reason, &aliased);
+	if (g_expected_copy.pending) CompareExpectedCopy(copy); // (KYTY_DS_LINEAR_COPY_HOOK=2 only)
 	if (!copy) {
 		NoteCopy(g_copy_stats.shader, reason);
 		return false;
@@ -177,6 +261,7 @@ bool TryLinearCopy(const LinearCopyDispatch& dispatch, BufferCache& cache, uint3
 		}
 		NoteCopy(g_copy_stats.copies_aliased);
 	}
+	const F0Measure::LinearCopyScope f0_copy(copy->dst, copy->src, copy->bytes); // (f0)
 	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
 	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
 	NoteCopy(g_copy_stats.copies);
@@ -254,5 +339,52 @@ std::optional<LinearCopy> LinearCopyOf(const LinearCopyDispatch& dispatch, uint3
 	if (!LibKernel::Memory::IsFullyMapped(src, bytes) || !LibKernel::Memory::IsFullyMapped(dst, bytes))
 		return refuse("unmapped", dst, count, period);
 	return LinearCopy {src, dst, bytes};
+}
+
+// (render4) LinearCopyOf's checks from its counts on, for ranges given directly. Kept in step with it: the same
+// refusals in the same order (a descriptor's base is 48 bits, nonzero and dword-aligned; its records are the count
+// for the destination and the period for the source, so "count > records" is "period < count").
+std::optional<LinearCopy> LinearCopyOfRanges(uint64_t dst, uint64_t src, uint32_t count_dwords, uint32_t period_dwords,
+                                             uint64_t commands, uint64_t commands_bytes, const char** reason,
+                                             bool* aliased) {
+	const auto refuse = [&](const char* why, uint64_t at = 0, uint64_t n = 0, uint64_t p = 0) {
+		if (reason != nullptr) *reason = why;
+		LinearCopyRefused(why, at, n, p);
+		return std::nullopt;
+	};
+	const uint64_t count = count_dwords, period = period_dwords, bytes = count * 4;
+	if (src == 0 || dst == 0 || (src & 3) != 0 || (dst & 3) != 0 || (src >> 48u) != 0 || (dst >> 48u) != 0)
+		return refuse("buffer descriptors");
+	if (count == 0 || period < count) return refuse("counts", dst, count, period);
+	if (bytes > 16 * 1024 * 1024) return refuse("groups or size", dst, count, period);
+	if ((src < dst + bytes && dst < src + bytes) || (commands < dst + bytes && dst < commands + commands_bytes))
+		return refuse("overlap", dst, count, period);
+	if (!LibKernel::Memory::IsUniqueGuestBackingRangeAcrossMappings(dst, bytes)) {
+		if (aliased == nullptr) return refuse("aliased backing (destination)", dst, count, period);
+		*aliased = true;
+	} else if (aliased != nullptr) {
+		*aliased = false;
+	}
+	if (!LibKernel::Memory::IsFullyMapped(src, bytes) || !LibKernel::Memory::IsFullyMapped(dst, bytes))
+		return refuse("unmapped", dst, count, period);
+	return LinearCopy {src, dst, bytes};
+}
+
+// (render4) As TryLinearCopy(const LinearCopyDispatch&, ...) from its copy on.
+bool TryLinearCopyRanges(BufferCache& cache, uint64_t dst, uint64_t src, uint32_t count, uint32_t period, uint64_t commands,
+                         uint64_t commands_bytes) {
+	const char* reason  = nullptr;
+	bool        aliased = false;
+	const auto  copy    = LinearCopyOfRanges(dst, src, count, period, commands, commands_bytes, &reason, &aliased);
+	if (!copy) return false; // (the game's packets run: their dispatch notes the reason)
+	if (aliased) {
+		if (!cache.PrepareAliasesForCpuWrite(copy->dst, copy->bytes)) return false;
+		NoteCopy(g_copy_stats.copies_aliased);
+	}
+	const F0Measure::LinearCopyScope f0_copy(copy->dst, copy->src, copy->bytes); // (f0)
+	cache.CopyBuffer(copy->dst, copy->src, copy->bytes, false, false);
+	cache.ScheduleCopyFeedback(copy->dst, copy->bytes);
+	NoteCopy(g_copy_stats.copies);
+	return true;
 }
 } // namespace Libs::Graphics::DemonsSouls

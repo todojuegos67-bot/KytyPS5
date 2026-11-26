@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "local/raiz-wb-guard.h" // (crash-ba2b1f: PrintGuestPageState)
 #include "local/mem-guard.h"
 #include "loader/gameArgs.h"
 
@@ -19,8 +20,10 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsPageFree.h"
 #include "loader/demonsSoulsCopy.h"
 #include "loader/demonsSoulsGpuPages.h"
+#include "loader/demonsSoulsWriteAudit.h"
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsSuperResolution.h"
@@ -28,6 +31,8 @@
 #include "loader/demonsSoulsTouchGuard.h"
 #include "loader/demonsSoulsSkipIntro.h"
 #include "loader/demonsSoulsAllocClamp.h"
+#include "loader/demonsSoulsPortAlloc.h"
+#include "loader/demonsSoulsInventory.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -35,6 +40,9 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 #include "live-trace.h"
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
+#include "local/f0-measure.h" // (esperas2: the game thread's time in the fault handler, KYTY_ESPERAS)
+#include "native/g1-probe.h" // (g1)
 
 #include <algorithm>
 #include <atomic>
@@ -852,6 +860,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		Juego3::Scope juego3_fault(Juego3::TagFault); // (juego3: the game thread's time in the fault handler)
+		F0Measure::FaultScope esperas_fault(info->exception_address); // (esperas2, KYTY_ESPERAS)
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -871,8 +881,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
+		// (audit1, KYTY_DS_WRITE_AUDIT: the writer of a write fault, for the audit's FUGA table. Measurement only.)
+		// (policy1: and the reader of a read fault, for the "[read-audit]" table.)
+		if (DemonsSoulsWriteAudit::On())
+			DemonsSoulsWriteAudit::NoteFaultSite(info->exception_address, info->rsp);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
+			// (g1, KYTY_G1_PROBE: the CPU's reads of GPU-written pages by call site; one relaxed load when off)
+			G1::NoteGpuFault(access == GpuAccess::Read, info->exception_address, info->rsp, info->access_violation_vaddr);
 			return true;
 		}
 	}
@@ -950,6 +966,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			bool any = false;
 			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
 			if (!any) std::printf("  none\n");
+			// (crash-ba2b1f) Their state now: host protection, the trackers' bits (read without locks), kept GPU bytes,
+			// the write watch since the GPU took them (KYTY_RAIZ_WB_GUARD) and the guard's marks.
+			std::printf("State of those pages:\n");
+			for (const auto page: pages) Libs::LibKernel::Memory::PrintGuestPageState(page);
 		}
 		// The memory the registers point at (the object a bad pointer came from: its fields and lists).
 		{
@@ -1625,6 +1645,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	// (p1) KYTY_PORT_ALLOC=1: antes que PageFree (que instala AllocNativo) y que AllocClamp (lee KYTY_MEM_DIRECTA_MB).
+	DemonsSoulsPortAlloc::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsPageFree::Install(m_programs.empty() ? nullptr : m_programs.front()); // (m5) KYTY_ENGINE_FREE
 	GameArgs::DumpConvarNames(m_programs.empty() ? nullptr : m_programs.front());
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
@@ -1637,6 +1660,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsSkipIntro::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsCamera::InstallNoRamp(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsInventory::Install(m_programs.empty() ? nullptr : m_programs.front()); // (trucos3/4) F2 > Trucos: game-thread writes, inventory, names
+	// (audit1) KYTY_DS_WRITE_AUDIT=1, off by default. Last: DemonsSoulsGpuPages (above) verifies whole functions this
+	// patches the entries of, and every patch above has checked the game's own bytes by now.
+	DemonsSoulsWriteAudit::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1660,7 +1687,10 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	DemonsSoulsWriteAudit::Clear(); // (audit1; first: its patches were the last ones written)
 	DemonsSoulsIdle::Clear();
+	DemonsSoulsPageFree::Clear();
+	DemonsSoulsPortAlloc::Clear();
 	DemonsSoulsCopy::Clear();
 	DemonsSoulsGpuPages::Clear();
 

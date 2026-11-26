@@ -10,6 +10,9 @@
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
 #include "libs/vaContext.h"
+#include "loader/demonsSoulsTextureProbe.h"
+#include "local/tex-directa.h" // (etapa2d) KYTY_TEX_DIRECTA, parte A
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE)
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
@@ -648,7 +651,16 @@ void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
 }
 
 void* KYTY_SYSV_ABI memcpy(void* dest, const void* src, size_t n) {
-	return ::memcpy(dest, src, n);
+	// KYTY_TEXTURE_PROBE: counts only the streamed texture chunks' copy (measurement, demonsSoulsTextureProbe.h).
+	::Loader::DemonsSoulsTextureProbe::OnCopy(reinterpret_cast<uint64_t>(__builtin_return_address(0)), dest, n);
+	// (g1, KYTY_G1_PROBE: the binder's register-pair copies; one relaxed load when off. native/g1-probe.h)
+	::G1::OnMemcpy(reinterpret_cast<uint64_t>(__builtin_return_address(0)), dest, src, n);
+	// (etapa 2.1, KYTY_TEX_DIRECTA, apagado por defecto) trozo del streaming a VirtualMemo: hash del origen y a la cola de
+	// subida directa a la GPU; la copia a la RAM se hace igual (local/tex-directa.h).
+	::TexDirecta::OnMemcpy(dest, src, n);
+	void* const result = ::memcpy(dest, src, n);
+	::G1::AfterMemcpy();
+	return result;
 }
 
 void* KYTY_SYSV_ABI memmove(void* dest, const void* src, size_t n) {

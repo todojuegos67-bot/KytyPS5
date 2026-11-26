@@ -35,6 +35,12 @@ uint64_t DiscardPages(void* address, uint64_t size);
 // the working set's drop, whichever is more); detail: the parts, for the log line.
 uint64_t FlushNow(int64_t scratch_idle_ms, char* detail, size_t detail_size);
 
+// (hp, 11-25) KYTY_SCRATCH_SUELTA (on unless =0): the Scratch buffers below are registered even with KYTY_SOFT_RELEASE
+// off, and ReleaseIdleScratch (the mem1 thread, every 5 s) frees those idle for idle_ms or more (one in use is skipped:
+// try_lock). No heap compaction, no frame check: freeing an idle vector is a free() (the segment heap or VirtualFree).
+[[nodiscard]] bool ScratchOn();
+uint64_t ReleaseIdleScratch(int64_t idle_ms);
+
 // A thread's reusable byte buffer (one per thread: `thread_local SoftRelease::Scratch s("name")`), which otherwise keeps
 // its largest size for good. With KYTY_SOFT_RELEASE=1 the release thread frees one idle for 10 s or more, under its own
 // lock (try_lock: one in use is skipped), and logs the MiB by source; the heap compaction after gives the pages back.

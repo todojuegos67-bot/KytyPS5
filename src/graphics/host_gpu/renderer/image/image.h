@@ -89,6 +89,10 @@ public:
 	// A parked image taken back for `image_info` (TextureCache::TakeParkedImage, the same Vulkan image): the state the
 	// constructor gives a new one, but for its Vulkan image, views and barrier state (and serial: the same object).
 	void PrepareReuse(const ImageInfo& image_info);
+	// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse image (backing.sparse): its layers whose guest slices meet [begin, end) bound
+	// while committed, unbound when not; [gone_begin, gone_end) about to be unmapped (GPU thread; nothing for a dense one).
+	void SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin = 0, uint64_t gone_end = 0);
+	[[nodiscard]] bool IsSparse() const noexcept { return backing.sparse != nullptr; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -96,6 +100,8 @@ public:
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
 	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	// (p7, KYTY_P7_C7) A new image's contents cleared to 0 before its first use that may read them (Transit).
+	bool ClearUndefined(vk::CommandBuffer command_buffer);
 	// The whole-image barrier state the calling thread's next transition starts from (a speculative translation's
 	// own once it used the image: speculation-state.h).
 	[[nodiscard]] const VulkanImageState& CurrentState() const;
@@ -391,6 +397,9 @@ public:
 	uint64_t         lru_tick           = 0; // the collection tick of its last use (TextureCache)
 	// Transit group that last set the whole-image state; see BeginTransitGroup.
 	uint64_t         transit_group      = 0;
+	// (p7b, C2) The recording thread's count of writing commands (LocalVulkanRecording::RecordedWrites) when the
+	// whole-image state was last set: a repeat in the same transit group is proven redundant only while it is unchanged.
+	uint64_t         transit_writes     = UINT64_MAX;
 	// The staging copy of the last whole-image upload (null: none or not refillable) and the command buffer it was
 	// recorded in (CommandScheduler::CommandSerial): TextureCache::InitializeImage.
 	const Buffer*    staged_ring        = nullptr;
@@ -417,9 +426,71 @@ public:
 	mutable uint32_t level_view         = UINT32_MAX;
 	mutable uint64_t level_begin        = 0;
 	mutable uint64_t level_end          = 0;
+	// (M7, GestorMem) Id del gestor central de memoria (0: sin registrar), tipo y flags comunicados (para no llamar al
+	// gestor en cada uso: solo cuando cambian). Los pone TextureCache (RegisterImage / UnregisterImage / Find*).
+	uint64_t         gestor_id          = 0;
+	int8_t           gestor_tipo        = -1;
+	uint8_t          gestor_flags       = 0;
+
+	// (M7, TEX-DEDUP) Dos direcciones del juego con el mismo contenido (hash, formato y forma) comparten la VkImage: la
+	// imagen nueva se crea como alias de `SetShareSource` (cuenta de referencias en Share; la memoria se libera con la
+	// ultima). El estado de barreras es uno solo para el grupo (PushSharedState lo copia a todos tras cada transicion).
+	// Copy-on-write: TextureCache::FindImage borra el miembro que se vaya a escribir (CPU, GPU, bufer, RT o storage) antes
+	// de usarlo; se crea otra vez con su propia VkImage. Las paginas de cada direccion las vigila su propia imagen.
+	struct Share;
+	Share* share       = nullptr;
+	bool   share_fresh = false; // recien unida: su contenido ya esta en la VkImage (TextureCache la da por subida)
+	[[nodiscard]] bool SharedWithOthers() const noexcept;
+	// Hilo que crea la imagen: el siguiente constructor de este hilo intenta ser alias de `source` (nullptr: nada).
+	static void SetShareSource(Image* source) noexcept;
+	struct DedupStats {
+		uint64_t ahora_n = 0, ahora_bytes = 0; // imagenes que ahora usan la VkImage de otra, y sus bytes (VRAM ahorrada)
+		uint64_t unidas = 0, unidas_bytes = 0, separadas = 0, escrituras_tarde = 0; // acumulado
+	};
+	[[nodiscard]] static DedupStats Dedup() noexcept;
+	static void NoteDedupSeparated() noexcept;
+
+	void PushSharedState(); // (M7) el estado de barreras de esta imagen a los demas miembros de su grupo
+
+	// (RT-ALIAS-MEM, KYTY_RT_ALIAS_MEM=1) Aliasing de memoria de Vulkan para los render targets que el juego solapa en
+	// sus arenas (RTSharedAllocator/RTPersistAllocator: un asignador lineal que se reinicia, Ghidra 0x91c680/0x915930;
+	// en PS5 varias superficies viven en los mismos bytes). Una imagen nueva cuyo rango del juego cae entero dentro del
+	// de otra viva de la misma arena se crea como VkImage propia ligada (vmaBindImageMemory2) a la VkDeviceMemory de esa
+	// otra, en el desplazamiento del juego: sin asignacion propia. Cuando un miembro escribe, los que solapan su rango de
+	// memoria quedan "pisados": su siguiente uso parte de VK_IMAGE_LAYOUT_UNDEFINED con dependencia completa (lo que
+	// pide Vulkan para memoria con alias). Si un miembro pisado se LEE antes de escribirse (el juego aun necesitaba su
+	// contenido), se marca malo: TextureCache lo recrea con memoria propia y ese rango no vuelve a compartir.
+	struct MemAlias;
+	std::atomic<MemAlias*> mem_alias {nullptr};
+	uint64_t          mem_alias_off   = 0; // desplazamiento y tamano en la VkDeviceMemory del grupo
+	uint64_t          mem_alias_size  = 0;
+	std::atomic<bool> mem_alias_pisada {false};
+	std::atomic<bool> mem_alias_mala {false};
+	// Creada con memoria que admite alias (VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT: sin VkMemoryDedicatedAllocateInfo, que
+	// ataria la memoria a una sola VkImage): solo estas pueden prestar su memoria a otras.
+	bool              mem_alias_capable = false;
+	// Hilo que crea la imagen: la siguiente imagen de este hilo intenta ligarse a la memoria de `host` en `offset` (host
+	// nullptr: ninguna); `capable`: si no se liga, se crea con memoria que admite alias (RT de las arenas del juego).
+	// `for_address`: solo la imagen de esa direccion del juego lo toma (otra creada antes en el mismo hilo, no).
+	static void SetMemAliasHost(Image* host, uint64_t offset, bool capable, uint64_t for_address) noexcept;
+	[[nodiscard]] bool MemAliasGuest() const noexcept; // ligada a la memoria de otra (no tiene asignacion propia)
+	[[nodiscard]] bool MemAliasBad() const noexcept { return mem_alias_mala.load(std::memory_order_relaxed); }
+	[[nodiscard]] static bool MemAliasBlocked(uint64_t address, uint64_t size);
+	struct MemAliasStats {
+		uint64_t ahora_n = 0, ahora_bytes = 0;                        // imagenes sin memoria propia ahora, y sus bytes
+		uint64_t unidas = 0, rechazadas = 0, reinicios = 0, malas = 0; // acumulado
+	};
+	[[nodiscard]] static MemAliasStats MemAliasCounters() noexcept;
 
 private:
 	friend struct ImageTestAccess;
+	bool TryJoinShare(Image& source, const vk::ImageCreateInfo& create);
+	bool TryJoinMemAlias(Image& host, uint64_t offset, const vk::ImageCreateInfo& create);
+	bool CreateAliasCapable(const vk::ImageCreateInfo& create);
+	void FillMemAliasBacking(const vk::ImageCreateInfo& create, vk::Image image, VmaAllocation allocation);
+	void MemAliasBeforeUse(vk::AccessFlags2 destination_access, VulkanImageState* spec_state,
+	                       std::vector<VulkanImageState>* spec_subresources);
+	void NoteLateWrite() noexcept;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,

@@ -48,6 +48,9 @@ public:
 	// A game buffer bound to `allocation` (a defragmentation pass's destination: BufferCache::Defragment).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::BufferUsageFlags flags,
 	       uint64_t size, VmaAllocation allocation);
+	// (tiron7) Host memory imported as a buffer (VK_EXT_external_memory_host): `memory` and `buffer` are owned and freed with it.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::Buffer buffer,
+	       vk::DeviceMemory memory, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -103,6 +106,10 @@ public:
 	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
 	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RunGarbageCollector).
 	bool bda_read = false;
+	// (BDA-RETIRO) Ultimo uso REAL visto por la preparacion BDA (ms de steady_clock; 0 = aun no visto). El recolector
+	// no lo toca: TouchBuffer del recolector no cuenta como uso (BufferCache::RetireStaleBuffers).
+	mutable int64_t bda_use_ms = 0; // (puesto por BufferCache::TouchBuffer, uso real; no por el recolector)
+	bool    bda_contado = false; // (BDA-RETIRO) ya mirado por el recolector una vez
 	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into it or an image's
 	// bytes (TextureCache::DownloadImageData): writes that need not synchronize their pages first (a shader's write
 	// does, BufferCache::ObtainBuffer). Uploads into it then stay in order in that buffer (UploadPrologue).
@@ -128,6 +135,7 @@ private:
 	bool                          m_coherent = false;
 	bool                          m_in_system_memory = false;
 	std::span<uint8_t>            m_mapped;
+	vk::DeviceMemory              m_imported = nullptr; // (tiron7)
 	struct Sparse;
 	std::unique_ptr<Sparse> m_sparse;
 };

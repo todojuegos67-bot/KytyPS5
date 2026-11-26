@@ -78,13 +78,29 @@ bool Enabled() {
 	return on;
 }
 
+bool ScratchOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SCRATCH_SUELTA");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	return on;
+}
+
+uint64_t ReleaseIdleScratch(int64_t idle_ms) {
+	const auto      now = NowNs();
+	uint64_t        freed = 0;
+	std::lock_guard lock(g_scratch_mutex);
+	for (auto* s: g_scratches) freed += s->ReleaseIfIdle(now, std::max<int64_t>(0, idle_ms) * 1'000'000ll);
+	return freed;
+}
+
 void Register(const char* name, uint64_t (*release)()) {
 	std::lock_guard lock(g_mutex);
 	g_sources.emplace_back(name, release);
 }
 
 Scratch::Scratch(const char* name): source(name) {
-	if (!Enabled()) return;
+	if (!Enabled() && !ScratchOn()) return;
 	std::lock_guard lock(g_scratch_mutex);
 	g_scratches.push_back(this);
 	registered = true;

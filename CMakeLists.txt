@@ -189,7 +189,7 @@ if(KYTY_CLANG_CL)
 	option(KYTY_NATIVE_OPT "Release: -O3 -march=KYTY_MARCH" ON)
 	# A build for other PCs: x86-64-v3 (AVX2, FMA, BMI2). native also takes this CPU's newer
 	# extensions (GFNI, AVX-VNNI), which crash CPUs without them at the first use.
-	set(KYTY_MARCH "native" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)")
+	set(KYTY_MARCH "x86-64-v3" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)" FORCE) # (11-23) always AVX2: native put AVX-512 in the exe and it died at start (0xc000001d) on CPUs without it (Intel Core Ultra / Arrow Lake, most Intel desktops)
 	option(KYTY_THIN_LTO "Release: ThinLTO" ON)
 	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
 	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
@@ -359,6 +359,22 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${lod_stats_pack_header}")
 
+# (render1 F2) KYTY_RENDER1=2: the native depth batch against the normal depth (src/local/render1-native.inc).
+set(render1_cmp_source "${KYTY_SOURCE_DIR}/local/render1-cmp.comp")
+set(render1_cmp_spv "${gpu_tiler_generated_dir}/render1_cmp.spv")
+set(render1_cmp_header "${gpu_tiler_generated_dir}/render1_cmp_spv.h")
+add_custom_command(
+	OUTPUT "${render1_cmp_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${render1_cmp_spv}" "${render1_cmp_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${render1_cmp_spv} -DOUTPUT=${render1_cmp_header}
+	        -DSYMBOL=RENDER1_CMP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${render1_cmp_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${render1_cmp_header}")
+
 # KYTY_UPSCALE_SHARPNESS: sharpening after DLSS or XeSS (src/local/frame-gen.cpp).
 set(sharpen_source "${KYTY_SOURCE_DIR}/local/sharpen.comp")
 set(sharpen_spv "${gpu_tiler_generated_dir}/sharpen.spv")
@@ -524,7 +540,7 @@ set(rt_reflections_header "${gpu_tiler_generated_dir}/rt_reflections_spv.h")
 add_custom_command(
 	OUTPUT "${rt_reflections_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3
 	        -o "${rt_reflections_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_spv} -DOUTPUT=${rt_reflections_header}
 	        -DSYMBOL=RT_REFLECTIONS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -539,7 +555,7 @@ set(rt_reflections_hw_header "${gpu_tiler_generated_dir}/rt_reflections_hw_spv.h
 add_custom_command(
 	OUTPUT "${rt_reflections_hw_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -DKYTY_HWRT
 	        -o "${rt_reflections_hw_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hw_spv} -DOUTPUT=${rt_reflections_hw_header}
 	        -DSYMBOL=RT_REFLECTIONS_HW_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -553,7 +569,7 @@ set(rt_reflections_hwm_header "${gpu_tiler_generated_dir}/rt_reflections_hwm_spv
 add_custom_command(
 	OUTPUT "${rt_reflections_hwm_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -DKYTY_HWRT -DKYTY_HWRT_MATERIAL
 	        -o "${rt_reflections_hwm_spv}" "${rt_reflections_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${rt_reflections_hwm_spv} -DOUTPUT=${rt_reflections_hwm_header}
 	        -DSYMBOL=RT_REFLECTIONS_HWM_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -578,6 +594,21 @@ add_custom_command(
 )
 list(APPEND kyty_emulator_src "${gbuf_view_header}")
 
+# (pt1) BB_PATHTRACING: ray-traced sun shadows and reflections through the scene TLAS (src/local/pathtrace.cpp).
+set(pt_source "${KYTY_SOURCE_DIR}/local/pt.comp")
+set(pt_spv "${gpu_tiler_generated_dir}/pt.spv")
+set(pt_header "${gpu_tiler_generated_dir}/pt_spv.h")
+add_custom_command(
+	OUTPUT "${pt_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${pt_spv}" "${pt_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${pt_spv} -DOUTPUT=${pt_header}
+	        -DSYMBOL=PT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${pt_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${pt_header}")
 # KYTY_HWRT_LIGHTS: ray-traced local-light shadows through the scene TLAS (src/local/hw-lights.cpp).
 set(hwlights_source "${KYTY_SOURCE_DIR}/local/hw-lights.comp")
 set(hwlights_spv "${gpu_tiler_generated_dir}/hwlights.spv")
@@ -608,6 +639,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${rtwater_header}")
+# (rtq2 b) KYTY_RTN: "Reflejos RT nuevos", the hardware trace where the game reflects (src/local/rt-nuevo.cpp).
+set(rtnuevo_source "${KYTY_SOURCE_DIR}/local/rt-nuevo.comp")
+set(rtnuevo_spv "${gpu_tiler_generated_dir}/rtnuevo.spv")
+set(rtnuevo_header "${gpu_tiler_generated_dir}/rtnuevo_spv.h")
+add_custom_command(
+	OUTPUT "${rtnuevo_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${rtnuevo_spv}" "${rtnuevo_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${rtnuevo_spv} -DOUTPUT=${rtnuevo_header}
+	        -DSYMBOL=RTNUEVO_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${rtnuevo_source}" "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${rtnuevo_header}")
 # KYTY_RT_FLICKER: the RT passes' flicker self-check (src/local/rt-flicker.cpp).
 set(rtflicker_source "${KYTY_SOURCE_DIR}/local/rt-flicker.comp")
 set(rtflicker_spv "${gpu_tiler_generated_dir}/rtflicker.spv")
@@ -931,6 +977,9 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_imgui_hdr.frag"
+	"${gpu_tiler_shader_dir}/gpu_ds_sombras.vert"
+	"${gpu_tiler_shader_dir}/gpu_ds_sombras_skin.vert"
+	"${gpu_tiler_shader_dir}/gpu_ds_sombras_cmp.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -951,11 +1000,19 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# (f5) The native renderer (src/native; KYTY_NATIVE_RENDER, off by default).
+file(GLOB kyty_native_src CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/native/*.cpp" "${KYTY_SOURCE_DIR}/native/*.h" "${KYTY_SOURCE_DIR}/native/*.inc")
+list(APPEND kyty_emulator_src ${kyty_native_src})
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
 	"${KYTY_SOURCE_DIR}/local/local-platform.h"
 	"${KYTY_SOURCE_DIR}/local/local-platform.cpp"
+	"${KYTY_SOURCE_DIR}/local/f0-measure.h"
+	"${KYTY_SOURCE_DIR}/local/f0-measure.cpp"
+	"${KYTY_SOURCE_DIR}/local/juego3.h"
+	"${KYTY_SOURCE_DIR}/local/juego3.cpp"
 	"${KYTY_SOURCE_DIR}/local/dyn-multiplier.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.h"
 	"${KYTY_SOURCE_DIR}/local/frame-gen.cpp"
@@ -965,6 +1022,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-reflections.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.h"
 	"${KYTY_SOURCE_DIR}/local/hwrt-scene.cpp"
+	"${KYTY_SOURCE_DIR}/local/pathtrace.h"
+	"${KYTY_SOURCE_DIR}/local/pathtrace.cpp"
 	"${KYTY_SOURCE_DIR}/local/hwrt-gi.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.h"
 	"${KYTY_SOURCE_DIR}/local/rt-ao.cpp"
@@ -983,6 +1042,8 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/rt-capture.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-water.h"
 	"${KYTY_SOURCE_DIR}/local/rt-water.cpp"
+	"${KYTY_SOURCE_DIR}/local/rt-nuevo.h"
+	"${KYTY_SOURCE_DIR}/local/rt-nuevo.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.h"
 	"${KYTY_SOURCE_DIR}/local/rt-flicker.cpp"
 	"${KYTY_SOURCE_DIR}/local/rt-softsun.h"
@@ -1453,6 +1514,10 @@ endif()
 # without a console, its settings from settings.ini, an in-game options menu, the game's icon. The packaging renames
 # it to "Demon's Souls.exe" (.github/workflows/build.yml, the ds-pc-port branch). Off: the emulator as it always was.
 option(KYTY_DS_PORT "Build kyty_emulator as the Demon's Souls PC port (Windows)" OFF)
+option(KYTY_NO_ONLINE "Build the Demon's Souls port without the embedded online server (antivirus A/B test)" OFF)
+if (KYTY_NO_ONLINE)
+	add_compile_definitions(KYTY_NO_ONLINE=1)
+endif()
 set(kyty_emulator_main "${KYTY_SOURCE_DIR}/main.cpp")
 if (KYTY_DS_PORT AND WIN32)
 	enable_language(RC)
@@ -1469,6 +1534,9 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-i18n.h"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-resume.h"
+		"${KYTY_SOURCE_DIR}/port/ds-online.cpp"
+		"${KYTY_SOURCE_DIR}/port/ds-online.h"
+		"${KYTY_SOURCE_DIR}/port/ds-online-core.inc"
 		"${KYTY_SOURCE_DIR}/port/ds-precompile.h"
 		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl2.cpp"
 		"${KYTY_THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdlrenderer2.cpp"
@@ -1478,13 +1546,17 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
 	if (KYTY_CLANG_CL)
 		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
-			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" "${KYTY_SOURCE_DIR}/port/ds-resume.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" "${KYTY_SOURCE_DIR}/port/ds-resume.cpp" "${KYTY_SOURCE_DIR}/port/ds-online.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 	endif()
 	# (The icon by name from resources/.)
 	set_property(SOURCE "${KYTY_SOURCE_DIR}/port/ds-port.rc" APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/resources")
 	message(STATUS "Building the Demon's Souls PC port (KYTY_DS_PORT)")
 endif()
 add_executable(kyty_emulator ${kyty_emulator_main} ${kyty_emulator_src})
+if(KYTY_CLANG_CL AND KYTY_PGO_GENERATE)
+	# (11-26) The port quits with TerminateProcess/quick_exit (no atexit): the profile is written every 20 s and at quick_exit.
+	target_sources(kyty_emulator PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools/local/pgo-dump.cpp")
+endif()
 if (KYTY_DS_PORT AND WIN32)
 	set_target_properties(kyty_emulator PROPERTIES WIN32_EXECUTABLE ON)
 	target_compile_definitions(kyty_emulator PRIVATE KYTY_DS_PORT=1)
@@ -1492,6 +1564,8 @@ if (KYTY_DS_PORT AND WIN32)
 	if (MSVC)
 		# A Windows program with the usual main(): no console window.
 		target_link_options(kyty_emulator PRIVATE "/ENTRY:mainCRTStartup")
+		# (hp, 11-25) No linker-made manifest: ds-port.rc embeds ds-port.manifest (asInvoker + SegmentHeap) as RT_MANIFEST 1.
+		target_link_options(kyty_emulator PRIVATE "/MANIFEST:NO")
 	endif()
 	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 winhttp dxgi advapi32 windowscodecs)
 	# (10-27) The version stamp the in-game update compares with releases/latest (the CI passes its package name, the tag).

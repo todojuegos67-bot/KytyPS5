@@ -23,6 +23,7 @@
 // Anything else: nothing is changed and the reason is printed.
 #include "loader/demonsSoulsAllocClamp.h"
 
+#include "common/guardedCopy.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "kernel/memory.h"
@@ -31,11 +32,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 
 namespace Loader::DemonsSoulsAllocClamp {
@@ -157,6 +160,62 @@ std::vector<uint64_t> Between(const std::vector<uint64_t>& calls, uint64_t begin
 	return in;
 }
 
+// (n3) KYTY_MEM_DIRECTA_MB: memoria directa que se anuncia al asignador del juego (0 o sin poner = 12 GiB + 2.4 MiB, como
+// hasta ahora). Ghidra 01.007.000, PlatformPageAllocator::Init 0x80c200: pool = min(disponible - sobrecoste, 12 GiB), sin
+// minimo ni assert (solo salta si es 0); el sobrecoste (tablas de seguimiento) = ((((L >> 16) + 0x3f) >> 2 & ~0xF) +
+// 0x26f437) & ~0xFFFF. El resto de la memoria directa (MFSR AllocateMainDirect, middleware 0x1de2fc0) sale de fuera del
+// pool y no depende de este tamano. Sin paginas: 0x80d9a0 reutiliza bloques liberados (+0x70) y si no, HandleOutOfMemory
+// 0x7f9890 ("Out of Memory, Requesting ...") devuelve fallo: no espera ni vacia el streaming.
+uint64_t Overhead(uint64_t limit) {
+	return (((((limit >> 16u) + 0x3fu) >> 2u) & ~uint64_t {0xF}) + 0x26f437u) & ~uint64_t {0xFFFF};
+}
+
+uint64_t LimitFromEnv() {
+	const char* v = std::getenv("KYTY_MEM_DIRECTA_MB");
+	if (v == nullptr) return Limit;
+	const unsigned long long mb = std::strtoull(v, nullptr, 10);
+	if (mb == 0) return Limit;
+	const uint64_t bytes = (static_cast<uint64_t>(mb) << 20u) & ~uint64_t {0xFFFF};
+	// Por debajo de 64 MiB el pool quedaria en nada; por encima del tope actual no cambia nada.
+	return std::clamp<uint64_t>(bytes, uint64_t {64} << 20u, Limit);
+}
+
+template <typename T>
+bool Peek(uint64_t address, T* out) {
+	return address >= 0x10000 && address < (uint64_t {1} << 47u) &&
+	       Common::GuardedCopy(out, reinterpret_cast<const void*>(address), sizeof(T)) == 0;
+}
+
+// [mem-directa] cada 10 s. Estado del asignador *(base + 0x2ee4d60); dos categorias (CPU, GPU) de 0xa0 bytes:
+// +0x90 bytes mapeados en uso (memoria real), +0x98 su pico (demonsSoulsAllocNativo.cpp).
+void Report(uint64_t base, uint64_t announced, uint64_t pool) {
+	std::thread([base, announced, pool] {
+		uint64_t peak = 0;
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+			uint64_t state = 0, used = 0, cat_peak = 0;
+			if (!Peek(base + 0x2ee4d60, &state) || state == 0) continue;
+			uint64_t sum_used = 0, sum_peak = 0;
+			bool     ok       = true;
+			for (uint64_t c = 0; c < 2 && ok; c++) {
+				ok = Peek(state + c * 0xa0 + 0x90, &used) && Peek(state + c * 0xa0 + 0x98, &cat_peak);
+				sum_used += used;
+				sum_peak += cat_peak;
+			}
+			if (!ok) continue;
+			peak = std::max(peak, sum_peak);
+			const double mib = 1.0 / (1024.0 * 1024.0);
+			std::printf("[mem-directa] anunciado %.0f MiB (KYTY_MEM_DIRECTA_MB%s), reservado por el juego %.0f MiB, usado (mapeado "
+			            "real) %.0f MiB, pico %.0f MiB, margen %.0f MiB (%.0f %%)\n",
+			            static_cast<double>(announced) * mib, announced == Limit ? "=0: como PS5" : "",
+			            static_cast<double>(pool) * mib, static_cast<double>(sum_used) * mib, static_cast<double>(peak) * mib,
+			            (static_cast<double>(pool) - static_cast<double>(peak)) * mib,
+			            pool == 0 ? 0.0 : 100.0 * (static_cast<double>(pool) - static_cast<double>(peak)) / static_cast<double>(pool));
+			std::fflush(stdout);
+		}
+	}).detach();
+}
+
 } // namespace
 
 void Install(Program* program) {
@@ -212,11 +271,18 @@ void Install(Program* program) {
 		return;
 	}
 	// The return addresses of the start-up's direct-memory calls (call + 5) are printed at run time.
-	Libs::LibKernel::Memory::SetAvailableDirectClamp(site + 5, Limit, site - ShapeBefore, allocs[2] + 6, base);
-	std::printf("[port] ds-alloc: allocator clamp applied: the call at eboot+0x%llx is told at most 0x%llx (12 GiB + 2.4 MiB) "
+	const uint64_t announced = LimitFromEnv();
+	const uint64_t pool      = std::min(announced - std::min(announced, Overhead(announced)), AllocatorBudget);
+	Libs::LibKernel::Memory::SetAvailableDirectClamp(site + 5, announced, site - ShapeBefore, allocs[2] + 6, base);
+	std::printf("[mem-directa] anunciado al asignador %llu MiB (%s), pool del juego %llu MiB\n",
+	            static_cast<unsigned long long>(announced >> 20u),
+	            announced == Limit ? "KYTY_MEM_DIRECTA_MB=0: igual que PS5" : "KYTY_MEM_DIRECTA_MB",
+	            static_cast<unsigned long long>(pool >> 20u));
+	Report(base, announced, pool);
+	std::printf("[port] ds-alloc: allocator clamp applied: the call at eboot+0x%llx is told at most 0x%llx "
 	            "of available direct memory; expected next: no AllocateDirect/MapDirect from eboot+0x%llx/0x%llx (the "
 	            "block above 12 GiB), an AllocateDirect of 12 GiB (0x300000000) from eboot+0x%llx\n",
-	            static_cast<unsigned long long>(site - base), static_cast<unsigned long long>(Limit),
+	            static_cast<unsigned long long>(site - base), static_cast<unsigned long long>(announced),
 	            static_cast<unsigned long long>(allocs[1] + 5 - base), static_cast<unsigned long long>(maps[1] + 5 - base),
 	            static_cast<unsigned long long>(allocs[2] + 5 - base));
 	std::fflush(stdout);

@@ -92,13 +92,53 @@ int64_t Stamp(const fs::path& p) {
 
 // The user's folders and files (the launcher's $ExcludeDirs / $ExcludeFiles, for the port).
 const char* const kUserDirs[]  = {"_PipelineCache", "_SaveData", "_SaveData-copias", "_backup_update", "logs", "config", "profiles"};
-// (10-28) amd_fidelityfx_vk.dll: the patched AMD DLL (FSR 3 frame generation x3 / x4) is never replaced on update or restore.
-const char* const kUserFiles[] = {"game-path.txt", "ram16.txt", "kbm_curve.txt", "version.txt", "amd_fidelityfx_vk.dll"};
+// (11-22) The three AMD FidelityFX DLLs (amd_fidelityfx_vk.dll, _loader_vk.dll, _upscaler_vk.dll) must match as a set:
+// vk.dll was pinned here (10-28, to keep a hand-patched FG x3/x4 dll), but _loader and _upscaler were updated, so an
+// in-place update left a mismatched set and the exe would not start (fine on a clean download). The release already
+// ships the right vk.dll (clean downloads work and have FG), so it is updated with the other two now; the replaced
+// one is kept in the backup. (A user who hand-patches their own vk.dll re-applies it after updating.)
+const char* const kUserFiles[] = {"game-path.txt", "ram16.txt", "kbm_curve.txt", "version.txt"};
 
 } // namespace
 
 const char* CurrentVersion() {
-	return KYTY_DS_PORT_VERSION;
+	// (11-21) The version the updater installed (version.txt next to the exe, written by DoInstall) wins over the
+	// compiled-in name while the exe is not newer than it: the release tag and the name the build was compiled with
+	// differ, so without it the launcher offered the same release again after installing it. A newer exe dropped in
+	// by hand (a local build) is newer than version.txt, so its compiled-in name is shown again.
+	static const std::string v = [] {
+		std::string out = KYTY_DS_PORT_VERSION;
+#if defined(_WIN32)
+		wchar_t buf[MAX_PATH] = {};
+		const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+		if (n > 0 && n < MAX_PATH) {
+			const fs::path exe(buf);
+			const fs::path vf = exe.parent_path() / "version.txt";
+			const std::string tag = Trim(ReadFile(vf));
+			if (!tag.empty() && tag.size() < 200 && Stamp(vf) >= Stamp(exe)) out = tag;
+		}
+#endif
+		return out;
+	}();
+	return v.c_str();
+}
+
+std::string InstalledZip() {
+	static const std::string v = [] {
+		std::string out;
+#if defined(_WIN32)
+		wchar_t buf[MAX_PATH] = {};
+		const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+		if (n > 0 && n < MAX_PATH) {
+			const fs::path exe(buf);
+			const fs::path vf = exe.parent_path() / "version-zip.txt";
+			const std::string z = Trim(ReadFile(vf));
+			if (!z.empty() && z.size() < 200 && Stamp(vf) >= Stamp(exe)) out = z;
+		}
+#endif
+		return out;
+	}();
+	return v;
 }
 
 std::string BuildIso() {
@@ -413,6 +453,7 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 		if (!step.old.empty()) fs::remove(step.old, ec);
 	if (keep_also.empty()) PruneBackups(root, kKeepBackups, {name});
 	else PruneBackups(root, kKeepBackups, {name, keep_also}); // (restore: the restored one stays too)
+	WriteFile(root / "version.txt", new_version); // (11-21) the installed release, read by CurrentVersion()
 	r.ok      = true;
 	r.backup  = name;
 	r.version = new_version;
@@ -611,24 +652,40 @@ Result ReadResult() {
 } // namespace
 
 bool CheckLatest(Release* release, std::string* error) {
-	std::string body;
-	if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=100",
-	             [&](const char* data, DWORD n, int64_t) {
-		             body.append(data, n);
-		             return body.size() < (8u << 20);
-	             },
-	             error)) {
-		*error = "No se pudo consultar GitHub: " + *error;
-		return false;
-	}
-	try {
-		// (10-28c) Only the port's own releases (DemonsSoulsPC-*): releases/latest is the emulator's on purpose. The list
-		// comes newest first; the first published (not draft / prerelease) one with a DemonsSoulsPC-*.zip wins.
-		const auto list = nlohmann::json::parse(body);
-		if (!list.is_array()) {
+	// (11-23) Every page of the list, not only the first 100: GitHub orders it by the date of the tag's COMMIT, so a
+	// release published today on an old commit came after 100 others and was never seen ("Tienes la última versión").
+	nlohmann::json list = nlohmann::json::array();
+	for (int page = 1; page <= 10; page++) {
+		std::string body;
+		if (!HttpGet("https://api.github.com/repos/todojuegos67-bot/KytyPS5/releases?per_page=100&page=" + std::to_string(page),
+		             [&](const char* data, DWORD n, int64_t) {
+			             body.append(data, n);
+			             return body.size() < (8u << 20);
+		             },
+		             error)) {
+			if (page > 1) break; // (what came already is used)
+			*error = "No se pudo consultar GitHub: " + *error;
+			return false;
+		}
+		nlohmann::json part;
+		try {
+			part = nlohmann::json::parse(body);
+		} catch (...) {
+			if (page > 1) break;
 			*error = "Respuesta de GitHub no valida.";
 			return false;
 		}
+		if (!part.is_array()) {
+			if (page > 1) break;
+			*error = "Respuesta de GitHub no valida.";
+			return false;
+		}
+		for (auto& item: part) list.push_back(std::move(item));
+		if (part.size() < 100) break;
+	}
+	try {
+		// (10-28c) Only the port's own releases (DemonsSoulsPC-*): releases/latest is the emulator's on purpose. The
+		// newest published (not draft / prerelease) one with a DemonsSoulsPC-*.zip wins.
 		// (port25) Newest PUBLISHED first (published_at), not the list's order (a release published later but created
 		// earlier came after older ones).
 		std::vector<nlohmann::json> sorted(list.begin(), list.end());

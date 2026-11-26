@@ -59,6 +59,8 @@ public:
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 	// A module Build made, done with: the thread's next Build fills it again (no allocation of its size).
 	static void Recycle(std::vector<uint32_t>&& module);
+	// The thread's pooled sections and module (Recycle's) back to the heap: for a thread done translating for a while.
+	static void ReleaseThreadPool();
 
 private:
 	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,

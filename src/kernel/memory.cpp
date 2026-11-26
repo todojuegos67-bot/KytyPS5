@@ -7,8 +7,17 @@
 #include "writeback-verify.h"
 #include "fresh-memory.h"
 #include "guest-lazy-commit.h"
+#include "f0-measure.h" // (f0, KYTY_F0: memoryAddressSpace.inc)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE: memoryAddressSpace.inc)
+#include "frame-nativo.h" // (FRAME-NATIVO) protection changes by label (memoryAddressSpace.inc)
+#include "frame-nativo2.h" // (FRAME-NATIVO2 v2) imported arenas excluded from protection (memoryAddressSpace.inc)
 #include "mem-guard.h"
 #include "ram-guard.h"
+#include "common/guardedCopy.h" // (raiz2: NativeGuardedRead, the read probes)
+#include "raiz.h" // (raiz1: KYTY_RAIZ, private guest memory)
+#include "parpadeo6.h" // (SIN-VIGILAR-GANCHO: "asentados sin vigilante" en la linea [parpadeo6])
+#include "raiz-wb-guard.h" // (crash-ba2b1f: KYTY_RAIZ_WB_GUARD)
+#include "arena-dueno.h" // (ARENA-DUENO: KYTY_ARENA_DUENO=1, los [wb-guard] por instancia duena)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -18,13 +27,18 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h" // (ram1: KYTY_DS_FREED_DISCARD)
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/demonsSoulsMemMap.h" // (ram2: PageAllocatorFree for the "[ram]" line)
+#include "loader/demonsSoulsTextureProbe.h"
 #include "native-resource-state.h"
 #include "speculation-state.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -51,6 +65,9 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 #include <winioctl.h> // FSCTL_SET_SPARSE (KYTY_BACKING_FILE)
+#include <psapi.h>    // (ram6: K32QueryWorkingSetEx, KYTY_DS_FREED_RELEASE)
+#include <deque>      // (ram9: StoreTrim)
+#include <random>     // (ram9: StoreTrim)
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -142,6 +159,85 @@ void Print(const char* what, uint64_t caller, uint64_t len, uint64_t phys, const
 	std::fflush(stdout);
 }
 } // namespace AvailableClamp
+
+// (MAPA-GRANDE) KYTY_MAPA_GRANDE=1 (apagado por defecto; solo mide): cada memoria del juego de 64 MiB o mas que el
+// emulador pone en una direccion del juego, con la funcion del juego que la pidio. Motivo: el bloque 0x33fc00000 (320 MiB,
+// 301 en RAM, log 20261124-221631) esta en direcciones del juego pero fuera de los 41 asignadores que registra el motor
+// (tabla eboot+0x2ea0df0, Ghidra 0x7f8a10); un bloque de 64 KiB del PlatformPageAllocator (0x801d00) no sale entero en
+// un solo mapeo, asi que es un mapeo directo grande. Cada funcion de mapeo del juego guarda su direccion de vuelta al
+// entrar (el primer nivel: las llamadas anidadas del emulador no la pisan) y el punto que hace la memoria nativa
+// (ReplacePlaceholderNative y la memoria privada) imprime:
+//   [mapa-grande] 0x33fc00000 320 MiB <- sceKernelMapDirectMemory desde eboot+0x...; en la pila: eboot+0x.. eboot+0x..
+// (los marcos de la pila: valores de la pila del hilo que caen en el codigo del eboot, los primeros 8, para ver quien
+// esta por encima del envoltorio del motor).
+namespace MapaGrande {
+constexpr uint64_t    kEboot = 0x900000000ull, kEbootSize = 0x3000000ull;
+thread_local uint64_t t_caller = 0;
+thread_local const char* t_what = nullptr;
+[[nodiscard]] bool On() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_MAPA_GRANDE");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+struct Scope {
+	bool own;
+	Scope(const char* what, uint64_t caller) noexcept: own(t_caller == 0) {
+		if (own) {
+			t_caller = caller;
+			t_what   = what;
+		}
+	}
+	~Scope() {
+		if (own) {
+			t_caller = 0;
+			t_what   = nullptr;
+		}
+	}
+	Scope(const Scope&)            = delete;
+	Scope& operator=(const Scope&) = delete;
+};
+void Note(uint64_t vaddr, uint64_t size) noexcept {
+	if (size < (uint64_t {64} << 20u) || !On()) return;
+	char   text[600];
+	size_t used = 0;
+	const auto add = [&](const char* format, auto... args) {
+		if (used + 1 >= sizeof(text)) return;
+		const int n = std::snprintf(text + used, sizeof(text) - used, format, args...);
+		if (n > 0) used = std::min(sizeof(text) - 1, used + static_cast<size_t>(n));
+	};
+	const uint64_t caller = t_caller;
+	if (caller >= kEboot && caller < kEboot + kEbootSize)
+		add("[mapa-grande] 0x%llx %llu MiB <- %s desde eboot+0x%llx; en la pila:", static_cast<unsigned long long>(vaddr),
+		    static_cast<unsigned long long>(size >> 20u), t_what != nullptr ? t_what : "?",
+		    static_cast<unsigned long long>(caller - kEboot));
+	else
+		add("[mapa-grande] 0x%llx %llu MiB <- %s desde 0x%llx (fuera del eboot); en la pila:", static_cast<unsigned long long>(vaddr),
+		    static_cast<unsigned long long>(size >> 20u), t_what != nullptr ? t_what : "(sin funcion de mapeo)",
+		    static_cast<unsigned long long>(caller));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// (the stack the guest call runs on, host or guest: up to the end of the committed region that holds this frame)
+	const auto*              at = static_cast<const uint64_t*>(__builtin_frame_address(0));
+	MEMORY_BASIC_INFORMATION region {};
+	uint64_t                 high = 0;
+	if (VirtualQuery(at, &region, sizeof(region)) == sizeof(region))
+		high = reinterpret_cast<uint64_t>(region.BaseAddress) + region.RegionSize;
+	int got = 0;
+	for (uint64_t p = reinterpret_cast<uint64_t>(at); p + 8 <= high && p < reinterpret_cast<uint64_t>(at) + 0x4000 && got < 8; p += 8) {
+		const uint64_t v = *reinterpret_cast<const uint64_t*>(p);
+		if (v > kEboot && v < kEboot + kEbootSize) {
+			add(" eboot+0x%llx", static_cast<unsigned long long>(v - kEboot));
+			got++;
+		}
+	}
+#endif
+	std::printf("%s\n", text);
+	std::fflush(stdout);
+}
+} // namespace MapaGrande
+#define KYTY_MAPA_GRANDE_SCOPE(what) \
+	MapaGrande::Scope mapa_grande_scope((what), reinterpret_cast<uint64_t>(__builtin_return_address(0)))
 
 void SetAvailableDirectClamp(uint64_t return_address, uint64_t limit, uint64_t trace_begin, uint64_t trace_end,
                              uint64_t image_base) {
@@ -274,6 +370,10 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 #endif
+
+// (ram15, KYTY_NATIVE_TEXTURE_OFFLOAD) Called first by every window over guest memory (NativeGuardedAccess in the .inc):
+// the texture offload gives back the dropped bytes a window would read (SetNativeWindowHook).
+static std::atomic<native_window_hook_t> g_native_window_hook {nullptr};
 
 #include "memoryAddressSpace.inc"
 
@@ -1345,12 +1445,365 @@ bool GuestRangeAccess(uint64_t vaddr, uint64_t size, bool* gpu, bool* cpu_write)
 	return true;
 }
 
+// (11-14) Native memory: a write by the emulator itself (GPU results written back, offloaded textures restored) is
+// not a game write: its pages' write-watch bits are cleared, or the caches would take the GPU's own results for new
+// CPU data and upload stale bytes over them (corrupt, flickering textures).
+void NativeForgetWrites(uint64_t vaddr, uint64_t size) {
+#if defined(_WIN32)
+	if (size == 0 || !NativeMemoryEnabled()) return;
+	// (raiz1, KYTY_RAIZ: the game's writes are seen by faults, no sweep reads the write watch - a ResetWriteWatch per
+	// write-back for nothing -, and KYTY_RAIZ_VERIFY's audit must see it as it is.)
+	if (Raiz::On()) return;
+	constexpr uint64_t Page = 0x1000;
+	const uint64_t     begin = vaddr & ~(Page - 1u);
+	const uint64_t     end   = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	// (ram4) ResetWriteWatch takes one allocation's pages: over a range the game mapped in several calls (pool blocks
+	// side by side: a texture or a buffer written back across two of them) it fails whole and resets nothing, and the
+	// emulator's own write was then taken for the game's at the next sweep (the GPU's results invalidated: uploaded
+	// again from the bytes just written back, an image's GPU copy dropped). Then mapping by mapping, as the sweeps read
+	// it (NativeWrittenPages: read and reset, the pages read thrown away; the caller kept the game's writes before its
+	// own, PageManager::CaptureCpuWrites).
+	if (ResetWriteWatch(reinterpret_cast<void*>(begin), end - begin) != 0) {
+		static std::atomic<uint64_t> fallbacks {0};
+		if (fallbacks.fetch_add(1, std::memory_order_relaxed) == 0) {
+			std::printf("Native memory: a write-back over more than one allocation (0x%llx+0x%llx): its write watch reset "
+			            "mapping by mapping (said once)\n",
+			            static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+			std::fflush(stdout);
+		}
+		(void)NativeWriteWatch(begin, end - begin, nullptr, nullptr, true);
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
+// (ram15) KYTY_NATIVE_TEXTURE_OFFLOAD (local/texture-offload.h): memory.h.
+void SetNativeWindowHook(native_window_hook_t hook) {
+	g_native_window_hook.store(hook, std::memory_order_release);
+}
+
+uint64_t NativeOffloadDrop(uint64_t vaddr, uint64_t size, uint64_t* refused) {
+	uint64_t done = 0, not_done = 0;
+#if defined(_WIN32)
+	if (size != 0 && UINT64_MAX - vaddr >= size && g_guest_address_space != nullptr && g_guest_address_space->IsNative()) {
+		constexpr uint64_t Chunk = uint64_t {1} << 20u; // (a MiB at a time: the working-set lock a reset holds)
+		const uint64_t     end   = vaddr + size;
+		for (uint64_t chunk = vaddr; chunk < end; chunk += Chunk) {
+			const uint64_t chunk_end = std::min(end, chunk + Chunk);
+			uint64_t       reset = 0, refused_here = 0;
+			const bool     ran   = g_guest_address_space->RunQuietWith([&] {
+                for (uint64_t at = chunk; at < chunk_end;) {
+                    MEMORY_BASIC_INFORMATION info {};
+                    if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+                    const uint64_t stop =
+                        std::min(chunk_end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+                    if (stop <= at) break;
+                    if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+                        if (VirtualAlloc(reinterpret_cast<void*>(at), stop - at, MEM_RESET, PAGE_READWRITE) != nullptr) {
+                            reset += stop - at;
+                            (void)VirtualUnlock(reinterpret_cast<void*>(at), stop - at); // (fails "not locked": out of the working set)
+                        } else {
+                            refused_here += stop - at;
+                        }
+                    }
+                    at = stop;
+                }
+			});
+			if (!ran) refused_here = chunk_end - chunk; // (the address space busy for 200 ms: left in RAM)
+			done += reset;
+			not_done += refused_here;
+			SwitchToThread();
+		}
+	}
+#else
+	(void)vaddr;
+	not_done = size;
+#endif
+	if (refused != nullptr) *refused = not_done;
+	return done;
+}
+
+bool NativeOffloadWrite(uint64_t vaddr, const void* data, uint64_t size) {
+	if (size == 0) return true;
+#if defined(_WIN32)
+	if (data == nullptr || g_guest_address_space == nullptr || !g_guest_address_space->IsNative()) return false;
+	auto*    host = reinterpret_cast<uint8_t*>(vaddr);
+	uint64_t left = size;
+	// (A guarded copy inside the window: a page unmapped meanwhile stops it instead of faulting in the emulator.)
+	NativeGuardedAccess(host, size, [&] { left = Common::GuardedCopy(host, data, size); }, true);
+	return left == 0;
+#else
+	(void)vaddr, (void)data;
+	return false;
+#endif
+}
+
+bool NativeOffloadOpen(uint64_t vaddr, uint64_t size, bool write) {
+#if defined(_WIN32)
+	if (size == 0 || g_guest_address_space == nullptr || !g_guest_address_space->IsNative()) return false;
+	NativeProtectLock guard(NativeReadFaultsRequested());
+	DWORD old = 0;
+	return VirtualProtect(reinterpret_cast<void*>(vaddr), size, write ? PAGE_READWRITE : PAGE_READONLY, &old) != 0;
+#else
+	(void)vaddr, (void)size, (void)write;
+	return false;
+#endif
+}
+
+// (anuncio1) KYTY_RAIZ_ANNOUNCE=1 + KYTY_RAIZ_VERIFY=1 (loader/demonsSoulsWriteAudit.cpp): the write watch of the pages
+// no protection watches. No lock of the emulator's: callers hold a tracker region's lock or a cache's. A write-watch call
+// takes one allocation's pages; a range over several is done VirtualQuery region by region (each inside one allocation).
+// Memory unmapped meanwhile: the calls fail there and nothing is reported or reset.
+void NativeAnnounceReset(uint64_t vaddr, uint64_t size) {
+#if defined(_WIN32)
+	if (size == 0 || !NativeMemoryEnabled()) return;
+	constexpr uint64_t Page  = 0x1000;
+	const uint64_t     begin = vaddr & ~(Page - 1u);
+	const uint64_t     end   = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	if (ResetWriteWatch(reinterpret_cast<void*>(begin), end - begin) == 0) return;
+	for (uint64_t at = begin; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t stop = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && stop > at) (void)ResetWriteWatch(reinterpret_cast<void*>(at), stop - at);
+		at = std::max(stop, at + Page);
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
+uint64_t NativeAnnounceWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max) {
+#if defined(_WIN32)
+	if (size == 0 || !NativeMemoryEnabled()) return 0;
+	constexpr uint64_t  Page  = 0x1000;
+	constexpr ULONG_PTR Batch = 256;
+	const uint64_t      begin = vaddr & ~(Page - 1u);
+	const uint64_t      end   = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	void*               found[Batch];
+	uint64_t            total = 0;
+	// The written pages of [from, to) (inside one allocation); false: the call was refused.
+	const auto take = [&](uint64_t from, uint64_t to) {
+		while (from < to) {
+			ULONG_PTR count       = Batch;
+			DWORD     granularity = 0;
+			if (GetWriteWatch(0, reinterpret_cast<void*>(from), to - from, found, &count, &granularity) != 0) return false;
+			for (ULONG_PTR i = 0; i < count; ++i) {
+				if (pages != nullptr && total < max) pages[total] = reinterpret_cast<uint64_t>(found[i]);
+				++total;
+			}
+			if (count < Batch) break;
+			from = reinterpret_cast<uint64_t>(found[count - 1]) + Page;
+		}
+		return true;
+	};
+	if (take(begin, end)) return total;
+	total = 0;
+	for (uint64_t at = begin; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t stop = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && stop > at) (void)take(at, stop);
+		at = std::max(stop, at + Page);
+	}
+	return total;
+#else
+	(void)vaddr;
+	(void)size;
+	(void)pages;
+	(void)max;
+	return 0;
+#endif
+}
+
+// (nativo2) memory.h.
+uint64_t NativeTakeWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max, bool* failed) {
+	if (failed != nullptr) *failed = false;
+#if defined(_WIN32)
+	if (size == 0 || !NativeMemoryEnabled()) return 0;
+	constexpr uint64_t  Page  = 0x1000;
+	constexpr ULONG_PTR Batch = 256;
+	const uint64_t      begin = vaddr & ~(Page - 1u);
+	const uint64_t      end   = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	void*               found[Batch];
+	uint64_t            total = 0;
+	// The written pages of [from, to) (inside one allocation); false: the call was refused.
+	const auto take = [&](uint64_t from, uint64_t to) {
+		while (from < to) {
+			ULONG_PTR count       = Batch;
+			DWORD     granularity = 0;
+			if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(from), to - from, found, &count, &granularity) != 0) return false;
+			for (ULONG_PTR i = 0; i < count; ++i) {
+				if (pages != nullptr && total < max) pages[total] = reinterpret_cast<uint64_t>(found[i]);
+				++total;
+			}
+			if (count < Batch) break;
+			from = reinterpret_cast<uint64_t>(found[count - 1]) + Page;
+		}
+		return true;
+	};
+	if (take(begin, end)) return total;
+	// (Refused over the whole range: it spans allocations. What a refused call reset is nothing - Windows fails it whole -,
+	// and what earlier batches found stays counted: no page whose bit was reset is lost.)
+	for (uint64_t at = begin; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) {
+			if (failed != nullptr) *failed = true;
+			break;
+		}
+		const uint64_t stop = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+		if (info.State == MEM_COMMIT && stop > at && (info.Type != MEM_PRIVATE || !take(at, stop)) && failed != nullptr)
+			*failed = true;
+		at = std::max(stop, at + Page);
+	}
+	return total;
+#else
+	(void)vaddr;
+	(void)size;
+	(void)pages;
+	(void)max;
+	if (failed != nullptr) *failed = true;
+	return 0;
+#endif
+}
+
+// (PROT-MENOS4) The written pages of [vaddr, vaddr + size) without resetting their write watch (one GetWriteWatch per 256
+// pages found). *failed: the range is not one write-watched allocation (nothing read; the caller takes another path).
+uint64_t NativePeekWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max, bool* failed) {
+	if (failed != nullptr) *failed = false;
+#if defined(_WIN32)
+	if (size == 0 || !NativeMemoryEnabled()) return 0;
+	constexpr uint64_t  Page  = 0x1000;
+	constexpr ULONG_PTR Batch = 256;
+	uint64_t            from  = vaddr & ~(Page - 1u);
+	const uint64_t      to    = (vaddr + size + Page - 1u) & ~(Page - 1u);
+	void*               found[Batch];
+	uint64_t            total = 0;
+	while (from < to) {
+		ULONG_PTR count       = Batch;
+		DWORD     granularity = 0;
+		if (GetWriteWatch(0, reinterpret_cast<void*>(from), to - from, found, &count, &granularity) != 0) {
+			if (failed != nullptr) *failed = true;
+			return 0;
+		}
+		for (ULONG_PTR i = 0; i < count; ++i) {
+			if (pages != nullptr && total < max) pages[total] = reinterpret_cast<uint64_t>(found[i]);
+			++total;
+		}
+		if (count < Batch) break;
+		from = reinterpret_cast<uint64_t>(found[count - 1]) + Page;
+	}
+	return total;
+#else
+	(void)vaddr;
+	(void)size;
+	(void)pages;
+	(void)max;
+	if (failed != nullptr) *failed = true;
+	return 0;
+#endif
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	// (Native memory: the game's writes there since the last sweep are kept before NativeForgetWrites clears the
+	// write watch of the emulator's own write: PageManager::CaptureCpuWrites.)
+	if (size != 0 && NativeMemoryEnabled()) Libs::Graphics::PageManager::CaptureCpuWrites(vaddr, size);
+	const bool done = g_guest_address_space != nullptr && g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (done) NativeForgetWrites(vaddr, size);
+	return done;
+}
+
+// (raiz2) Memory::NativeGuardedRead / TryGetUploadSourcePointer (memory.h).
+bool NativeGuardedRead(void* destination, const void* guest, uint64_t size) {
+	if (size == 0) return true;
+	auto*       to   = static_cast<uint8_t*>(destination);
+	const auto* from = static_cast<const uint8_t*>(guest);
+#if defined(_WIN32)
+	if (Raiz::On()) {
+		// Straight through the guest's own pages; where one is no-access the copy stops (no fault handler runs) and the
+		// rest goes through a window (opened read-only: a game write meanwhile still faults).
+		// (raiz11, KYTY_RAIZ_STALE_CHECK) The direct part checked against the put-ins of kept GPU bytes under way: one
+		// overlapping it may have shown this copy the pages' old bytes (readable, the GPU's not in yet). Read again
+		// through a window then (KYTY_RAIZ_STALE_FIX): the gate alone waits for the put-in to end.
+		NativeReadTicket ticket;
+		NativeReadTicketTake(reinterpret_cast<uint64_t>(from), size, &ticket);
+		const auto stale_again = [&]() {
+			if (NativeReadTicketClean(ticket)) return;
+			const bool fix = NativeStaleFixOn();
+			NativeNoteStale(Raiz::StaleUpload, reinterpret_cast<uint64_t>(from), size, static_cast<uint64_t>(Raiz::t_site), fix);
+			if (fix) {
+				NativeGuardedAccess(from, size, [&] {
+					if (const uint64_t rest = Common::GuardedCopy(to, from, size); rest != 0) std::memset(to + size - rest, 0, rest);
+				});
+			}
+		};
+		const uint64_t left = Common::GuardedCopy(to, from, size);
+		if (left == 0) {
+			Raiz::g_counters.guarded_reads_direct.fetch_add(1, std::memory_order_relaxed);
+			stale_again();
+			return true;
+		}
+		const uint64_t done = size - left;
+		Raiz::g_counters.guarded_reads_window.fetch_add(1, std::memory_order_relaxed);
+		// (Guarded inside the window too: a page that is not committed - not a tracker's no-access - reads as zeros
+		// instead of faulting on this thread; said once.)
+		bool short_read = false;
+		NativeGuardedAccess(from + done, left, [&] {
+			if (const uint64_t rest = Common::GuardedCopy(to + done, from + done, left); rest != 0) {
+				std::memset(to + size - rest, 0, rest);
+				short_read = true;
+			}
+		});
+		if (!short_read && done != 0) stale_again(); // (raiz11: the direct part)
+		if (short_read) {
+			static std::atomic<uint32_t> said {0};
+			if (said.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::printf("[raiz] guarded read of 0x%llx+0x%llx: part not readable even in a window (not committed?): "
+				            "zeros\n",
+				            static_cast<unsigned long long>(reinterpret_cast<uint64_t>(from)), static_cast<unsigned long long>(size));
+				std::fflush(stdout);
+			}
+		}
+		return !short_read;
+	}
+#endif
+	NativeGuardedAccess(from, size, [&] { std::memcpy(to, from, size); });
+	return true;
+}
+
+void NativeWindowRun(const void* guest, uint64_t size, void (*access)(void*), void* context) { // (tiron8)
+	if (size == 0) return;
+	const auto* from = static_cast<const uint8_t*>(guest);
+#if defined(_WIN32)
+	// (raiz11, as NativeGuardedRead) Checked against the put-ins of kept GPU bytes under way: one overlapping it may have
+	// shown the copy the pages' old bytes; read again then (KYTY_RAIZ_STALE_FIX), the gate waiting for the put-in to end.
+	NativeReadTicket ticket;
+	if (Raiz::On()) NativeReadTicketTake(reinterpret_cast<uint64_t>(from), size, &ticket);
+	NativeGuardedAccess(from, size, [&] { access(context); });
+	if (Raiz::On() && !NativeReadTicketClean(ticket)) {
+		const bool fix = NativeStaleFixOn();
+		NativeNoteStale(Raiz::StaleUpload, reinterpret_cast<uint64_t>(from), size, static_cast<uint64_t>(Raiz::t_site), fix);
+		if (fix) NativeGuardedAccess(from, size, [&] { access(context); });
+	}
+#else
+	NativeGuardedAccess(from, size, [&] { access(context); });
+#endif
+}
+
+const uint8_t* TryGetUploadSourcePointer(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr) return nullptr;
+	if (!Raiz::On()) return g_guest_address_space->BackingPointer(vaddr, size);
+	t_native_allow_protected_pointer = true;
+	const auto* pointer              = g_guest_address_space->BackingPointer(vaddr, size);
+	t_native_allow_protected_pointer = false;
+	return pointer;
 }
 
 bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	Raiz::SiteScope site(Raiz::SiteCpuWrite); // (raiz2: the "[raiz]" line's write windows by source)
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteCpuBacking(vaddr, data, size);
 }
@@ -1364,6 +1817,51 @@ bool TryWriteCpuBacking(uint64_t vaddr, const void* data, uint64_t size) {
 
 const uint8_t* TryGetBackingPointer(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space != nullptr ? g_guest_address_space->BackingPointer(vaddr, size) : nullptr;
+}
+
+bool NativeMemoryEnabled() {
+	return NativeMemoryRequested();
+}
+
+bool NativeReadFaultsEnabled() {
+	return NativeReadFaultsRequested();
+}
+
+void NativeProtectCounters(uint64_t* protects, uint64_t* copy_protects, uint64_t* copies) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (protects != nullptr) *protects = g_native_protects.load(std::memory_order_relaxed);
+	if (copy_protects != nullptr) *copy_protects = g_native_copy_protects.load(std::memory_order_relaxed);
+	if (copies != nullptr) *copies = g_native_guarded_copies.load(std::memory_order_relaxed);
+#else
+	if (protects != nullptr) *protects = 0;
+	if (copy_protects != nullptr) *copy_protects = 0;
+	if (copies != nullptr) *copies = 0;
+#endif
+}
+
+bool NativeWriteWatch(uint64_t vaddr, uint64_t size, native_write_watch_func_t callback, void* user, bool reset) {
+	if (g_guest_address_space == nullptr || !g_guest_address_space->IsNative()) return false;
+	// (The pages gathered under the address space's lock, given to the callback after it.)
+	thread_local std::vector<uint64_t> pages;
+	pages.clear();
+	const bool ok = g_guest_address_space->NativeWrittenPages(vaddr, size, reset, &pages);
+	if (callback != nullptr && !pages.empty()) {
+		const std::vector<uint64_t> written = std::move(pages); // (a callback may call NativeWriteWatch again)
+		pages.clear();
+		for (const auto page: written) callback(page, user);
+	}
+	return ok;
+}
+
+bool NativeWriteWatchRanges(const std::pair<uint64_t, uint64_t>* ranges, size_t count, bool reset, std::vector<uint64_t>* pages,
+                            std::vector<uint32_t>* failed) {
+	if (g_guest_address_space == nullptr || !g_guest_address_space->IsNative() || ranges == nullptr || pages == nullptr) return false;
+	return g_guest_address_space->NativeWrittenRanges(ranges, count, reset, pages, failed);
+}
+
+void NativeWriteWatchCounters(uint64_t* calls, uint64_t* retries) {
+	if (calls != nullptr) *calls = g_native_watch_calls.load(std::memory_order_relaxed);
+	if (retries != nullptr) *retries = g_native_watch_retries.load(std::memory_order_relaxed);
 }
 
 bool PrefaultGuestRange(const void* address, uint64_t size) {
@@ -1413,6 +1911,13 @@ static bool SpeculationReadsClean(uint64_t vaddr, uint64_t size) {
 }
 
 bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
+	// (FRAME-NATIVO2 v11b, =4) Bloques sin vigilar de instancias de solo lectura: la GPU no escribe alli (red de seguridad
+	// en BufferCache), asi que un estado "escrito por la GPU" es de un dueno anterior: se lee siempre la memoria real del
+	// juego (antes: rechazado -> "a descriptor source did not evaluate").
+	if (::FrameNativo2::SoloLectura() && ::FrameNativo2::RoAll(vaddr, size) && SpeculationReadsClean(vaddr, size)) {
+		::FrameNativo2::g_ro_desc_reads.fetch_add(1, std::memory_order_relaxed);
+		return TryReadBackingToHost(vaddr, data, size);
+	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsTranslatingThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
@@ -1470,6 +1975,11 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return true;
 	}
+	// (FRAME-NATIVO2 v11b, =4) En bloques sin vigilar nunca se descarga lo de la GPU: pisaria lo que el juego escribio.
+	if (::FrameNativo2::SoloLectura() && ::FrameNativo2::RoAll(vaddr, size)) {
+		::FrameNativo2::g_ro_sync_skips.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
 	if (Graphics::Spec::Current() != nullptr) {
 		// A speculative translation (speculation-state.h) reads guest memory as it is: words the GPU wrote need the
 		// GPU first (the translation that follows waits for it).
@@ -1498,7 +2008,51 @@ bool SyncGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 		}
 		GetGpuResources().GetBufferCache().ReadMemory(vaddr, size);
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// (raiz11, KYTY_RAIZ_STALE_CHECK) Read-watched bytes the caller reads straight after this (indirect arguments, tables):
+	// a put-in of kept GPU bytes under way over them shows their OLD bytes (readable already, the GPU's not in yet).
+	// Counted; waited for (KYTY_RAIZ_STALE_FIX: at most 20 ms, the put-in is microseconds).
+	if (NativePutInBusy(vaddr, size)) {
+		const bool fix = NativeStaleFixOn();
+		NativeNoteStale(Raiz::StaleGpuSync, vaddr, size, g_srt_shader_hash, fix); // (first: whether it covers these pages)
+		if (fix) {
+			const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+			while (NativePutInBusy(vaddr, size) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+		}
+	}
+#endif
 	return true;
+}
+
+// (raiz12, KYTY_RAIZ_SETTLE; local/raiz.h) A game thread about to read [vaddr, vaddr + size) of GPU results (a hook at
+// the reader's entry): with mode 1, what the GPU still owns of it read back (the readback a read fault would make, once
+// for the range), its deferred releases applied by this thread (the put-ins of their kept bytes, under the page
+// manager's locks: a put-in another thread holds is waited for there), then until no put-in is under way over it and
+// no kept bytes are left over it (at most 4 ms; NativeSettle). After that no page of it shows old bytes: each is either
+// in with the GPU's bytes or no-access (a read faults and gets them). A put-in starts only on pages with kept bytes; none
+// is kept over the range until the GPU writes it again, which the game orders after its reads (it waits for the GPU
+// work first). Mode 2: only the checks at entry, counted. `site`: Raiz::SettleSiteKind. Returns RaizSettle* flags.
+uint32_t RaizSettleRange(uint64_t vaddr, uint64_t size, uint32_t site, int mode) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static_assert(uint32_t {RaizSettleBusy} == uint32_t {NativeSettleBusy} && uint32_t {RaizSettlePending} == uint32_t {NativeSettlePending} &&
+	              uint32_t {RaizSettleReadback} == uint32_t {NativeSettleReadback} && uint32_t {RaizSettleWaited} == uint32_t {NativeSettleWaited} &&
+	              uint32_t {RaizSettleLeft} == uint32_t {NativeSettleLeft});
+	if (!NativeReadFaultsRequested()) return 0;
+	return NativeSettle(
+	    vaddr, size, site,
+	    [&] {
+		    if (ReadFaults(vaddr, size)) return TryReadbackRange(vaddr, size);
+		    // (SIN-VIGILAR-GANCHO) m_noread pages (CPUHEAP-/DEFAULTTAGG-SIN-VIGILAR): readable with old bytes, no fault
+		    // reads them back; the XPR chunk bits 0xa1f290 reads live in DefaultTagg (RenderSingleFrameCPU, Ghidra 0xaa2050).
+		    if (!TryReadbackRangeUnwatched(vaddr, size)) return false;
+		    if (site == Raiz::SettleChunkBits) ::Parpadeo6::g_c.unwatched.fetch_add(1, std::memory_order_relaxed);
+		    return true;
+	    },
+	    [&] { Graphics::PageManager::ApplyDeferredReleases(vaddr, size); }, mode);
+#else
+	(void)vaddr, (void)size, (void)site, (void)mode;
+	return 0;
+#endif
 }
 
 uint64_t MappingEnd(uint64_t vaddr) {
@@ -1582,6 +2136,7 @@ bool PrintWriteBacksOverlapping(uint64_t vaddr, uint64_t size) {
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* source) noexcept {
+	Raiz::SiteScope site(Raiz::SiteOf(source)); // (raiz2: the "[raiz]" line's write windows by source)
 	const auto index = g_write_back_count.fetch_add(1, std::memory_order_relaxed);
 	g_write_backs[index % WriteBackRecords] = {std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                          vaddr, size, source};
@@ -1593,6 +2148,15 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 			if (on) WritebackVerify::Rehash(vaddr, size);
 		}
 	} verify {vaddr, size, WritebackVerify::Enabled()};
+	// (crash-ba2b1f, KYTY_RAIZ_WB_GUARD) This write is the emulator's: the write watch of its pages forgets it (after it, on
+	// every path out), so the next write-back over them does not take it for the game's.
+	struct GuardForget {
+		uint64_t vaddr, size;
+		bool     on;
+		~GuardForget() {
+			if (on) RaizWbEmulatorWrote(vaddr, size);
+		}
+	} guard_forget {vaddr, size, RaizWbGuardOn()};
 	if (verify.on) WritebackVerify::Check(vaddr, static_cast<const uint8_t*>(data), size, source);
 	if (TryWriteBacking(vaddr, data, size)) {
 		return;
@@ -1625,6 +2189,209 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size, const char* s
 		            " (0x%" PRIx64 " bytes written; committed parts %zu) caller=%p\n",
 		            vaddr, size, written, parts.size(), __builtin_return_address(0));
 	}
+}
+
+// ---- (crash-ba2b1f) KYTY_RAIZ_WB_GUARD (local/raiz-wb-guard.h) -------------------------------------------------------
+namespace {
+std::mutex                   g_wbg_mutex;  // (a leaf)
+std::unordered_set<uint64_t> g_wbg_marked; // pages a game write was found on where it should have faulted
+std::atomic<uint32_t>        g_wbg_marked_count {0};
+std::atomic<uint64_t>        g_wbg_skipped {0}, g_wbg_overwritten {0}, g_wbg_marks {0}, g_wbg_race_pages {0},
+    g_wbg_race_words {0}, g_wbg_race_after {0}, g_wbg_owned_calls {0}, g_wbg_emulator_calls {0};
+std::atomic<int64_t>         g_wbg_last_summary {0};
+std::atomic<RaizPagePeek>    g_wbg_peek {nullptr};
+std::atomic<void*>           g_wbg_peek_user {nullptr};
+
+// A line every 5 s at most, only when something was found (called from the paths that find it).
+void WbgSummary() {
+	const int64_t now  = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t       last = g_wbg_last_summary.load(std::memory_order_relaxed);
+	if (now - last < 5 || !g_wbg_last_summary.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+	std::printf("[wb-guard] (crash-ba2b1f) totals: write-back pages left alone because the game wrote them while GPU-owned "
+	            "%llu (counted only, KYTY_RAIZ_WB_GUARD=2: %llu); put-ins where a game write landed in the open page "
+	            "%llu pages (%llu words kept the game's; %llu pages written after the copy); pages marked %llu; resets: "
+	            "GPU took %llu, emulator wrote %llu\n",
+	            static_cast<unsigned long long>(g_wbg_skipped.load()), static_cast<unsigned long long>(g_wbg_overwritten.load()),
+	            static_cast<unsigned long long>(g_wbg_race_pages.load()), static_cast<unsigned long long>(g_wbg_race_words.load()),
+	            static_cast<unsigned long long>(g_wbg_race_after.load()), static_cast<unsigned long long>(g_wbg_marks.load()),
+	            static_cast<unsigned long long>(g_wbg_owned_calls.load()), static_cast<unsigned long long>(g_wbg_emulator_calls.load()));
+	std::fflush(stdout);
+}
+} // namespace
+
+int RaizWbGuardMode() noexcept {
+	static const int mode = [] {
+		if (!Raiz::On() || !NativeMemoryEnabled()) return 0;
+		const char* v = std::getenv("KYTY_RAIZ_WB_GUARD");
+		const int   m = (v == nullptr || v[0] == '\0') ? 1 : (v[0] == '0' ? 0 : v[0] == '2' ? 2 : 1);
+		std::printf("[wb-guard] KYTY_RAIZ_WB_GUARD=%d (crash-ba2b1f): %s\n", m,
+		            m == 0   ? "off"
+		            : m == 1 ? "a GPU write-back leaves alone the GPU-owned pages the game wrote since the GPU took them (=2: "
+		                       "only counted, =0: off)"
+		                     : "the GPU-owned pages the game wrote since the GPU took them are counted (written back as before)");
+		std::fflush(stdout);
+		return m;
+	}();
+	return mode;
+}
+
+void RaizWbGpuOwned(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0 || !RaizWbGuardOn()) return;
+	NativeAnnounceReset(vaddr, size);
+	g_wbg_owned_calls.fetch_add(1, std::memory_order_relaxed);
+	if (g_wbg_marked_count.load(std::memory_order_relaxed) == 0) return;
+	std::lock_guard lock(g_wbg_mutex);
+	for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < vaddr + size; page += 0x1000) g_wbg_marked.erase(page);
+	g_wbg_marked_count.store(static_cast<uint32_t>(g_wbg_marked.size()), std::memory_order_relaxed);
+}
+
+void RaizWbEmulatorWrote(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0 || !RaizWbGuardOn()) return;
+	NativeAnnounceReset(vaddr, size);
+	g_wbg_emulator_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RaizWbNoteGameWrote(uint64_t page, const char* where) noexcept {
+	page &= ~uint64_t {0xfff};
+	if (ArenaDueno::On()) ArenaDueno::OnWbGuard(page); // (ARENA-DUENO)
+	{
+		std::lock_guard lock(g_wbg_mutex);
+		g_wbg_marked.insert(page);
+		g_wbg_marked_count.store(static_cast<uint32_t>(g_wbg_marked.size()), std::memory_order_relaxed);
+	}
+	// (Its GPU copy lacks the write: uploaded again before the next submission reads it - as a write fault would have
+	// made it -. The GPU thread's resync, GpuResourceManager; a page still GPU-owned is read back first, the mark keeps
+	// the write-back off it.)
+	Raiz::QueueResync(page, page + 0x1000);
+	static std::atomic<uint32_t> said {0};
+	g_wbg_marks.fetch_add(1, std::memory_order_relaxed);
+	if (said.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("[wb-guard] page 0x%llx: a game write with no fault (%s): marked, queued as CPU-written\n",
+		            static_cast<unsigned long long>(page), where != nullptr ? where : "?");
+		std::fflush(stdout);
+	}
+	WbgSummary();
+}
+
+void RaizWbGameWritten(uint64_t vaddr, uint64_t size, std::vector<uint64_t>* pages) noexcept {
+	pages->clear();
+	if (size == 0 || !RaizWbGuardOn()) return;
+	constexpr uint64_t Max = 1024;
+	uint64_t           found[Max];
+	const uint64_t     total = NativeAnnounceWritten(vaddr, size, found, Max);
+	for (uint64_t i = 0; i < total && i < Max; ++i) pages->push_back(found[i]);
+	if (g_wbg_marked_count.load(std::memory_order_relaxed) != 0) {
+		std::lock_guard lock(g_wbg_mutex);
+		const uint64_t  first = vaddr & ~uint64_t {0xfff};
+		if (((vaddr + size - first + 0xfff) >> 12u) <= g_wbg_marked.size()) {
+			for (uint64_t page = first; page < vaddr + size; page += 0x1000)
+				if (g_wbg_marked.count(page) != 0) pages->push_back(page);
+		} else {
+			for (const auto page: g_wbg_marked)
+				if (page >= first && page < vaddr + size) pages->push_back(page);
+		}
+	}
+	if (pages->size() > 1) {
+		std::sort(pages->begin(), pages->end());
+		pages->erase(std::unique(pages->begin(), pages->end()), pages->end());
+	}
+}
+
+void RaizWbNoteSkipped(uint64_t page, uint64_t address, uint64_t size, const char* source, bool skipped) noexcept {
+	(skipped ? g_wbg_skipped : g_wbg_overwritten).fetch_add(1, std::memory_order_relaxed);
+	if (ArenaDueno::On()) ArenaDueno::OnWbGuard(page); // (ARENA-DUENO)
+	// (Left alone: the GPU's copy of the page lacks the game's bytes - the reason it is here -: uploaded again before the
+	// next submission reads it, as a write fault would have made it. The GPU thread's resync, GpuResourceManager.)
+	if (skipped) Raiz::QueueResync(page, page + 0x1000);
+	static std::atomic<uint32_t> said {0};
+	if (said.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("[wb-guard] %s write-back of 0x%llx+0x%llx: page 0x%llx written by the game while GPU-owned (no fault): "
+		            "%s\n",
+		            source != nullptr ? source : "?", static_cast<unsigned long long>(address),
+		            static_cast<unsigned long long>(size), static_cast<unsigned long long>(page),
+		            skipped ? "LEFT ALONE (the game's bytes kept)" : "written over as before (KYTY_RAIZ_WB_GUARD=2)");
+		std::fflush(stdout);
+	}
+	WbgSummary();
+}
+
+void RaizWbNotePutInRace(uint64_t page, uint64_t words, bool after) noexcept {
+	g_wbg_race_pages.fetch_add(1, std::memory_order_relaxed);
+	if (ArenaDueno::On()) ArenaDueno::OnWbGuard(page); // (ARENA-DUENO)
+	g_wbg_race_words.fetch_add(words, std::memory_order_relaxed);
+	if (after) g_wbg_race_after.fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<uint32_t> said {0};
+	if (said.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("[wb-guard] put-in of kept GPU bytes into page 0x%llx: the game wrote the open page %s (%llu words of "
+		            "8 bytes kept the game's)\n",
+		            static_cast<unsigned long long>(page), after ? "after the copy, before its protection" : "during the copy",
+		            static_cast<unsigned long long>(words));
+		std::fflush(stdout);
+	}
+	WbgSummary();
+}
+
+void RaizWbSetPagePeek(RaizPagePeek peek, void* user) noexcept {
+	g_wbg_peek_user.store(user, std::memory_order_relaxed);
+	g_wbg_peek.store(peek, std::memory_order_release);
+}
+
+// (Crash reports: no lock waited for - the crashing thread may hold any of them -: try_lock, "?" when taken.)
+void PrintGuestPageState(uint64_t page) noexcept {
+	page &= ~uint64_t {0xfff};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	char                     host[96] = "?";
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) == sizeof(info)) {
+		const DWORD p    = info.Protect & 0xffu;
+		const char* prot = p == PAGE_NOACCESS ? "no-access" : p == PAGE_READONLY ? "read-only" : p == PAGE_READWRITE ? "read-write"
+		                 : p == PAGE_EXECUTE_READ ? "exec-read" : p == PAGE_EXECUTE_READWRITE ? "exec-read-write" : "other";
+		std::snprintf(host, sizeof(host), "%s %s%s (0x%lx)",
+		              info.State == MEM_COMMIT ? "committed" : info.State == MEM_RESERVE ? "reserved" : "free",
+		              info.Type == MEM_PRIVATE ? "private " : info.Type == MEM_MAPPED ? "mapped " : "", prot,
+		              static_cast<unsigned long>(info.Protect));
+	}
+	char       tracker[128] = "untracked";
+	uint32_t   bits         = 0;
+	const auto peek         = g_wbg_peek.load(std::memory_order_acquire);
+	if (peek != nullptr && peek(g_wbg_peek_user.load(std::memory_order_relaxed), page, &bits) && (bits & RaizPeekRegion) != 0) {
+		std::snprintf(tracker, sizeof(tracker), "%s%s%s%s%s%s", (bits & RaizPeekCpuDirty) ? "cpu-dirty " : "clean ",
+		              (bits & RaizPeekGpuDirty) ? "GPU-DIRTY " : "", (bits & RaizPeekWritable) ? "writable " : "write-watched ",
+		              (bits & RaizPeekReadable) ? "readable" : "read-watched", (bits & RaizPeekNoWatch) ? " no-watch" : "",
+		              (bits & RaizPeekNoSplit) ? " refused" : "");
+	}
+	const bool read_watch = g_gpu_resources != nullptr && g_gpu_resources->HasReadWatchers(page, 0x1000);
+	const char* kept = "0";
+	if (g_pending_count.load(std::memory_order_relaxed) != 0) {
+		if (g_pending_mutex.try_lock()) {
+			kept = g_pending.count(page) != 0 ? "YES" : "no";
+			g_pending_mutex.unlock();
+		} else {
+			kept = "?";
+		}
+	}
+	const char* watch = "n/a";
+	{
+		void*     found[1] {};
+		ULONG_PTR count       = 1;
+		DWORD     granularity = 0;
+		if (GetWriteWatch(0, reinterpret_cast<void*>(page), 0x1000, found, &count, &granularity) == 0) watch = count != 0 ? "SET" : "clear";
+	}
+	const char* mark = "no";
+	if (g_wbg_marked_count.load(std::memory_order_relaxed) != 0) {
+		if (g_wbg_mutex.try_lock()) {
+			mark = g_wbg_marked.count(page) != 0 ? "YES" : "no";
+			g_wbg_mutex.unlock();
+		} else {
+			mark = "?";
+		}
+	}
+	std::printf("  page 0x%016llx: host %s | tracker %s | page manager read watcher %s | kept GPU bytes %s | write watch %s "
+	            "(since the GPU took it, with KYTY_RAIZ_WB_GUARD) | guard mark %s\n",
+	            static_cast<unsigned long long>(page), host, tracker, read_watch ? "yes" : "no", kept, watch, mark);
+#else
+	std::printf("  page 0x%016llx\n", static_cast<unsigned long long>(page));
+#endif
 }
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -1703,6 +2470,33 @@ bool InRemapWindow(uint64_t vaddr) noexcept {
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+}
+
+bool TryReadbackRange(uint64_t vaddr, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
+	       g_gpu_resources->ReadbackRange(vaddr, size);
+}
+
+// (SIN-VIGILAR-GANCHO) Cheap gate first: only granules labelled cpuheap / DefaultTagg with their SIN-VIGILAR switch on can
+// hold m_noread pages (RegionManager::UpdateGpuProtection decides with the same FrameNativo::Classify), one relaxed load
+// per 64 KiB granule; anything else returns before the page manager and the buffer cache are asked.
+static bool MaybeUnwatchedGpuPages(uint64_t vaddr, uint64_t size) noexcept {
+	// (11-26 03:28) APAGADO por defecto (KYTY_LECTURA_SIN_VIGILANTE=1 lo enciende): con el rompia el culling (geometria que desaparece).
+	static const bool kOn = [] { const char* v = std::getenv("KYTY_LECTURA_SIN_VIGILANTE"); return v != nullptr && v[0] == '1'; }();
+	if (!kOn) return false;
+	const bool cpuheap = ::CpuheapSinVigilar::On(), tagg = ::DefaultTaggSinVigilar::On();
+	if ((!cpuheap && !tagg) || size == 0 || size > (uint64_t {64} << 20u)) return false;
+	for (uint64_t g = vaddr & ~0xffffull; g < vaddr + size; g += 0x10000) {
+		const auto cls = FrameNativo::Classify(g);
+		if ((cls == FrameNativo::CCpuheap && cpuheap) || (cls == FrameNativo::CDefaultTagg && tagg)) return true;
+	}
+	return false;
+}
+
+bool TryReadbackRangeUnwatched(uint64_t vaddr, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && MaybeUnwatchedGpuPages(vaddr, size) && IsGpuAddressRange(vaddr, size) &&
+	       !g_gpu_resources->HasReadWatchers(vaddr, size) &&
+	       g_gpu_resources->ReadbackRange(vaddr, size);
 }
 
 struct PrtAperture {
@@ -1810,7 +2604,17 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 		// A second mapping of the same backing bytes: each is the other's alias (GuestBackingAliases), the first unique
 		// again once it is gone.
 		const auto second = base + 2u * PageSize;
-		if (g_guest_address_space->MapBacking(second, PageSize, PageSize, VirtualMemory::Mode::ReadWrite, &failure_reason)) {
+		if (g_guest_address_space->IsNative()) {
+			// (KYTY_NATIVE_MEMORY: no aliases - the second mapping is refused -, and the first stays unique.)
+			g_native_alias_selftest = true; // (raiz2: its refusal is said as the self-test's)
+			const bool refused =
+			    !g_guest_address_space->MapBacking(second, PageSize, PageSize, VirtualMemory::Mode::ReadWrite, &failure_reason) &&
+			    failure_reason == GuestBackingStore::FailureReason::NativeAliasRefused;
+			g_native_alias_selftest = false;
+			ok = ok && refused && g_guest_address_space->IsUniqueBackingRange(alias, PageSize) &&
+			     g_guest_address_space->BackingPointer(alias, PageSize) == reinterpret_cast<const uint8_t*>(alias);
+			if (refused) failure_reason = GuestBackingStore::FailureReason::None;
+		} else if (g_guest_address_space->MapBacking(second, PageSize, PageSize, VirtualMemory::Mode::ReadWrite, &failure_reason)) {
 			std::vector<std::pair<uint64_t, uint64_t>> aliases;
 			ok = ok && !g_guest_address_space->IsUniqueBackingRange(alias, PageSize);
 			ok = ok && g_guest_address_space->BackingAliases(alias, PageSize, &aliases) && aliases.size() == 1 &&
@@ -1971,7 +2775,1751 @@ uint64_t FlushTrim(uint64_t budget, uint64_t* held_us) {
 }
 
 } // namespace RamFlushGuest
+
+// (ram1) KYTY_DS_FREED_DISCARD=1 (Windows, Demon's Souls; off by default): the guest store's bytes of the direct memory
+// the game's page allocator gives back dropped from RAM. Demon's Souls takes almost all direct memory once at start-up
+// (PS5PlatformPageAllocator: AllocateDirect of up to 12 GiB, demonsSoulsAllocClamp.cpp) and maps it 64 KiB at a time;
+// a decommit (VirtualAlloc op 2: texture mips dropped by CTexture::SetCurrentStreamingChunk 0x9014f4, heaps and pages
+// given back) is UnmapPhysicalPages (0x80eb90): it sets the pages' bits in its free-page bitmap and unmaps them
+// (sceKernelBatchMap op 1, or sceKernelReserveVirtualRange over them). Those bytes are no one's from then on: the next
+// commit gets whichever free page the bitmap gives, and its new owner writes it before reading (the streamer memcpy's
+// the mips in, 0x901459). Kyty kept them: the direct memory stays allocated, so the RAM flush's FlushFreed never sees
+// them; the parked view's pages are trimmed to the modified list and written to the page file, the alias's stay
+// resident. A native port's allocator decommits them. Here: each unmap of direct memory inside that pool is queued, and
+// a thread of its own drops the store's bytes of it 1 MiB at a time (GuestBackingStore::DiscardUncovered: only while no
+// guest mapping covers them, checked under the store's lock a map takes exclusive; DiscardVirtualMemory, MEM_RESET when
+// refused). The commit charge stays (page-file section). Logged: "Freed discard ..." every 30 s while it drops.
+namespace FreedDiscard {
+
+std::atomic<uint64_t> g_pool_begin {0}, g_pool_end {0};
+std::atomic<uint64_t> g_dropped {0}, g_covered {0}, g_reserved {0}, g_refused {0}, g_queued {0}, g_calls {0};
+
+// (ram2) KYTY_DS_FREED_DISCARD: 1 = ram1's path (queued, dropped later through the emulator's alias by a thread);
+// 2 = reset through the game's own view just before the unmap (GuestBackingStore::ResetSoleMapping), nothing queued,
+// no thread, no VirtualQuery. Logs 11-15 04:54/04:57 (ram1, =1): 205-394 MiB "dropped" and nothing gained (available
+// 249-856 MiB, the modified list up to 1460 MiB): the alias's pages of a freed range were never in the working set
+// ("in RAM not mapped by the game 0-2 MiB"), so the discard there had nothing to act on while the game's view's pages
+// had already been trimmed dirty to the modified list.
+int RequestedMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DS_FREED_DISCARD");
+		return v == nullptr ? 0 : v[0] == '2' ? 2 : v[0] == '1' ? 1 : 0;
+	}();
+	return mode;
+}
+bool Requested() {
+	return RequestedMode() != 0;
+}
+// The mode in use once the pool is known (0 until then, and when refused).
+std::atomic<int>      g_active {0};
+std::atomic<uint64_t> g_reset_bytes {0}, g_reset_calls {0}, g_reset_us {0}, g_reset_max_us {0}, g_reset_shared {0},
+    g_reset_refused {0};
+
+struct Queue {
+	std::mutex                                 mutex;
+	std::condition_variable                    ready;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges; // physical (backing offset, size)
+};
+Queue& GetQueue() {
+	static auto* queue = new Queue; // (never destroyed: its thread may outlive static destructors)
+	return *queue;
+}
+
+void Report(bool force) {
+	static auto     last       = std::chrono::steady_clock::now();
+	static uint64_t last_drops = 0;
+	const auto      now        = std::chrono::steady_clock::now();
+	if (!force && now - last < std::chrono::seconds(30)) return;
+	const uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
+	if (!force && dropped == last_drops) return;
+	last = now;
+	std::printf("Freed discard (KYTY_DS_FREED_DISCARD=1): %llu MiB of freed direct memory dropped from RAM in all (%llu MiB "
+	            "since the last line), %llu MiB queued in %llu unmaps; kept: %llu MiB mapped again first, %llu MiB never "
+	            "committed, %llu MiB refused by Windows\n",
+	            static_cast<unsigned long long>(dropped >> 20u),
+	            static_cast<unsigned long long>((dropped - last_drops) >> 20u),
+	            static_cast<unsigned long long>(g_queued.load(std::memory_order_relaxed) >> 20u),
+	            static_cast<unsigned long long>(g_calls.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_covered.load(std::memory_order_relaxed) >> 20u),
+	            static_cast<unsigned long long>(g_reserved.load(std::memory_order_relaxed) >> 20u),
+	            static_cast<unsigned long long>(g_refused.load(std::memory_order_relaxed) >> 20u));
+	std::fflush(stdout);
+	last_drops = dropped;
+}
+
+void Worker() {
+	LocalPlatform::SetThreadName("Kyty.FreedDiscard");
+	// (Normal priority: a discard holds the working-set lock over its pages, which the game's page faults wait for; a
+	// descheduled low-priority thread must not hold it.)
+	auto&                                      queue = GetQueue();
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	for (;;) {
+		{
+			std::unique_lock lock(queue.mutex);
+			queue.ready.wait_for(lock, std::chrono::seconds(30), [&] { return !queue.ranges.empty(); });
+		}
+		// (A short wait gathers a batch: the streamer unmaps a texture's mips in a row, BatchMap 64 entries at a time.)
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		{
+			std::lock_guard lock(queue.mutex);
+			ranges.swap(queue.ranges);
+		}
+		std::sort(ranges.begin(), ranges.end());
+		std::vector<std::pair<uint64_t, uint64_t>> merged; // [begin, end)
+		for (const auto& [offset, size]: ranges) {
+			if (!merged.empty() && offset <= merged.back().second) merged.back().second = std::max(merged.back().second, offset + size);
+			else merged.emplace_back(offset, offset + size);
+		}
+		ranges.clear();
+		constexpr uint64_t Chunk = uint64_t {1} << 20u;
+		for (const auto& [begin, end]: merged) {
+			for (uint64_t at = begin; at < end;) {
+				const uint64_t stop    = std::min(end, (at & ~(Chunk - 1u)) + Chunk);
+				uint64_t       covered = 0, reserved = 0, refused = 0;
+				const uint64_t dropped =
+				    g_guest_address_space != nullptr
+				        ? g_guest_address_space->DiscardUncoveredBacking(at, stop - at, &covered, &reserved, &refused)
+				        : 0;
+				g_dropped.fetch_add(dropped, std::memory_order_relaxed);
+				g_covered.fetch_add(covered, std::memory_order_relaxed);
+				g_reserved.fetch_add(reserved, std::memory_order_relaxed);
+				g_refused.fetch_add(refused, std::memory_order_relaxed);
+				at = stop;
+				SwitchToThread();
+			}
+		}
+		Report(false);
+	}
+}
+
+// (ram3) KYTY_DS_FREECACHE_RESET=1 (Windows, Demon's Souls 01.007.000; off by default; needs the backing view: not
+// KYTY_NATIVE_MEMORY, a backing file or lazy commit). The game's page allocator keeps the blocks it frees MAPPED in a
+// free list (ReleasePages 0x80f550; "bloques liberados que siguen mapeados" of the [ram] line: 709-876 MiB after 2.5
+// min, log 11-15 06:00) and hands them out again as new memory (first fit, 0x80e7a0): their contents are dead, but
+// the emulator sees no unmap, so Windows trims them like live data - to the page file or its compression store (3.6
+// GB there in that log). A thread walks the free lists every KYTY_DS_FREECACHE_RESET_MS (default 2000) holding the
+// game's own allocator spinlock (DemonsSoulsMemMap::WithPageAllocatorFreeBlocks: no block can be handed out
+// meanwhile) and resets, through the game's view, the pool pages of the blocks found free at two passes in a row
+// (VirtualAlloc MEM_RESET by GuestBackingStore::ResetSoleMapping, the same call KYTY_DS_FREED_DISCARD=2 makes before
+// an unmap: "no longer of interest", dropped instead of written or compressed when trimmed; a native allocator would
+// decommit them). The lock is held KYTY_DS_FREECACHE_RESET_US at most a pass (default 1000; the rest at the next
+// pass, 250 ms later). A block reused and freed again between two passes is not seen as new (left as it is until it
+// changes). Logged every 30 s when it did something: "Free cache reset ...".
+namespace FreeCache {
+
+bool Requested() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_DS_FREECACHE_RESET");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+struct Entry {
+	uint64_t size = 0, mapped = 0, done = 0; // (done: bytes of it reset; == size: all)
+	bool     old = false;                    // (seen at the pass before)
+};
+struct Work {
+	std::unordered_map<uint64_t, Entry> before, now; // by base
+	uint64_t budget_us = 1000;
+	uint64_t reset = 0, shared = 0, refused = 0, blocks = 0, mapped = 0;
+	bool     more = false; // (the budget ended first)
+};
+
+// With the game's allocator spinlock held (see above): short, no waits. The store's shared lock inside
+// ResetBackingBeforeUnmap is taken exclusive only by a map or unmap, which a game thread makes with this spinlock held
+// when it is the allocator's (FlushMemoryRequestQueue 0x80f2c0), or without any allocator lock otherwise.
+void OnBlocks(void* user, const Loader::DemonsSoulsMemMap::FreeBlock* blocks, size_t count) {
+	auto&          work  = *static_cast<Work*>(user);
+	const auto     start = std::chrono::steady_clock::now();
+	const uint64_t pool_begin = g_pool_begin.load(std::memory_order_relaxed);
+	const uint64_t pool_end   = g_pool_end.load(std::memory_order_acquire);
+	constexpr uint64_t Chunk  = uint64_t {4} << 20u;
+	work.now.clear();
+	work.more = false;
+	work.blocks = count;
+	work.mapped = 0;
+	for (size_t i = 0; i < count; i++) {
+		const auto& block = blocks[i];
+		work.mapped += block.mapped;
+		if (block.mapped == 0) continue; // (nothing of it is mapped)
+		Entry entry {block.size, block.mapped, 0, true};
+		const auto found = work.before.find(block.base);
+		const bool same  = found != work.before.end() && found->second.size == block.size && found->second.mapped == block.mapped;
+		if (same) entry.done = found->second.done;
+		if (same && found->second.old && pool_end != 0 && g_guest_address_space != nullptr) {
+			while (entry.done < entry.size) {
+				const auto us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+				if (us >= work.budget_us) {
+					work.more = true;
+					break;
+				}
+				const uint64_t piece = std::min(Chunk, entry.size - entry.done);
+				work.reset += g_guest_address_space->ResetBackingBeforeUnmap(block.base + entry.done, piece, pool_begin, pool_end,
+				                                                             &work.shared, &work.refused);
+				entry.done += piece;
+			}
+		}
+		work.now.emplace(block.base, entry);
+	}
+	work.before.swap(work.now);
+}
+
+void Worker() {
+	LocalPlatform::SetThreadName("Kyty.FreeCache");
+	// (Normal priority: it holds the game's allocator spinlock while it works; a descheduled low-priority holder would
+	// make the game's threads spin.)
+	const auto number = [](const char* name, uint64_t fallback, uint64_t lowest, uint64_t highest) {
+		const char* v = std::getenv(name);
+		const uint64_t n = v != nullptr && v[0] != '\0' ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : fallback;
+		return std::min(std::max(n, lowest), highest);
+	};
+	const uint64_t period_ms = number("KYTY_DS_FREECACHE_RESET_MS", 2000, 250, 60000);
+	Work           work;
+	work.budget_us = number("KYTY_DS_FREECACHE_RESET_US", 1000, 100, 20000);
+	uint64_t total = 0, shared = 0, refused = 0, passes = 0, busy = 0, invalid = 0, hold_us = 0, hold_max_us = 0, said_total = 0;
+	uint64_t said_invalid = 0;
+	auto     said = std::chrono::steady_clock::now();
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(work.more ? 250 : period_ms));
+		if (g_pool_end.load(std::memory_order_acquire) == 0) continue;
+		work.reset = work.shared = work.refused = 0;
+		work.more  = false;
+		uint64_t   cached = 0;
+		const auto t0     = std::chrono::steady_clock::now();
+		const int  result = Loader::DemonsSoulsMemMap::WithPageAllocatorFreeBlocks(&OnBlocks, &work, &cached);
+		const auto us     = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+		if (result == 0) {
+			passes++;
+			total += work.reset;
+			shared += work.shared;
+			refused += work.refused;
+			hold_us += us;
+			hold_max_us = std::max(hold_max_us, us);
+		} else if (result == 2) {
+			busy++;
+		} else if (result == 3) {
+			invalid++;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - said < std::chrono::seconds(30) || (total == said_total && invalid == said_invalid)) continue;
+		said         = now;
+		std::printf("Free cache reset (30 s, KYTY_DS_FREECACHE_RESET=1): %llu MiB of the game's free blocks reset in all (%llu "
+		            "MiB since the last line); free cache now %llu MiB mapped in %llu blocks; %llu passes (lock busy %llu, "
+		            "lists not valid %llu), the game's allocator lock held %.1f ms in all, at most %.2f ms; left: %llu MiB "
+		            "mapped twice, %llu MiB refused by Windows\n",
+		            static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>((total - said_total) >> 20u),
+		            static_cast<unsigned long long>(work.mapped >> 20u), static_cast<unsigned long long>(work.blocks),
+		            static_cast<unsigned long long>(passes), static_cast<unsigned long long>(busy),
+		            static_cast<unsigned long long>(invalid), static_cast<double>(hold_us) / 1000.0,
+		            static_cast<double>(hold_max_us) / 1000.0, static_cast<unsigned long long>(shared >> 20u),
+		            static_cast<unsigned long long>(refused >> 20u));
+		std::fflush(stdout);
+		said_total   = total;
+		said_invalid = invalid;
+		hold_max_us  = 0;
+	}
+}
+
+} // namespace FreeCache
+
+// (ram6) KYTY_DS_FREED_RELEASE=1 (Windows, Demon's Souls 01.007.000; off by default; the guest store's backing view
+// in the page file - all committed or KYTY_BACKING_ON_DEMAND -, not KYTY_NATIVE_MEMORY, KYTY_BACKING_FILE or lazy
+// commit, where it counts nothing). What the game's page allocator holds dead, given back to Windows:
+//  - its free-block cache (Ghidra 01.007.000, ram6/NOTAS.md): ReleasePages 0x80f550 puts a fully mapped block, still
+//    mapped, in its category's free list (sorted by address, merged with its neighbours, no limit: 2192 MiB right
+//    after a zone unload, log 11-15 09:19); RequestVirtualPages 0x80d9a0 takes from there first (first fit 0x80e7a0,
+//    unless flag 2) with no system call, and unmaps a cached block only when the bitmap has no page left (0x80e15c).
+//    A reused block is new memory: its new owner writes it before reading it (pages from the bitmap come with the old
+//    bytes of whoever had them, so nothing in the game can count on their contents);
+//  - what it unmaps (UnmapPhysicalPages 0x80eb90: mips the streamer drops, partly mapped blocks).
+// A thread walks the free lists every KYTY_DS_FREED_RELEASE_MS (default 1000) with the game's allocator spinlock held
+// (DemonsSoulsMemMap::WithPageAllocatorFreeBlocks, as KYTY_DS_FREECACHE_RESET). What was free at two passes in a row is
+// first made CPU-written for the GPU caches (TryPrepareHostOverwrite, outside the game's lock: no GPU copy of it stays
+// "clean" with bytes that are about to change, none is read back into it), then - the lock taken again, the block
+// checked still free - given back: GuestBackingStore::ReleaseSoleMapping (DiscardVirtualMemory through the game's
+// view and the alias; MEM_RESET + out of the working set when refused). At most KYTY_DS_FREED_RELEASE_US (default
+// 2000) of the game's lock a pass; the rest 50 ms later. A released range that comes back into RAM while still free
+// (touched, or reused and freed between passes) is released again. KYTY_DS_FREED_RELEASE=2: the same walk, nothing
+// invalidated or released - what would be, and how much of it is in RAM. Totals in the [ram] line (KYTY_RAM_LINE=1).
+namespace FreedRelease {
+
+int RequestedMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_DS_FREED_RELEASE");
+		return v == nullptr ? 0 : v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
+	}();
+	return mode;
+}
+bool Requested() {
+	return RequestedMode() != 0;
+}
+
+std::atomic<int> g_active {0}; // (the mode in use once the pool is known; 0 off)
+
+// Bytes unless said otherwise.
+struct Counters {
+	std::atomic<uint64_t> cache {0}, unmap {0};                 // released (or, mode 2, that would be): free blocks, unmaps
+	std::atomic<uint64_t> discarded {0}, reset {0};              // (mode 1) by DiscardVirtualMemory / MEM_RESET + unlock
+	std::atomic<uint64_t> reused {0}, touched {0};               // taken back by the game / back in RAM while still free
+	std::atomic<uint64_t> shared {0}, refused {0}, partial {0};  // not released: mapped twice, Windows, block partly mapped
+	std::atomic<uint64_t> now_free {0}, now_released {0};        // at the last pass
+	std::atomic<uint64_t> checked {0}, still_game {0}, still_alias {0}; // samples right after release still in RAM
+	std::atomic<uint64_t> sampled {0}, in_ram {0};               // (mode 2) the would-release set now: bytes, ~in RAM
+	std::atomic<uint64_t> invalidated {0};
+	std::atomic<uint64_t> passes {0}, busy {0}, invalid {0}, held_us {0}, held_max_us {0};
+	std::atomic<uint64_t> unmap_calls {0}, unmap_us {0}, unmap_max_us {0};
+};
+Counters& Stat() {
+	static Counters counters;
+	return counters;
+}
+void Max(std::atomic<uint64_t>& to, uint64_t v) {
+	uint64_t seen = to.load(std::memory_order_relaxed);
+	while (v > seen && !to.compare_exchange_weak(seen, v, std::memory_order_relaxed)) {
+	}
+}
+
+using Ranges = std::vector<std::pair<uint64_t, uint64_t>>; // sorted, disjoint [begin, end)
+
+void Normalize(Ranges* r) {
+	std::sort(r->begin(), r->end());
+	size_t n = 0;
+	for (const auto& x: *r) {
+		if (x.first >= x.second) continue;
+		if (n != 0 && x.first <= (*r)[n - 1].second) (*r)[n - 1].second = std::max((*r)[n - 1].second, x.second);
+		else (*r)[n++] = x;
+	}
+	r->resize(n);
+}
+Ranges Intersect(const Ranges& a, const Ranges& b) {
+	Ranges out;
+	for (size_t i = 0, j = 0; i < a.size() && j < b.size();) {
+		const uint64_t lo = std::max(a[i].first, b[j].first);
+		const uint64_t hi = std::min(a[i].second, b[j].second);
+		if (lo < hi) out.emplace_back(lo, hi);
+		if (a[i].second < b[j].second) i++;
+		else j++;
+	}
+	return out;
+}
+Ranges Subtract(const Ranges& a, const Ranges& b) {
+	Ranges out;
+	size_t j = 0;
+	for (const auto& x: a) {
+		uint64_t at = x.first;
+		while (j < b.size() && b[j].second <= at) j++;
+		for (size_t k = j; k < b.size() && b[k].first < x.second; k++) {
+			if (b[k].first > at) out.emplace_back(at, b[k].first);
+			at = std::max(at, b[k].second);
+			if (at >= x.second) break;
+		}
+		if (at < x.second) out.emplace_back(at, x.second);
+	}
+	return out;
+}
+uint64_t Bytes(const Ranges& r) {
+	uint64_t n = 0;
+	for (const auto& x: r) n += x.second - x.first;
+	return n;
+}
+
+constexpr size_t   MaxBlocks = 8192; // (WithPageAllocatorFreeBlocks gives at most this many)
+constexpr size_t   MaxDone   = 4096;
+constexpr uint64_t Chunk     = uint64_t {4} << 20u;
+
+// (ram14) KYTY_DS_FREED_RELEASE with native guest memory (KYTY_NATIVE_MEMORY, which KYTY_RAIZ=1 uses). There the
+// guest address IS the memory: private, committed when mapped, no section, no alias (the start-up self-test refuses
+// one), and a guest unmap releases it (VirtualFree MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER): what the game unmaps is
+// already given back. What it keeps dead is only its free-block cache (Ghidra, eboot 01.007.000, projelf_un3, ram14):
+//  - ReleasePages 0x80f550: a fully mapped block goes, still mapped, into its category's free list (state + c*0xa0,
+//    +0x28; nodes are PageAllocationInfo of 0x78 bytes from 0x80d0a0, never inside the memory they describe); only a
+//    partly mapped one is unmapped (UnmapPhysicalPages 0x80eb90, flag 1);
+//  - 0x80e7a0 (first fit, called by RequestVirtualPages 0x80d9a0 unless flag 2): splits a cached block and hands it
+//    out with no system call, no zeroing: its new owner writes before reading (nothing can count on the old bytes).
+// Logs 11-16 03:47/04:40/05:26 (16 GB, raiz): "bloques liberados que siguen mapeados" 423-545 MiB all session long;
+// with private memory Windows can only keep them (RAM or its compression store: 4-5 GB there). Here each block free at
+// two passes in a row is reset at its guest address (VirtualAlloc MEM_RESET: no write to the pages, whatever their
+// protection; the pages stay committed and mapped; their RAM and compressed copies are dropped instead of kept) and
+// trimmed (VirtualUnlock). Only committed private regions (VirtualQuery) are touched; the commit charge stays.
+std::atomic<bool> g_native {false};
+
+// (commit-real, KYTY_COMMIT_REAL=1 by default) With commit-at-touch on, a free block is decommitted instead
+// (NativeLazyCommit::DecommitFree: MEM_DECOMMIT, the commit charge given back too, not only the RAM; the next touch
+// commits it again, zero-filled - a reused block is written by its new owner before it is read, Ghidra above). Pages
+// whose protection is not the mapping's (watched or taken out by the GPU caches or an offload) keep MEM_RESET below.
+uint64_t NativeRelease(uint64_t vaddr, uint64_t size, bool act, GuestBackingStore::ReleaseCounts* counts) {
+	if (size == 0 || UINT64_MAX - vaddr < size) return 0;
+	const uint64_t end  = vaddr + size;
+	uint64_t       done = 0;
+	if (act) {
+		uint64_t       rest        = 0;
+		const uint64_t decommitted = NativeLazyCommit::DecommitFree(vaddr, size, &rest);
+		counts->reset += decommitted;
+		done += decommitted;
+	}
+	for (uint64_t at = vaddr; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize);
+		const uint64_t stop       = std::min(end, region_end);
+		if (stop <= at) break;
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+			const uint64_t bytes = stop - at;
+			if (!act) {
+				done += bytes;
+			} else if (VirtualAlloc(reinterpret_cast<void*>(at), bytes, MEM_RESET, PAGE_READWRITE) != nullptr) {
+				counts->reset += bytes;
+				done += bytes;
+			} else {
+				counts->refused += bytes;
+				counts->Skip(at, stop);
+			}
+		}
+		at = stop;
+	}
+	counts->done += done;
+	return done;
+}
+
+// Out of the working set (nothing written: a reset page leaves it without a page-file or compression copy).
+void NativeTrim(uint64_t vaddr, uint64_t size) {
+	const uint64_t end = vaddr + size;
+	for (uint64_t at = vaddr; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t stop = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + static_cast<uint64_t>(info.RegionSize));
+		if (stop <= at) break;
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) (void)VirtualUnlock(reinterpret_cast<void*>(at), stop - at);
+		at = stop;
+	}
+}
+
+// Bit 0 of flags[i]: the page at addresses[i] is in the working set (K32QueryWorkingSetEx, 1024 a call).
+bool NativeSample(const uint64_t* addresses, size_t count, uint8_t* flags) {
+	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> query(std::min<size_t>(count, 1024));
+	for (size_t begin = 0; begin < count; begin += query.size()) {
+		const size_t n = std::min(query.size(), count - begin);
+		for (size_t i = 0; i < n; i++) {
+			query[i]                = {};
+			query[i].VirtualAddress = reinterpret_cast<PVOID>(addresses[begin + i] & ~uint64_t {0xfff});
+		}
+		if (K32QueryWorkingSetEx(GetCurrentProcess(), query.data(), static_cast<DWORD>(n * sizeof(query[0]))) == 0) return false;
+		for (size_t i = 0; i < n; i++) flags[begin + i] = query[i].VirtualAttributes.Valid != 0 ? 1u : 0u;
+	}
+	return true;
+}
+
+uint64_t ReleaseRange(uint64_t vaddr, uint64_t size, uint64_t pool_begin, uint64_t pool_end, bool act,
+                      GuestBackingStore::ReleaseCounts* counts) {
+	if (g_native.load(std::memory_order_relaxed)) return NativeRelease(vaddr, size, act, counts);
+	return g_guest_address_space->ReleaseBackingSole(vaddr, size, pool_begin, pool_end, act, counts);
+}
+void TrimRange(uint64_t vaddr, uint64_t size, uint64_t pool_begin, uint64_t pool_end) {
+	if (g_native.load(std::memory_order_relaxed)) NativeTrim(vaddr, size);
+	else g_guest_address_space->TrimBackingSole(vaddr, size, pool_begin, pool_end);
+}
+bool SampleResidency(const uint64_t* addresses, size_t count, uint8_t* flags) {
+	if (g_native.load(std::memory_order_relaxed)) return NativeSample(addresses, count, flags);
+	return g_guest_address_space->SampleBackingResidency(addresses, count, flags);
+}
+
+// Filled with the game's allocator lock held: no allocation there (capacities reserved before).
+struct Pass {
+	std::vector<Loader::DemonsSoulsMemMap::FreeBlock> blocks; // the fully mapped free blocks, by base
+	uint64_t                                          partial = 0;
+	const Ranges*                                     todo    = nullptr;
+	std::pair<uint64_t, uint64_t>                     done[MaxDone];
+	size_t                                            done_count = 0;
+	std::pair<uint64_t, uint64_t>                     skipped[MaxDone]; // (counts.skipped: mapped twice, refused)
+	uint64_t                                          budget_us = 2000, pool_begin = 0, pool_end = 0;
+	GuestBackingStore::ReleaseCounts                  counts;
+	bool                                              more = false;
+};
+
+void TakeBlocks(Pass& p, const Loader::DemonsSoulsMemMap::FreeBlock* blocks, size_t count) {
+	p.blocks.clear();
+	p.partial = 0;
+	for (size_t i = 0; i < count && p.blocks.size() < MaxBlocks; i++) {
+		if (blocks[i].mapped == blocks[i].size) p.blocks.push_back(blocks[i]);
+		else p.partial += blocks[i].size; // (a partly mapped block is on its way out: UnmapPhysicalPages)
+	}
+	std::sort(p.blocks.begin(), p.blocks.end(), [](const auto& a, const auto& b) { return a.base < b.base; });
+}
+
+void OnCollect(void* user, const Loader::DemonsSoulsMemMap::FreeBlock* blocks, size_t count) {
+	TakeBlocks(*static_cast<Pass*>(user), blocks, count);
+}
+
+void OnRelease(void* user, const Loader::DemonsSoulsMemMap::FreeBlock* blocks, size_t count) {
+	auto& p = *static_cast<Pass*>(user);
+	const auto start = std::chrono::steady_clock::now();
+	TakeBlocks(p, blocks, count);
+	p.done_count = 0;
+	p.more       = false;
+	for (const auto& [b, e]: *p.todo) {
+		// (Only if all of it is still in one fully mapped free block: taken or changed since, it waits for a pass.)
+		auto it = std::upper_bound(p.blocks.begin(), p.blocks.end(), b, [](uint64_t v, const auto& f) { return v < f.base; });
+		if (it == p.blocks.begin()) continue;
+		--it;
+		if (b < it->base || e > it->base + it->size) continue;
+		for (uint64_t at = b; at < e;) {
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+			if (us >= p.budget_us || p.done_count == MaxDone) {
+				p.more = true;
+				return;
+			}
+			const uint64_t stop = std::min(e, at + Chunk);
+			(void)ReleaseRange(at, stop - at, p.pool_begin, p.pool_end, true, &p.counts);
+			p.done[p.done_count++] = {at, stop};
+			at = stop;
+		}
+	}
+}
+
+// One sample per `stride` bytes of `set` (at most `max`): the addresses, and the stride used.
+uint64_t SampleAddresses(const Ranges& set, size_t max, std::vector<uint64_t>* out) {
+	out->clear();
+	const uint64_t bytes  = Bytes(set);
+	uint64_t       stride = 0x10000;
+	while (bytes / stride > max) stride <<= 1u;
+	for (const auto& [b, e]: set)
+		for (uint64_t at = b; at < e && out->size() < max; at += stride) out->push_back(at);
+	return stride;
+}
+
+void Worker() {
+	LocalPlatform::SetThreadName("Kyty.FreedRelease");
+	// (Normal priority: it holds the game's allocator spinlock while it works.)
+	const auto number = [](const char* name, uint64_t fallback, uint64_t lowest, uint64_t highest) {
+		const char*    v = std::getenv(name);
+		const uint64_t n = v != nullptr && v[0] != '\0' ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : fallback;
+		return std::min(std::max(n, lowest), highest);
+	};
+	const int      mode       = RequestedMode();
+	const uint64_t period_ms  = number("KYTY_DS_FREED_RELEASE_MS", 1000, 200, 60000);
+	const uint64_t budget_us  = number("KYTY_DS_FREED_RELEASE_US", 2000, 100, 20000);
+	const bool     invalidate = [] {
+		const char* v = std::getenv("KYTY_DS_FREED_RELEASE_INVALIDATE");
+		return v == nullptr || v[0] != '0';
+	}();
+	// (ram14) KYTY_DS_FREED_RELEASE_QUIET=0: the resets and the trim without holding every guest map, unmap and
+	// protection change off (ram9's caution, kept by default; with native memory there is no shared view to race).
+	const bool quiet = [] {
+		const char* v = std::getenv("KYTY_DS_FREED_RELEASE_QUIET");
+		return v == nullptr || v[0] != '0';
+	}();
+	auto said = std::chrono::steady_clock::now();
+	auto&                 st   = Stat();
+	auto*                 pass = new Pass; // (never destroyed: the thread may outlive static destructors)
+	pass->blocks.reserve(MaxBlocks);
+	pass->budget_us = budget_us;
+	Ranges   previous, released, invalidated_set;
+	Ranges   stuck; // (free ranges left as they were - mapped twice, refused -: not released again and again)
+	bool     more     = false;
+	auto     scanned  = std::chrono::steady_clock::now();
+	std::vector<uint64_t> addresses;
+	std::vector<uint8_t>  flags;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(more ? 50 : period_ms));
+		more = false;
+		if (g_active.load(std::memory_order_acquire) == 0 || g_pool_end.load(std::memory_order_acquire) == 0) continue;
+		pass->pool_begin = g_pool_begin.load(std::memory_order_relaxed);
+		pass->pool_end   = g_pool_end.load(std::memory_order_acquire);
+		// 1. What is free now.
+		uint64_t   cached = 0;
+		auto       t0     = std::chrono::steady_clock::now();
+		const int  result = Loader::DemonsSoulsMemMap::WithPageAllocatorFreeBlocks(&OnCollect, pass, &cached);
+		uint64_t   us     = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+		if (result != 0) {
+			(result == 2 ? st.busy : st.invalid).fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		st.passes.fetch_add(1, std::memory_order_relaxed);
+		st.held_us.fetch_add(us, std::memory_order_relaxed);
+		Max(st.held_max_us, us);
+		st.partial.store(pass->partial, std::memory_order_relaxed);
+		Ranges now;
+		now.reserve(pass->blocks.size());
+		for (const auto& f: pass->blocks) now.emplace_back(f.base, f.base + f.size);
+		Normalize(&now);
+		// 2. Released bytes no longer free: the game took them back (or unmapped them).
+		const Ranges kept = Intersect(released, now);
+		st.reused.fetch_add(Bytes(released) - Bytes(kept), std::memory_order_relaxed);
+		released        = kept;
+		invalidated_set = Intersect(invalidated_set, now);
+		stuck           = Intersect(stuck, now);
+		// 3. Free at this pass and the one before, not released yet.
+		Ranges todo = Subtract(Intersect(previous, now), released);
+		previous    = now;
+		st.now_free.store(Bytes(now), std::memory_order_relaxed);
+		if (mode == 2) {
+			// (Counted through the store as mode 1 would release it - the pool's, mapped once -; nothing changed.)
+			GuestBackingStore::ReleaseCounts counts;
+			counts.skipped     = pass->skipped;
+			counts.skipped_max = MaxDone;
+			if (g_guest_address_space != nullptr)
+				for (const auto& [b, e]: todo)
+					(void)ReleaseRange(b, e - b, pass->pool_begin, pass->pool_end, false, &counts);
+			st.cache.fetch_add(counts.done, std::memory_order_relaxed);
+			st.shared.fetch_add(counts.shared, std::memory_order_relaxed);
+			for (size_t i = 0; i < counts.skipped_count; i++) stuck.push_back(pass->skipped[i]);
+			Normalize(&stuck);
+			for (const auto& r: todo) released.push_back(r);
+			Normalize(&released);
+		} else if (!todo.empty() && g_guest_address_space != nullptr) {
+			// 4. The GPU caches told first (outside the game's lock: they take their own locks).
+			if (invalidate) {
+				for (const auto& [b, e]: Subtract(todo, invalidated_set)) {
+					if (TryPrepareHostOverwrite(b, e - b)) st.invalidated.fetch_add(e - b, std::memory_order_relaxed);
+					invalidated_set.emplace_back(b, e);
+				}
+				Normalize(&invalidated_set);
+			}
+			// 5. Given back, each range checked still free with the lock held again.
+			pass->todo               = &todo;
+			pass->counts             = {};
+			pass->counts.skipped     = pass->skipped;
+			pass->counts.skipped_max = MaxDone;
+			t0           = std::chrono::steady_clock::now();
+			// (ram9) With the guest memory quiet (no guest map, unmap or protection change meanwhile, as every working
+			// set trim of the emulator): its MEM_RESETs ran beside the page manager's ~34,000 protection changes a
+			// second (log 22:40, 16 GB, Windows restarted at ~10.5 min; bug check 0x1A seen before with a working-set
+			// change beside a protection change). The game's lock is only tried (64 attempts): no wait on it here.
+			int again = 2;
+			if (!quiet) again = Loader::DemonsSoulsMemMap::WithPageAllocatorFreeBlocks(&OnRelease, pass, &cached);
+			else if (!g_guest_address_space->RunQuietWith(
+			             [&] { again = Loader::DemonsSoulsMemMap::WithPageAllocatorFreeBlocks(&OnRelease, pass, &cached); }))
+				again = 2;
+			us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+			if (again == 0) {
+				st.held_us.fetch_add(us, std::memory_order_relaxed);
+				Max(st.held_max_us, us);
+				st.cache.fetch_add(pass->counts.done, std::memory_order_relaxed);
+				st.discarded.fetch_add(pass->counts.discarded, std::memory_order_relaxed);
+				st.reset.fetch_add(pass->counts.reset, std::memory_order_relaxed);
+				st.shared.fetch_add(pass->counts.shared, std::memory_order_relaxed);
+				st.refused.fetch_add(pass->counts.refused, std::memory_order_relaxed);
+				Ranges done(pass->done, pass->done + pass->done_count);
+				for (const auto& r: done) released.push_back(r);
+				Normalize(&released);
+				for (size_t i = 0; i < pass->counts.skipped_count; i++) stuck.push_back(pass->skipped[i]);
+				Normalize(&stuck);
+				more = pass->more;
+				// (ram8) Out of the working set now (reset pages are dropped without a page-file write when they leave
+				// it): out of the game's lock, with every guest map, unmap and protection change held off, as the RAM
+				// flush's trim. A block the game took back meanwhile is only trimmed: nothing is written.
+				if (!done.empty()) {
+					const uint64_t begin_pool = pass->pool_begin, end_pool = pass->pool_end; // (ram9: quiet again, apart)
+					if (quiet)
+						(void)g_guest_address_space->RunQuietWith([&] {
+							for (const auto& [b, e]: done) TrimRange(b, e - b, begin_pool, end_pool);
+						});
+					else
+						for (const auto& [b, e]: done) TrimRange(b, e - b, begin_pool, end_pool);
+				}
+				// 6. Did it leave RAM? (A sample of what was just released: 512 pages at most, both views.)
+				Normalize(&done);
+				done = Subtract(done, stuck);
+				if (!done.empty()) {
+					(void)SampleAddresses(done, 512, &addresses);
+					flags.resize(addresses.size());
+					if (SampleResidency(addresses.data(), addresses.size(), flags.data())) {
+						uint64_t game = 0, alias = 0;
+						for (const uint8_t f: flags) {
+							game += (f & 1u) != 0 ? 1 : 0;
+							alias += (f & 2u) != 0 ? 1 : 0;
+						}
+						st.checked.fetch_add(addresses.size(), std::memory_order_relaxed);
+						st.still_game.fetch_add(game, std::memory_order_relaxed);
+						st.still_alias.fetch_add(alias, std::memory_order_relaxed);
+					}
+				}
+			} else {
+				(again == 2 ? st.busy : st.invalid).fetch_add(1, std::memory_order_relaxed);
+				more = true;
+			}
+		}
+		// 7. Every 5 s: what of the released (or would-be) set is in RAM. Mode 1: a page back in RAM while still free was
+		// touched (or reused and freed between passes): released again at the next passes.
+		const Ranges given = Subtract(released, stuck);
+		if (std::chrono::steady_clock::now() - scanned >= std::chrono::seconds(5) && !given.empty() &&
+		    g_guest_address_space != nullptr) {
+			scanned             = std::chrono::steady_clock::now();
+			const uint64_t step = SampleAddresses(given, 32768, &addresses);
+			flags.resize(addresses.size());
+			if (SampleResidency(addresses.data(), addresses.size(), flags.data())) {
+				Ranges   back;
+				uint64_t in_ram = 0;
+				for (size_t i = 0; i < addresses.size(); i++) {
+					if (flags[i] == 0) continue;
+					in_ram += step;
+					back.emplace_back(addresses[i], addresses[i] + step);
+				}
+				if (mode == 2) {
+					st.sampled.store(Bytes(given), std::memory_order_relaxed);
+					st.in_ram.store(in_ram, std::memory_order_relaxed);
+				} else if (!back.empty()) {
+					Normalize(&back);
+					back = Intersect(back, given);
+					st.touched.fetch_add(Bytes(back), std::memory_order_relaxed);
+					released        = Subtract(released, back);
+					invalidated_set = Subtract(invalidated_set, back);
+				}
+			}
+		}
+		st.now_released.store(Bytes(Subtract(released, stuck)), std::memory_order_relaxed);
+		// (ram14) Every 30 s, its own line (with or without KYTY_RAM_LINE): what is given back now, in GB.
+		if (std::chrono::steady_clock::now() - said >= std::chrono::seconds(30)) {
+			said              = std::chrono::steady_clock::now();
+			constexpr double GiB = 1024.0 * 1024.0 * 1024.0;
+			const auto get = [](const std::atomic<uint64_t>& a) { return static_cast<double>(a.load(std::memory_order_relaxed)); };
+			const uint64_t   checked = st.checked.load(std::memory_order_relaxed);
+			std::printf("Freed release (30 s, KYTY_DS_FREED_RELEASE=%d%s): RAM ahorrada ahora %.2f GB (bloques libres del juego "
+			            "devueltos a Windows, sin reutilizar ni volver a RAM; libres ahora %.2f GB); devuelto en total %.2f GB, "
+			            "reutilizado por el juego %.2f GB, vuelto a RAM estando libre %.2f GB, rechazado %.2f GB; tras devolver "
+			            "seguian en RAM %llu de %llu muestras; candado del juego %llu pasadas (ocupado %llu), la mas larga "
+			            "%.2f ms; memoria quieta %s\n",
+			            mode, g_native.load(std::memory_order_relaxed) ? ", memoria nativa" : "",
+			            mode == 1 ? get(st.now_released) / GiB : 0.0, get(st.now_free) / GiB, get(st.cache) / GiB,
+			            get(st.reused) / GiB, get(st.touched) / GiB, get(st.refused) / GiB,
+			            static_cast<unsigned long long>(st.still_game.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(checked), static_cast<unsigned long long>(get(st.passes)),
+			            static_cast<unsigned long long>(get(st.busy)), get(st.held_max_us) / 1000.0, quiet ? "si" : "no");
+			std::fflush(stdout);
+		}
+	}
+}
+
+// (nativa2) KYTY_RAM_NATIVA2=1 (off by default; =2 measures only): the free chunks of the game's CPU HeapAllocator
+// ("cpuheap", 1 GiB; Ghidra 01.007.000: Free 0x802f90, size tree at heap+0x88, lock at [heap+0x80]; see
+// DemonsSoulsMemMap::WithCpuHeapFreeChunks) keep their pages in RAM: the heap never gives a chunk back while its
+// segment holds anything else, and the loads of the title screen / Nexus free their temporary buffers there. Log
+// 11-24 09:34: cpuheap 0.85 of 1.00 GB in RAM, all of it without a GPU copy. Here the interior of each chunk free at two
+// passes in a row (from chunk+0x40 to 0x40 before its end, whole pages: the heap's header, tree node and the next
+// chunk's header are never touched) is reset (MEM_RESET; DiscardVirtualMemory through the view without native memory)
+// and trimmed, with the heap's lock held and the chunk checked still free; the GPU caches told first. A reused chunk is
+// new memory for its new owner (malloc: nothing reads it before writing it). A "[ram-nativa2]" line every 10 s.
+int Nativa2Mode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_RAM_NATIVA2");
+		if (v == nullptr) { // (RAM-NATIVA) KYTY_RAM_NATIVA tambien mide el monton CPU (solo medir)
+			const char* t = std::getenv("KYTY_RAM_NATIVA");
+			return t != nullptr && (t[0] == '1' || t[0] == '2') ? 2 : 0;
+		}
+		return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
+	}();
+	return mode;
+}
+
+Counters& HeapStat() {
+	static Counters counters;
+	return counters;
+}
+
+std::atomic<uint64_t> g_heap_chunks {0};
+
+void HeapWorker() {
+	LocalPlatform::SetThreadName("Kyty.RamNativa2");
+	const int mode = Nativa2Mode();
+	auto&     st   = HeapStat();
+	auto*     pass = new Pass; // (never destroyed: the thread may outlive static destructors)
+	pass->blocks.reserve(MaxBlocks);
+	pass->budget_us = 2000;
+	Ranges                previous, released, invalidated_set, stuck;
+	bool                  more    = false;
+	auto                  scanned = std::chrono::steady_clock::now();
+	auto                  said    = scanned;
+	std::vector<uint64_t> addresses;
+	std::vector<uint8_t>  flags;
+	uint64_t              in_ram_now = 0;
+	constexpr double      GiB        = 1024.0 * 1024.0 * 1024.0;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(more ? 50 : 1000));
+		more = false;
+		if (g_pool_end.load(std::memory_order_acquire) == 0 || g_guest_address_space == nullptr) continue;
+		pass->pool_begin = g_pool_begin.load(std::memory_order_relaxed);
+		pass->pool_end   = g_pool_end.load(std::memory_order_acquire);
+		// 1. What is free now (the heap's lock held while it is read).
+		uint64_t  free_bytes = 0, chunks = 0;
+		auto      t0         = std::chrono::steady_clock::now();
+		const int result     = Loader::DemonsSoulsMemMap::WithCpuHeapFreeChunks(&OnCollect, pass, &free_bytes, &chunks);
+		uint64_t  us         = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+		if (result != 0) {
+			(result == 2 ? st.busy : st.invalid).fetch_add(1, std::memory_order_relaxed);
+		} else {
+			st.passes.fetch_add(1, std::memory_order_relaxed);
+			st.held_us.fetch_add(us, std::memory_order_relaxed);
+			Max(st.held_max_us, us);
+			st.now_free.store(free_bytes, std::memory_order_relaxed);
+			g_heap_chunks.store(chunks, std::memory_order_relaxed);
+			Ranges now;
+			now.reserve(pass->blocks.size());
+			for (const auto& f: pass->blocks) now.emplace_back(f.base, f.base + f.size);
+			Normalize(&now);
+			st.sampled.store(Bytes(now), std::memory_order_relaxed);
+			// 2. Released bytes no longer free: the game took them back.
+			const Ranges kept = Intersect(released, now);
+			st.reused.fetch_add(Bytes(released) - Bytes(kept), std::memory_order_relaxed);
+			released        = kept;
+			invalidated_set = Intersect(invalidated_set, now);
+			stuck           = Intersect(stuck, now);
+			// 3. Free at this pass and the one before, not released yet.
+			const Ranges todo = Subtract(Subtract(Intersect(previous, now), released), stuck);
+			previous          = now;
+			if (mode == 1 && !todo.empty()) {
+				// 4. The GPU caches told first (outside the heap's lock: they take their own locks).
+				for (const auto& [b, e]: Subtract(todo, invalidated_set)) {
+					if (TryPrepareHostOverwrite(b, e - b)) st.invalidated.fetch_add(e - b, std::memory_order_relaxed);
+					invalidated_set.emplace_back(b, e);
+				}
+				Normalize(&invalidated_set);
+				// 5. Given back, each range checked still inside a free chunk with the lock held again, the guest memory
+				// quiet (no map, unmap or protection change meanwhile, as KYTY_DS_FREED_RELEASE).
+				pass->todo               = &todo;
+				pass->counts             = {};
+				pass->counts.skipped     = pass->skipped;
+				pass->counts.skipped_max = MaxDone;
+				int again                = 2;
+				t0                       = std::chrono::steady_clock::now();
+				if (!g_guest_address_space->RunQuietWith([&] {
+					    again = Loader::DemonsSoulsMemMap::WithCpuHeapFreeChunks(&OnRelease, pass, nullptr, nullptr);
+				    }))
+					again = 2;
+				us = static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+				if (again == 0) {
+					st.held_us.fetch_add(us, std::memory_order_relaxed);
+					Max(st.held_max_us, us);
+					st.cache.fetch_add(pass->counts.done, std::memory_order_relaxed);
+					st.discarded.fetch_add(pass->counts.discarded, std::memory_order_relaxed);
+					st.reset.fetch_add(pass->counts.reset, std::memory_order_relaxed);
+					st.shared.fetch_add(pass->counts.shared, std::memory_order_relaxed);
+					st.refused.fetch_add(pass->counts.refused, std::memory_order_relaxed);
+					Ranges done(pass->done, pass->done + pass->done_count);
+					for (const auto& r: done) released.push_back(r);
+					Normalize(&released);
+					for (size_t i = 0; i < pass->counts.skipped_count; i++) stuck.push_back(pass->skipped[i]);
+					Normalize(&stuck);
+					more = pass->more;
+					if (!done.empty()) {
+						const uint64_t begin_pool = pass->pool_begin, end_pool = pass->pool_end;
+						(void)g_guest_address_space->RunQuietWith([&] {
+							for (const auto& [b, e]: done) TrimRange(b, e - b, begin_pool, end_pool);
+						});
+					}
+				} else {
+					(again == 2 ? st.busy : st.invalid).fetch_add(1, std::memory_order_relaxed);
+					more = true;
+				}
+			}
+			// 6. Every 5 s: released pages back in RAM while still free (touched) are released again later; and what
+			// of the free interior is in RAM now (the measurement).
+			if (std::chrono::steady_clock::now() - scanned >= std::chrono::seconds(5)) {
+				scanned = std::chrono::steady_clock::now();
+				const Ranges given = Subtract(released, stuck);
+				if (!given.empty()) {
+					const uint64_t step = SampleAddresses(given, 16384, &addresses);
+					flags.resize(addresses.size());
+					if (SampleResidency(addresses.data(), addresses.size(), flags.data())) {
+						Ranges back;
+						for (size_t i = 0; i < addresses.size(); i++)
+							if (flags[i] != 0) back.emplace_back(addresses[i], addresses[i] + step);
+						if (!back.empty()) {
+							Normalize(&back);
+							back = Intersect(back, given);
+							st.touched.fetch_add(Bytes(back), std::memory_order_relaxed);
+							released        = Subtract(released, back);
+							invalidated_set = Subtract(invalidated_set, back);
+						}
+					}
+				}
+				const Ranges kept_free = Subtract(now, Subtract(released, stuck));
+				in_ram_now             = 0;
+				if (!kept_free.empty()) {
+					const uint64_t step = SampleAddresses(kept_free, 16384, &addresses);
+					flags.resize(addresses.size());
+					if (SampleResidency(addresses.data(), addresses.size(), flags.data()))
+						for (const uint8_t f: flags) in_ram_now += f != 0 ? step : 0;
+				}
+				st.in_ram.store(std::min(in_ram_now, Bytes(kept_free)), std::memory_order_relaxed);
+			}
+			st.now_released.store(Bytes(Subtract(released, stuck)), std::memory_order_relaxed);
+		}
+		// 7. Every 10 s: its line, GB.
+		if (std::chrono::steady_clock::now() - said >= std::chrono::seconds(10)) {
+			said           = std::chrono::steady_clock::now();
+			const auto get = [](const std::atomic<uint64_t>& a) { return static_cast<double>(a.load(std::memory_order_relaxed)); };
+			std::printf("[ram-nativa2] 10 s, GB (KYTY_RAM_NATIVA2=%d%s): monton CPU del juego (cpuheap): libre %.2f en %llu trozos, "
+			            "interior devolvible %.2f, de lo no devuelto sigue en RAM %.2f; RAM ahorrada ahora %.2f (devuelto y sin "
+			            "reutilizar); devuelto en total %.2f [MEM_RESET %.2f, Discard %.2f], reutilizado por el juego %.2f, "
+			            "vuelto a RAM estando libre %.2f, rechazado %.2f; avisado a la GPU %.2f; candado del monton %llu pasadas "
+			            "(ocupado %llu, arbol no valido %llu), la mas larga %.2f ms\n",
+			            mode, mode == 2 ? ", solo mide" : "", get(st.now_free) / GiB,
+			            static_cast<unsigned long long>(g_heap_chunks.load(std::memory_order_relaxed)), get(st.sampled) / GiB,
+			            get(st.in_ram) / GiB, mode == 1 ? get(st.now_released) / GiB : 0.0, get(st.cache) / GiB,
+			            get(st.reset) / GiB, get(st.discarded) / GiB, get(st.reused) / GiB, get(st.touched) / GiB,
+			            get(st.refused) / GiB, get(st.invalidated) / GiB,
+			            static_cast<unsigned long long>(get(st.passes)), static_cast<unsigned long long>(get(st.busy)),
+			            static_cast<unsigned long long>(get(st.invalid)),
+			            static_cast<double>(st.held_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0);
+			std::fflush(stdout);
+		}
+	}
+}
+
+void StartNativa2() {
+	static std::atomic<bool> started {false};
+	if (Nativa2Mode() == 0 || started.exchange(true)) return;
+	std::thread(HeapWorker).detach();
+	std::printf("[ram-nativa2] ON (KYTY_RAM_NATIVA2=%d): trozos libres del monton CPU del juego (Free 0x802f90, arbol heap+0x88, "
+	            "candado [heap+0x80]) %s; linea [ram-nativa2] cada 10 s\n",
+	            Nativa2Mode(), Nativa2Mode() == 1 ? "devueltos a Windows por dentro (MEM_RESET, sin tocar cabecera ni final)"
+	                                              : "solo medidos");
+	std::fflush(stdout);
+}
+
+
+// (RAM-NATIVA) KYTY_RAM_NATIVA=1 (apagado por defecto; =2 solo mide): los bloques libres de los TaggedFrameAllocator
+// (arenas "DefaultTagg"). Ghidra 01.007.000 (projelf_par1, VA del juego):
+//  - AllocTag 0x7fe350 (vtable+0xf8 del padre): candado *[padre+0x80] (0 -> -1, cmpxchg); bloques de [padre+0x88]
+//    (1 MiB); trozos en la lista [padre+0x518] -> monton+0x10; [padre+0x90] += bloques dados y
+//    [padre+0xa0] = max([padre+0xa0], [padre+0x90]) (el maximo historico del propio juego).
+//  - Trozo nuevo 0x7fefc0: 0x801d00(padre, [padre+0x88]*0x78 = 120 MiB, 0x10000) y [padre+0x98] += 0x78 (reservado).
+//  - FreeTag 0x7fe540 (vtable+0x100): [padre+0x90] -= bloques; mascara de uso del trozo [c+0x18] (128 bits, 120
+//    validos) &= ~mascara; un trozo vacio que no es el primero (padre+0xe8) se devuelve: 0x801b80 / 0x801a10 ->
+//    ReleasePages 0x80f550 (cache de bloques libres del PageAllocator, ya cubierta por KYTY_DS_FREED_RELEASE).
+// Aqui, cada 1 s, con el candado del juego: los bloques con bit 0 en [c+0x18] (libres). Libres dos pasadas seguidas:
+// la GPU avisada (TryPrepareHostOverwrite, fuera del candado) y, con el candado otra vez y el bit comprobado todavia
+// a 0, MEM_RESET por la vista del juego (ReleaseRange: commit intacto, sin fallos de pagina, sin desmapear: un VkBuffer
+// importado y la cache de buferes siguen validos). Cuando AllocTag vuelve a dar el bloque, el juego lo escribe antes
+// de leerlo (memoria de fotograma) y Windows lo trae de nuevo a RAM al tocarlo. Linea [ram-nativa] cada 10 s, MiB
+// exactos por padre (una consulta de working set por pagina).
+// KYTY_RAM_NATIVA activo tambien enciende la medida del monton CPU ([ram-nativa2] =2, solo mide) si no esta puesta.
+int TagMode() {
+	static const int mode = [] {
+		const char* v = std::getenv("KYTY_RAM_NATIVA");
+		return v == nullptr ? 0 : v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
+	}();
+	return mode;
+}
+
+namespace TagNativa {
+constexpr int      MaxParents = 8;
+constexpr uint64_t AllocTagVa = 0x7fe350, FreeTagVa = 0x7fe540;
+
+uint64_t Rd(uint64_t a) {
+	return *reinterpret_cast<const volatile uint64_t*>(a);
+}
+// Candado del juego *[padre+0x80] (como AllocTag 0x7fe350); false si sigue ocupado.
+bool Lock(uint64_t parent) {
+	auto* lock = reinterpret_cast<std::atomic<int64_t>*>(Rd(parent + 0x80));
+	if (lock == nullptr) return true;
+	for (int i = 0; i < 20000; i++) {
+		int64_t z = 0;
+		if (lock->compare_exchange_weak(z, -1, std::memory_order_acquire)) return true;
+		_mm_pause();
+	}
+	return false;
+}
+void Unlock(uint64_t parent) {
+	auto* lock = reinterpret_cast<std::atomic<int64_t>*>(Rd(parent + 0x80));
+	if (lock != nullptr) lock->store(0, std::memory_order_release);
+}
+
+struct Snap {
+	uint64_t block = 0, used = 0, reserved = 0, peak = 0;
+	Ranges   all, free; // trozos enteros / bloques libres (sin reservar memoria con el candado: capacidad previa)
+};
+// Con el candado tomado. false si la estructura no es valida.
+bool Read(uint64_t parent, Snap* s) {
+	s->all.clear();
+	s->free.clear();
+	s->block    = Rd(parent + 0x88);
+	s->used     = Rd(parent + 0x90);
+	s->reserved = Rd(parent + 0x98);
+	s->peak     = Rd(parent + 0xa0);
+	if (s->block == 0 || s->block > (uint64_t {64} << 20u) || (s->block & 0xfff) != 0) return false;
+	const uint64_t heads = parent + 0x518;
+	int            guard = 0;
+	for (uint64_t h = Rd(heads); h != heads && h != 0 && guard < 4096; h = Rd(h), ++guard) {
+		const uint64_t chunks = h + 0x10;
+		for (uint64_t c = Rd(chunks); c != chunks && c != 0 && guard < 4096; c = Rd(c), ++guard) {
+			const uint64_t base = Rd(c + 0x10);
+			if (base == 0 || s->all.size() == s->all.capacity()) continue;
+			const uint64_t m[2] = {Rd(c + 0x18), Rd(c + 0x20) & ((uint64_t {1} << 0x38) - 1)};
+			s->all.emplace_back(base, base + 120 * s->block);
+			for (uint64_t i = 0; i < 120;) {
+				if (((m[i >> 6] >> (i & 63)) & 1u) != 0) {
+					++i;
+					continue;
+				}
+				uint64_t j = i;
+				while (j < 120 && ((m[j >> 6] >> (j & 63)) & 1u) == 0) ++j;
+				if (s->free.size() < s->free.capacity()) s->free.emplace_back(base + i * s->block, base + j * s->block);
+				i = j;
+			}
+		}
+	}
+	return guard < 4096;
+}
+
+// Bytes en RAM de un conjunto (una muestra por pagina de 4 KiB: exacto).
+uint64_t InRam(const Ranges& set, std::vector<uint64_t>* addresses, std::vector<uint8_t>* flags) {
+	addresses->clear();
+	for (const auto& [b, e]: set)
+		for (uint64_t a = b; a < e; a += 0x1000) addresses->push_back(a);
+	if (addresses->empty()) return 0;
+	flags->resize(addresses->size());
+	if (!SampleResidency(addresses->data(), addresses->size(), flags->data())) return 0;
+	uint64_t n = 0;
+	for (const uint8_t f: *flags) n += f != 0 ? 0x1000 : 0;
+	return n;
+}
+
+struct Parent {
+	uint64_t addr = 0;
+	Ranges   previous, released, invalidated, stuck;
+	Snap     snap;
+	uint64_t reset = 0, reused = 0, touched = 0, refused = 0, busy = 0, invalid = 0, held_max_us = 0;
+	uint64_t ram_used = 0, ram_free = 0, released_now = 0;
+};
+
+void Worker() {
+	LocalPlatform::SetThreadName("Kyty.RamNativa");
+	const int mode = (TagMode() == 1 && ::FrameNativo2::Mode() != 0) ? 2 : TagMode(); // (FRAME-NATIVO2 importa arenas: solo medir)
+	auto*     ps   = new Parent[MaxParents]; // (nunca se destruye)
+	int       np   = 0;
+	for (int i = 0; i < MaxParents; i++) {
+		ps[i].snap.all.reserve(256);
+		ps[i].snap.free.reserve(256 * 61);
+	}
+	std::vector<uint64_t>        addresses;
+	std::vector<uint8_t>         flags;
+	std::pair<uint64_t, uint64_t> skipped[MaxDone];
+	auto                         said = std::chrono::steady_clock::now();
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		if (g_pool_end.load(std::memory_order_acquire) == 0 || g_guest_address_space == nullptr) continue;
+		const uint64_t pool_begin = g_pool_begin.load(std::memory_order_relaxed), pool_end = g_pool_end.load(std::memory_order_acquire);
+		// 0. Padres nuevos (de los Init vistos por ARENA-DUENO), comprobados con su vtable: +0xf8 = AllocTag, +0x100 = FreeTag.
+		const uint64_t eboot = ::ArenaDueno::g_eboot.load(std::memory_order_relaxed);
+		const int      ni    = ::ArenaDueno::g_inst_count.load(std::memory_order_acquire);
+		for (int i = 0; i < ni && eboot != 0; i++) {
+			const uint64_t p = ::ArenaDueno::g_inst[i].parent;
+			if (p == 0) continue;
+			bool known = false;
+			for (int k = 0; k < np; k++) known = known || ps[k].addr == p;
+			if (known || np == MaxParents) continue;
+			const uint64_t vt = Rd(p);
+			if (vt == 0 || Rd(vt + 0xf8) != eboot + AllocTagVa || Rd(vt + 0x100) != eboot + FreeTagVa) continue;
+			ps[np++].addr = p;
+			std::printf("[ram-nativa] padre TaggedFrameAllocator 0x%llx (vtable AllocTag eboot+0x7fe350, FreeTag eboot+0x7fe540)\n",
+			            static_cast<unsigned long long>(p));
+			std::fflush(stdout);
+		}
+		const bool report = std::chrono::steady_clock::now() - said >= std::chrono::seconds(10);
+		for (int k = 0; k < np; k++) {
+			Parent& P = ps[k];
+			// 1. Lo libre ahora (candado del juego).
+			auto t0 = std::chrono::steady_clock::now();
+			if (!Lock(P.addr)) {
+				P.busy++;
+				continue;
+			}
+			const bool ok = Read(P.addr, &P.snap);
+			Unlock(P.addr);
+			const auto us = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+			P.held_max_us = std::max(P.held_max_us, us);
+			if (!ok) {
+				P.invalid++;
+				continue;
+			}
+			Ranges now = P.snap.free;
+			Normalize(&now);
+			// 2. Devuelto que ya no esta libre: el juego lo volvio a pedir (AllocTag).
+			const Ranges kept = Intersect(P.released, now);
+			P.reused += Bytes(P.released) - Bytes(kept);
+			P.released    = kept;
+			P.invalidated = Intersect(P.invalidated, now);
+			P.stuck       = Intersect(P.stuck, now);
+			// 3. Libre en esta pasada y en la anterior, sin devolver.
+			const Ranges todo = Subtract(Subtract(Intersect(P.previous, now), P.released), P.stuck);
+			P.previous        = now;
+			if (mode == 1 && !todo.empty()) {
+				// 4. La GPU avisada antes (fuera del candado del juego: las caches toman los suyos). Nunca en el hilo de la GPU.
+				for (const auto& [b, e]: Subtract(todo, P.invalidated)) {
+					(void)TryPrepareHostOverwrite(b, e - b);
+					P.invalidated.emplace_back(b, e);
+				}
+				Normalize(&P.invalidated);
+				// 5. Devuelto con el candado otra vez y cada bloque comprobado todavia libre (bit 0 en [c+0x18]).
+				GuestBackingStore::ReleaseCounts counts;
+				counts.skipped     = skipped;
+				counts.skipped_max = MaxDone;
+				Ranges done;
+				done.reserve(todo.size());
+				int state = 2;
+				(void)g_guest_address_space->RunQuietWith([&] {
+					if (!Lock(P.addr)) return;
+					Snap& s = P.snap;
+					if (!Read(P.addr, &s)) {
+						Unlock(P.addr);
+						state = 1;
+						return;
+					}
+					Ranges still = s.free;
+					Normalize(&still);
+					for (const auto& [b, e]: Intersect(todo, still)) {
+						(void)ReleaseRange(b, e - b, pool_begin, pool_end, true, &counts);
+						done.emplace_back(b, e);
+					}
+					Unlock(P.addr);
+					state = 0;
+				});
+				if (state == 0) {
+					P.reset += counts.done;
+					P.refused += counts.refused;
+					for (const auto& r: done) P.released.push_back(r);
+					Normalize(&P.released);
+					for (size_t i = 0; i < counts.skipped_count; i++) P.stuck.push_back(skipped[i]);
+					Normalize(&P.stuck);
+					if (!done.empty())
+						(void)g_guest_address_space->RunQuietWith([&] {
+							for (const auto& [b, e]: done) TrimRange(b, e - b, pool_begin, pool_end);
+						});
+				} else {
+					(state == 2 ? P.busy : P.invalid)++;
+				}
+			}
+			// 6. Cada 10 s: RAM exacta (pagina a pagina) de lo usado y de lo libre; lo devuelto que volvio a RAM estando libre.
+			if (report) {
+				const Ranges given = Subtract(P.released, P.stuck);
+				const uint64_t back = InRam(given, &addresses, &flags);
+				P.touched += back;
+				if (back != 0) {
+					Ranges b2;
+					for (size_t i = 0; i < addresses.size(); i++)
+						if (flags[i] != 0) b2.emplace_back(addresses[i], addresses[i] + 0x1000);
+					Normalize(&b2);
+					P.released    = Subtract(P.released, b2);
+					P.invalidated = Subtract(P.invalidated, b2);
+				}
+				Ranges all = P.snap.all;
+				Normalize(&all);
+				P.ram_used     = InRam(Subtract(all, now), &addresses, &flags);
+				P.ram_free     = InRam(now, &addresses, &flags);
+				P.released_now = Bytes(Subtract(P.released, P.stuck));
+			}
+		}
+		if (!report) continue;
+		said                 = std::chrono::steady_clock::now();
+		constexpr double MiB = 1024.0 * 1024.0;
+		uint64_t         tr = 0, tu = 0, tp = 0, tram = 0, tsaved = 0;
+		for (int k = 0; k < np; k++) {
+			const Parent& P   = ps[k];
+			const uint64_t blk = P.snap.block;
+			const Ranges& now  = P.previous;
+			std::printf("[ram-nativa] 10 s, MiB (KYTY_RAM_NATIVA=%d%s) padre 0x%llx (TaggedFrameAllocator, bloque %llu KiB): "
+			            "reservado %.0f ([+0x98]), en uso %.0f ([+0x90]), maximo del juego %.0f ([+0xa0]), libre %.0f; "
+			            "en RAM: usado %.1f + libre %.1f = %.1f; devuelto ahora %.1f, devuelto en total %.1f, reutilizado por el "
+			            "juego %.1f, vuelto a RAM estando libre %.1f, rechazado %.1f; candado ocupado %llu, no valido %llu, "
+			            "lectura mas larga %.2f ms\n",
+			            mode, mode == 2 ? ", solo mide" : "", static_cast<unsigned long long>(P.addr),
+			            static_cast<unsigned long long>(blk >> 10u), static_cast<double>(P.snap.reserved * blk) / MiB,
+			            static_cast<double>(P.snap.used * blk) / MiB, static_cast<double>(P.snap.peak * blk) / MiB,
+			            static_cast<double>(Bytes(now)) / MiB, static_cast<double>(P.ram_used) / MiB,
+			            static_cast<double>(P.ram_free) / MiB, static_cast<double>(P.ram_used + P.ram_free) / MiB,
+			            static_cast<double>(P.released_now) / MiB, static_cast<double>(P.reset) / MiB,
+			            static_cast<double>(P.reused) / MiB, static_cast<double>(P.touched) / MiB,
+			            static_cast<double>(P.refused) / MiB, static_cast<unsigned long long>(P.busy),
+			            static_cast<unsigned long long>(P.invalid), static_cast<double>(P.held_max_us) / 1000.0);
+			tr += P.snap.reserved * blk;
+			tu += P.snap.used * blk;
+			tp += P.snap.peak * blk;
+			tram += P.ram_used + P.ram_free;
+			tsaved += P.released_now;
+		}
+		std::printf("[ram-nativa] 10 s, MiB TOTAL TaggedFrameAllocator (%d padres): reservado %.0f, en uso %.0f, maximo %.0f, "
+		            "en RAM %.1f, ahorrado ahora %.1f\n",
+		            np, static_cast<double>(tr) / MiB, static_cast<double>(tu) / MiB, static_cast<double>(tp) / MiB,
+		            static_cast<double>(tram) / MiB, static_cast<double>(tsaved) / MiB);
+		std::fflush(stdout);
+	}
+}
+} // namespace TagNativa
+
+void StartTag() {
+	static std::atomic<bool> started {false};
+	if (TagMode() == 0 || started.exchange(true)) return;
+	std::thread(TagNativa::Worker).detach();
+	std::printf("[ram-nativa] ON (KYTY_RAM_NATIVA=%d): bloques libres de los TaggedFrameAllocator (AllocTag 0x7fe350, FreeTag "
+	            "0x7fe540, mascara [trozo+0x18], candado [padre+0x80]) %s; linea [ram-nativa] cada 10 s%s\n",
+	            TagMode(), TagMode() == 1 ? "devueltos a Windows (MEM_RESET tras 2 pasadas libres, commit intacto)" : "solo medidos",
+	            (TagMode() == 1 && ::FrameNativo2::Mode() != 0) ? " (FRAME-NATIVO2 encendido: solo mide)" : "");
+	std::fflush(stdout);
+}
+
+void Start(uint64_t start, uint64_t len) {
+	StartNativa2(); // (nativa2)
+	StartTag();     // (RAM-NATIVA)
+	if (!Requested()) return;
+	const int mode = RequestedMode();
+	g_active.store(mode, std::memory_order_release);
+	std::thread(Worker).detach();
+	if (g_native.load(std::memory_order_relaxed))
+		std::printf("Freed release: on (KYTY_DS_FREED_RELEASE=%d, native guest memory, ram14): the game's free-block cache "
+		            "(ReleasePages 0x80f550 keeps freed blocks mapped; 0x80e7a0 hands them out again unzeroed), free at two "
+		            "passes in a row, %s at its guest address (MEM_RESET + out of the working set; commit unchanged); "
+		            "unmaps already give memory back; pool 0x%llx+%llu MiB; a 'Freed release (30 s' line with the GB\n",
+		            mode, mode == 1 ? "reset" : "counted, nothing changed", static_cast<unsigned long long>(start),
+		            static_cast<unsigned long long>(len >> 20u));
+	else if (mode == 1)
+		std::printf("Freed release: on (KYTY_DS_FREED_RELEASE=1): what the game's page allocator holds dead (its free-block "
+		            "cache, free at two passes in a row, and what it unmaps) is given back to Windows (DiscardVirtualMemory "
+		            "through the game's view and the alias; the commit charge stays: a page-file section); pool 0x%llx+%llu "
+		            "MiB; totals in the [ram] line (KYTY_RAM_LINE=1)\n",
+		            static_cast<unsigned long long>(start), static_cast<unsigned long long>(len >> 20u));
+	else
+		std::printf("Freed release: measuring only (KYTY_DS_FREED_RELEASE=2): what KYTY_DS_FREED_RELEASE=1 would give back, "
+		            "nothing changed; pool 0x%llx+%llu MiB; totals in the [ram] line (KYTY_RAM_LINE=1)\n",
+		            static_cast<unsigned long long>(start), static_cast<unsigned long long>(len >> 20u));
+	std::fflush(stdout);
+}
+
+// Just before a guest unmap of direct memory at [vaddr, vaddr + len), on the unmapping thread: what of it is the pool's
+// and mapped nowhere else, given back (mode 1) or counted (mode 2). Timed.
+void BeforeUnmap(uint64_t vaddr, uint64_t len) {
+	const int mode = g_active.load(std::memory_order_relaxed);
+	if (mode == 0) return;
+	// (ram9) KYTY_DS_FREED_RELEASE_UNMAP=0: not at the unmap (41 of the 53 GB of log 22:40; 73,044 calls): the free-block
+	// cache only (its resets under the quiet guest memory). For an A/B of the restart.
+	static const bool at_unmap = [] {
+		const char* v = std::getenv("KYTY_DS_FREED_RELEASE_UNMAP");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!at_unmap) return;
+	const uint64_t end = g_pool_end.load(std::memory_order_acquire);
+	if (end == 0 || g_guest_address_space == nullptr) return;
+	if (g_native.load(std::memory_order_relaxed)) return; // (ram14: a native unmap releases the memory itself)
+	const auto                       t0 = std::chrono::steady_clock::now();
+	GuestBackingStore::ReleaseCounts counts;
+	(void)g_guest_address_space->ReleaseBackingSole(vaddr, len, g_pool_begin.load(std::memory_order_relaxed), end, mode == 1,
+	                                                &counts);
+	if (counts.done == 0 && counts.shared == 0 && counts.refused == 0) return;
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+	auto& st = Stat();
+	st.unmap.fetch_add(counts.done, std::memory_order_relaxed);
+	st.discarded.fetch_add(counts.discarded, std::memory_order_relaxed);
+	st.reset.fetch_add(counts.reset, std::memory_order_relaxed);
+	st.shared.fetch_add(counts.shared, std::memory_order_relaxed);
+	st.refused.fetch_add(counts.refused, std::memory_order_relaxed);
+	st.unmap_calls.fetch_add(1, std::memory_order_relaxed);
+	st.unmap_us.fetch_add(us, std::memory_order_relaxed);
+	Max(st.unmap_max_us, us);
+}
+
+// The [ram] line's part (its thread only), MiB; empty when off.
+void Line(char* out, size_t size) {
+	out[0]         = 0;
+	const int mode = g_active.load(std::memory_order_relaxed);
+	if (mode == 0) return;
+	auto&           st        = Stat();
+	static uint64_t last      = 0;
+	const auto      mib       = [](uint64_t b) { return static_cast<unsigned long long>(b >> 20u); };
+	const auto      get       = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+	const uint64_t  total     = get(st.cache) + get(st.unmap);
+	const uint64_t  checked   = get(st.checked);
+	if (mode == 1) {
+		std::snprintf(out, size,
+		              "devuelto a Windows (KYTY_DS_FREED_RELEASE=1) %llu en total (+%llu): de bloques libres %llu, al "
+		              "desmapear %llu [DiscardVirtualMemory %llu, MEM_RESET %llu]; reutilizado o desmapeado por el juego "
+		              "%llu; vuelto a RAM estando libre %llu; rechazado: con otro mapeo %llu, por Windows %llu, bloques a "
+		              "medio mapear ahora %llu; ahora libres %llu, de ellos devueltos %llu; tras devolver seguian en RAM %llu "
+		              "de %llu muestras por la vista del juego y %llu por el alias; avisado a la GPU %llu; candado del juego "
+		              "%llu pasadas (ocupado %llu, listas no validas %llu), %.1f ms en total, la mas larga %.2f ms; al "
+		              "desmapear %llu llamadas, %.1f ms, la mas larga %.2f ms",
+		              mib(total), mib(total - last), mib(get(st.cache)), mib(get(st.unmap)), mib(get(st.discarded)),
+		              mib(get(st.reset)), mib(get(st.reused)), mib(get(st.touched)), mib(get(st.shared)), mib(get(st.refused)),
+		              mib(get(st.partial)), mib(get(st.now_free)), mib(get(st.now_released)),
+		              static_cast<unsigned long long>(get(st.still_game)), static_cast<unsigned long long>(checked),
+		              static_cast<unsigned long long>(get(st.still_alias)), mib(get(st.invalidated)),
+		              static_cast<unsigned long long>(get(st.passes)), static_cast<unsigned long long>(get(st.busy)),
+		              static_cast<unsigned long long>(get(st.invalid)), static_cast<double>(get(st.held_us)) / 1000.0,
+		              static_cast<double>(st.held_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0,
+		              static_cast<unsigned long long>(get(st.unmap_calls)), static_cast<double>(get(st.unmap_us)) / 1000.0,
+		              static_cast<double>(st.unmap_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0);
+	} else {
+		std::snprintf(out, size,
+		              "se devolveria (KYTY_DS_FREED_RELEASE=2, solo mide) %llu en total (+%llu): de bloques libres %llu, al "
+		              "desmapear %llu; reutilizado o desmapeado por el juego %llu; ahora libres %llu, ya contados %llu, en RAM "
+		              "unos %llu (muestra cada 5 s); no se devolveria: con otro mapeo %llu, bloques a medio mapear ahora %llu; "
+		              "candado del juego %llu pasadas (ocupado %llu, listas no validas %llu), %.1f ms en total, la mas larga "
+		              "%.2f ms",
+		              mib(total), mib(total - last), mib(get(st.cache)), mib(get(st.unmap)), mib(get(st.reused)),
+		              mib(get(st.now_free)), mib(get(st.sampled)), mib(get(st.in_ram)), mib(get(st.shared)),
+		              mib(get(st.partial)), static_cast<unsigned long long>(get(st.passes)),
+		              static_cast<unsigned long long>(get(st.busy)), static_cast<unsigned long long>(get(st.invalid)),
+		              static_cast<double>(get(st.held_us)) / 1000.0,
+		              static_cast<double>(st.held_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0);
+	}
+	last = total;
+}
+
+} // namespace FreedRelease
+
+// KernelAllocateDirectMemory: the page allocator's pool is the one direct allocation of 4 GiB or more (12 GiB less
+// 64 KiB with the allocator clamp; Kyty's store is 13.5 GiB, so there is only one).
+void NotePool(uint64_t start, uint64_t len) {
+	if ((!Requested() && !FreeCache::Requested() && !FreedRelease::Requested() && FreedRelease::Nativa2Mode() == 0) ||
+	    len < (uint64_t {4} << 30u) ||
+	    g_pool_end.load(std::memory_order_relaxed) != 0)
+		return;
+	// (ram14) With native guest memory, KYTY_DS_FREED_RELEASE alone (its native path); the other two still need the view.
+	if (g_guest_address_space != nullptr && g_guest_address_space->IsNative() &&
+	    (FreedRelease::Requested() || FreedRelease::Nativa2Mode() != 0) &&
+	    Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+		if (Requested() || FreeCache::Requested()) {
+			std::printf("Freed discard / free cache reset: off with native guest memory (KYTY_DS_FREED_RELEASE does it)\n");
+			std::fflush(stdout);
+		}
+		g_pool_begin.store(start, std::memory_order_relaxed);
+		g_pool_end.store(start + len, std::memory_order_release);
+		FreedRelease::g_native.store(true, std::memory_order_relaxed);
+		FreedRelease::Start(start, len);
+		return;
+	}
+	if (g_guest_address_space == nullptr || g_guest_address_space->IsNative() ||
+	    !Libs::Graphics::DemonsSouls::IsSupportedGame()) {
+		std::printf("Freed discard / free cache reset / freed release: off (KYTY_DS_FREED_DISCARD, KYTY_DS_FREECACHE_RESET "
+		            "and KYTY_DS_FREED_RELEASE need Demon's Souls and the guest store's backing view, not KYTY_NATIVE_MEMORY)\n");
+		std::fflush(stdout);
+		return;
+	}
+	g_pool_begin.store(start, std::memory_order_relaxed);
+	g_pool_end.store(start + len, std::memory_order_release);
+	FreedRelease::Start(start, len); // (ram6)
+	if (FreeCache::Requested() && FreedRelease::Requested()) { // (ram6: the same blocks; one walker of the lists at a time)
+		std::printf("Free cache reset: off (KYTY_DS_FREED_RELEASE covers the same blocks)\n");
+		std::fflush(stdout);
+	} else if (FreeCache::Requested()) { // (ram3)
+		std::thread(FreeCache::Worker).detach();
+		std::printf("Free cache reset: on (KYTY_DS_FREECACHE_RESET=1): the blocks the game's page allocator frees and keeps "
+		            "mapped are reset (MEM_RESET through the game's view, under the game's allocator lock) once free at two "
+		            "passes in a row; pool 0x%llx+%llu MiB\n",
+		            static_cast<unsigned long long>(start), static_cast<unsigned long long>(len >> 20u));
+		std::fflush(stdout);
+	}
+	if (!Requested()) return;
+	if (RequestedMode() == 2) {
+		// (ram2) No queue and no thread: BeforeUnmap resets each range as the game unmaps it.
+		g_active.store(2, std::memory_order_release);
+		std::printf("Freed discard: on (KYTY_DS_FREED_DISCARD=2): the page allocator's pool is direct memory 0x%llx+%llu "
+		            "MiB; its pages are reset through the game's view as the game unmaps them (MEM_RESET: no page-file "
+		            "write of them, commit charge unchanged); totals in the [ram] line (KYTY_RAM_LINE=1)\n",
+		            static_cast<unsigned long long>(start), static_cast<unsigned long long>(len >> 20u));
+		std::fflush(stdout);
+		return;
+	}
+	g_active.store(1, std::memory_order_release);
+	std::thread(Worker).detach();
+	std::printf("Freed discard: on (KYTY_DS_FREED_DISCARD=1): the page allocator's pool is direct memory 0x%llx+%llu MiB; "
+	            "its pages the game unmaps are dropped from RAM (commit charge unchanged)\n",
+	            static_cast<unsigned long long>(start), static_cast<unsigned long long>(len >> 20u));
+	std::fflush(stdout);
+}
+
+// ReleaseDirectMemoryInternal: the pool given back (never seen in Demon's Souls): off; the RAM flush owns released memory.
+void NoteRelease(uint64_t start, uint64_t len) {
+	const uint64_t end = g_pool_end.load(std::memory_order_acquire);
+	if (end == 0 || start >= end || start + len <= g_pool_begin.load(std::memory_order_relaxed)) return;
+	g_pool_end.store(0, std::memory_order_release);
+	g_active.store(0, std::memory_order_release);
+	FreedRelease::g_active.store(0, std::memory_order_release); // (ram6)
+	std::printf("Freed discard: off (the page allocator's pool was released)\n");
+	std::fflush(stdout);
+}
+
+// UnmapRange: direct memory [offset, offset + len) unmapped. Only the pool's whole 64 KiB granules.
+void Note(uint64_t offset, uint64_t len) {
+	if (g_active.load(std::memory_order_relaxed) != 1) return; // (ram2: mode 2 did its work in BeforeUnmap)
+	const uint64_t end = g_pool_end.load(std::memory_order_acquire);
+	if (end == 0) return;
+	const uint64_t pool_begin = g_pool_begin.load(std::memory_order_relaxed);
+	constexpr uint64_t Granule = 0x10000;
+	const uint64_t     b       = std::max(offset, pool_begin);
+	const uint64_t     e       = std::min(offset + len, end);
+	const uint64_t     ab      = (b + Granule - 1) & ~(Granule - 1);
+	const uint64_t     ae      = e & ~(Granule - 1);
+	if (ae <= ab) return;
+	g_queued.fetch_add(ae - ab, std::memory_order_relaxed);
+	g_calls.fetch_add(1, std::memory_order_relaxed);
+	auto& queue = GetQueue();
+	{
+		std::lock_guard lock(queue.mutex);
+		if (queue.ranges.size() < (size_t {1} << 20u)) queue.ranges.emplace_back(ab, ae - ab);
+	}
+	queue.ready.notify_one();
+}
+
+// (ram2, KYTY_DS_FREED_DISCARD=2) Just before a guest unmap of direct memory at [vaddr, vaddr + len): what of it is
+// the pool's and mapped nowhere else is reset through the game's view (the unmap that follows takes it out of the
+// working set clean). On the unmapping thread: one shared lock of the store and one VirtualAlloc(MEM_RESET) a mapping,
+// timed (the [ram] line gives calls, total and longest).
+void BeforeUnmap(uint64_t vaddr, uint64_t len) {
+	if (g_active.load(std::memory_order_relaxed) != 2) return;
+	const uint64_t end = g_pool_end.load(std::memory_order_acquire);
+	if (end == 0 || g_guest_address_space == nullptr) return;
+	const auto     t0     = std::chrono::steady_clock::now();
+	uint64_t       shared = 0, refused = 0;
+	const uint64_t done   = g_guest_address_space->ResetBackingBeforeUnmap(
+        vaddr, len, g_pool_begin.load(std::memory_order_relaxed), end, &shared, &refused);
+	if (done == 0 && shared == 0 && refused == 0) return;
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+	g_reset_bytes.fetch_add(done, std::memory_order_relaxed);
+	g_reset_shared.fetch_add(shared, std::memory_order_relaxed);
+	g_reset_refused.fetch_add(refused, std::memory_order_relaxed);
+	g_reset_calls.fetch_add(1, std::memory_order_relaxed);
+	g_reset_us.fetch_add(us, std::memory_order_relaxed);
+	uint64_t longest = g_reset_max_us.load(std::memory_order_relaxed);
+	while (us > longest && !g_reset_max_us.compare_exchange_weak(longest, us, std::memory_order_relaxed)) {
+	}
+}
+
+// (ram2) The counters for the [ram] line.
+void Stats(uint64_t* v) {
+	const int mode = g_active.load(std::memory_order_relaxed);
+	v[0]           = static_cast<uint64_t>(mode);
+	if (mode == 2) {
+		v[1] = g_reset_bytes.load(std::memory_order_relaxed);
+		v[3] = g_reset_shared.load(std::memory_order_relaxed);
+		v[4] = g_reset_refused.load(std::memory_order_relaxed);
+		v[5] = g_reset_calls.load(std::memory_order_relaxed);
+		v[6] = g_reset_us.load(std::memory_order_relaxed);
+		v[7] = g_reset_max_us.exchange(0, std::memory_order_relaxed);
+	} else {
+		v[1] = g_dropped.load(std::memory_order_relaxed);
+		v[2] = g_queued.load(std::memory_order_relaxed);
+		v[3] = g_covered.load(std::memory_order_relaxed);
+		v[4] = g_refused.load(std::memory_order_relaxed);
+		v[5] = g_calls.load(std::memory_order_relaxed);
+	}
+}
+
+
+// (ram9) The guest store's pages in RAM ("almacen del juego": 6.1-6.3 GB of a 16 GB PC in log 22:40, available 330-1900
+// MiB all along, free 0-8): how much of it the game uses, and what it does not use given back to Windows' standby list.
+//
+// KYTY_STORE_HOTSET=1 (or with KYTY_STORE_TRIM=1): every 30 s, 512 granules of 64 KiB picked at random among the game's
+// mappings of the store; those in RAM (their first page valid in the working set) are trimmed (VirtualUnlock, through
+// the game's view and the alias, guest memory quiet) and looked at again 1 s and 10 s later: back in RAM = touched in
+// that time (a soft fault from the standby/modified list: no disk, no byte lost). Line:
+//   Store hot set (30 s): mapped M MiB, in RAM ~R MiB (r of n sampled); touched again within 1 s a% (~A MiB), within
+//   10 s b% (~B MiB); all-time ...
+// A = what about 60 frames use; B what 10 s use. Cost: 32 MiB trimmed every 30 s.
+//
+// KYTY_STORE_TRIM=1 (off): while available memory is below KYTY_STORE_TRIM_BELOW_MB (1500), granules of 2 MiB of the
+// store go out of the working set (round robin over the game's mappings, both views), up to KYTY_STORE_TRIM_MB_S (256)
+// MiB a second, 8 granules per quiet section (~1 ms with every guest protection change held off), until available is
+// KYTY_STORE_TRIM_BELOW_MB + 512 again. A granule the game touched again within 2 s of its trim (its first page back) is
+// hot: left alone for 120 s. What leaves goes to standby (clean) or modified (dirty: Windows writes or compresses it):
+// it stays in Windows' lists, counted as available, and comes back by a soft fault while it is there. No byte is lost;
+// a page Windows gave away meanwhile comes back from the page file (a hard fault: only cold pages, by the rule above).
+// Line every 30 s: "Store trim (30 s): ..." (MiB trimmed, hot granules skipped and found, quiet sections and time).
+namespace StoreTrim {
+using Granule = GuestBackingStore::Granule;
+
+bool InRam(uint64_t address) {
+	PSAPI_WORKING_SET_EX_INFORMATION page {};
+	page.VirtualAddress = reinterpret_cast<void*>(address & ~uint64_t {0xfff});
+	return K32QueryWorkingSetEx(GetCurrentProcess(), &page, sizeof(page)) != 0 && page.VirtualAttributes.Valid != 0;
+}
+
+// Granules out of the working set, both views, guest memory quiet. False when the quiet section was refused.
+bool Trim(const Granule* granules, size_t count, uint64_t bytes_each) {
+	if (g_guest_address_space == nullptr || count == 0) return false;
+	return g_guest_address_space->RunQuietWith([&] {
+		for (size_t i = 0; i < count; i++) {
+			const uint64_t bytes = std::min(bytes_each, granules[i].bytes);
+			(void)VirtualUnlock(reinterpret_cast<void*>(granules[i].guest), bytes);
+			(void)VirtualUnlock(granules[i].alias, bytes);
+		}
+	});
+}
+
+// (ram10) Windows' paging I/O, pages a second (PDH "Memory" counters, English names; pdh.dll loaded here, no import):
+// [0] Pages Input/sec (read from disk by hard faults), [1] Pages Output/sec (written to disk - page file or a mapped
+// file such as KYTY_BACKING_FILE's - to free RAM), [2] Page Writes/sec (those writes, operations). False when missing.
+bool PagingCounters(double* out) {
+	using OpenQuery  = LONG(WINAPI*)(const wchar_t*, DWORD_PTR, HANDLE*);
+	using AddCounter = LONG(WINAPI*)(HANDLE, const wchar_t*, DWORD_PTR, HANDLE*);
+	using Collect    = LONG(WINAPI*)(HANDLE);
+	using GetValue   = LONG(WINAPI*)(HANDLE, DWORD, DWORD*, void*);
+	struct Value { // (PDH_FMT_COUNTERVALUE on x64)
+		DWORD  status;
+		DWORD  padding;
+		double value;
+	};
+	static_assert(sizeof(Value) == 16);
+	struct State {
+		bool     ok      = false;
+		Collect  collect = nullptr;
+		GetValue get     = nullptr;
+		HANDLE   query   = nullptr;
+		HANDLE   counters[3] {};
+	};
+	static State state = [] {
+		State   s;
+		HMODULE pdh = LoadLibraryW(L"pdh.dll");
+		if (pdh == nullptr) return s;
+		const auto open = reinterpret_cast<OpenQuery>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhOpenQueryW")));
+		const auto add  = reinterpret_cast<AddCounter>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhAddEnglishCounterW")));
+		s.collect       = reinterpret_cast<Collect>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhCollectQueryData")));
+		s.get           = reinterpret_cast<GetValue>(reinterpret_cast<void*>(GetProcAddress(pdh, "PdhGetFormattedCounterValue")));
+		if (open == nullptr || add == nullptr || s.collect == nullptr || s.get == nullptr) return s;
+		if (open(nullptr, 0, &s.query) != 0 || s.query == nullptr) return s;
+		const wchar_t* names[3] = {L"\\Memory\\Pages Input/sec", L"\\Memory\\Pages Output/sec", L"\\Memory\\Page Writes/sec"};
+		for (int i = 0; i < 3; i++)
+			if (add(s.query, names[i], 0, &s.counters[i]) != 0) return s;
+		(void)s.collect(s.query); // (a rate needs two samples)
+		s.ok = true;
+		return s;
+	}();
+	if (!state.ok || state.collect(state.query) != 0) return false;
+	for (int i = 0; i < 3; i++) {
+		constexpr DWORD FormatDouble = 0x00000200; // PDH_FMT_DOUBLE
+		Value           v {};
+		if (state.get(state.counters[i], FormatDouble, nullptr, &v) != 0) return false;
+		out[i] = v.value;
+	}
+	return true;
+}
+
+uint64_t Number(const char* name, uint64_t fallback) {
+	const char* v = std::getenv(name);
+	return v != nullptr && v[0] != '\0' ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : fallback;
+}
+
+void Worker() {
+	LocalPlatform::SetThreadName("Kyty.StoreTrim");
+	std::this_thread::sleep_for(std::chrono::seconds(10)); // (the port sets its variables after the start)
+	const bool trim_on = Number("KYTY_STORE_TRIM", 0) == 1;
+	const bool hot_on  = trim_on || Number("KYTY_STORE_HOTSET", 0) == 1;
+	if (!trim_on && !hot_on) return;
+	const uint64_t below   = Number("KYTY_STORE_TRIM_BELOW_MB", 1500) << 20u;
+	const uint64_t target  = below + (uint64_t {512} << 20u);
+	const uint64_t per_s   = std::max<uint64_t>(Number("KYTY_STORE_TRIM_MB_S", 256), 16) << 20u;
+	constexpr uint64_t Big = uint64_t {2} << 20u, Probe = uint64_t {64} << 10u;
+	std::printf("Store trim: %s (KYTY_STORE_TRIM=%d; below %llu MiB available, %llu MiB/s at most); hot set measure %s; "
+	            "store %s\n",
+	            trim_on ? "on" : "off", trim_on ? 1 : 0, static_cast<unsigned long long>(below >> 20u),
+	            static_cast<unsigned long long>(per_s >> 20u), hot_on ? "on (KYTY_STORE_HOTSET)" : "off",
+	            g_guest_address_space->StoreInFile()
+	                ? "in a file (KYTY_BACKING_FILE: trimmed dirty pages are written to it, not to memory compression)"
+	                : "in the page file (trimmed dirty pages go to Windows' memory compression: KYTY_BACKING_FILE=1 sends them to disk)");
+	std::fflush(stdout);
+	std::vector<Granule> big, probe;
+	std::unordered_map<uint64_t, uint64_t> hot_until; // granule guest address -> tick it is hot until
+	struct Pending {
+		uint64_t guest = 0, tick = 0;
+	};
+	std::deque<Pending> pending; // trimmed, first page looked at 2 s later
+	size_t               cursor = 0;
+	uint64_t             tick = 0, last_list = 0;
+	uint64_t trimmed = 0, skipped = 0, found_hot = 0, quiet = 0, quiet_refused = 0, quiet_us = 0;
+	uint64_t all_n = 0, all_1 = 0, all_10 = 0;
+	std::mt19937_64 random(GetTickCount64());
+	for (;; tick++) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+		const uint64_t now_ms = GetTickCount64();
+		if (big.empty() || tick - last_list >= 30) {
+			g_guest_address_space->StoreGranules(Big, &big);
+			last_list = tick;
+			if (cursor >= big.size()) cursor = 0;
+		}
+		// Hot: back in RAM within 2 s of its trim.
+		while (!pending.empty() && now_ms - pending.front().tick >= 2000) {
+			if (InRam(pending.front().guest)) {
+				hot_until[pending.front().guest] = now_ms + 120000;
+				found_hot++;
+			}
+			pending.pop_front();
+		}
+		// The hot set measure, every 30 s.
+		if (hot_on && tick % 30 == 5 && !big.empty()) {
+			g_guest_address_space->StoreGranules(Probe, &probe);
+			uint64_t mapped = 0;
+			for (const auto& g: probe) mapped += g.bytes;
+			std::vector<Granule> picked, resident;
+			for (size_t i = 0; i < 512 && !probe.empty(); i++) picked.push_back(probe[random() % probe.size()]);
+			for (const auto& g: picked)
+				if (InRam(g.guest)) resident.push_back(g);
+			if (!resident.empty() && Trim(resident.data(), resident.size(), Probe)) {
+				size_t back_1 = 0, back_10 = 0;
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				for (const auto& g: resident) back_1 += InRam(g.guest) ? 1 : 0;
+				std::this_thread::sleep_for(std::chrono::seconds(9));
+				for (const auto& g: resident) back_10 += InRam(g.guest) ? 1 : 0;
+				const double in_ram = static_cast<double>(mapped) * static_cast<double>(resident.size()) / picked.size();
+				const double f1 = static_cast<double>(back_1) / resident.size(), f10 = static_cast<double>(back_10) / resident.size();
+				all_n += resident.size();
+				all_1 += back_1;
+				all_10 += back_10;
+				std::printf("Store hot set (30 s): mapped %llu MiB, in RAM ~%.0f MiB (%zu of %zu sampled); touched again within 1 s "
+				            "%.0f%% (~%.0f MiB), within 10 s %.0f%% (~%.0f MiB); all-time %.0f%% / %.0f%% of %llu\n",
+				            static_cast<unsigned long long>(mapped >> 20u), in_ram / 1048576.0, resident.size(), picked.size(),
+				            f1 * 100.0, in_ram * f1 / 1048576.0, f10 * 100.0, in_ram * f10 / 1048576.0,
+				            100.0 * static_cast<double>(all_1) / static_cast<double>(all_n),
+				            100.0 * static_cast<double>(all_10) / static_cast<double>(all_n), static_cast<unsigned long long>(all_n));
+				std::fflush(stdout);
+			}
+			tick += 10;
+		}
+		// The trim, while available memory is short.
+		if (trim_on && !big.empty()) {
+			const uint64_t available = RamGuard::AvailablePhysical();
+			static bool    active    = false;
+			if (available != 0 && available < below) active = true;
+			if (available == 0 || available >= target) active = false;
+			if (active) {
+				uint64_t budget = per_s;
+				std::vector<Granule> batch;
+				for (size_t seen = 0; seen < big.size() && budget >= Big; seen++) {
+					const Granule& g = big[cursor];
+					cursor           = cursor + 1 < big.size() ? cursor + 1 : 0;
+					const auto hot   = hot_until.find(g.guest);
+					if (hot != hot_until.end()) {
+						if (hot->second > now_ms) {
+							skipped++;
+							continue;
+						}
+						hot_until.erase(hot);
+					}
+					if (!InRam(g.guest)) continue;
+					batch.push_back(g);
+					budget -= Big;
+					if (batch.size() == 8) {
+						const auto t0 = std::chrono::steady_clock::now();
+						if (Trim(batch.data(), batch.size(), Big)) {
+							quiet++;
+							for (const auto& b: batch) {
+								trimmed += b.bytes;
+								pending.push_back({b.guest, GetTickCount64()});
+							}
+						} else {
+							quiet_refused++;
+						}
+						quiet_us += static_cast<uint64_t>(
+						    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+						batch.clear();
+						std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					}
+				}
+				if (!batch.empty() && Trim(batch.data(), batch.size(), Big)) {
+					quiet++;
+					for (const auto& b: batch) {
+						trimmed += b.bytes;
+						pending.push_back({b.guest, GetTickCount64()});
+					}
+				}
+			}
+			// (ram10) Windows' paging I/O beside it, averaged over the 30 s (sampled each second).
+			static double paging_sum[3] {};
+			static uint64_t paging_n = 0;
+			double          paging[3] {};
+			if (PagingCounters(paging)) {
+				for (int i = 0; i < 3; i++) paging_sum[i] += paging[i];
+				paging_n++;
+			}
+			if (tick % 30 == 0) {
+				const double n = paging_n != 0 ? static_cast<double>(paging_n) : 1.0;
+				std::printf("Store trim (30 s): %llu MiB out of the working set in all, %s now (available %llu MiB); hot granules "
+				            "found %llu, skipped %llu; quiet sections %llu (refused %llu), %.1f ms in all; Windows paging (whole "
+				            "PC, 30 s mean): read from disk %.0f pages/s (%.1f MiB/s), written to disk %.0f pages/s (%.1f MiB/s) "
+				            "in %.0f writes/s\n",
+				            static_cast<unsigned long long>(trimmed >> 20u), active ? "trimming" : "idle",
+				            static_cast<unsigned long long>(available >> 20u), static_cast<unsigned long long>(found_hot),
+				            static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(quiet),
+				            static_cast<unsigned long long>(quiet_refused), static_cast<double>(quiet_us) / 1000.0,
+				            paging_sum[0] / n, paging_sum[0] / n / 256.0, paging_sum[1] / n, paging_sum[1] / n / 256.0,
+				            paging_sum[2] / n);
+				paging_sum[0] = paging_sum[1] = paging_sum[2] = 0;
+				paging_n                                     = 0;
+			}
+		}
+	}
+}
+
+void Start() {
+	static std::once_flag once;
+	std::call_once(once, [] { std::thread(Worker).detach(); });
+}
+} // namespace StoreTrim
+} // namespace FreedDiscard
+#else
+namespace FreedDiscard {
+inline void NotePool(uint64_t, uint64_t) {}
+inline void NoteRelease(uint64_t, uint64_t) {}
+inline void Note(uint64_t, uint64_t) {}
+inline void BeforeUnmap(uint64_t, uint64_t) {}
+inline void Stats(uint64_t*) {}
+namespace FreedRelease { // (ram6)
+inline void BeforeUnmap(uint64_t, uint64_t) {}
+inline void Line(char* out, size_t) {
+	out[0] = 0;
+}
+} // namespace FreedRelease
+} // namespace FreedDiscard
 #endif
+
+// (ram2) For the "[ram]" line (ram-guard.cpp, KYTY_RAM_LINE=1), any thread: counters and four guarded reads of the
+// game's page allocator, no lock and no walk. out[0] freed-discard mode in use (0 off); [1] bytes of freed direct
+// memory dropped (mode 1) or reset (mode 2) in all; [2] bytes queued (mode 1); [3] bytes left because another mapping
+// covered them; [4] bytes Windows refused; [5] calls; [6] microseconds in the resets, in all (mode 2); [7] the longest
+// reset since the last call, microseconds (mode 2); [8] 1 when [9] and [10] are read; [9] bytes of the game's page
+// allocator's released blocks still mapped (its free-block cache: the emulator sees no unmap of them); [10] bytes of
+// its pool not mapped (free in its bitmap).
+void RamLineStats(uint64_t* out, size_t count);
+void RamLineStats(uint64_t* out, size_t count) {
+	uint64_t v[11] {};
+	FreedDiscard::Stats(v);
+	uint64_t cached = 0, unmapped = 0;
+	if (Loader::DemonsSoulsMemMap::PageAllocatorFree(&cached, &unmapped)) {
+		v[8]  = 1;
+		v[9]  = cached;
+		v[10] = unmapped;
+	}
+	for (size_t i = 0; i < count && i < 11; i++) out[i] = v[i];
+}
+
+// (ram6) The [ram] line's KYTY_DS_FREED_RELEASE part (ram-guard.cpp, its thread), MiB; "" when off.
+void RamLineFreedRelease(char* out, size_t size);
+void RamLineFreedRelease(char* out, size_t size) {
+	if (out == nullptr || size == 0) return;
+	FreedDiscard::FreedRelease::Line(out, size);
+}
+
+// (ram16, KYTY_RAM16) For the "[ram16]" line (ram-guard.cpp, its thread), any thread, no lock: the bytes
+// KYTY_DS_FREED_RELEASE=1 gave back to Windows that the game has not taken back nor touched since (its "RAM ahorrada
+// ahora", at its last pass); 0 when it is off, only measuring (=2) or not on Windows.
+uint64_t Ram16FreedReleasedNow();
+uint64_t Ram16FreedReleasedNow() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (FreedDiscard::FreedRelease::g_active.load(std::memory_order_relaxed) != 1) return 0;
+	return FreedDiscard::FreedRelease::Stat().now_released.load(std::memory_order_relaxed);
+#else
+	return 0;
+#endif
+}
 
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
@@ -1990,6 +4538,7 @@ void Initialize() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RamGuard::RegisterBudgetFlush("released guest memory", RamGuard::FlushGuestFreed, RamFlushGuest::FlushFreed);
 	RamGuard::RegisterBudgetFlush("guest store alias", RamGuard::FlushTrim, RamFlushGuest::FlushTrim);
+	FreedDiscard::StoreTrim::Start(); // (ram9: KYTY_STORE_TRIM / KYTY_STORE_HOTSET, read in its thread; nothing without)
 #endif
 }
 
@@ -3188,6 +5737,7 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 
 int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot,
                                                    int flags, const char* name) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMapNamedFlexibleMemory");
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -3336,6 +5886,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 }
 
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMapFlexibleMemory");
 	struct AccessReport { ~AccessReport() { ReportGuestAccess(false); } } access_report;
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
@@ -3529,9 +6080,12 @@ static int UnmapRange(uint64_t vaddr, size_t len, const VirtualRanges::Range& ra
 		const auto          direct_offset = range.offset + vaddr - range.start;
 		if (DecodeMemoryProtection(range.protection, &direct_mode, &direct_gpu) &&
 		    g_guest_address_space->BackingContains(vaddr, len) &&
+		    (FreedDiscard::BeforeUnmap(vaddr, len), true) && // (ram2, KYTY_DS_FREED_DISCARD=2: reset through this view)
+		    (FreedDiscard::FreedRelease::BeforeUnmap(vaddr, len), true) && // (ram6, KYTY_DS_FREED_RELEASE)
 		    g_guest_address_space->UnmapBacking(vaddr, len)) {
 			if (g_physical_memory->Unmap(vaddr, len, &gpu_mode)) {
 				owner_unmapped = true;
+				FreedDiscard::Note(direct_offset, len); // (ram1, KYTY_DS_FREED_DISCARD: queued, dropped if still unmapped)
 			} else {
 				EXIT_IF(!g_guest_address_space->MapBacking(vaddr, len, direct_offset, direct_mode));
 			}
@@ -3578,6 +6132,8 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	const int result = UnmapMemoryRange(vaddr, len);
 	if (result != OK) {
 		RestoreGpuRangeProtection(vaddr, len);
+	} else {
+		::Loader::DemonsSoulsTextureProbe::OnUnmap(vaddr, len); // KYTY_TEXTURE_PROBE (measurement only)
 	}
 	return result;
 }
@@ -3806,6 +6362,7 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 	}
 
 	*phys_addr_out = static_cast<int64_t>(addr);
+	FreedDiscard::NotePool(addr, len); // (ram1, KYTY_DS_FREED_DISCARD)
 
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 
@@ -3829,6 +6386,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 
 static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	FreedDiscard::NoteRelease(static_cast<uint64_t>(start), len); // (ram1, KYTY_DS_FREED_DISCARD)
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
 		if (!g_physical_memory->ReleasePoolExpansion(static_cast<uint64_t>(start), len)) {
@@ -3959,6 +6517,7 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMapDirectMemory");
 	struct AccessReport { ~AccessReport() { ReportGuestAccess(false); } } access_report;
 	PRINT_NAME();
 
@@ -4154,6 +6713,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMapDirectMemory2");
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -4173,6 +6733,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int 
 int KYTY_SYSV_ABI KernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags,
                                              int64_t direct_memory_start, size_t alignment,
                                              const char* name) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMapNamedDirectMemory");
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -4341,6 +6902,10 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		bool          unmapped = true;
 
 		if (chunk.range.type == VirtualRangeType::Direct) {
+			// (ram2, KYTY_DS_FREED_DISCARD=2: Demon's Souls' UnmapPhysicalPages unmaps this way too. A rollback below -
+			// the reservation failing, fatal anyway - would map reset pages back.)
+			FreedDiscard::BeforeUnmap(chunk.range.start, chunk.range.size);
+			FreedDiscard::FreedRelease::BeforeUnmap(chunk.range.start, chunk.range.size); // (ram6, KYTY_DS_FREED_RELEASE)
 			if (!g_guest_address_space->UnmapBacking(chunk.range.start, chunk.range.size)) {
 				unmapped = false;
 			} else {
@@ -4428,6 +6993,9 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		if (g_free_callback != nullptr && IsCommittedRangeType(chunk.range.type)) {
 			g_free_callback(chunk.range.start, chunk.range.size);
 		}
+		// (ram1, KYTY_DS_FREED_DISCARD: Demon's Souls' UnmapPhysicalPages unmaps this way too, sceKernelReserveVirtualRange
+		// over the pages it frees.)
+		if (chunk.range.type == VirtualRangeType::Direct) FreedDiscard::Note(chunk.range.offset, chunk.range.size);
 	}
 
 	return true;
@@ -4737,6 +7305,10 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size, VirtualMe
                                   const char* name) {
 	const auto vaddr =
 	    AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Stack, false);
+	// (commit-al-tocar, KYTY_COMMIT_AL_TOCAR=1) A stack is committed whole now: a fault on a reserved stack page cannot be
+	// handled (Windows writes the exception's frame on that same stack) and ends the process without a report. Fiber
+	// stacks (MapGuestStack, never memset) were the ones: the first push of a fiber on its reserved stack, ~20 s.
+	if (vaddr != 0) (void)PrefaultGuestRange(reinterpret_cast<void*>(vaddr), size);
 	if (vaddr != 0 && g_alloc_callback != nullptr) {
 		g_alloc_callback(vaddr, size);
 	}
@@ -4765,7 +7337,78 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	return true;
 }
 
+#if defined(_WIN32)
+// (11-14) Watched pages pinned in RAM (KYTY_PIN_WATCHED=1 turns it on; KYTY_PIN_WATCHED_MB, default 6144: at most that
+// much). Every reboot measured on 11-14 was bug check 0x1A / 0x41202: Windows paging a page out while its protection
+// changes. The page manager changes protections tens of thousands of times a minute; when RAM runs low, Windows trims
+// those very pages. A page is locked (VirtualLock) the first time its protection is changed, while still accessible,
+// and stays locked until the game frees it: Windows can no longer page it, so the race cannot happen.
+namespace PinWatched {
+static std::mutex                   g_mutex;
+static std::unordered_set<uint64_t> g_granules; // 64 KiB granules tried (locked or refused)
+static uint64_t                     g_pinned = 0, g_budget = 0, g_refused = 0;
+static bool                         g_on = false, g_full_logged = false;
+static std::once_flag               g_once;
+constexpr uint64_t                  Granule = uint64_t {1} << 16u;
+
+static void Init() {
+	const char* off = std::getenv("KYTY_PIN_WATCHED");
+	g_on = off != nullptr && off[0] == '1'; // (11-14) off by default: it filled the RAM (6 GB pinned at once)
+	if (!g_on) {
+		std::printf("Pin watched pages: off (KYTY_PIN_WATCHED=0)\n");
+		std::fflush(stdout);
+		return;
+	}
+	const char* mb = std::getenv("KYTY_PIN_WATCHED_MB");
+	g_budget       = (mb != nullptr && *mb != 0 ? std::strtoull(mb, nullptr, 10) : 6144ull) << 20u;
+	SIZE_T wmin = 0, wmax = 0;
+	GetProcessWorkingSetSize(GetCurrentProcess(), &wmin, &wmax);
+	const BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), wmin + g_budget + (256ull << 20u),
+	                                           std::max<SIZE_T>(wmax, wmin + g_budget + (1024ull << 20u)),
+	                                           QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+	std::printf("Pin watched pages: on, up to %llu MiB locked (working set minimum %s; KYTY_PIN_WATCHED=1 turns it on)\n",
+	            static_cast<unsigned long long>(g_budget >> 20u), ok ? "raised" : "NOT raised");
+	std::fflush(stdout);
+}
+
+static void Before(uint64_t vaddr, uint64_t size) {
+	std::call_once(g_once, Init);
+	if (!g_on || size == 0) return;
+	std::lock_guard lock(g_mutex);
+	for (uint64_t g = vaddr & ~(Granule - 1u); g < vaddr + size; g += Granule) {
+		if (!g_granules.insert(g).second) continue;
+		if (g_pinned + Granule > g_budget) {
+			if (!g_full_logged) {
+				g_full_logged = true;
+				std::printf("Pin watched pages: budget of %llu MiB used up; later watched pages are not pinned\n",
+				            static_cast<unsigned long long>(g_budget >> 20u));
+				std::fflush(stdout);
+			}
+			continue;
+		}
+		if (VirtualLock(reinterpret_cast<void*>(g), Granule) != 0) {
+			g_pinned += Granule;
+		} else {
+			g_refused++;
+		}
+	}
+}
+
+// The game freed [vaddr, vaddr + size): its locks went with the mapping.
+static void Forget(uint64_t vaddr, uint64_t size) {
+	if (!g_on || size == 0) return;
+	std::lock_guard lock(g_mutex);
+	for (uint64_t g = vaddr & ~(Granule - 1u); g < vaddr + size; g += Granule) {
+		if (g_granules.erase(g) != 0 && g_pinned >= Granule) g_pinned -= Granule;
+	}
+}
+} // namespace PinWatched
+#endif
+
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+#if defined(_WIN32)
+	PinWatched::Before(vaddr, size);
+#endif
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
 }
@@ -4781,6 +7424,9 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
 	UnmapGpuRange(vaddr, mapped_size, true);
 	const bool freed = FreeGuestMemoryOwner(vaddr, mapped_size);
+#if defined(_WIN32)
+	if (freed) PinWatched::Forget(vaddr, mapped_size);
+#endif
 	if (!freed) {
 		RestoreGpuRangeProtection(vaddr, mapped_size);
 	}
@@ -4872,6 +7518,7 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
 
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
                                   int* num_entries_out, int flags) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelBatchMap");
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
@@ -5068,6 +7715,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 }
 
 int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int prot, int flags) {
+	KYTY_MAPA_GRANDE_SCOPE("sceKernelMemoryPoolCommit");
 	PRINT_NAME();
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);

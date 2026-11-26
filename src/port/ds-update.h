@@ -30,6 +30,9 @@ inline constexpr int         kKeepBackups = 2;
 
 // The version compiled into the exe (-DKYTY_DS_PORT_VERSION, the CI's package name = its release tag).
 const char* CurrentVersion();
+// (11-23) The release zip this folder came from (version-zip.txt next to the exe, put in the zip by HACER-ZIP), or ""
+// (none, or the exe is newer: a local build). A zip replaced in the same release is then still offered as an update.
+std::string InstalledZip();
 // (port21) When this build was made (the CI's clock, UTC): "30/10/2026 19:40 UTC".
 const char* BuildStamp();
 

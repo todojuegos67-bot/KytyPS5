@@ -2975,80 +2975,608 @@ try { $panel.AutoScroll = $false; $panel.HorizontalScroll.Maximum = 0; $panel.Ho
 # (10-27 startup) Estado final ANTES de mostrar (antes iba en Shown y se veia recolocar). Mismo orden de antes.
 try { Update-AntiLagBox } catch { }
 try { Update-ResLock; Update-LowEnd } catch { }
-# (10-27 trophies) Collapsible Trophies section: the ones earned (grade and name in the game's language) and the % complete.
-# Written by the emulator: _SaveData\PPSA01341\trophies.json (unlocks) and trophies-list.json (the .ucp's list).
+# (trofeos-2) Trophies: a tab at the bottom left and a hand-drawn drop-down, animated (opening, rows coming in one
+# after another, a glow under the mouse, details that unfold). The emulator's data in _SaveData\PPSA01341:
+# trophies-list.json (name, description and grade in the game's language), trophies.json (id -> unix time earned) and
+# trophy-icons\tropNNN.png (icons from the game's .ucp). Opening the launcher only reads the counter; the icons, on opening.
 $trophyDir    = Join-Path $root '_SaveData\PPSA01341'
 $trophyGrades = @{ 'P' = 'Platinum'; 'G' = 'Gold'; 'S' = 'Silver'; 'B' = 'Bronze' }
 $trophyPts    = @{ 'P' = 300; 'G' = 90; 'S' = 30; 'B' = 15 }  # (PSN points: the % as the console shows it)
 $trophyColors = @{ 'P' = [System.Drawing.Color]::FromArgb(170, 200, 235); 'G' = [System.Drawing.Color]::FromArgb(236, 196, 72); 'S' = [System.Drawing.Color]::FromArgb(200, 205, 212); 'B' = [System.Drawing.Color]::FromArgb(205, 127, 70) }
-function Get-TrophySummary {
-	$r = @{ Earned = @(); Total = 0; Count = 0; Pct = 0 }
+$trTxt = @{
+	Title = 'Trophies'; Of = '{0} of {1} earned'; None = 'No trophies yet: they appear the first time you play.'; Empty = 'No trophies in this view.'
+	Earned = 'Earned'; NotYet = 'Not earned yet'; NoDate = 'Earned (date unknown)'
+	Hidden = 'Hidden trophy'; HiddenDesc = 'Keep playing to reveal it.'; HiddenLine = 'Hidden · not earned'
+	Chips = @('All', 'Earned', 'Pending'); Culture = 'en-US'; DateFmt = "MMMM d, yyyy 'at' h:mm tt"
+}
+function Get-TrophyData {
+	# Light read (two small JSON files). Stamp: the files' times, so the rows are not remade when nothing changed.
+	$r = @{ List = @(); Un = @{}; Total = 0; NGot = 0; Pct = 0; Got = @{}; All = @{}; Stamp = '' }
 	try {
 		$listFile = Join-Path $trophyDir 'trophies-list.json'; $unFile = Join-Path $trophyDir 'trophies.json'
-		$list = @(); if (Test-Path -LiteralPath $listFile) { $list = @((Get-Content -LiteralPath $listFile -Raw -Encoding UTF8 | ConvertFrom-Json).trophies) }
-		$un = @{}
-		if (Test-Path -LiteralPath $unFile) { $j = Get-Content -LiteralPath $unFile -Raw -Encoding UTF8 | ConvertFrom-Json; if ($j.unlocked) { foreach ($p in $j.unlocked.PSObject.Properties) { $un[[string]$p.Name] = [long]$p.Value } } }
-		$r.Total  = $list.Count
-		$r.Earned = @($list | Where-Object { $un.ContainsKey([string]$_.id) } | Sort-Object { $un[[string]$_.id] })
-		$r.Count  = $r.Earned.Count
+		foreach ($f in @($listFile, $unFile)) { if (Test-Path -LiteralPath $f) { $r.Stamp += [string]([System.IO.File]::GetLastWriteTimeUtc($f).Ticks) + ';' } else { $r.Stamp += '-;' } }
+		if (Test-Path -LiteralPath $listFile) { $r.List = @((Get-Content -LiteralPath $listFile -Raw -Encoding UTF8 | ConvertFrom-Json).trophies) }
+		if (Test-Path -LiteralPath $unFile) {
+			$j = Get-Content -LiteralPath $unFile -Raw -Encoding UTF8 | ConvertFrom-Json
+			if ($j.unlocked) { foreach ($p in $j.unlocked.PSObject.Properties) { $r.Un[[string]$p.Name] = [long]$p.Value } }
+		}
+		$r.Total = $r.List.Count
 		$all = 0; $got = 0
-		foreach ($t in $list) { $p = $trophyPts[[string]$t.grade]; if (-not $p) { $p = 15 }; $all += $p; if ($un.ContainsKey([string]$t.id)) { $got += $p } }
+		foreach ($t in $r.List) {
+			$g = [string]$t.grade; $p = $trophyPts[$g]; if (-not $p) { $p = 15 }
+			$all += $p; $r.All[$g] = 1 + [int]$r.All[$g]
+			if ($r.Un.ContainsKey([string]$t.id)) { $got += $p; $r.NGot++; $r.Got[$g] = 1 + [int]$r.Got[$g] }
+		}
 		if ($all -gt 0) { $r.Pct = [math]::Floor(100 * $got / $all) }
 	} catch { }
 	return $r
 }
-$trophyW = 420; $trophyListH = 360
-$btnTrophy = New-Button 'Trophies  v' 24 ($H - 70) $trophyW 46 $false
-$btnTrophy.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Bold)
-$btnTrophy.TextAlign = 'MiddleLeft'
-try {  # (10-27 trofeos) icono de copa dibujado (dorado)
-	$ti = New-Object System.Drawing.Bitmap 30, 30; $tg = [System.Drawing.Graphics]::FromImage($ti); $tg.SmoothingMode = 'AntiAlias'
+# Compatibility: the former summary (in case another part of the launcher uses it).
+function Get-TrophySummary {
+	$d = Get-TrophyData
+	$earned = @($d.List | Where-Object { $d.Un.ContainsKey([string]$_.id) } | Sort-Object { $d.Un[[string]$_.id] })
+	return @{ Earned = $earned; Total = $d.Total; Count = $d.NGot; Pct = $d.Pct }
+}
+
+# ---- type: Cinzel (OFL) next to the launcher; without it, Palatino Linotype / Georgia (Windows' own) ----
+$script:trFontCol = New-Object System.Drawing.Text.PrivateFontCollection
+$script:trCinzel = $null
+foreach ($c in @((Join-Path $root 'cinzel.ttf'), (Join-Path $root 'fonts\cinzel.ttf'))) {
+	if (-not $script:trCinzel -and (Test-Path -LiteralPath $c)) {
+		try { $script:trFontCol.AddFontFile($c); if ($script:trFontCol.Families.Count -gt 0) { $script:trCinzel = $script:trFontCol.Families[0] } } catch { }
+	}
+}
+function New-TrFont([string[]]$names, [float]$size, [System.Drawing.FontStyle]$style) {
+	foreach ($n in $names) {
+		try {
+			if ($n -eq '*cinzel') {
+				if ($script:trCinzel) { return (New-Object System.Drawing.Font($script:trCinzel, $size, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)) }
+			} else {
+				$f = New-Object System.Drawing.Font($n, $size, $style, [System.Drawing.GraphicsUnit]::Point)
+				if ($f.Name -eq $n) { return $f }
+				$f.Dispose()
+			}
+		} catch { }
+	}
+	return (New-Object System.Drawing.Font('Segoe UI', $size, $style))
+}
+$trDisplay = @('*cinzel', 'Palatino Linotype', 'Georgia', 'Times New Roman')
+$trBook    = @('Palatino Linotype', 'Georgia', 'Times New Roman')
+$trF = @{
+	Title = New-TrFont $trDisplay 20 ([System.Drawing.FontStyle]::Regular)
+	Pct   = New-TrFont $trDisplay 22 ([System.Drawing.FontStyle]::Regular)
+	Name  = New-TrFont $trDisplay 12.5 ([System.Drawing.FontStyle]::Regular)
+	Grade = New-TrFont $trDisplay 8 ([System.Drawing.FontStyle]::Regular)
+	Chip  = New-TrFont $trDisplay 8.5 ([System.Drawing.FontStyle]::Regular)
+	Tab   = New-TrFont $trDisplay 12.5 ([System.Drawing.FontStyle]::Regular)
+	Body  = New-TrFont $trBook 11 ([System.Drawing.FontStyle]::Regular)
+	Date  = New-TrFont $trBook 9.5 ([System.Drawing.FontStyle]::Italic)
+	Small = New-TrFont $trBook 10 ([System.Drawing.FontStyle]::Regular)
+	Mark  = New-TrFont $trDisplay 20 ([System.Drawing.FontStyle]::Regular)
+}
+$trC = @{
+	Bone    = [System.Drawing.Color]::FromArgb(234, 224, 202)
+	BoneDim = [System.Drawing.Color]::FromArgb(176, 166, 146)
+	Gold    = [System.Drawing.Color]::FromArgb(222, 196, 140)
+	GoldHi  = [System.Drawing.Color]::FromArgb(246, 222, 160)
+	GoldLo  = [System.Drawing.Color]::FromArgb(138, 110, 62)
+	Ash     = [System.Drawing.Color]::FromArgb(122, 116, 106)
+	AshDim  = [System.Drawing.Color]::FromArgb(92, 88, 80)
+}
+$script:trFmt = [System.Drawing.StringFormat]::GenericTypographic.Clone()
+$script:trFmt.FormatFlags = $script:trFmt.FormatFlags -bor [System.Drawing.StringFormatFlags]::MeasureTrailingSpaces
+function Get-TrTrackedWidth($g, [string]$s, $font, [float]$track) {
+	$w = 0.0
+	foreach ($ch in $s.ToCharArray()) { $w += $g.MeasureString([string]$ch, $font, 2000, $script:trFmt).Width + $track }
+	return ($w - $track)
+}
+function Write-TrTracked($g, [string]$s, $font, $brush, [float]$x, [float]$y, [float]$track) {
+	# Letter-spaced capitals (GDI+ has no tracking): letter by letter. Only into cached bitmaps.
+	foreach ($ch in $s.ToCharArray()) {
+		$cs = [string]$ch
+		$g.DrawString($cs, $font, $brush, $x, $y, $script:trFmt)
+		$x += $g.MeasureString($cs, $font, 2000, $script:trFmt).Width + $track
+	}
+}
+function Get-TrCapText([string]$s) { return $s.ToUpper() }
+function New-TrRect($x, $y, $w, $h) { return (New-Object System.Drawing.Rectangle([int]$x, [int]$y, [int]$w, [int]$h)) }
+function New-TrGem($g, $color, [float]$cx, [float]$cy, [float]$r) {
+	$pts = [System.Drawing.PointF[]]@((New-Object System.Drawing.PointF($cx, ($cy - $r))), (New-Object System.Drawing.PointF(($cx + $r * 0.72), $cy)), (New-Object System.Drawing.PointF($cx, ($cy + $r))), (New-Object System.Drawing.PointF(($cx - $r * 0.72), $cy)))
+	$b = New-Object System.Drawing.SolidBrush($color); $g.FillPolygon($b, $pts); $b.Dispose()
+	$hl = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(110, 255, 255, 255))
+	$g.FillPolygon($hl, [System.Drawing.PointF[]]@($pts[0], $pts[1], (New-Object System.Drawing.PointF($cx, $cy)))); $hl.Dispose()
+}
+# What is behind (the window's background picture): the panel is drawn as glass over it, without flicker.
+function Get-TrUnder([int]$x, [int]$y, [int]$w, [int]$h) {
+	$b = New-Object System.Drawing.Bitmap($w, $h)
+	$g = [System.Drawing.Graphics]::FromImage($b)
+	$g.Clear($form.BackColor)
+	if ($form.BackgroundImage) { $g.DrawImage($form.BackgroundImage, (New-TrRect 0 0 $w $h), (New-TrRect $x $y $w $h), [System.Drawing.GraphicsUnit]::Pixel) }
+	$g.Dispose()
+	return $b
+}
+# Gold cup (the former button's).
+$trCup = $null
+try {
+	$trCup = New-Object System.Drawing.Bitmap 30, 30; $tg = [System.Drawing.Graphics]::FromImage($trCup); $tg.SmoothingMode = 'AntiAlias'
 	$tb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(236, 196, 72)); $tp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(236, 196, 72)), 2.4
 	$tg.FillPie($tb, 7, -6, 16, 22, 0, 180); $tg.DrawArc($tp, 2, 2, 8, 9, 90, 180); $tg.DrawArc($tp, 20, 2, 8, 9, 270, 180)
 	$tg.FillRectangle($tb, 13, 15, 4, 7); $tg.FillRectangle($tb, 9, 22, 12, 3); $tg.FillRectangle($tb, 7, 25, 16, 3)
-	$tg.Dispose(); $btnTrophy.Image = $ti; $btnTrophy.ImageAlign = 'MiddleLeft'; $btnTrophy.TextImageRelation = 'ImageBeforeText'
+	$tg.Dispose(); $tb.Dispose(); $tp.Dispose()
 } catch { }
-$form.Controls.Add($btnTrophy)
-$gTrophy = New-Object System.Windows.Forms.Panel
-$gTrophy.Location = New-Object System.Drawing.Point(24, ($H - 76 - $trophyListH)); $gTrophy.Size = New-Object System.Drawing.Size($trophyW, $trophyListH)
-$gTrophy.BackColor = [System.Drawing.Color]::FromArgb(14, 16, 22); $gTrophy.Visible = $false
-$form.Controls.Add($gTrophy)
-$lbTrophyPct = New-Label '' $smallFont $gold 10 6 ($trophyW - 20) 26
-$gTrophy.Controls.Add($lbTrophyPct)
-$pbTrophy = New-Object System.Windows.Forms.ProgressBar
-$pbTrophy.Location = New-Object System.Drawing.Point(10, 34); $pbTrophy.Size = New-Object System.Drawing.Size(($trophyW - 20), 8); $pbTrophy.Maximum = 100
-$gTrophy.Controls.Add($pbTrophy)
-$lvTrophy = New-Object System.Windows.Forms.ListView
-$lvTrophy.View = 'Details'; $lvTrophy.FullRowSelect = $true; $lvTrophy.HeaderStyle = 'Nonclickable'; $lvTrophy.BorderStyle = 'None'
-$lvTrophy.Location = New-Object System.Drawing.Point(10, 50); $lvTrophy.Size = New-Object System.Drawing.Size(($trophyW - 20), ($trophyListH - 60))
-$lvTrophy.BackColor = [System.Drawing.Color]::FromArgb(22, 25, 33); $lvTrophy.ForeColor = $ink; $lvTrophy.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-[void]$lvTrophy.Columns.Add('Grade', 90); [void]$lvTrophy.Columns.Add('Name', ($trophyW - 20 - 90 - 22))
-$gTrophy.Controls.Add($lvTrophy)
-function Update-TrophySection([bool]$open) {
-	$s = Get-TrophySummary
-	$arrow = if ($open) { '^' } else { 'v' }
-	$btnTrophy.Text = if ($s.Total -gt 0) { 'Trophies   ' + $s.Count + ' / ' + $s.Total + '   (' + $s.Pct + '%)  ' + $arrow } else { 'Trophies  ' + $arrow }
-	$gTrophy.Visible = $open
-	if (-not $open) { return }
-	$lbTrophyPct.Text = if ($s.Total -gt 0) { '' + $s.Pct + '% complete   -   ' + $s.Count + ' / ' + $s.Total } else { 'No trophies yet (they appear as you play)' }
-	$pbTrophy.Value = [math]::Max(0, [math]::Min(100, $s.Pct))
-	$lvTrophy.BeginUpdate(); $lvTrophy.Items.Clear()
-	foreach ($t in $s.Earned) {
-		$g = [string]$t.grade; $gt = $trophyGrades[$g]; if (-not $gt) { $gt = [string]$t.grade_text }
-		$it = New-Object System.Windows.Forms.ListViewItem($gt)
-		[void]$it.SubItems.Add([string]$t.name)
-		$it.UseItemStyleForSubItems = $false
-		if ($trophyColors[$g]) { $it.ForeColor = $trophyColors[$g] }
-		$it.SubItems[1].ForeColor = $ink
-		$it.ToolTipText = [string]$t.detail
-		[void]$lvTrophy.Items.Add($it)
-	}
-	$lvTrophy.ShowItemToolTips = $true
-	$lvTrophy.EndUpdate()
-	$gTrophy.BringToFront(); $btnTrophy.BringToFront()
+
+# ---- state ----
+$trophyW = 420; $trophyTabH = 46
+$trDropW = 520; $trDropH = [int][math]::Max(300, [math]::Min(700, $H - 76 - 40))
+$tr = @{
+	Open = 0.0; OpenT = 0.0; T0 = 0.0; Last = 0.0; Filter = 0
+	Data = $null; Stamp = $null; Rows = @(); View = @(); Layout = @(); Chips = @()
+	Scroll = 0.0; ScrollT = 0.0; ContentH = 0.0
+	HeadH = 150; ListX = 12; RowW = ($trDropW - 24 - 10); RowH0 = 78; Gap = 6
+	Under = $null; Glass = $null; Head = $null; TabUnder = $null
+	Icons = @{}; TabHov = 0.0; TabHovT = 0.0; Busy = $false
+	SW = [System.Diagnostics.Stopwatch]::StartNew()
+	CM = (New-Object System.Drawing.Imaging.ColorMatrix); IA = (New-Object System.Drawing.Imaging.ImageAttributes)
+	MG = $null; MB = $null
 }
-$btnTrophy.Add_Click({ Update-TrophySection (-not $gTrophy.Visible) })
-try { Update-TrophySection $false } catch { }
+$tr.MB = New-Object System.Drawing.Bitmap 4, 4; $tr.MG = [System.Drawing.Graphics]::FromImage($tr.MB)
+$tr.MG.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+$tr.ListY = $tr.HeadH
+$tr.ListH = $trDropH - $tr.HeadH - 14
+function Get-TrEase([double]$x) { if ($x -le 0) { return 0.0 }; if ($x -ge 1) { return 1.0 }; return (1.0 - [math]::Pow(1.0 - $x, 3)) }
+function Get-TrEaseIO([double]$x) { if ($x -le 0) { return 0.0 }; if ($x -ge 1) { return 1.0 }; if ($x -lt 0.5) { return 4 * $x * $x * $x }; return (1 - [math]::Pow(-2 * $x + 2, 3) / 2) }
+
+# ---- icons: read from disk only when their row is first drawn (54 px, grey while not earned) ----
+function Get-TrIcon([int]$id, [bool]$earned) {
+	$key = '' + $id + '|' + $earned
+	if ($tr.Icons.ContainsKey($key)) { return $tr.Icons[$key] }
+	$res = $null
+	$names = @(('trop{0:D3}.png' -f $id), ('trop{0}.png' -f $id), ('trop{0:D4}.png' -f $id))
+	if ($id -eq 100) { $names += 'trop001.png' }  # (the port's own trophy uses trophy 1's icon, as in game)
+	foreach ($n in $names) {
+		$p = Join-Path $trophyDir ('trophy-icons\' + $n)
+		if ($res -or -not (Test-Path -LiteralPath $p)) { continue }
+		try {
+			$ms = New-Object System.IO.MemoryStream(, [System.IO.File]::ReadAllBytes($p))
+			$src = [System.Drawing.Image]::FromStream($ms)
+			$b = New-Object System.Drawing.Bitmap 54, 54
+			$g = [System.Drawing.Graphics]::FromImage($b)
+			$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic; $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+			if ($earned) { $g.DrawImage($src, (New-TrRect 0 0 54 54)) }
+			else {
+				$cm = New-Object System.Drawing.Imaging.ColorMatrix; $k = 0.42
+				$cm.Matrix00 = 0.30 * $k; $cm.Matrix01 = 0.30 * $k; $cm.Matrix02 = 0.30 * $k
+				$cm.Matrix10 = 0.59 * $k; $cm.Matrix11 = 0.59 * $k; $cm.Matrix12 = 0.59 * $k
+				$cm.Matrix20 = 0.11 * $k; $cm.Matrix21 = 0.11 * $k; $cm.Matrix22 = 0.11 * $k
+				$ia = New-Object System.Drawing.Imaging.ImageAttributes; $ia.SetColorMatrix($cm)
+				$g.DrawImage($src, (New-TrRect 0 0 54 54), 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+				$ia.Dispose()
+			}
+			$g.Dispose(); $src.Dispose(); $ms.Dispose()
+			$res = $b
+		} catch { }
+	}
+	$tr.Icons[$key] = $res
+	return $res
+}
+
+# ---- the drop-down's glass background (once) ----
+function Build-TrGlass {
+	$w = $trDropW; $h = $trDropH
+	if ($tr.Under) { $tr.Under.Dispose() }; if ($tr.Glass) { $tr.Glass.Dispose() }
+	$tr.Under = Get-TrUnder $pTrophy.Left $pTrophy.Top $w $h
+	$b = New-Object System.Drawing.Bitmap($w, $h)
+	$g = [System.Drawing.Graphics]::FromImage($b)
+	$g.DrawImageUnscaled($tr.Under, 0, 0)
+	$lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect 0 0 $w $h), [System.Drawing.Color]::FromArgb(222, 12, 11, 10), [System.Drawing.Color]::FromArgb(238, 6, 6, 8), [single]90)
+	$g.FillRectangle($lg, 0, 0, $w, $h); $lg.Dispose()
+	# a warm glow at the top (as candlelight) and darker below
+	$top = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect 0 0 $w 160), [System.Drawing.Color]::FromArgb(34, 200, 160, 90), [System.Drawing.Color]::FromArgb(0, 200, 160, 90), [single]90)
+	$g.FillRectangle($top, 0, 0, $w, 160); $top.Dispose()
+	$p1 = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, $trC.Gold)); $g.DrawRectangle($p1, 0, 0, ($w - 1), ($h - 1)); $p1.Dispose()
+	$p2 = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(34, $trC.Gold)); $g.DrawRectangle($p2, 4, 4, ($w - 9), ($h - 9)); $p2.Dispose()
+	# corners: thin brackets and a lozenge
+	$g.SmoothingMode = 'AntiAlias'
+	$pc = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(190, $trC.Gold), 1.4)
+	foreach ($cn in @(@(0, 0, 1, 1), @(($w - 1), 0, -1, 1), @(0, ($h - 1), 1, -1), @(($w - 1), ($h - 1), -1, -1))) {
+		$x = $cn[0]; $y = $cn[1]; $sx = $cn[2]; $sy = $cn[3]
+		$g.DrawLine($pc, [float]$x, [float]($y + $sy * 1), [float]($x + $sx * 22), [float]($y + $sy * 1))
+		$g.DrawLine($pc, [float]($x + $sx * 1), [float]$y, [float]($x + $sx * 1), [float]($y + $sy * 22))
+		New-TrGem $g ([System.Drawing.Color]::FromArgb(200, $trC.Gold)) ([float]($x + $sx * 9)) ([float]($y + $sy * 9)) 3.2
+	}
+	$pc.Dispose(); $g.Dispose()
+	$tr.Glass = $b
+}
+
+# ---- header: title, %, bar, grades and filters (remade only when the data or the filter change) ----
+function Build-TrHead {
+	$d = $tr.Data; $w = $trDropW; $h = $tr.HeadH
+	if ($tr.Head) { $tr.Head.Dispose() }
+	$b = New-Object System.Drawing.Bitmap($w, $h)
+	$g = [System.Drawing.Graphics]::FromImage($b)
+	$g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+	$bGoldHi = New-Object System.Drawing.SolidBrush($trC.GoldHi); $bGold = New-Object System.Drawing.SolidBrush($trC.Gold)
+	$bBone = New-Object System.Drawing.SolidBrush($trC.BoneDim); $bAsh = New-Object System.Drawing.SolidBrush($trC.Ash)
+	# title with a soft shadow
+	$sh = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 0, 0, 0))
+	Write-TrTracked $g (Get-TrCapText $trTxt.Title) $trF.Title $sh 25 21 5
+	Write-TrTracked $g (Get-TrCapText $trTxt.Title) $trF.Title $bGoldHi 24 19 5
+	$sub = if ($d.Total -gt 0) { $trTxt.Of -f $d.NGot, $d.Total } else { $trTxt.None }
+	$g.DrawString($sub, $trF.Date, $bBone, [float]25, [float]56)
+	if ($d.Total -gt 0) {
+		$pt = '' + $d.Pct + '%'
+		$pw = Get-TrTrackedWidth $g $pt $trF.Pct 1.5
+		Write-TrTracked $g $pt $trF.Pct $sh ([float]($w - 24 - $pw + 1)) 20 1.5
+		Write-TrTracked $g $pt $trF.Pct $bGold ([float]($w - 24 - $pw)) 18 1.5
+		# progress bar: a thin thread, a gold fill and a lozenge at its end
+		$x0 = 24; $x1 = $w - 24; $y = 84
+		$pt1 = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(90, $trC.Ash)); $g.DrawLine($pt1, $x0, $y, $x1, $y); $pt1.Dispose()
+		$fx = $x0 + ($x1 - $x0) * [math]::Max(0, [math]::Min(100, $d.Pct)) / 100.0
+		if ($fx -gt $x0 + 1) {
+			$lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.RectangleF($x0, ($y - 2), [float]($fx - $x0 + 1), 4)), $trC.GoldLo, $trC.GoldHi, [single]0)
+			$g.FillRectangle($lg, [float]$x0, [float]($y - 1.5), [float]($fx - $x0), [float]3); $lg.Dispose()
+			$glow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(40, $trC.GoldHi)); $g.FillEllipse($glow, [float]($fx - 10), [float]($y - 10), [float]20, [float]20); $glow.Dispose()
+		}
+		New-TrGem $g $trC.GoldHi ([float]$fx) ([float]$y) 5
+		# grades: earned / total
+		$x = 26
+		foreach ($k in @('P', 'G', 'S', 'B')) {
+			if (-not $d.All[$k]) { continue }
+			New-TrGem $g $trophyColors[$k] ([float]($x + 4)) ([float]106) 5.5
+			$t = '' + [int]$d.Got[$k] + ' / ' + [int]$d.All[$k]
+			$g.DrawString($t, $trF.Small, $bBone, [float]($x + 13), [float]97)
+			$x += 26 + [int]$g.MeasureString($t, $trF.Small).Width + 12
+		}
+	}
+	# filters on the right: ALL / EARNED / PENDING
+	$chips = @(); $x = $w - 24
+	for ($i = $trTxt.Chips.Count - 1; $i -ge 0; $i--) {
+		$s = Get-TrCapText $trTxt.Chips[$i]
+		$cw = Get-TrTrackedWidth $g $s $trF.Chip 1.6
+		$x -= $cw
+		$sel = ($i -eq $tr.Filter)
+		Write-TrTracked $g $s $trF.Chip $(if ($sel) { $bGoldHi } else { $bAsh }) ([float]$x) 122 1.6
+		if ($sel) { $pu = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, $trC.Gold)); $g.DrawLine($pu, [float]$x, [float]138, [float]($x + $cw), [float]138); $pu.Dispose() }
+		$chips += @{ F = $i; R = (New-TrRect ($x - 6) 116 ($cw + 12) 28) }
+		$x -= 22
+	}
+	$tr.Chips = $chips
+	# divider with a central lozenge, fading at the sides
+	$y = $h - 4
+	$lgL = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect 16 ($y - 1) ($w / 2 - 16) 2), [System.Drawing.Color]::FromArgb(0, $trC.Gold), [System.Drawing.Color]::FromArgb(150, $trC.Gold), [single]0)
+	$g.FillRectangle($lgL, [float]16, [float]$y, [float]($w / 2 - 16), [float]1); $lgL.Dispose()
+	$lgR = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect ($w / 2) ($y - 1) ($w / 2 - 16) 2), [System.Drawing.Color]::FromArgb(150, $trC.Gold), [System.Drawing.Color]::FromArgb(0, $trC.Gold), [single]0)
+	$g.FillRectangle($lgR, [float]($w / 2), [float]$y, [float]($w / 2 - 16), [float]1); $lgR.Dispose()
+	New-TrGem $g $trC.Gold ([float]($w / 2)) ([float]($y + 0.5)) 3.5
+	foreach ($o in @($bGoldHi, $bGold, $bBone, $bAsh, $sh)) { $o.Dispose() }
+	$g.Dispose()
+	$tr.Head = $b
+}
+
+# ---- rows ----
+function Get-TrDateText([long]$t) {
+	if ($t -le 0) { return $trTxt.NoDate }
+	try {
+		$c = [System.Globalization.CultureInfo]::GetCultureInfo($trTxt.Culture)
+		$dt = [System.DateTimeOffset]::FromUnixTimeSeconds($t).LocalDateTime
+		return ($trTxt.Earned + ' ' + $dt.ToString($trTxt.DateFmt, $c))
+	} catch { return $trTxt.NoDate }
+}
+function New-TrRows {
+	foreach ($r in $tr.Rows) { if ($r.Bmp) { $r.Bmp.Dispose() } }
+	$rows = @()
+	foreach ($t in $tr.Data.List) {
+		$id = [int]$t.id; $k = [string]$t.id
+		$earned = $tr.Data.Un.ContainsKey($k)
+		$time = if ($earned) { [long]$tr.Data.Un[$k] } else { [long]0 }
+		$rows += @{ Id = $id; T = $t; Earned = $earned; Time = $time; Bmp = $null; H1 = $tr.RowH0; Exp = 0.0; ExpT = 0.0; Hov = 0.0; HovT = 0.0; Idx = 0 }
+	}
+	$tr.Rows = $rows
+	Set-TrView
+}
+function Set-TrView {
+	# Order: earned (most recent first), then the pending ones by number.
+	$e = @($tr.Rows | Where-Object { $_.Earned } | Sort-Object -Property @{ Expression = { $_.Time }; Descending = $true }, @{ Expression = { $_.Id }; Ascending = $true })
+	$p = @($tr.Rows | Where-Object { -not $_.Earned } | Sort-Object -Property @{ Expression = { $_.Id } })
+	$v = @(switch ($tr.Filter) { 1 { $e } 2 { $p } default { @($e) + @($p) } })
+	$i = 0; foreach ($r in $v) { $r.Idx = $i; $r.Exp = 0.0; $r.ExpT = 0.0; $r.Hov = 0.0; $r.HovT = 0.0; $i++ }
+	$tr.View = @($v)
+	$tr.Scroll = 0.0; $tr.ScrollT = 0.0
+}
+function Build-TrRow($r) {
+	$t = $r.T; $w = $tr.RowW; $h0 = $tr.RowH0
+	$g0 = $tr.MG
+	$hid = ([bool]$t.hidden) -and -not $r.Earned
+	$desc = if ($hid) { $trTxt.HiddenDesc } else { [string]$t.detail }
+	$tx = 84; $tw = $w - $tx - 18
+	$dh = [int][math]::Ceiling($g0.MeasureString($desc, $trF.Body, $tw).Height)
+	$h1 = [int]($h0 + 12 + $dh + 16)
+	$b = New-Object System.Drawing.Bitmap($w, $h1)
+	$g = [System.Drawing.Graphics]::FromImage($b)
+	$g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+	$g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+	$gc = $trophyColors[[string]$t.grade]; if (-not $gc) { $gc = $trC.Gold }
+	# card: veil, edge and an accent in the grade's colour
+	$veil = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect 0 0 $w $h1), [System.Drawing.Color]::FromArgb($(if ($r.Earned) { 30 } else { 16 }), 255, 236, 200), [System.Drawing.Color]::FromArgb(4, 255, 236, 200), [single]0)
+	$g.FillRectangle($veil, 0, 0, $w, $h1); $veil.Dispose()
+	$edge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb($(if ($r.Earned) { 46 } else { 22 }), $trC.Gold)); $g.DrawRectangle($edge, 0, 0, ($w - 1), ($h1 - 1)); $edge.Dispose()
+	if ($r.Earned) { $ab = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(210, $gc)); $g.FillRectangle($ab, 0, 0, 2, $h1); $ab.Dispose() }
+	# framed icon
+	$ix = 14; $iy = 12
+	$fr = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb($(if ($r.Earned) { 170 } else { 70 }), $(if ($r.Earned) { $gc } else { $trC.Ash })))
+	$g.DrawRectangle($fr, ($ix - 2), ($iy - 2), 57, 57); $fr.Dispose()
+	$ico = if ($hid) { $null } else { Get-TrIcon $r.Id $r.Earned }
+	if ($ico) { $g.DrawImageUnscaled($ico, $ix, $iy) }
+	else {
+		$bk = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 20, 18, 16)); $g.FillRectangle($bk, $ix, $iy, 54, 54); $bk.Dispose()
+		$rp = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110, $trC.Gold), 1.2); $g.DrawEllipse($rp, ($ix + 10), ($iy + 10), 34, 34); $rp.Dispose()
+		if ($hid) {
+			$qb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(170, $trC.Gold)); $q = '?'
+			$qs = $g.MeasureString($q, $trF.Mark); $g.DrawString($q, $trF.Mark, $qb, [float]($ix + 27 - $qs.Width / 2), [float]($iy + 27 - $qs.Height / 2)); $qb.Dispose()
+		} elseif ($trCup) {
+			$ia = New-Object System.Drawing.Imaging.ImageAttributes; $cm = New-Object System.Drawing.Imaging.ColorMatrix; $cm.Matrix33 = $(if ($r.Earned) { 1.0 } else { 0.4 }); $ia.SetColorMatrix($cm)
+			$g.DrawImage($trCup, (New-TrRect ($ix + 12) ($iy + 12) 30 30), 0, 0, 30, 30, [System.Drawing.GraphicsUnit]::Pixel, $ia); $ia.Dispose()
+		}
+	}
+	if (-not $r.Earned) {
+		# small padlock over the icon
+		$lx = $ix + 40; $ly = $iy + 38
+		$lb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 22, 20, 18)); $g.FillRectangle($lb, ($lx - 3), ($ly - 7), 18, 19); $lb.Dispose()
+		$lp = New-Object System.Drawing.Pen($trC.Ash, 1.4); $g.DrawArc($lp, ($lx + 1), ($ly - 5), 10, 10, 180, 180)
+		$lf = New-Object System.Drawing.SolidBrush($trC.Ash); $g.FillRectangle($lf, $lx, $ly, 12, 9); $lf.Dispose(); $lp.Dispose()
+	}
+	# grade at the top right (lozenge + spaced name)
+	$gname = $trophyGrades[[string]$t.grade]; if (-not $gname) { $gname = [string]$t.grade_text }
+	$gs = Get-TrCapText $gname
+	$gw = Get-TrTrackedWidth $g $gs $trF.Grade 1.8
+	$gb = New-Object System.Drawing.SolidBrush($(if ($r.Earned) { $gc } else { $trC.AshDim }))
+	Write-TrTracked $g $gs $trF.Grade $gb ([float]($w - 16 - $gw)) 15 1.8
+	New-TrGem $g $(if ($r.Earned) { $gc } else { $trC.AshDim }) ([float]($w - 16 - $gw - 10)) ([float]21) 4.5
+	$gb.Dispose()
+	# name (cut with ... when too long) and date
+	$name = if ($hid) { $trTxt.Hidden } else { [string]$t.name }
+	$sf = New-Object System.Drawing.StringFormat; $sf.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter; $sf.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
+	$nb = New-Object System.Drawing.SolidBrush($(if ($r.Earned) { $trC.Bone } else { $trC.Ash }))
+	$g.DrawString($name, $trF.Name, $nb, (New-Object System.Drawing.RectangleF([float]$tx, [float]12, [float]($w - $tx - 28 - $gw), [float]26)), $sf); $nb.Dispose(); $sf.Dispose()
+	$dl = if ($r.Earned) { Get-TrDateText $r.Time } elseif ($hid) { $trTxt.HiddenLine } else { $trTxt.NotYet }
+	$db = New-Object System.Drawing.SolidBrush($(if ($r.Earned) { [System.Drawing.Color]::FromArgb(206, 182, 128) } else { $trC.AshDim }))
+	$g.DrawString($dl, $trF.Date, $db, [float]$tx, [float]43); $db.Dispose()
+	# details (shown when the row unfolds)
+	$sp = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect $tx ($h0 - 1) $tw 2), [System.Drawing.Color]::FromArgb(110, $trC.Gold), [System.Drawing.Color]::FromArgb(0, $trC.Gold), [single]0)
+	$g.FillRectangle($sp, $tx, ($h0 - 1), $tw, 1); $sp.Dispose()
+	$bb = New-Object System.Drawing.SolidBrush($(if ($r.Earned) { $trC.BoneDim } else { $trC.Ash }))
+	$g.DrawString($desc, $trF.Body, $bb, (New-Object System.Drawing.RectangleF([float]$tx, [float]($h0 + 10), [float]$tw, [float]($dh + 4)))); $bb.Dispose()
+	$g.Dispose()
+	$r.Bmp = $b; $r.H1 = $h1
+}
+function Get-TrRowH($r, [double]$e) { return ($tr.RowH0 + ($r.H1 - $tr.RowH0) * (Get-TrEaseIO $e)) }
+function Get-TrMaxScroll {
+	$hh = 0.0; foreach ($r in $tr.View) { $hh += (Get-TrRowH $r $r.ExpT) + $tr.Gap }
+	return [math]::Max(0.0, $hh - $tr.ListH + 4)
+}
+
+# ---- drawing the drop-down (every animation frame; it only copies bitmaps already made) ----
+function Show-TrFrame($g) {
+	$w = $trDropW; $h = $trDropH
+	$o = Get-TrEase $tr.Open
+	if ($tr.Under) { $g.DrawImageUnscaled($tr.Under, 0, 0) }
+	$rev = [int][math]::Round($h * $o)
+	if ($rev -le 0 -or -not $tr.Glass) { return }
+	$top = $h - $rev
+	$g.SetClip((New-TrRect 0 $top $w $rev))
+	$g.DrawImageUnscaled($tr.Glass, 0, 0)
+	if ($tr.Head) { $g.DrawImageUnscaled($tr.Head, 0, 0) }
+	$now = $tr.SW.Elapsed.TotalMilliseconds - $tr.T0
+	$lx = $tr.ListX; $ly = $tr.ListY; $lh = $tr.ListH
+	$g.SetClip((New-TrRect 0 ([math]::Max($top, $ly)) $w ([math]::Max(0, $ly + $lh - [math]::Max($top, $ly)))))
+	$layout = @()
+	if ($tr.View.Count -eq 0) {
+		$m = if ($tr.Data.Total -gt 0) { $trTxt.Empty } else { $trTxt.None }
+		$mb = New-Object System.Drawing.SolidBrush($trC.Ash); $sf = New-Object System.Drawing.StringFormat; $sf.Alignment = 'Center'
+		$g.DrawString($m, $trF.Date, $mb, (New-Object System.Drawing.RectangleF(20, [float]($ly + 40), [float]($w - 40), 60)), $sf); $mb.Dispose(); $sf.Dispose()
+	}
+	$y = [int][math]::Round($ly + 4 - $tr.Scroll)
+	foreach ($r in $tr.View) {
+		$rh = [int][math]::Floor((Get-TrRowH $r $r.Exp))
+		if ($y + $rh -ge $ly -and $y -le $ly + $lh) {
+			if (-not $r.Bmp) { Build-TrRow $r }
+			# staggered entrance: each row comes 45 ms after the previous one, sliding in from the left
+			$born = 120 + 45 * [math]::Min($r.Idx, 14)
+			$a = Get-TrEase (($now - $born) / 380.0)
+			if ($a -gt 0.002) {
+				$x = $lx + [int]((1 - $a) * 28)
+				$dst = New-TrRect $x $y $tr.RowW $rh
+				$src = New-TrRect 0 0 $tr.RowW $rh
+				if ($a -lt 0.995) {
+					$tr.CM.Matrix33 = [single]$a; $tr.IA.SetColorMatrix($tr.CM)
+					$g.DrawImage($r.Bmp, $dst, 0, 0, $tr.RowW, $rh, [System.Drawing.GraphicsUnit]::Pixel, $tr.IA)
+				} else { $g.DrawImage($r.Bmp, $dst, $src, [System.Drawing.GraphicsUnit]::Pixel) }
+				# hover glow: gold light from the left, edge and bar
+				if ($r.Hov -gt 0.01) {
+					$hv = $r.Hov * $a
+					$lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect $x $y $tr.RowW ([math]::Max(1, $rh))), [System.Drawing.Color]::FromArgb([int](58 * $hv), 236, 196, 120), [System.Drawing.Color]::FromArgb(0, 236, 196, 120), [single]0)
+					$g.FillRectangle($lg, [float]$x, [float]$y, [float]$tr.RowW, [float]$rh); $lg.Dispose()
+					$hp = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb([int](150 * $hv), $trC.Gold)); $g.DrawRectangle($hp, [float]$x, [float]$y, [float]($tr.RowW - 1), [float]($rh - 1)); $hp.Dispose()
+					$hb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb([int](235 * $hv), $trC.GoldHi)); $g.FillRectangle($hb, [float]$x, [float]$y, [float]3, [float]$rh); $hb.Dispose()
+				}
+				# unfold arrow (turns as the row opens)
+				$e = Get-TrEaseIO $r.Exp; $cx = $x + $tr.RowW - 20; $cy = $y + 52; $d = 3.0 * (1 - 2 * $e)
+				$ap = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb([int]((90 + 140 * [math]::Max($r.Hov, $e)) * $a), $trC.Gold), 1.5)
+				$g.SmoothingMode = 'AntiAlias'
+				$g.DrawLines($ap, [System.Drawing.PointF[]]@((New-Object System.Drawing.PointF([float]($cx - 5), [float]($cy - $d))), (New-Object System.Drawing.PointF([float]$cx, [float]($cy + $d))), (New-Object System.Drawing.PointF([float]($cx + 5), [float]($cy - $d)))))
+				$g.SmoothingMode = 'Default'; $ap.Dispose()
+			}
+		}
+		$layout += @{ R = $r; Y = $y; H = $rh }
+		$y += $rh + $tr.Gap
+	}
+	$tr.Layout = $layout
+	$tr.ContentH = $y + $tr.Scroll - $ly
+	# thin scroll bar
+	$g.SetClip((New-TrRect 0 $top $w $rev))
+	if ($tr.ContentH -gt $lh + 4) {
+		$tx = $w - 13; $th = [math]::Max(30, $lh * $lh / $tr.ContentH)
+		$ms = [math]::Max(1.0, $tr.ContentH - $lh); $ty = $ly + ($lh - $th) * [math]::Min(1.0, $tr.Scroll / $ms)
+		$tb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(40, $trC.Gold)); $g.FillRectangle($tb, $tx, $ly, 2, $lh); $tb.Dispose()
+		$tt = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(170, $trC.Gold)); $g.FillRectangle($tt, [float]($tx - 1), [float]$ty, [float]4, [float]$th); $tt.Dispose()
+	}
+	# gold edge along the unfolding border
+	if ($o -lt 0.999) {
+		$ep = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb([int](230 * (1 - $o * 0.6)), $trC.GoldHi)); $g.DrawLine($ep, 0, $top, $w, $top); $ep.Dispose()
+	}
+	$g.ResetClip()
+}
+
+# ---- tab (bottom left) ----
+function Show-TrTab($g) {
+	$w = $pTrophyTab.Width; $h = $pTrophyTab.Height
+	if (-not $tr.TabUnder) { $tr.TabUnder = Get-TrUnder $pTrophyTab.Left $pTrophyTab.Top $w $h }
+	$g.DrawImageUnscaled($tr.TabUnder, 0, 0)
+	$hv = [math]::Max($tr.TabHov, (Get-TrEase $tr.Open))
+	$bg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(205, 12, 11, 10)); $g.FillRectangle($bg, 0, 0, $w, $h); $bg.Dispose()
+	if ($hv -gt 0.01) {
+		$lg = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-TrRect 0 0 $w $h), [System.Drawing.Color]::FromArgb([int](52 * $hv), 236, 196, 120), [System.Drawing.Color]::FromArgb(0, 236, 196, 120), [single]0)
+		$g.FillRectangle($lg, 0, 0, $w, $h); $lg.Dispose()
+	}
+	$bp = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb([int](90 + 140 * $hv), $trC.Gold)); $g.DrawRectangle($bp, 0, 0, ($w - 1), ($h - 1)); $bp.Dispose()
+	$g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+	if ($trCup) { $g.DrawImage($trCup, 12, 8, 30, 30) }
+	$tb = New-Object System.Drawing.SolidBrush($(if ($hv -gt 0.5) { $trC.GoldHi } else { $trC.Bone }))
+	$cap = Get-TrCapText $trTxt.Title
+	Write-TrTracked $g $cap $trF.Tab $tb 52 13 3; $tb.Dispose()
+	$d = $tr.Data
+	$right = if ($d -and $d.Total -gt 0) { '' + $d.NGot + ' / ' + $d.Total + '   ' + [char]0x00B7 + '   ' + $d.Pct + '%' } else { [string][char]0x2014 }
+	$rb = New-Object System.Drawing.SolidBrush($trC.BoneDim)
+	$rs = $g.MeasureString($right, $trF.Small)
+	$g.DrawString($right, $trF.Small, $rb, [float]($w - 40 - $rs.Width), [float](($h - $rs.Height) / 2)); $rb.Dispose()
+	# arrow: points up (it opens upwards) and turns on opening
+	$e = Get-TrEase $tr.Open; $cx = $w - 22; $cy = $h / 2; $dd = 3.5 * (1 - 2 * $e)
+	$ap = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(220, $trC.Gold), 1.6)
+	$g.DrawLines($ap, [System.Drawing.PointF[]]@((New-Object System.Drawing.PointF([float]($cx - 6), [float]($cy + $dd))), (New-Object System.Drawing.PointF([float]$cx, [float]($cy - $dd))), (New-Object System.Drawing.PointF([float]($cx + 6), [float]($cy + $dd)))))
+	$ap.Dispose()
+}
+
+$pTrophyTab = New-Object System.Windows.Forms.Panel
+$pTrophyTab.Location = New-Object System.Drawing.Point(24, ($H - 70)); $pTrophyTab.Size = New-Object System.Drawing.Size($trophyW, $trophyTabH)
+$pTrophyTab.Cursor = [System.Windows.Forms.Cursors]::Hand
+Set-DoubleBuffer $pTrophyTab
+$form.Controls.Add($pTrophyTab)
+$pTrophy = New-Object System.Windows.Forms.Panel
+$pTrophy.Location = New-Object System.Drawing.Point(24, ($H - 76 - $trDropH)); $pTrophy.Size = New-Object System.Drawing.Size($trDropW, $trDropH)
+$pTrophy.Visible = $false
+Set-DoubleBuffer $pTrophy
+try { [System.Windows.Forms.Control].GetMethod('SetStyle', [System.Reflection.BindingFlags]'Instance,NonPublic').Invoke($pTrophy, @([System.Windows.Forms.ControlStyles]::Selectable, $true)) } catch { }
+$form.Controls.Add($pTrophy)
+# (former names, in case something uses them)
+$btnTrophy = $pTrophyTab; $gTrophy = $pTrophy
+
+$tr.Timer = New-Object System.Windows.Forms.Timer
+$tr.Timer.Interval = 15
+function Step-TrAnim {
+	$now = $tr.SW.Elapsed.TotalMilliseconds
+	$dt = [math]::Min(0.05, [math]::Max(0.001, ($now - $tr.Last) / 1000.0)); $tr.Last = $now
+	$busy = $false; $tabDirty = $false
+	if ($tr.Open -ne $tr.OpenT) {
+		if ($tr.OpenT -gt $tr.Open) { $tr.Open = [math]::Min(1.0, $tr.Open + $dt / 0.30) } else { $tr.Open = [math]::Max(0.0, $tr.Open - $dt / 0.20) }
+		$busy = $true; $tabDirty = $true
+		if ($tr.Open -le 0 -and $tr.OpenT -le 0) { $pTrophy.Visible = $false }
+	}
+	$k = 1.0 - [math]::Exp(-$dt * 16.0)
+	if ([math]::Abs($tr.TabHovT - $tr.TabHov) -gt 0.005) { $tr.TabHov += ($tr.TabHovT - $tr.TabHov) * $k; $busy = $true; $tabDirty = $true } else { $tr.TabHov = $tr.TabHovT }
+	if ($pTrophy.Visible) {
+		$ke = 1.0 - [math]::Exp(-$dt * 9.0)
+		foreach ($r in $tr.View) {
+			if ([math]::Abs($r.HovT - $r.Hov) -gt 0.005) { $r.Hov += ($r.HovT - $r.Hov) * $k; $busy = $true } else { $r.Hov = $r.HovT }
+			if ($r.Exp -ne $r.ExpT) {
+				if ($r.ExpT -gt $r.Exp) { $r.Exp = [math]::Min(1.0, $r.Exp + $dt / 0.32) } else { $r.Exp = [math]::Max(0.0, $r.Exp - $dt / 0.26) }
+				$busy = $true
+			}
+		}
+		$ms = Get-TrMaxScroll; $tr.ScrollT = [math]::Max(0.0, [math]::Min($ms, $tr.ScrollT))
+		if ([math]::Abs($tr.ScrollT - $tr.Scroll) -gt 0.4) { $tr.Scroll += ($tr.ScrollT - $tr.Scroll) * $ke; $busy = $true } else { $tr.Scroll = $tr.ScrollT }
+		$since = $now - $tr.T0
+		if ($since -lt (120 + 45 * [math]::Min([math]::Max(0, $tr.View.Count - 1), 14) + 400)) { $busy = $true }
+		elseif ($tr.Open -ge 1) {
+			# when idle: one pending row per step (the icons of rows not yet seen), without stalls
+			foreach ($r in $tr.View) { if (-not $r.Bmp) { Build-TrRow $r; $busy = $true; break } }
+		}
+		$pTrophy.Invalidate()
+	}
+	if ($tabDirty) { $pTrophyTab.Invalidate() }
+	if (-not $busy) { $tr.Timer.Stop() }
+}
+$tr.Timer.Add_Tick({ try { Step-TrAnim } catch { $tr.Timer.Stop() } })
+function Start-TrAnim { if (-not $tr.Timer.Enabled) { $tr.Last = $tr.SW.Elapsed.TotalMilliseconds; $tr.Timer.Start() } }
+function Update-TrData {
+	$d = Get-TrophyData
+	$changed = ($d.Stamp -ne $tr.Stamp)
+	$tr.Data = $d
+	if ($changed) {
+		$tr.Stamp = $d.Stamp
+		if ($pTrophy.Visible) { New-TrRows; Build-TrHead } else { $tr.Dirty = $true }
+		$pTrophyTab.Invalidate()
+	}
+}
+function Open-Trophies {
+	Update-TrData
+	if ($tr.Dirty -or -not $tr.Head) { New-TrRows; Build-TrHead; $tr.Dirty = $false } else { Set-TrView }
+	if (-not $tr.Glass) { Build-TrGlass }
+	# the first screen of rows (with their icons) is made now; the rest when idle, one per step
+	$acc = 0; foreach ($r in $tr.View) { if ($acc -gt $tr.ListH) { break }; if (-not $r.Bmp) { Build-TrRow $r }; $acc += $tr.RowH0 + $tr.Gap }
+	$tr.T0 = $tr.SW.Elapsed.TotalMilliseconds; $tr.OpenT = 1.0
+	$pTrophy.Visible = $true; $pTrophy.BringToFront(); $pTrophyTab.BringToFront()
+	try { $pTrophy.Focus() | Out-Null } catch { }
+	Start-TrAnim
+}
+function Close-Trophies { $tr.OpenT = 0.0; foreach ($r in $tr.View) { $r.HovT = 0.0 }; Start-TrAnim }
+function Switch-Trophies { if ($tr.OpenT -gt 0) { Close-Trophies } else { Open-Trophies } }
+# Compatibility with the former function.
+function Update-TrophySection([bool]$open) { if ($open) { Open-Trophies } else { if ($tr.OpenT -gt 0) { Close-Trophies } else { Update-TrData } } }
+
+$pTrophyTab.Add_Paint({ param($s, $e) try { Show-TrTab $e.Graphics } catch { } })
+$pTrophyTab.Add_MouseEnter({ try { $tr.TabHovT = 1.0; Start-TrAnim } catch { } })
+$pTrophyTab.Add_MouseLeave({ try { $tr.TabHovT = 0.0; Start-TrAnim } catch { } })
+$pTrophyTab.Add_MouseClick({ param($s, $e) try { if ($e.Button -eq 'Left') { Switch-Trophies } } catch { } })
+$pTrophy.Add_Paint({ param($s, $e) try { Show-TrFrame $e.Graphics } catch { } })
+$pTrophy.Add_MouseEnter({ try { $pTrophy.Focus() | Out-Null } catch { } })
+$pTrophy.Add_MouseMove({ param($s, $e) try {
+	$hit = $null
+	if ($e.Y -ge $tr.ListY -and $e.Y -lt $tr.ListY + $tr.ListH -and $e.X -ge $tr.ListX -and $e.X -lt $tr.ListX + $tr.RowW) {
+		foreach ($l in $tr.Layout) { if ($e.Y -ge $l.Y -and $e.Y -lt $l.Y + $l.H) { $hit = $l.R; break } }
+	}
+	$chip = $false; foreach ($c in $tr.Chips) { if ($c.R.Contains($e.Location)) { $chip = $true } }
+	$ch = $false
+	foreach ($r in $tr.View) { $want = $(if ([object]::ReferenceEquals($r, $hit)) { 1.0 } else { 0.0 }); if ($r.HovT -ne $want) { $r.HovT = $want; $ch = $true } }
+	$pTrophy.Cursor = $(if ($hit -or $chip) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default })
+	if ($ch) { Start-TrAnim }
+} catch { } })
+$pTrophy.Add_MouseLeave({ try { foreach ($r in $tr.View) { $r.HovT = 0.0 }; Start-TrAnim } catch { } })
+$pTrophy.Add_MouseClick({ param($s, $e) try {
+	if ($e.Button -ne 'Left') { return }
+	foreach ($c in $tr.Chips) {
+		if ($c.R.Contains($e.Location) -and $c.F -ne $tr.Filter) {
+			$tr.Filter = $c.F; Set-TrView; Build-TrHead; $tr.T0 = $tr.SW.Elapsed.TotalMilliseconds - 100; Start-TrAnim; return
+		}
+	}
+	if ($e.Y -lt $tr.ListY -or $e.Y -ge $tr.ListY + $tr.ListH) { return }
+	foreach ($l in $tr.Layout) {
+		if ($e.Y -ge $l.Y -and $e.Y -lt $l.Y + $l.H) {
+			$r = $l.R; $r.ExpT = $(if ($r.ExpT -gt 0) { 0.0 } else { 1.0 })
+			if ($r.ExpT -gt 0) {
+				if (-not $r.Bmp) { Build-TrRow $r }
+				# keep the opened row fully in view
+				$bottom = $l.Y + $tr.Scroll - $tr.ListY + $r.H1 + 8
+				if ($bottom - $tr.ScrollT -gt $tr.ListH) { $tr.ScrollT = $bottom - $tr.ListH }
+			}
+			Start-TrAnim; break
+		}
+	}
+} catch { } })
+$pTrophy.Add_MouseWheel({ param($s, $e) try { $tr.ScrollT = $tr.ScrollT - $e.Delta * 0.55; Start-TrAnim } catch { } })
+# A click outside (on the background) closes the drop-down; back in the launcher (after playing) the counter is refreshed.
+$form.Add_MouseDown({ try { if ($tr.OpenT -gt 0) { Close-Trophies } } catch { } })
+$form.Add_Activated({ try { Update-TrData } catch { } })
+try { Update-TrData } catch { }
 function Set-DoubleBufferAll($p) { foreach ($c in @($p.Controls)) { if ($c -is [System.Windows.Forms.Panel] -or $c -is [System.Windows.Forms.GroupBox] -or $c -is [System.Windows.Forms.PictureBox]) { Set-DoubleBuffer $c }; if ($c.Controls.Count) { Set-DoubleBufferAll $c } } }
 Set-DoubleBufferAll $form
 $panel.ResumeLayout($true); $form.ResumeLayout($true)

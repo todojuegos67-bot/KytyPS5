@@ -1,4 +1,7 @@
 #include "local/skip-shader.h"
+#include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
+#include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
+#include "local/envio1.h"
 #include "local/rt-local-lights.h"
 #include "local/hwrt-scene.h"
 #include "local/sync-stats.h"
@@ -35,6 +38,8 @@
 #include "native-preparation-state.h"
 #include "live-counters.h"
 
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <xxhash.h>
 #include "xpr-capture.h"
@@ -42,6 +47,8 @@
 #include "speculation-state.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "p7-compat.h" // (p7, KYTY_P7: C1)
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
 
 #include <algorithm>
 #include <cinttypes>
@@ -58,10 +65,13 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include "local/tiron4-counters.h" // (tiron5)
 #include <unordered_map>
 #include <vector>
 
 extern volatile std::atomic<uint32_t> kyty_local_fill_clear_mode; // (textureCache.cpp)
+
+#include "local/onda-dump-gpu.inc" // (onda4: KYTY_ONDA_DUMP, F12 image sequence)
 
 namespace Libs::Graphics {
 
@@ -331,13 +341,34 @@ private:
 	[[gnu::noinline]] void Begin(uint64_t shader_hash, uint64_t indirect_args, const PreparedBindings& bindings,
 	                             BufferCache& cache) {
 		m_traced = Programs() != "rtls" && (Programs().find(fmt::format("{:016x}", shader_hash)) != std::string::npos ||
-		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos));
+		                                    (indirect_args != 0 && Programs().find("indirect") != std::string::npos) ||
+		                                    CensusNow());
 		m_on = m_traced || RtLocal::Wanted();
 		if (!m_on) return;
 		m_shader_hash = shader_hash;
 		if (!m_traced) return;
 		for (const auto& source: bindings.buffer_sources)
 			m_dirty_before.push_back(source.size != 0 && cache.IsRegionCpuModified(source.address, source.size));
+	}
+	// (rtq2) KYTY_PROG_TRACE=* : a census of every compute program of the frame, once, KYTY_PROG_TRACE_AFTER_S (default
+	// 90) seconds after the first dispatch (in play, not in the menus), for KYTY_PROG_TRACE_FRAMES_S (default 2) seconds:
+	// per program at most 4 lines (its bindings, images with address/format/size, written). Used to find the game's
+	// SSR / IBL / fog chain by the addresses one writes and the next reads (kRTT_SSR -> CS 9fb5cc274b5e4f82).
+	static bool CensusNow() {
+		static const bool star = Programs().find('*') != std::string::npos;
+		if (!star) return false;
+		using Clock = std::chrono::steady_clock;
+		static const Clock::time_point first = Clock::now();
+		static const double after = [] {
+			const char* v = std::getenv("KYTY_PROG_TRACE_AFTER_S");
+			return v != nullptr && *v != 0 ? std::atof(v) : 90.0;
+		}();
+		static const double span = [] {
+			const char* v = std::getenv("KYTY_PROG_TRACE_FRAMES_S");
+			return v != nullptr && *v != 0 ? std::atof(v) : 2.0;
+		}();
+		const double t = std::chrono::duration<double>(Clock::now() - first).count();
+		return t >= after && t < after + span;
 	}
 	[[gnu::noinline]] void PrintLine(const PreparedBindings& bindings, RenderContext& context,
 	                                 const Common::SlotVector<Image>& images, uint32_t groups_x, uint32_t groups_y,
@@ -363,7 +394,8 @@ private:
 		static uint32_t                               lines = 0;
 		{
 			std::lock_guard lock(lines_mutex);
-			if (lines >= 20000 || per_program[m_shader_hash]++ >= 50) return;
+			static const bool star = Programs().find('*') != std::string::npos;
+			if (lines >= 20000 || per_program[m_shader_hash]++ >= (star ? 4u : 50u)) return;
 			++lines;
 		}
 		const auto& program = *bindings.runtime->program;
@@ -708,6 +740,279 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 		record.PredictClear(found->second);
 }
 
+namespace {
+// (render2) KYTY_ASYNC_COMPUTE_PIPELINES=1 (off by default): a normal-path dispatch whose compute pipeline is not made
+// yet no longer always stops the GPU thread for the driver. Each frame the first KYTY_ASYNC_COMPUTE_SYNC_MS (default
+// 2) of such compiles are made here as before, so a frame that brings a few new pipelines dispatches them all; past
+// that the pipeline goes to a compile worker (PipelineCache::TryCreateComputePipelineAsync), the GPU thread waits for
+// it at most KYTY_ASYNC_COMPUTE_WAIT_MS a frame (default 2) and the dispatch is skipped while it compiles, as a draw
+// is with KYTY_ASYNC_DRAW_PIPELINES. Never skipped: the TAA pass (frame generation and the upscalers hang on it), a
+// captured frame, and a dispatch whose pipeline has been compiling for KYTY_ASYNC_COMPUTE_HOLD_MS (default 250):
+// those wait for the worker. Measured basis (16 GB profile, no pipeline warmup): 14-145 compute pipelines in one
+// frame at a zone's load, ~0.6 ms each, 13-132 ms of dispatch.pipeline in that frame.
+struct AsyncComputeDispatches {
+	bool    on             = false;
+	int64_t sync_budget_us = 2000, wait_budget_us = 2000, hold_ms = 250;
+	// The GPU thread's: this frame's compiles made here and waits for the workers, and when each program's dispatch
+	// was first skipped.
+	uint64_t frame   = UINT64_MAX;
+	int64_t  sync_us = 0, waited_us = 0;
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> skipping;
+	// Since the start, and as the last [async-compute] line had them.
+	struct Totals {
+		uint64_t made_here = 0, made_here_us = 0, queued = 0, waited_us = 0, skipped = 0, held = 0, held_us = 0;
+		uint64_t compiled = 0, compiled_us = 0;
+	};
+	Totals                                total, reported;
+	bool                                  active = false;
+	std::chrono::steady_clock::time_point reported_at {};
+};
+AsyncComputeDispatches& AsyncComputeState() {
+	static AsyncComputeDispatches state = [] {
+		AsyncComputeDispatches made;
+		const auto             number = [](const char* name, double fallback, double low, double high) {
+			const char* value = std::getenv(name);
+			return std::clamp(value != nullptr && *value != '\0' ? std::atof(value) : fallback, low, high);
+		};
+		const char* value   = std::getenv("KYTY_ASYNC_COMPUTE_PIPELINES");
+		made.on             = value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		if (Tiron4::PipeOn()) made.on = true; // (tiron5: KYTY_TIRON5_PIPE=1)
+		made.sync_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_SYNC_MS", 2.0, 0.0, 1000.0) * 1000.0);
+		made.wait_budget_us = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_WAIT_MS", 2.0, 0.0, 1000.0) * 1000.0);
+		made.hold_ms        = static_cast<int64_t>(number("KYTY_ASYNC_COMPUTE_HOLD_MS", 250.0, 0.0, 60000.0));
+		if (made.on) {
+			std::printf("Async compute pipelines: on (KYTY_ASYNC_COMPUTE_PIPELINES=1): %.1f ms of compiles a frame on the "
+			            "GPU thread (KYTY_ASYNC_COMPUTE_SYNC_MS), then on the compile workers, waited for %.1f ms a frame "
+			            "(KYTY_ASYNC_COMPUTE_WAIT_MS), the dispatch skipped meanwhile for at most %lld ms "
+			            "(KYTY_ASYNC_COMPUTE_HOLD_MS)\n",
+			            static_cast<double>(made.sync_budget_us) / 1000.0, static_cast<double>(made.wait_budget_us) / 1000.0,
+			            static_cast<long long>(made.hold_ms));
+			std::fflush(stdout);
+		}
+		return made;
+	}();
+	return state;
+}
+// A line at most every 5 s, only after something happened: what the switch did since the last one.
+void AsyncComputeReport(AsyncComputeDispatches& state, const PipelineCache& cache) {
+	if (!state.active) return;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - state.reported_at < std::chrono::seconds(5)) return;
+	state.total.compiled    = cache.AsyncComputeCompiled();
+	state.total.compiled_us = cache.AsyncComputeCompileUs();
+	const auto& t = state.total;
+	const auto& r = state.reported;
+	const auto  ms = [](uint64_t us) { return static_cast<double>(us) / 1000.0; };
+	std::printf("[async-compute] since the last line: %llu pipelines made on the GPU thread (%.1f ms), %llu sent to the "
+	            "workers, %llu compiled there (%.1f ms off the GPU thread), waited %.1f ms, %llu dispatches skipped, %llu "
+	            "held (%.1f ms); total skipped %llu\n",
+	            static_cast<unsigned long long>(t.made_here - r.made_here), ms(t.made_here_us - r.made_here_us),
+	            static_cast<unsigned long long>(t.queued - r.queued), static_cast<unsigned long long>(t.compiled - r.compiled),
+	            ms(t.compiled_us - r.compiled_us), ms(t.waited_us - r.waited_us),
+	            static_cast<unsigned long long>(t.skipped - r.skipped), static_cast<unsigned long long>(t.held - r.held),
+	            ms(t.held_us - r.held_us), static_cast<unsigned long long>(t.skipped));
+	std::fflush(stdout);
+	state.reported    = state.total;
+	state.reported_at = now;
+	state.active      = false; // (until a dispatch next finds its pipeline not made)
+}
+} // namespace
+
+// (render4) KYTY_DS_LINEAR_COPY_HOOK: the copy an announcement of the game's linear copy function makes, under the
+// terms DispatchDirect's register check below copies under: the copy shader proved by its program (m_linear_copy_shader)
+// and the shader map unchanged since, no frame capture, no speculation, no live shader skip; every 64th use is left to
+// the game's packets, whose dispatch takes the normal path and proves the program again. The census scopes are the
+// dispatch's (the [render] line counts it as a dispatch and its time as linear_copy).
+bool RenderExecutor::DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t src, uint32_t count, uint32_t period,
+                                  uint64_t commands, uint64_t commands_bytes) {
+	if (buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed))
+		return false;
+	auto&      learned = Catalog();
+	const auto shader  = learned.m_linear_copy_shader.load(std::memory_order_relaxed);
+	if (shader == 0 || ShaderMapGeneration() != learned.m_linear_copy_generation) return false;
+	if ((++m_linear_copy_hook_uses & 63u) == 0) return false;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	LiveCensus::Scope census(LiveCensus::Dispatch, shader, 0);
+	LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader);
+	Envio1::NoteDispatch();
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard   lock(m_context.GetMutex());
+	envio1_lock.reset();
+	LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, shader, 11);
+	return DemonsSouls::TryLinearCopyRanges(m_context.GetBufferCache(), dst, src, count, period, commands, commands_bytes);
+}
+
+// (copia1, KYTY_COPIA1; local/copia1.h) DsLinearCopy for a run of announcements: its terms checked once, then each copy
+// as DsLinearCopy makes it (the 64th-use rule per copy), in order, under one lock and one census scope; the first copy
+// not made ends the run.
+uint32_t RenderExecutor::DsLinearCopyBatch(CommandBuffer& buffer, const DsLinearCopyItem* items, uint32_t n) {
+	if (n == 0 || buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed))
+		return 0;
+	auto&      learned = Catalog();
+	const auto shader  = learned.m_linear_copy_shader.load(std::memory_order_relaxed);
+	if (shader == 0 || ShaderMapGeneration() != learned.m_linear_copy_generation) return 0;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	LiveCensus::Scope census(LiveCensus::Dispatch, shader, 0);
+	LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader);
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard   lock(m_context.GetMutex());
+	envio1_lock.reset();
+	LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, shader, 11);
+	uint32_t made = 0;
+	for (; made < n; ++made) {
+		if ((++m_linear_copy_hook_uses & 63u) == 0) break;
+		Envio1::NoteDispatch();
+		const auto& item = items[made];
+		if (!DemonsSouls::TryLinearCopyRanges(m_context.GetBufferCache(), item.dst, item.src, item.count, item.period,
+		                                      item.commands, item.commands_bytes))
+			break;
+	}
+	return made;
+}
+
+// (F5 pase 1, KYTY_NATIVO_PASE_SSRCLEAR; local/ds-nativo-pase.h) The SSRClear pass natively: the game's texture clear
+// (eboot+0x9ad560: its clear shader over the whole of one 2D texture) as a Vulkan clear of the texture cache's image of
+// that T#. Only when the image is exactly the view (one level, one layer, the T#'s size, colour, no DCC): the clear
+// covers all of it. Anything else: false, and the game's packets run as always.
+bool RenderExecutor::DsNativeClear(CommandBuffer& buffer, const uint32_t* tsharp) {
+	if (buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed) || tsharp == nullptr)
+		return false;
+	// T# fields (shaderBindings.h ShaderTextureResource): Base40, Width5 / Height5, BaseLevel, LastLevel, BaseArray5,
+	// Depth, MetaCompress / WriteCompress.
+	const uint64_t address    = ((tsharp[0] | (uint64_t {tsharp[1]} << 32u)) & 0xFFFFFFFFFFull) << 8u;
+	const uint32_t width      = (((tsharp[1] >> 30u) & 0x3u) | ((tsharp[2] & 0xFFFu) << 2u)) + 1u;
+	const uint32_t height     = ((tsharp[2] >> 14u) & 0x3FFFu) + 1u;
+	const uint32_t base_level = (tsharp[3] >> 12u) & 0xFu;
+	const uint32_t last_level = (tsharp[3] >> 16u) & 0xFu;
+	const uint32_t base_array = (tsharp[4] >> 16u) & 0x1FFFu;
+	const uint32_t depth      = tsharp[4] & 0x1FFFu;
+	const bool     compressed = ((tsharp[6] >> 20u) & 0x3u) != 0;
+	if (address == 0 || base_level != 0 || last_level != 0 || base_array != 0 || depth != 0 || compressed) return false;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Envio1::NoteDispatch();
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard              lock(m_context.GetMutex());
+	envio1_lock.reset();
+	auto&         cache = m_context.GetTextureCache();
+	const ImageId id    = cache.FindImageFromRange(address, 1, false);
+	if (!id) return false;
+	uint64_t size = 0;
+	{
+		std::scoped_lock cache_lock {cache.m_lock};
+		const auto*      image = cache.TryGetImage(id);
+		if (image == nullptr || image->depth_id || image->info.IsDepth() || image->info.IsVolume() ||
+		    image->info.samples != 1 || image->info.data.address != address || image->info.resources.levels != 1 ||
+		    image->info.TransferLayers() != 1 || image->info.extent.width != width || image->info.extent.height != height)
+			return false;
+		size = image->info.data.size;
+	}
+	return size != 0 && cache.ClearImageFromBuffer(buffer, address, size, 0u);
+}
+
+// (F5 pase 2, B1) KYTY_NATIVO_PASE_SOMBRAS=3: ver render.h. Mismo marco que DsNativeClear.
+bool RenderExecutor::DsShadowCopyLayer(CommandBuffer& buffer, uint64_t address, uint32_t layer, const char** why) {
+	*why = "?";
+	if (buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed) || address == 0)
+		return *why = "no se puede ahora (especulacion, captura o buffer)", false;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Envio1::NoteDispatch();
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard              lock(m_context.GetMutex());
+	envio1_lock.reset();
+	auto&         cache = m_context.GetTextureCache();
+	// (La imagen que uso el draw anterior como profundidad, si es la de esta direccion; si no, por su rango.)
+	const ImageId id    = (m_ds_last_depth_id && m_ds_last_depth_addr == address) ? m_ds_last_depth_id
+	                                                                               : cache.FindImageFromRange(address, 1, false);
+	if (!id) return *why = "la cache no tiene la imagen", false;
+	auto&            graphics = m_context.GetGraphics();
+	std::scoped_lock cache_lock {cache.m_lock};
+	auto*            image = cache.TryGetImage(id);
+	if (image == nullptr || image->backing.image == nullptr || image->backing.sparse != nullptr)
+		return *why = "imagen sin vk::Image o dispersa", false;
+	if (!image->info.IsDepth() || image->info.samples != 1 || layer >= image->backing.layers || image->backing.mip_levels < 1)
+		return *why = "no es una imagen de profundidad con esa capa", false;
+	// La imagen propia: una vez, del formato y tamano de la de la cache (una capa).
+	static VkImage       own_image  = VK_NULL_HANDLE;
+	static VmaAllocation own_memory = nullptr;
+	static vk::Format    own_format = vk::Format::eUndefined;
+	static vk::Extent3D  own_extent {};
+	const vk::Extent3D   extent {image->backing.extent.width, image->backing.extent.height, 1};
+	if (own_image != VK_NULL_HANDLE && (own_format != image->backing.format || own_extent != extent)) return *why = "otro formato", false;
+	if (own_image == VK_NULL_HANDLE) {
+		VkImageCreateInfo create {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+		create.imageType     = VK_IMAGE_TYPE_2D;
+		create.format        = static_cast<VkFormat>(image->backing.format);
+		create.extent        = {extent.width, extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.samples       = VK_SAMPLE_COUNT_1_BIT;
+		create.tiling        = VK_IMAGE_TILING_OPTIMAL;
+		create.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+		create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO;
+		if (vmaCreateImage(graphics.allocator, &create, &allocate, &own_image, &own_memory, nullptr) != VK_SUCCESS) {
+			own_image = VK_NULL_HANDLE;
+			return *why = "no se pudo crear la imagen propia", false;
+		}
+		own_format = image->backing.format;
+		own_extent = extent;
+	}
+	vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eDepth;
+	buffer.EndRendering(); // (como DispatchDirect: una copia no puede ir dentro de un pase de render; el siguiente draw lo reabre)
+	const vk::CommandBuffer command = buffer.Handle();
+	buffer.InvalidateGraphicsState();
+	// La capa de la cache a TransferSrc con su propio Transit; el estado previo, guardado para devolverla.
+	const VulkanImageState previous = image->CurrentState();
+	ImageSubresourceRange  range {};
+	range.base_level  = 0;
+	range.level_count = 1;
+	range.base_layer  = layer;
+	range.layer_count = 1;
+	image->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+	// La propia a TransferDst (su contenido anterior no importa).
+	vk::ImageMemoryBarrier2 to_dst {};
+	to_dst.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	to_dst.srcAccessMask       = vk::AccessFlagBits2::eNone;
+	to_dst.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	to_dst.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	to_dst.oldLayout           = vk::ImageLayout::eUndefined;
+	to_dst.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+	to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_dst.image               = vk::Image(own_image);
+	to_dst.subresourceRange    = vk::ImageSubresourceRange {aspect, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &to_dst;
+	command.pipelineBarrier2(dependency);
+	vk::ImageCopy region {};
+	region.srcSubresource = vk::ImageSubresourceLayers {aspect, 0, layer, 1};
+	region.dstSubresource = vk::ImageSubresourceLayers {aspect, 0, 0, 1};
+	region.extent         = extent;
+	command.copyImage(image->backing.image, vk::ImageLayout::eTransferSrcOptimal, vk::Image(own_image),
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &region);
+	// La propia, lista para leerse; la de la cache, de vuelta a su estado previo.
+	vk::ImageMemoryBarrier2 to_read = to_dst;
+	to_read.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	to_read.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	to_read.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	to_read.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead;
+	to_read.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+	to_read.newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal;
+	dependency.pImageMemoryBarriers = &to_read;
+	command.pipelineBarrier2(dependency);
+	if (previous.layout != vk::ImageLayout::eUndefined)
+		image->Transit(previous.layout, previous.access_mask, range, command);
+	*why = "copiada";
+	return true;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode,
@@ -717,6 +1022,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
+	// (w11, KYTY_NATIVO_VGEO) (w20) Every compute dispatch tries the table way FIRST, before the normal path's prologue
+	// (traces, census and counter scopes, Envio1, SkipShader paint, the null/valid shader checks): the normal path did the
+	// same TableDispatch right after that prologue, so a dispatch the table takes is recorded the same way, ~1.6 us
+	// sooner (measured w11: 0.68 us/dispatch this way). TableDispatch refuses by itself what cannot go the table way (not
+	// seen twice by the normal path, the linear copy / meta clear specials, TAA under frame generation, HWRT, path
+	// tracing, SkipShader, capture); those continue below without a second table attempt. No per-CS list: before (w18),
+	// a learned list of 48 CS (>= 2/f, rows emptied every 300 frames) took 157 of ~1320 dispatches/f.
+	struct VgeoTimer {
+		std::atomic<uint64_t>* count = nullptr; std::atomic<uint64_t>* ns = nullptr; uint64_t t0 = 0;
+		~VgeoTimer() { if (count != nullptr) { count->fetch_add(1, std::memory_order_relaxed); ns->fetch_add(VgeoNativo::Now() - t0, std::memory_order_relaxed); } }
+	} vgeo_timer;
+	bool table_tried = false;
+	if (VgeoNativo::Mode() != 0) {
+		const uint64_t vgeo_cs = sh_ctx.GetCs().cs_regs.data_addr;
+		const auto&    paint   = SkipShader::Paint::Get();
+		vgeo_timer.t0          = VgeoNativo::Now();
+		if (VgeoNativo::TableFirst() && vgeo_cs != 0 && kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 &&
+		    Spec::Current() == nullptr && !FrameCapture::Active() && !OndaDump::Recording() && !paint.list && !paint.live &&
+		    !Juego3::FixCapable() && (mode & (1u << 5u)) == 0 &&
+		    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
+			buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id, thread_group_x,
+			                    thread_group_y, thread_group_z, mode, vgeo_cs);
+			std::optional<RenderLockGuard> vgeo_lock;
+			if (Role() == 0) vgeo_lock.emplace(m_context.GetMutex());
+			m_dispatch_declined = nullptr;
+			if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, false)) {
+				vgeo_timer.count = &VgeoNativo::g_fast; vgeo_timer.ns = &VgeoNativo::g_fast_ns;
+				return;
+			}
+			table_tried      = true; // (its refusal stands: the normal path below does not ask the table again)
+			vgeo_timer.count = &VgeoNativo::g_normal; vgeo_timer.ns = &VgeoNativo::g_normal_ns;
+		} else {
+			vgeo_timer.count = &VgeoNativo::g_val_normal; vgeo_timer.ns = &VgeoNativo::g_val_normal_ns;
+		}
+	}
 	{
 		// (Diagnostic, KYTY_DISPATCH_TRACE_ADDR=<cs address hex>: that shader's dispatch sizes and user data.)
 		static const uint64_t trace = std::getenv("KYTY_DISPATCH_TRACE_ADDR") != nullptr
@@ -750,6 +1090,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	LiveCounters::g_last_dispatch_shader = sh_ctx.GetCs().cs_regs.data_addr;
 	SyncStats::g_shader = sh_ctx.GetCs().cs_regs.data_addr;
+	const Juego3::DispatchScope juego3_cs(sh_ctx.GetCs().cs_regs.data_addr); // (juego3: the writes below are this shader's)
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
@@ -759,6 +1100,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	std::optional<RenderLockGuard> lock;
 	{
 		LiveCensus::Scope census_lock(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 12);
+		Envio1::NoteDispatch();
+		const Envio1::Scope envio1_lock(Envio1::Lock); // (envio1)
 		if (Role() == 0) lock.emplace(m_context.GetMutex());
 	}
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return;
@@ -781,8 +1124,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// A compute shader the normal path dispatched before (TableDispatchSeen) whose program allows table mode (an
 	// indirect dispatch of threads: the normal path reads its counts).
 	const bool thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	m_dispatch_declined          = nullptr;
-	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && (!thread_dimensions || indirect_args == 0) &&
+	if (!table_tried) m_dispatch_declined = nullptr; // (w20: a refusal of the table-first attempt above stands)
+	if (!table_tried && kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && !OndaDump::Recording() && // (onda4)
+	    (!thread_dimensions || indirect_args == 0) &&
 	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
 		LiveCensus::Scope census_table(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10);
 		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) return;
@@ -843,6 +1187,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		LiveCensus::Scope census_copy(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 11);
 		if (DemonsSouls::TryLinearCopy(dispatch, m_context.GetBufferCache(), thread_group_x, thread_group_y,
 		                               thread_group_z, mode)) {
+			LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader); // (render4, KYTY_RENDER_STATS: the "cs" part)
 			TableDispatchSeen(sh_ctx.GetCs(), "dispatch: linear copy", thread_dimensions);
 			ResetBindings();
 			return;
@@ -892,6 +1237,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	LiveCensus::SetDispatchShader(program.shader_hash); // (render4, KYTY_RENDER_STATS: the "cs" part)
 	if (LiveCounters::g_dispatch_keys_on.load(std::memory_order_relaxed)) {
 		// Local diagnostic: is a dispatch (shader, user data, groups) repeated from last frame, and
 		// with the same materialized resources? (What a per-object native dispatch record could reuse.)
@@ -1050,9 +1396,75 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 2);
 	TableDispatchSeen(sh_ctx.GetCs(), nullptr, use_thread_dimensions);
+	// (render2) KYTY_ASYNC_COMPUTE_PIPELINES (AsyncComputeDispatches above): the pipeline before anything of the
+	// dispatch is recorded or resolved, so that a skipped dispatch leaves nothing behind.
+	PipelineCache::Pipeline* async_pipeline = nullptr;
+	if (auto& async = AsyncComputeState(); async.on && Role() == 0 && !FrameCapture::Active()) {
+		using How        = PipelineCache::AsyncCompute;
+		auto& cache      = m_context.GetPipelineCache();
+		bool  compiling  = false;
+		const auto time_now = [] { return std::chrono::steady_clock::now(); };
+		const auto us    = [](std::chrono::steady_clock::duration time) {
+			return std::chrono::duration_cast<std::chrono::microseconds>(time).count();
+		};
+		if (const auto frame = m_context.FrameNumber(); frame != async.frame) {
+			async.frame     = frame;
+			async.sync_us   = 0;
+			async.waited_us = 0;
+			AsyncComputeReport(async, cache);
+		}
+		async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Find, &compiling);
+		if (async_pipeline == nullptr) {
+			async.active     = true;
+			const auto begin = time_now();
+			// (The TAA pass: one dispatch a frame that frame generation, the upscalers and the scene's notes hang on.)
+			const bool keep = FrameGen::IsTaaShader(program.shader_hash);
+			if (!compiling && (keep || async.sync_us < async.sync_budget_us)) {
+				// Within the frame's budget: made here, as before.
+				async_pipeline   = &cache.CreateComputePipeline(input_info, compute_program);
+				const auto spent = us(time_now() - begin);
+				async.sync_us += spent;
+				async.total.made_here++;
+				async.total.made_here_us += static_cast<uint64_t>(spent);
+			} else {
+				if (!compiling) async.total.queued++;
+				async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Queue);
+				if (async_pipeline == nullptr && async.waited_us < async.wait_budget_us) {
+					const auto waiting  = cache.PipelineWaiting();
+					const auto deadline = begin + std::chrono::microseconds(async.wait_budget_us - async.waited_us);
+					while (waiting != nullptr && !waiting->load(std::memory_order_acquire) && time_now() < deadline)
+						std::this_thread::yield();
+					const auto spent = us(time_now() - begin);
+					async.waited_us += spent;
+					async.total.waited_us += static_cast<uint64_t>(spent);
+					async_pipeline = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Find);
+				}
+				if (async_pipeline == nullptr) {
+					const auto first = async.skipping.try_emplace(compute_program.id, begin).first->second;
+					if (keep || begin - first >= std::chrono::milliseconds(async.hold_ms)) {
+						const auto held_begin = time_now();
+						async_pipeline        = cache.TryCreateComputePipelineAsync(input_info, compute_program, How::Block);
+						async.total.held++;
+						async.total.held_us += static_cast<uint64_t>(us(time_now() - held_begin));
+					}
+				}
+				if (async_pipeline == nullptr) {
+					const auto skipped = ++async.total.skipped;
+					if ((skipped & (skipped - 1)) == 0) {
+						std::printf("Async compute pipelines: %llu dispatches skipped while their pipelines compile\n",
+						            static_cast<unsigned long long>(skipped));
+					}
+					ResetBindings();
+					return;
+				}
+			}
+			async.skipping.erase(compute_program.id);
+		}
+	}
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	auto& pipeline = async_pipeline != nullptr
+	                     ? *async_pipeline
+	                     : m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 3);
 	NativePreparationScratch<PreparedBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
@@ -1146,6 +1558,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	// KYTY_TAA_DIAG=1: the TAA dispatch's images (slot, guest address, format, size, storage), the first frames and
 	// every 600th (the plan to put DLSS in its place: which image its output is, and what reads it after).
+	// (onda3) The TAA's weights (CB from user data s0:s1 -> qword [8]; dwords 7..11 = s20..s23 and the deflicker term,
+	// dword 24 = history valid, dword 25 = the CPU's ramp at offset 100), printed whenever they change: to see the static
+	// weight against the motion one in the same run as the "onda".
+	if (FrameGen::IsTaaShader(program.shader_hash) && std::getenv("KYTY_ONDA_JUEGO") != nullptr) {
+		const auto& cs  = sh_ctx.GetCs();
+		const uint64_t ud = static_cast<uint64_t>(cs.cs_user_sgpr.value[0]) | (static_cast<uint64_t>(cs.cs_user_sgpr.value[1]) << 32u);
+		if (ud != 0) {
+			const uint64_t cb = reinterpret_cast<const uint64_t*>(ud)[1];
+			if (cb != 0) {
+				const auto* w = reinterpret_cast<const float*>(cb);
+				static float last[7] {};
+				const float  now[7] {w[7], w[8], w[9], w[10], w[11], w[24], w[25]};
+				if (std::memcmp(now, last, sizeof(now)) != 0) {
+					std::memcpy(last, now, sizeof(now));
+					uint32_t valid = 0;
+					std::memcpy(&valid, &now[5], 4);
+					std::printf("[onda3] TAA %016llx pesos: estatico(s20) %.4f movimiento(s21) %.4f factor(s22) %.4f "
+					            "deflicker(s23) %.4f off44 %.4f historia %u rampa(off100) %.4f\n",
+					            static_cast<unsigned long long>(program.shader_hash), now[0], now[1], now[2], now[3],
+					            now[4], valid, now[6]);
+					std::fflush(stdout);
+				}
+			}
+		}
+	}
 	if (FrameGen::IsTaaShader(program.shader_hash) && FrameGen::TaaDiagFrame()) {
 		auto& cache = m_context.GetTextureCache();
 		std::printf("[taa] dispatch %ux%ux%u groups, %zu images:", thread_group_x, thread_group_y, thread_group_z,
@@ -1217,11 +1654,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const bool        chain            = DemonsSouls::ComputeChains(program.shader_hash);
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
+	// (onda4, KYTY_ONDA_DUMP: during an F12 session, a listed shader's bound images copied before it runs)
+	uint64_t   onda_written = 0;
+	const bool onda = OndaDump::Wanted() && Role() == 0 && Spec::Current() == nullptr &&
+	                  OndaDump::BeginDispatch(m_context.GetCommandScheduler(), m_context.FrameNumber());
+	if (onda && !bindings.images.empty()) {
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) onda_written |= uint64_t {1} << i;
+		OndaDump::BeforeDispatch(m_context.GetGraphics(), m_context.GetCommandScheduler(), m_context.GetTextureCache(), vk_buffer,
+		                         m_context.FrameNumber(), program.shader_hash, std::span<const TextureBinding> {bindings.images},
+		                         onda_written);
+	}
 	// (KYTY_SSR: before a G-buffer consumer, the packed layers copied; before the commit, the bindings intact.)
 	if (FrameGen::SsrWanted() && !bindings.images.empty())
 		FrameGen::SsrCaptureGbuffer(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                            std::span<const TextureBinding> {bindings.images});
 	PreparedBindings* descriptor_stage = &bindings;
+	const Envio1::Scope envio1_record(Envio1::Record); // (envio1: to the end of the dispatch)
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
@@ -1239,6 +1688,41 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	// (p7b, C1 precise: local/p7-compat.h) A chained dispatch's hazards against its chain's earlier dispatches, from
+	// the guest ranges of its V#s (what CommitBindings bound); one barrier only where there is one. Counted in any mode
+	// but KYTY_P7=0, recorded with KYTY_P7_C1=1.
+	if (chain && P7::Tracking()) {
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count = 0;
+		for (size_t i = 0; i < bindings.buffer_sources.size() && i < program.info.buffers.size(); ++i) {
+			const auto& source   = bindings.buffer_sources[i];
+			const auto& resource = program.info.buffers[i];
+			if (source.size == 0 || source.address == 0) continue;
+			if (count == accesses.size()) {
+				// (More buffers than room: everything this one touches unknown - counted as reads of anything.)
+				count = SIZE_MAX;
+				break;
+			}
+			accesses[count++] = {.begin  = source.address,
+			                     .end    = source.address + source.size,
+			                     .read   = resource.read,
+			                     .write  = resource.written,
+			                     .atomic = resource.atomic};
+		}
+		const bool unknown = count == SIZE_MAX || program.info.uses_dma;
+		const auto hazard  = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(),
+		                                   count == SIZE_MAX ? accesses.size() : count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
@@ -1258,7 +1742,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always) {
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7) {
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 			                          vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0,
@@ -1290,6 +1777,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// (onda4) what it wrote, for a listed shader or a listed address
+	if (onda && !bindings.images.empty())
+		OndaDump::AfterDispatch(m_context.GetGraphics(), m_context.GetCommandScheduler(), m_context.GetTextureCache(), vk_buffer,
+		                        m_context.FrameNumber(), program.shader_hash, std::span<const TextureBinding> {bindings.images},
+		                        onda_written);
 	// (KYTY_GBUF_VIEW / KYTY_GBUF_TAP, refl7 diagnostic: a G-buffer reader's outputs logged, the tapped image copied;
 	// refl8: KYTY_RT_REFLECTIONS' guide, the game's own SSR result copied from the deferred lighting's inputs)
 	if ((FrameGen::GbufViewWanted() || FrameGen::RtReflGuideWanted()) && !bindings.images.empty()) {
@@ -1300,6 +1792,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                               std::span<const TextureBinding> {bindings.images}, written);
 		FrameGen::RtReflGuideAfterDispatch(m_context.GetGraphics(), m_context.GetTextureCache(), vk_buffer, program.shader_hash,
 		                                   std::span<const TextureBinding> {bindings.images}, written);
+	}
+	// (pt1, BB_PATHTRACING: the images of the dispatches inside the scopes it reads: ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && PathTrace::WantDispatchHook()) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::AfterDispatch(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
+	}
+	// (pt1c, BB_PATHTRACING: the colour the game's TAA reads = the lit HDR image)
+	if (PathTrace::Requested() && Role() == 0 && !bindings.images.empty() && FrameGen::IsTaaShader(program.shader_hash)) {
+		uint64_t written = 0;
+		for (size_t i = 0; i < program.info.images.size() && i < 64; ++i)
+			if (program.info.images[i].written) written |= uint64_t {1} << i;
+		PathTrace::NoteTaaInput(m_context.GetTextureCache(), std::span<const TextureBinding> {bindings.images}, written, program.shader_hash);
 	}
 	// (KYTY_RT_SUN: the first dispatch of a flip sampling the sun cascades' array copies their layers)
 	if (FrameGen::RtSunWanted() && !bindings.images.empty())
@@ -1315,3 +1822,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 } // namespace Libs::Graphics
+
+// (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=3 / =1) Sombras en cascada nativas: RenderExecutor::DsNatMark / DsNatBeforeDraw.
+#include "graphics/host_gpu/renderer/dsSombrasNativas.inc"

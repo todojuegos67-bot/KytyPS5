@@ -26,6 +26,11 @@
 #include <deque>
 #include <fstream>
 #include <vector>
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
 
 namespace Libs {
 
@@ -403,6 +408,83 @@ static void keep_safe(std::string_view name) {
 	}
 }
 
+// (11-23) The flush to disk (FlushFileBuffers of each file) and the backup copy of a slot the game UNMOUNTED, off the
+// game's thread: the game waited for them (idle 287 ms / 132 ms frames right at its autosaves, log 20261123-053501).
+// One worker, in order; a mount of the same slot waits for its pending one first (so a backup never copies a slot the
+// game is writing again), F1's exit and FlushAll drain them. KYTY_SAVE_ASYNC_FLUSH=0: as before (on the game's thread).
+// Every flush + backup taking 20 ms or more is logged ("[save] ... flush + backup N ms").
+// (Never destroyed: the worker may still wait on them while the process exits.)
+static std::mutex&              g_ks_m       = *new std::mutex;
+static std::condition_variable& g_ks_cv      = *new std::condition_variable;
+static std::deque<std::string>& g_ks_queue   = *new std::deque<std::string>;   // slots waiting for their flush + backup
+static std::set<std::string>&   g_ks_queued  = *new std::set<std::string>;     // the same, to find them
+static std::string&             g_ks_running = *new std::string;               // the slot the worker is on ("" none)
+static bool async_keep_safe() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SAVE_ASYNC_FLUSH");
+		const bool  r = !(v != nullptr && v[0] == '0');
+		std::printf("[save] flush + backup of an unmounted save: %s (KYTY_SAVE_ASYNC_FLUSH)\n", r ? "on a worker, off the game's thread" : "on the game's thread");
+		return r;
+	}();
+	return on;
+}
+static void keep_safe_timed(const std::string& name, const char* why) {
+	const auto start = std::chrono::steady_clock::now();
+	keep_safe(name);
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	if (ms >= 20.0) {
+		std::printf("[save] %s %s: flush + backup %.1f ms\n", why, name.c_str(), ms);
+		std::fflush(stdout);
+	}
+}
+static void keep_safe_after_umount(const std::string& name) {
+	if (!async_keep_safe()) {
+		keep_safe_timed(name, "umount");
+		return;
+	}
+	static std::once_flag once;
+	std::call_once(once, [] {
+		std::thread([] {
+			for (;;) {
+				std::string next;
+				{
+					std::unique_lock lock(g_ks_m);
+					g_ks_cv.wait(lock, [] { return !g_ks_queue.empty(); });
+					next = g_ks_queue.front();
+					g_ks_queue.pop_front();
+					g_ks_queued.erase(next);
+					g_ks_running = next;
+				}
+				keep_safe_timed(next, "umount (worker)");
+				{
+					std::lock_guard lock(g_ks_m);
+					g_ks_running.clear();
+				}
+				g_ks_cv.notify_all();
+			}
+		}).detach();
+	});
+	{
+		std::lock_guard lock(g_ks_m);
+		if (g_ks_queued.insert(name).second) g_ks_queue.push_back(name);
+	}
+	g_ks_cv.notify_all();
+}
+// The slot's pending flush + backup done first (a mount of it, so the backup never copies new writes halfway).
+static void wait_keep_safe(const std::string& name) {
+	std::unique_lock lock(g_ks_m);
+	g_ks_cv.wait(lock, [&] { return g_ks_queued.count(name) == 0 && g_ks_running != name; });
+}
+// Every pending flush + backup done (exit, FlushAll).
+static void drain_keep_safe() {
+	std::unique_lock lock(g_ks_m);
+	g_ks_cv.wait(lock, [] { return g_ks_queue.empty() && g_ks_running.empty(); });
+}
+static bool keep_safe_pending() {
+	std::lock_guard lock(g_ks_m);
+	return !g_ks_queue.empty() || !g_ks_running.empty();
+}
+
 // A slot left broken by a crash (a file of zeros) gets its newest good backup back before the game reads it.
 static void repair(std::string_view name) {
 	const auto slot = slot_files(name);
@@ -464,7 +546,7 @@ bool BlockForExit(int timeout_ms, int settle_ms) {
 	auto       idle  = Clock::time_point {};
 	bool       quiet = false;
 	for (;;) {
-		const bool busy = MountedSlots() != 0 || LibKernel::FileSystem::OpenSaveWrites() != 0;
+		const bool busy = MountedSlots() != 0 || LibKernel::FileSystem::OpenSaveWrites() != 0 || keep_safe_pending(); // (11-23)
 		const auto now  = Clock::now();
 		if (busy) {
 			quiet = false;
@@ -495,6 +577,7 @@ bool BlockForExit(int timeout_ms, int settle_ms) {
 }
 
 void FlushAll() {
+	drain_keep_safe(); // (11-23) the worker's pending flushes + backups first
 	const auto title = std::filesystem::path(SAVE_DATA_DIR) / get_title_id();
 	std::error_code error;
 	for (const auto& entry: std::filesystem::directory_iterator(title, error)) {
@@ -733,6 +816,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	if (!created) {
+		wait_keep_safe(dir_name); // (11-23) its flush + backup from the last unmount finished first
 		repair(dir_name);
 	}
 
@@ -915,7 +999,7 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	const std::string dir_name = g_mount_slots.Directory(static_cast<size_t>(slot));
 	LibKernel::FileSystem::Umount(point);
 	g_mount_slots.Release(static_cast<size_t>(slot));
-	keep_safe(dir_name);
+	keep_safe_after_umount(dir_name); // (11-23) on the worker (KYTY_SAVE_ASYNC_FLUSH)
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}

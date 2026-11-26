@@ -1,3 +1,8 @@
+#include "local/pathtrace.h" // (pt1: F9)
+#include "local/rtq.h"       // (rtq1: F10)
+#include "local/rtq2-probe.h" // (rtq2: F12, KYTY_RTQ2_PROBE)
+#include "local/onda-dump.h"   // (onda4: F12, KYTY_ONDA_DUMP)
+#include "local/rt-reflections.h" // (rpost1: F10)
 #include "local/port-live.h"
 #include "local/skip-shader.h"
 #include "graphics/presentation/window.h"
@@ -46,6 +51,8 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <atomic>
+#include <mutex>
 #include "graphics/presentation/window/windowInternal.h"
 #include "frame-gen.h"
 #include "kytyGitVersion.h"
@@ -138,37 +145,59 @@ static uint32_t PadTargetFromName(std::string_view name, bool* ok) {
 	return 0;
 }
 
-static PadRemap& GetPadRemap() {
-	static PadRemap remap = [] {
-		PadRemap r;
-		for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) r.button[i] = ControllerButtonToPadButton(i);
-		const char* env = std::getenv("KYTY_PAD_MAP");
-		if (env == nullptr || *env == '\0') return r;
-		r.active              = true;
-		std::string_view list = env;
-		while (!list.empty()) {
-			const auto end   = list.find(';');
-			const auto entry = list.substr(0, end);
-			list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
-			const auto eq    = entry.find('=');
-			if (eq == std::string_view::npos) continue;
-			const std::string source(entry.substr(0, eq));
-			bool              ok     = false;
-			const uint32_t    target = PadTargetFromName(entry.substr(eq + 1), &ok);
-			if (!ok) {
-				LOGF("KYTY_PAD_MAP: unknown target in '%s'\n", std::string(entry).c_str());
-			} else if (source == "lefttrigger" || source == "righttrigger") {
-				r.trigger[source == "lefttrigger" ? 0 : 1] = target;
-			} else if (const auto b = SDL_GameControllerGetButtonFromString(source.c_str());
-			           b != SDL_CONTROLLER_BUTTON_INVALID) {
-				r.button[b] = target;
-			} else {
-				LOGF("KYTY_PAD_MAP: unknown input in '%s'\n", std::string(entry).c_str());
-			}
+static PadRemap BuildPadRemap(const char* text) {
+	PadRemap r;
+	for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++) r.button[i] = ControllerButtonToPadButton(i);
+	if (text == nullptr || *text == '\0') return r;
+	r.active              = true;
+	std::string_view list = text;
+	while (!list.empty()) {
+		const auto end   = list.find(';');
+		const auto entry = list.substr(0, end);
+		list             = end == std::string_view::npos ? std::string_view {} : list.substr(end + 1);
+		const auto eq    = entry.find('=');
+		if (eq == std::string_view::npos) continue;
+		const std::string source(entry.substr(0, eq));
+		bool              ok     = false;
+		const uint32_t    target = PadTargetFromName(entry.substr(eq + 1), &ok);
+		if (!ok) {
+			LOGF("KYTY_PAD_MAP: unknown target in '%s'\n", std::string(entry).c_str());
+		} else if (source == "lefttrigger" || source == "righttrigger") {
+			r.trigger[source == "lefttrigger" ? 0 : 1] = target;
+		} else if (const auto b = SDL_GameControllerGetButtonFromString(source.c_str());
+		           b != SDL_CONTROLLER_BUTTON_INVALID) {
+			r.button[b] = target;
+		} else {
+			LOGF("KYTY_PAD_MAP: unknown input in '%s'\n", std::string(entry).c_str());
 		}
-		LOGF("KYTY_PAD_MAP: %s\n", env);
-		return r;
-	}();
+	}
+	LOGF("KYTY_PAD_MAP: %s\n", text);
+	return r;
+}
+
+// (remap-f2) The F2 menu's "Mapear mando" changes the map live (HostPadMapSetLive, present thread): the window thread
+// (the only one that reads the map) takes the new text at its next pad event.
+static std::mutex        g_pad_live_mutex;
+static std::string       g_pad_live_text;
+static std::atomic<bool> g_pad_live_pending {false};
+
+void HostPadMapSetLive(const char* map) {
+	std::scoped_lock lock(g_pad_live_mutex);
+	g_pad_live_text = map != nullptr ? map : "";
+	g_pad_live_pending.store(true, std::memory_order_release);
+}
+
+static PadRemap& GetPadRemap() {
+	static PadRemap remap = BuildPadRemap(std::getenv("KYTY_PAD_MAP"));
+	if (g_pad_live_pending.exchange(false, std::memory_order_acquire)) {
+		std::string text;
+		{
+			std::scoped_lock lock(g_pad_live_mutex);
+			text = g_pad_live_text;
+		}
+		remap = BuildPadRemap(text.c_str());
+		if (!remap.active) LOGF("KYTY_PAD_MAP: (default buttons)\n");
+	}
 	return remap;
 }
 
@@ -342,8 +371,30 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				// KYTY_KBM: Space is a game key (roll), not pause.
 				if (!HostInputKbmEnabled()) SetPause(game, !game.paused.load(std::memory_order_acquire));
 				break;
+			// (rtq1) F10 with KYTY_RTQ: the ray-traced effects' debug view on / off (rtq.h).
+			case SDLK_F10:
+				// (rpost1) KYTY_REFL_POST: F10 the reflection's light after the upscaler ON / OFF (same place, A/B by eye).
+				if (Libs::Graphics::FrameGen::RtReflPostWanted() && !key.repeat) {
+					const bool v = Libs::Graphics::FrameGen::RtReflPostToggle();
+					std::printf("RT reflections: post-upscale %s (F10)\n", v ? "ON" : "OFF");
+					std::fflush(stdout);
+					Loader::DemonsSoulsWarp::ShowNotice(v ? "Reflejos tras el reescalado: ON (F10)" : "Reflejos tras el reescalado: OFF (F10)", 3);
+				} else if (Rtq::Wanted() && !key.repeat) {
+					const bool v = !Rtq::debug_view.load(std::memory_order_relaxed);
+					Rtq::debug_view.store(v, std::memory_order_relaxed);
+					Loader::DemonsSoulsWarp::ShowNotice(v ? "RTQ: vista de depuracion ON (F10)" : "RTQ: vista de depuracion OFF (F10)", 2);
+				}
+				break;
 			// F9: a debug snapshot of the picture shown (src/local/debug-snapshot.h), the game paused; F9 again resumes.
 			case SDLK_F9:
+				// (pt1) BB_PATHTRACING=1: F9 turns the path tracing on / off (A/B); the snapshot keeps F9 otherwise.
+				if (Libs::Graphics::PathTrace::Requested()) {
+					if (!key.repeat) {
+						Libs::Graphics::PathTrace::ToggleLive();
+						Loader::DemonsSoulsWarp::ShowNotice("Path tracing: F9 (ver [pt] en el log)", 2);
+					}
+					break;
+				}
 				if (!key.repeat) {
 					if (!game.paused.load(std::memory_order_acquire)) {
 						const auto folder = DebugSnapshot::Take(g_window != nullptr ? g_window->window : nullptr);
@@ -361,6 +412,12 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				if (!key.repeat) {
 					PerfOverlay::CycleLevel();
 				}
+				break;
+			// (rtq2) F12 with KYTY_RTQ2_PROBE=1: one whole frame recorded (rtq2-probe.h).
+			case SDLK_F12:
+				// (onda4) with KYTY_ONDA_DUMP=1: a sequence of images (onda-dump.h) and the first frame's call list instead.
+				if (!key.repeat && OndaDump::Wanted()) OndaDump::Arm();
+				else if (!key.repeat && Rtq2Probe::Wanted()) Rtq2Probe::Trigger();
 				break;
 			case SDLK_F11:
 				if (!key.repeat) {
@@ -446,6 +503,23 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
+// A pad at a device index opened once and connected (a pad mapped late is opened by GenericJoystickAdded; its
+// "controller added", if one still comes, finds it open).
+static void OpenPadAt(int index) {
+	const SDL_JoystickID instance = SDL_JoystickGetDeviceInstanceID(index);
+	if (instance >= 0 && SDL_GameControllerFromInstanceID(instance) != nullptr) {
+		Controller::Connect(instance);
+		return;
+	}
+	if (auto* pad = SDL_GameControllerOpen(index); pad != nullptr) {
+		Controller::Connect(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad)));
+	} else {
+		LOGF("Controller %d could not be opened: %s\n", index, SDL_GetError());
+		std::printf("[pad] el mando %d no se pudo abrir: %s\n", index, SDL_GetError());
+		std::fflush(stdout);
+	}
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	// (A new mapping for a connected controller, e.g. from Steam: its buttons arrive mapped from then on.)
 	if (f.remapped) {
@@ -469,12 +543,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		// (One that cannot be opened, e.g. gone again by now, stays out: its removal is then ignored too.)
-		if (auto* pad = SDL_GameControllerOpen(f.id); pad != nullptr) {
-			int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-			Controller::Connect(id);
-		} else {
-			LOGF("Controller %d could not be opened: %s\n", f.id, SDL_GetError());
-		}
+		OpenPadAt(f.id);
 	}
 
 	if (f.removed) {
@@ -486,6 +555,17 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		if (f.button >= 0 && f.button < SDL_CONTROLLER_BUTTON_MAX) {
 			PadRemapPress(f.id, GetPadRemap().button[f.button], f.down);
 		}
+	} else if ((f.down || f.up) && f.button == SDL_CONTROLLER_BUTTON_BACK && [] {
+		           // (select-tp) Select/View/Back acts as the PS5 touchpad press (the game's toolbelt: messages,
+		           // gestures) on any pad; a touch on the left half, as Backspace on the keyboard. KYTY_SELECT_TOUCHPAD=0: off.
+		           static const bool on = [] {
+			           const char* v = std::getenv("KYTY_SELECT_TOUCHPAD");
+			           return v == nullptr || *v != '0';
+		           }();
+		           return on;
+	           }()) {
+		Controller::SetTouchPad(f.id, 0, f.down, 0.25f, 0.5f);
+		Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
 	} else if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
@@ -515,6 +595,127 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 			Controller::SetAxis(f.id, axis,
 			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
+	}
+}
+
+// pad-dinput (23-11): a joystick SDL has no game-controller mapping for (a DirectInput pad: 360 clones, generic USB
+// pads, an old receiver in DInput mode) never became a controller: the game did not see it at all, and a wrong mapping
+// from the database showed up as "the direction goes to one side". Every joystick that appears is logged with its
+// DirectInput shape (axes, buttons, hats, each axis's rest), and an unmapped one gets a mapping built from that shape:
+// - buttons in the 360 DirectInput order (A B X Y LB RB Back Start LS RS Guide), the d-pad from hat 0;
+// - left stick a0/a1;
+// - an axis resting at an end (beyond 75%) is a trigger (the first two: L2, R2);
+// - 5 axes with none at an end: the 360 DirectInput layout, a2 the combined triggers (+a2 L2, -a2 R2), a3/a4 the right
+//   stick;
+// - otherwise the next two centered axes are the right stick, and one more centered axis with no trigger found is the
+//   combined triggers.
+// KYTY_PAD_DINPUT_AUTO=0: no automatic mapping (log only).
+static void GenericJoystickAdded(int index) {
+	SDL_Joystick* js = SDL_JoystickOpen(index);
+	if (js == nullptr) {
+		std::printf("[pad] joystick %d no se pudo abrir: %s\n", index, SDL_GetError());
+		std::fflush(stdout);
+		return;
+	}
+	SDL_JoystickUpdate(); // (its first report: the rest values)
+	char guid[64] {};
+	SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(js), guid, sizeof(guid));
+	const char* name_raw = SDL_JoystickName(js);
+	std::string name     = name_raw != nullptr ? name_raw : "Mando";
+	for (auto& c: name) {
+		if (c == ',') c = ' ';
+	}
+	const int  axes      = SDL_JoystickNumAxes(js);
+	const int  buttons   = SDL_JoystickNumButtons(js);
+	const int  hats      = SDL_JoystickNumHats(js);
+	const bool mapped    = SDL_IsGameController(index) == SDL_TRUE;
+	// The backend SDL reads it through: SDL2 writes it in the GUID's byte 14 ('x' XInput, 'h' HIDAPI, 'r' RawInput,
+	// 'w' Windows.Gaming.Input, 'v' virtual, 's' Steam); none: DirectInput (or the platform's own driver).
+	const Uint8 driver   = SDL_JoystickGetGUID(js).data[14];
+	const char* backend  = driver == 'x' ? "XInput" : driver == 'h' ? "HIDAPI" : driver == 'r' ? "RawInput"
+	                     : driver == 'w' ? "WGI" : driver == 'v' ? "virtual" : driver == 's' ? "Steam" : "DirectInput";
+	std::vector<int> rest(static_cast<size_t>(std::max(axes, 0)));
+	std::string      rest_text;
+	for (int i = 0; i < axes; i++) {
+		Sint16 v = 0;
+		if (SDL_JoystickGetAxisInitialState(js, i, &v) != SDL_TRUE) {
+			v = SDL_JoystickGetAxis(js, i);
+		}
+		rest[static_cast<size_t>(i)] = v;
+		rest_text += " a" + std::to_string(i) + "=" + std::to_string(v);
+	}
+	std::printf("[pad] mando: %s (%s, GUID %s, ejes %d, botones %d, hats %d), %s\n", name.c_str(), backend, guid, axes,
+	            buttons, hats, mapped ? "con mapeo de SDL" : "sin mapeo de SDL");
+	std::printf("[pad]   reposo de los ejes:%s\n", rest_text.c_str());
+	std::fflush(stdout);
+
+	static const bool auto_map = [] {
+		const char* v = std::getenv("KYTY_PAD_DINPUT_AUTO");
+		return v == nullptr || *v != '0';
+	}();
+	// mando_forzar_generico (KYTY_PAD_FORCE_GENERIC=1): the shape's mapping replaces SDL's for every non-PlayStation pad
+	// (an escape when the database's mapping of a pad is wrong).
+	static const bool force_generic = [] {
+		const char* v = std::getenv("KYTY_PAD_FORCE_GENERIC");
+		return v != nullptr && *v == '1';
+	}();
+	const auto type   = SDL_GameControllerTypeForIndex(index);
+	const bool sony   = type == SDL_CONTROLLER_TYPE_PS3 || type == SDL_CONTROLLER_TYPE_PS4 || type == SDL_CONTROLLER_TYPE_PS5;
+	const bool remap  = mapped && force_generic && !sony;
+	if ((mapped && !remap) || !auto_map || axes < 2 || buttons < 4) {
+		SDL_JoystickClose(js);
+		if (!mapped) {
+			std::printf("[pad]   sin mapeo automatico (%s)\n", !auto_map ? "KYTY_PAD_DINPUT_AUTO=0" : "pocos ejes o botones");
+			std::fflush(stdout);
+		}
+		return;
+	}
+
+	std::string map = std::string(guid) + "," + name + ",";
+	static const char* const button_names[] = {"a", "b", "x", "y", "leftshoulder", "rightshoulder", "back", "start",
+	                                           "leftstick", "rightstick", "guide"};
+	for (int i = 0; i < buttons && i < 11; i++) {
+		map += std::string(button_names[i]) + ":b" + std::to_string(i) + ",";
+	}
+	if (hats > 0) {
+		map += "dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,";
+	}
+	map += "leftx:a0,lefty:a1,";
+	std::vector<int> ends;
+	std::vector<int> centers;
+	for (int i = 2; i < axes; i++) {
+		(std::abs(rest[static_cast<size_t>(i)]) > 24576 ? ends : centers).push_back(i);
+	}
+	if (axes == 5 && ends.empty()) {
+		map += "lefttrigger:+a2,righttrigger:-a2,rightx:a3,righty:a4,";
+	} else {
+		size_t used = 0;
+		if (centers.size() >= 2) {
+			map += "rightx:a" + std::to_string(centers[0]) + ",righty:a" + std::to_string(centers[1]) + ",";
+			used = 2;
+		}
+		if (ends.size() >= 2) {
+			map += "lefttrigger:a" + std::to_string(ends[0]) + ",righttrigger:a" + std::to_string(ends[1]) + ",";
+		} else if (ends.size() == 1) {
+			map += "lefttrigger:a" + std::to_string(ends[0]) + ",";
+		} else if (centers.size() > used) {
+			map += "lefttrigger:+a" + std::to_string(centers[used]) + ",righttrigger:-a" +
+			       std::to_string(centers[used]) + ",";
+		}
+	}
+	SDL_JoystickClose(js);
+
+	if (SDL_GameControllerAddMapping(map.c_str()) < 0) {
+		std::printf("[pad]   mapeo automatico rechazado: %s\n", SDL_GetError());
+		std::fflush(stdout);
+		return;
+	}
+	std::printf("[pad]   mapeo %s: %s\n", remap ? "generico forzado" : "automatico", map.c_str());
+	std::fflush(stdout);
+	// (A mapping added for a joystick already present sends no "controller added": it is opened here. A replaced
+	// mapping reaches an open pad as "remapped", and its "controller added" is still queued.)
+	if (!mapped) {
+		OpenPadAt(index);
 	}
 }
 
@@ -671,6 +872,14 @@ void WindowContext::ProcessEvent(double time_s) {
 			}
 			return;
 		}
+	}
+	// (rdoc1) KYTY_RENDERDOC=1: F12 captures one frame with RenderDoc (renderDoc.cpp); F12 had no other use. Before the
+	// port's menu so it cannot take it; without KYTY_RENDERDOC the key goes on as before.
+	if (event->type == SDL_KEYDOWN && event->key.keysym.sym == SDLK_F12 && Libs::Graphics::RenderDocAvailable()) {
+		if (event->key.repeat == 0) {
+			Libs::Graphics::RenderDocRequestCapture(); // (no on-screen notice: it would be drawn into the captured frame)
+		}
+		return;
 	}
 	if (PortLive::g_hooks != nullptr && PortLive::g_hooks->event != nullptr && PortLive::g_hooks->event(*event)) {
 		return; // (the PC port's options menu)
@@ -883,6 +1092,10 @@ void WindowContext::ProcessEvent(double time_s) {
 			}
 			break;
 
+		case SDL_JOYDEVICEADDED:
+			GenericJoystickAdded(event->jdevice.which);
+			break;
+
 		case SDL_CONTROLLERDEVICEADDED:
 		case SDL_CONTROLLERDEVICEREMOVED:
 		case SDL_CONTROLLERDEVICEREMAPPED: {
@@ -1038,6 +1251,28 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
+	// pad-db (23-11): gamecontrollerdb.txt next to the exe (the SDL community's mapping database), if present, is read
+	// at init, so pads already plugged in come up mapped. KYTY_PAD_DB=<path>: another file.
+	{
+		std::string db;
+		if (const char* v = std::getenv("KYTY_PAD_DB"); v != nullptr && *v != '\0') {
+			db = v;
+		} else if (char* base = SDL_GetBasePath(); base != nullptr) {
+			db = std::string(base) + "gamecontrollerdb.txt";
+			SDL_free(base);
+		}
+		if (!db.empty()) {
+			if (SDL_RWops* f = SDL_RWFromFile(db.c_str(), "rb"); f != nullptr) {
+				SDL_RWclose(f);
+				SDL_SetHint(SDL_HINT_GAMECONTROLLERCONFIG_FILE, db.c_str());
+				std::printf("[pad] base de mapeos de mandos: %s\n", db.c_str());
+			} else {
+				std::printf("[pad] sin gamecontrollerdb.txt junto al exe: mapeos de SDL incluidos + mapeo automatico\n");
+			}
+			std::fflush(stdout);
+		}
+	}
+
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
@@ -1102,11 +1337,15 @@ static void WindowCreate(WindowContext& context) {
 	}
 
 	// KYTY_OUTPUT_HEIGHT: full screen at the chosen resolution (OutputDisplayMode); the swapchain is then made at it.
+	// (11-21) The display is no longer switched to a lower resolution (the desktop and the loading picture came out
+	// enlarged): full screen at the desktop's resolution and the presenter scales the game's frames to it.
+	// KYTY_OUTPUT_SWITCH_DISPLAY=1 switches it as before.
+	const bool switch_display = [] { const char* v = std::getenv("KYTY_OUTPUT_SWITCH_DISPLAY"); return v != nullptr && v[0] == '1'; }(); // (11-22) default off: full screen at the desktop's native resolution, the presenter scales the game to it (no desktop resolution change). =1 switches the display as before (smaller swapchain, less VRAM).
 	if (fullscreen && Loader::DemonsSoulsRenderSize::RequestedOutputHeight() != 0) {
 		const int       display = std::max(0, SDL_GetWindowDisplayIndex(context.window));
 		SDL_DisplayMode mode {}, desktop {};
 		SDL_GetDesktopDisplayMode(display, &desktop);
-		if (OutputDisplayMode(display, mode)) {
+		if (switch_display && OutputDisplayMode(display, mode)) {
 			// (Not minimized when another window - the metrics overlay, the launcher - takes the focus: the display
 			// stays at that mode with the game behind it, as with the desktop's full screen.)
 			SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");

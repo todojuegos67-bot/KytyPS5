@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/shader/recompiler/Rtq2Patch.h" // (rtq2: suelo estable, the disk key)
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -23,11 +24,13 @@
 #include "resource-plan-serial.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
+#include "libs/trim.h"
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 #include "native-preparation-scratch.h"
 #include "native-resource-state.h"
 #include "shader-warmup-cache.h"
+#include "vram-recursos.h"
 #include "scene-tags.h"
 #include "shader-gate.h"
 #include "live-census.h"
@@ -67,6 +70,7 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include "local/tiron6-seeds.h" // (tiron6)
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -75,7 +79,21 @@ volatile std::atomic<uint32_t> kyty_local_pipeline_index_mode {0};
 extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
 }
 
+// (arranque-ligero 2) Graphics pipelines made before play by the light start (renderDraw.cpp prints them).
+std::atomic<uint64_t> g_kyty_ligero_precreados {0};
+
 namespace Libs::Graphics {
+
+// (arranque-ligero) KYTY_ARRANQUE_LIGERO: 0 off; 1 no pipeline made before play; 2 the compute ones still not, but the
+// graphics seeds (tiron10: the draws the game made in earlier sessions, the fog's and effects' among them) are, and a
+// draw is never skipped while its pipeline compiles (renderDraw.cpp).
+static int ArranqueLigeroModo() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_ARRANQUE_LIGERO");
+		return value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+	}();
+	return mode;
+}
 
 namespace {
 
@@ -392,6 +410,35 @@ static bool PlanEvictionEnabled() {
 	return enabled;
 }
 
+// (ram7) The flips a plan stays unused before it may leave (KYTY_PLAN_IDLE_FLIPS, 3600 by default, at least 30): was a
+// static of SweepPlans, the preloads use it too.
+static uint32_t PlanIdleFlips() {
+	static const uint32_t flips = [] {
+		const char* value = std::getenv("KYTY_PLAN_IDLE_FLIPS");
+		return value != nullptr && *value != '\0' ? std::max(30u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+		                                          : 3600u;
+	}();
+	return flips;
+}
+// (ram7) KYTY_PLAN_BUDGET_MB set: plans a worker brought back beside one used (PreloadPlans: up to 256 of the 600 flips
+// around its last use) count as used KYTY_PLAN_PRELOAD_GRACE_FLIPS (600) flips ago only, not now: one not used by then
+// may leave at the next sweep. Before, each one came back as just used and stayed PlanIdleFlips: with a budget of
+// 64 MiB, 6464 plans came back beside the render thread and 971 of them were used (log 21:56); the budget was never met.
+static bool PlanBudgetSet() {
+	static const bool set = [] {
+		const char* value = std::getenv("KYTY_PLAN_BUDGET_MB");
+		return value != nullptr && *value != '\0';
+	}();
+	return set;
+}
+static uint32_t PlanPreloadGraceFlips() {
+	static const uint32_t flips = [] {
+		const char* value = std::getenv("KYTY_PLAN_PRELOAD_GRACE_FLIPS");
+		return value != nullptr && *value != '\0' ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 600u;
+	}();
+	return std::min(flips, PlanIdleFlips());
+}
+
 // A plan's bytes written (any thread: the file's end reserved atomically).
 static bool SpillPlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan, SpilledPlan& out) {
 	static std::once_flag        once;
@@ -595,7 +642,47 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		bool                                         table_mode = false; // an empty handle: refused
+		// (tiron11, KYTY_TIRON11=1) SpecializationHash(specialization), taken at its first lookup (0: not yet; the
+		// specialization of a stored permutation never changes).
+		mutable uint64_t spec_hash = 0;
 	};
+
+	// (tiron11) A hash of every field of a specialization (field by field: no padding bytes), never 0.
+	static uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& value) {
+		uint64_t   h   = 0xcbf29ce484222325ull ^ (value.buffers.size() * 0x9e3779b97f4a7c15ull) ^ value.images.size();
+		const auto mix = [&](uint64_t v) {
+			h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+			h *= 0x100000001b3ull;
+		};
+		for (const auto& b: value.buffers) {
+			mix(b.packed_stride);
+			mix(static_cast<uint64_t>(b.descriptor_format));
+			mix(b.descriptor_swizzle);
+			mix(b.byte_base_offset ? 1u : 0u);
+		}
+		for (const auto& i: value.images) {
+			mix(static_cast<uint64_t>(i.numeric_class));
+			mix(static_cast<uint64_t>(i.dimension));
+			mix(i.mip_count);
+			mix(static_cast<uint64_t>(i.conversion_format));
+			mix(i.shader_swizzle);
+			mix(i.indirect_root);
+			mix(i.indirect_mapping_offset);
+			mix(i.indirect_search_iterations);
+			mix((i.cube ? 1u : 0u) | (i.fmask ? 2u : 0u));
+		}
+		return h != 0 ? h : 1;
+	}
+	[[nodiscard]] static bool Tiron11On() {
+		static const bool on = [] {
+			const char* v   = std::getenv("KYTY_TIRON11");
+			const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
+			std::printf("[tiron11] busqueda de permutaciones de shader por hash: %s\n", set ? "ON (KYTY_TIRON11=1)" : "off");
+			std::fflush(stdout);
+			return set;
+		}();
+		return on;
+	}
 
 	// A permutation the prefetch translated, its SPIR-V in the prefetch's scratch file: zstd-compressed (spirv_bytes,
 	// a fifth of it), or as it is (spirv_bytes 0).
@@ -623,7 +710,188 @@ struct PipelineCache::ProgramCache {
 		vk::ShaderModule                               module = nullptr; // the result's, made by the worker
 		std::string                                    refused;
 		std::atomic<bool>                              done {false};
+		// (TABLA-PRECARGA) A job made at start-up from the recording (StartTableSeeds), not by a draw: its static key,
+		// and 0 free / 1 taken by Get / 2 skipped by its worker (little RAM left), set once by compare-exchange.
+		bool                                           seeded = false;
+		std::vector<uint32_t>                          static_key;
+		std::atomic<int>                               seed_state {0};
 	};
+
+	// (TABLA-PRECARGA, KYTY_TABLA_PRECARGA; default 0, 1: on) Log 20261125-011726, the 122.3 ms frame: 1797 draws whose
+	// pair had no table variant yet (table_store_variant), 1786 of them deferred to the normal path (draw.programs 30.2 +
+	// draw.bindings 38.7 ms), waiting for the pair's table mode programs, which a compile worker translated anew every
+	// session (nothing kept them). The table mode inputs of every program the table path published are recorded
+	// (<cache>.table.inputs, next to the table pipelines' driver cache <cache>.table.bin, which already keeps their
+	// pipelines); at start-up the compile workers translate them again, and Get takes the job made of a seed as if a
+	// draw had asked for it (the same translation, the same specialization and push data start). A seed never asked for
+	// stays in RAM until the exit: the [tabla-precarga] line counts it.
+	static bool TablaPrecargaOn() {
+		static const bool on = [] {
+			// (Apagado por defecto: log 20261125-015727, 2124 traducidos en 2190 ms, 202 MiB de SPIR-V, y los mismos 21
+			// fotogramas de mas de 50 ms: el coste de esos dibujos no era traducir. KYTY_TABLA_PRECARGA=1 lo enciende.)
+			const char* v = std::getenv("KYTY_TABLA_PRECARGA");
+			const bool  set = v != nullptr && v[0] == '1';
+			std::printf("[tabla-precarga] programas en modo tabla de sesiones anteriores traducidos al arrancar: %s\n",
+			            set ? "ON (KYTY_TABLA_PRECARGA=1)" : "off (KYTY_TABLA_PRECARGA=0)");
+			std::fflush(stdout);
+			return set;
+		}();
+		return on;
+	}
+	struct TableSeedStats {
+		std::atomic<uint64_t> total {0}, made {0}, refused {0}, skipped {0}, taken {0}, spirv_bytes {0}, code_bytes {0};
+		std::atomic<int64_t>  begin_ns {0};
+		uint64_t              private_before = 0, working_before = 0;
+	};
+	LocalShaderWarmup::Cache                                     table_recording;
+	std::mutex                                                   table_seed_mutex;
+	std::unordered_multimap<uint64_t, std::shared_ptr<TableJob>> table_seeds;
+	std::shared_ptr<TableSeedStats>                              table_seed_stats = std::make_shared<TableSeedStats>();
+	static uint64_t TableSeedKey(ShaderType stage, uint64_t hash, uint32_t push_cursor,
+	                             const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		return hash ^ (SpecializationHash(specialization) * 0x9e3779b97f4a7c15ull) ^ (uint64_t {push_cursor} << 32u) ^
+		       static_cast<uint64_t>(stage);
+	}
+	// The seed of this program, specialization and push data start (null: none, or its worker skipped it).
+	std::shared_ptr<TableJob> TakeTableSeed(ShaderType stage, const ShaderParams& params, const std::vector<uint32_t>& static_key,
+	                                        uint32_t push_cursor,
+	                                        const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		std::lock_guard lock(table_seed_mutex);
+		if (table_seeds.empty()) return nullptr;
+		const auto key   = TableSeedKey(stage, params.hash, push_cursor, specialization);
+		auto [it, end]   = table_seeds.equal_range(key);
+		for (; it != end; ++it) {
+			auto& job = it->second;
+			if (job->options.stage != stage || job->push_data_cursor != push_cursor || job->specialization != specialization ||
+			    job->static_key != static_key || !std::ranges::equal(job->code, params.code) ||
+			    !std::ranges::equal(job->back_code, params.back_code))
+				continue;
+			auto seed = std::move(job);
+			table_seeds.erase(it);
+			int free = 0;
+			if (!seed->seed_state.compare_exchange_strong(free, 1, std::memory_order_acq_rel)) return nullptr; // (skipped)
+			table_seed_stats->taken.fetch_add(1, std::memory_order_relaxed);
+			return seed;
+		}
+		return nullptr;
+	}
+	// A table mode program the table path published, recorded (not one made of a seed: the recording has it).
+	void RecordTableJob(const TableJob& job, const std::vector<uint32_t>& static_key) {
+		if (job.seeded || !table_recording.Enabled()) return;
+		LocalShaderWarmup::Record record;
+		record.stage           = job.options.stage;
+		record.hash            = job.options.shader_hash;
+		record.user_data_count = static_cast<uint32_t>(job.user_data.size());
+		record.push_cursor     = job.push_data_cursor;
+		record.static_key      = static_key;
+		record.code            = job.code;
+		record.back_code       = job.back_code;
+		record.specialization  = job.specialization;
+		if (record.stage == ShaderType::Pixel) record.pixel = job.pixel;
+		else if (record.stage == ShaderType::Compute) record.compute = job.compute;
+		else record.vertex = job.vertex;
+		(void)table_recording.Add(record);
+	}
+	// Opens the recording and hands every seed to the compile workers (start-up, before the game draws).
+	void StartTableSeeds(const std::filesystem::path& location, const std::string& identity) {
+		if (!TablaPrecargaOn() || !push_job) return;
+		if (!table_recording.Open(location, "table:" + identity))
+			PipelineCacheLog("[tabla-precarga] fichero no valido, se empieza de cero: {}", Common::PathToString(location));
+		const size_t count = table_recording.records.size();
+		auto         stats = table_seed_stats;
+		const auto   mem   = LocalPlatform::ProcessMemory();
+		stats->private_before = mem.private_bytes;
+		stats->working_before = mem.working_set;
+		stats->begin_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+		std::vector<std::shared_ptr<TableJob>> jobs;
+		jobs.reserve(count);
+		for (const auto& words: table_recording.records) {
+			LocalShaderWarmup::Record record;
+			LocalShaderWarmup::Reader reader {words};
+			if (!LocalShaderWarmup::Visit(reader, record) || !LocalShaderWarmup::ValidKey(record)) continue;
+			auto job              = std::make_shared<TableJob>();
+			job->seeded           = true;
+			job->specialization   = record.specialization;
+			job->push_data_cursor = record.push_cursor;
+			job->static_key       = record.static_key;
+			job->code             = std::move(record.code);
+			job->back_code        = std::move(record.back_code);
+			job->user_data.assign(record.user_data_count, 0u); // (as the warmup: values are resolved at each draw)
+			job->vertex           = record.vertex;
+			job->pixel            = record.pixel;
+			job->compute          = record.compute;
+			job->options          = LocalShaderWarmup::Options(record, job->user_data);
+			job->options.table_mode = true;
+			job->options.user_data  = job->user_data;
+			job->options.back_code  = job->back_code;
+			job->options.input_info = {};
+			if (record.stage == ShaderType::Pixel) job->options.input_info.pixel = &job->pixel;
+			else if (record.stage == ShaderType::Compute) job->options.input_info.compute = &job->compute;
+			else job->options.input_info.vertex = &job->vertex;
+			stats->code_bytes.fetch_add((job->code.size() + job->back_code.size()) * sizeof(uint32_t), std::memory_order_relaxed);
+			jobs.push_back(std::move(job));
+		}
+		table_recording.ReleaseLoaded(); // (the jobs hold their inputs; each save copies the rest from the file)
+		table_recording.StartWriter();
+		stats->total.store(jobs.size(), std::memory_order_relaxed);
+		PipelineCacheLog("[tabla-precarga] {} programas en modo tabla grabados ({} validos), a traducir beside the game",
+		                 count, jobs.size());
+		if (jobs.empty()) return;
+		{
+			std::lock_guard lock(table_seed_mutex);
+			for (const auto& job: jobs)
+				table_seeds.emplace(TableSeedKey(job->options.stage, job->options.shader_hash, job->push_data_cursor,
+				                                 job->specialization),
+				                    job);
+		}
+		for (auto& job: jobs) {
+			push_job([job = std::move(job), device = device, stats] {
+				// Little RAM left (under 2 GiB available): a seed nobody took yet is skipped (made when first used).
+				int free = 0;
+				if (LocalPlatform::AvailablePhysicalMemory() < (uint64_t {2} << 30u) &&
+				    job->seed_state.compare_exchange_strong(free, 2, std::memory_order_acq_rel)) {
+					stats->skipped.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					try {
+						Common::RecoverableExitScope recoverable;
+						auto translated = ShaderRecompiler::TranslateProgram(job->code, job->options);
+						job->result     = ShaderRecompiler::CompileProgram(std::move(translated), job->options,
+						                                                   job->specialization, job->push_data_cursor);
+						job->module     = CreateModule(device, job->options, job->result->spirv);
+						job->info       = TakeOnWorker(*job->result);
+						stats->spirv_bytes.fetch_add(job->result->spirv.size() * sizeof(uint32_t), std::memory_order_relaxed);
+						stats->made.fetch_add(1, std::memory_order_relaxed);
+					} catch (const Common::RecoverableExit& refused) {
+						job->refused = refused.message;
+						stats->refused.fetch_add(1, std::memory_order_relaxed);
+					}
+				}
+				job->done.store(true, std::memory_order_release);
+				const auto finished = stats->made.load() + stats->refused.load() + stats->skipped.load();
+				if (finished == stats->total.load(std::memory_order_relaxed)) {
+					const auto mem = LocalPlatform::ProcessMemory();
+					const auto ms  = (std::chrono::steady_clock::now().time_since_epoch().count() -
+					                  stats->begin_ns.load(std::memory_order_relaxed)) /
+					                 1000000;
+					const auto mib = [](uint64_t now, uint64_t before) {
+						return static_cast<long long>((static_cast<int64_t>(now) - static_cast<int64_t>(before)) >> 20);
+					};
+					std::printf("[tabla-precarga] hecho en %lld ms: %llu traducidos, %llu rechazados (igual que en juego), %llu "
+					            "saltados por poca RAM, %llu ya pedidos por el juego; SPIR-V %llu MiB + entradas %llu MiB; RAM "
+					            "del proceso desde el inicio de la precarga: privada %+lld MiB, en uso %+lld MiB (incluye lo que el "
+					            "juego cargo a la vez)\n",
+					            static_cast<long long>(ms), static_cast<unsigned long long>(stats->made.load()),
+					            static_cast<unsigned long long>(stats->refused.load()),
+					            static_cast<unsigned long long>(stats->skipped.load()),
+					            static_cast<unsigned long long>(stats->taken.load()),
+					            static_cast<unsigned long long>(stats->spirv_bytes.load() >> 20u),
+					            static_cast<unsigned long long>(stats->code_bytes.load() >> 20u),
+					            mib(mem.private_bytes, stats->private_before), mib(mem.working_set, stats->working_before));
+					std::fflush(stdout);
+				}
+			});
+		}
+	}
 
 	struct SourceEntry {
 		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
@@ -766,7 +1034,11 @@ struct PipelineCache::ProgramCache {
 			entry->plan_loading = false;
 			if (!entry->plan_out || loaded.linear != (entry->plan_linear != nullptr)) continue;
 			RestorePlan(*entry, std::move(loaded.plan));
-			entry->plan_use       = plan_clock;
+			entry->plan_use = plan_clock;
+			if (PlanBudgetSet()) {
+				const uint32_t age = PlanIdleFlips() - PlanPreloadGraceFlips(); // (ram7: idle once the grace is over)
+				entry->plan_use    = plan_clock - std::min(plan_clock, age);
+			}
 			entry->plan_preloaded = true;
 			plan_preloads++;
 		}
@@ -802,17 +1074,19 @@ struct PipelineCache::ProgramCache {
 	void SweepPlans() {
 		// (KYTY_PLAN_IDLE_FLIPS=<n>: another idle time, and a sweep each n/30 flips: a test of plans leaving and coming
 		// back all the time.)
-		static const uint32_t PlanIdleFlips = [] {
-			const char* value = std::getenv("KYTY_PLAN_IDLE_FLIPS");
-			return value != nullptr && *value != '\0' ? std::max(30u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
-			                                          : 3600u;
-		}();
+		const uint32_t IdleFlips = PlanIdleFlips(); // (ram7: a function of its own, the same value)
 		static constexpr uint32_t PlanWritesPerSweep = 4;
-		const uint32_t            PlanSweepFlips     = PlanIdleFlips / 30u;
+		const uint32_t            PlanSweepFlips     = IdleFlips / 30u;
 		DrainLoadedPlans();
 		if (!PlanEvictionEnabled() || ++plan_clock % PlanSweepFlips != 0) return;
 		// (RAM the system does not report: a budget of 0, every idle plan leaves.)
+		// (ram5) KYTY_PLAN_BUDGET_MB=<n> (unset: 1/128 of the RAM, as before): plans kept in memory by that many MiB, at
+		// 77 KiB a plan (the prefetch's mean: 1146 MiB for 15153 plans). On 64 GB the default is 512 MiB (~6800 plans):
+		// no plan ever left ("Shader plans: 0 out of memory at the end"). Only idle ones leave (KYTY_PLAN_IDLE_FLIPS,
+		// 3600 flips) and come back from the scratch file when used (on the workers first: PreloadPlans).
 		static const size_t budget = [] {
+			if (const char* value = std::getenv("KYTY_PLAN_BUDGET_MB"); value != nullptr && *value != '\0')
+				return static_cast<size_t>((std::strtoull(value, nullptr, 10) << 20u) / (77u * 1024u));
 			const uint64_t ram = LocalPlatform::PhysicalMemory();
 			return static_cast<size_t>(ram / 128u / (77u * 1024u));
 		}();
@@ -822,7 +1096,7 @@ struct PipelineCache::ProgramCache {
 			(void)key;
 			if (source.plan_out) continue;
 			in_memory++;
-			if (plan_clock - source.plan_use >= PlanIdleFlips) idle.push_back(&source);
+			if (plan_clock - source.plan_use >= IdleFlips) idle.push_back(&source);
 		}
 		if (in_memory <= budget || idle.empty()) return;
 		std::ranges::sort(idle, {}, [](const SourceEntry* source) { return source->plan_use; });
@@ -894,8 +1168,9 @@ struct PipelineCache::ProgramCache {
 			std::atomic<uint8_t>                              state {Pending};
 			std::atomic<uint32_t>                             worker {0};      // (ds-pc-port44) its translating thread
 			std::atomic<bool>                                 boosted {false}; // (raised for the render thread waiting)
-			std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
-			std::vector<PrefetchedModule>                     modules;
+			// (up1120, upstream 5d4487f: held apart; an empty optional took a ResourcePlan's 520 bytes in each group.)
+			std::unique_ptr<ShaderRecompiler::IR::ResourcePlan> plan;
+			std::vector<PrefetchedModule>                       modules;
 			// The plan in the scratch file instead (zstd-compressed ResourcePlanSerial bytes): `plan` stays empty until
 			// the game takes the group over (LoadSpilledPlan). Its linear SRT plan stays here: rebuilding it (its code
 			// generated, its AOT function looked up) took ~1 ms of the render thread's per plan; the plan's values ~0.2.
@@ -1012,13 +1287,95 @@ struct PipelineCache::ProgramCache {
 		for (const auto& output: info.outputs) n += output.debug_name.capacity() > 15 ? output.debug_name.capacity() + 1 : 0;
 		return n;
 	}
+	// (ram5) A resident plan's heap bytes, as AddGroupMemory counts them (values, memory infos, the rest, its info).
+	static uint64_t PlanBytes(const ShaderRecompiler::IR::ResourcePlan& plan) {
+		uint64_t n = 0;
+		for (const auto& inst: plan.value_storage)
+			n += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
+			     inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
+		n += Capacity(plan.memory_info) + Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
+		     Capacity(plan.materialization_sources) + Capacity(plan.srt_reads) + Capacity(plan.clean_flat_slots);
+		for (const auto& block: plan.control_flow) n += Capacity(block.successors) + Capacity(block.sources);
+		return n + InfoBytes(plan.info);
+	}
+	// (ram5, KYTY_RAM_LINE=1; render thread, the cache's lock held) Every 60 s: what the program cache holds. One plan in
+	// 16 is measured (PlanBytes) and the rest counted at their mean: ~1 ms a minute.
+	void RamCensus(size_t graphics_pipelines, size_t compute_pipelines, size_t pending) {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_RAM_LINE");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (!on) return;
+		// (tiron13, KYTY_TIRON13=1) Not on the render thread: 20261120-022835, its first pass took 154.7 ms under the cache's
+		// lock at a flip (the 183.8 ms frame: 63% of the samples in RamCensus <- PromoteFinished <- CommandProcessor::Flip).
+		// A diagnostic only: the "[ram]" line (system calls) stays.
+		static const bool skip = [] {
+			const char* v = std::getenv("KYTY_TIRON13");
+			const bool  set = v == nullptr || v[0] != '0'; // (picos) on by default
+			std::printf("[tiron13] censo de la cache de pipelines en el hilo de render: %s\n", set ? "QUITADO (KYTY_TIRON13=1)" : "cada 60 s");
+			std::fflush(stdout);
+			return set;
+		}();
+		if (skip) return;
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(60)) return;
+		last = now;
+		const auto begin = now;
+		size_t   in_memory = 0, out = 0, measured = 0, permutations = 0, prefetched = 0, jobs = 0, n = 0;
+		// (ram7) Plans in memory by their last use: within 10 s, 30 s, 60 s (600, 1800, 3600 flips; at most what a budget
+		// can keep without reloads while playing), and brought back by a worker and not used since.
+		size_t used_10 = 0, used_30 = 0, used_60 = 0, preloaded_unused = 0;
+		uint64_t measured_bytes = 0, warm_bytes = 0, spilled_bytes = 0, info_bytes = 0;
+		for (const auto& [key, source]: programs) {
+			(void)key;
+			if (source.plan_out) {
+				out++;
+			} else {
+				in_memory++;
+				const uint32_t age = plan_clock - std::min(plan_clock, source.plan_use);
+				used_10 += age < 600u ? 1 : 0;
+				used_30 += age < 1800u ? 1 : 0;
+				used_60 += age < 3600u ? 1 : 0;
+				preloaded_unused += source.plan_preloaded ? 1 : 0;
+				if (n++ % 16 == 0) {
+					measured++;
+					measured_bytes += PlanBytes(source.resource_plan);
+				}
+			}
+			spilled_bytes += source.plan_spilled.bytes;
+			permutations += source.permutations.size();
+			for (const auto& permutation: source.permutations) info_bytes += InfoBytes(permutation.program.info);
+			prefetched += source.prefetched.size();
+			for (const auto& module: source.prefetched) info_bytes += InfoBytes(module.program.info);
+			jobs += source.table_jobs.size();
+			warm_bytes += Capacity(source.warm_code) + Capacity(source.warm_back_code);
+		}
+		const uint64_t plan_bytes = measured != 0 ? measured_bytes / measured * in_memory : 0;
+		const auto*    p          = prefetch_live.load(std::memory_order_acquire);
+		std::printf("Heap census, pipeline cache (KYTY_RAM_LINE=1, %.1f ms): %zu programs; plans in memory %zu = ~%llu MiB "
+		            "(%llu KiB each, %zu measured), out %zu (%llu MiB written to the scratch file, not RAM); permutations %zu, prefetched not "
+		            "used %zu, their infos %llu MiB; table jobs %zu; warm code %llu MiB; pipelines graphics %zu compute %zu "
+		            "pending %zu; prefetch groups %zu; JIT %llu MiB (KYTY_PLAN_BUDGET_MB: plans kept)\n",
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), programs.size(),
+		            in_memory, static_cast<unsigned long long>(plan_bytes >> 20u),
+		            static_cast<unsigned long long>(measured != 0 ? measured_bytes / measured >> 10u : 0), measured, out,
+		            static_cast<unsigned long long>(spilled_bytes >> 20u), permutations, prefetched,
+		            static_cast<unsigned long long>(info_bytes >> 20u), jobs, static_cast<unsigned long long>(warm_bytes >> 20u),
+		            graphics_pipelines, compute_pipelines, pending, p != nullptr ? p->groups.size() : size_t {0},
+		            static_cast<unsigned long long>(JitArena::Used() >> 20u));
+		std::printf("Heap census, plans in memory by last use: %zu within 10 s, %zu within 30 s, %zu within 60 s; %zu brought "
+		            "back beside the render thread and not used since (KYTY_PLAN_IDLE_FLIPS %u, KYTY_PLAN_BUDGET_MB %s)\n",
+		            used_10, used_30, used_60, preloaded_unused, PlanIdleFlips(), PlanBudgetSet() ? "set" : "unset");
+	}
 	static void AddGroupMemory(Prefetch& p, const Prefetch::Group& group) {
 		std::array<uint64_t, PrefetchMemoryParts> n {};
 		n[MemGroup] = sizeof(group) + Capacity(group.records) + Capacity(group.modules);
 		if (group.plan) {
+			n[MemGroup] += sizeof(*group.plan);
 			const auto& plan = *group.plan;
 			for (const auto& inst: plan.value_storage)
-				n[MemPlanValues] += sizeof(inst) + 2 * sizeof(void*) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
+				n[MemPlanValues] += sizeof(inst) + inst.NumArgs() * sizeof(ShaderRecompiler::IR::Value) +
 				                    inst.NumPhiBlocks() * sizeof(void*) + inst.Uses().capacity() * sizeof(ShaderRecompiler::IR::Use);
 			n[MemPlanMemoryInfo] = Capacity(plan.memory_info);
 			n[MemPlanOther]      = Capacity(plan.descriptor_sources) + Capacity(plan.control_flow) +
@@ -1097,6 +1454,7 @@ struct PipelineCache::ProgramCache {
 				if (recorded.empty()) return;
 				p.inputs.records.clear();
 			}
+			p.inputs.KeepRecordsOnly(); // (the records alone are read: the recipes go)
 			const std::unordered_set<ProgramKey, ProgramKeyHash> skip(warm.begin(), warm.end());
 			for (uint32_t i = 0; i < p.inputs.records.size() && !p.stop.load(std::memory_order_relaxed); ++i) {
 				LocalShaderWarmup::Record record;
@@ -1262,6 +1620,7 @@ struct PipelineCache::ProgramCache {
 				                 p.spilled_plans.load(std::memory_order_relaxed),
 				                 p.spilled_plan_bytes.load(std::memory_order_relaxed) >> 20u,
 				                 p.spill_verify_failures.load(std::memory_order_relaxed));
+				Libs::Trim::AfterShaderPrefetch(); // (recorte1: KYTY_TRIM=1, the heap pass on its own thread)
 			}
 		}
 	}
@@ -1367,7 +1726,7 @@ struct PipelineCache::ProgramCache {
 	}
 	// The plan SpillPlan wrote, back in the group (render thread, the group taken over); false when it cannot be read.
 	bool LoadSpilledPlan(Prefetch::Group& group) {
-		if (group.plan || group.plan_bytes == 0) return group.plan.has_value();
+		if (group.plan || group.plan_bytes == 0) return group.plan != nullptr;
 		const auto begin = std::chrono::steady_clock::now();
 		std::vector<char>    packed(group.plan_bytes);
 		std::vector<uint8_t> bytes(group.plan_raw);
@@ -1381,7 +1740,7 @@ struct PipelineCache::ProgramCache {
 		const auto values = std::chrono::steady_clock::now();
 		if (linear != (group.plan_linear != nullptr)) return false;
 		plan.linear_srt = std::move(group.plan_linear);
-		group.plan.emplace(std::move(plan));
+		group.plan      = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(plan));
 		const auto end = std::chrono::steady_clock::now();
 		prefetch->plan_read_ms += std::chrono::duration<double, std::milli>(read - begin).count();
 		prefetch->plan_values_ms += std::chrono::duration<double, std::milli>(values - read).count();
@@ -1403,11 +1762,21 @@ struct PipelineCache::ProgramCache {
 	// options: what TranslateProgram and CompileProgram read).
 	uint64_t DiskKey(const Prefetch& p, const Prefetch::Group& group) const {
 		uint64_t h = 0x6b79747973707631ull; // (chained: each record's words seeded with the hash so far, and its length)
+		bool rtq2 = false;
+		bool onda3 = false;
 		for (const auto index: group.records) {
 			const auto& words = p.inputs.records[index];
 			h = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), h ^ (static_cast<uint64_t>(words.size()) << 32u));
+			// (rtq2) With the IBL patch on, the group holding the IBL's code is keyed apart: its patched translation is
+			// made and stored beside the unpatched one (which stays for the patch off).
+			if (!rtq2 && ShaderRecompiler::Rtq2Patch::IblOn())
+				rtq2 = ShaderRecompiler::Rtq2Patch::HoldsIblSignature({words.data(), words.size()});
+			// (onda3) Same for the TAA patch (KYTY_ONDA_JUEGO=1).
+			if (!onda3 && ShaderRecompiler::Rtq2Patch::TaaOn())
+				onda3 = ShaderRecompiler::Rtq2Patch::HoldsTaaSignature({words.data(), words.size()});
 		}
-		return h;
+		if (onda3) h ^= 0x6f6e646133544141ull;
+		return rtq2 ? h ^ 0x7274713249424c31ull : h;
 	}
 
 	// The group from the disk store: its plan and modules (their SPIR-V into the scratch file, as a translation's).
@@ -1455,7 +1824,7 @@ struct PipelineCache::ProgramCache {
 			modules.push_back(std::move(m));
 		}
 		if (at != payload.size()) return false;
-		group.plan    = std::move(plan);
+		if (plan) group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(std::move(*plan)); // (up1120)
 		group.modules = std::move(modules);
 		const auto hits = p.disk_hits.fetch_add(1, std::memory_order_relaxed) + 1;
 		if (hits == 1 || hits % 5000 == 0) PipelineCacheLog("Shader prefetch: {} programs taken from the disk store", hits);
@@ -1479,7 +1848,9 @@ struct PipelineCache::ProgramCache {
 				// Inputs the recompiler rejects (code the game never runs) are left out, as the precompile did.
 				Common::RecoverableExitScope recoverable;
 				auto translated = ShaderRecompiler::TranslateProgram(record.code, options);
-				if (!group.plan) group.plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+				if (!group.plan)
+					group.plan = std::make_unique<ShaderRecompiler::IR::ResourcePlan>(
+					    ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
 				ShaderRecompiler::IR::CanonicalizeSpecialization(translated.program.info, record.specialization);
 				auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, record.specialization,
 				                                               record.push_cursor);
@@ -1886,10 +2257,18 @@ struct PipelineCache::ProgramCache {
 				return layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 				    push_data_cursor, layout.ShaderDataDwords());
 			};
+			// (tiron11) The hash first: a full compare (vectors of buffers and images) only where it matches.
+			// 20261120-020146, the 237.7 ms frame: ProgramCache::Get<Compute> 9% of the render thread's samples in
+			// ResourceSpecialization::operator== (and 5-5-3% in the 276.2 ms one, through GetGraphicsPrograms).
+			const uint64_t wanted_hash = Tiron11On() ? SpecializationHash(active_specialization) : 0;
 			const auto find_permutation = [&] { return std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
-				        return candidate.table_mode == table_mode && compatible_push_data(candidate) &&
-				               candidate.specialization == active_specialization;
+				        if (candidate.table_mode != table_mode || !compatible_push_data(candidate)) return false;
+				        if (wanted_hash != 0) {
+					        if (candidate.spec_hash == 0) candidate.spec_hash = SpecializationHash(candidate.specialization);
+					        if (candidate.spec_hash != wanted_hash) return false;
+				        }
+				        return candidate.specialization == active_specialization;
 			        }); };
 			// A borrowed specialization comes from the guard: the permutation it
 			// selected under the same publication is still the right one.
@@ -1951,10 +2330,17 @@ struct PipelineCache::ProgramCache {
 		// by a compile worker (table_pending until then); a refused one keeps an empty permutation.
 		if (table_mode) {
 			if (entry == programs.end()) return {};
-			auto&      jobs  = entry->second.table_jobs;
-			const auto found = std::ranges::find_if(jobs, [&](const auto& job) {
+			auto& jobs  = entry->second.table_jobs;
+			auto  found = std::ranges::find_if(jobs, [&](const auto& job) {
 				return job->push_data_cursor == push_data_cursor && job->specialization == table_specialization;
 			});
+			// (TABLA-PRECARGA) Its translation started at start-up from the recording: taken as this draw's job.
+			if (found == jobs.end()) {
+				if (auto seed = TakeTableSeed(stage, params, lookup_key.static_state, push_data_cursor, table_specialization)) {
+					jobs.push_back(std::move(seed));
+					found = jobs.end() - 1;
+				}
+			}
 			if (found == jobs.end()) {
 				auto job              = std::make_shared<TableJob>();
 				job->specialization   = table_specialization;
@@ -2010,6 +2396,7 @@ struct PipelineCache::ProgramCache {
 				                                ShaderRecompiler::IR::ResourceSpecialization {table_specialization},
 				                                job->module);
 				permutation.table_mode = true;
+				RecordTableJob(*job, lookup_key.static_state); // (TABLA-PRECARGA)
 			} else {
 				static std::atomic<uint32_t> reports {0};
 				if (reports.fetch_add(1, std::memory_order_relaxed) < 200)
@@ -2149,6 +2536,7 @@ struct PipelineCache::ProgramCache {
 	// (default SpareThreads).
 	static uint32_t WarmupThreads(bool background) {
 		uint32_t threads = background ? SpareThreads() : 1;
+		if (background && Tiron6::On()) threads = Tiron6::Threads(threads, LocalPlatform::AvailablePhysicalMemory()); // (tiron6)
 		const char* name = background ? "KYTY_SHADER_WARMUP_BACKGROUND_THREADS" : "KYTY_SHADER_WARMUP_THREADS";
 		if (const char* value = std::getenv(name); value && *value) {
 			const auto end    = value + std::strlen(value);
@@ -2196,8 +2584,9 @@ struct PipelineCache::ProgramCache {
 	class WarmWorkers {
 	public:
 		WarmWorkers(vk::Device device, std::span<const std::span<const uint32_t>> records, uint32_t threads,
-		            bool background)
-		    : device(device), records(records), jobs(records.size()), ready(records.size()), background(background) {
+		            bool background, const std::vector<uint8_t>* only = nullptr)
+		    : device(device), records(records), jobs(records.size()), ready(records.size()), background(background),
+		      only(only) {
 			for (uint32_t t = 0; t < threads; ++t) pool.emplace_back([this] { Run(); });
 		}
 		~WarmWorkers() {
@@ -2235,7 +2624,9 @@ struct PipelineCache::ProgramCache {
 				}
 				if (stop.load(std::memory_order_relaxed)) return;
 				const size_t index = WarmOrder(n, jobs.size(), background);
-				jobs[index]        = PrepareWarmJob(device, records[index]);
+				// (tiron1: the records asked for only; the others are taken as invalid, at once.)
+				if (only == nullptr || (index < only->size() && (*only)[index] != 0))
+					jobs[index] = PrepareWarmJob(device, records[index]);
 				ready[index].store(1, std::memory_order_release);
 				ready[index].notify_one();
 			}
@@ -2245,6 +2636,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<std::unique_ptr<WarmJob>>      jobs;
 		std::vector<std::atomic<uint8_t>>          ready;
 		bool                                       background = false;
+		const std::vector<uint8_t>*                only       = nullptr; // (tiron1) the records to translate (null: all)
 		std::atomic<size_t>                        taken {0};
 		std::atomic<size_t>                        consumed {0};
 		std::atomic<bool>                          stop {false};
@@ -2291,7 +2683,9 @@ struct PipelineCache::ProgramCache {
 		return found != entry->second.permutations.end() ? &*found : nullptr;
 	}
 
-	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop) {
+	// (tiron1) `only`: the records to translate (null: all); the others keep a null permutation.
+	void TranslateWarmup(Common::Mutex& mutex, bool background, const std::atomic<bool>& stop,
+	                     const std::vector<uint8_t>* only = nullptr) {
 		const auto begin = std::chrono::steady_clock::now();
 		// 0 means all recorded inputs. A caller can explicitly bound startup time.
 		uint32_t budget_seconds = 0;
@@ -2312,9 +2706,9 @@ struct PipelineCache::ProgramCache {
 			const auto parsed = std::from_chars(value, end, translate_seconds);
 			if (parsed.ec != std::errc {} || parsed.ptr != end || translate_seconds > 3600) translate_seconds = 0;
 		}
-		const char* only               = std::getenv("KYTY_SHADER_WARMUP_ONLY");
+		const char* only_env           = std::getenv("KYTY_SHADER_WARMUP_ONLY");
 		auto        translate_deadline = background ? std::chrono::steady_clock::time_point::max() : warm_deadline;
-		if (!background && translate_seconds != 0 && (only == nullptr || std::string_view(only) != "1"))
+		if (!background && translate_seconds != 0 && (only_env == nullptr || std::string_view(only_env) != "1"))
 			translate_deadline = std::min(translate_deadline, begin + std::chrono::seconds(translate_seconds));
 		const size_t count = warm_records.size();
 		warm_permutations.assign(count, nullptr);
@@ -2325,7 +2719,7 @@ struct PipelineCache::ProgramCache {
 		const uint32_t threads = WarmupThreads(background);
 		PipelineCacheLog("Shader warmup: {} threads of {} CPUs", threads, LocalPlatform::AllCpus()); // (ds-pc-port47)
 		std::optional<WarmWorkers> workers;
-		if (threads > 1 || background) workers.emplace(device, warm_records, threads, background);
+		if (threads > 1 || background) workers.emplace(device, warm_records, threads, background, only);
 		for (size_t n = 0; n < count; ++n) {
 			if (stop.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= translate_deadline) {
 				left = count - n;
@@ -2334,6 +2728,7 @@ struct PipelineCache::ProgramCache {
 			if (!background) StartupProgress::Report("Preparing shaders", n, count);
 			warm_done.store(n, std::memory_order_relaxed);
 			const size_t index = WarmOrder(n, count, background);
+			if (!workers && only != nullptr && (index >= only->size() || (*only)[index] == 0)) continue; // (tiron1)
 			const auto   job   = workers ? workers->Take(index) : PrepareWarmJob(device, warm_records[index]);
 			if (!job) continue;
 			auto&          record = job->record;
@@ -2450,6 +2845,7 @@ struct PipelineCache::PendingComputePipeline {
 	std::unique_ptr<Pipeline> pipeline = std::make_unique<Pipeline>();
 	ShaderComputeInputInfo    input_info;
 	vk::ShaderModule          module = nullptr;
+	bool                      from_store = false; // (render2) the worker's LastPipelineFromStore, read once done
 	std::atomic<bool>         done {false};
 };
 
@@ -2476,6 +2872,13 @@ public:
 		for (uint32_t i = 0; i < count; i++)
 			m_threads.emplace_back([this] {
 				if (m_background) LocalPlatform::MakeShaderWorkerThread(); // (ds-pc-port47: every CPU)
+				// (picos2) Off the game's CPUs (KYTY_GAME_CPUS, the V-Cache CCD) when the port set them: ~20 translators on
+				// every CPU took the game threads' cores (tiron3 21-11: a 125 ms frame, game threads at 46-62%).
+				// KYTY_SHADER_OFF_GAME=0: every CPU, as before.
+				if (m_background) {
+					const char* off = std::getenv("KYTY_SHADER_OFF_GAME");
+					if (off == nullptr || off[0] != '0') LocalPlatform::AvoidCpuList(std::getenv("KYTY_GAME_CPUS"));
+				}
 				Run();
 			});
 	}
@@ -2495,20 +2898,42 @@ public:
 		}
 		m_wake.notify_one();
 	}
+	// (render2) Ahead of the queued jobs: a pipeline the GPU thread skips work for until it is made.
+	void PushFront(std::function<void()> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_jobs.push_front(std::move(job));
+		}
+		m_wake.notify_one();
+	}
 
 private:
 	void Run() {
+		// A thread idle for IdleRelease after a job gives the translator's per-thread scratch back (ShaderRecompiler::
+		// ReleaseThreadScratch): kept between a burst's programs, a buffer of it is up to ~8 MiB, and every thread of these
+		// pools that once translated a big program held them for the rest of the session (at 1-1: decode vectors of 4-7
+		// MiB and SPIR-V sections of 1-3 MiB, ~35 MiB).
+		constexpr auto IdleRelease = std::chrono::seconds(5);
+		bool           worked      = false;
 		for (;;) {
 			std::function<void()> job;
 			{
 				std::unique_lock lock(m_mutex);
-				m_wake.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
+				const auto       ready = [this] { return m_stop || !m_jobs.empty(); };
+				if (worked && !m_wake.wait_for(lock, IdleRelease, ready)) {
+					lock.unlock();
+					ShaderRecompiler::ReleaseThreadScratch();
+					worked = false;
+					lock.lock();
+				}
+				m_wake.wait(lock, ready);
 				// Queued jobs still run at shutdown: their pipelines are destroyed with the rest.
 				if (m_jobs.empty() || (m_stop && m_background)) return;
 				job = std::move(m_jobs.front());
 				m_jobs.pop_front();
 			}
 			job();
+			worked = true;
 		}
 	}
 
@@ -2590,6 +3015,8 @@ void PipelineCache::PromoteFinished() {
 	Common::LockGuard lock(m_mutex);
 	PromoteOptimized();
 	m_program_cache->SweepPlans();
+	m_program_cache->RamCensus(m_graphics_pipelines.size(), m_compute_pipelines.size(),
+	                           m_pending_graphics_pipelines.size() + m_pending_compute_pipelines.size());
 	EvictIdlePipelines();
 }
 
@@ -2637,6 +3064,11 @@ struct EvictSettings {
 	bool                     on     = true;
 	bool                     always = false;
 	std::chrono::nanoseconds idle   = std::chrono::seconds(180);
+	// (11-23, barrido1) KYTY_PIPELINE_EVICT_BUDGET_US: the render thread's time a check may spend destroying pipelines
+	// (default 1500 us; 0 = the old limit of 256 a check whatever the time). vkDestroyPipeline cost 0.4-0.8 ms on the
+	// NVIDIA driver: a 16 GB run's sweep of a world left (1,750 pipelines, 256 a check every 60 flips) made 7 frames of
+	// 69-212 ms in a row (log 20261123-060740, lines 31929-32233). The rest go at the next checks.
+	int64_t                  budget_us = 1500;
 };
 const EvictSettings& PipelineEvictSettings() {
 	static const EvictSettings settings = [] {
@@ -2652,6 +3084,8 @@ const EvictSettings& PipelineEvictSettings() {
 		}
 		if (seconds != nullptr && *seconds != '\0')
 			out.idle = std::chrono::seconds(std::max<uint64_t>(std::strtoull(seconds, nullptr, 10), 5));
+		if (const char* budget = std::getenv("KYTY_PIPELINE_EVICT_BUDGET_US"); budget != nullptr && *budget != '\0')
+			out.budget_us = static_cast<int64_t>(std::strtoll(budget, nullptr, 10));
 		return out;
 	}();
 	return settings;
@@ -2683,27 +3117,42 @@ bool KeepsRemake(GraphicContext& graphics, PipelineCache::Pipeline& pipeline, bo
 }
 } // namespace
 
-// What a graphics pipeline is made of, as its remake keeps it (~11 KB: the vertex input info's 32 resource slots), without
-// the draw's resource values (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
+// What a graphics pipeline is made of, as its remake keeps it, without the draw's resource values
+// (ShaderStageRuntime::resources: no part of the pipeline). Cold memory once made.
 struct PipelineCache::GraphicsMakeInputs {
 	PipelineRenderingState   rendering;
 	PipelineVertexInputState vertex_input;
 	PipelineStaticParameters static_params;
-	ShaderVertexInputInfo    vs_input_info;
 	ShaderPixelInputInfo     ps_input_info;
 	ShaderProgram            vertex_program;
 	ShaderProgram            pixel_program;
 	bool                     ps_active       = false;
 	bool                     native_bindings = false;
 	bool                     table           = false; // the table pipelines' driver cache
+	// The vertex input info as a warmup record holds it (LocalShaderWarmup::VisitVertexInput: what pipeline creation
+	// reads of it), and its program. Whole, its three 32-slot arrays made ~10 KB of a remake's ~11 (16 GB policy at 1-1:
+	// 1,337 remakes held 14.6 MiB, growing with the pipelines of every world played).
+	std::vector<uint32_t>                           vs_input_words;
+	const ShaderRecompiler::IR::CompiledShaderInfo* vs_program = nullptr;
+
+	void SetVertexInput(const ShaderVertexInputInfo& info) {
+		LocalShaderWarmup::Writer writer; // (only reads it)
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(writer, const_cast<ShaderVertexInputInfo&>(info)));
+		vs_input_words = std::move(writer.words);
+		vs_input_words.shrink_to_fit();
+		vs_program = info.stage.program;
+	}
 };
 
 std::shared_ptr<const std::function<void(PipelineCache::Pipeline&)>>
 PipelineCache::GraphicsRemake(GraphicsMakeInputs inputs) {
-	inputs.vs_input_info.stage.resources = {};
 	inputs.ps_input_info.stage.resources = {};
 	return std::make_shared<const std::function<void(Pipeline&)>>([this, in = std::move(inputs)](Pipeline& target) {
-		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, in.vs_input_info, in.vertex_program,
+		const auto                vs_input_info = std::make_unique<ShaderVertexInputInfo>();
+		LocalShaderWarmup::Reader reader {in.vs_input_words};
+		EXIT_IF(!LocalShaderWarmup::VisitVertexInput(reader, *vs_input_info) || reader.cursor != in.vs_input_words.size());
+		vs_input_info->stage.program = in.vs_program;
+		CreatePipelineInternal(m_graphics, target, in.rendering, in.vertex_input, *vs_input_info, in.vertex_program,
 		                       in.ps_active ? &in.ps_input_info : nullptr, in.pixel_program, in.static_params,
 		                       in.table ? TablePipelineCache() : m_driver_cache, in.native_bindings, PipelineBuild::Full);
 	});
@@ -2751,6 +3200,12 @@ void PipelineCache::EvictIdlePipelines() {
 	const uint32_t     flip         = g_pipeline_flip.fetch_add(1, std::memory_order_relaxed) + 1;
 	const auto         now          = std::chrono::steady_clock::now();
 	m_flip_times[flip % m_flip_times.size()] = now.time_since_epoch().count();
+	if (flip % CheckFlips == 0) { // (RECURSOS-JUSTOS: the [recursos] line's pipelines; under m_mutex here)
+		VramRecursos::g_graphics.store(m_graphics_pipelines.size(), std::memory_order_relaxed);
+		VramRecursos::g_compute.store(m_compute_pipelines.size(), std::memory_order_relaxed);
+		VramRecursos::g_expulsados.store(g_pipeline_evictions.evicted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		VramRecursos::g_rehechos.store(g_pipeline_evictions.remade.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	}
 	// A world the game left (SceneTags::Enter; with 20 GiB of RAM or less, SweepsWorldsLeft): once the one it went to was
 	// played for SceneSettle, the pipelines no
 	// binding used since the change - and none of the new world's recorded ones, which the warmup made for its places not
@@ -2770,7 +3225,11 @@ void PipelineCache::EvictIdlePipelines() {
 		m_scene_since      = now;
 		m_scene_swept      = false;
 	}
-	if (!settings.on || flip % CheckFlips != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
+	// (barrido1) While a world left is being swept a little at a time (the destroy budget), a check every 6 flips: the
+	// sweep ends in about half a minute instead of minutes, ~1.5 ms every 6 frames on the render thread.
+	const bool     sweep_pending = settings.budget_us > 0 && SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
+	const uint32_t every         = sweep_pending ? 6u : CheckFlips;
+	if (!settings.on || flip % every != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
 	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);
@@ -2786,7 +3245,10 @@ void PipelineCache::EvictIdlePipelines() {
 		const auto idle_evicted = g_pipeline_evictions.evicted.load(std::memory_order_relaxed) -
 		                          g_pipeline_evictions.scene.load(std::memory_order_relaxed);
 		const auto remade = g_pipeline_evictions.remade.load(std::memory_order_relaxed);
-		if (idle_evicted >= MinIdleSample && remade * 4 >= idle_evicted) {
+		// (VG-AB, 11-25) Log 20261125-102943 (grupo VRAM): 2053 expulsados, 329 rehechos (16 %, 271 ms en el hilo de
+		// render, hasta 5,5 ms cada uno) y el driver siguio en 844 MiB ([recursos]): expulsar no devolvio VRAM. Corte al
+		// 1/8 rehecho en vez de 1/4.
+		if (idle_evicted >= MinIdleSample && remade * 8 >= idle_evicted) {
 			m_idle_evict_off = true;
 			std::printf("Pipelines out of video memory while idle: %llu of the %llu evicted made again (%.0f ms): none "
 			            "evicted while idle from here on\n",
@@ -2795,6 +3257,21 @@ void PipelineCache::EvictIdlePipelines() {
 			std::fflush(stdout);
 		}
 	}
+	// (PIPE-INACTIVOS, 11-25) KYTY_PIPE_INACTIVOS (apagado por defecto; =1 como antes): sin expulsar pipelines por
+	// inactividad con la VRAM al limite. Expulsar no devuelve VRAM en NVIDIA (el driver se queda su monton de codigo):
+	// log 20261125-195442-560, 993 expulsados y la parte del driver siguio en 1763 MiB; 555 rehechos (725 ms en el hilo
+	// de render, hasta 6,5 ms cada uno). Log 20261125-102943: 2053 expulsados, driver 844 MiB antes y despues. Los
+	// mundos dejados (SweepsWorldsLeft) siguen yendose, y KYTY_PIPELINE_EVICT=2 / KYTY_RAM_DIET siguen igual.
+	static const bool inactivos = [] {
+		const char* v = std::getenv("KYTY_PIPE_INACTIVOS");
+		const bool  r = v != nullptr && v[0] == '1';
+		std::printf("[pipe-inactivos] KYTY_PIPE_INACTIVOS=%d: %s (ahorro de memoria medido: 0 MiB de VRAM; evita los rehechos: "
+		            "725 ms y hasta 6,5 ms por pipeline en el log 195442)\n",
+		            r ? 1 : 0, r ? "pipelines inactivos expulsados con la VRAM al limite (como antes)" : "no se expulsan por inactividad");
+		std::fflush(stdout);
+		return r;
+	}();
+	if (!inactivos && !settings.always) m_evict_pressure = false;
 	if (m_idle_evict_off) m_evict_pressure = false;
 	// The RAM diet (KYTY_RAM_DIET=1, opt-in) still evicts, whatever the idle-evict cut-off above. RAM pressure
 	// (ram-guard.h) no longer releases pipelines: only the normal idle eviction runs (a mass release under pressure
@@ -2821,6 +3298,19 @@ void PipelineCache::EvictIdlePipelines() {
 	uint32_t below = 0; // bound in an earlier flip: idle since then
 	if (m_evict_pressure) {
 		auto idle = settings.idle;
+		// (PIPE-VIVOS) KYTY_PIPE_VIVOS (encendido por defecto; =0 lo apaga): con el proceso por ENCIMA del presupuesto real
+		// del driver, los pipelines expulsables sin enlazar en 20 s se van en vez de esperar 180 s. Log 20261125-094604-438
+		// (8 GB): 7182 vivos, driver 763 MiB, uso 107-111 %; de 414 expulsados por inactividad solo 15 se rehicieron (27 ms).
+		static const bool vivos = [] {
+			const char* v = std::getenv("KYTY_PIPE_VIVOS");
+			const bool  r = !(v != nullptr && v[0] == '0');
+			std::printf("[recursos] KYTY_PIPE_VIVOS=%d: por encima del presupuesto, pipelines sin usar en 20 s fuera (=0: 180 s)\n", r ? 1 : 0);
+			std::fflush(stdout);
+			return r;
+		}();
+		// (VG-AB, 11-25) Ya no acorta a 20 s: log 102943 (KYTY_PIPE_VIVOS=1) 329 de 2053 vueltos a usar (271 ms de
+		// tirones) y el driver igual (844 MiB antes y despues). Se queda la espera normal (settings.idle, 180 s).
+		(void)vivos;
 		const auto horizon = (now - idle).time_since_epoch().count();
 		uint32_t   first   = flip - std::min<uint32_t>(flip - 1, static_cast<uint32_t>(m_flip_times.size() - 1)), last = flip;
 		if (m_flip_times[first % m_flip_times.size()] <= horizon) {
@@ -2835,9 +3325,10 @@ void PipelineCache::EvictIdlePipelines() {
 	std::unordered_set<uint64_t> scene_recipes;
 	if (scene_left) scene_recipes = SceneTags::Recipes(SceneTags::Current());
 	size_t     evicted = 0, left = 0;
+	bool       out_of_time = false; // (barrido1) this check's destroy time spent: the rest at the next checks
 	const auto evict   = [&](Pipeline& pipeline) {
-		if (evicted == MaxEvictions || pipeline.pipeline == nullptr || pipeline.remake == nullptr || pipeline.unoptimized ||
-		    pipeline.optimized != nullptr)
+		if (evicted == MaxEvictions || out_of_time || pipeline.pipeline == nullptr || pipeline.remake == nullptr ||
+		    pipeline.unoptimized || pipeline.optimized != nullptr)
 			return;
 		const bool idle  = pipeline.last_flip < below;
 		const bool other = scene_left && pipeline.last_flip < m_prev_scene_flip && !scene_recipes.contains(pipeline.recipe);
@@ -2847,11 +3338,14 @@ void PipelineCache::EvictIdlePipelines() {
 		pipeline.pipeline = nullptr;
 		evicted++;
 		left += idle ? 0 : 1;
+		if (settings.budget_us > 0 &&
+		    std::chrono::steady_clock::now() - now >= std::chrono::microseconds(settings.budget_us))
+			out_of_time = true;
 		if (RamDietEnabled()) g_ram_diet_evicted.fetch_add(1, std::memory_order_relaxed);
 	};
 	for (auto& [key, pipeline]: m_graphics_pipelines) evict(*pipeline);
 	for (auto& [id, pipeline]: m_compute_pipelines) evict(*pipeline);
-	if (scene_left && evicted < MaxEvictions) m_scene_swept = true;
+	if (scene_left && evicted < MaxEvictions && !out_of_time) m_scene_swept = true;
 	g_pipeline_evictions.scene.fetch_add(left, std::memory_order_relaxed);
 	if (scene_left && m_scene_swept) {
 		std::printf("Pipelines of the worlds left (%s for %lld s): %llu evicted in all, %llu made again (%.0f ms)\n",
@@ -2975,6 +3469,13 @@ void PipelineCache::FinishCompileWorkers() {
 		}
 	}
 	m_pending_graphics_pipelines.clear();
+	// (render2) The normal path's compute pipelines a worker finished and no dispatch took: destroyed with the rest.
+	for (auto& [id, pending]: m_pending_normal_compute_pipelines) {
+		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
+			m_compute_pipelines.emplace(id, std::move(pending->pipeline));
+		}
+	}
+	m_pending_normal_compute_pipelines.clear();
 }
 
 // The compiler inputs the static precompile compiled, as a warmup file: what the shader prefetch
@@ -3082,6 +3583,13 @@ static void NoteStaticShardsDone(const std::filesystem::path& driver_cache, uint
 // Live "objects" (live-counters.h): container sizes read from the live thread (counts only, no iteration).
 static PipelineCache* g_live_pipeline_cache = nullptr;
 
+// (ramemu1, KYTY_DRIVER_CACHE_LAZY) The main driver cache file left on disk and a small side cache used instead (path
+// here, empty: off). With the static store's binaries every pipeline of play is made of them (20261123-085737: 4580 of
+// 4580, 0 by the driver), yet NVIDIA copies a loaded cache whole into the process heap: the 233 MB warmed cache sat
+// there unused. The side cache keeps what the store lacks (8 pipelines that session) for the next sessions; the main
+// file is never written over, so a PC without the store or with KYTY_DRIVER_CACHE_LAZY=0 loads it as before.
+static std::filesystem::path g_main_cache_side;
+
 void PipelineCache::ReportObjects(uint64_t id) const {
 	const auto  store    = ModuleStore::Stats();
 	const auto* prefetch = m_program_cache->prefetch_live.load(std::memory_order_acquire);
@@ -3172,6 +3680,16 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		if (low_ram && std::string_view(warmup) == "1")
 			PipelineCacheLog("Shader warmup: recording only (RAM {} MiB)", ram >> 20u);
 		m_program_cache->LoadWarmup(path, title + device, adopt_from);
+		// (TABLA-PRECARGA) The table mode programs of earlier sessions, translated beside the game (on a PC under 30 GB
+		// too: only those the table path used, a fraction of the 3.1 GiB the full warmup took; a worker skips its seed with
+		// under 2 GiB of RAM available). Next to the table pipelines' cache: <cache>.table.inputs.
+		{
+			auto table_inputs = m_table_cache_path;
+			if (!table_inputs.empty()) {
+				table_inputs.replace_extension(".inputs");
+				m_program_cache->StartTableSeeds(table_inputs, title + device);
+			}
+		}
 		// (10-27c) A PC without recorded play (a fresh folder: warmup-v2 empty) whose driver cache the start menu's
 		// precompile did not warm with every static recipe: the static inputs' recipes, compiled beside the game into
 		// the driver cache only (KYTY_STATIC_WARMUP=0: not). Before, such a PC warmed 0 of 0 recipes and compiled every
@@ -3241,6 +3759,29 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 			m_warmup_thread          = std::thread([this, settings] { RunWarmup(settings); });
 		} else {
 			RunWarmup(settings);
+			// (tiron1, KYTY_TIRON1=1) Under 30 GB of RAM no pipeline is made before play: the compute ones, which the
+			// render thread waits for (13-132 ms of a zone's first frames, 0.6-0.75 ms each), beside the game.
+			// (tiron6, KYTY_TIRON6=1: also without KYTY_TIRON1 or with enough RAM, when nothing else warms compute)
+			// (arranque-ligero, KYTY_ARRANQUE_LIGERO=1; off by default) No compute pipelines made before play: log
+			// 20261124-090024 (16 GB): this warm cost +4481 MiB committed / +3710 MiB resident (3631 pipelines, 16.3 s the
+			// game waited) before the title screen. Each one is made from the driver's disk cache the first time it is used.
+			static const bool arranque_ligero = [] {
+				const int  mode = ArranqueLigeroModo();
+				const bool on   = mode != 0;
+				std::printf("[arranque-ligero] %s (KYTY_ARRANQUE_LIGERO=%d): pipelines de compute %s%s\n", on ? "ON" : "off",
+				            mode, on ? "NO se hacen antes de jugar (se hacen al usarse; ~3.7 GB menos de RAM al arrancar)" : "antes de jugar, como siempre",
+				            mode == 2 ? "; graficos criticos (semillas) SI antes de jugar y ningun draw se salta" : "");
+				std::fflush(stdout);
+				return on;
+			}();
+			// (arranque-ligero 2) The thread runs, but makes only the graphics seeds (Tiron1WarmCompute leaves compute out).
+			if ((!arranque_ligero || ArranqueLigeroModo() == 2) && (Tiron1::On() || Tiron6::On()) && (low_ram || !settings.warm_pipelines) && std::string_view(warmup) == "1" &&
+			    !m_warm_cache_only &&
+			    (only == nullptr || std::string_view(only) != "1") && force != "0")
+				m_warmup_thread = std::thread([this, compute_video] { Tiron1WarmCompute(compute_video); });
+			// (tiron6 v2) Before the game starts: this thread waits for those compute pipelines (the splash's bar
+			// shows them), at most KYTY_TIRON6_MAX_S (60 s); past it they go on beside the game, as v1.
+			if (Tiron6::On() && m_warmup_thread.joinable()) Tiron6WaitInFront();
 		}
 	}
 	if (!prefetch_by_warmup) StartShaderPrefetch({});
@@ -3330,6 +3871,7 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		programs.warming = false;
 		programs.ReleaseRetired();
 		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
 		PipelineCacheLog("Shader warmup: done beside the game in {} ms; meanwhile the game translated {} programs itself "
 		                 "({:.0f} ms) and made {} pipelines ({:.0f} ms)",
 		                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count(),
@@ -3346,6 +3888,10 @@ void PipelineCache::RunWarmup(WarmupSettings settings) {
 		    mib(memory_after.working_set, memory_shaders.working_set),
 		    mib(m_graphics.GetDeviceMemoryUsage(), video_before));
 		m_graphics.LogVideoMemory("warmup");
+		{
+			Common::LockGuard lock(m_mutex);
+			programs.warmup.ReleaseLoaded(); // (the recording's words: read from its file from now on)
+		}
 		programs.warmup.StartWriter();
 		if (const char* only = std::getenv("KYTY_SHADER_WARMUP_ONLY"); only && std::string_view(only) == "1") {
 			if (!Save()) {
@@ -3488,7 +4034,8 @@ void PipelineCache::StartShaderPrefetch(std::vector<std::vector<uint32_t>> recor
 
 PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	const auto& programs = *m_program_cache;
-	if (const auto phase = programs.warm_phase.load(std::memory_order_acquire); phase != 0) {
+	if (const auto phase = programs.warm_phase.load(std::memory_order_acquire);
+	    phase != 0 && !m_tiron1_quiet.load(std::memory_order_acquire)) {
 		const auto total = programs.warm_total.load(std::memory_order_relaxed);
 		return {std::min(programs.warm_done.load(std::memory_order_relaxed), total), total,
 		        phase == 1 ? "Preparing recorded shaders" : "Preparing recorded pipelines"};
@@ -3497,6 +4044,179 @@ PipelineCache::PrefetchProgress PipelineCache::GetPrefetchProgress() const {
 	if (prefetch == nullptr || !prefetch->ready.load(std::memory_order_acquire)) return {};
 	const auto total = prefetch->groups.size();
 	return {std::min(prefetch->finished.load(std::memory_order_relaxed), total), total};
+}
+
+// (tiron1, KYTY_TIRON1=1; pipelineCache.h, local/tiron1.h) On m_warmup_thread, beside the game, as WarmScene with the
+// recording read again: its compute recipes only, newest first up to KYTY_TIRON1_COMPUTE_MAX, their records translated
+// (TranslateWarmup, those records only) and their pipelines made (WarmPipelines, the warmup's video memory cap). What the
+// game made meanwhile stays the game's.
+// (tiron6 v2) The caller's thread (start-up, before the game runs) waits for Tiron1WarmCompute: its progress on the
+// splash (the precompile's bar and status line), KYTY_TIRON6_MAX_S at most; then the game starts whatever is left.
+void PipelineCache::Tiron6WaitInFront() {
+	auto&      programs = *m_program_cache;
+	const auto begin    = std::chrono::steady_clock::now();
+	const auto limit    = std::chrono::milliseconds(static_cast<int64_t>(Tiron6::MaxSeconds() * 1000.0));
+	int        last     = -1;
+	while (!Tiron6::g_done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() - begin < limit) {
+		const auto phase = programs.warm_phase.load(std::memory_order_acquire);
+		const auto total = programs.warm_total.load(std::memory_order_relaxed);
+		const auto done  = std::min(programs.warm_done.load(std::memory_order_relaxed), total);
+		// (Shaders first, half the bar; then the pipelines, the other half.)
+		const float part = total == 0 ? 0.0f : static_cast<float>(done) / static_cast<float>(total);
+		const float bar  = phase == 2 ? 0.5f + 0.5f * part : phase == 1 ? 0.5f * part : 0.0f;
+		const int   step = static_cast<int>(bar * 100.0f);
+		if (step != last) {
+			last = step;
+			char text[160];
+			std::snprintf(text, sizeof(text), "Preparando pipelines de compute: %s %zu/%zu (%d %%)",
+			              phase == 2 ? "pipelines" : "shaders", done, total, step);
+			Tiron6::Report(text, bar);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+	const bool done = Tiron6::g_done.load(std::memory_order_acquire);
+	Tiron6::Report(done ? "Iniciando..." : "Iniciando (el resto de pipelines sigue en segundo plano)...", -1.0f);
+	PipelineCacheLog("Tiron6: the game waited {} ms for its compute pipelines ({}; KYTY_TIRON6_MAX_S={})", ms,
+	                 done ? "all made" : "time out: the rest beside the game", Tiron6::MaxSeconds());
+}
+
+void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
+	LocalPlatform::SetThreadName("Kyty.Warmup");
+	auto& programs = *m_program_cache;
+	Tiron1::g_warm_state.store(1, std::memory_order_relaxed);
+	// The shader prefetch first (it translates every program of the game on every thread at start-up): at most 180 s.
+	const auto begin = std::chrono::steady_clock::now();
+	// (tiron6: not waited for. On a 16 GB PC the prefetch stops below 3 GiB free and this wait ran out at 180 s, so these
+	// pipelines were made at the end of the session (log 19-11 19:36: done at line 13269 of 14792) instead of before play.)
+	if (Tiron6::On()) LocalPlatform::MakeShaderWorkerThread(); // (below normal: never against the game's threads)
+	while (!Tiron6::On() && !m_warmup_stop.load(std::memory_order_relaxed) &&
+	       std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
+		const auto progress = GetPrefetchProgress();
+		if (progress.label == nullptr && progress.total != 0 && progress.done >= progress.total) break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	}
+	if (m_warmup_stop.load(std::memory_order_relaxed)) { Tiron6::g_done.store(true); return; }
+	const auto start = std::chrono::steady_clock::now();
+	const auto tiron6_memory = LocalPlatform::ProcessMemory(); // (tiron6: the RAM this costs)
+	std::vector<std::vector<uint32_t>> records, recipes;
+	if (!LocalShaderWarmup::Cache::ReadInputs(m_warmup_path, records, recipes)) {
+		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
+		PipelineCacheLog("Tiron1: compute pipelines before play: the recording could not be read");
+		Tiron6::g_done.store(true);
+		return;
+	}
+	// (tiron6: no 1500 cap - every session made the newest 1500 and still 900-1400 more on use; the seeds, the compute
+	// pipelines the game used in earlier sessions, first.)
+	const auto cap = Tiron6::On() ? SIZE_MAX
+	                              : static_cast<size_t>(Tiron1::EnvNumber("KYTY_TIRON1_COMPUTE_MAX", 1500.0, 0.0, 1000000.0));
+	if (Tiron6::On()) Tiron6::OrderBySeeds(recipes, [](const std::vector<uint32_t>& words) { return LocalShaderWarmup::RecipeKey(words); });
+	std::vector<std::vector<uint32_t>> compute;
+	std::vector<uint8_t>               needed(records.size(), 0);
+	std::unordered_set<uint64_t>       only;
+	// (ram16-t6) 16 GB profile: only the seeds (Tiron6::SeedsOnly, tiron6-seeds.h), when there are enough of them.
+	const bool seeds_only    = Tiron6::On() && Tiron6::SeedsOnly() && Tiron6::SeedCount() >= Tiron6::SeedsOnlyMin();
+	size_t     seeds_skipped = 0;
+	for (auto recorded = recipes.rbegin(); recorded != recipes.rend() && compute.size() < cap; ++recorded) {
+		LocalShaderWarmup::PipelineRecord recipe;
+		LocalShaderWarmup::Reader         reader {*recorded};
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+		if (recipe.compute == LocalShaderWarmup::NoShader) {
+			// (tiron10) A graphics recipe the game made in an earlier session (a seed): warmed too, its programs translated.
+			const auto key = LocalShaderWarmup::RecipeKey(*recorded);
+			if (!Tiron6::On() || !Tiron6::GraphicsOn() || !Tiron6::IsSeed(key) || recipe.vertex >= records.size() ||
+			    (recipe.pixel != LocalShaderWarmup::NoShader && recipe.pixel >= records.size()))
+				continue;
+			if (!only.insert(key).second) continue;
+			needed[recipe.vertex] = 1;
+			if (recipe.pixel != LocalShaderWarmup::NoShader) needed[recipe.pixel] = 1;
+			compute.push_back(std::move(*recorded));
+			continue;
+		}
+		if (recipe.compute >= records.size()) continue;
+		if (ArranqueLigeroModo() == 2) continue; // (arranque-ligero 2: compute made on use, as with 1)
+		if (seeds_only && !Tiron6::IsSeed(LocalShaderWarmup::RecipeKey(*recorded))) { ++seeds_skipped; continue; }
+		if (!only.insert(LocalShaderWarmup::RecipeKey(*recorded)).second) continue;
+		needed[recipe.compute] = 1;
+		compute.push_back(std::move(*recorded));
+	}
+	std::reverse(compute.begin(), compute.end()); // (the recording's order: WarmPipelines takes the newest first)
+	if (Tiron6::On())
+		PipelineCacheLog("[ram16-t6] precarga de pipelines de compute: {} (KYTY_TIRON6_SEEDS_ONLY={}, {} semillas, minimo {}); "
+		                 "recetas sin semilla saltadas {} (se hacen al usarse)",
+		                 seeds_only ? "solo semillas" : "todas las recetas", Tiron6::SeedsOnly() ? 1 : 0, Tiron6::SeedCount(),
+		                 Tiron6::SeedsOnlyMin(), seeds_skipped);
+	if (compute.empty()) {
+		Tiron1::g_warm_state.store(4, std::memory_order_relaxed);
+		PipelineCacheLog("Tiron1: compute pipelines before play: none recorded yet");
+		Tiron6::g_done.store(true);
+		return;
+	}
+	Tiron1::g_warm_wanted.store(compute.size(), std::memory_order_relaxed);
+	Tiron1::g_warm_state.store(2, std::memory_order_relaxed);
+	m_tiron1_quiet.store(true, std::memory_order_release);
+	size_t pipelines_before = 0, graphics_before = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		programs.warming = true;
+		programs.warm_records.assign(records.begin(), records.end());
+		programs.warm_recipes = std::move(compute);
+		pipelines_before      = m_compute_pipelines.size();
+		graphics_before       = m_graphics_pipelines.size();
+	}
+	programs.TranslateWarmup(m_mutex, true, m_warmup_stop, &needed);
+	size_t translated = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (size_t i = 0; i < needed.size() && i < programs.warm_permutations.size(); ++i)
+			translated += needed[i] != 0 && programs.warm_permutations[i] != nullptr ? 1 : 0;
+	}
+	Tiron1::g_warm_programs.store(translated, std::memory_order_relaxed);
+	if (!m_warmup_stop.load(std::memory_order_relaxed))
+		WarmPipelines(Tiron6::On() ? Tiron6::VideoCap(compute_video, m_graphics.GetTotalMemoryBudget()) : compute_video, true, &only);
+	size_t made = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		made = m_compute_pipelines.size() - std::min(m_compute_pipelines.size(), pipelines_before);
+		if (ArranqueLigeroModo() == 2) {
+			const auto graphics = m_graphics_pipelines.size() - std::min(m_graphics_pipelines.size(), graphics_before);
+			g_kyty_ligero_precreados.store(graphics, std::memory_order_relaxed);
+			std::printf("[arranque-ligero] precreados %llu criticos (graficos semilla de %llu recetas), saltos evitados 0\n",
+			            static_cast<unsigned long long>(graphics), static_cast<unsigned long long>(Tiron1::g_warm_wanted.load()));
+			std::fflush(stdout);
+		}
+		programs.warming = false;
+		programs.ReleaseRetired();
+		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warm_permutations = {};
+		programs.warm_records      = {};
+		programs.warm_recipes      = {};
+	}
+	m_tiron1_quiet.store(false, std::memory_order_release);
+	const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	Tiron1::g_warm_compute.store(made, std::memory_order_relaxed);
+	Tiron1::g_warm_ms.store(static_cast<uint64_t>(ms), std::memory_order_relaxed);
+	Tiron1::g_warm_state.store(3, std::memory_order_relaxed);
+	PipelineCacheLog("Tiron1: compute pipelines before play: {} recipes, {} programs translated, {} pipelines made (the "
+	                 "game's own meanwhile kept) in {} ms",
+	                 Tiron1::g_warm_wanted.load(), translated, made, ms);
+	if (Tiron6::On()) {
+		const auto memory_after = LocalPlatform::ProcessMemory();
+		PipelineCacheLog("Tiron6: compute before play: {} seeds from earlier sessions, {} recipes, {} made in {} ms ({} "
+		                 "threads); RAM {:+} MiB committed {:+} MiB resident, {} MiB left free",
+		                 Tiron6::SeedCount(), Tiron1::g_warm_wanted.load(), made, ms,
+		                 ProgramCache::WarmupThreads(true),
+		                 (static_cast<int64_t>(memory_after.private_bytes) - static_cast<int64_t>(tiron6_memory.private_bytes)) >> 20,
+		                 (static_cast<int64_t>(memory_after.working_set) - static_cast<int64_t>(tiron6_memory.working_set)) >> 20,
+		                 LocalPlatform::AvailablePhysicalMemory() >> 20u);
+		Tiron6::g_done.store(true, std::memory_order_release);
+		// (The seeds this session adds go to the disk every 5 s, from this thread: none from the render thread.)
+		while (!m_warmup_stop.load(std::memory_order_relaxed)) {
+			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			Tiron6::Flush();
+		}
+	}
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {
@@ -3661,6 +4381,20 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const
 				for (auto& [n, pipeline]: batch) {
 					const auto& job   = jobs[n];
 					pipeline->recipe  = job.recipe_key;
+					// (RECURSOS-JUSTOS) A compute pipeline of the warmup keeps how to make it again (as the game's own:
+					// from the main driver cache), its last use now: unbound, idle eviction and the worlds' sweep take
+					// it. Before, none had a remake, so all of them (3,746 in 20261125-090852) stayed for the session.
+					if (VramRecursos::On() && job.compute != nullptr && pipeline->remake == nullptr) {
+						LocalShaderWarmup::Record input;
+						if (decode(job.recipe.compute, input) && KeepsRemake(m_graphics, *pipeline, true)) {
+							input.compute.stage.program = &job.compute->program;
+							pipeline->remake = std::make_shared<const std::function<void(Pipeline&)>>(
+							    [this, info = input.compute, module = job.compute->handle.module](Pipeline& target) {
+								    CreatePipelineInternal(m_graphics, target, info, module, m_driver_cache);
+							    });
+							VramRecursos::g_warm_expulsables.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
 					const bool  added = job.compute != nullptr
 					                        ? m_compute_pipelines.try_emplace(job.compute->handle.id, std::move(pipeline)).second
 					                        : m_graphics_pipelines.try_emplace(job.key, std::move(pipeline)).second;
@@ -3815,6 +4549,15 @@ static bool StaticBlobsFromCache() {
 		return value != nullptr && std::string_view(value) == "1";
 	}();
 	return on;
+}
+
+// (up1118, upstream 8fd86d4) As InitializeStaticCache takes them: none of the store's files, all.
+uint32_t PipelineCache::StaticStoreFeatures() {
+	std::error_code error;
+	for (const auto& path: {StaticFeaturesPath(), StaticCachePath(), StaticBinariesPath(), StaticBlobsPath()}) {
+		if (std::filesystem::exists(path, error)) return ReadStaticFeatures();
+	}
+	return ~0u;
 }
 
 // A static pipeline cache of this GPU and driver exists (its file begins with their signature).
@@ -4009,7 +4752,55 @@ void PipelineCache::InitializeDriverCache() {
 		if (ram != 0) limit = std::min(limit, ram >= (uint64_t {24} << 30u) ? ram / 16u : uint64_t {512} << 20u);
 		return store ? std::min(limit, StoreLimit) : limit;
 	};
-	m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
+	// (ramemu1) KYTY_DRIVER_CACHE_LAZY: on by default up to 20 GB of RAM (=1 any RAM, =0 off) when the static store's
+	// binaries make the pipelines (pipeline binaries on, binaries store open) and the main cache is the precompile's
+	// (warmed: nothing of it is compiled again in play). Then that file stays on disk and a side cache is used.
+	{
+		const char* lazy_env = std::getenv("KYTY_DRIVER_CACHE_LAZY");
+#ifdef KYTY_STATIC_PRECOMPILE
+		const bool lazy_on = false; // (the precompile tool fills the main cache itself)
+		(void)lazy_env;
+#else
+		const bool  lazy_on  = lazy_env != nullptr ? std::string_view(lazy_env) != "0" : (ram != 0 && ram <= (uint64_t {20} << 30u));
+#endif
+		// (DRV-SIN-CACHE, 11-25) KYTY_DRV_SIN_CACHE (encendido por defecto; =0 como antes): tambien sin la nota de
+		// precompilacion (warmed). Log 20261125-195442-560 (16 GB, 8 GB VRAM): la cache principal no tenia nota, se
+		// cargo entera (242 MB, 524 ms; el driver la copia en su RAM) y de 4391 pipelines de la sesion solo 6 salieron
+		// del driver (4385 de los binarios del almacen estatico; 39 fuera del almacen). Con el almacen de binarios
+		// abierto la cache grande se queda en disco y lo nuevo va a la cache lateral (.extra.bin), como KYTY_DRIVER_CACHE_LAZY.
+		static const bool sin_cache = [] {
+			const char* v = std::getenv("KYTY_DRV_SIN_CACHE");
+			return v != nullptr && v[0] == '1'; // (11-26 limpieza) apagado por defecto
+		}();
+		const bool lazy_any = lazy_on && (warmed || sin_cache);
+		const auto drv_mem_before = LocalPlatform::ProcessMemory();
+		std::error_code drv_size_error;
+		const auto      drv_main_size = std::filesystem::file_size(m_driver_cache_path, drv_size_error);
+		if (lazy_any && m_static_binaries != nullptr && m_graphics.pipeline_binaries_enabled) {
+			auto side = m_driver_cache_path;
+			side.replace_extension(".extra.bin");
+			std::error_code size_error;
+			const auto      main_size = std::filesystem::file_size(m_driver_cache_path, size_error);
+			g_main_cache_side         = side;
+			PipelineCacheLog("[ramemu1] Vulkan pipeline cache: {} left on disk ({} MiB the driver would copy into RAM; the "
+			                 "static store's binaries make the pipelines), side cache {} instead (KYTY_DRIVER_CACHE_LAZY=0: as before)",
+			                 Common::PathToString(m_driver_cache_path), size_error ? 0 : static_cast<uint64_t>(main_size >> 20u),
+			                 Common::PathToString(side));
+			m_driver_cache = LoadDriverCache(side, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
+		} else {
+			m_driver_cache = LoadDriverCache(m_driver_cache_path, ram_limit(uint64_t {2} << 30u), m_driver_cache_saved_size);
+		}
+		// (DRV-SIN-CACHE) Lo que costo en RAM la cache principal del driver (A/B: KYTY_DRV_SIN_CACHE=0 / 1).
+		const auto drv_mem_after = LocalPlatform::ProcessMemory();
+		std::printf("[drv-cache] KYTY_DRV_SIN_CACHE=%d: cache principal del driver %s (archivo %llu MiB); RAM privada %+lld MiB, "
+		            "en RAM %+lld MiB al cargarla; ahorro esperado ~%llu MiB de RAM frente a cargarla (VRAM: 0, el driver la guarda en RAM)\n",
+		            sin_cache ? 1 : 0, g_main_cache_side.empty() ? "cargada" : "dejada en disco (cache lateral)",
+		            drv_size_error ? 0ull : static_cast<unsigned long long>(drv_main_size >> 20u),
+		            (static_cast<long long>(drv_mem_after.private_bytes) - static_cast<long long>(drv_mem_before.private_bytes)) >> 20,
+		            (static_cast<long long>(drv_mem_after.working_set) - static_cast<long long>(drv_mem_before.working_set)) >> 20,
+		            (g_main_cache_side.empty() || drv_size_error) ? 0ull : static_cast<unsigned long long>(drv_main_size >> 20u));
+		std::fflush(stdout);
+	}
 	if (m_driver_cache == nullptr) return;
 #ifndef KYTY_STATIC_PRECOMPILE
 	// Pipelines compiled in play as their binaries beside it, for the sessions after (PlayedPipelines): AMD's Windows
@@ -4187,8 +4978,11 @@ vk::PipelineCache PipelineCache::LoadDriverCache(const std::filesystem::path& fi
 // Written to a temporary file renamed to `file_path`, unless nothing compiled since it was loaded or saved
 // (`saved_size`). The cache stays in use: a save right after the warmup destroyed it, so nothing compiled later
 // in that session (native XPR variants, first uses, optimized builds) was cached or saved at the exit.
-bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& file_path,
+bool PipelineCache::SaveDriverCache(vk::PipelineCache cache, const std::filesystem::path& requested_path,
                                     size_t& saved_size) {
+	// (ramemu1) The main cache left on disk: what this session compiled goes to the side cache, never over it.
+	const std::filesystem::path& file_path =
+	    (cache == m_driver_cache && !g_main_cache_side.empty()) ? g_main_cache_side : requested_path;
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -4250,6 +5044,11 @@ bool PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
 	if (m_scene_warmup && !SceneTags::Save()) PipelineCacheLog("Scene warmup: saving the scene tags failed");
 	const bool inputs_saved = m_program_cache->warmup.Save();
+	if (m_program_cache->table_recording.Enabled()) { // (TABLA-PRECARGA)
+		if (m_program_cache->table_recording.Save())
+			PipelineCacheLog("[tabla-precarga] guardados {} programas en modo tabla", m_program_cache->table_recording.records.size());
+		else PipelineCacheLog("[tabla-precarga] no se pudo guardar");
+	}
 	if (!inputs_saved) PipelineCacheLog("Shader warmup: cache save failed");
 	else if (m_program_cache->warmup.Enabled()) PipelineCacheLog("Shader warmup: saved {} inputs and {} pipelines",
 	    m_program_cache->warmup.records.size(), m_program_cache->warmup.pipelines.size());
@@ -4263,6 +5062,7 @@ bool PipelineCache::Save() {
 		saved &= SaveDriverCache(m_table_cache, m_table_cache_path, m_table_cache_saved_size);
 	}
 	if (m_played != nullptr) saved &= m_played->Save();
+	Tiron6::Flush(); // (tiron6)
 	return saved;
 }
 
@@ -4676,7 +5476,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				inputs.rendering       = job->rendering;
 				inputs.vertex_input    = job->vertex_input;
 				inputs.static_params   = job->static_params;
-				inputs.vs_input_info   = job->vs_input_info;
+				inputs.SetVertexInput(job->vs_input_info);
 				inputs.ps_input_info   = job->ps_input_info;
 				inputs.ps_active       = job->ps_active;
 				inputs.vertex_program  = job->vertex_program;
@@ -4757,7 +5557,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		inputs.rendering       = rendering;
 		inputs.vertex_input    = iter->first.vertex_input;
 		inputs.static_params   = static_params;
-		inputs.vs_input_info   = vs_input_info;
+		inputs.SetVertexInput(vs_input_info);
 		inputs.ps_active       = ps_active;
 		inputs.vertex_program  = vertex_program;
 		inputs.pixel_program   = pixel_program;
@@ -4781,6 +5581,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 	    (!ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
 		m_program_cache->warmup.AddPipeline(recipe);
 		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		if (Tiron6::On() && Tiron6::GraphicsOn()) Tiron6::Note(iter->second->recipe); // (tiron10: a graphics seed)
 	}
 
 	return iter->second.get();
@@ -4845,6 +5646,7 @@ PipelineCache::CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	if (recipe.compute != LocalShaderWarmup::NoShader) {
 		m_program_cache->warmup.AddPipeline(recipe);
 		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		Tiron6::Note(iter->second->recipe); // (tiron6: a seed for the next session's warm)
 	}
 
 	return *iter->second;
@@ -4901,6 +5703,97 @@ PipelineCache::Pipeline* PipelineCache::TryCreateComputePipeline(const ShaderCom
 	LiveCounters::Add(LiveCounters::AsyncPipelines);
 	m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
 	return nullptr;
+}
+
+// (render2, KYTY_ASYNC_COMPUTE_PIPELINES) See pipelineCache.h. What a worker makes is what CreateComputePipeline makes
+// (FirstBuild, the main driver cache, no native bindings); what CreateComputePipeline does after the driver's call
+// (the remake, the optimized build, the recording's recipe) is done here, on the GPU thread under m_mutex, when the
+// finished pipeline is taken in.
+PipelineCache::Pipeline* PipelineCache::TryCreateComputePipelineAsync(const ShaderComputeInputInfo& input_info,
+                                                                      const ShaderProgram& compute_program, AsyncCompute how,
+                                                                      bool* compiling) {
+	EXIT_IF(!compute_program);
+	if (compiling != nullptr) *compiling = false;
+	std::shared_ptr<PendingComputePipeline> job;
+	{
+		Common::LockGuard lock(m_mutex);
+		PromoteOptimized();
+		if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end()) {
+			// (Made meanwhile by CreateComputePipeline: the worker's copy, if any, stays with its job until the end.)
+			return iter->second.get();
+		}
+		if (auto pending = m_pending_normal_compute_pipelines.find(compute_program.id);
+		    pending != m_pending_normal_compute_pipelines.end()) {
+			job = pending->second;
+		} else if (how == AsyncCompute::Queue) {
+			job             = std::make_shared<PendingComputePipeline>();
+			job->input_info = input_info;
+			job->module     = compute_program.module;
+			m_pending_normal_compute_pipelines.emplace(compute_program.id, job);
+			const auto build = FirstBuild(m_graphics);
+			Workers().PushFront([this, job, build] {
+				const auto begin = std::chrono::steady_clock::now();
+				SlowLog::Scope slow([&](double ms) {
+					std::printf("SLOW AsyncComputePipeline %.1f ms normal CS=0x%016llx; %s\n", ms,
+					            static_cast<unsigned long long>(job->input_info.stage.program->shader_hash),
+					            LastPipelineStoreOutcome());
+				}, SlowLog::HitchThreshold());
+				CreatePipelineInternal(m_graphics, *job->pipeline, job->input_info, job->module, m_driver_cache, build);
+				job->from_store = LastPipelineFromStore();
+				CountRuntimePipeline(job->from_store);
+				MainPipelineDone();
+				m_async_compute_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+				                                                       std::chrono::steady_clock::now() - begin)
+				                                                       .count()),
+				                             std::memory_order_relaxed);
+				m_async_compute_done.fetch_add(1, std::memory_order_relaxed);
+				job->done.store(true, std::memory_order_release);
+			});
+			LiveCounters::Add(LiveCounters::AsyncPipelines);
+		}
+		if (job != nullptr && !job->done.load(std::memory_order_acquire) && how != AsyncCompute::Block) {
+			if (compiling != nullptr) *compiling = true;
+			m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(job, &job->done);
+			return nullptr;
+		}
+	}
+	if (job == nullptr) {
+		// (Neither made nor compiling.)
+		return how == AsyncCompute::Block ? &CreateComputePipeline(input_info, compute_program) : nullptr;
+	}
+	// (Block: the worker has it, or will take it ahead of its queue. Not under m_mutex: the workers' other jobs go on.)
+	while (!job->done.load(std::memory_order_acquire)) {
+		// (The window closes: the workers drop the jobs still queued. The caller skips its dispatch.)
+		if (m_stopping.load(std::memory_order_relaxed)) return nullptr;
+		std::this_thread::yield();
+	}
+	Common::LockGuard lock(m_mutex);
+	if (auto iter = m_compute_pipelines.find(compute_program.id); iter != m_compute_pipelines.end()) return iter->second.get();
+	auto pending = m_pending_normal_compute_pipelines.find(compute_program.id);
+	// (Only the GPU thread takes jobs in: the job is still there.)
+	EXIT_IF(pending == m_pending_normal_compute_pipelines.end() || pending->second != job || job->pipeline == nullptr);
+	auto       finished   = std::move(job->pipeline);
+	const bool from_store = job->from_store;
+	m_pending_normal_compute_pipelines.erase(pending);
+	EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
+	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(finished));
+	EXIT_IF(!inserted);
+	m_render_pipelines++;
+	// (As CreateComputePipeline, from here on.)
+	const auto make = [this, kept_info = job->input_info, module = job->module](PipelineBuild build) {
+		return [=, this](Pipeline& target) { CreatePipelineInternal(m_graphics, target, kept_info, module, m_driver_cache, build); };
+	};
+	if (KeepsRemake(m_graphics, *iter->second, from_store))
+		iter->second->remake = std::make_shared<const std::function<void(Pipeline&)>>(make(PipelineBuild::Full));
+	BuildOptimized(*iter->second, make(PipelineBuild::Optimize));
+	LocalShaderWarmup::PipelineRecord recipe;
+	recipe.compute = m_program_cache->RecordedIndex(compute_program);
+	if (recipe.compute != LocalShaderWarmup::NoShader) {
+		m_program_cache->warmup.AddPipeline(recipe);
+		iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+		Tiron6::Note(iter->second->recipe); // (tiron6: a seed for the next session's warm)
+	}
+	return iter->second.get();
 }
 #ifdef KYTY_STATIC_PRECOMPILE
 #include "staticPrecompile.inc"

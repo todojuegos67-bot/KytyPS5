@@ -220,6 +220,27 @@ uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource) {
 	                                "storage image descriptor array was not emitted");
 }
 
+bool UsesPixelInterlock(const EmitterState& state) {
+	return state.stage == ShaderType::Pixel &&
+	       std::ranges::any_of(state.program.info.images, [](const IR::ImageResource& image) {
+		       return image.resource_class == IR::ImageResourceClass::Storage && image.read && !image.atomic;
+	       });
+}
+
+uint32_t EmitStorageImageRead(EmitterState& state, uint32_t resource, uint32_t coord) {
+	const auto& image = state.program.info.images.at(resource);
+	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage || image.atomic ||
+	        image.mip_mode != IR::ImageMipMode::None);
+	state.builder.RequireCapability(CapabilityStorageImageReadWithoutFormat);
+	const auto image_type = ImageType(state, image);
+	const auto descriptor = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, image_type, descriptor, StorageImageDescriptorPointer(state, resource)});
+	const auto texel = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpImageRead, ImageVectorType(state, image.numeric_class, 4), texel, descriptor, coord});
+	return texel;
+}
+
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel) {
 	const auto& image = state.program.info.images.at(resource);

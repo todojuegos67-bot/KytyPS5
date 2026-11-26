@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "slow-log.h"
+#include "local/ds-nativo-sombras.h" // (F5 pase 2, =2: quien lee la imagen de profundidad de las cascadas)
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -29,6 +30,10 @@
 #include "kernel/memory.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
+#include "tex-anticipada.h" // (etapa1) KYTY_TEX_ANTICIPADA
+#include "tex-directa.h" // (etapa 2.1) KYTY_TEX_DIRECTA
+#include "tex-nativa.h" // (N1) KYTY_TEX_NATIVA
+#include <unordered_map>
 #endif
 
 #include <algorithm>
@@ -315,8 +320,9 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	switch (tile) {
 		case Prospero::TileMode::kLinear: supported_tile = true; break;
 		case Prospero::TileMode::kDepth:
+			// (No atomics. Read, it is a pixel shader's image it stores to as well: TrackResources' `storage_reads`.)
 			supported_tile =
-			    !resource.read && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
+			    !resource.atomic && !Prospero::IsFmaskTextureFormat(descriptor.Format()) &&
 			    (is_2d || is_2d_array) &&
 			    TileGetTextureBlockLayout(descriptor.Format(), tile, false, tile_layout);
 			break;
@@ -336,10 +342,10 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 			break;
 		default: break;
 	}
-	const auto swizzle = descriptor.DstSelXYZW();
-	const bool supported_swizzle =
-	    IsValidImageSwizzle(swizzle) &&
-	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	// (A storage image's view takes no swizzle: the shader applies it to what it stores, and to what it reads of one it
+	// reads, TrackResources' `storage_reads`.)
+	const auto swizzle           = descriptor.DstSelXYZW();
+	const bool supported_swizzle = IsValidImageSwizzle(swizzle);
 	const auto max_mip = resource.r128 ? descriptor.LastLevel() : descriptor.MaxMip();
 	const auto view_last_level =
 	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
@@ -384,7 +390,7 @@ std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& reso
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	                              resource.written && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
 	    raw_sint_storage ||
@@ -639,6 +645,19 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	                        : 0u;
 	// The first level held: the T#'s base, or past the levels left out.
 	const auto first_held = std::max(base, drop);
+	// (N1, KYTY_TEX_NATIVA) Textura de una CTexture: la imagen es la cadena de mips ENTERA (dispersa, memoria por mip segun
+	// lo que el juego compromete: sparseImage.cpp SparseUpdateLevels) y el draw la ve desde el mip base del T#. Un mip mayor
+	// que llega despues cae dentro de la misma imagen (antes: otra imagen desde ese mip). Los niveles que KYTY_TEXTURE_REDUCE
+	// deja fuera no se ligan nunca (MinLevel) y la vista empieza despues de ellos, como antes.
+	if (TexNativa::IsNative(full.data.address) && full.resources.layers == 1 && full.resources.levels > 1 &&
+	    full.type == Prospero::ImageType::kColor2D && !full.IsVolume() && !full.IsDepth() && !full.HasStencil() &&
+	    !full.HasMetadata() && full.samples == 1) {
+		TexNativa::SetMinLevel(full.data.address, drop);
+		desc.view_info.base_level  = first_held;
+		desc.view_info.level_count = last - first_held + 1u;
+		TexNativa::c_views.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	// (An array only for the levels left out: one held from its T#'s later base level is not tried.)
 	if (first_held == 0 || (drop == 0 && (!TexturePrefixEnabled(small_video_memory) || full.resources.layers > 1)) ||
 	    full.resources.layers == 0 || full.samples != 1 || full.type != Prospero::ImageType::kColor2D ||
@@ -808,6 +827,398 @@ struct RenderExecutor::TextureResolveCache {
 	std::array<Entry, 4096> entries;
 };
 
+// (etapa1, KYTY_TEX_ANTICIPADA) Estado del hilo de render: si la resolucion en curso es una anticipada y que imagen se
+// creo antes para cada direccion de textura (para contar si el draw la usa).
+// (etapa1b) Instalacion temprana de los ganchos: la llama el cargador (Loader::DemonsSoulsCopy::Install) al cargar el
+// eboot, antes de que el juego cree ninguna CTexture. Antes se instalaban en el primer draw. InstallOnce es idempotente.
+namespace TexAntEarly {
+void Install() {
+	TexAnt::InstallOnce();
+}
+} // namespace TexAntEarly
+
+namespace TexAntRender {
+inline bool g_in_pre = false;
+// (11-25d, revision 7) Con el serial de la imagen (un ImageId se reutiliza tras borrarse: sin serial, una imagen nueva en
+// el mismo hueco contaba como "usada") y la hora, para vaciar lo viejo (antes crecia sin limite).
+struct PreEntry {
+	ImageId  id {};
+	uint64_t serial = 0;
+	int64_t  t_us   = 0;
+};
+inline std::unordered_map<uint64_t, PreEntry>& PreMap() {
+	static std::unordered_map<uint64_t, PreEntry> m;
+	return m;
+}
+inline void PrePut(TextureCache& cache, uint64_t address, ImageId id) {
+	const auto* image = cache.TryGetImage(id);
+	PreMap()[address] = {id, image != nullptr ? image->serial : 0, TexAnt::NowUs()};
+}
+inline bool PreSame(TextureCache& cache, const PreEntry& e, ImageId id) {
+	if (!(e.id == id)) return false;
+	const auto* image = cache.TryGetImage(id);
+	return image != nullptr && image->serial == e.serial;
+}
+// Cada 10 s: fuera las de mas de 30 s (el draw que las usa llega en ms; si no llego, ya no cuenta) y tope de 65536.
+inline void PrePurge() {
+	static int64_t last = 0;
+	const int64_t  now  = TexAnt::NowUs();
+	auto&          m    = PreMap();
+	if (now - last < 10000000 && m.size() < 65536) return;
+	last = now;
+	for (auto it = m.begin(); it != m.end();) it = now - it->second.t_us > 30000000 ? m.erase(it) : std::next(it);
+	if (m.size() >= 65536) m.clear();
+}
+} // namespace TexAntRender
+
+// (etapa1, KYTY_TEX_ANTICIPADA; local/tex-anticipada.h) Antes de cada draw, en el hilo de render: las CTexture que el
+// juego creo (eboot+0x8fe750) o cuyo detalle cambio (eboot+0x901330) hace >= 20 ms se resuelven por el mismo camino que
+// un draw (ResolveTextureUncached con un recurso muestreado del tipo del T#), con <= 1,5 ms cada vez y una vez cada 4 ms
+// como mucho. La imagen queda creada y subida antes de su primer draw; nada mas cambia (la copia en RAM se mantiene).
+void RenderExecutor::TexAnticipadaDrain() {
+	// (N2+N3, KYTY_TEX_NATIVA) Trozos que el juego copio a texturas nativas sin escribirlos en la RAM emulada: a su mip de
+	// la GPU (lo que queda, en la siguiente vuelta).
+	// (N2+N3c) Una vez cada 8 ms como mucho (esto corre antes de CADA draw: ~1700 por fotograma) y <= 1,5 ms cada vez.
+	// Los bytes ya estan en el anillo de subida de la GPU (los copio el juego): solo el destilado a su mip.
+	static int64_t native_last = 0;
+	if (TexNativa::On() && TexAnt::NowUs() - native_last >= 8000) {
+		TexNativa::Coste coste(TexNativa::kCDrain); // (N2+N3f) todo el bloque
+		const int64_t    t0    = TexAnt::NowUs();
+		native_last            = t0;
+		auto&            cache = m_context.GetTextureCache();
+		{
+			TexNativa::Coste coste_ring(TexNativa::kCRing); // (N2+N3f)
+			cache.NativeRingPrepare();
+			cache.NativeRingCollect();
+		}
+		// (FPS-FIX) Tope por vuelta 1,5 ms -> 0,5 ms (KYTY_TEX_NATIVA_US lo cambia). Log 044349: cada trozo cuesta ahora
+		// 25-67 us (antes 3-4 us, log 032808) y el drenaje llega a 99 ms/30 s, en rafagas de 1,5 ms dentro de un draw.
+		// Lo que hace falta de media es ~3,3 ms/s; con 0,5 ms cada 8 ms caben ~62 ms/s: la subida no se retrasa,
+		// solo se reparte y desaparece el pico de 1,5 ms en el fotograma.
+		static const int64_t native_budget_us = [] {
+			const char* v = std::getenv("KYTY_TEX_NATIVA_US");
+			const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 500;
+			return static_cast<int64_t>(n > 0 ? n : 500);
+		}();
+		for (int k = 0; k < 64 && TexNativa::g_pending.load(std::memory_order_acquire) && TexAnt::NowUs() - t0 < native_budget_us; k++) {
+			TexNativa::Pending p;
+			{
+				std::lock_guard<std::mutex> lock(TexNativa::PMutex());
+				auto&                       q = TexNativa::PQueue();
+				if (q.empty()) {
+					TexNativa::g_pending.store(false, std::memory_order_release);
+					break;
+				}
+				p = q.front();
+				q.pop_front();
+			}
+			TexNativa::Coste coste_up(TexNativa::kCUpload); // (N2+N3f)
+			cache.NativeUploadHost(p.dest, p.size, p.ring_offset, p.seq, p.base);
+		}
+	}
+	// (etapa 2.1, KYTY_TEX_DIRECTA; local/tex-directa.h) Trozos del streaming que el juego copio a VirtualMemo
+	// (memcpy eboot+0x901459): se suben ya a su imagen (mip/capa), antes del draw. <= 128 trozos y <= ~1 ms por draw (etapa 2.1c).
+	if (TexDirecta::On()) {
+		// (etapa 2.1d) <= 128 trozos y <= ~1 ms por draw. Sin imagen todavia: al final de la cola hasta 3 s (la etapa 1
+		// la crea en cuanto el juego crea la CTexture); pasado ese tiempo, camino del draw.
+		static std::vector<TexDirecta::Item> items, waiting;
+		// Una vez cada 2 ms como mucho (esto corre antes de cada draw: ~1700 por fotograma).
+		static int64_t last_run = 0;
+		const int64_t  gate     = TexAnt::NowUs();
+		if (gate - last_run >= 2000) {
+			last_run = gate;
+			TexDirecta::Take(items, 128);
+		} else {
+			items.clear();
+		}
+		if (!items.empty()) {
+			waiting.clear();
+			const int64_t  t0  = TexAnt::NowUs();
+			const uint64_t now = TexDirecta::NowUs();
+			size_t         k   = 0;
+			for (; k < items.size(); k++) {
+				if (TexAnt::NowUs() - t0 > 1000) break;
+				const auto& it = items[k];
+				uint32_t    fmt = 0, tile = 0;
+				uint64_t    off = 0;
+				const int   r   = m_context.GetTextureCache().DirectUploadRange(it.dest, it.size, 0, &fmt, &tile, &off);
+				if (r == TexDirecta::kNoImage) {
+					if (now - it.t_us < TexDirecta::kWaitImageUs) {
+						waiting.push_back(it);
+						continue;
+					}
+					TexDirecta::c_img_never.fetch_add(1, std::memory_order_relaxed);
+				} else if (!it.had_image) {
+					TexDirecta::c_img_after.fetch_add(1, std::memory_order_relaxed);
+					TexDirecta::c_after_wait_us.fetch_add(now - it.t_us, std::memory_order_relaxed);
+				} else {
+					TexDirecta::c_img_before.fetch_add(1, std::memory_order_relaxed);
+				}
+				TexDirecta::Account(r, it.size);
+			}
+			TexDirecta::Requeue(items, k);
+			TexDirecta::RequeueBack(waiting);
+			TexDirecta::c_render_us.fetch_add(static_cast<uint64_t>(TexAnt::NowUs() - t0), std::memory_order_relaxed);
+		}
+		TexDirecta::MaybeLog();
+	}
+	TexAnt::InstallOnce();
+	TexAnt::MaybeLog();
+	TexNativa::MaybeLog();
+	// (11-25c, KYTY_TEX_NATIVA) T# de una CTexture -> su imagen, por el MISMO camino que un draw (misma clave). Devuelve la
+	// imagen o un id vacio.
+	const auto resolve_ctexture = [&](uint64_t tex, uint64_t* address_out, uint64_t* size_out) -> ImageId {
+		uint32_t dw[8];
+		if (!TexAnt::ReadTSharp(tex, dw)) return ImageId {};
+		ShaderRecompiler::IR::DescriptorValue value {};
+		for (int i = 0; i < 8; i++) value.dwords[static_cast<size_t>(i)] = dw[i];
+		value.dword_count     = 8;
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+		if (descriptor.IsNull()) return ImageId {};
+		ShaderRecompiler::IR::ImageResource resource {};
+		resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		resource.numeric_class  = Prospero::SampledTextureNumericClass(descriptor.Format());
+		resource.read           = true;
+		using Dim               = ShaderRecompiler::Decoder::ImageDimension;
+		switch (descriptor.Type()) {
+			case Prospero::ImageType::kColor2D: resource.dimension = Dim::Dim2D; break;
+			case Prospero::ImageType::kColor2DArray: resource.dimension = Dim::Dim2DArray; break;
+			default: resource.dimension = Dim::Unknown; break; // las nativas son 2D de una capa (sparseImage.cpp)
+		}
+		if (resource.dimension == Dim::Unknown || resource.numeric_class == Prospero::TextureNumericClass::Unsupported)
+			return ImageId {};
+		TexAntRender::g_in_pre = true;
+		auto binding           = ResolveTextureUncached(resource, value);
+		TexAntRender::g_in_pre = false;
+		if (!binding.image_id || binding.desc.info.data.address == 0) return ImageId {};
+		*address_out = binding.desc.info.data.address;
+		*size_out    = binding.desc.info.data.size;
+		return binding.image_id;
+	};
+	// (11-25e) Presupuesto POR FOTOGRAMA (ventana de 16 ms) comun a la creacion urgente y a la anticipada. Antes cada una
+	// tenia 2 ms por LLAMADA y se llama antes de cada draw (~1700 por fotograma): en carga de zona sumaban decenas de ms en
+	// un fotograma (log 20261125-101818: render 2108 ms, max 35 ms una vuelta; SLOW Frame 51 -> 116 con queue_run/cpu
+	// ~22 ms). Ahora <= KYTY_TEX_NATIVA_PRE_US (por defecto 1500 us) por ventana; lo que no cabe sigue en su cola (los
+	// trozos que lleguen antes van por su camino normal: nada se pierde ni queda negro).
+	static const int64_t pre_budget_us = [] {
+		const char*     v = std::getenv("KYTY_TEX_NATIVA_PRE_US");
+		const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 1500;
+		return static_cast<int64_t>(n > 0 ? n : 1500);
+	}();
+	static int64_t pre_win_start = 0, pre_win_used = 0;
+	{
+		const int64_t now_w = TexAnt::NowUs();
+		if (now_w - pre_win_start >= 16000) {
+			pre_win_start = now_w;
+			pre_win_used  = 0;
+		}
+	}
+	const auto pre_left = [&]() -> int64_t { return pre_budget_us - pre_win_used; };
+	// (11-25d) Creacion URGENTE (tex-nativa.h, Urgente): un trozo de 0x901330 espera en el hilo del juego a la imagen de SU
+	// CTexture. Se atiende en cada llamada (antes de cada draw), sin puerta de tiempo ni tope: cada peticion es una CTexture
+	// con un trozo ya en camino, y el hilo del juego esta parado hasta la respuesta.
+	if (TexNativa::On() && pre_left() > 0 && TexNativa::g_urgent.load(std::memory_order_acquire)) {
+		static std::vector<std::shared_ptr<TexNativa::Urgente>> urgent;
+		TexNativa::TakeUrgent(urgent);
+		const int64_t t0 = TexAnt::NowUs();
+		auto&         texture_cache = m_context.GetTextureCache();
+		// (cov1) <= 2 ms por vuelta (log 090852: una vuelta de 60,9 ms en el hilo de render); lo que no cabe, a la cola otra vez.
+		size_t done_u = 0;
+		const int64_t lim_u = pre_left();
+		for (; done_u < urgent.size() && TexAnt::NowUs() - t0 < lim_u; done_u++) {
+			const auto& r       = urgent[done_u];
+			uint64_t    address = 0, size = 0;
+			const auto  id      = resolve_ctexture(r->tex, &address, &size);
+			if (id) {
+				TexAntRender::PrePut(texture_cache, address, id);
+				TexNativa::c_pre_made.fetch_add(1, std::memory_order_relaxed);
+				TexNativa::MarkMade(r->tex);
+			}
+			TexNativa::Responder(r, static_cast<bool>(id));
+		}
+		if (done_u < urgent.size()) {
+			std::lock_guard<std::mutex> lock(TexNativa::UMutex());
+			auto& q = TexNativa::UQueue();
+			q.insert(q.begin(), urgent.begin() + static_cast<std::ptrdiff_t>(done_u), urgent.end());
+			TexNativa::g_urgent.store(true, std::memory_order_release);
+		}
+		urgent.clear();
+		const auto dt = static_cast<uint64_t>(TexAnt::NowUs() - t0);
+		pre_win_used += static_cast<int64_t>(dt);
+		TexNativa::c_pre_us.fetch_add(dt, std::memory_order_relaxed);
+		if (dt > TexNativa::c_pre_max_us.load(std::memory_order_relaxed)) TexNativa::c_pre_max_us.store(dt, std::memory_order_relaxed);
+	}
+	TexAntRender::PrePurge();
+	// (11-25c) Las CTexture nativas: su imagen dispersa (sin memoria ligada) se crea en cuanto el juego crea la CTexture
+	// (FTextureFactory 0x901240 pide sus trozos justo despues de 0x8fe750), sin edad minima ni tope de bytes, <= 2 ms por
+	// vuelta, una vuelta cada 1 ms como mucho. El trozo que llega encuentra la imagen y va directo a la VRAM.
+	if (TexNativa::On() && pre_left() > 0 && TexNativa::g_create_pending.load(std::memory_order_acquire)) {
+		static int64_t pre_last = 0;
+		const int64_t  t0       = TexAnt::NowUs();
+		// (cov1) Sin puerta de 1 ms: la cola se mira antes de cada draw (con la cola vacia no se llega aqui) para que la
+		// imagen exista antes que el trozo (el tope de 2 ms por vuelta se mantiene).
+		if (t0 - pre_last >= 0) {
+			pre_last = t0;
+			std::vector<uint64_t> todo;
+			{
+				std::lock_guard<std::mutex> lock(TexNativa::CreateMutex());
+				todo.swap(TexNativa::CreateQueue());
+				TexNativa::g_create_pending.store(false, std::memory_order_release);
+			}
+			auto&  texture_cache = m_context.GetTextureCache();
+			size_t done          = 0;
+			const int64_t lim_c = pre_left();
+			for (; done < todo.size() && TexAnt::NowUs() - t0 < lim_c; done++) {
+				uint64_t   address = 0, size = 0;
+				const auto id      = resolve_ctexture(todo[done], &address, &size);
+				if (!id) {
+					TexNativa::c_pre_bad.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+				TexAntRender::PrePut(texture_cache, address, id);
+				TexNativa::c_pre_made.fetch_add(1, std::memory_order_relaxed);
+				TexNativa::MarkMade(todo[done]);
+				if (auto* image = texture_cache.TryGetImage(id); image != nullptr && texture_cache.IsNativeSparse(*image))
+					TexNativa::c_pre_native.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (done < todo.size()) {
+				std::lock_guard<std::mutex> lock(TexNativa::CreateMutex());
+				auto&                       q = TexNativa::CreateQueue();
+				q.insert(q.begin(), todo.begin() + static_cast<std::ptrdiff_t>(done), todo.end());
+				TexNativa::g_create_pending.store(true, std::memory_order_release);
+			}
+			const auto dt = static_cast<uint64_t>(TexAnt::NowUs() - t0);
+			pre_win_used += static_cast<int64_t>(dt);
+			TexNativa::c_pre_us.fetch_add(dt, std::memory_order_relaxed);
+			if (dt > TexNativa::c_pre_max_us.load(std::memory_order_relaxed)) TexNativa::c_pre_max_us.store(dt, std::memory_order_relaxed);
+		}
+	}
+	if (!TexAnt::g_pending.load(std::memory_order_acquire) || TexAnt::g_disabled.load(std::memory_order_relaxed)) return;
+	static int64_t last = 0;
+	const int64_t  start = TexAnt::NowUs();
+	// (etapa1d) Una vez por fotograma como mucho (16 ms), <= 1 ms cada vez y <= 64 MB/s creados.
+	if (start - last < 16000) return;
+	last = start;
+	// (P3) Presupuesto adaptativo: en carga de zona la cola crece a cientos de CTexture y 1 ms / 64 MB/s no llegaba (el
+	// draw las creaba todas de golpe: fotograma de 971 ms, full_upload_bytes 405 MB, image_init 164 ms). Con cola >= 32:
+	// hasta 4 ms por fotograma y 512 MB/s; si no, lo de antes. KYTY_TEX_ANT_US / KYTY_TEX_ANT_MBS fijan el alto (0 = como antes).
+	static const int64_t  burst_us = [] {
+		const char* v = std::getenv("KYTY_TEX_ANT_US");
+		return v != nullptr ? static_cast<int64_t>(std::strtoll(v, nullptr, 10)) : int64_t {4000};
+	}();
+	static const uint64_t burst_bytes = [] {
+		const char* v = std::getenv("KYTY_TEX_ANT_MBS");
+		return (v != nullptr ? static_cast<uint64_t>(std::strtoull(v, nullptr, 10)) : uint64_t {512}) << 20u;
+	}();
+	static bool     burst     = false;
+	const int64_t   budget_us = burst && burst_us > 1000 ? burst_us : 1000;
+	const uint64_t  cap_bytes = burst && burst_bytes > (64ull << 20u) ? burst_bytes : (64ull << 20u);
+	static int64_t  win_start = 0;
+	static uint64_t win_bytes = 0;
+	if (start - win_start >= 1000000) { win_start = start; win_bytes = 0; }
+	if (win_bytes >= cap_bytes) return;
+	std::vector<TexAnt::Item> ready;
+	{
+		std::lock_guard<std::mutex> lock(TexAnt::QMutex());
+		auto&                       q = TexAnt::Queue();
+		burst                         = q.size() >= 32; // (P3) para la proxima vuelta
+		size_t                      keep = 0;
+		for (auto& it: q) {
+			if (start - it.t_us >= 20000 && ready.size() < 256) ready.push_back(it);
+			else q[keep++] = it;
+		}
+		q.resize(keep);
+		TexAnt::g_pending.store(!q.empty(), std::memory_order_release);
+	}
+	auto&  texture_cache = m_context.GetTextureCache();
+	auto&  pre_map       = TexAntRender::PreMap();
+	size_t done          = 0;
+	for (; done < ready.size(); done++) {
+		if (TexAnt::NowUs() - start >= budget_us || win_bytes >= cap_bytes) break; // (P3)
+		uint32_t dw[8];
+		if (!TexAnt::ReadTSharp(ready[done].tex, dw)) {
+			TexAnt::c_bad.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		ShaderRecompiler::IR::DescriptorValue value {};
+		for (int i = 0; i < 8; i++) value.dwords[static_cast<size_t>(i)] = dw[i];
+		value.dword_count = 8;
+		// (etapa1d) La misma CTexture con el mismo T# ya se resolvio: no se vuelve a crear (era la fuente de duplicadas).
+		{
+			static std::unordered_map<uint64_t, uint64_t> seen;
+			uint64_t h = 1469598103934665603ull;
+			for (int i = 0; i < 8; i++) h = (h ^ dw[i]) * 1099511628211ull;
+			auto [it_seen, fresh] = seen.try_emplace(ready[done].tex, h);
+			if (!fresh && it_seen->second == h) {
+				TexAnt::c_skip_same.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			it_seen->second = h;
+			if (seen.size() > 200000) seen.clear();
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+		if (descriptor.IsNull()) {
+			TexAnt::c_bad.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		ShaderRecompiler::IR::ImageResource resource {};
+		resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		resource.numeric_class  = Prospero::SampledTextureNumericClass(descriptor.Format());
+		resource.read           = true;
+		using Dim = ShaderRecompiler::Decoder::ImageDimension;
+		switch (descriptor.Type()) {
+			case Prospero::ImageType::kColor1D: resource.dimension = Dim::Dim1D; break;
+			case Prospero::ImageType::kColor1DArray: resource.dimension = Dim::Dim1DArray; break;
+			case Prospero::ImageType::kColor2D: resource.dimension = Dim::Dim2D; break;
+			case Prospero::ImageType::kColor2DArray: resource.dimension = Dim::Dim2DArray; break;
+			case Prospero::ImageType::kColor3D: resource.dimension = Dim::Dim3D; break;
+			case Prospero::ImageType::kCube:
+				resource.dimension = Dim::Dim2DArray;
+				resource.cube      = true;
+				break;
+			default: resource.dimension = Dim::Unknown; break; // MSAA y otros: no
+		}
+		if (resource.dimension == Dim::Unknown ||
+		    resource.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			TexAnt::c_bad.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		TexAntRender::g_in_pre = true;
+		auto binding           = ResolveTextureUncached(resource, value);
+		TexAntRender::g_in_pre = false;
+		const uint64_t address = binding.desc.info.data.address;
+		if (!binding.image_id || address == 0) {
+			TexAnt::c_bad.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (auto it = pre_map.find(address); it != pre_map.end() && !TexAntRender::PreSame(texture_cache, it->second, binding.image_id) &&
+		                                      texture_cache.TryGetImage(it->second.id) != nullptr) {
+			TexAnt::c_dup.fetch_add(1, std::memory_order_relaxed);
+		}
+		TexAntRender::PrePut(texture_cache, address, binding.image_id);
+		TexAnt::c_created.fetch_add(1, std::memory_order_relaxed);
+		TexAnt::c_created_bytes.fetch_add(binding.desc.info.data.size, std::memory_order_relaxed);
+		win_bytes += binding.desc.info.data.size;
+	}
+	TexAnt::c_render_us.fetch_add(static_cast<uint64_t>(TexAnt::NowUs() - start), std::memory_order_relaxed);
+	if (done < ready.size()) {
+		std::lock_guard<std::mutex> lock(TexAnt::QMutex());
+		auto&                       q = TexAnt::Queue();
+		q.insert(q.end(), ready.begin() + static_cast<std::ptrdiff_t>(done), ready.end());
+		TexAnt::g_pending.store(true, std::memory_order_release);
+	}
+	// Seguridad: si los draws no usan lo creado antes (otra clave, p. ej. vistas del pool), se deja de crear para no gastar
+	// (etapa1c: 400 desactivaba antes de que el draw llegara a usarlas: log 210417, 143 usadas despues) VRAM: 3000 o mas creadas y menos de 1 de cada 10 usadas.
+	const uint64_t created = TexAnt::c_created.load(std::memory_order_relaxed);
+	if (created >= 3000 && TexAnt::c_used.load(std::memory_order_relaxed) * 10 < created &&
+	    !TexAnt::g_disabled.exchange(true)) {
+		std::printf("[anticipada] desactivada: de %llu creadas el draw solo uso %llu (la clave del draw es otra)\n",
+		            static_cast<unsigned long long>(created),
+		            static_cast<unsigned long long>(TexAnt::c_used.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.written || resource.atomic || resource.depth_compare ||
@@ -855,6 +1266,8 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	}
 
 	const auto address      = descriptor.Base40();
+	if (DsNativoSombras::Mode() == 2) // (solo el T# ya descodificado: memoria del host)
+		DsNativoSombras::NoteTextureRead(address, descriptor.fields, storage);
 	const auto width        = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height       = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto base_level   = descriptor.BaseLevel();
@@ -1076,13 +1489,36 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// Shadow-map arrays (a depth-compare sample, a depth image, or memory the GPU renders into: the 80-layer spot-light
 	// shadow pool) keep every layer to the T#'s last: the layer bound solved from the shader can miss the light's layer,
 	// which then reads a clamped, wrong layer (spot-shadow artifacts, as with the depth-array full re-upload).
+	// (vram8, 11-23) KYTY_VRAM8_BC_BOUND (default: on with small video memory, the 8 GB cards and their simulation; =1 on
+	// any card, =0 off): not for a block-compressed array the GPU's writes are only next to. The GPU renders no BC
+	// texture, so "GPU-written" there is another resource over the same memory (the shadow pool's lent layers inside the
+	// streamed BC7 texture pool), not a shadow map: such a view keeps the shader's layer bound (ArrayViewLayers, as every
+	// other pool view). Log 114208: a 1024x1024 BC7 pool view from layer 2114 of 2785 widened to 671 layers made a
+	// 671 MiB image uploaded whole (3.2 s frame, 4 sparse buffers of 64 MiB mapped in 850 ms each) and pushed 671 MiB of
+	// other textures out of an 8 GB card at once; bound, the view holds its 256 layers as before.
+	static const int bc_bound_env = [] {
+		const char* v = std::getenv("KYTY_VRAM8_BC_BOUND");
+		return v == nullptr || *v == '\0' ? -1 : (*v == '0' ? 0 : 1);
+	}();
+	// (etapa2, 11-23) On again by default on a small video memory heap: log 20261123-211651 exercised it, "array view
+	// held as layers 2865..3440 of 3441 (0x10bc100000)": the BC7 pool view widened to its last layer, a 576-layer
+	// image uploaded whole in 2756 ms (3.2 s frame), the same case as the 671 layers of log 114208.
+	const bool bc_bound = bc_bound_env == 1 || (bc_bound_env < 0 && texture_cache.SmallVramHeap());
 	if (desc.info.resources.layers > 1 && desc.view_info.base_layer < desc.info.resources.layers &&
 	    (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray) &&
-	    (resource.depth_compare || desc.info.IsDepth() ||
-	     texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
-	     texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size))) {
-		desc.view_info.layer_count = desc.info.resources.layers - desc.view_info.base_layer;
+	     resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray)) {
+		const bool shadow_like = resource.depth_compare || desc.info.IsDepth();
+		const bool gpu_near    = !shadow_like &&
+		                      (texture_cache.IsRegionGpuModified(desc.info.data.address, desc.info.data.size) ||
+		                       texture_cache.HasGpuWrittenImageOverlap(desc.info.data.address, desc.info.data.size));
+		const uint32_t all = desc.info.resources.layers - desc.view_info.base_layer;
+		if (shadow_like || (gpu_near && !(bc_bound && block_bytes != 0))) {
+			desc.view_info.layer_count = all;
+		} else if (gpu_near && all > desc.view_info.layer_count) {
+			Vram8::kept_n.fetch_add(1, std::memory_order_relaxed);
+			Vram8::kept_bytes.fetch_add(desc.info.data.size / desc.info.resources.layers * (all - desc.view_info.layer_count),
+			                            std::memory_order_relaxed);
+		}
 	}
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	if (static const bool log_views = std::getenv("KYTY_UPLOAD_LOG") != nullptr; log_views && levels > 1 && !storage) {
@@ -1157,7 +1593,28 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	// (A texture or storage image the GPU cannot make, its memory full: a null image, not the end of the emulator; a
 	// storage view loses its writes until the collector made room. Issue #53: a 320x180x61 storage image of the cinematic
 	// mode on a 16 GB RX 7800 XT whose video memory the 4K targets had filled.)
+	// (etapa1, KYTY_TEX_ANTICIPADA) Un draw: cuanto tarda aqui la creacion (FindImage crea y sube la imagen nueva) y si
+	// encontro la imagen que TexAnticipadaDrain creo antes para la misma direccion (usada) o hizo otra (descartada:
+	// formato, tiling o mips distintos de los del T# de la CTexture).
+	const bool    tex_ant_pre = TexAntRender::g_in_pre;
+	const int64_t tex_ant_t0  = tex_ant_pre ? 0 : TexAnt::NowUs();
 	auto id = texture_cache.FindImage(desc, shader_conversion, true);
+	if (!tex_ant_pre) {
+		if (const int64_t dt = TexAnt::NowUs() - tex_ant_t0; dt >= 1000) {
+			TexAnt::c_draw_inits.fetch_add(1, std::memory_order_relaxed);
+			TexAnt::c_draw_init_us.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+		}
+		auto& pre_map = TexAntRender::PreMap();
+		if (!pre_map.empty()) {
+			if (auto it = pre_map.find(desc.info.data.address); it != pre_map.end()) {
+				const bool same = TexAntRender::PreSame(texture_cache, it->second, id); // (11-25d) mismo id Y mismo serial
+				(same ? TexAnt::c_used : TexAnt::c_discard).fetch_add(1, std::memory_order_relaxed);
+				// (etapa2, KYTY_TEX_SOLO_GPU) usada con la misma imagen: candidata a vivir solo en la GPU
+				if (same && TexAnt::SoloGpu()) TexAnt::MarkUsed(desc.info.data.address);
+				pre_map.erase(it);
+			}
+		}
+	}
 	if (!id) {
 		return bind_null(fmt::format("no image could be made for the texture: {}x{} layers={} levels={} format={} "
 		                             "addr=0x{:016x} size=0x{:x}",

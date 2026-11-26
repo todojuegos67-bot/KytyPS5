@@ -53,6 +53,10 @@ void SetDeviceStorageBufferBounds(bool enabled);
 	                                       uint32_t push_data_start_dword = 0);
 // A CompileResult's SPIR-V the caller is done with: the thread's next CompileProgram writes its module there.
 void RecycleSpirv(std::vector<uint32_t>&& spirv);
+// The calling thread's translation scratch back to the heap: the buffers TranslateProgram and CompileProgram keep for
+// the thread's next program (decoded instructions, SPIR-V sections and definitions; up to ~8 MiB each), for a thread
+// done translating for a while.
+void ReleaseThreadScratch();
 
 } // namespace Libs::Graphics::ShaderRecompiler
 

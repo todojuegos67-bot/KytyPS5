@@ -1,0 +1,43 @@
+#version 450
+// (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=3; renderer/dsSombrasNativas.inc) Compara la capa dibujada en nativo (A) con la
+// capa emulada (B), pixel a pixel: igual si los bits difieren en 1 ULP como mucho (o los valores son iguales). Si no:
+// el error absoluto maximo (bits de un float positivo: el orden de los enteros es el de los valores) y de que lado
+// queda el pixel mas cercano (`less`: el test del juego guarda el menor). En un cubo parcial (entradas omitidas que
+// dibuja solo el juego) "emulado mas cerca" puede ser de una omitida; "nativo mas cerca" es siempre un error.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D native_depth;
+layout(set = 0, binding = 1) uniform sampler2D emulated_depth;
+layout(std430, set = 0, binding = 2) buffer Result {
+	uint equal;
+	uint max_error;       // (floatBitsToUint del error absoluto)
+	uint native_nearer;   // (pixeles distintos con el nativo mas cerca)
+	uint emulated_nearer; // (pixeles distintos con el emulado mas cerca)
+} result;
+layout(push_constant) uniform Params {
+	uvec2 size;
+	uint  less;
+} pc;
+
+shared uint group_equal;
+
+void main() {
+	if (gl_LocalInvocationIndex == 0u) group_equal = 0u;
+	barrier();
+	uvec2 xy = gl_GlobalInvocationID.xy;
+	if (xy.x < pc.size.x && xy.y < pc.size.y) {
+		float a  = texelFetch(native_depth, ivec2(xy), 0).r;
+		float b  = texelFetch(emulated_depth, ivec2(xy), 0).r;
+		uint  ua = floatBitsToUint(a), ub = floatBitsToUint(b);
+		uint  d  = ua > ub ? ua - ub : ub - ua;
+		if (a == b || d <= 1u) {
+			atomicAdd(group_equal, 1u);
+		} else {
+			atomicMax(result.max_error, floatBitsToUint(abs(a - b)));
+			bool native_nearer = pc.less != 0u ? a < b : a > b;
+			if (native_nearer) atomicAdd(result.native_nearer, 1u);
+			else atomicAdd(result.emulated_nearer, 1u);
+		}
+	}
+	barrier();
+	if (gl_LocalInvocationIndex == 0u && group_equal != 0u) atomicAdd(result.equal, group_equal);
+}

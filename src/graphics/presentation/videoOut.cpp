@@ -32,6 +32,7 @@
 #include "local/fsr3-fg.h"
 #include "local/frame-gen.h"
 #include "local/anti-lag.h"
+#include "local/prot-menos.h" // (PROT-MENOS4) NoteFlip
 
 #include <algorithm>
 #include <array>
@@ -711,6 +712,12 @@ void NoteCinematic(const char* name) noexcept {
 	// (11-11) The intro's cinematic skip patch is only for the opening voidwalk: any other cinematic's files (the
 	// Nexus arrival, scn000001_maidentravel, came while it was still armed and was cut, breaking the Nexus floor
 	// effect) remove it before that cinematic plays.
+	// (picos3) The opening voidwalk is skipped by the game patch: it does not play, so it holds nothing (it held the
+	// first minutes at 60 fps until the player moved the mouse or a stick, log 21-11 09:38). KYTY_VOIDWALK_HOLD=1: as before.
+	if (name != nullptr && std::strstr(name, "voidwalk") != nullptr && Loader::DemonsSoulsSkipIntro::CinematicSkipArmed()) {
+		const char* keep = std::getenv("KYTY_VOIDWALK_HOLD");
+		if (keep == nullptr || keep[0] != '1') return;
+	}
 	if (name != nullptr && std::strstr(name, "voidwalk") == nullptr && Loader::DemonsSoulsSkipIntro::CinematicSkipArmed())
 		Loader::DemonsSoulsSkipIntro::Disarm("another cinematic started (only the opening one is skipped)");
 	const auto now  = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -761,6 +768,18 @@ bool CutsceneHeld() noexcept {
 		std::fflush(stdout);
 	}
 	return held;
+}
+// (cutfg) KYTY_CUTSCENE_FG (default 1): frame generation also through in-engine cutscenes (their real frames stay held to
+// 60 by SceneFreeFloor, so their speed is unchanged); pre-rendered movies (MoviePlaying) keep it off. 0: off as before.
+bool CutsceneFgOff() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CUTSCENE_FG");
+		const bool  r     = value == nullptr || std::strcmp(value, "0") != 0;
+		std::printf("Cutscenes: frame generation %s (KYTY_CUTSCENE_FG)\n", r ? "on, real frames held to 60" : "off");
+		std::fflush(stdout);
+		return r;
+	}();
+	return !on && CutsceneHeld();
 }
 bool MoviePlaying() noexcept {
 	const auto last = g_movie_frame_ns.load(std::memory_order_relaxed);
@@ -1852,13 +1871,15 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 		// (Smooth 120 held the intro to 40, 10-18). In the world the floors as they were (no new pacing there).
 		// CutsceneHeld too: the intro the title replays after idling reads no files (cached), so CinematicPlaying never
 		// comes on; it ran uncapped at ~110 fps (too fast) with FSR 3 generating, then the GPU hung (log 20261109-013819).
-		fg_off = MoviePlaying() || CutsceneHeld() || !PlayerInputSeen();
+		fg_off = MoviePlaying() || CutsceneFgOff() || !PlayerInputSeen();
+		// (cutfg) In a cutscene with generation on only SceneFreeFloor's 60 holds the real frames (fixed step a frame).
+		const bool cutscene = CinematicPlaying() || CutsceneHeld();
 		if (scene_free) floor = std::max(floor, SceneFreeFloor());
 		floor = std::max(floor, Unlock30Floor());
 		if (!fg_off) {
-			if (Graphics::Presenter::GeneratesFrames()) floor = std::max(floor, FrameGenFloor());
+			if (Graphics::Presenter::GeneratesFrames() && !cutscene) floor = std::max(floor, FrameGenFloor());
 			// Never in an in-engine cinematic (10-21: 56 must not apply there; it keeps 60).
-			if (Graphics::Presenter::IsSceneFrame(*r.frame) && !CinematicPlaying()) {
+			if (Graphics::Presenter::IsSceneFrame(*r.frame) && !cutscene) {
 				floor = std::max(floor, FlipFpsFloor());
 				floor = std::max(floor, g_dyn_flip_floor.load(std::memory_order_relaxed));
 			}
@@ -1875,7 +1896,8 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	// flips keep to that grid, as Reflex holds the game for DLSS-G. Held only at the present, the game made 60 and 4
 	// a second were dropped (a stutter). Half a vblank early is due (the flips land on the nearest vblank).
 	static std::chrono::steady_clock::time_point s_paced_next {};
-	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying() && !fg_off
+	const double paced_interval = r.frame != nullptr && Graphics::Presenter::IsSceneFrame(*r.frame) && !MoviePlaying() && !fg_off &&
+	                                      !CinematicPlaying() && !CutsceneHeld() // (cutfg)
 	                                  ? std::max(Graphics::Fsr3::RealFrameInterval(), Graphics::FrameGen::RealFrameInterval())
 	                                  : 0.0;
 	const auto   paced_now      = std::chrono::steady_clock::now();
@@ -1889,7 +1911,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	// Within a vblank of that time it is waited for precisely here (the port unlocked: the game reserves its next
 	// flip meanwhile; m_processing keeps this request at the front).
 	const uint32_t vblank_hz = std::max(Config::GetVblankFrequency(), 1u);
-	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !MoviePlaying() && !CinematicPlaying() &&
+	const bool     fg_paced  = !when_ready && FgPacingEnabled() && r.frame != nullptr && !fg_off && !MoviePlaying() && !CinematicPlaying() && !CutsceneHeld() &&
 	                      Graphics::Presenter::GeneratesFrames() && Graphics::Presenter::IsSceneFrame(*r.frame) &&
 	                      Graphics::Presenter::IsGameView(*r.frame) && r.ready_time != g_fg_pacing.last_ready &&
 	                      FgPacingUpdate(r.ready_time, std::max(static_cast<double>(floor + 1) / vblank_hz, 1.0 / 60.0));
@@ -1977,6 +1999,7 @@ bool FlipQueue::Flip(uint32_t micros, bool when_ready) {
 	                                  s_fg_paced ? g_fg_pacing.target * 1000.0 : 0.0);
 
 	g_flip_released.fetch_add(1, std::memory_order_relaxed);
+	ProtMenos::NoteFlip(); // (PROT-MENOS4) frames for the [prot-menos] line (one relaxed add)
 	g_last_floor.store(std::max(floor, r.cfg->flip_rate), std::memory_order_relaxed);
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;

@@ -21,9 +21,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace Libs::Controller {
@@ -136,7 +140,8 @@ private:
 	static constexpr uint32_t STATES_MAX = 64;
 
 	void CheckActive();
-	bool Claim(int id, bool significant);
+	bool Claim(int id, bool significant, bool press = false);
+	int  StickDeadZone(int id, Controller::Axis axis, int value);
 	void LogActive(const char* why);
 	void AddState();
 	void CountDroppedState();
@@ -144,6 +149,17 @@ private:
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
+	// pad-dz (23-11): per host pad, the radial dead zone of each stick (0..1 of full travel; 0: none) and the sticks' last
+	// raw values (0..255), so that one axis's event is filtered with the other axis of the same stick.
+	struct PadInfo {
+		int     id       = 0;
+		float   dz[2]    = {0.0f, 0.0f};
+		int     raw[4]   = {128, 128, 128, 128};
+		float   center[4] = {127.5f, 127.5f, 127.5f, 127.5f}; // each stick axis's rest (calibrated on connect)
+		bool    dead[4]   = {false, false, false, false};     // an axis resting at an end: not a stick (bad mapping)
+	};
+	std::vector<PadInfo> m_pads;
+	uint64_t             m_active_input_ms = 0; // SDL ticks of the player-1 pad's last significant input
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
@@ -165,6 +181,141 @@ private:
 };
 
 static GameController* g_controller = nullptr;
+
+// pad-rumble (23-11): the motors are set on a thread of their own. SDL_GameControllerRumble on an XInput pad is
+// XInputSetState, which waits for the pad: a wireless Xbox 360 pad (the PC receiver) takes milliseconds per call and its
+// radio link carries the input too. The haptics-as-rumble path (the audio thread, every buffer whose loudness changed)
+// called it under the pad mutex: the game's pad read and the SDL event thread waited on it, and the link flooded with
+// motor reports (late or lost presses, stick lag, audio hitches). Now SetVibration only stores the wanted levels; the
+// thread sends the newest one, at most every 50 ms to an XInput pad (16 ms to others), never under the pad mutex.
+// KYTY_PAD_RUMBLE_THREAD=0: the old direct call.
+namespace Rumble {
+static std::mutex              g_mutex;
+static std::condition_variable g_cv;
+static int                     g_pad_id  = -1;   // the player-1 pad (SDL instance id), -1/keyboard: none
+static int                     g_large   = 0;
+static int                     g_small   = 0;
+static uint64_t                g_seq     = 0;    // bumped on every change of the above
+static bool                    g_started = false;
+static bool                    g_stop    = false;
+static std::atomic<bool>       g_running {false};
+
+static bool Enabled() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PAD_RUMBLE_THREAD");
+		return v == nullptr || *v != '0';
+	}();
+	return on;
+}
+
+static void Worker() {
+	int      sent_pad = -1, sent_large = -1, sent_small = -1;
+	uint64_t seen_seq = 0;
+	auto     last     = std::chrono::steady_clock::time_point {};
+	bool     slow_logged = false;
+	for (;;) {
+		int pad_id = -1, large = 0, small = 0;
+		{
+			std::unique_lock<std::mutex> lock(g_mutex);
+			g_cv.wait(lock, [&] { return g_stop || g_seq != seen_seq; });
+			if (g_stop) break;
+			seen_seq = g_seq;
+			pad_id   = g_pad_id;
+			large    = g_large;
+			small    = g_small;
+		}
+		if (pad_id < 0 || (pad_id == sent_pad && large == sent_large && small == sent_small)) {
+			continue;
+		}
+		bool xinput = false;
+		SDL_LockJoysticks();
+		auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(pad_id));
+		if (pad != nullptr) {
+			const auto type = SDL_GameControllerGetType(pad);
+			xinput = type == SDL_CONTROLLER_TYPE_XBOX360 || type == SDL_CONTROLLER_TYPE_XBOXONE ||
+			         (type != SDL_CONTROLLER_TYPE_PS5 && type != SDL_CONTROLLER_TYPE_PS4 &&
+			          SDL_GameControllerGetPlayerIndex(pad) >= 0);
+		}
+		SDL_UnlockJoysticks();
+		if (pad == nullptr) {
+			continue;
+		}
+		// Spacing: the newest levels after the wait (a burst collapses into one report). A stop (0/0) is never held
+		// back longer than the spacing either.
+		const auto gap  = std::chrono::milliseconds(xinput ? 50 : 16);
+		const auto next = last + gap;
+		if (const auto now = std::chrono::steady_clock::now(); now < next) {
+			std::unique_lock<std::mutex> lock(g_mutex);
+			g_cv.wait_until(lock, next, [] { return g_stop; });
+			if (g_stop) break;
+			seen_seq = g_seq;
+			pad_id   = g_pad_id;
+			large    = g_large;
+			small    = g_small;
+			if (pad_id < 0) continue;
+		}
+		const auto t0 = std::chrono::steady_clock::now();
+		SDL_LockJoysticks();
+		if (auto* p = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(pad_id)); p != nullptr) {
+			(void)SDL_GameControllerRumble(p, static_cast<uint16_t>(large * 0x101U),
+			                               static_cast<uint16_t>(small * 0x101U), RUMBLE_DURATION_MS);
+		}
+		SDL_UnlockJoysticks();
+		last = std::chrono::steady_clock::now();
+		const auto ms = std::chrono::duration<double, std::milli>(last - t0).count();
+		if (ms > 4.0 && !slow_logged) {
+			slow_logged = true;
+			std::printf("[pad] vibración lenta en este mando: %.1f ms por envío (inalámbrico); va en su propio hilo, "
+			            "espaciada %d ms\n", ms, xinput ? 50 : 16);
+			std::fflush(stdout);
+		}
+		sent_pad   = pad_id;
+		sent_large = large;
+		sent_small = small;
+	}
+	g_running.store(false);
+}
+
+static void Set(int pad_id, int large, int small) {
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (g_stop) return;
+	if (!g_started) {
+		g_started = true;
+		g_running.store(true);
+		std::thread(Worker).detach();
+	}
+	if (g_pad_id == pad_id && g_large == large && g_small == small) return;
+	g_pad_id = pad_id;
+	g_large  = large;
+	g_small  = small;
+	g_seq++;
+	g_cv.notify_one();
+}
+
+// The player-1 pad changed: the motors follow it (the old pad is stopped by its own last levels, 0 in practice).
+static void SetPad(int pad_id) {
+	std::lock_guard<std::mutex> lock(g_mutex);
+	if (!g_started || g_pad_id == pad_id) {
+		g_pad_id = pad_id;
+		return;
+	}
+	g_pad_id = pad_id;
+	g_seq++;
+	g_cv.notify_one();
+}
+
+// Before the pads close: the thread ends (waits up to 100 ms for a send in flight).
+static void Stop() {
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_stop = true;
+		g_cv.notify_one();
+	}
+	for (int i = 0; i < 100 && g_running.load(); i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+} // namespace Rumble
 
 // SetScriptedInput's values; `until` (steady clock ns, 0: none) is written last.
 struct ScriptedInput {
@@ -400,8 +551,70 @@ void EmergencyShutdown() {
 	}
 }
 
+// Stick dead zones (pad-dz, 23-11). XInput's recommended ones (XINPUT_GAMEPAD_LEFT/RIGHT_THUMB_DEADZONE 7849/8689 of
+// 32767) for XInput pads (Xbox 360 / One / Series, and any pad in an XInput slot), 15% for every other pad that is not a
+// PlayStation one (DirectInput pads: 360 clones, generic USB pads, Switch); a DualSense / DualShock keeps its raw sticks.
+// The sticks of an old or cheap pad rest well off center, and the game, made for the DualSense, took that rest as a
+// push (the character walked to one side by itself). KYTY_PAD_DEADZONE=<percent> (0-50): both sticks of every pad
+// (0: none).
+// Rest calibration: on connect each stick axis is read; a rest up to 28% off center becomes that axis's center, one
+// resting at an end (beyond 75%: a trigger or a combined-trigger axis taken for a stick by a bad mapping) is held at
+// center until it ever passes through the middle (then it is a real stick that was held on connect).
+static void PadDeadZones(int id, float* dz, float* center, bool* dead) {
+	dz[0] = dz[1] = 0.0f;
+	if (id == HOST_INPUT_CONTROLLER_ID) return;
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
+	if (pad == nullptr) return;
+	const auto type = SDL_GameControllerGetType(pad);
+	const bool sony = type == SDL_CONTROLLER_TYPE_PS5 || type == SDL_CONTROLLER_TYPE_PS4 ||
+	                  type == SDL_CONTROLLER_TYPE_PS3;
+	const bool xinput = type == SDL_CONTROLLER_TYPE_XBOX360 || type == SDL_CONTROLLER_TYPE_XBOXONE ||
+	                    (!sony && SDL_GameControllerGetPlayerIndex(pad) >= 0);
+	if (const char* v = std::getenv("KYTY_PAD_DEADZONE"); v != nullptr && *v != '\0') {
+		const float pct = std::clamp(static_cast<float>(std::atof(v)), 0.0f, 50.0f);
+		dz[0] = dz[1] = pct / 100.0f;
+	} else if (xinput) {
+		dz[0] = 7849.0f / 32767.0f;
+		dz[1] = 8689.0f / 32767.0f;
+	} else if (!sony) {
+		dz[0] = dz[1] = 0.15f;
+	}
+	if (sony) return;
+	SDL_GameControllerUpdate(); // (the pad was just opened: its first report)
+	static const SDL_GameControllerAxis axes[4] = {SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY,
+	                                               SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY};
+	int rest[4] {};
+	for (int i = 0; i < 4; i++) {
+		rest[i]          = SDL_GameControllerGetAxis(pad, axes[i]);
+		const int mag    = std::abs(rest[i]);
+		if (mag > 24576) {
+			dead[i] = true;
+		} else if (mag > 600 && mag <= 9175) {
+			center[i] = 127.5f + static_cast<float>(rest[i]) / 257.0f;
+		}
+	}
+	std::printf("[pad] reposo de los sticks (-32768..32767): izq %d,%d der %d,%d%s%s\n", rest[0], rest[1], rest[2],
+	            rest[3], (dead[0] || dead[1] || dead[2] || dead[3]) ? " | eje en un extremo: se ignora hasta que pase por el centro" : "",
+	            (center[0] != 127.5f || center[1] != 127.5f || center[2] != 127.5f || center[3] != 127.5f)
+	                ? " | centro recalibrado" : "");
+	std::fflush(stdout);
+}
+
 void GameController::Connect(int id) {
+	PadInfo info;
+	info.id = id;
+	PadDeadZones(id, info.dz, info.center, info.dead); // (SDL lookups before the pad mutex)
+	if (id != HOST_INPUT_CONTROLLER_ID) {
+		std::printf("[pad] zona muerta del mando %d: izq %.0f%%, der %.0f%%\n", id, info.dz[0] * 100.0f,
+		            info.dz[1] * 100.0f);
+		std::fflush(stdout);
+	}
+
 	Common::LockGuard lock(m_mutex);
+
+	m_pads.erase(std::remove_if(m_pads.begin(), m_pads.end(), [id](const PadInfo& p) { return p.id == id; }),
+	             m_pads.end());
+	m_pads.push_back(info);
 
 	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
 		return;
@@ -426,6 +639,17 @@ void GameController::Disconnect(int id) {
 	}
 
 	m_connected_ids.erase(it);
+	m_pads.erase(std::remove_if(m_pads.begin(), m_pads.end(), [id](const PadInfo& p) { return p.id == id; }),
+	             m_pads.end());
+
+	// The player-1 pad gone (a wireless pad drops for a moment): nothing it held stays held. CheckActive resets the
+	// state when another pad takes over; when it was the only pad, release here too.
+	if (id == m_active_id) {
+		m_state         = {};
+		m_states_num    = 0;
+		m_first_state   = 0;
+		m_next_touch_id = 1;
+	}
 
 	CheckActive();
 }
@@ -463,14 +687,27 @@ void GameController::CheckActive() {
 // pad-1024: the player-1 pad, its name and its XInput slot (SDL player index: 0-3 for an XInput pad, whatever slot
 // Windows gave it; -1 for a HIDAPI pad such as a DualSense).
 void GameController::LogActive(const char* why) {
+	Rumble::SetPad(m_active_id == HOST_INPUT_CONTROLLER_ID ? -1 : m_active_id);
 	if (m_active_id < 0 || m_active_id == HOST_INPUT_CONTROLLER_ID) {
-		std::printf("Pad: player 1 = %s (%s, %d connected)\n", m_active_id < 0 ? "none" : "keyboard", why,
+		std::printf("Pad: player 1 = %s (%s, %d connected)\n",
+		            m_active_id == HOST_INPUT_CONTROLLER_ID ? "keyboard" : "none", why,
 		            static_cast<int>(m_connected_ids.size()));
 	} else {
 		auto*       pad   = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
 		const char* name  = pad != nullptr ? SDL_GameControllerName(pad) : nullptr;
 		const int   slot  = pad != nullptr ? SDL_GameControllerGetPlayerIndex(pad) : -1;
-		const bool  ps5   = pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5;
+		const auto  type  = pad != nullptr ? SDL_GameControllerGetType(pad) : SDL_CONTROLLER_TYPE_UNKNOWN;
+		const bool  ps5   = type == SDL_CONTROLLER_TYPE_PS5;
+		const char* kind  = type == SDL_CONTROLLER_TYPE_XBOX360   ? "Xbox 360"
+		                    : type == SDL_CONTROLLER_TYPE_XBOXONE ? "Xbox One/Series"
+		                    : type == SDL_CONTROLLER_TYPE_PS5     ? "DualSense"
+		                    : type == SDL_CONTROLLER_TYPE_PS4     ? "DualShock 4"
+		                                                          : (name ? name : "desconocido");
+		if (slot >= 0 && !ps5) {
+			std::printf("[pad] mando: %s (XInput ranura %d)\n", kind, slot + 1);
+		} else {
+			std::printf("[pad] mando: %s\n", kind);
+		}
 		if (slot >= 0 && !ps5) {
 			std::printf("Pad: player 1 = '%s' (id %d, XInput slot %d) (%s, %d connected)\n", name ? name : "?",
 			            m_active_id, slot + 1, why, static_cast<int>(m_connected_ids.size()));
@@ -486,13 +723,30 @@ void GameController::LogActive(const char* why) {
 // virtual or idle pad, holds slot 1), and a DualSense and an XInput pad can both be connected: the first connected one
 // was player 1 for good and the other's input was dropped. Now a press (or a stick/trigger past half) on another
 // connected pad makes it player 1; input from the others is ignored, so two pads never mix in one state.
-bool GameController::Claim(int id, bool significant) {
+bool GameController::Claim(int id, bool significant, bool press) {
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+		if (significant && id == m_active_id) {
+			m_active_input_ms = SDL_GetTicks64();
+		}
 		return true;
 	}
 	if (!significant || std::find(m_connected_ids.begin(), m_connected_ids.end(), id) == m_connected_ids.end()) {
 		return false;
 	}
+	// pad-claim (23-11, regression of 11-13's pad-1024): only a button press makes another pad player 1, as before
+	// 11-13 for sticks and triggers. Since pad-1024 a stick or trigger past half on any other connected device took
+	// player 1 and cleared the state: a second device of the same pad (a DirectInput pad also seen as a virtual XInput
+	// one: Steam Input, x360ce, DS4Windows) or one with an axis resting at an end (a combined trigger axis, a bad mapping)
+	// took it on every event of that axis: the stick went to one side and the real pad's input was dropped.
+	// KYTY_PAD_AXIS_CLAIM=1: sticks and triggers switch the pad again (pad-1024).
+	static const bool axis_claim = [] {
+		const char* v = std::getenv("KYTY_PAD_AXIS_CLAIM");
+		return v != nullptr && *v == '1';
+	}();
+	if (!press && !axis_claim && m_active_id >= 0 && m_active_id != HOST_INPUT_CONTROLLER_ID) {
+		return false;
+	}
+	m_active_input_ms = SDL_GetTicks64();
 	m_active_id     = id;
 	m_state         = {};
 	m_next_touch_id = 1;
@@ -560,7 +814,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
 	// The keyboard shares the player-1 pad with the active gamepad.
-	if (Claim(id, down)) {
+	if (Claim(id, down, down)) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
@@ -573,7 +827,15 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
 	const bool trigger_axis = axis == Controller::Axis::TriggerLeft || axis == Controller::Axis::TriggerRight;
+	int        other        = -1; // the stick's other axis, filtered with this one
+	if (!trigger_axis && id != HOST_INPUT_CONTROLLER_ID) {
+		value = StickDeadZone(id, axis, value);
+		other = StickDeadZone(id, static_cast<Controller::Axis>(static_cast<int>(axis) ^ 1), -1);
+	}
 	if (Claim(id, trigger_axis ? value > 128 : (value < 64 || value > 192))) {
+		if (other >= 0) {
+			m_state.axes[static_cast<int>(axis) ^ 1] = other;
+		}
 		m_state.time = LibKernel::KernelGetProcessTime();
 
 		int axis_id = static_cast<int>(axis);
@@ -594,6 +856,47 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 
 		AddState();
 	}
+}
+
+// A host pad's stick axis (0..255 as SDL gave it, center 127.5) through the stick's radial dead zone: inside it, 128
+// (centered); outside, the rest of the travel rescaled to the full range, the direction kept. value -1: the axis's
+// last raw value (the other axis of a stick whose one axis moved). Pads without a dead zone pass through unchanged.
+int GameController::StickDeadZone(int id, Controller::Axis axis, int value) {
+	const int a = static_cast<int>(axis);
+	if (a < 0 || a > 3) return value;
+	PadInfo* info = nullptr;
+	for (auto& p: m_pads) {
+		if (p.id == id) {
+			info = &p;
+			break;
+		}
+	}
+	if (info == nullptr) return value;
+	if (value >= 0) {
+		info->raw[a] = value;
+		if (info->dead[a] && value > 96 && value < 160) info->dead[a] = false; // through the middle: a real stick
+	}
+	const int   stick = a / 2; // LeftX/LeftY = 0/1, RightX/RightY = 2/3
+	const float dz    = info->dz[stick];
+	const bool  any_dead = info->dead[stick * 2] || info->dead[stick * 2 + 1];
+	if (dz <= 0.0f && !any_dead) return value >= 0 ? value : -1;
+	const auto axis_of = [info](int i) {
+		if (info->dead[i]) return 0.0f;
+		const float c = info->center[i];
+		const float d = static_cast<float>(info->raw[i]) - c;
+		return std::clamp(d / (d < 0.0f ? c : 255.0f - c), -1.0f, 1.0f);
+	};
+	const float x   = axis_of(stick * 2);
+	const float y   = axis_of(stick * 2 + 1);
+	const float mag = std::sqrt(x * x + y * y);
+	float       out = 0.0f;
+	if (mag > dz && mag > 0.0f) {
+		const float scaled = std::min((mag - dz) / (1.0f - dz), 1.0f);
+		out                = ((a & 1) == 0 ? x : y) / mag * scaled;
+	}
+	const int v = out < 0.0f ? 128 + static_cast<int>(std::lround(out * 128.0f))
+	                         : 128 + static_cast<int>(std::lround(out * 127.0f));
+	return std::clamp(v, 0, 255);
 }
 
 void GameController::RightStick(int id, int x, int y) {
@@ -642,6 +945,7 @@ void GameController::ResetInputState() {
 }
 
 void GameController::ReleaseHostPads() {
+	Rumble::Stop();
 	Common::LockGuard lock(m_mutex);
 
 	std::vector<SDL_GameController*> pads;
@@ -679,6 +983,14 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
+		return;
+	}
+
+	// (No SDL call under the pad mutex: the thread looks the pad up itself.)
+	if (Rumble::Enabled()) {
+		if (m_active_id >= 0) {
+			Rumble::Set(m_active_id, large_motor, small_motor);
+		}
 		return;
 	}
 

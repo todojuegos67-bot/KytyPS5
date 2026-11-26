@@ -54,6 +54,9 @@
 #include <intrin.h>
 
 #include "mem-guard.h"
+#include "cold-store.h" // (ram11)
+#include "f0-measure.h" // (f0)
+#include "local-platform.h" // (commit-al-tocar: the simulated video memory's ballast in the report)
 
 #include <atomic>
 #include <cstdint>
@@ -63,6 +66,410 @@
 #include <map>
 #include <utility>
 #include <vector>
+#include <algorithm>
+#include <psapi.h>
+
+// ---- (commit-al-tocar) KYTY_COMMIT_AL_TOCAR=1: native guest memory committed at first touch ----------------------
+// Off by default. With KYTY_NATIVE_MEMORY (private memory at the guest addresses) every guest mapping was committed
+// whole when mapped (ReplacePlaceholderNative / Commit). Ghidra (01.007.000, eboot.raw = game + 0xbdb0): the game
+// asks the kernel once for 12 GiB of direct memory (sceKernelAllocateDirectMemory at game 0x80cdd3 / file 0x818b83,
+// init at game 0x80c2b3 / file 0x818063) and its own allocators (PageAllocator 64 KiB bitmap, HeapAllocator 1 GiB,
+// TaggedFrameAllocator 120 MiB blocks - Init game 0x8114a0 / file 0x81d250 only links its lists, touches no block,
+// VirtualMemory 0x1000000000+0xec00000000) map whole budgets that they fill later. Log 20261124-110909-771: private
+// (commit) 13885 MiB at flip 30 with a working set of 7173 MiB. As on a PC: reserved when mapped, committed by
+// 64 KiB granules (the game's page) at the first touch.
+//  - CPU touch (guest or emulator code): the vectored handler (first) commits the still-reserved pages of the granule
+//    with the mapping's own protection (AllocationProtect) and the instruction runs again.
+//  - Protection changes / VirtualLock over guest memory (GPU watches, guest mprotect, every caller in the exe): the
+//    exe's import of VirtualProtect/VirtualLock is redirected here once; the reserved pages of the range are committed
+//    first (mapping protection), then the real call - so a page is reserved only while it has its mapping protection.
+//  - Kernel-mode access (ReadFile/WriteFile, sockets, guest stacks): GuestLazyCommit::Prefault commits first.
+// Only pages still reserved are ever committed (a commit of a committed page would reset a watch). Nothing is
+// decommitted here. A "[commit-al-tocar]" line every 10 s.
+namespace NativeLazyCommit {
+
+struct State {
+	SRWLOCK                       lock = SRWLOCK_INIT; // ranges + commits
+	std::map<uint64_t, uint64_t>  ranges;              // begin -> end, guest mappings reserved here
+	std::atomic<uint64_t>         reserved {0};        // bytes mapped reserved (what commit-at-map committed)
+	std::atomic<uint64_t>         committed {0};       // bytes committed here since
+	std::atomic<uint64_t>         faults {0};
+	std::atomic<uint64_t>         protect_commits {0};
+	std::atomic<uint64_t>         failures {0};
+	std::atomic<uint64_t>         decommitted {0};     // (commit-real) bytes of freed game blocks decommitted, in total
+	std::atomic<uint64_t>         decommit_calls {0};
+	std::atomic_bool              enabled {false};
+	BOOL(WINAPI* real_protect)(LPVOID, SIZE_T, DWORD, PDWORD) = nullptr;
+	BOOL(WINAPI* real_lock)(LPVOID, SIZE_T)                    = nullptr;
+};
+
+inline State& Get() {
+	static State state;
+	return state;
+}
+
+// (commit-real) KYTY_COMMIT_REAL: on by default (=0 off: committed when mapped, as before). As a PC game: the game's
+// memory is reserved when it maps it and committed when it touches it, and what it frees is decommitted (FreedRelease,
+// memory.cpp: MEM_DECOMMIT instead of MEM_RESET), so the process commit is only what is really in use.
+// KYTY_COMMIT_AL_TOCAR=1 still forces commit-at-touch on (KYTY_COMMIT_REAL=0 with it: on too).
+inline bool CommitRealRequested() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_COMMIT_REAL");
+		return v != nullptr && v[0] == '1'; // (11-26 limpieza) apagado por defecto
+	}();
+	return on;
+}
+
+inline bool Requested() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_COMMIT_AL_TOCAR");
+		return (v != nullptr && v[0] == '1') || CommitRealRequested();
+	}();
+	return on;
+}
+
+inline bool Enabled() {
+	return Get().enabled.load(std::memory_order_relaxed);
+}
+
+constexpr uint64_t Granule = uint64_t {64} << 10u;
+
+// Whether [begin, end) overlaps a registered range (lock held, shared or exclusive).
+inline bool OverlapsLocked(const State& state, uint64_t begin, uint64_t end) {
+	auto it = state.ranges.upper_bound(begin);
+	if (it != state.ranges.begin()) {
+		auto prev = std::prev(it);
+		if (prev->second > begin) return true;
+	}
+	return it != state.ranges.end() && it->first < end;
+}
+
+// Commits the still-reserved private pages of [begin, end) inside registered ranges, each run with its allocation's
+// protection (exclusive lock held). No allocation (fault handler).
+inline bool CommitReservedLocked(State& state, uint64_t begin, uint64_t end, bool* any) {
+	bool ok = true;
+	for (uint64_t at = begin; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != sizeof(info)) return false;
+		const uint64_t region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		const uint64_t stop       = region_end < end ? region_end : end;
+		if (stop <= at) return false;
+		if (info.State == MEM_RESERVE && info.Type == MEM_PRIVATE && OverlapsLocked(state, at, stop)) {
+			// (Only the registered part: clip to the range holding `at`.)
+			uint64_t b = at, e = stop;
+			auto     it = state.ranges.upper_bound(at);
+			if (it != state.ranges.begin() && std::prev(it)->second > at) {
+				e = std::min(e, std::prev(it)->second);
+			} else if (it != state.ranges.end()) {
+				b = it->first;
+				e = std::min(e, it->second);
+			}
+			if (b < e) {
+				DWORD protect = info.AllocationProtect & 0xffu;
+				if (protect == 0) protect = PAGE_READWRITE;
+				if (VirtualAlloc(reinterpret_cast<void*>(b), e - b, MEM_COMMIT, protect) == nullptr) {
+					state.failures.fetch_add(1, std::memory_order_relaxed);
+					ok = false;
+				} else {
+					state.committed.fetch_add(e - b, std::memory_order_relaxed);
+					if (any != nullptr) *any = true;
+				}
+			}
+			at = e > at ? e : stop;
+			continue;
+		}
+		at = stop;
+	}
+	return ok;
+}
+
+// (commit-real) Committed private bytes of [begin, end) (VirtualQuery; for the counters only).
+inline uint64_t CommittedBytes(uint64_t begin, uint64_t end) {
+	uint64_t n = 0;
+	for (uint64_t at = begin; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		const uint64_t stop       = region_end < end ? region_end : end;
+		if (stop <= at) break;
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) n += stop - at;
+		at = stop;
+	}
+	return n;
+}
+
+// (commit-real) A free block of the game's allocators [vaddr, vaddr + size) given back to Windows for real: its committed
+// private pages decommitted (commit charge and RAM gone; the reservation and the game's mapping stay), so a later touch
+// faults and Handler commits it again, zero-filled, with the mapping's protection - as MEM_RESET, nothing in the game
+// counts on a free block's old bytes (memory.cpp, FreedRelease). Only where it is exact:
+//  - the whole range inside one registered mapping (commit-at-touch handles the next touch there);
+//  - each committed region decommitted only if its current protection IS the mapping's (AllocationProtect): a page
+//    watched (read-only) or taken out (no access) by the GPU caches or an offload keeps MEM_RESET (returned false for
+//    it), so no tracker ever sees a protection it did not set.
+// Called under the game's allocator lock (the block checked free). Returns the bytes decommitted; *rest: the bytes
+// committed but left to MEM_RESET.
+inline uint64_t DecommitFree(uint64_t vaddr, uint64_t size, uint64_t* rest) {
+	*rest       = 0;
+	auto& state = Get();
+	// (KYTY_FRAME_NATIVO2 on: arenas imported into Vulkan as host memory; nothing decommitted then, MEM_RESET as before.)
+	static const bool imports = [] {
+		const char* v = std::getenv("KYTY_FRAME_NATIVO2");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	if (imports || !CommitRealRequested() || !state.enabled.load(std::memory_order_relaxed) || size == 0) return 0;
+	const uint64_t end  = vaddr + size;
+	uint64_t       done = 0;
+	AcquireSRWLockExclusive(&state.lock);
+	auto it     = state.ranges.upper_bound(vaddr);
+	bool inside = it != state.ranges.begin() && std::prev(it)->first <= vaddr && std::prev(it)->second >= end;
+	for (uint64_t at = vaddr; at < end;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) != sizeof(info)) break;
+		const uint64_t region_end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+		const uint64_t stop       = region_end < end ? region_end : end;
+		if (stop <= at) break;
+		if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+			const DWORD mapping = info.AllocationProtect & 0xffu;
+			const bool  same    = mapping != 0 && (info.Protect & 0xffu) == mapping && (info.Protect & (PAGE_GUARD | PAGE_NOCACHE)) == 0;
+			if (inside && same && VirtualFree(reinterpret_cast<void*>(at), stop - at, MEM_DECOMMIT) != 0) {
+				done += stop - at;
+			} else {
+				*rest += stop - at;
+			}
+		}
+		at = stop;
+	}
+	ReleaseSRWLockExclusive(&state.lock);
+	if (done != 0) {
+		state.decommitted.fetch_add(done, std::memory_order_relaxed);
+		state.decommit_calls.fetch_add(1, std::memory_order_relaxed);
+		const uint64_t c = state.committed.load(std::memory_order_relaxed);
+		state.committed.fetch_sub(done < c ? done : c, std::memory_order_relaxed);
+	}
+	return done;
+}
+
+// The reserved pages of [address, address + size) committed (before a protection change, a lock, a kernel access).
+inline bool Ensure(const void* address, uint64_t size) {
+	auto& state = Get();
+	if (!state.enabled.load(std::memory_order_relaxed) || address == nullptr || size == 0) return true;
+	const uint64_t begin = reinterpret_cast<uint64_t>(address) & ~uint64_t {0xfff};
+	const uint64_t end   = (reinterpret_cast<uint64_t>(address) + size + 0xfff) & ~uint64_t {0xfff};
+	AcquireSRWLockShared(&state.lock);
+	const bool ours = OverlapsLocked(state, begin, end);
+	ReleaseSRWLockShared(&state.lock);
+	if (!ours) return true;
+	AcquireSRWLockExclusive(&state.lock);
+	bool       any = false;
+	const bool ok  = CommitReservedLocked(state, begin, end, &any);
+	ReleaseSRWLockExclusive(&state.lock);
+	if (any) state.protect_commits.fetch_add(1, std::memory_order_relaxed);
+	return ok;
+}
+
+inline BOOL WINAPI HookProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old_protect) {
+	(void)Ensure(address, size);
+	return Get().real_protect(address, size, protect, old_protect);
+}
+
+inline BOOL WINAPI HookLock(LPVOID address, SIZE_T size) {
+	(void)Ensure(address, size);
+	return Get().real_lock(address, size);
+}
+
+inline LONG CALLBACK Handler(EXCEPTION_POINTERS* pointers) {
+	auto& state = Get();
+	if (!state.enabled.load(std::memory_order_relaxed) || pointers == nullptr || pointers->ExceptionRecord == nullptr ||
+	    pointers->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+	    pointers->ExceptionRecord->NumberParameters < 2)
+		return EXCEPTION_CONTINUE_SEARCH;
+	const auto address = static_cast<uint64_t>(pointers->ExceptionRecord->ExceptionInformation[1]);
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info) || info.State != MEM_RESERVE ||
+	    info.Type != MEM_PRIVATE)
+		return EXCEPTION_CONTINUE_SEARCH;
+	const uint64_t begin = address & ~(Granule - 1);
+	AcquireSRWLockExclusive(&state.lock);
+	if (!OverlapsLocked(state, address, address + 1)) {
+		ReleaseSRWLockExclusive(&state.lock);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	(void)CommitReservedLocked(state, begin, begin + Granule, nullptr);
+	ReleaseSRWLockExclusive(&state.lock);
+	state.faults.fetch_add(1, std::memory_order_relaxed);
+	MEMORY_BASIC_INFORMATION after {};
+	if (VirtualQuery(reinterpret_cast<void*>(address), &after, sizeof(after)) == sizeof(after) && after.State == MEM_COMMIT)
+		return EXCEPTION_CONTINUE_EXECUTION; // (a no-access mapping faults again, committed: the other handlers)
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The exe's import slots of `name` (kernel32 / KERNELBASE) pointed at `hook`; the original kept in `*real`.
+template <typename F>
+inline int PatchImport(const char* name, F hook, F* real) {
+	auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+	if (base == nullptr) return 0;
+	const void* targets[2] = {nullptr, nullptr};
+	if (HMODULE k = GetModuleHandleW(L"kernel32.dll"); k != nullptr) targets[0] = reinterpret_cast<const void*>(GetProcAddress(k, name));
+	if (HMODULE k = GetModuleHandleW(L"KernelBase.dll"); k != nullptr) targets[1] = reinterpret_cast<const void*>(GetProcAddress(k, name));
+	if (*real == nullptr) *real = reinterpret_cast<F>(const_cast<void*>(targets[0] != nullptr ? targets[0] : targets[1]));
+	if (*real == nullptr) return 0;
+	auto*       dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+	auto*       nt  = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+	const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (dir.VirtualAddress == 0) return 0;
+	int patched = 0;
+	for (auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); desc->Name != 0; ++desc) {
+		for (auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc->FirstThunk); thunk->u1.Function != 0; ++thunk) {
+			const auto fn = reinterpret_cast<const void*>(thunk->u1.Function);
+			if (fn == nullptr || (fn != targets[0] && fn != targets[1])) continue;
+			DWORD old = 0;
+			// (The real call: our own hook is not in place for this slot yet.)
+			auto* real_protect = Get().real_protect != nullptr ? Get().real_protect : &::VirtualProtect;
+			if (real_protect(&thunk->u1.Function, sizeof(thunk->u1.Function), PAGE_READWRITE, &old) == 0) continue;
+			thunk->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
+			DWORD dummy = 0;
+			real_protect(&thunk->u1.Function, sizeof(thunk->u1.Function), old, &dummy);
+			++patched;
+		}
+	}
+	return patched;
+}
+
+inline uint64_t ProcessPrivateMiB() {
+	PROCESS_MEMORY_COUNTERS_EX pmc {};
+	pmc.cb = sizeof(pmc);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) == 0) return 0;
+	return static_cast<uint64_t>(pmc.PrivateUsage) >> 20u;
+}
+
+inline uint64_t ProcessWorkingSetMiB() {
+	PROCESS_MEMORY_COUNTERS pmc {};
+	pmc.cb = sizeof(pmc);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) == 0) return 0;
+	return static_cast<uint64_t>(pmc.WorkingSetSize) >> 20u;
+}
+
+// (commit-real) Private working set (PROCESS_MEMORY_COUNTERS_EX2's PrivateWorkingSetSize, Windows 10 1809+; the struct
+// written out here for older SDKs). 0 when Windows does not give it.
+struct CommitRealCounters {
+	DWORD  cb;
+	DWORD  PageFaultCount;
+	SIZE_T PeakWorkingSetSize, WorkingSetSize, QuotaPeakPagedPoolUsage, QuotaPagedPoolUsage, QuotaPeakNonPagedPoolUsage,
+	    QuotaNonPagedPoolUsage, PagefileUsage, PeakPagefileUsage, PrivateUsage, PrivateWorkingSetSize, SharedCommitUsage;
+};
+
+inline uint64_t ProcessPrivateRamMiB() {
+	CommitRealCounters pmc {};
+	pmc.cb = sizeof(pmc);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)) == 0) return 0;
+	return static_cast<uint64_t>(pmc.PrivateWorkingSetSize) >> 20u;
+}
+
+// One "[commit-real]" line every 10 s: the emulator's commit (process private usage), its private RAM, and the commit
+// avoided (what commit-at-map would hold now and is not committed: mapped by the game and never touched, plus what was
+// decommitted from its free blocks and not touched again).
+inline DWORD WINAPI ReportThread(LPVOID) {
+	auto& state = Get();
+	SetThreadDescription(GetCurrentThread(), L"Kyty.CommitReal");
+	for (int seconds = 10;; seconds += 10) {
+		Sleep(10000);
+		const uint64_t reserved  = state.reserved.load(std::memory_order_relaxed);
+		const uint64_t committed = state.committed.load(std::memory_order_relaxed);
+		const uint64_t avoided   = reserved > committed ? reserved - committed : 0;
+		const uint64_t priv      = ProcessPrivateMiB();
+		const uint64_t ballast   = LocalPlatform::SimulationBallast() >> 20u;
+		const uint64_t game      = committed >> 20u;
+		const uint64_t rest      = priv > ballast + game ? priv - ballast - game : 0;
+		std::printf("[commit-real] %d s, MiB (KYTY_COMMIT_REAL=1; =0 lo apaga): commit del emulador %llu (juego %llu + resto del "
+		            "emulador %llu + lastre de VRAM simulada %llu), RAM privada %llu; comprometido evitado %llu (juego mapeado %llu, "
+		            "comprometido solo lo tocado; bloques libres del juego descomprometidos %llu en total en %llu pasadas); fallos "
+		            "de pagina atendidos %llu, rangos comprometidos antes de proteger %llu, fallidos %llu\n",
+		            seconds, static_cast<unsigned long long>(priv), static_cast<unsigned long long>(game),
+		            static_cast<unsigned long long>(rest), static_cast<unsigned long long>(ballast),
+		            static_cast<unsigned long long>(ProcessPrivateRamMiB()), static_cast<unsigned long long>(avoided >> 20u),
+		            static_cast<unsigned long long>(reserved >> 20u),
+		            static_cast<unsigned long long>(state.decommitted.load(std::memory_order_relaxed) >> 20u),
+		            static_cast<unsigned long long>(state.decommit_calls.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(state.faults.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(state.protect_commits.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(state.failures.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+}
+
+// Once, at the first native mapping: handler, import redirections, report thread. False: stays off (commit at map).
+inline bool Start() {
+	static const bool started = [] {
+		auto& state = Get();
+		if (!Requested()) return false;
+		if (AddVectoredExceptionHandler(1, Handler) == nullptr) {
+			std::printf("[commit-real] sin manejador de excepciones: apagado (se compromete al mapear)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		const int p = PatchImport<BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD)>("VirtualProtect", &HookProtect, &state.real_protect);
+		const int l = PatchImport<BOOL(WINAPI*)(LPVOID, SIZE_T)>("VirtualLock", &HookLock, &state.real_lock);
+		if (p == 0 || state.real_protect == nullptr) {
+			std::printf("[commit-real] no se pudo redirigir VirtualProtect: apagado (se compromete al mapear)\n");
+			std::fflush(stdout);
+			return false;
+		}
+		if (state.real_lock == nullptr) state.real_lock = &::VirtualLock;
+		state.enabled.store(true, std::memory_order_release);
+		std::printf("[commit-real] ON (KYTY_COMMIT_REAL=1 por defecto, =0 lo apaga): memoria del juego reservada al mapear y "
+		            "comprometida al tocarla por granulos de 64 KiB; bloques que el juego libera descomprometidos (MEM_DECOMMIT); "
+		            "VirtualProtect redirigido en %d sitio(s), VirtualLock en %d; proceso al empezar: comprometido %llu MiB, en "
+		            "RAM %llu MiB; linea [commit-real] cada 10 s\n",
+		            p, l, static_cast<unsigned long long>(ProcessPrivateMiB()),
+		            static_cast<unsigned long long>(ProcessWorkingSetMiB()));
+		std::fflush(stdout);
+		if (HANDLE t = CreateThread(nullptr, 0, ReportThread, nullptr, 0, nullptr); t != nullptr) CloseHandle(t);
+		return true;
+	}();
+	return started;
+}
+
+// A guest mapping [vaddr, vaddr + size) now reserved here (before any touch).
+inline void Register(uint64_t vaddr, uint64_t size) {
+	auto& state = Get();
+	AcquireSRWLockExclusive(&state.lock);
+	state.ranges[vaddr] = vaddr + size;
+	ReleaseSRWLockExclusive(&state.lock);
+	state.reserved.fetch_add(size, std::memory_order_relaxed);
+}
+
+// [vaddr, vaddr + size) unmapped: no longer ours (ranges crossing its edges split).
+inline void Unregister(uint64_t vaddr, uint64_t size) {
+	auto& state = Get();
+	if (!state.enabled.load(std::memory_order_relaxed) || size == 0) return;
+	const uint64_t end = vaddr + size;
+	AcquireSRWLockExclusive(&state.lock);
+	auto it = state.ranges.upper_bound(vaddr);
+	if (it != state.ranges.begin()) --it;
+	uint64_t removed = 0, removed_committed = 0;
+	while (it != state.ranges.end() && it->first < end) {
+		const uint64_t b = it->first, e = it->second;
+		if (e <= vaddr) {
+			++it;
+			continue;
+		}
+		it = state.ranges.erase(it);
+		const uint64_t cut_b = b > vaddr ? b : vaddr, cut_e = e < end ? e : end;
+		removed += cut_e - cut_b;
+		removed_committed += CommittedBytes(cut_b, cut_e); // (commit-real: still mapped here, released right after)
+		if (b < vaddr) state.ranges[b] = vaddr;
+		if (e > end) {
+			state.ranges[end] = e;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&state.lock);
+	// (The counters: mapped bytes and their committed bytes back out - the line shows what is mapped now.)
+	state.reserved.fetch_sub(std::min(removed, state.reserved.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+	state.committed.fetch_sub(std::min(removed_committed, state.committed.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+}
+
+} // namespace NativeLazyCommit
 
 namespace GuestLazyCommit {
 
@@ -431,6 +838,11 @@ inline bool LockedAttempt(State& state, uint32_t* error, F&& attempt) {
 // Commits the reserved pages of [address, address + size), each with the protection it would have had committed from
 // the start (before a kernel-mode access, a stack, a readability check).
 inline bool Prefault(const void* address, uint64_t size) {
+	// (ram11, KYTY_COLD_STORE) A kernel-mode access - file reads and writes, sockets - does not fault: what the cold
+	// store holds there comes back first. Nothing when it holds nothing.
+	ColdStore::Ensure(reinterpret_cast<uint64_t>(address), size);
+	(void)NativeLazyCommit::Ensure(address, size); // (commit-al-tocar: KYTY_COMMIT_AL_TOCAR)
+	F0Measure::Ensure(reinterpret_cast<uint64_t>(address), size); // (f0: our guards off first)
 	auto& state = Get();
 	if (!state.enabled || address == nullptr || size == 0) return true;
 	uint64_t begin = 0, end = 0;
@@ -715,6 +1127,16 @@ inline void Report(uint64_t written_bytes, uint64_t watched_bytes) {
 #else
 
 #include <cstdint>
+
+namespace NativeLazyCommit {
+inline bool Requested() { return false; }
+inline bool Enabled() { return false; }
+inline bool Start() { return false; }
+inline bool Ensure(const void*, uint64_t) { return true; }
+inline void Register(uint64_t, uint64_t) {}
+inline void Unregister(uint64_t, uint64_t) {}
+inline uint64_t DecommitFree(uint64_t, uint64_t, uint64_t* rest) { *rest = 0; return 0; }
+} // namespace NativeLazyCommit
 
 namespace GuestLazyCommit {
 inline bool Requested() { return false; }

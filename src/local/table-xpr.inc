@@ -256,6 +256,9 @@ struct RenderExecutor::TableXpr {
 	Pair*    store       = nullptr;
 	uint64_t store_state = 0, store_frame = 0;
 	uint32_t store_requests = 0;
+	// (tiron1, KYTY_TIRON1=1) The render thread's time this frame from each granted store request to the end of its
+	// TableStore (its normal-path draw and the store), and the time the last one was granted.
+	int64_t tiron1_store_us = 0, tiron1_grant_ns = 0;
 	// The draw's T#/S# words (the set's key) and pixel stage LOD statistics words; its runs' addresses.
 	TableWords                           words;
 	std::vector<uint32_t>                lod_stats;
@@ -343,6 +346,31 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t                WrittenEntries = 1024;
 	std::array<WrittenRange, WrittenEntries> written;
+	// (trad1b, KYTY_TRAD1; local/trad1.h) A written range's last full ObtainBuffer (the main executor, no speculation,
+	// unformatted), keyed by the range itself (its clamped address and size: what ObtainBuffer is asked), not by the
+	// V#'s words or their entry: kept across the special generation's moves (mappings, image starts) and across V#s
+	// whose other words differ. While its registration epoch stands, its buffer is live and no GPU-written byte of its
+	// tracker regions was given back since `coverage`, a use in another tick only renotes the write. 2-way by the range,
+	// the older way replaced; allocated at the first use with KYTY_TRAD1 on.
+	struct Trad1Range {
+		uint64_t          address = 0, size = 0;
+		vk::DeviceAddress device = 0;
+		BufferId          owner {};
+		const Buffer*     owner_buffer = nullptr;
+		uint64_t          registration = 0, coverage = 0, used = 0;
+	};
+	static constexpr size_t       Trad1Sets = 4096;
+	std::unique_ptr<Trad1Range[]> trad1_ranges;
+	uint64_t                      trad1_clock = 0;
+	// The entry of [address, address + size): the way that holds it, else the one to replace (address 0 there).
+	Trad1Range& Trad1Find(uint64_t address, uint64_t size) {
+		if (trad1_ranges == nullptr) trad1_ranges = std::make_unique<Trad1Range[]>(2 * Trad1Sets);
+		const auto set = (((address >> 2u) ^ (size * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull) >> 52u;
+		auto*      way = &trad1_ranges[2 * set];
+		if (way[0].address == address && way[0].size == size) return way[0];
+		if (way[1].address == address && way[1].size == size) return way[1];
+		return way[0].used <= way[1].used ? way[0] : way[1];
+	}
 	// The draw's blocks (per stage): its slots (IR::TablePlan::BlockDwords), then its buffers.
 	std::array<std::vector<uint32_t>, 2> blocks;
 	// An indirect image's candidates for the draw or dispatch being made (per stage), in the order its set binds them
@@ -356,6 +384,7 @@ struct RenderExecutor::TableXpr {
 void RenderExecutor::TableReset(TablePair& pair) {
 	auto& table = *m_table_xpr;
 	EXIT_IF(Role() != 0);
+	TrustedDepth::Forget(); // (trust1: its entries name the pair's programs and variants)
 	for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
 	if (table.store == &pair) table.store = nullptr;
 	if (table.last_pair == &pair) table.last_pair = nullptr;
@@ -371,6 +400,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 void RenderExecutor::TableForgetStates() {
 	auto* table = m_table_xpr.get();
 	if (table == nullptr) return;
+	TrustedDepth::Forget(); // (trust1: its entries name draw states)
 	table->last_pair  = nullptr;
 	table->last_state = nullptr;
 	table->last_set   = nullptr;
@@ -409,6 +439,7 @@ void RenderExecutor::TableSweepPairs() {
 		});
 	const size_t after = table->pairs.size() + table->dispatches.size();
 	if (after == before) return;
+	TrustedDepth::Forget(); // (trust1: its entries name pairs)
 	table->pair_cache         = {};
 	table->found_key          = {};
 	table->found_pair         = nullptr;
@@ -496,12 +527,26 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
                                                      uint64_t index_base, uint64_t index_bytes,
                                                      vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	auto& table = OwnTable();
+	Tiron1::t_no_native_store = false; // (tiron1: set below only for a pair waiting for its store)
+	// (cine1) A store request whose granted draw never reached TableStore (the draw left ExecutePreparedDraw early,
+	// or drew the flip composite) is dropped here, at the next draw: it no longer waits for a later, unrelated draw's
+	// TableStore, which consumed it (the pair and state did not match: the body returned at once) and charged the whole
+	// time in between to the store (opening cinematic, logs 20261124-074027-854 / -082011-604: "draw normal del store"
+	// 8.7 ms a store, 286 bodies of which 257 returned at once).
+	if (Role() == 0 && table.store != nullptr) {
+		table.store           = nullptr;
+		table.tiron1_grant_ns = 0;
+	}
+	if (LiveCensus::Mdraw::Active() && Role() == 0) LiveCensus::Mdraw::t_entry = __rdtsc(); // (mdraw C0: the call's clock)
 	// (Another executor's catalog is read under its lock.)
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
 	TableSweepPairs();
 	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1e, 0); // census: the table path's phases (b)
+	// (thread1, KYTY_RENDER_STATS: the pair, variant and draw state lookups, up to TableDraw.)
+	std::optional<LiveCensus::StatScope> stat_lookup;
+	stat_lookup.emplace(0, 15);
 	auto*       catalog = CatalogTable();
 	auto&       cache   = *m_native_xpr;
 	const auto& sh      = buffer.GetShaders();
@@ -573,23 +618,194 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	// kept its other states' draws on the native path, storing native records, until a later frame.) Those draws
 	// stored native records too, which the table variant replaced a frame or two later: 100-230 a slow frame walking
 	// into new parts of Boletarian Palace 1-3 (each traced and sorted, ~3 ms of the frame).
+	// (tiron1, KYTY_TIRON1=1) A pair waiting for its store: its draw takes the native record it has (a miss draws the
+	// normal way, as Deferred), and stores none (native-xpr.inc NativeXprTry): the table variant replaces it soon.
+	const bool tiron1        = Tiron1::On();
+	const auto tiron1_wait   = [&] {
+		LiveCounters::Add(LiveCounters::TableStoreDeferred);
+		Tiron1::t_no_native_store = true;
+		Tiron1::g_native_kept.fetch_add(1, std::memory_order_relaxed);
+		return TableResult::Native;
+	};
+	// (KYTY_STORE_SIN_DRAW) The store made here from the seed a normal draw left (StoreSinDraw, native-xpr.inc):
+	// true when done (or waiting for its programs/pipeline, or refused), the draw then takes its native record.
+	// (0: no seed, the normal way; 1: done; 2: the frame's time cap reached, the draw waits.)
+	const auto seed_store = [&]() -> int {
+		static uint64_t cap_frame = 0;
+		static int64_t  cap_used  = 0;
+		if (cap_frame != frame) cap_frame = frame, cap_used = 0;
+		const auto pair_key = StoreSinDraw::PairKey(pair.vs, pair.ps, static_cast<uint64_t>(pair.start_instance));
+		auto       seed     = StoreSinDraw::Copy(
+            StoreSinDraw::Key(pair.vs, pair.ps, static_cast<uint64_t>(pair.start_instance), cache.state_key));
+		if (!seed) {
+			StoreSinDraw::g_no_seed.fetch_add(1, std::memory_order_relaxed);
+			StoreSinDraw::Classify(pair_key, cache.state_key);
+			return 0;
+		}
+		{
+			const auto& states = Catalog().NativeXprState().states;
+			if (states.find(cache.state_key) == states.end())
+				return StoreSinDraw::g_no_state.fetch_add(1, std::memory_order_relaxed), 0;
+		}
+		if (cap_used >= StoreSinDraw::CapUs()) return StoreSinDraw::g_capped.fetch_add(1, std::memory_order_relaxed), 2;
+		struct Done {
+			int64_t  begin;
+			int64_t& used;
+			~Done() {
+				const auto us = (Tiron1::NowNs() - begin) / 1000;
+				StoreSinDraw::g_done.fetch_add(1, std::memory_order_relaxed);
+				if (us > 0 && us <= 1000000) {
+					used += us;
+					StoreSinDraw::g_done_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+				}
+			}
+		} done {Tiron1::NowNs(), cap_used};
+		auto&       pipelines = m_context.GetPipelineCache();
+		const auto& sh        = buffer.GetShaders();
+		const auto& ctx       = buffer.GetRegisters();
+		auto&       st        = seed->state;
+		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
+		for (uint32_t i = 0; i < st.color_count; i++) mapping[st.color_info[i].target_slot] = st.color_info[i].export_mapping;
+		st.programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx, buffer.GetUserConfig(),
+		                                            mapping, st.ps_active, st.vs_input_info, st.ps_input_info, true, pair.portable);
+		if (pipelines.TablePending()) {
+			pair.waiting = pipelines.TableWaiting(); // (the pair stores again once it is done)
+			return 1;
+		}
+		const auto* vertex = st.vs_input_info.stage.program;
+		const auto* pixel  = st.ps_active ? st.ps_input_info.stage.program : nullptr;
+		const auto  refuse = [&](const char* reason) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
+				std::printf("Table: VS 0x%llx PS 0x%llx refused: %s (store-sin-draw)\n", static_cast<unsigned long long>(pair.vs),
+				            static_cast<unsigned long long>(pair.ps), reason);
+			const auto write = CatalogWrite();
+			pair.refused     = true;
+			return 1;
+		};
+		if (!st.programs.vertex || vertex == nullptr || !vertex->table_mode) return refuse("no table mode vertex program");
+		if (vertex->stage != ShaderType::Vertex) return refuse("not a vertex program");
+		if (st.ps_active && (!st.programs.pixel || pixel == nullptr || !pixel->table_mode))
+			return refuse("no table mode pixel program");
+		const std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {vertex, pixel};
+		if (pair.programs[0] == nullptr) {
+			const auto write = CatalogWrite();
+			pair.programs    = programs;
+			TableRuns(pair);
+		} else if (pair.programs != programs) {
+			const auto write = CatalogWrite();
+			const auto found = std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
+			if (found == pair.variants.end()) pair.variants.push_back({.state = cache.state_key, .refused = true});
+			return 1;
+		}
+		const auto* pipeline = pipelines.TryCreateGraphicsPipeline(
+		    std::span {st.color_info, st.color_count}, st.depth_info, st.vs_input_info, buffer,
+		    st.ps_active ? &st.ps_input_info : nullptr, seed->topology, seed->restart, st.programs.vertex, st.programs.pixel, true);
+		if (pipeline == nullptr) pair.waiting = pipelines.PipelineWaiting();
+		{
+			const auto write   = CatalogWrite();
+			auto       variant = std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
+			if (variant == pair.variants.end()) variant = pair.variants.insert(variant, {.state = cache.state_key});
+			variant->pipeline       = pipeline;
+			variant->mapping        = mapping;
+			variant->fetch_embedded = st.vs_input_info.fetch_embedded;
+		}
+		if (pixel != nullptr && FrameGen::RtWaterIsWaterPs(pixel->shader_hash) && st.color_count >= 1)
+			FrameGen::RtWaterNoteState(vertex->shader_hash, pixel->shader_hash, st.color_count,
+			                           st.depth_info.image_id ? st.depth_info.desc.info.extent.width : 0,
+			                           st.depth_info.depth_write_enable, static_cast<int>(seed->topology));
+		return 1;
+	};
+	// (KYTY_STORE_SIN_DRAW) The 5 s line: stores without a draw against the normal ones (tiron1's counters: their cost
+	// less the store body is the normal-path draw), in us a frame of the render thread before and after.
+	const auto seed_line = [&] {
+		static int64_t  last_ns    = 0;
+		static uint64_t last_frame = 0;
+		static uint64_t last[11]   = {};
+		const auto      now        = Tiron1::NowNs();
+		if (last_ns == 0) {
+			last_ns    = now;
+			last_frame = frame;
+			return;
+		}
+		if (now - last_ns < 5000000000LL) return;
+		const uint64_t cur[11] = {StoreSinDraw::g_done.load(),    StoreSinDraw::g_done_us.load(),
+		                          StoreSinDraw::g_no_seed.load(), StoreSinDraw::g_no_state.load(),
+		                          Tiron1::g_stores.load(),        Tiron1::g_store_us.load(),
+		                          Tiron1::g_store_body_us.load(), StoreSinDraw::g_miss_new.load(),
+		                          StoreSinDraw::g_miss_pair_other_state.load(), StoreSinDraw::g_miss_state_other_pair.load(),
+		                          StoreSinDraw::g_capped.load()};
+		uint64_t d[11];
+		for (int i = 0; i < 11; ++i) d[i] = cur[i] - last[i], last[i] = cur[i];
+		const double frames  = static_cast<double>(std::max<uint64_t>(frame - last_frame, 1));
+		const double normal  = static_cast<double>(d[4]);
+		const double each_us = normal > 0 && d[5] > d[6] ? static_cast<double>(d[5] - d[6]) / normal : 0.0;
+		const double now_us  = (static_cast<double>(d[5]) + static_cast<double>(d[1])) / frames;
+		const double was_us  = (static_cast<double>(d[5]) + static_cast<double>(d[0]) * each_us) / frames;
+		std::printf("[store-sin-draw] 5 s: %.0f fotogramas | stores sin draw %llu (%.2f/fotograma, %.1f us/fotograma) | "
+		            "stores por la ruta normal %llu (%.2f/fotograma, draw normal %.0f us cada uno) | caidos a la ruta normal: "
+		            "sin semilla %llu (par nunca dibujado %llu, par solo en otros estados %llu, estado solo con otros pares %llu), "
+		            "sin estado %llu | esperan por tope de tiempo %llu | hilo de render en stores: antes %.1f us/fotograma, ahora %.1f "
+		            "(ahorro %.1f us/fotograma)%s\n",
+		            frames, static_cast<unsigned long long>(d[0]), static_cast<double>(d[0]) / frames,
+		            static_cast<double>(d[1]) / frames, static_cast<unsigned long long>(d[4]), normal / frames, each_us,
+		            static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[7]), static_cast<unsigned long long>(d[8]),
+		            static_cast<unsigned long long>(d[9]), static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[10]),
+		            was_us, now_us, was_us - now_us,
+		            Tiron1::On() ? "" : " (sin KYTY_TIRON1=1 no hay coste de la ruta normal)");
+		std::fflush(stdout);
+		last_ns    = now;
+		last_frame = frame;
+	};
 	const auto request_store = [&] {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table store"), TableResult::Native;
 		if (pair.waiting) {
-			if (!pair.waiting->load(std::memory_order_acquire))
+			if (!pair.waiting->load(std::memory_order_acquire)) {
+				if (tiron1) return tiron1_wait();
 				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred; // (programs compiling)
+			}
 			pair.waiting.reset();
 		}
 		if (table.store_frame != frame) {
-			table.store_frame    = frame;
-			table.store_requests = 0;
+			table.store_frame     = frame;
+			table.store_requests  = 0;
+			table.tiron1_store_us = 0;
 		}
-		if (pair.store_frame == frame && pair.store_state == cache.state_key)
+		if (pair.store_frame == frame && pair.store_state == cache.state_key) {
+			if (tiron1) return tiron1_wait();
 			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Deferred;
-		// (Past the budget, the others draw from native records meanwhile.)
+		}
+		// (KYTY_STORE_SIN_DRAW) Made here from the seed: the draw takes its native record (no normal-path draw).
+		if (StoreSinDraw::On() && Role() == 0 && !HwScene::Active()) {
+			seed_line();
+			const int seeded = seed_store();
+			if (seeded == 1) {
+				pair.store_frame          = frame;
+				pair.store_state          = cache.state_key;
+				Tiron1::t_no_native_store = true;
+				return TableResult::Native;
+			}
+			if (seeded == 2) {
+				if (tiron1) return tiron1_wait();
+				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
+			}
+		}
+		// (Past the budget, the others draw from native records meanwhile.) (tiron1: past it, more while the stores
+		// granted this frame took less than KYTY_TIRON1_STORE_MS of the render thread.)
+		bool by_time = false;
 		if (const auto budget = kyty_local_table_store_budget.load(std::memory_order_relaxed);
-		    budget != 0 && table.store_requests >= budget)
-			return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
+		    budget != 0 && table.store_requests >= budget) {
+			if (!tiron1 || table.tiron1_store_us >= Tiron1::StoreBudgetUs()) {
+				if (tiron1) return tiron1_wait();
+				return LiveCounters::Add(LiveCounters::TableStoreDeferred), TableResult::Native;
+			}
+			by_time = true;
+		}
+		if (tiron1) {
+			table.tiron1_grant_ns = Tiron1::NowNs();
+			Tiron1::g_stores.fetch_add(1, std::memory_order_relaxed);
+			if (by_time) Tiron1::g_stores_by_time.fetch_add(1, std::memory_order_relaxed);
+		}
 		++table.store_requests;
 		pair.store_frame  = frame;
 		pair.store_state  = cache.state_key;
@@ -617,12 +833,14 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	const auto& draw_state = *cache.last_state;
 	TablePrefetchArrays(pair, pair.last_set[Role()]);
 	if (!NativeXprTargetsCurrent(draw_state)) return LiveCounters::Add(LiveCounters::TableStoreTargets), request_store();
+	stat_lookup.reset();
 	return TableDraw(buffer, pair, *variant, draw_state, commands, index_base, index_bytes, index_type, direct);
 }
 
 bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
+	if (LiveCensus::Mdraw::Active() && Role() == 0) LiveCensus::Mdraw::t_entry = __rdtsc(); // (mdraw C0: the call's clock)
 	std::shared_lock<std::shared_mutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
@@ -645,6 +863,8 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	              direct) != TableResult::Drawn)
 		return false;
 	LiveCounters::Add(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
+	// (thread1, KYTY_RENDER_STATS: the calls continued, runs and direct draws apart.)
+	if (LiveCensus::g_render && LiveCensus::RenderStatsOn()) LiveCensus::g_continued_calls[direct != nullptr ? 1 : 0] += 1;
 	return true;
 }
 
@@ -919,6 +1139,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 	const bool full  = !own || textures.GcTick() >= set.touched_tick + TableImageSet::TouchTicks ||
 	                  textures.CurrentFrame() >= set.touched_frame + TableImageSet::TouchTicks ||
 	                  m_context.GetCommandScheduler().Current().IsInvalid();
+	G1::NoteSetCheck(full); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
 	// Registrations since: their pages say which proofs they reach (none, when the log of the latest has none over the
 	// views' span: the game moves registrations every frame somewhere).
 	bool moved = set.resolution_epoch[Role()] != resolution;
@@ -943,6 +1164,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		const bool held = !full && dep.proven && image->validity == dep.validity &&
 		                  (!moved || !textures.RegistrationsSince(dep.desc.info.data.address, dep.desc.info.data.size,
 		                                                          set.resolution_epoch[0]));
+		G1::NoteSetUse(held); // (g1 NP1)
 		if (held && mode != 2) continue;
 		const auto refuse = [&] {
 			if (held) {
@@ -959,6 +1181,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		// The guest rewrote it (a texture streaming in), or a GPU buffer write its bytes or its stencil plane: upload it
 		// as the normal path's FindTexture does.
 		if (TableRefreshPending(*image, dep.desc)) {
+			G1::NoteSetRefresh(); // (g1 NP1)
 			if (held) (void)refuse();
 			if (Spec::Current() != nullptr) return Spec::Refuse("texture upload"), false;
 			if (!image->registered || image->depth_id || image->binding.needs_rebind) return false;
@@ -1023,6 +1246,7 @@ bool RenderExecutor::TableValidateSet(TableImageSet& set) {
 		set.touched_tick  = textures.GcTick();
 		set.touched_frame = textures.CurrentFrame();
 	}
+	G1::NoteSetOk(); // (g1 NP1)
 	return true;
 }
 
@@ -1093,13 +1317,16 @@ bool RenderExecutor::TableEvaluate(TablePair& pair, std::array<std::span<const u
 	// (KYTY_GPUREAD_PROBE) A run read through `reader`, noted when its memory is GPU-written.
 	const auto read_run = [&](uint32_t st, uint32_t index, uint64_t address, uint32_t count, uint32_t first,
 	                          uint32_t* out) {
+		TrustedDepth::NoteRun(st, first, count, address); // (trust1: while an XPR depth draw captures its reads)
 		if (!probing) {
 			reader.Read(address, count, out);
+			if (PortR::Verifying() && PortR::t_capture) PortR::NoteRun(st, address, count, out); // (port-r=2: the run, for TableDraw's comparison)
 			return;
 		}
 		// (TSC cycles, not steady_clock: two clock reads per run were 20% of the render thread at the dragon's path.)
 		const auto begin = __rdtsc();
 		reader.Read(address, count, out);
+		if (PortR::Verifying() && PortR::t_capture) PortR::NoteRun(st, address, count, out); // (port-r=2)
 		const auto cycles = __rdtsc() - begin;
 		const auto ns     = cycles / 4u; // (~4 GHz TSC: a threshold and a total, not a measurement)
 		const uint64_t key   = pair.vs * 31u + st * 7919u + index;
@@ -1801,6 +2028,8 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 	};
 	if (table.gathered != &pair) TableGather(pair, user_data);
 	table.gathered = nullptr; // (taken: a later draw or dispatch gathers its own)
+	// (render4, KYTY_RENDER_STATS: what the blocks do with the V#s, LiveCensus::g_table_blocks; the render thread's only.)
+	const bool block_stats = LiveCensus::g_render && LiveCensus::RenderStatsOn();
 	for (uint32_t st = 0; st < stages; ++st) {
 		const auto& program = *pair.programs[st];
 		const auto& plan    = program.table_plan;
@@ -1829,8 +2058,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				if (writes != nullptr && resource.written && (uint64_t {words4[0]} | (words4[1] & 0xffffu)) != 0 &&
 				    words4[2] != 0)
 					*writes = true;
+				if (block_stats) ++LiveCensus::g_table_blocks[0];
 				auto& proof = table.written[XXH3_64bits(words4.data(), sizeof(words4)) & (TableXpr::WrittenEntries - 1)];
 				if (proof.special != table.special_generation || proof.words != words4) {
+					if (Trad1::Mode() != 0) ++(proof.words != words4 ? Trad1::g.reset_words : Trad1::g.reset_special); // (trad1b)
 					const auto [clamped_address, clamped_size] = range_of(words4);
 					proof = {.words = words4, .special = table.special_generation, .address = clamped_address, .size = clamped_size};
 				}
@@ -1853,6 +2084,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					    buffer_cache.GetBufferIfLive(proof.owner) == proof.owner_buffer) {
 						device = proof.device;
 						LiveCounters::Add(LiveCounters::TableWrittenMemo);
+						if (Trad1::Mode() != 0) ++Trad1::g.old_memo; // (trad1)
 						// KYTY_TABLE_WRITTEN_VERIFY=1: the lookup as well, its result against the memo's.
 						static const bool verify = std::getenv("KYTY_TABLE_WRITTEN_VERIFY") != nullptr;
 						if (verify) {
@@ -1866,24 +2098,119 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								            static_cast<unsigned long long>(device), static_cast<unsigned long long>(found));
 						}
 					} else {
-						proof.memo                 = false;
-						const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
-						region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
-						const auto id = buffer_cache.FindBuffer(address, size);
-						if (owner == nullptr || buffer_cache.GetBufferIfLive(id) != owner) return false;
-						if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
-						device = owner->BufferDeviceAddress() + offset;
-						// (The epochs after ObtainBuffer: its uploads and GPU marks are what the next use must find.)
-						if (const auto epoch = buffer_cache.CpuModificationEpoch(address, size); own_plain && epoch != 0) {
-							proof.memo         = true;
-							proof.device       = device;
-							proof.owner        = id;
-							proof.owner_buffer = owner;
-							proof.tick         = tick;
-							proof.registration = buffer_cache.RegistrationEpoch();
-							proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
-							proof.cpu_epoch    = epoch;
+						// (trad1b, KYTY_TRAD1; local/trad1.h) Another tick, or an epoch the old memo needs moved: with this
+						// range's last full obtain still standing on ObtainBuffer's write memo terms (registration, the
+						// same live buffer, no GPU-written byte of its regions given back), the write is only noted again
+						// (=1), or the old path checked against it (=2). Looked up by the range, not the V#'s entry.
+						const uint32_t trad1    = own_plain ? Trad1::Mode() : 0u;
+						bool           taken    = false;
+						bool           eligible = false;
+						auto           why      = Trad1::NoProof;
+						TableXpr::Trad1Range* range = nullptr;
+						if (trad1 != 0) {
+							buffer_cache.Trad1EnableCoverage();
+							range = &table.Trad1Find(address, size);
+							if (range->address != address || range->size != size) why = Trad1::NoProof;
+							else if (range->registration != buffer_cache.RegistrationEpoch()) why = Trad1::Registration;
+							else if (buffer_cache.GetBufferIfLive(range->owner) != range->owner_buffer) why = Trad1::BufferGone;
+							else if (buffer_cache.Trad1CoverageMoved(address, size, range->coverage)) why = Trad1::Coverage;
+							else eligible = true;
+							if (eligible && trad1 == 1) {
+								const bool     sample = Trad1::SampleFast();
+								const uint64_t start  = sample ? __rdtsc() : 0;
+								if (buffer_cache.Trad1RenoteWritten(range->owner, range->owner_buffer, address, size,
+								                                    range->registration, range->coverage)) {
+									taken       = true;
+									device      = range->device;
+									range->used = ++table.trad1_clock;
+									++Trad1::g.hits;
+									region_epochs.fill({UINT64_MAX, 0}); // (the drain may have moved them)
+									// As after a full obtain: the old memo holds for the rest of the tick.
+									const auto epoch   = buffer_cache.CpuModificationEpoch(address, size);
+									proof.memo         = epoch != 0;
+									proof.device       = range->device;
+									proof.owner        = range->owner;
+									proof.owner_buffer = range->owner_buffer;
+									proof.tick         = tick;
+									proof.registration = range->registration;
+									proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
+									proof.cpu_epoch    = epoch;
+									if (sample) {
+										Trad1::g.fast_cycles += __rdtsc() - start;
+										++Trad1::g.fast_samples;
+									}
+								} else {
+									eligible = false;
+									why      = Trad1::Refused;
+								}
+							}
+							if (!eligible) ++Trad1::g.miss[why];
 						}
+						if (!taken) {
+							const bool verify      = trad1 == 2 && eligible;
+							bool       would_write = false;
+							vk::DeviceAddress expect_device = 0;
+							const Buffer*     expect_buffer = nullptr;
+							uint64_t          expect_coverage = 0, expect_registration = 0;
+							if (verify) {
+								++Trad1::g.hits; // (what =1 would take)
+								would_write         = buffer_cache.Trad1SyncWouldUpload(address, size);
+								expect_device       = range->device;
+								expect_buffer       = range->owner_buffer;
+								expect_coverage     = range->coverage;
+								expect_registration = range->registration;
+							}
+							const bool     sample = trad1 != 0 && (trad1 == 1 || verify) && Trad1::SampleFull();
+							const uint64_t start  = sample ? __rdtsc() : 0;
+							if (block_stats) ++LiveCensus::g_table_blocks[1];
+							proof.memo                 = false;
+							const auto [owner, offset] = buffer_cache.ObtainBuffer(address, size, true, formatted);
+							region_epochs.fill({UINT64_MAX, 0}); // (its uploads may have moved them)
+							const auto id = buffer_cache.FindBuffer(address, size);
+							if (owner == nullptr || buffer_cache.GetBufferIfLive(id) != owner) return false;
+							if (formatted) textures.InvalidateMemoryFromGPU(address, size, "storage-buffer");
+							device = owner->BufferDeviceAddress() + offset;
+							if (sample) {
+								Trad1::g.full_cycles += __rdtsc() - start;
+								++Trad1::g.full_samples;
+							}
+							// (trad1, =2) Only where the shortcut would still have been taken after the drain (the
+							// epochs unchanged by the old path's own drain and lookups).
+							if (verify && !buffer_cache.Trad1CoverageMoved(address, size, expect_coverage) &&
+							    buffer_cache.RegistrationEpoch() == expect_registration) {
+								++Trad1::g.checked;
+								if (owner != expect_buffer)
+									Trad1::NoteDifference("buffer", address, size, reinterpret_cast<uint64_t>(expect_buffer),
+									                      reinterpret_cast<uint64_t>(owner));
+								else if (device != expect_device)
+									Trad1::NoteDifference("device", address, size, expect_device, device);
+								if (would_write) {
+									++Trad1::g.dirty;
+									Trad1::NoteDifference("upload (pages not GPU-owned)", address, size, 0, 1);
+								}
+							}
+							// (The epochs after ObtainBuffer: its uploads and GPU marks are what the next use must find.)
+							if (const auto epoch = buffer_cache.CpuModificationEpoch(address, size); own_plain && epoch != 0) {
+								proof.memo         = true;
+								proof.device       = device;
+								proof.owner        = id;
+								proof.owner_buffer = owner;
+								proof.tick         = tick;
+								proof.registration = buffer_cache.RegistrationEpoch();
+								proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
+								proof.cpu_epoch    = epoch;
+							}
+							if (trad1 != 0)
+								*range = {.address      = address,
+								          .size         = size,
+								          .device       = device,
+								          .owner        = id,
+								          .owner_buffer = owner,
+								          .registration = buffer_cache.RegistrationEpoch(),
+								          .coverage     = buffer_cache.GpuCoverageEpoch(),
+								          .used         = ++table.trad1_clock};
+						}
+						if (trad1 != 0) Trad1::MaybeReport(LiveControl::g_flips.load(std::memory_order_relaxed));
 					}
 				}
 				const auto [word, stride]      = word_of(words4);
@@ -1894,6 +2221,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				block[plan.BufferDword(i) + 4] = stride;
 				continue;
 			}
+			if (block_stats) ++LiveCensus::g_table_blocks[2];
 			auto& held    = *entries[i].second;
 			bool  current = held.words == words4 && (held.special == 0 || held.special == table.special_generation);
 			if (current && (held.registration & TableXpr::RingCopyMark) != 0) {
@@ -1930,12 +2258,15 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 				// Another page of its tracker regions was written: the range itself may still be clean.
 				if (const auto epoch = cpu_epoch(held.address, held.size); epoch == 0 || epoch != held.cpu_epoch) {
 					LiveCensus::Scope reprove(LiveCensus::DrawPhase, 0x7ab1e, 6);
+					if (block_stats) ++LiveCensus::g_table_blocks[4];
 					current = range_clean(held.address, held.size);
+					G1::NoteReprove(current); // (g1 NP1)
 					if (current) held.cpu_epoch = epoch;
 				}
 			}
 			if (!current) {
 				LiveCensus::Scope resolve(LiveCensus::DrawPhase, 0x7ab1e, 5);
+				if (block_stats) ++LiveCensus::g_table_blocks[3];
 				// (Kept only once resolved: a refusal leaves nothing a later use could take.)
 				held = {};
 				TableXpr::ResolvedBuffer fresh {.words = words4, .device = null_device};
@@ -1974,6 +2305,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
 							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							F0Measure::NoteRingCopy(address, size); // (f0)
 							if (shared != nullptr && cpu != 0)
 								*shared = {.address     = address,
 								           .size        = size,
@@ -2109,6 +2441,19 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, vk::CommandBuffer vk
 				break;
 			}
 		}
+		// A depth image with an HTile clear pending: the normal path's FindTexture clears it first
+		// (KYTY_SAMPLE_PENDING_HTILE_CLEAR, upstream 5a65bfb); the draw or dispatch is left to it.
+		if (image->info.IsDepth() && TextureCache::SampleHtileClearOn()) {
+			uint64_t meta    = 0;
+			bool     consume = false;
+			if (textures.SampleHtileClearPending(*image, dep.desc, &meta, &consume)) {
+				if (auto* spec = Spec::Current()) {
+					if (consume) spec->ConsumeMeta(meta, 0);
+					return Spec::Refuse("table: depth texture with an HTile clear pending"), false;
+				}
+				return false;
+			}
+		}
 	}
 	// As CommitBindings': the transitions all precede the one draw or dispatch.
 	const TransitGroup transit_group;
@@ -2130,18 +2475,292 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const auto  stages = pair.programs[1] != nullptr ? 2u : 1u;
 	const std::array<std::span<const uint32_t>, 2> user_data {std::span<const uint32_t> {sh.GetVs().gs_user_sgpr.value},
 	                                                          std::span<const uint32_t> {sh.GetPs().ps_user_sgpr.value}};
+	// (mdraw C0/C1, KYTY_MDRAW_STATS / KYTY_MDRAW_SKIP; local/live-census.h LiveCensus::Mdraw; off: one relaxed load)
+	// Is this call a member of a multi-draw group with the table call before it: the tests known before any
+	// preparation (the image set is compared at the end, C0 only). C1: a member is neither prepared nor emitted.
+	const bool     mdraw       = LiveCensus::Mdraw::Active() && Role() == 0 && Spec::Current() == nullptr;
+	const uint64_t mdraw_start = mdraw ? (LiveCensus::Mdraw::t_entry != 0 ? LiveCensus::Mdraw::t_entry : __rdtsc()) : 0;
+	uint64_t       mdraw_emit  = 0;
+	uint32_t       mdraw_break = LiveCensus::Mdraw::Breaks; // (Breaks: a member)
+	uint32_t       mdraw_ud    = 0;                         // a member's per-draw words of the vertex stage that differ
+	if (mdraw) {
+		LiveCensus::Mdraw::t_entry = 0;
+		auto&       last   = LiveCensus::Mdraw::g_last;
+		const auto& vertex = *pair.programs[0];
+		uint32_t    per_draw = 0; // (the vertex stage's user data words a multi-draw would pass per draw)
+		const auto  allow    = [&](int64_t index) {
+            if (index >= 0 && index < 32) per_draw |= 1u << static_cast<uint32_t>(index);
+		};
+		allow(pair.start_instance);
+		if (vertex.info.vertex_offset_sgpr >= 0) allow(int64_t {vertex.info.vertex_offset_sgpr} - int64_t {vertex.user_data_base});
+		if (vertex.info.instance_offset_sgpr >= 0)
+			allow(int64_t {vertex.info.instance_offset_sgpr} - int64_t {vertex.user_data_base});
+		const uint64_t command = buffer.IsInvalid() ? uint64_t {0}
+		                                            : reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(buffer.RawHandle()));
+		if (direct != nullptr || commands.empty() || index_base == 0) {
+			mdraw_break = LiveCensus::Mdraw::BDirect;
+		} else if (!last.valid) {
+			mdraw_break = LiveCensus::Mdraw::BFirst;
+		} else if (command == 0 || command != last.command || buffer.GraphicsGeneration() != last.generation) {
+			mdraw_break = LiveCensus::Mdraw::BCommand;
+		} else if (LiveCounters::Value(LiveCounters::RenderPasses) != last.passes || !buffer.RenderingWith(draw_state.rendering) ||
+		           buffer.InCopyRun() || buffer.ComputeChainPending()) {
+			mdraw_break = LiveCensus::Mdraw::BPass;
+		} else if (reinterpret_cast<uint64_t>(&pair) != last.pair) {
+			mdraw_break = LiveCensus::Mdraw::BPair;
+		} else if (reinterpret_cast<uint64_t>(&variant) != last.variant || reinterpret_cast<uint64_t>(&draw_state) != last.state) {
+			mdraw_break = LiveCensus::Mdraw::BState;
+		} else if (last.writes) {
+			mdraw_break = LiveCensus::Mdraw::BWrites;
+		} else if (index_base != last.index_base || index_bytes != last.index_bytes ||
+		           static_cast<uint32_t>(index_type) != last.index_type) {
+			mdraw_break = LiveCensus::Mdraw::BIndex;
+		} else if (HwScene::Active() || Render1::Mode() == 2 || PortR::Verifying()) {
+			mdraw_break = LiveCensus::Mdraw::BExcluded; // (paths that capture or batch each draw: never skipped)
+		} else {
+			std::array<uint32_t, 2> other {};
+			for (uint32_t st = 0; st < 2; ++st)
+				for (uint32_t i = 0; i < 32; ++i) {
+					const uint32_t now = st < stages && i < user_data[st].size() ? user_data[st][i] : 0u;
+					if (now == last.ud[st][i]) continue;
+					if (st == 0 && ((per_draw >> i) & 1u) != 0) mdraw_ud |= 1u << i;
+					else other[st] |= 1u << i;
+				}
+			if (other[0] != 0 || other[1] != 0) {
+				mdraw_break = other[0] != 0 ? LiveCensus::Mdraw::BUdVs : LiveCensus::Mdraw::BUdPs;
+				for (uint32_t st = 0; st < 2; ++st)
+					for (uint32_t i = 0; i < 32; ++i)
+						if (((other[st] >> i) & 1u) != 0) ++LiveCensus::Mdraw::g_c.ud_break[st][i];
+			}
+		}
+		if (mdraw_break == LiveCensus::Mdraw::Breaks && LiveCensus::Mdraw::SkipNow()) {
+			// (C1) Neither prepared nor emitted. What a later table draw reads of this one stays the group's first
+			// call's (cache.emit, table.last_*: the same pair, variant, state, pipeline, index buffer and command
+			// buffer, which the tests above proved); the comparison base takes this call's user data and arguments.
+			auto& c = LiveCensus::Mdraw::g_c;
+			++c.skipped;
+			c.skipped_draws += commands.size();
+			++c.members;
+			c.member_draws += commands.size();
+			++LiveCensus::Mdraw::g_group_calls;
+			for (uint32_t st = 0; st < 2; ++st)
+				for (uint32_t i = 0; i < 32; ++i)
+					last.ud[st][i] = st < stages && i < user_data[st].size() ? user_data[st][i] : 0u;
+			last.last_arg   = commands.back();
+			last.args_known = false;
+			return TableResult::Drawn;
+		}
+		last.valid = false; // (valid again only once this call is drawn: a refusal below leaves no group behind)
+	}
+	// (port-r, KYTY_PORT_R=2; local/port-r.h) A draw of the game's geometry list run by the host (eboot+0xab57d0): its
+	// native description (found by the table address its user data carries) is compared with what this draw translates
+	// to, after the evaluation (PortR::End below); the clock takes the whole step, every return. Off: one load.
+	PortR::DrawClock port_r_clock(PortR::Verifying() && Role() == 0 && Spec::Current() == nullptr &&
+	                              PortR::Begin(user_data[0], stages > 1 ? user_data[1] : std::span<const uint32_t> {}));
 	// (The index buffer's held entry, a cold line of a 320 KiB table, loads while the tables are evaluated.)
 	if (index_base != 0) {
 		const auto* held = &table.indices[(index_base * 0x9e3779b97f4a7c15ull) >> 51u];
 		__builtin_prefetch(held);
 		__builtin_prefetch(reinterpret_cast<const char*>(held + 1) - 1);
 	}
+	// (trust1) KYTY_DS_TRUSTED_DEPTH / KYTY_RENDER_STATS (local/trusted-depth.h): an XPR depth draw's key (the pair and
+	// its programs, the draw state, both stages' user data), its entry in the trusted registry (=1 drawn from it, =2
+	// compared with the normal path's result) and its reads, captured while TableEvaluate makes them.
+	// (draw1) KYTY_DRAW1: the same registry proven by the runs' words read again (trusted-depth.h), for XPR runs into
+	// any target; the measurement (KYTY_RENDER_STATS) stays the depth draws'.
+	const int  trust_mode  = TrustedDepth::Mode();
+	const bool trust_stats = TrustedDepth::StatsOn();
+	const bool trust_bytes = TrustedDepth::ByteProof();
+	const bool depth_only  = draw_state.targets.size() == 1 && draw_state.targets[0].requested.IsDepth();
+	const bool trust_depth = (trust_mode != 0 || trust_stats) && direct == nullptr && !commands.empty() && Role() == 0 &&
+	                         Spec::Current() == nullptr && (depth_only || (trust_mode != 0 && trust_bytes));
+	bool                 trust_pair = false, trust_hit = false, trust_sample = false;
+	uint64_t             trust_key = 0, trust_mapping = 0, trust_start = 0;
+	TrustedDepth::Entry* trust_entry = nullptr;
+	// (reuso1) KYTY_REUSO1: the preparation's cycles (key, proof or evaluation+gather, set, BDA, blocks) of the draws
+	// the registry follows, hit or not: the [reuso1] line's saving per hit is their difference.
+	const uint64_t reuso_start = TrustedDepth::Reuso1Mode() != 0 && trust_depth ? __rdtsc() : 0;
+	// (draw1, KYTY_DRAW1 with KYTY_RENDER_STATS) A render list's direct draw's key, for its repetition (measurement only).
+	if (direct != nullptr && trust_bytes && trust_stats && Role() == 0 && Spec::Current() == nullptr) {
+		const std::array<uint64_t, 3> head {reinterpret_cast<uint64_t>(&pair), variant.state, reinterpret_cast<uint64_t>(&draw_state)};
+		uint64_t key = XXH3_64bits_withSeed(user_data[0].data(), user_data[0].size_bytes(), XXH3_64bits(head.data(), sizeof(head)));
+		if (stages > 1) key = XXH3_64bits_withSeed(user_data[1].data(), user_data[1].size_bytes(), key);
+		TrustedDepth::NoteKindKey(TrustedDepth::KindList, key);
+	}
+	if (trust_depth) {
+		trust_pair = true;
+		for (uint32_t st = 0; st < stages && trust_pair; ++st) {
+			const auto& program = *pair.programs[st];
+			if (!program.table_plan.indirect.empty()) trust_pair = false;
+			for (const auto& resource: program.info.buffers)
+				if (resource.written || resource.atomic) trust_pair = false;
+		}
+		const std::array<uint64_t, 6> head {reinterpret_cast<uint64_t>(&pair), reinterpret_cast<uint64_t>(pair.programs[0]),
+		                                    reinterpret_cast<uint64_t>(pair.programs[1]), variant.state,
+		                                    reinterpret_cast<uint64_t>(&draw_state),
+		                                    user_data[0].size() | uint64_t {stages > 1 ? user_data[1].size() : 0} << 32u};
+		trust_key = XXH3_64bits_withSeed(user_data[0].data(), user_data[0].size_bytes(), XXH3_64bits(head.data(), sizeof(head)));
+		if (stages > 1) trust_key = XXH3_64bits_withSeed(user_data[1].data(), user_data[1].size_bytes(), trust_key);
+		if (trust_stats && depth_only) TrustedDepth::NoteKey(trust_key);
+		if (trust_stats && !depth_only) TrustedDepth::NoteKindKey(TrustedDepth::KindXprColor, trust_key); // (draw1)
+		trust_sample = trust_stats && depth_only && TrustedDepth::Sample();
+		if (trust_mode != 0 && !trust_pair) ++TrustedDepth::g_counts[TrustedDepth::CPairIneligible];
+		if (trust_mode != 0 && trust_pair) {
+			++TrustedDepth::g_counts[TrustedDepth::CEligible];
+			if (!DsTrustFeed::Live() && !trust_bytes) {
+				++TrustedDepth::g_counts[TrustedDepth::CNoFeed];
+			} else if (auto& unstable = TrustedDepth::Entries()[TrustedDepth::EntryIndex(trust_key)];
+			           trust_bytes && unstable.changed >= 2 && unstable.key == trust_key && unstable.forget == TrustedDepth::g_forget) {
+				// (draw1) A key whose words keep changing (memory rewritten between its draws): neither proven nor stored
+				// again, nothing captured; its draws go the normal way.
+				++TrustedDepth::g_counts[TrustedDepth::CUnstable];
+			} else {
+				// (Before any read: what a later proof compares with.)
+				trust_mapping = m_context.GetGpuResources().MappingEpoch();
+				trust_start   = m_context.GetTextureCache().StartEpoch();
+				trust_entry   = &unstable;
+				auto& entry   = *trust_entry;
+				bool  valid   = entry.valid && entry.key == trust_key && entry.forget == TrustedDepth::g_forget && entry.pair == &pair &&
+				             entry.programs[0] == pair.programs[0] && entry.programs[1] == pair.programs[1] &&
+				             entry.state_key == variant.state && entry.draw_state == &draw_state;
+				for (uint32_t st = 0; st < stages && valid; ++st)
+					valid = entry.user[st].size() == user_data[st].size() &&
+					        std::equal(user_data[st].begin(), user_data[st].end(), entry.user[st].begin());
+				if (!valid) {
+					if (entry.valid) ++TrustedDepth::g_counts[TrustedDepth::CInvalidKey];
+					entry.valid = false;
+				} else {
+					if (trust_bytes) {
+						// (draw1) The mappings and image starts first (the runs' pages as mapped as when they were read),
+						// then the runs' words, read as TableEvaluate reads them (its reader: a page GPU work wrote is read
+						// as it would read it), against the entry's: the slots they filled.
+						if (entry.mapping != trust_mapping || entry.start_epoch != trust_start) {
+							valid = false;
+							++TrustedDepth::g_counts[TrustedDepth::CInvalidReg];
+						} else {
+							// Each run's pages mapped, as TableEvaluate's locate proves them (the same per-page memo, reset
+							// with the mapping epoch as there), before anything is read.
+							if (const auto epoch = m_context.GetGpuResources().MappingEpoch(); epoch != table.mapping_epoch) {
+								table.mapped.fill(UINT64_MAX);
+								table.mapping_epoch = epoch;
+							}
+							for (const auto& run: entry.runs) {
+								if (run.count == 0 || !valid) continue;
+								for (auto page = run.address >> 14u; page <= (run.address + uint64_t {run.count} * 4u - 1) >> 14u; ++page) {
+									auto& seen = table.mapped[page & 255u];
+									if (seen == page) continue;
+									if (!Libs::LibKernel::Memory::IsFullyMapped(page << 14u, 16384)) {
+										valid = false;
+										break;
+									}
+									seen = page;
+								}
+								for (auto line = run.address & ~63ull; valid && line < run.address + uint64_t {run.count} * 4u; line += 64)
+									__builtin_prefetch(reinterpret_cast<const void*>(line));
+							}
+							NativeXprReader                    reader(m_context.GetGpuResources());
+							thread_local std::vector<uint32_t> now;
+							for (const auto& run: entry.runs) {
+								if (run.count == 0 || !valid) continue;
+								const auto& block = entry.block[run.st & 1u];
+								if (run.st > 1 || uint64_t {run.first} + run.count > block.size()) {
+									valid = false;
+									break;
+								}
+								now.resize(run.count);
+								reader.Read(run.address, run.count, now.data());
+								if (std::memcmp(now.data(), block.data() + run.first, uint64_t {run.count} * 4u) != 0) {
+									// (reuso1) Which words changed, for the next decision (counted only with KYTY_REUSO1).
+									if (TrustedDepth::Reuso1Mode() != 0)
+										TrustedDepth::NoteWordDiff(now.data(), block.data() + run.first, run.count,
+										                           static_cast<uint32_t>(&run - entry.runs.data()));
+									valid = false;
+									break;
+								}
+							}
+							if (!valid) {
+								++TrustedDepth::g_counts[TrustedDepth::CInvalidBytes];
+								++entry.changed;
+							}
+						}
+					} else {
+						for (const auto& range: entry.ranges)
+							if (DsTrustFeed::Generation(range.address, range.size) != range.generation) {
+								valid = false;
+								break;
+							}
+						if (!valid) ++TrustedDepth::g_counts[TrustedDepth::CInvalidGen];
+					}
+					if (valid) {
+						const auto& buffers = m_context.GetBufferCache();
+						valid = entry.mapping == trust_mapping && entry.start_epoch == trust_start;
+						for (const auto& [address, size]: entry.buffers)
+							if (valid && buffers.RegisteredSince(address, size, entry.registration)) valid = false;
+						if (!valid) {
+							++TrustedDepth::g_counts[TrustedDepth::CInvalidReg];
+						} else {
+							// (The buffers' own tracking too: a write it saw, announced or not, is uploaded by the normal path.)
+							for (size_t b = 0; b < entry.buffers.size() && valid; ++b)
+								valid = buffers.CpuModificationEpoch(entry.buffers[b].first, entry.buffers[b].second) ==
+								        entry.cpu_epochs[b];
+							if (!valid) ++TrustedDepth::g_counts[TrustedDepth::CInvalidCpu];
+						}
+					}
+					if (!valid) entry.valid = false;
+				}
+				// An entry is used (=1) or compared (=2) once a second sighting found the normal path's result the same
+				// with no announcement in between (confirmed): a write announced between the read and the generations'
+				// snapshot is caught there.
+				if (valid && entry.confirmed) {
+					if (trust_mode == 1) {
+						trust_hit = true;
+						for (uint32_t st = 0; st < stages; ++st) {
+							table.blocks[st].assign(entry.block[st].begin(), entry.block[st].end());
+							table.indirect[st].clear();
+						}
+						table.words.assign(entry.words.begin(), entry.words.end());
+						table.lod_stats.assign(entry.lod.begin(), entry.lod.end());
+						table.gathered = nullptr;
+						++TrustedDepth::g_counts[TrustedDepth::CHit];
+					} else {
+						++TrustedDepth::g_counts[TrustedDepth::CWouldHit];
+					}
+					if (!depth_only) ++TrustedDepth::g_counts[TrustedDepth::CHitColor];
+				}
+			}
+		}
+		if (!trust_hit && (trust_entry != nullptr || trust_sample)) {
+			TrustedDepth::t_capture.runs.clear();
+			TrustedDepth::t_capture.on = true;
+		}
+	}
 	std::optional<LiveCensus::Scope> phase;
-	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
-	if (!TableEvaluate(pair, user_data))
-		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
-	TableGather(pair, user_data);
-	phase.reset();
+	if (!trust_hit) {
+		phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 1);
+		const bool evaluated          = TableEvaluate(pair, user_data);
+		TrustedDepth::t_capture.on = false;
+		if (!evaluated)
+			return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: evaluation"), TableResult::Native;
+		TableGather(pair, user_data);
+		phase.reset();
+	}
+	if (port_r_clock.on) {
+		PortR::Translated port_r;
+		port_r.vs            = pair.vs;
+		port_r.ps            = pair.ps;
+		port_r.state         = variant.state;
+		port_r.draw_state    = &draw_state;
+		port_r.words         = std::span<const uint32_t> {table.words.data(), table.words.size()};
+		port_r.ud_vs         = user_data[0];
+		port_r.ud_ps         = stages > 1 ? user_data[1] : std::span<const uint32_t> {};
+		port_r.evaluated     = !trust_hit;
+		port_r.direct        = direct != nullptr && direct->indexed && direct->instance_count == 1;
+		port_r.index_base    = index_base;
+		port_r.index_address = direct != nullptr ? direct->index_address : 0;
+		port_r.index_count   = direct != nullptr ? direct->index_count : 0;
+		port_r.index_size    = index_type == vk::IndexType::eUint16 ? 2u : 4u;
+		PortR::End(port_r);
+	}
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 2);
 	auto* set = TableSet(buffer, pair, &variant, &draw_state);
 	if (auto* spec = Spec::Current(); spec != nullptr && set != nullptr)
@@ -2203,13 +2822,196 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	bool                             writes = false;
 	// (Before the blocks, which it does not depend on (the slots TableEvaluate read): the entries TableGather asked
 	// for meanwhile arrive.)
-	TablePrepareBda(pair, user_data);
+	{
+		LiveCensus::StatScope stat_bda(0, 12); // (render3, KYTY_RENDER_STATS: the BDA preparation and its uploads)
+		TablePrepareBda(pair, user_data);
+	}
 	// The blocks take each buffer's device address as it resolves: a later lookup that registers a buffer (a merge
 	// replaces an earlier one) leaves an earlier address stale, where the normal path binds after all its lookups
 	// (RebindBuffers). Such a draw takes the normal path; the next use finds the buffers registered.
 	const auto registration = buffer_cache.RegistrationEpoch();
-	if (!TableBlocks(pair, user_data, blocks, &writes))
+	bool       blocks_made  = false;
+	{
+		LiveCensus::StatScope stat_blocks(0, 13); // (render3, KYTY_RENDER_STATS: the blocks)
+		if (trust_hit) {
+			// (trust1, KYTY_DS_TRUSTED_DEPTH=1) The entry's blocks into the ring, as TableBlocks copies its own.
+			auto& upload = buffer_cache.GetTableUploadBuffer();
+			for (uint32_t st = 0; st < stages; ++st)
+				if (pair.programs[st]->table_plan.BlockDwords() != 0)
+					blocks[st] = upload.BufferDeviceAddress() +
+					             upload.Copy(table.blocks[st].data(), table.blocks[st].size() * sizeof(uint32_t), 16);
+			blocks_made = true;
+		} else {
+			blocks_made = TableBlocks(pair, user_data, blocks, &writes);
+		}
+	}
+	if (!blocks_made)
 		return LiveCounters::Add(LiveCounters::TableDrawNative), Spec::Refuse("table: blocks"), TableResult::Native;
+	if (reuso_start != 0 && trust_entry != nullptr) TrustedDepth::NotePrep(trust_hit, __rdtsc() - reuso_start);
+	// (trust1) The normal path's result of an XPR depth draw the registry follows (or a sampled one): its reads
+	// classified (KYTY_RENDER_STATS), compared with a confirmed entry (=2) or one to confirm, and stored.
+	if (trust_depth && !trust_hit && (trust_entry != nullptr || trust_sample)) {
+		const auto&                                    captured = TrustedDepth::t_capture.runs;
+		thread_local std::vector<TrustedDepth::Range>                ranges;
+		thread_local std::vector<std::array<uint32_t, 2>> buffer_dwords;
+		ranges.clear();
+		buffer_dwords.clear();
+		bool ring = false; // (a V# read from a copy in the ring, or not held: its device address is this draw's only)
+		for (const auto& run: captured) ranges.push_back({run.address, uint64_t {run.count} * 4u, 0});
+		const size_t slot_ranges = ranges.size();
+		for (uint32_t st = 0; st < stages; ++st) {
+			const auto& program = *pair.programs[st];
+			const auto& plan    = program.table_plan;
+			for (size_t i = 0; i < plan.buffers.size() && i < table.entries[st].size(); ++i) {
+				const auto& resource = program.info.buffers[i];
+				if (resource.written || resource.atomic) continue;
+				const auto& [words4, held] = table.entries[st][i];
+				const auto dword           = plan.BufferDword(i);
+				buffer_dwords.push_back({st, dword});
+				const vk::DeviceAddress device = table.blocks[st][dword] | uint64_t {table.blocks[st][dword + 1]} << 32u;
+				if (held == nullptr || held->words != words4 || (held->registration & TableXpr::RingCopyMark) != 0 ||
+				    held->device != device) {
+					ring = true;
+					continue;
+				}
+				if (held->size != 0) ranges.push_back({held->address, held->size, 0});
+			}
+		}
+		uint32_t     bad        = TrustedDepth::ReadStatic;
+		bool         all_static = true;
+		TrustedDepth::ShaderReads* reads      = trust_sample ? TrustedDepth::ReadsOf(pair.programs[0]->shader_hash) : nullptr;
+		const auto   classify   = [&] {
+			for (size_t r = 0; r < ranges.size(); ++r) {
+				const uint32_t read = TrustedDepth::Classify(ranges[r].address, ranges[r].size);
+				if (reads != nullptr) reads->bytes[r < slot_ranges ? 0 : 1][read] += ranges[r].size;
+				if (read != TrustedDepth::ReadStatic && all_static) {
+					all_static = false;
+					bad        = read;
+				}
+			}
+		};
+		bool classified = false;
+		if (reads != nullptr) {
+			classify();
+			classified = true;
+			reads->calls += 1;
+			if (all_static && !ring) reads->all_static += 1;
+		}
+		if (trust_entry != nullptr) {
+			auto&          entry  = *trust_entry;
+			const uint64_t shader = pair.programs[0]->shader_hash;
+			const bool     same_key = entry.valid && entry.key == trust_key && entry.forget == TrustedDepth::g_forget;
+			// The normal path's result against the entry's: =2 counts and lists what differs in a confirmed entry; an
+			// unconfirmed one is confirmed when nothing does.
+			bool differs = false;
+			if (same_key) {
+				const bool report = entry.confirmed && trust_mode == 2;
+				const auto note   = [&](uint32_t st, char what, uint32_t index, uint32_t trusted, uint32_t fresh) {
+					differs = true;
+					if (report) TrustedDepth::NoteMismatch(shader, st, what, index, trusted, fresh);
+				};
+				if (entry.runs.size() != captured.size()) {
+					note(0, 'n', 0, static_cast<uint32_t>(entry.runs.size()), static_cast<uint32_t>(captured.size()));
+				} else {
+					for (size_t k = 0; k < captured.size(); ++k) {
+						const auto& a = entry.runs[k];
+						const auto& b = captured[k];
+						if (a.st != b.st || a.first != b.first || a.count != b.count || a.address != b.address)
+							note(b.st, 'a', static_cast<uint32_t>(k), static_cast<uint32_t>(a.address), static_cast<uint32_t>(b.address));
+						for (uint32_t w = b.first; w < b.first + b.count; ++w)
+							if (w < entry.block[b.st].size() && w < table.blocks[b.st].size() &&
+							    entry.block[b.st][w] != table.blocks[b.st][w])
+								note(b.st, 's', w, entry.block[b.st][w], table.blocks[b.st][w]);
+					}
+				}
+				if (entry.buffer_dwords != buffer_dwords) {
+					note(0, 'n', 1, static_cast<uint32_t>(entry.buffer_dwords.size()), static_cast<uint32_t>(buffer_dwords.size()));
+				} else {
+					for (const auto& [st, dword]: buffer_dwords)
+						for (uint32_t w = dword; w < dword + 5; ++w)
+							if (w < entry.block[st].size() && w < table.blocks[st].size() && entry.block[st][w] != table.blocks[st][w])
+								note(st, 'b', w, entry.block[st][w], table.blocks[st][w]);
+				}
+				if (entry.words.size() != table.words.size()) {
+					note(0, 'n', 2, static_cast<uint32_t>(entry.words.size()), static_cast<uint32_t>(table.words.size()));
+				} else {
+					for (size_t w = 0; w < table.words.size(); ++w)
+						if (entry.words[w] != table.words[w]) note(0, 'w', static_cast<uint32_t>(w), entry.words[w], table.words[w]);
+				}
+				if (entry.lod.size() != table.lod_stats.size()) {
+					note(1, 'n', 3, static_cast<uint32_t>(entry.lod.size()), static_cast<uint32_t>(table.lod_stats.size()));
+				} else {
+					for (size_t w = 0; w < table.lod_stats.size(); ++w)
+						if (entry.lod[w] != table.lod_stats[w]) note(1, 'l', static_cast<uint32_t>(w), entry.lod[w], table.lod_stats[w]);
+				}
+				if (differs && report) ++TrustedDepth::g_counts[TrustedDepth::CMismatchCalls];
+				if (!differs && !entry.confirmed) entry.confirmed = true;
+			}
+			if (same_key && !differs) {
+				// (Confirmed, or compared clean: kept as it is, with its own proofs.)
+			} else if (!same_key && (entry.key != trust_key || entry.forget != TrustedDepth::g_forget || entry.sightings == 0)) {
+				// First sighting of the key here: only noted (most keys are never seen again: nothing to store).
+				entry           = {};
+				entry.key       = trust_key;
+				entry.forget    = TrustedDepth::g_forget;
+				entry.sightings = 1;
+				++TrustedDepth::g_counts[TrustedDepth::CFirstSight];
+			} else {
+				if (!classified && !trust_bytes) classify(); // (draw1: the words are the proof, not the memory's class)
+				entry.valid     = false;
+				entry.confirmed = false;
+				entry.key       = trust_key;
+				entry.forget    = TrustedDepth::g_forget;
+				++entry.sightings;
+				if (ring) {
+					++TrustedDepth::g_counts[TrustedDepth::CRefuseRing];
+				} else if (ranges.size() > TrustedDepth::MaxRanges) {
+					++TrustedDepth::g_counts[TrustedDepth::CRefuseRanges];
+				} else if (!all_static && !trust_bytes) {
+					++TrustedDepth::g_counts[TrustedDepth::CRefuseClass];
+					++TrustedDepth::g_refused_class[bad];
+				} else if (std::any_of(ranges.begin() + static_cast<std::ptrdiff_t>(slot_ranges), ranges.end(), [&](const auto& range) {
+					           return buffer_cache.CpuModificationEpoch(range.address, range.size) == 0 ||
+					                  buffer_cache.IsRegionCpuModified(range.address, range.size);
+				           })) {
+					++TrustedDepth::g_counts[TrustedDepth::CRefuseDirty];
+				} else {
+					// (Generations now, after the reads: a write announced in between is caught by the confirmation.)
+					if (!trust_bytes)
+						for (auto& range: ranges) range.generation = DsTrustFeed::Generation(range.address, range.size);
+					entry.pair       = &pair;
+					entry.programs   = {pair.programs[0], pair.programs[1]};
+					entry.state_key  = variant.state;
+					entry.draw_state = &draw_state;
+					for (uint32_t st = 0; st < 2; ++st) {
+						if (st < stages) {
+							entry.user[st].assign(user_data[st].begin(), user_data[st].end());
+							entry.block[st].assign(table.blocks[st].begin(), table.blocks[st].end());
+						} else {
+							entry.user[st].clear();
+							entry.block[st].clear();
+						}
+					}
+					entry.words.assign(table.words.begin(), table.words.end());
+					entry.lod.assign(table.lod_stats.begin(), table.lod_stats.end());
+					entry.runs.assign(captured.begin(), captured.end());
+					entry.buffer_dwords.assign(buffer_dwords.begin(), buffer_dwords.end());
+					entry.ranges.assign(ranges.begin(), ranges.end());
+					entry.buffers.clear();
+					entry.cpu_epochs.clear();
+					for (size_t r = slot_ranges; r < ranges.size(); ++r) {
+						entry.buffers.emplace_back(ranges[r].address, ranges[r].size);
+						entry.cpu_epochs.push_back(buffer_cache.CpuModificationEpoch(ranges[r].address, ranges[r].size));
+					}
+					entry.registration = registration; // (before TableBlocks' lookups)
+					entry.mapping      = trust_mapping;
+					entry.start_epoch  = trust_start;
+					entry.valid        = true;
+					++TrustedDepth::g_counts[TrustedDepth::CStored];
+				}
+			}
+		}
+	}
 	// Frame generation's camera (FrameGen::OnDraw: the G-buffer vertex shaders' view-projection, previous one and
 	// jitter), from the block's slots: dword s of the vertex stage's block is flattened SRT slot s, as the normal path's
 	// flattened_srt. Without it every frame of a session reported "camera default" (the G-buffer draws take this path).
@@ -2217,18 +3019,23 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (HwScene::Active() && Spec::Current() == nullptr)
 		HwScene::NoteCamera(pair.programs[0]->shader_hash,
 		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
-	if (FrameGen::Capturing() && Spec::Current() == nullptr)
+	// (render5: KYTY_DRAW_FLAGS, Render5Flags in native-xpr.inc, for the five questions below and the two after the draw)
+	if (Render5Flags::Capturing() && Spec::Current() == nullptr)
 		FrameGen::OnDraw(pair.programs[0]->shader_hash,
 		                 std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), 't');
-	if (FrameGen::SsrWanted() && Spec::Current() == nullptr)
+	// (pt1) BB_PATHTRACING: the sun's light matrix from the draws inside a RenderShadowCascade scope
+	if (PathTrace::Requested() && Spec::Current() == nullptr)
+		PathTrace::OnDraw(pair.programs[0]->shader_hash,
+		                  std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
+	if (Render5Flags::Wanted(Render5Flags::Ssr) && Spec::Current() == nullptr)
 		FrameGen::OnSsrDraw(pair.programs[0]->shader_hash,
 		                    std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()));
-	if (FrameGen::ContactShadowsWanted() && Spec::Current() == nullptr)
+	if (Render5Flags::Wanted(Render5Flags::Contact) && Spec::Current() == nullptr)
 		FrameGen::OnShadowDraw(pair.programs[0]->shader_hash,
 		                       std::span<const uint32_t>(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size()), false);
 	// (KYTY_RT_SUN: a sun cascade's draw, a depth-only draw into a layer of a square layered depth image: its layer and
 	// light matrix)
-	if (FrameGen::RtSunWanted() && Spec::Current() == nullptr && draw_state.targets.size() == 1) {
+	if (Render5Flags::Wanted(Render5Flags::RtSun) && Spec::Current() == nullptr && draw_state.targets.size() == 1) {
 		const auto& t = draw_state.targets[0];
 		const auto& r = t.requested;
 		if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
@@ -2251,6 +3058,33 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		++groups;
 		first += count;
 	}
+	// (render1 F2c) What the draw's shaders read of its own depth target (its set's images: the program's bindings).
+	if (Render1::Mode() == 2 && Render1::t_current.native) {
+		auto& read = Render1::t_read;
+		read       = {};
+		read.known = true;
+		for (const auto& target: draw_state.targets) {
+			if (!target.requested.IsDepth()) continue;
+			for (const auto& image: set->images) {
+				++read.images;
+				if (!(image.id == target.id)) continue;
+				read.reads_depth = true;
+				read.base_layer  = image.range.base_layer;
+				read.layers      = image.range.layer_count;
+				read.base_level  = image.range.base_level;
+				read.levels      = image.range.level_count;
+			}
+			break;
+		}
+	}
+	// (render1 F2, KYTY_RENDER1=2: a p0/p1 depth draw into the native batch; before anything is bound or compared with
+	// what is bound: a new batch starts by copying the depth and invalidates the graphics state)
+	const bool render1 = Render1::Mode() == 2 && Render1::t_current.native &&
+	                     Render1Begin(buffer, draw_state,
+	                                  direct != nullptr || commands.empty() ? Render1::RDirect
+	                                  : writes                              ? Render1::RWrites
+	                                  : variant.hwrt_scene && HwScene::Active() ? Render1::RHwrt
+	                                                                            : Render1::Reasons);
 	auto&      emit       = cache.emit;
 	const bool indexed    = direct == nullptr || direct->indexed; // (a draw of vertices binds no indices)
 	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
@@ -2271,6 +3105,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return TableResult::Native;
 	phase.reset();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 4);
+	if (mdraw) mdraw_emit = __rdtsc(); // (mdraw C0: the emission from here)
 	if (buffer.IsInvalid()) return Spec::Refuse("table: buffer"), TableResult::Native;
 	const auto vk_buffer    = buffer.Handle();
 	const bool same_command = emit.command == vk_buffer && emit.generation == buffer.GraphicsGeneration();
@@ -2279,6 +3114,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	auto&      texture_cache = m_context.GetTextureCache();
 	const auto images_epoch  = texture_cache.ImagesEpoch();
 	const bool own           = Spec::Current() == nullptr;
+	// (f5b) A verified pass's targets (KYTY_NATIVE_PASSES ..:2; one load otherwise).
+	if (own && NativeRender::NoteTargetsWanted()) // (pt1: BB_PATHTRACING's GBuffer / ResolveLighting targets too)
+		for (const auto& target: draw_state.targets)
+			NativeRender::NoteTarget(target.id.index, target.id.generation, target.range.base_level, target.range.base_layer,
+			                         target.requested.IsDepth());
 	const bool in_place      = same_command && emit.state == &draw_state && table.last_set == set &&
 	                      table.images_epoch == images_epoch && own;
 	if (!in_place) {
@@ -2305,7 +3145,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// KYTY_HWRT (local/hwrt-scene.h): a G-buffer state's draws take its capturing pipeline (same layout), on this
 	// render thread only; the first record of each draw call goes in push constant dword HwScene::CursorDword.
 	bool hwrt_capture = false;
-	if (variant.hwrt_scene && HwScene::Active()) {
+	// (pt1) BB_PATHTRACING: only inside the game's capture scopes (GBuffer, VirtualGeo: the frame map); CaptureHere is
+	// true when it is off.
+	if (variant.hwrt_scene && HwScene::Active() && PathTrace::CaptureHere()) {
 		const uint32_t draws = direct != nullptr ? 1u : static_cast<uint32_t>(commands.size());
 		if (Role() != 0 || Spec::Current() != nullptr) {
 			HwScene::NoteSkip(HwScene::Skip::Speculation, draws);
@@ -2347,6 +3189,8 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 				d.ps_module = variant.hwrt_ps_module;
 				d.ps_images = &set->hwrt_ps_images;
 				d.cache     = &texture_cache;
+			} else if (PathTrace::Requested()) {
+				d.ps_module = variant.hwrt_ps_module; // (pt1: whether it discards - alpha-tested meshes stay out of the rays)
 			}
 			d.index_size     = static_cast<uint32_t>(hwrt_index_size);
 			d.index_count    = index_count;
@@ -2355,6 +3199,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			const uint64_t begin = index_base + uint64_t {first_index} * hwrt_index_size;
 			if (indexed && buffer_cache.IsRegionGpuModified(begin, uint64_t {index_count} * hwrt_index_size)) {
 				HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+				HwScene::NoteGpuWrittenKind(false); // (pt1e: the indices)
 				return false;
 			}
 			d.index_address = indexed && index_base != 0 && begin + uint64_t {index_count} * hwrt_index_size <= index_base + index_bytes
@@ -2381,6 +3226,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			for (uint32_t i = 0; i < group_sizes[group]; ++i) {
 				if (buffer_cache.IsRegionGpuModified(commands[first_command + i], stride)) {
 					HwScene::NoteSkip(HwScene::Skip::GpuWritten);
+					HwScene::NoteGpuWrittenKind(true); // (pt1e: the indirect arguments)
 					continue;
 				}
 				const auto* args = reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(commands[first_command + i]);
@@ -2447,9 +3293,14 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.drawIndexedIndirect(arguments[group].first->Handle(), arguments[group].second, group_sizes[group],
 		                              static_cast<uint32_t>(stride));
 	}
-	if (FrameGen::RtParticlesDebug() && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
+	if (render1 && !hwrt_capture)
+		Render1Add(buffer, draw_state, pipeline, set->set, {}, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		           {push_data.dwords.data(), push_dwords}, !same_index, !same_index ? indices.first->Handle() : vk::Buffer {},
+		           !same_index ? indices.second : 0, index_base, index_bytes, index_type, {arguments.data(), groups},
+		           {group_sizes.data(), groups}, commands);
+	if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty()) // (rtparticles census: this path's draws by target)
 		FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
-	if (FrameGen::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
+	if (Render5Flags::Capturing()) FrameGen::AfterDraw(buffer); // (frame generation's HUD-less image)
 	// As the normal path's: shaders that write buffers end the rendering, and a barrier orders their writes.
 	if (writes) {
 		m_context.GetCommandScheduler().EndRendering();
@@ -2471,6 +3322,92 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.last_set     = set;
 	table.images_epoch = texture_cache.ImagesEpoch();
 	LiveCounters::Add(LiveCounters::TableDraws, std::max<size_t>(commands.size(), 1));
+	// (thread1, KYTY_RENDER_STATS: the draws by what they draw into, LiveCensus::g_draw_targets; nothing otherwise.)
+	if (LiveCensus::g_render && LiveCensus::RenderStatsOn()) {
+		uint32_t drawn_into = LiveCensus::DrawColor;
+		if (draw_state.targets.size() == 1 && draw_state.targets[0].requested.IsDepth())
+			drawn_into = draw_state.targets[0].requested.resources.layers >= 4 ? LiveCensus::DrawDepthLayered
+			                                                                  : LiveCensus::DrawDepthOnly;
+		LiveCensus::g_draw_targets[drawn_into][0] += 1;
+		LiveCensus::g_draw_targets[drawn_into][1] += std::max<size_t>(commands.size(), 1);
+		// (trust1: the call's class, TrustedDepth::ClassClock, and the calls by depth image.)
+		TrustedDepth::t_target = drawn_into == LiveCensus::DrawColor ? 2u : 1u;
+		if (drawn_into != LiveCensus::DrawColor)
+			TrustedDepth::NoteDepthImage(draw_state.targets[0].requested.data.address,
+			                             draw_state.targets[0].requested.resources.layers,
+			                             std::max<size_t>(commands.size(), 1), direct == nullptr);
+	}
+	// (mdraw C0) This call measured and compared with the last (its image set, its arguments, its blocks), the group
+	// it opens or joins, and the comparison base for the next one. (The end's clock first: the bookkeeping is not
+	// counted.)
+	if (mdraw) {
+		const uint64_t mdraw_end = __rdtsc();
+		auto&          c         = LiveCensus::Mdraw::g_c;
+		auto&          last      = LiveCensus::Mdraw::g_last;
+		const uint64_t draws     = std::max<size_t>(commands.size(), 1);
+		const uint64_t emit_at   = mdraw_emit != 0 ? mdraw_emit : mdraw_end;
+		// (C1 on: no arguments read nor blocks copied, so that the OFF window's members cost what the ON window's do.)
+		const bool     detail    = LiveCensus::Mdraw::SkipMode() == 0;
+		if (mdraw_break == LiveCensus::Mdraw::Breaks && reinterpret_cast<uint64_t>(set) != last.set)
+			mdraw_break = LiveCensus::Mdraw::BSet;
+		++c.calls;
+		c.draws += draws;
+		c.all_cycles += mdraw_end - mdraw_start;
+		c.all_emit += mdraw_end - emit_at;
+		const auto read_args = [&](uint64_t address, std::array<uint32_t, 5>& out) {
+			if (buffer_cache.IsRegionGpuModified(address, stride)) return false;
+			std::memcpy(out.data(), reinterpret_cast<const void*>(address), sizeof(out));
+			return true;
+		};
+		if (mdraw_break == LiveCensus::Mdraw::Breaks) {
+			++LiveCensus::Mdraw::g_group_calls;
+			++c.members;
+			c.member_draws += draws;
+			c.member_cycles += mdraw_end - mdraw_start;
+			c.member_emit += mdraw_end - emit_at;
+			c.member_prep += emit_at - mdraw_start;
+			for (uint32_t i = 0; i < 32; ++i)
+				if (((mdraw_ud >> i) & 1u) != 0) ++c.ud_member[0][i];
+			++c.fields[commands[0] == last.last_arg + stride ? LiveCensus::Mdraw::FArgsContig : LiveCensus::Mdraw::FArgsJump];
+			std::array<uint32_t, 5> now {};
+			if (!detail) {
+				// (not compared)
+			} else if (!last.args_known || !read_args(commands[0], now)) {
+				++c.fields[LiveCensus::Mdraw::FArgsGpu];
+			} else {
+				for (uint32_t i = 0; i < 5; ++i)
+					if (now[i] != last.args[i]) ++c.fields[LiveCensus::Mdraw::FIndexCount + i];
+			}
+			bool blocks_differ = false;
+			for (uint32_t st = 0; st < stages && detail; ++st)
+				if (table.blocks[st] != last.blocks[st]) blocks_differ = true;
+			if (blocks_differ) ++c.fields[LiveCensus::Mdraw::FBlocks];
+		} else {
+			++c.breaks[mdraw_break];
+			LiveCensus::Mdraw::Close();
+			LiveCensus::Mdraw::g_group_calls = 1;
+		}
+		last.valid      = direct == nullptr && !commands.empty() && index_base != 0;
+		last.writes     = writes;
+		last.pair       = reinterpret_cast<uint64_t>(&pair);
+		last.variant    = reinterpret_cast<uint64_t>(&variant);
+		last.state      = reinterpret_cast<uint64_t>(&draw_state);
+		last.set        = reinterpret_cast<uint64_t>(set);
+		last.command    = reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(vk_buffer));
+		last.generation = buffer.GraphicsGeneration();
+		last.passes     = LiveCounters::Value(LiveCounters::RenderPasses);
+		last.index_base = index_base;
+		last.index_bytes = index_bytes;
+		last.index_type = static_cast<uint32_t>(index_type);
+		for (uint32_t st = 0; st < 2; ++st)
+			for (uint32_t i = 0; i < 32; ++i) last.ud[st][i] = st < stages && i < user_data[st].size() ? user_data[st][i] : 0u;
+		last.last_arg   = commands.empty() ? 0 : commands.back();
+		last.args_known = detail && !commands.empty() && read_args(commands.back(), last.args);
+		for (uint32_t st = 0; st < 2 && detail; ++st) {
+			if (st < stages) last.blocks[st].assign(table.blocks[st].begin(), table.blocks[st].end());
+			else last.blocks[st].clear();
+		}
+	}
 	return TableResult::Drawn;
 }
 
@@ -2638,7 +3575,41 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
                                 bool primitive_restart_enable, const RenderState& rendering, bool storable) {
 	auto&       table = *m_table_xpr;
 	auto* const pair  = std::exchange(table.store, nullptr);
+	// (KYTY_STORE_SIN_DRAW) Every normal-path draw leaves its seed (once a pair state): a later store of the same
+	// pair and state - one deferred by the budget, or waiting - is then made without a normal-path draw.
+	if (StoreSinDraw::On() && storable && Role() == 0) {
+		const auto& sinsh = buffer.GetShaders();
+		const auto  sinvs = sinsh.GetVs().es_regs.data_addr, sinps = sinsh.GetPs().ps_regs.data_addr;
+		const auto  sinsi = static_cast<uint64_t>(sinsh.GetVs().start_instance_user_sgpr);
+		const auto  sinst = NativeXprStateKey(buffer);
+		StoreSinDraw::Note(StoreSinDraw::PairKey(sinvs, sinps, sinsi), sinst, StoreSinDraw::Key(sinvs, sinps, sinsi, sinst), state,
+		                   topology, primitive_restart_enable, true);
+	}
 	if (!storable || pair == nullptr) return;
+	// (tiron1) The request's time, from its grant (TableTry) to here, whatever the store's way out.
+	struct Tiron1StoreTime {
+		TableXpr& table;
+		~Tiron1StoreTime() {
+			if (table.tiron1_grant_ns == 0) return;
+			const auto us = (Tiron1::NowNs() - std::exchange(table.tiron1_grant_ns, 0)) / 1000;
+			if (us <= 0 || us > 1000000) return;
+			table.tiron1_store_us += us;
+			Tiron1::g_store_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+		}
+	};
+	std::optional<Tiron1StoreTime> tiron1_time;
+	if (Tiron1::On()) tiron1_time.emplace(table);
+	// (tablas1) The body's own time (the rest of g_store_us is the granted draw's normal-path draw).
+	struct Tiron1BodyTime {
+		int64_t begin = Tiron1::NowNs();
+		~Tiron1BodyTime() {
+			const auto us = (Tiron1::NowNs() - begin) / 1000;
+			Tiron1::g_store_bodies.fetch_add(1, std::memory_order_relaxed);
+			if (us > 0 && us <= 1000000) Tiron1::g_store_body_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+		}
+	};
+	std::optional<Tiron1BodyTime> tiron1_body;
+	if (tiron1_time) tiron1_body.emplace();
 	const auto& sh = buffer.GetShaders();
 	// (A request whose packet never reached a prepared draw must not store for another state.)
 	if (sh.GetVs().es_regs.data_addr != pair->vs || sh.GetPs().ps_regs.data_addr != pair->ps ||
@@ -2650,10 +3621,15 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> mapping {};
 	for (uint32_t i = 0; i < state.color_count; i++)
 		mapping[state.color_info[i].target_slot] = state.color_info[i].export_mapping;
+	const int64_t programs_begin = tiron1_body ? Tiron1::NowNs() : 0;
 	table_state.programs = pipelines.GetGraphicsPrograms(sh.GetVs(), sh.GetPs(), ctx.GetShaderRegisters(), ctx,
 	                                                     buffer.GetUserConfig(), mapping, state.ps_active,
 	                                                     table_state.vs_input_info, table_state.ps_input_info, true,
 	                                                     pair->portable);
+	if (tiron1_body) {
+		const auto us = (Tiron1::NowNs() - programs_begin) / 1000;
+		if (us > 0 && us <= 1000000) Tiron1::g_store_programs_us.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+	}
 	if (pipelines.TablePending()) {
 		pair->waiting = pipelines.TableWaiting(); // (the pair stores again once it is done)
 		return;
@@ -2773,6 +3749,7 @@ void RenderExecutor::TableStore(CommandBuffer& buffer, const DrawRenderState& st
 			}
 		}
 	}
+	if (tiron1_body && pipeline != nullptr) Tiron1::g_store_captured.fetch_add(1, std::memory_order_relaxed);
 	NativeXprCaptureState(buffer, state, rendering, table.store_state);
 }
 
@@ -2853,16 +3830,22 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 		return m_dispatch_declined = known->special != nullptr ? known->special : "dispatch: refused", false;
 	if ((Role() == 0 && known->sightings < 2) || known->vs != cs.cs_regs.data_addr) return false;
 	auto& pair = *known;
+	// (render4, KYTY_RENDER_STATS: the dispatch's shader for the [render] line's "cs" part; the dispatch's scope reads it.)
+	if (pair.programs[0] != nullptr) LiveCensus::SetDispatchShader(pair.programs[0]->shader_hash);
 	// (The game's 3D view; a dispatch declined below goes the normal way, which notes it too.)
 	if (Role() == 0 && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		FrameGen::NoteScene();
 	// Frame generation reads the TAA pass's depth and motion vectors from the normal path's bindings
 	// (RenderExecutor::DispatchDirect, FrameGen::OnDispatch): one dispatch a frame.
-	if (FrameGen::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
+	if (Render5Flags::Capturing() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: frame generation (TAA)", false;
 	// (KYTY_HWRT: the TAA's dispatch is where the scene's acceleration structures are built, on the normal path.)
 	if (HwScene::Active() && pair.programs[0] != nullptr && FrameGen::IsTaaShader(pair.programs[0]->shader_hash))
 		return m_dispatch_declined = "table: hardware ray tracing (TAA)", false;
+	// (pt1) BB_PATHTRACING reads the images of the dispatches in a few scopes (ResolveSunShadows, RenderLights,
+	// ResolveLighting, RenderSSR: ~45 a frame): the normal path, whose bindings reach PathTrace::AfterDispatch.
+	if (PathTrace::Requested() && Role() == 0 && PathTrace::WantDispatchHook())
+		return m_dispatch_declined = "table: path tracing (scope images)", false;
 	TablePrefetchPair(pair);
 	if (Role() == 0) pair.used_frame = m_context.FrameNumber();
 	if (Role() == 0) TablePrefetchNext(OwnTable().previous_dispatch, pair);
@@ -2972,6 +3955,13 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	if (kyty_local_table_indirect_mode.load(std::memory_order_relaxed) == 0 &&
 	    (!pair.programs[0]->table_plan.indirect.empty() || pair.programs[0]->table_plan.dynamic_reads))
 		return m_dispatch_declined = "table: indirect off", false;
+	// (draw1, KYTY_DRAW1 with KYTY_RENDER_STATS) The dispatch's key (its pair and user data), for its repetition
+	// (measurement only).
+	if (TrustedDepth::ByteProof() && TrustedDepth::StatsOn() && Role() == 0 && Spec::Current() == nullptr) {
+		const uint64_t head = reinterpret_cast<uint64_t>(&pair);
+		TrustedDepth::NoteKindKey(TrustedDepth::KindDispatch,
+		                          XXH3_64bits_withSeed(user_data[0].data(), user_data[0].size_bytes(), XXH3_64bits(&head, sizeof(head))));
+	}
 	if (!TableEvaluate(pair, user_data)) return m_dispatch_declined = "table: tables unmapped", false;
 	TableGather(pair, user_data);
 	phase.reset();
@@ -2984,16 +3974,25 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	std::array<vk::DeviceAddress, 2> blocks {};
 	bool                             storage_writes = false;
 	auto&                            cache          = m_context.GetBufferCache();
-	TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+	{
+		LiveCensus::StatScope stat_bda(1, 5); // (render3, KYTY_RENDER_STATS: the BDA preparation and its uploads)
+		TablePrepareBda(pair, user_data); // (as TableDraw's: before the blocks)
+	}
 	const auto                       registration   = cache.RegistrationEpoch(); // (as TableDraw's)
 	TableWatchBegin(*pair.programs[0], user_data[0]);
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) {
+	bool blocks_made = false;
+	{
+		LiveCensus::StatScope stat_blocks(1, 6); // (render3, KYTY_RENDER_STATS: the blocks)
+		blocks_made = TableBlocks(pair, user_data, blocks, &storage_writes);
+	}
+	if (!blocks_made) {
 		TableWatchState::g_current.watch = nullptr;
 		return m_dispatch_declined = "table: blocks", false;
 	}
 	vk::Buffer indirect_buffer = nullptr;
 	uint64_t   indirect_offset = 0;
 	if (indirect_args != 0) {
+		LiveCensus::StatScope stat_args(1, 7); // (render3, KYTY_RENDER_STATS: the indirect arguments)
 		// As DispatchDirect's: the arguments' owner, made current.
 		cache.EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 		const auto id = cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t));
@@ -3030,6 +4029,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const auto& pipeline = set->pipeline != nullptr ? *set->pipeline : *pair.pipeline;
 	const auto& program  = set->program != nullptr ? *set->program : *pair.programs[0];
 	const auto& bindings = program.bindings;
+	const Envio1::Scope envio1_record(Envio1::Record); // (envio1, KYTY_ENVIO1=1: to the end of the dispatch)
 	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
 	if (bindings.UsesPushData()) {
 		ShaderRecompiler::IR::PushData push_data;
@@ -3046,6 +4046,45 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	TableWatchDispatch(indirect_args, continues_chain);
 	if (storage_writes && !continues_chain) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// (p7b, C1 precise: local/p7-compat.h) As DispatchDirect's: the hazards against the chain's earlier dispatches,
+	// from the guest ranges of its V#s (the words TableBlocks resolved); one barrier only where there is one.
+	if (chain && P7::Tracking()) {
+		const auto&                     shader  = *pair.programs[0];
+		const auto&                     entries = OwnTable().entries[0];
+		std::array<P7::ChainAccess, 16> accesses {};
+		size_t                          count   = 0;
+		bool                            unknown = shader.info.uses_dma || shader.table_plan.global_memory ||
+		                                          shader.table_plan.dynamic_reads;
+		for (size_t i = 0; i < entries.size() && i < shader.info.buffers.size(); ++i) {
+			ShaderBufferResource descriptor;
+			std::copy_n(entries[i].first.begin(), 4, descriptor.fields);
+			const auto address = descriptor.Base48();
+			const auto bytes   = descriptor.Stride() != 0 ? uint64_t {descriptor.Stride()} * descriptor.NumRecords()
+			                                              : uint64_t {descriptor.NumRecords()};
+			if (descriptor.Type() != 0 || address == 0 || bytes == 0) continue;
+			if (count == accesses.size()) {
+				unknown = true;
+				break;
+			}
+			const auto& resource = shader.info.buffers[i];
+			accesses[count++]    = {.begin  = address,
+			                        .end    = address + bytes,
+			                        .read   = resource.read,
+			                        .write  = resource.written,
+			                        .atomic = resource.atomic};
+		}
+		const auto hazard = P7::ChainStep(&buffer, continues_chain, indirect_args, accesses.data(), count, unknown);
+		if (hazard != 0 && P7::ChainPrecise()) {
+			VulkanMemoryBarrier hazard_barrier {}; // (the alias: <windows.h> defines MemoryBarrier)
+			hazard_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+			hazard_barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+			                               vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+			                          vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eDrawIndirect,
+			                          vk::DependencyFlags {}, 1, &hazard_barrier, 0, nullptr, 0, nullptr);
+			P7::Add(P7::ChainBarriers);
+		}
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, BindPipelineHandle(pipeline));
 	if (indirect_args != 0) {
 		vk::BufferMemoryBarrier args_barrier {};
@@ -3063,7 +4102,10 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 			const char* value = std::getenv("KYTY_INDIRECT_ARGS_BARRIER");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!continues_chain || args_barrier_always)
+		// (p7, C1: also inside a chain, local/p7-compat.h; live.)
+		const bool args_barrier_p7 = continues_chain && !args_barrier_always && P7::ArgsBarrierInChain();
+		if (args_barrier_p7) P7::Add(P7::ArgsBarriers);
+		if (!continues_chain || args_barrier_always || args_barrier_p7)
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
 			                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);

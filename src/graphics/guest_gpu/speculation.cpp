@@ -8,6 +8,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "draw-state-observer.h"
+#include "envio2.h"
+#include "envio3.h"
 #include "local-platform.h"
 #include "vulkan-recording.h"
 
@@ -74,9 +76,9 @@ static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
 	return names[entry->kind == Spec::EffectsLog::Kind::GpuWrite ? 0 : 1][static_cast<size_t>(entry->source)];
 }
 
-Speculation::Translator::Translator(RenderContext& renderer, uint32_t number)
+Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, int queue_event_id)
     : index(number), draw(std::make_unique<RenderExecutor>(renderer)), compute(std::make_unique<RenderExecutor>(renderer)),
-      executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, 0)),
+      executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, queue_event_id)),
       table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(), MemoryUsage::Upload,
                                                   uint64_t {64} << 20u,
                                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress)),
@@ -97,7 +99,151 @@ Speculation::Speculation(RenderContext& renderer)
 	for (uint32_t i = 0; i < threads; ++i) m_translators.push_back(std::make_unique<Translator>(renderer, i));
 }
 
+// (envio2) No state pass, no Push: Hand / CommitHanded only.
+Speculation::Speculation(RenderContext& renderer, int queue_event_id, std::function<void()> wake)
+    : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, queue_event_id)),
+      m_state(std::make_unique<CommandProcessor>(renderer, queue_event_id)), m_detached_wake(std::move(wake)),
+      m_name(Envio3::Mode() != 0 ? "Speculation (envio3, ACB)" : "Speculation (envio2, ACB)") {
+	m_queue_event_id = queue_event_id;
+	m_max_in_flight  = Envio3::Mode() != 0 ? Envio3::MaxInFlight : 1;
+	m_translators.push_back(std::make_unique<Translator>(renderer, 0, queue_event_id));
+	m_detached = std::thread([this] { DetachedRun(); });
+}
+
+void Speculation::DetachedRun() {
+	LocalPlatform::SetThreadName("Kyty.Acb2");
+	// (Off the GPU thread's CPUs, as the speculation's threads: it goes on meanwhile.)
+	LocalPlatform::AvoidCpuList(std::getenv("KYTY_RENDER_CPUS"));
+	auto& translator = *m_translators[0];
+	// (Its Vulkan calls go to the driver as they are made, no recording stream: its recorder is its own.)
+	RenderContext::SetThreadExecutors(&translator.executors);
+	GuestGpu::SetSpeculationThread(true);
+	Spec::t_packet_slot = translator.index;
+	std::unique_lock lock(m_detached_mutex);
+	for (;;) {
+		m_detached_job_cv.wait(lock, [&] { return m_detached_quit || !m_detached_jobs.empty(); });
+		if (m_detached_quit) return;
+		// (In the order handed: the GPU thread commits each queue's head; one handed later waits less.)
+		auto job = std::move(m_detached_jobs.front());
+		m_detached_jobs.pop_front();
+		lock.unlock();
+		// (Its start state is its own: Hand copied it.)
+		const auto start  = NowNs();
+		auto       result = Translate(translator, *job.start, job.commands, job.execution);
+		result->serial    = job.serial;
+		// (envio3) What the GPU thread did since it was handed is checked, not only since its translation began: the
+		// log keeps it (m_in_flight). ENVIO2 alone kept the translation's start, as before.
+		if (Envio3::Mode() != 0) result->effects_from = std::min(result->effects_from, job.effects_from);
+		Envio2::Add(Envio2::g_totals.acb2_ns, NowNs() - start);
+		lock.lock();
+		m_detached_starts.push_back(std::move(job.start));
+		m_detached_results.push_back(std::move(result));
+		lock.unlock();
+		m_detached_done_cv.notify_all();
+		if (m_detached_wake) m_detached_wake(); // (the GPU thread may sleep with the submission blocked)
+		lock.lock();
+	}
+}
+
+bool Speculation::Hand(uint64_t serial, const CommandProcessor& cp, std::span<const uint32_t> commands,
+                       const Pm4Execution& execution) {
+	if (Full() || !DetachedOn()) return false;
+	if (std::ranges::any_of(m_in_flight, [&](const Flying& f) { return f.serial == serial; })) return false;
+	uint64_t effects_from = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		// (Nothing in flight: what the normal translation logged so far is needed by no result.)
+		if (m_in_flight.empty()) m_log.DropBefore(m_log.End());
+		effects_from = m_log.End();
+	}
+	Envio3::NoteDepth(m_in_flight.size() + 1);
+	m_in_flight.push_back({serial, effects_from});
+	{
+		std::lock_guard lock(m_detached_mutex);
+		DetachedJob job;
+		if (!m_detached_starts.empty()) {
+			job.start = std::move(m_detached_starts.back());
+			m_detached_starts.pop_back();
+		} else {
+			job.start = std::make_unique<CommandProcessor>(m_renderer, m_queue_event_id);
+		}
+		job.start->CopyStateFrom(cp, false);
+		job.serial       = serial;
+		job.commands     = commands;
+		job.execution    = execution;
+		job.effects_from = effects_from;
+		m_detached_jobs.push_back(std::move(job));
+	}
+	m_detached_job_cv.notify_one();
+	return true;
+}
+
+void Speculation::Landed(uint64_t serial) {
+	std::erase_if(m_in_flight, [&](const Flying& f) { return f.serial == serial; });
+	// (What no result in flight began before is dropped.)
+	std::lock_guard lock(m_mutex);
+	auto            oldest = m_log.End();
+	for (const auto& f: m_in_flight) oldest = std::min(oldest, f.effects_from);
+	m_log.DropBefore(oldest);
+}
+
+Speculation::Outcome Speculation::CommitHanded(uint64_t serial, CommandProcessor& cp, Pm4Execution& execution,
+                                               uint64_t& waited_ns) {
+	EXIT_IF(!std::ranges::any_of(m_in_flight, [&](const Flying& f) { return f.serial == serial; }));
+	std::unique_ptr<Result> result;
+	{
+		std::unique_lock lock(m_detached_mutex);
+		waited_ns       = 0;
+		const auto mine = [&] {
+			return std::ranges::find_if(m_detached_results, [&](const auto& r) { return r->serial == serial; });
+		};
+		if (mine() == m_detached_results.end()) {
+			const auto start = NowNs();
+			m_detached_done_cv.wait(lock, [&] { return mine() != m_detached_results.end(); });
+			waited_ns = NowNs() - start;
+		}
+		const auto found = mine();
+		result           = std::move(*found);
+		m_detached_results.erase(found);
+	}
+	const auto outcome = Commit(std::move(result), cp, execution);
+	if (outcome == Outcome::Blocked) {
+		m_detached_blocked.push_back(std::move(m_blocked)); // (still in flight: its effects are kept)
+		return outcome;
+	}
+	Landed(serial);
+	return outcome;
+}
+
+bool Speculation::BlockedHanded(uint64_t serial) const noexcept {
+	return std::ranges::any_of(m_detached_blocked, [&](const auto& r) { return r->serial == serial; });
+}
+
+Speculation::Outcome Speculation::ResumeHanded(uint64_t serial, CommandProcessor& cp, Pm4Execution& execution) {
+	const auto found = std::ranges::find_if(m_detached_blocked, [&](const auto& r) { return r->serial == serial; });
+	EXIT_IF(found == m_detached_blocked.end());
+	auto result = std::move(*found);
+	m_detached_blocked.erase(found);
+	const auto outcome = Continue(std::move(result), cp, execution);
+	if (outcome == Outcome::Blocked) {
+		m_detached_blocked.push_back(std::move(m_blocked));
+		return outcome;
+	}
+	Landed(serial);
+	return outcome;
+}
+
 Speculation::~Speculation() {
+	if (m_detached.joinable()) {
+		{
+			std::lock_guard lock(m_detached_mutex);
+			m_detached_quit = true;
+		}
+		m_detached_job_cv.notify_all();
+		m_detached.join();
+		for (auto& result: m_detached_results) m_renderer.GetCommandScheduler().DestroyRecorder(std::move(result->recorder));
+		for (auto& result: m_detached_blocked) m_renderer.GetCommandScheduler().DestroyRecorder(std::move(result->recorder));
+	}
 	{
 		std::lock_guard lock(m_mutex);
 		m_quit = true;
@@ -698,6 +844,10 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 	const auto kept      = committed == 0 ? r.start_ns : r.segment_ends[committed - 1];
 	m_kept_ns += kept - r.start_ns;
 	m_lost_ns += r.end_ns - kept;
+	if (DetachedOn() && Envio3::Mode() != 0) { // (envio3: the ACB thread's time whose work went to the GPU)
+		Envio2::Add(Envio3::g_totals.moved_ns, kept - r.start_ns);
+		Envio2::Add(Envio3::g_totals.lost_ns, r.end_ns - kept);
+	}
 	m_segments += committed;
 	auto outcome = Outcome::None;
 	if (progress == Progress::Complete) {
@@ -722,6 +872,8 @@ Speculation::Outcome Speculation::Continue(std::unique_ptr<Result> result, Comma
 		for (const auto& translator: m_translators)
 			if (translator->translating != 0 && translator->current != nullptr)
 				oldest = std::min(oldest, translator->current->effects_from);
+		// (envio2/envio3: the ACB thread's in flight, from when each was handed.)
+		for (const auto& f: m_in_flight) oldest = std::min(oldest, f.effects_from);
 		m_log.DropBefore(oldest);
 	}
 	Report();
@@ -783,6 +935,13 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		// logged since it began); the words it read from a speculation before it in memory now; the waits it found
 		// satisfied satisfied.
 		if (const char* why = Changed(result, index)) return ++m_stop_reasons[why], Progress::Stopped;
+		// (envio3) An image the work uses that a sweep found CPU-written since it was handed (logged as host writes by
+		// GpuResourceManager::InvalidateCpuWrittenPages): its upload is the GPU thread's; the rest the normal way.
+		if (DetachedOn() && Envio3::Mode() != 0 && !m_effects.host_writes.Empty())
+			for (const auto& use: state.closed[index].images)
+				if (m_effects.host_writes.Intersects(use.image->info.data.address, use.image->info.data.size))
+					return Envio2::Add(Envio3::g_totals.sweep_stops), ++m_stop_reasons["commit: CPU wrote an image (sweep)"],
+					       Progress::Stopped;
 		for (const auto& fact: state.meta_facts)
 			if (!fact.cleared && fact.first <= index && index <= fact.last &&
 			    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))
@@ -1009,11 +1168,11 @@ void Speculation::Report() {
 	const auto frames = static_cast<double>(std::max<uint64_t>(frame - m_report_frame, 1));
 	m_report_frame    = frame;
 	const auto ms     = [&](uint64_t ns) { return static_cast<double>(ns) / 1e6 / frames; };
-	std::printf("Speculation: %llu whole, %llu partly, %llu not committed; %llu segments, %llu holes (%llu waits blocked); "
+	std::printf("%s: %llu whole, %llu partly, %llu not committed; %llu segments, %llu holes (%llu waits blocked); "
 	            "ahead: %llu being translated, %llu not yet; blind %llu (stopped %llu of %llu); per frame: queue %.2f ms, "
 	            "translation kept %.2f ms, lost %.2f ms, commit %.2f ms (holes %.2f ms), waits %.2f ms; start delay %.2f ms; "
 	            "translations %llu/%llu/%llu/%llu/%llu/%llu (<0.5/1/2/4/8 ms/more, longest %.1f ms)",
-	            static_cast<unsigned long long>(m_whole), static_cast<unsigned long long>(m_partly),
+	            m_name, static_cast<unsigned long long>(m_whole), static_cast<unsigned long long>(m_partly),
 	            static_cast<unsigned long long>(m_none), static_cast<unsigned long long>(m_segments),
 	            static_cast<unsigned long long>(m_holes_run), static_cast<unsigned long long>(m_waits_blocked),
 	            static_cast<unsigned long long>(m_waits_for_ahead), static_cast<unsigned long long>(m_ahead_misses),

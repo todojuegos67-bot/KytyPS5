@@ -13,11 +13,15 @@
 #include "port/ds-i18n.h"
 #include "port/ds-steam.h"
 #include "port/ds-resume.h"
+#include "port/ds-style.h" // (trucos11) the Demon's Souls remake look
+#include "port/ds-online.h" // (online5) Multijugador
 
 #include "local/perf-overlay.h"
 #include "local/local-platform.h"
 #include "local/ram-guard.h"
 #include "local/port-live.h"
+#include "kernel/memory.h" // (trucos) the cheats' guest reads / writes
+#include "loader/demonsSoulsInventory.h" // (trucos3) items and spells added on the game thread
 #include "graphics/presentation/window/hostInput.h"
 #include "libs/trophy.h"
 
@@ -26,6 +30,8 @@
 #include <d3d11.h>
 #include <psapi.h>
 #include <d3dcompiler.h>
+#include <mmsystem.h> // (chat2) PlaySoundW: the notice chime
+#pragma comment(lib, "winmm.lib")
 #undef interface
 #undef small
 #undef hyper
@@ -43,6 +49,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cerrno>
 #include <cstdarg>
 #include <regex>
 #include <atomic>
@@ -74,19 +82,47 @@ namespace Port {
 namespace {
 
 struct Input {
-	enum Kind { Key, Analog, MousePos, MouseButton, Wheel, Tab } kind;
+	enum Kind { Key, Analog, MousePos, MouseButton, Wheel, Tab, Text } kind; // (online6: Text, the typed characters)
 	int   key  = 0;
 	bool  down = false;
 	float x = 0, y = 0;
+	std::string text = {};
 };
+// (online6) A text field of the F2 pages has the keyboard (ImGui's WantTextInput, present thread): Esc, Q / E and the
+// pad's Circle go to the field (Esc leaves it) instead of the page's navigation.
+std::atomic<bool> g_text_active {false};
 
 Runtime                  g_rt;
 Settings                 g_edit;       // the menu's copy (present thread)
 Settings                 g_saved;      // what settings.ini holds now
 
+// (onlineclean) Cheats are usable ONLY offline and with the manual "SIN TRUCOS" medallion off. Online (the game was
+// launched with multijugador=1) forces every cheat off, hidden and locked, exactly like no_cheats, without the player
+// touching the medallion: it avoids bans and desyncing other players. Graphics / performance are not cheats, untouched.
+// (The server-reachable state is not a reliable "in a session" signal, so the launch mode decides.)
+// (trucos-online) Cheats and online are mutually exclusive. "Cheats in use" = a cheat switch on now, or any cheat action
+// applied in this process (Port::CheatsUsed: souls, Nivel personaje, Armas y objetos). While cheats
+// are in use the online switch cannot be turned on (Multiplayer::Card) and a launch is offline (BuildLaunch, ds-main).
+namespace Cheats { bool AnySwitchOn(); }
+inline bool CheatsInUse() { return Port::CheatsUsed() || Cheats::AnySwitchOn(); }
+// The live online switch blocks cheats only when online is really in use (saved on and not refused for cheats); the
+// launch mode (g_rt.launched.multiplayer, false when the launch was refused) blocks them for the whole session.
+inline bool CheatsBlocked() { return g_saved.no_cheats || g_rt.launched.randomizer || g_rt.launched.multiplayer || (g_saved.multiplayer && !CheatsInUse()); } // (rando1: the randomizer too)
+
 // (ds-pc-port13) Preparar shaders: all CPU threads or relaxed (asked the first time, then settings.ini's
 // precompilar_hilos; Opciones > Sistema changes it), then the precompile.
 void StartShaders() {
+	// (precomp-fix) No game folder yet: ask for it first (the precompile needs it; it is saved to settings.ini).
+	if (g_saved.game.empty() && g_rt.pick_folder) {
+		const std::string picked = g_rt.pick_folder();
+		if (!picked.empty() && (!g_rt.is_game || g_rt.is_game(picked))) {
+			g_edit.game = g_saved.game = picked;
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_edit;
+			on_disk.game = picked;
+			(void)SaveSettings(g_rt.ini_path, on_disk);
+		}
+	}
 	Precompile::Choose(g_rt.ini_path, &g_edit);
 	g_saved.precompile_threads = g_edit.precompile_threads;
 	Precompile::Start();
@@ -105,6 +141,11 @@ void ToggleShaderThreads(bool running) {
 	}
 	if (running) std::thread([] { Precompile::Stop(); Precompile::Start(); }).detach();
 }
+namespace Shop { // (trucos19) the shop's step navigation (defined below), for the window thread's Circle / Esc
+extern std::atomic<int>  g_level;
+extern std::atomic<bool> g_refocus;
+bool                     Back();
+} // namespace Shop
 std::atomic<bool>        g_open {false};
 std::atomic<bool>        g_trophy_page {false};      // (port34) F2 > Ver trofeos is shown (window and present threads)
 // (ds-pc-port37) F2 > Mapear mando / Teclado y raton: the page shown (0 none, 1 pad mapper, 2 keyboard and mouse), and a
@@ -116,6 +157,16 @@ std::atomic<bool>        g_kbm_capture {false};
 std::atomic<bool>        g_pages_reset {false}; // (ds-pc-port42) SetOpen: the pages' own state (capture row) cleared at their next frame
 std::mutex               g_capture_mutex;
 std::string              g_captured; // "" while waiting; "\x1b" cancelled
+// (remap-f2) "Mapear mando": a pad button being captured (5 s). The window thread (or the launcher's loop) writes the
+// pressed button's SDL name (a, b, leftshoulder, lefttrigger, dpup, ...) to g_pad_captured under g_capture_mutex and
+// clears g_pad_capture; "\x1b" = cancelled (Esc / right click), "" = no button (time out). While it waits, no pad,
+// key or click reaches the game or moves the menu.
+constexpr double         kPadCaptureSeconds = 5.0;
+std::atomic<bool>        g_pad_capture {false};
+std::atomic<double>      g_pad_capture_at {0.0};
+std::atomic<bool>        g_pad_trig_armed[2] {}; // a trigger counts once it was seen released (one held at the start does not)
+std::atomic<int>         g_pad_last {-1};        // the instance id of the pad that last pressed a button (its button names)
+std::string              g_pad_captured;
 std::atomic<bool>        g_focus_trophy_btn_request {false}; // (port34) window thread: back from it, focus its button
 int                      g_trophy_tab_delta = 0;     // (port34) present thread: L1/R1, Q/E on the trophy page
 bool                     g_focus_trophy_btn = false;
@@ -125,7 +176,8 @@ std::mutex               g_mutex;
 std::deque<Input>        g_inputs;
 int                      g_passthrough = 0; // window thread: zeroed axes sent to the game as the menu opened
 int                      g_cursor_before = -1;
-constexpr int            kTabCount = 7; // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
+constexpr int            kTabCount = 8; // (online11) + Conexión online
+// // (10-27c) Gráficos, Pantalla, Sonido, Controles, Sistema, Trofeos; (ds-pc-port37) Ajustes del juego
 int                      g_tab = 0, g_tab_request = -1;
 int                      g_fg_live = 0;
 std::string              g_status;
@@ -273,9 +325,14 @@ void SetOpen(bool open) {
 	// no queued scroll. A page or a capture left behind kept eating Esc / Circle and the menu looked stuck.
 	g_f1_page     = 0;
 	g_kbm_capture = false;
+	{
+		std::scoped_lock lock(g_capture_mutex); // (remap-f2) a pad capture waiting ends, cancelled
+		if (g_pad_capture.exchange(false)) g_pad_captured = "\x1b";
+	}
 	g_popup       = false;
 	g_page_scroll = 0;
 	g_pages_reset = true;
+	g_text_active = false; // (online6)
 	std::printf("[port] F2 menu: %s\n", open ? "open" : "closed");
 	std::fflush(stdout);
 	(open ? Anim::g_opened_at : Anim::g_closed_at).store(Anim::Now(), std::memory_order_relaxed); // (ds-pc-port38)
@@ -342,7 +399,70 @@ ImGuiKey KeyboardKey(SDL_Keycode key) {
 		case SDLK_BACKSPACE: return ImGuiKey_Backspace;
 		case SDLK_HOME: return ImGuiKey_Home;
 		case SDLK_END: return ImGuiKey_End;
+		// (online6) editing and the clipboard shortcuts of the text fields (Ctrl+A / C / V / X / Z / Y, Shift+Insert)
+		case SDLK_DELETE: return ImGuiKey_Delete;
+		case SDLK_INSERT: return ImGuiKey_Insert;
+		case SDLK_ESCAPE: return ImGuiKey_Escape;
+		case SDLK_a: return ImGuiKey_A;
+		case SDLK_c: return ImGuiKey_C;
+		case SDLK_v: return ImGuiKey_V;
+		case SDLK_x: return ImGuiKey_X;
+		case SDLK_y: return ImGuiKey_Y;
+		case SDLK_z: return ImGuiKey_Z;
+		case SDLK_LCTRL: return ImGuiKey_LeftCtrl;
+		case SDLK_RCTRL: return ImGuiKey_RightCtrl;
+		case SDLK_LSHIFT: return ImGuiKey_LeftShift;
+		case SDLK_RSHIFT: return ImGuiKey_RightShift;
+		case SDLK_LALT: return ImGuiKey_LeftAlt;
+		case SDLK_RALT: return ImGuiKey_RightAlt;
 		default: return ImGuiKey_None;
+	}
+}
+
+// (remap-f2) The pad capture's end: `name` the button's SDL name, "\x1b" cancelled, "" no button in time.
+void PadCaptureEnd(const char* name) {
+	std::scoped_lock lock(g_capture_mutex);
+	if (g_pad_capture.exchange(false)) g_pad_captured = name;
+	Bump();
+}
+// (remap-f2) While a pad button is being captured: true when the event was taken (never passed to the game or the
+// menu's navigation). Window thread (OnEvent) and the launcher's own event loop.
+bool PadCaptureFeed(const SDL_Event& e) {
+	if (!g_pad_capture.load()) return false;
+	if (Anim::Now() - g_pad_capture_at.load() > kPadCaptureSeconds + 1.0) { // (the menu stopped drawing: never stuck)
+		PadCaptureEnd("");
+		return false;
+	}
+	switch (e.type) {
+		case SDL_CONTROLLERBUTTONDOWN: {
+			g_pad_last           = static_cast<int>(e.cbutton.which);
+			const char* name     = SDL_GameControllerGetStringForButton(static_cast<SDL_GameControllerButton>(e.cbutton.button));
+			PadCaptureEnd(name != nullptr && *name != '\0' ? name : "\x1b");
+			return true;
+		}
+		case SDL_CONTROLLERAXISMOTION: {
+			if (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+				const int   side = e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? 0 : 1;
+				const float v    = e.caxis.value / 32767.0f;
+				if (v < 0.3f) g_pad_trig_armed[side] = true;
+				else if (v > 0.6f && g_pad_trig_armed[side].load()) {
+					g_pad_last = static_cast<int>(e.caxis.which);
+					PadCaptureEnd(side == 0 ? "lefttrigger" : "righttrigger");
+				}
+			}
+			return true; // (no stick navigation while it waits)
+		}
+		case SDL_KEYDOWN:
+			if (e.key.keysym.sym == SDLK_F2 || e.key.keysym.sym == SDLK_F1) return false; // (F1/F2 close the menu: the capture ends with it)
+			if (e.key.keysym.sym == SDLK_ESCAPE && e.key.repeat == 0) PadCaptureEnd("\x1b");
+			return true;
+		case SDL_MOUSEBUTTONDOWN:
+			if (e.button.button == SDL_BUTTON_RIGHT) PadCaptureEnd("\x1b");
+			return true;
+		case SDL_MOUSEWHEEL:
+		case SDL_TEXTINPUT:
+		case SDL_TEXTEDITING: return true;
+		default: return false; // (releases, mouse motion, window events: as usual)
 	}
 }
 
@@ -363,6 +483,18 @@ bool OnEvent(const SDL_Event& e) {
 		}
 	}
 	const bool open = g_open.load();
+	{
+		// (online6) The emulator stops SDL's text input at start (window.cpp: no SDL_TEXTINPUT at all): while F2 is open it
+		// is on, so the text fields get the typed characters; closed, off again as before. Window thread (SDL's).
+		static bool text_on = false;
+		if (open != text_on) {
+			text_on = open;
+			if (open) SDL_StartTextInput();
+			else SDL_StopTextInput();
+		}
+	}
+	if (open && PadCaptureFeed(e)) return true; // (remap-f2)
+	if (e.type == SDL_CONTROLLERBUTTONDOWN) g_pad_last = static_cast<int>(e.cbutton.which);
 	switch (e.type) {
 		case SDL_KEYDOWN:
 			// (ds-pc-port41) F8: the Metricas panel (metricas.ps1's, top-centre), not the emulator's overlay.
@@ -370,9 +502,9 @@ bool OnEvent(const SDL_Event& e) {
 				if (e.key.repeat == 0) MetricsPanel::Toggle();
 				return true;
 			}
-			// (11-09) The menu key is F2 now (F1 made the game close at times): F1 and F2's repeats never reach the game.
-			if (e.key.keysym.sym == SDLK_F1 || (e.key.keysym.sym == SDLK_F2 && e.key.repeat != 0)) return true;
-			if (e.key.keysym.sym == SDLK_F2) {
+			// (11-22) The menu key is F1 or F2 (both open it); their repeats never reach the game, and neither does F1 (consumed).
+			if ((e.key.keysym.sym == SDLK_F1 || e.key.keysym.sym == SDLK_F2) && e.key.repeat != 0) return true;
+			if (e.key.keysym.sym == SDLK_F2 || e.key.keysym.sym == SDLK_F1) {
 				// (port26) F2: the small in-game menu (show the launcher next time; close the game). Nothing is saved or skipped.
 				if (open && g_trophy_page.exchange(false)) { // (port34) the trophy page: back to the menu
 					g_focus_trophy_btn_request = true;
@@ -394,7 +526,16 @@ bool OnEvent(const SDL_Event& e) {
 				Bump();
 				return true;
 			}
+			if (g_text_active.load()) { // (online6) a text field has the keyboard: every key goes to it (Esc leaves it)
+				if (const ImGuiKey k = KeyboardKey(e.key.keysym.sym); k != ImGuiKey_None) Queue({Input::Key, k, true});
+				return true;
+			}
 			if (e.key.keysym.sym == SDLK_ESCAPE && e.key.repeat == 0) {
+				if (g_f1_page.load() == 4 && !g_popup.load() && Shop::Back()) { // (trucos19) one step back inside the shop
+					Bump();
+					return true;
+				}
+				if (g_f1_page.load() == 4) Shop::g_level = 0, Shop::g_refocus = true;
 				if (g_f1_page.exchange(0) != 0) {
 					Bump();
 					return true;
@@ -417,7 +558,9 @@ bool OnEvent(const SDL_Event& e) {
 				if (const ImGuiKey k = KeyboardKey(e.key.keysym.sym); k != ImGuiKey_None) Queue({Input::Key, k, false});
 			}
 			return false; // (releases reach the game: nothing stays held)
-		case SDL_TEXTINPUT:
+		case SDL_TEXTINPUT: // (online6) the typed characters to the menu's text fields
+			if (open) Queue({Input::Text, 0, false, 0, 0, std::string(e.text.text)});
+			return open;
 		case SDL_TEXTEDITING: return open;
 		case SDL_CONTROLLERBUTTONDOWN: {
 			const auto b     = e.cbutton.button;
@@ -441,9 +584,19 @@ bool OnEvent(const SDL_Event& e) {
 				}
 				return true;
 			}
+			if (g_text_active.load() && b == SDL_CONTROLLER_BUTTON_B) { // (online6) Circle leaves the text field first
+				Queue({Input::Key, ImGuiKey_Escape, true});
+				Queue({Input::Key, ImGuiKey_Escape, false});
+				return true;
+			}
 			// (ds-pc-port37) The F2 pages: Circle back to the F2 menu, L1 scrolls up (L2, a trigger, below).
 			if (g_f1_page.load() != 0 && !g_popup.load()) {
 				if (b == SDL_CONTROLLER_BUTTON_B) {
+					if (g_f1_page.load() == 4 && Shop::Back()) { // (trucos19) one step back inside the shop
+						Bump();
+						return true;
+					}
+					if (g_f1_page.load() == 4) Shop::g_level = 0, Shop::g_refocus = true;
 					g_f1_page = 0;
 					Bump();
 					return true;
@@ -542,7 +695,91 @@ bool OnEvent(const SDL_Event& e) {
 	}
 }
 
+// (online6) The clipboard of the F2 text fields (Ctrl+V, Shift+Insert, Ctrl+C / X, the "Pegar" buttons): Windows' own
+// (CF_UNICODETEXT), so it works whatever ImGui backend is (not) set; pasted text loses its trailing spaces / line breaks.
+std::string ClipboardText() {
+	std::string out;
+#if defined(_WIN32)
+	if (OpenClipboard(nullptr)) {
+		if (HANDLE h = GetClipboardData(CF_UNICODETEXT); h != nullptr) {
+			if (const auto* w = static_cast<const wchar_t*>(GlobalLock(h)); w != nullptr) {
+				const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+				if (n > 1) {
+					out.resize(static_cast<size_t>(n - 1));
+					WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+				}
+				GlobalUnlock(h);
+			}
+		}
+		CloseClipboard();
+	}
+#else
+	if (char* s = SDL_GetClipboardText(); s != nullptr) {
+		out = s;
+		SDL_free(s);
+	}
+#endif
+	while (!out.empty() && (out.back() == ' ' || out.back() == '\r' || out.back() == '\n' || out.back() == '\t')) out.pop_back();
+	while (!out.empty() && (out.front() == ' ' || out.front() == '\r' || out.front() == '\n' || out.front() == '\t')) out.erase(out.begin());
+	return out;
+}
+void SetClipboard(const char* text) {
+#if defined(_WIN32)
+	const int n = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+	if (n <= 0 || !OpenClipboard(nullptr)) return;
+	EmptyClipboard();
+	if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(n) * sizeof(wchar_t)); g != nullptr) {
+		MultiByteToWideChar(CP_UTF8, 0, text, -1, static_cast<wchar_t*>(GlobalLock(g)), n);
+		GlobalUnlock(g);
+		if (SetClipboardData(CF_UNICODETEXT, g) == nullptr) GlobalFree(g);
+	}
+	CloseClipboard();
+#else
+	SDL_SetClipboardText(text);
+#endif
+}
+// (online6) After a text field: right click -> Pegar / Copiar / Borrar, and a small "Pegar" button beside it (pastes the
+// clipboard into the field, replacing it; trailing spaces / line breaks dropped).
+void PasteInto(char* buf, size_t size) {
+	const std::string clip = ClipboardText();
+	if (clip.empty()) return;
+	ImGui::ClearActiveID(); // (a field being edited keeps its own copy: let go of it so the new text shows)
+	std::snprintf(buf, size, "%s", clip.c_str());
+}
+void FieldTools(const char* id, char* buf, size_t size) {
+	ImGui::PushID(id);
+	if (ImGui::BeginPopupContextItem("##ctx")) {
+		if (ImGui::MenuItem(I18n::T("Pegar"))) PasteInto(buf, size);
+		if (ImGui::MenuItem(I18n::T("Copiar"))) SetClipboard(buf);
+		if (ImGui::MenuItem(I18n::T("Borrar"))) {
+			ImGui::ClearActiveID();
+			buf[0] = '\0';
+		}
+		ImGui::EndPopup();
+	}
+	ImGui::SameLine();
+	if (ImGui::Button(I18n::T("Pegar"))) PasteInto(buf, size);
+	ImGui::PopID();
+}
+std::string g_clip_buffer; // (ImGui keeps the pointer until the next call)
+const char* ImGuiGetClipboard(ImGuiContext*) {
+	g_clip_buffer = ClipboardText();
+	return g_clip_buffer.c_str();
+}
+void ImGuiSetClipboard(ImGuiContext*, const char* text) {
+	SetClipboard(text != nullptr ? text : "");
+}
+
 void DrainInputs() {
+	{
+		// (online6) Once: the clipboard; each frame: whether a text field has the keyboard (OnEvent reads it).
+		auto& pio = ImGui::GetPlatformIO();
+		if (pio.Platform_GetClipboardTextFn != &ImGuiGetClipboard) {
+			pio.Platform_GetClipboardTextFn = &ImGuiGetClipboard;
+			pio.Platform_SetClipboardTextFn = &ImGuiSetClipboard;
+		}
+		g_text_active = ImGui::GetIO().WantTextInput;
+	}
 	std::deque<Input> inputs;
 	{
 		std::scoped_lock lock(g_mutex);
@@ -551,11 +788,18 @@ void DrainInputs() {
 	auto& io = ImGui::GetIO();
 	for (const auto& in: inputs) {
 		switch (in.kind) {
-			case Input::Key: io.AddKeyEvent(static_cast<ImGuiKey>(in.key), in.down); break;
+			case Input::Key:
+				io.AddKeyEvent(static_cast<ImGuiKey>(in.key), in.down);
+				// (online6) ImGui reads Ctrl / Shift / Alt from their own mod keys (Ctrl+V, Shift+Insert)
+				if (in.key == ImGuiKey_LeftCtrl || in.key == ImGuiKey_RightCtrl) io.AddKeyEvent(ImGuiMod_Ctrl, in.down);
+				if (in.key == ImGuiKey_LeftShift || in.key == ImGuiKey_RightShift) io.AddKeyEvent(ImGuiMod_Shift, in.down);
+				if (in.key == ImGuiKey_LeftAlt || in.key == ImGuiKey_RightAlt) io.AddKeyEvent(ImGuiMod_Alt, in.down);
+				break;
 			case Input::Analog: io.AddKeyAnalogEvent(static_cast<ImGuiKey>(in.key), in.down, in.x); break;
 			case Input::MousePos: io.AddMousePosEvent(in.x, in.y); break;
 			case Input::MouseButton: io.AddMouseButtonEvent(in.key, in.down); break;
 			case Input::Wheel: io.AddMouseWheelEvent(in.x, in.y); break;
+			case Input::Text: io.AddInputCharactersUTF8(in.text.c_str()); break; // (online6)
 			case Input::Tab:
 				if (g_trophy_page.load()) g_trophy_tab_delta += in.key; // (port34) the trophy page's filters
 				else g_tab_request = (g_tab + in.key + kTabCount) % kTabCount;
@@ -600,73 +844,44 @@ const ImVec4 kGold {0.87f, 0.77f, 0.55f, 1.0f};
 const ImVec4 kWarn {1.0f, 0.78f, 0.30f, 1.0f};
 const ImVec4 kDim {0.72f, 0.70f, 0.66f, 1.0f};
 
-// ---- (ds-pc-port37) "Mapear mando": the emulator launcher's pad mapper (Launcher-souls.ps1 Show-PadMapper) in the menu. ----
-// The same drawings (mando-ps5.png: the game's PS5 controls; mando-8bitdo.png: your controller's physical buttons, SDL names)
-// and the same button centres measured on them (350 px high). Pick a physical button (on the right drawing or in the list),
-// then the PS5 control it does (on the left drawing or in its list). Saved as mapa_mando (KYTY_PAD_MAP), empty = default.
+// ---- (remap2) "Mapear mando", graphic: your controller drawn in the middle (mando-ps5.png / mando-8bitdo.png, next to
+// the exe), every button marked on it with a gold node and a fine line out to a stone plate with what it does now. Hover
+// or focus a plate (mouse, D-pad / stick) and it lights up with its node; press a button on the real controller and its
+// node flashes. Choose a plate (click, A / Cross or Enter) and a gold ring around that button empties in 5 s, with the
+// seconds in Cinzel: press the new button on your controller and the two swap their actions (the press that was asked is
+// confirmed with a flash on both), saved to settings.ini and applied live at once. The same button, Esc or a right click
+// cancel; nothing pressed in 5 s changes nothing. "Restaurar por defecto" puts the default buttons back. Saved as before:
+// mapa_mando (KYTY_PAD_MAP), "physical=PS5 control" (SDL names), empty = default; the old values load as they are. Shown
+// full screen as F2 > Mapear mando (Page) and, smaller, in the Controles tab (Draw). (remap-f2 before: a list of actions.)
+ImFont* DisplayFont(); // (Cinzel, below: the launcher's)
 namespace PadMap {
-struct Spot {
-	const char* name;
-	float       x, y, d, h; // centre and size in the drawing's pixels (h = d but the touchpad's)
-};
+// Your controller's buttons (SDL names) and what each does by default (window.cpp's table): written in this order.
 const char* const kPhys[] = {"a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger",
                              "leftstick", "rightstick", "start", "back", "dpup", "dpdown", "dpleft", "dpright"};
 const char* const kDefault[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2",
                                 "L3", "R3", "Options", "None", "Up", "Down", "Left", "Right"};
-const char* const kPs5[] = {"Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3",
-                            "Options", "TouchPad", "Up", "Down", "Left", "Right", "None"};
-const Spot kPsSpots[] = {{"Up", 96, 62, 29, 29},        {"Down", 96, 126, 29, 29},    {"Left", 65, 93, 29, 29},
-                         {"Right", 128, 93, 29, 29},    {"Triangle", 435, 60, 38, 38}, {"Circle", 472, 94, 38, 38},
-                         {"Cross", 435, 131, 38, 38},   {"Square", 398, 94, 38, 38},   {"L3", 178, 160, 67, 67},
-                         {"R3", 346, 160, 67, 67},      {"Options", 389, 32, 20, 20},  {"TouchPad", 265, 52, 150, 80}};
-const Spot kXbSpots[] = {{"y", 416, 58, 38, 38},        {"x", 377, 95, 38, 38},        {"b", 456, 95, 38, 38},
-                         {"a", 416, 132, 38, 38},       {"leftstick", 125, 86, 72, 72}, {"rightstick", 339, 156, 72, 72},
-                         {"dpup", 193, 140, 25, 25},    {"dpdown", 193, 192, 25, 25},  {"dpleft", 167, 166, 25, 25},
-                         {"dpright", 219, 166, 25, 25}, {"back", 226, 89, 22, 22},     {"start", 312, 89, 22, 22}};
+// The game's actions (the PS5 controls) and their short names on the plates.
+const std::pair<const char*, const char*> kActions[] = {
+    {"R1", "Ataque"}, {"R2", "Ataque fuerte"}, {"L1", "Bloquear"}, {"L2", "Parry"}, {"Circle", "Rodar / atrás"},
+    {"Cross", "Interactuar"}, {"Square", "Usar objeto"}, {"Triangle", "Dos manos"}, {"R3", "Fijar objetivo"}, {"L3", "Botón L3"},
+    {"Up", "Cambiar magia"}, {"Down", "Cambiar objeto"}, {"Left", "Cambiar mano izq."}, {"Right", "Cambiar mano der."},
+    {"Options", "Menú"}, {"TouchPad", "Panel táctil"}};
 
-const char* Label(const std::string& c) {
-	static const std::pair<const char*, const char*> names[] = {
-	    {"Cross", "Cruz"}, {"Circle", "Círculo"}, {"Square", "Cuadrado"}, {"Triangle", "Triángulo"}, {"Options", "Options"},
-	    {"TouchPad", "Panel táctil"}, {"Up", "Cruceta arriba"}, {"Down", "Cruceta abajo"}, {"Left", "Cruceta izquierda"},
-	    {"Right", "Cruceta derecha"}, {"None", "(nada)"}, {"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"},
-	    {"leftshoulder", "LB / L1"}, {"rightshoulder", "RB / R1"}, {"lefttrigger", "LT / L2"}, {"righttrigger", "RT / R2"},
-	    {"leftstick", "Stick izq. (L3)"}, {"rightstick", "Stick der. (R3)"}, {"start", "Start"}, {"back", "Select / Back"},
-	    {"dpup", "Cruceta arriba"}, {"dpdown", "Cruceta abajo"}, {"dpleft", "Cruceta izquierda"}, {"dpright", "Cruceta derecha"}};
-	for (const auto& [k, v]: names)
-		if (c == k) return I18n::T(v);
-	return c.c_str();
+using Map = std::map<std::string, std::string>;
+
+std::string DefaultFor(const std::string& phys) {
+	for (size_t i = 0; i < std::size(kPhys); i++)
+		if (phys == kPhys[i]) return kDefault[i];
+	return phys == "touchpad" ? "TouchPad" : "None"; // (window.cpp: the touchpad click is TouchPad, the others nothing)
 }
 
-struct Tex {
-	ImTextureData* tex = nullptr;
-	int            w = 0, h = 0;
-	ImGuiContext*  ctx = nullptr;
-	bool           tried = false;
-};
-Tex g_ps, g_xb;
-
-void Load(Tex& t, const wchar_t* file) {
-	if (t.tex != nullptr && t.ctx != ImGui::GetCurrentContext()) t = {}; // (another context: its backend owns the old one)
-	if (t.tried) return;
-	t.tried = true;
-	std::ifstream in(g_rt.exe_path.parent_path() / file, std::ios::binary);
-	const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-	int   channels = 0;
-	auto* px = bytes.empty() ? nullptr
-	                         : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &t.w,
-	                                                 &t.h, &channels, 4);
-	if (px == nullptr) return;
-	t.tex = IM_NEW(ImTextureData)();
-	t.tex->Create(ImTextureFormat_RGBA32, t.w, t.h);
-	std::memcpy(t.tex->GetPixels(), px, static_cast<size_t>(t.w) * t.h * 4);
-	t.tex->UseColors = true;
-	stbi_image_free(px);
-	ImGui::RegisterUserTexture(t.tex);
-	t.ctx = ImGui::GetCurrentContext();
+bool KnownPhys(const std::string& k) {
+	if (k == "lefttrigger" || k == "righttrigger") return true;
+	return SDL_GameControllerGetButtonFromString(k.c_str()) != SDL_CONTROLLER_BUTTON_INVALID;
 }
 
-std::map<std::string, std::string> Parse(const std::string& text) {
-	std::map<std::string, std::string> m;
+Map Parse(const std::string& text) {
+	Map m;
 	for (size_t i = 0; i < std::size(kPhys); i++) m[kPhys[i]] = kDefault[i];
 	size_t at = 0;
 	while (at <= text.size()) {
@@ -674,108 +889,889 @@ std::map<std::string, std::string> Parse(const std::string& text) {
 		const auto   item = text.substr(at, end - at);
 		at                = end + 1;
 		const size_t eq   = item.find('=');
-		if (eq != std::string::npos && m.contains(item.substr(0, eq))) m[item.substr(0, eq)] = item.substr(eq + 1);
+		if (eq != std::string::npos && KnownPhys(item.substr(0, eq))) m[item.substr(0, eq)] = item.substr(eq + 1);
 	}
 	return m;
 }
 
-std::string Format(const std::map<std::string, std::string>& m) {
+// The 16 buttons always (as before), then any other button (touchpad, paddles, misc1) not doing its default.
+std::string Format(const Map& m) {
 	bool same = true;
-	for (size_t i = 0; i < std::size(kPhys); i++) same = same && m.at(kPhys[i]) == kDefault[i];
+	for (const auto& [k, v]: m) same = same && v == DefaultFor(k);
 	if (same) return {};
 	std::string out;
 	for (const char* k: kPhys) out += (out.empty() ? "" : ";") + std::string(k) + "=" + m.at(k);
+	for (const auto& [k, v]: m) {
+		bool base = false;
+		for (const char* b: kPhys) base = base || k == b;
+		if (!base && v != DefaultFor(k)) out += ";" + k + "=" + v;
+	}
 	return out;
 }
 
-std::string g_sel = "a"; // the physical button being mapped
-
-// Draws one drawing with its spots at `at`, `scale`; returns the spot clicked ("" none). `hot(name)`: highlighted.
-template <typename Hot>
-std::string Drawing(const char* id, Tex& t, const Spot* spots, size_t n, ImVec2 at, float scale, Hot hot) {
-	auto*       dl = ImGui::GetWindowDrawList();
-	const float w = t.w > 0 ? t.w * scale : 540 * scale, h = 350 * scale;
-	if (t.tex != nullptr) dl->AddImage(t.tex->GetTexRef(), at, {at.x + w, at.y + h});
-	else dl->AddRectFilled(at, {at.x + w, at.y + h}, IM_COL32(40, 44, 54, 255), 12 * scale);
-	std::string clicked;
-	for (size_t i = 0; i < n; i++) {
-		const Spot& sp = spots[i];
-		const ImVec2 c {at.x + sp.x * scale, at.y + sp.y * scale};
-		const ImVec2 half {sp.d * scale * 0.5f, sp.h * scale * 0.5f};
-		ImGui::SetCursorScreenPos({c.x - half.x, c.y - half.y});
-		ImGui::PushID(id);
-		ImGui::PushID(static_cast<int>(i));
-		const bool pressed = ImGui::InvisibleButton("##spot", {std::max(1.0f, half.x * 2), std::max(1.0f, half.y * 2)});
-		const bool over    = ImGui::IsItemHovered();
-		ImGui::PopID();
-		ImGui::PopID();
-		const bool  on   = hot(sp.name);
-		const ImU32 ring = on ? IM_COL32(236, 200, 120, 255) : over ? IM_COL32(236, 200, 120, 200) : IM_COL32(236, 200, 120, 90);
-		if (on || over) {
-			if (sp.d != sp.h) dl->AddRectFilled({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, IM_COL32(236, 200, 120, 90), 8 * scale);
-			else dl->AddCircleFilled(c, half.x, IM_COL32(236, 200, 120, 90));
-		}
-		if (sp.d != sp.h) dl->AddRect({c.x - half.x, c.y - half.y}, {c.x + half.x, c.y + half.y}, ring, 8 * scale, 0, on ? 3.0f : 1.5f);
-		else dl->AddCircle(c, half.x, ring, 0, on ? 3.0f : 1.5f);
-		if (over) ImGui::SetTooltip("%s", Label(sp.name));
-		if (pressed) clicked = sp.name;
+// The controller whose button names are shown: the one that pressed a button last, else the first one open.
+SDL_GameController* ActivePad() {
+	if (const int last = g_pad_last.load(); last >= 0)
+		if (SDL_GameController* pad = SDL_GameControllerFromInstanceID(last); pad != nullptr) return pad;
+	for (int i = 0; i < SDL_NumJoysticks(); i++) {
+		if (SDL_IsGameController(i) == SDL_FALSE) continue;
+		if (SDL_GameController* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i)); pad != nullptr) return pad;
 	}
-	ImGui::SetCursorScreenPos({at.x, at.y + h});
-	return clicked;
+	return nullptr;
+}
+bool IsPlayStation(SDL_GameController* pad) {
+	if (pad == nullptr) return false;
+	const auto t = SDL_GameControllerGetType(pad);
+	return t == SDL_CONTROLLER_TYPE_PS3 || t == SDL_CONTROLLER_TYPE_PS4 || t == SDL_CONTROLLER_TYPE_PS5;
 }
 
-// The section; true when the mapping changed.
-bool Draw(Settings& s, float unit) {
-	Load(g_ps, L"mando-ps5.png");
-	Load(g_xb, L"mando-8bitdo.png");
-	auto m       = Parse(s.pad_map);
-	bool changed = false;
-	ImGui::TextWrapped("%s", I18n::T("1. Elige un botón de TU mando (dibujo de la derecha o la lista). 2. Elige qué botón del juego hace (dibujo de la izquierda). Se aplica al reiniciar el juego."));
-	const float avail = ImGui::GetContentRegionAvail().x;
-	const float scale = std::min(unit, (avail - 16 * unit) / (2 * 540.0f));
-	const ImVec2 at   = ImGui::GetCursorScreenPos();
-	ImGui::TextColored(kGold, "%s", I18n::T("Botón del juego (PS5)"));
-	ImGui::SetCursorScreenPos({at.x + 540 * scale + 16 * unit, at.y});
-	ImGui::TextColored(kGold, "%s", I18n::T("Tu mando"));
-	const float top = at.y + ImGui::GetTextLineHeightWithSpacing();
-	const std::string target = m[g_sel];
-	const std::string ps = Drawing("ps", g_ps, kPsSpots, std::size(kPsSpots), {at.x, top}, scale, [&](const char* n) { return target == n; });
-	const std::string xb = Drawing("xb", g_xb, kXbSpots, std::size(kXbSpots), {at.x + 540 * scale + 16 * unit, top}, scale,
-	                               [&](const char* n) { return g_sel == n; });
-	if (!xb.empty()) g_sel = xb;
-	if (!ps.empty() && m[g_sel] != ps) {
-		m[g_sel] = ps;
-		changed  = true;
+// A button of your controller by its printed name: PlayStation's, else Xbox's (Xbox 360 / One, 8BitDo in X-input...).
+std::string ButtonName(const std::string& phys, bool ps) {
+	struct Name {
+		const char* key;
+		const char* xbox;
+		const char* ps;
+	};
+	static const Name names[] = {
+	    {"a", "A", "Cruz"}, {"b", "B", "Círculo"}, {"x", "X", "Cuadrado"}, {"y", "Y", "Triángulo"},
+	    {"leftshoulder", "LB", "L1"}, {"rightshoulder", "RB", "R1"}, {"lefttrigger", "LT", "L2"}, {"righttrigger", "RT", "R2"},
+	    {"leftstick", "Stick izq. (L3)", "L3"}, {"rightstick", "Stick der. (R3)", "R3"}, {"start", "Start / Menu", "Options"},
+	    {"back", "Back / View", "Create / Share"}, {"guide", "Guide", "PS"}, {"dpup", "Cruceta arriba", "Cruceta arriba"},
+	    {"dpdown", "Cruceta abajo", "Cruceta abajo"}, {"dpleft", "Cruceta izquierda", "Cruceta izquierda"},
+	    {"dpright", "Cruceta derecha", "Cruceta derecha"}, {"touchpad", "Panel táctil", "Panel táctil"}, {"misc1", "Share", "Mic"},
+	    {"paddle1", "P1", "P1"}, {"paddle2", "P2", "P2"}, {"paddle3", "P3", "P3"}, {"paddle4", "P4", "P4"}};
+	for (const auto& n: names)
+		if (phys == n.key) return I18n::T(ps ? n.ps : n.xbox);
+	return phys;
+}
+
+std::string ActionName(const std::string& control) {
+	if (control == "None") return I18n::T("Sin acción");
+	for (const auto& [k, v]: kActions)
+		if (control == k) return I18n::T(v);
+	return control;
+}
+
+// ---- The drawings: where each button is on them (pixels of the PNG, measured on it), and on which side its plate is.
+struct Spot {
+	const char* phys;
+	float       x, y;
+	int         side; // 0 the left column, 1 the right one, 2 above the controller (the touchpad)
+};
+// mando-ps5.png (532 x 350). The triggers are not seen from the front: their nodes sit on a silhouette above L1 / R1.
+// Each column in its plates' order, chosen (by trying every order) so that the lines cross and cover buttons the least.
+const Spot kSpotsPs[] = {{"lefttrigger", 105, -15, 0},  {"leftshoulder", 105, 7, 0},   {"back", 142.5f, 34, 0},   {"dpup", 96.5f, 66, 0},
+                         {"dpleft", 70.5f, 92.5f, 0},   {"dpdown", 96.5f, 118, 0},    {"dpright", 121.5f, 92.5f, 0}, {"leftstick", 182, 161, 0},
+                         {"righttrigger", 425, -15, 1}, {"rightshoulder", 425, 7, 1}, {"y", 435.5f, 56, 1},      {"b", 472.5f, 92.5f, 1},
+                         {"x", 399, 92.5f, 1},          {"start", 389, 34, 1},        {"a", 435.5f, 131, 1},     {"rightstick", 350.5f, 161, 1},
+                         {"touchpad", 265, 50, 2}};
+// mando-8bitdo.png (537 x 350): Xbox's layout (A below, B right, X left, Y up), the left stick above the D-pad.
+const Spot kSpotsXb[] = {{"lefttrigger", 123, -13, 0},  {"leftshoulder", 123, 10, 0},  {"leftstick", 126, 90, 0},     {"back", 225.5f, 89, 0},
+                         {"dpup", 193, 140, 0},         {"dpleft", 164, 166, 0},       {"dpright", 222, 166, 0},      {"dpdown", 193, 194, 0},
+                         {"righttrigger", 418, -13, 1}, {"rightshoulder", 418, 10, 1}, {"y", 416.5f, 60, 1},          {"b", 454.3f, 96.7f, 1},
+                         {"x", 378.5f, 95, 1},          {"a", 416.7f, 133.3f, 1},      {"start", 312, 89, 1},         {"rightstick", 338, 164, 1}};
+
+// ---- The two drawings as textures, once per ImGui context (the launcher's, then the game's overlay).
+struct Art {
+	ImTextureData* tex = nullptr;
+	int            w = 0, h = 0;
+	bool           tried = false, linear = false;
+};
+Art           g_art[2];
+ImGuiContext* g_art_ctx    = nullptr;
+ImFont*       g_cinzel     = nullptr;
+ImGuiContext* g_cinzel_ctx = nullptr;
+
+Art& GetArt(int which) {
+	if (g_art_ctx != ImGui::GetCurrentContext()) { // (another context: the old one's textures went with it)
+		for (auto& a: g_art) a = Art {};
+		g_art_ctx = ImGui::GetCurrentContext();
 	}
-	ImGui::SetCursorScreenPos({at.x, top + 350 * scale + 8 * unit});
-	// The shoulders and triggers (not on the drawings) and every button: the list.
-	if (ImGui::BeginTable("##padmap", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchSame)) {
-		for (const char* k: kPhys) {
-			ImGui::TableNextRow();
-			ImGui::TableSetColumnIndex(0);
-			if (ImGui::Selectable(Label(k), g_sel == k, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) g_sel = k;
-			ImGui::TableSetColumnIndex(1);
-			ImGui::PushID(k);
-			ImGui::SetNextItemWidth(-1);
-			if (ImGui::BeginCombo("##to", Label(m[k]))) {
-				for (const char* c: kPs5)
-					if (ImGui::Selectable(Label(c), m[k] == c)) {
-						m[k]    = c;
-						g_sel   = k;
-						changed = true;
-					}
-				ImGui::EndCombo();
-			}
-			ImGui::PopID();
+	Art& a = g_art[which];
+	if (!a.tried) {
+		a.tried = true;
+		const auto path = g_rt.exe_path.parent_path() / (which == 0 ? L"mando-ps5.png" : L"mando-8bitdo.png");
+		std::ifstream     in(path, std::ios::binary);
+		const std::string bytes {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+		int               channels = 0;
+		auto*             px       = bytes.empty() ? nullptr
+		                                           : stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()),
+		                                                                   &a.w, &a.h, &channels, 4);
+		if (px == nullptr) {
+			std::printf("[port] mapear mando: %s not loaded (the buttons are drawn without it)\n", which == 0 ? "mando-ps5.png" : "mando-8bitdo.png");
+		} else {
+			a.tex = IM_NEW(ImTextureData)();
+			a.tex->Create(ImTextureFormat_RGBA32, a.w, a.h);
+			std::memcpy(a.tex->GetPixels(), px, static_cast<size_t>(a.w) * a.h * 4);
+			a.tex->UseColors = true;
+			stbi_image_free(px);
+			ImGui::RegisterUserTexture(a.tex);
 		}
-		ImGui::EndTable();
 	}
-	if (ImGui::Button(I18n::T("Restablecer los botones de serie"))) {
-		m       = Parse("");
-		changed = true;
+	// The launcher's SDL_Renderer samples nearest by default: bilinear once its texture exists (the game's overlay: linear).
+	if (a.tex != nullptr && !a.linear && g_start_mode && a.tex->Status == ImTextureStatus_OK && a.tex->GetTexID() != ImTextureID_Invalid) {
+		SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(a.tex->GetTexID())), SDL_ScaleModeLinear);
+		a.linear = true;
 	}
-	if (changed) s.pad_map = Format(m);
+	return a;
+}
+
+// Cinzel: the launcher's; in the game's overlay (which has none) the same font from the exe's resources, added once.
+ImFont* Cinzel() {
+	if (DisplayFont() != nullptr) return DisplayFont();
+	if (g_cinzel_ctx != ImGui::GetCurrentContext()) {
+		g_cinzel_ctx = ImGui::GetCurrentContext();
+		g_cinzel     = FindFont("Cinzel");
+#if defined(_WIN32)
+		// (ImGui 1.92 with a renderer that has textures: a font can be added at any time, it is rasterized on use)
+		if (g_cinzel == nullptr && (ImGui::GetIO().BackendFlags & ImGuiBackendFlags_RendererHasTextures) != 0)
+			if (HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(3), MAKEINTRESOURCEW(10)); res != nullptr)
+				if (HGLOBAL mem = LoadResource(nullptr, res); mem != nullptr) {
+					void*       data = LockResource(mem);
+					const DWORD size = SizeofResource(nullptr, res);
+					if (data != nullptr && size > 0) {
+						ImFontConfig cfg;
+						cfg.FontDataOwnedByAtlas = false; // (the resource stays mapped for the process' life)
+						cfg.OversampleH = cfg.OversampleV = 1;
+						cfg.PixelSnapH                    = true;
+						cfg.RasterizerMultiply            = 1.08f;
+						cfg.GlyphExtraAdvanceX            = 2.0f;
+						ImFormatString(cfg.Name, IM_ARRAYSIZE(cfg.Name), "Cinzel (mapear mando)");
+						g_cinzel = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(data, static_cast<int>(size), 0.0f, &cfg);
+					}
+				}
+#endif
+	}
+	return g_cinzel != nullptr ? g_cinzel : ImGui::GetFont();
+}
+ImFont* Body() {
+	ImFont* f = FindFont("segoeui");
+	return f != nullptr ? f : ImGui::GetFont();
+}
+ImFont* Semi() {
+	ImFont* f = FindFont("seguisb");
+	return f != nullptr ? f : Body();
+}
+
+// The launcher closes (before its context goes): the drawings freed.
+void Shutdown() {
+	if (g_art_ctx == ImGui::GetCurrentContext())
+		for (auto& a: g_art)
+			if (a.tex != nullptr) {
+				ImGui::UnregisterUserTexture(a.tex);
+				IM_DELETE(a.tex);
+			}
+	for (auto& a: g_art) a = Art {};
+	g_art_ctx    = nullptr;
+	g_cinzel     = nullptr;
+	g_cinzel_ctx = nullptr;
+}
+
+// ---- Drawing helpers.
+float g_alpha = 1.0f; // the whole screen's fade
+ImU32 Ca(int r, int g, int b, float a) {
+	return IM_COL32(r, g, b, static_cast<int>(std::clamp(a * g_alpha, 0.0f, 1.0f) * 255.0f + 0.5f));
+}
+float Ease(float t) {
+	t = std::clamp(t, 0.0f, 1.0f);
+	return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+float Clamp01(float t) {
+	return std::clamp(t, 0.0f, 1.0f);
+}
+float Hash(int i, int salt) {
+	uint32_t h = static_cast<uint32_t>(i) * 2654435761u ^ static_cast<uint32_t>(salt) * 40503u;
+	h ^= h >> 15;
+	h *= 2246822519u;
+	h ^= h >> 13;
+	return static_cast<float>(h & 0xFFFFu) / 65535.0f;
+}
+// A soft ellipse: `in` at the centre to `out` at the rim (vertex colours, no texture), `mid` at half the radius.
+void Radial(ImDrawList* dl, ImVec2 c, float rx, float ry, ImU32 in, ImU32 mid, ImU32 out, int seg = 48) {
+	if (rx <= 0.5f || ry <= 0.5f) return;
+	const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+	dl->PrimReserve(seg * 9, seg * 2 + 1);
+	const ImDrawIdx base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+	dl->PrimWriteVtx(c, uv, in);
+	constexpr float kPi = 3.14159265f;
+	for (int i = 0; i < seg; i++) {
+		const float a = 2.0f * kPi * static_cast<float>(i) / static_cast<float>(seg);
+		dl->PrimWriteVtx({c.x + std::cos(a) * rx * 0.5f, c.y + std::sin(a) * ry * 0.5f}, uv, mid);
+		dl->PrimWriteVtx({c.x + std::cos(a) * rx, c.y + std::sin(a) * ry}, uv, out);
+	}
+	for (int i = 0; i < seg; i++) {
+		const auto m0 = static_cast<ImDrawIdx>(base + 1 + i * 2), o0 = static_cast<ImDrawIdx>(m0 + 1);
+		const auto m1 = static_cast<ImDrawIdx>(base + 1 + ((i + 1) % seg) * 2), o1 = static_cast<ImDrawIdx>(m1 + 1);
+		dl->PrimWriteIdx(base), dl->PrimWriteIdx(m0), dl->PrimWriteIdx(m1);
+		dl->PrimWriteIdx(m0), dl->PrimWriteIdx(o0), dl->PrimWriteIdx(o1);
+		dl->PrimWriteIdx(m0), dl->PrimWriteIdx(o1), dl->PrimWriteIdx(m1);
+	}
+}
+// A slab with cut corners (`c`), shaded from `top` to `bottom`, and its outline.
+void Slab(ImDrawList* dl, ImVec2 a, ImVec2 b, float c, ImU32 top, ImU32 bottom, ImU32 line, float thick) {
+	const ImVec2 p[8] = {{a.x + c, a.y}, {b.x - c, a.y}, {b.x, a.y + c}, {b.x, b.y - c}, {b.x - c, b.y}, {a.x + c, b.y}, {a.x, b.y - c}, {a.x, a.y + c}};
+	const auto   mix  = [&](float y) {
+        const float t = Clamp01((y - a.y) / std::max(1.0f, b.y - a.y));
+        ImVec4      x = ImGui::ColorConvertU32ToFloat4(top), z = ImGui::ColorConvertU32ToFloat4(bottom);
+        return ImGui::ColorConvertFloat4ToU32({x.x + (z.x - x.x) * t, x.y + (z.y - x.y) * t, x.z + (z.z - x.z) * t, x.w + (z.w - x.w) * t});
+	};
+	const ImVec2 uv = dl->_Data->TexUvWhitePixel;
+	dl->PrimReserve(8 * 3, 9);
+	const ImDrawIdx base = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+	dl->PrimWriteVtx({(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f}, uv, mix((a.y + b.y) * 0.5f));
+	for (const auto& q: p) dl->PrimWriteVtx(q, uv, mix(q.y));
+	for (int i = 0; i < 8; i++) dl->PrimWriteIdx(base), dl->PrimWriteIdx(static_cast<ImDrawIdx>(base + 1 + i)), dl->PrimWriteIdx(static_cast<ImDrawIdx>(base + 1 + (i + 1) % 8));
+	if (thick > 0.0f) dl->AddPolyline(p, 8, line, ImDrawFlags_Closed, thick);
+}
+void Diamond(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+	dl->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, col);
+}
+// Text with extra letter spacing; returns its width (dl nullptr: measure only).
+float Spaced(ImDrawList* dl, ImFont* f, float size, ImVec2 at, ImU32 col, const std::string& text, float spacing) {
+	float       x = at.x;
+	const char* s = text.c_str();
+	const char* e = s + text.size();
+	while (s < e) {
+		unsigned int cp  = 0;
+		const int    len = ImTextCharFromUtf8(&cp, s, e);
+		if (len <= 0) break;
+		const std::string ch(s, static_cast<size_t>(len));
+		if (dl != nullptr) dl->AddText(f, size, {std::round(x), std::round(at.y)}, col, ch.c_str());
+		x += f->CalcTextSizeA(size, FLT_MAX, 0.0f, ch.c_str()).x + spacing;
+		s += len;
+	}
+	return x - at.x - (text.empty() ? 0.0f : spacing);
+}
+// Upper case (ASCII and the accented Latin letters of the six languages).
+std::string Upper(const std::string& s) {
+	std::string out = s;
+	for (size_t i = 0; i < out.size(); i++) {
+		const auto c = static_cast<unsigned char>(out[i]);
+		if (c >= 'a' && c <= 'z') out[i] = static_cast<char>(c - 32);
+		else if (c == 0xC3 && i + 1 < out.size()) {
+			const auto d = static_cast<unsigned char>(out[i + 1]);
+			if (d >= 0xA0 && d <= 0xBE && d != 0xB7) out[i + 1] = static_cast<char>(d - 0x20);
+			i++;
+		}
+	}
+	return out;
+}
+// The text cut to `max_w` with "...".
+std::string Fit(ImFont* f, float size, const std::string& text, float max_w) {
+	if (f->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str()).x <= max_w) return text;
+	std::string t = text;
+	while (!t.empty()) {
+		do t.pop_back();
+		while (!t.empty() && (static_cast<unsigned char>(t.back()) & 0xC0) == 0x80);
+		if (!t.empty()) t.pop_back();
+		if (f->CalcTextSizeA(size, FLT_MAX, 0.0f, (t + "...").c_str()).x <= max_w) return t + "...";
+	}
+	return "...";
+}
+// The button's mark on a plate's medallion: PlayStation's symbols, Xbox's letters, an arrow for the D-pad.
+void Glyph(ImDrawList* dl, const std::string& phys, ImVec2 c, float r, ImU32 col, bool ps, float e) {
+	const float th = std::max(1.0f, 1.6f * e);
+	const auto  text = [&](const char* t, float size) {
+        ImFont*      f  = Semi();
+        const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, t);
+        dl->AddText(f, size, {std::round(c.x - ts.x * 0.5f), std::round(c.y - ts.y * 0.5f)}, col, t);
+	};
+	const auto arrow = [&](float dx, float dy) {
+		const ImVec2 tip {c.x + dx * r * 0.62f, c.y + dy * r * 0.62f};
+		const ImVec2 l {c.x - dx * r * 0.18f - dy * r * 0.5f, c.y - dy * r * 0.18f + dx * r * 0.5f};
+		const ImVec2 q {c.x - dx * r * 0.18f + dy * r * 0.5f, c.y - dy * r * 0.18f - dx * r * 0.5f};
+		dl->AddTriangleFilled(tip, l, q, col);
+	};
+	if (ps && phys == "a") {
+		const float k = r * 0.5f;
+		dl->AddLine({c.x - k, c.y - k}, {c.x + k, c.y + k}, col, th);
+		dl->AddLine({c.x - k, c.y + k}, {c.x + k, c.y - k}, col, th);
+	} else if (ps && phys == "b") {
+		dl->AddCircle(c, r * 0.55f, col, 32, th);
+	} else if (ps && phys == "x") {
+		const float k = r * 0.5f;
+		dl->AddRect({c.x - k, c.y - k}, {c.x + k, c.y + k}, col, 0.0f, 0, th);
+	} else if (ps && phys == "y") {
+		const float k = r * 0.62f;
+		dl->AddTriangle({c.x, c.y - k}, {c.x + k * 0.92f, c.y + k * 0.62f}, {c.x - k * 0.92f, c.y + k * 0.62f}, col, th);
+	} else if (phys == "a" || phys == "b" || phys == "x" || phys == "y") {
+		const char t[2] = {static_cast<char>(phys[0] - 32), 0};
+		text(t, std::round(r * 1.15f));
+	} else if (phys == "dpup") arrow(0, -1);
+	else if (phys == "dpdown") arrow(0, 1);
+	else if (phys == "dpleft") arrow(-1, 0);
+	else if (phys == "dpright") arrow(1, 0);
+	else if (phys == "start") {
+		for (int i = -1; i <= 1; i++) dl->AddLine({c.x - r * 0.45f, c.y + i * r * 0.32f}, {c.x + r * 0.45f, c.y + i * r * 0.32f}, col, th);
+	} else if (phys == "back") {
+		dl->AddRect({c.x - r * 0.5f, c.y - r * 0.38f}, {c.x + r * 0.2f, c.y + r * 0.2f}, col, 1.5f * e, 0, th);
+		dl->AddRect({c.x - r * 0.2f, c.y - r * 0.1f}, {c.x + r * 0.5f, c.y + r * 0.48f}, col, 1.5f * e, 0, th);
+	} else if (phys == "touchpad") {
+		dl->AddRect({c.x - r * 0.6f, c.y - r * 0.36f}, {c.x + r * 0.6f, c.y + r * 0.36f}, col, 3.0f * e, 0, th);
+	} else {
+		static const std::pair<const char*, const char*> kText[] = {{"leftshoulder", "L1|LB"}, {"rightshoulder", "R1|RB"}, {"lefttrigger", "L2|LT"},
+		                                                            {"righttrigger", "R2|RT"}, {"leftstick", "L3|LS"},   {"rightstick", "R3|RS"}};
+		for (const auto& [k, v]: kText)
+			if (phys == k) {
+				const std::string both = v;
+				text((ps ? both.substr(0, 2) : both.substr(3, 2)).c_str(), std::round(r * 0.92f));
+				return;
+			}
+		text("?", std::round(r));
+	}
+}
+
+// ---- The state.
+enum class Mode { Idle, Capture };
+Mode        g_mode = Mode::Idle;
+std::string g_src;                   // Capture: the button whose action moves to the one you press
+double      g_started = 0.0, g_quiet_until = 0.0;
+std::string g_msg;
+ImU32       g_msg_col = IM_COL32(184, 176, 160, 255);
+std::string g_flash_a, g_flash_b;    // the two buttons just swapped ("*": all, after Restaurar)
+double      g_flash_at  = -10.0;
+int         g_last_frame = -10;
+double      g_shown_at  = 0.0;
+bool        g_focus_req = false;
+std::map<std::string, float> g_press; // per button, eased 0..1 while it is held on the real controller
+
+void StartCapture(const std::string& phys) {
+	std::scoped_lock lock(g_capture_mutex);
+	g_pad_captured.clear();
+	// A trigger held right now counts only after it is released (an analog trigger resting a little in is not a press).
+	bool free_trig[2] {true, true};
+	for (int i = 0; i < SDL_NumJoysticks(); i++) {
+		if (SDL_IsGameController(i) == SDL_FALSE) continue;
+		SDL_GameController* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
+		if (pad == nullptr) continue;
+		free_trig[0] = free_trig[0] && SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) < 9830;
+		free_trig[1] = free_trig[1] && SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) < 9830;
+	}
+	g_pad_trig_armed[0] = free_trig[0];
+	g_pad_trig_armed[1] = free_trig[1];
+	g_started           = Anim::Now();
+	g_pad_capture_at    = g_started;
+	g_pad_capture       = true;
+	g_mode              = Mode::Capture;
+	g_src               = phys;
+	g_msg.clear();
+	Bump();
+}
+
+// `to` takes `from`'s action and `from` takes `to`'s (a swap: nothing is left without its button); true when it changed.
+bool Swap(Map& m, const std::string& from, const std::string& to, bool ps) {
+	if (!m.contains(from)) m[from] = DefaultFor(from);
+	if (!m.contains(to)) m[to] = DefaultFor(to);
+	const std::string act = m[from], other = m[to];
+	if (act == other) {
+		g_msg     = std::string(I18n::T("Sin cambios:")) + " " + ButtonName(to, ps) + " = " + ActionName(act);
+		g_msg_col = IM_COL32(184, 176, 160, 255);
+		return false;
+	}
+	m[to]      = act;
+	m[from]    = other;
+	g_msg      = std::string(I18n::T("Asignado:")) + " " + ActionName(act) + " = " + ButtonName(to, ps) + "     \xC2\xB7     " + I18n::T("Intercambiado:") + " " +
+	        ActionName(other) + " = " + ButtonName(from, ps);
+	g_msg_col  = IM_COL32(236, 206, 146, 255);
+	g_flash_a  = from;
+	g_flash_b  = to;
+	g_flash_at = Anim::Now();
+	return true;
+}
+
+// The game's map live (window.cpp), when it is not the one it has (not in the launcher: JUGAR starts with it).
+void SetLive(const std::string& map) {
+	static std::string live = g_rt.launched.pad_map; // (what the game started with: KYTY_PAD_MAP)
+	if (g_start_mode || map == live) return;
+	live = map;
+	Libs::Graphics::HostPadMapSetLive(map.c_str());
+}
+
+// settings.ini's mapa_mando now (only that key), and the game's map live.
+void Commit(const Settings& s) {
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	on_disk.pad_map = s.pad_map;
+	if (SaveSettings(g_rt.ini_path, on_disk)) g_saved.pad_map = s.pad_map;
+	else g_msg += std::string("   ") + I18n::T("No se pudo guardar settings.ini"), g_msg_col = IM_COL32(255, 199, 77, 255);
+	SetLive(s.pad_map);
+}
+
+// Is `phys` held on the controller now?
+bool Held(SDL_GameController* pad, const std::string& phys) {
+	if (pad == nullptr) return false;
+	if (phys == "lefttrigger") return SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 16000;
+	if (phys == "righttrigger") return SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16000;
+	const auto b = SDL_GameControllerGetButtonFromString(phys.c_str());
+	return b != SDL_CONTROLLER_BUTTON_INVALID && SDL_GameControllerGetButton(pad, b) != 0;
+}
+
+// A stone button for the footer; true when pressed (click, A / Cross, Enter).
+bool StoneButton(const char* id, const std::string& label, ImVec2 a, ImVec2 b, float e) {
+	ImGui::SetCursorScreenPos(a);
+	const bool    pressed = ImGui::InvisibleButton(id, {b.x - a.x, b.y - a.y}, ImGuiButtonFlags_EnableNav);
+	ImGuiContext& g       = *ImGui::GetCurrentContext();
+	const float   h       = Anim::Hot(ImGui::GetItemID(), ImGui::IsItemHovered() || (ImGui::IsItemFocused() && g.NavCursorVisible));
+	auto*         dl      = ImGui::GetWindowDrawList();
+	for (int k = 1; k <= 3 && h > 0.0f; k++) {
+		const float o = static_cast<float>(k) * 2.5f * e;
+		Slab(dl, {a.x - o, a.y - o}, {b.x + o, b.y + o}, 7.0f * e + o, 0, 0, Ca(240, 200, 120, 0.13f / static_cast<float>(k) * h), 2.0f * e);
+	}
+	Slab(dl, a, b, 7.0f * e, Ca(44 + static_cast<int>(18 * h), 40 + static_cast<int>(15 * h), 34 + static_cast<int>(8 * h), 0.94f),
+	     Ca(20, 19, 18, 0.94f), Ca(222, 190, 128, 0.42f + 0.5f * h), std::max(1.0f, 1.3f * e));
+	ImFont*      f  = Semi();
+	const float  fs = std::round(20.0f * e);
+	const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label.c_str());
+	dl->AddText(f, fs, {std::round((a.x + b.x - ts.x) * 0.5f), std::round((a.y + b.y - ts.y) * 0.5f)}, Ca(236 + static_cast<int>(12 * h), 226, 204, 1.0f),
+	            label.c_str());
+	return pressed;
+}
+
+// ---- The screen, in the rectangle (o, size); `page`: F2's full page (title, Volver). True when the map changed (saved
+// and live already); `close`: Volver.
+bool Screen(Settings& s, ImVec2 o, ImVec2 size, float unit, bool page, bool* close) {
+	constexpr float kPi = 3.14159265f;
+	Map             m       = Parse(s.pad_map);
+	bool            changed = false;
+	auto*           pad     = ActivePad();
+	const bool      ps      = pad == nullptr || IsPlayStation(pad);
+	const bool      xb_art  = pad != nullptr && !ps;
+	const double    now     = Anim::Now();
+	// Shown again after a pause (opened, or the page changed): its entrance plays again.
+	if (ImGui::GetFrameCount() != g_last_frame + 1) {
+		g_shown_at  = now;
+		g_focus_req = page;
+	}
+	g_last_frame = ImGui::GetFrameCount();
+	// A capture ended (a button, cancelled or out of time)?
+	if (g_mode == Mode::Capture) {
+		bool        done = false;
+		std::string got;
+		{
+			std::scoped_lock lock(g_capture_mutex);
+			if (!g_pad_capture.load()) {
+				got  = g_pad_captured;
+				done = true;
+			} else if (now - g_started >= kPadCaptureSeconds) {
+				g_pad_capture = false;
+				done          = true;
+			}
+			g_pad_captured.clear();
+		}
+		if (done) {
+			g_mode        = Mode::Idle;
+			g_quiet_until = now + 0.35; // (the press that ended it does not start another one)
+			if (got.empty() || got == "\x1b" || got == g_src) {
+				g_msg     = I18n::T(got.empty() ? "Se acabó el tiempo: no se ha cambiado nada." : "Cancelado: no se ha cambiado nada.");
+				g_msg_col = IM_COL32(184, 176, 160, 255);
+			} else {
+				changed = Swap(m, g_src, got, ps);
+			}
+		}
+	}
+	const bool  capturing = g_mode == Mode::Capture;
+	const bool  can_start = !capturing && now >= g_quiet_until;
+	const float left      = capturing ? static_cast<float>(kPadCaptureSeconds - (now - g_started)) : 0.0f;
+
+	// Layout: designed for 1600 x (800 + the title's 120) at 1080p, scaled to fit.
+	const float T0 = page ? 120.0f : 0.0f;
+	const float e  = std::max(0.3f, std::min({unit, size.x / 1600.0f, size.y / (800.0f + T0)}));
+	const float cx = std::round(o.x + size.x * 0.5f);
+	const float y0 = std::round(o.y + std::max(0.0f, (size.y - (800.0f + T0) * e) * 0.5f));
+	const auto  Y  = [&](float v) { return y0 + (v + T0) * e; };
+	auto*       dl = ImGui::GetWindowDrawList();
+	const float t_in  = Ease(static_cast<float>((now - g_shown_at) / 0.5));
+	ImFont*     cinzel = Cinzel();
+	ImFont*     body   = Body();
+
+	// The drawing: 430 px high at 1080p, its top at 118.
+	const Art&   art   = GetArt(xb_art ? 1 : 0);
+	const float  aw    = art.tex != nullptr ? static_cast<float>(art.w) : (xb_art ? 537.0f : 532.0f);
+	const float  ah    = art.tex != nullptr ? static_cast<float>(art.h) : 350.0f;
+	const float  sc    = 430.0f * e / ah;
+	const float  iw = aw * sc, ih = ah * sc;
+	const float  rise  = (1.0f - t_in) * 18.0f * e;
+	const ImVec2 i0 {std::round(cx - iw * 0.5f), std::round(Y(118) + rise)};
+	const ImVec2 icenter {cx, i0.y + ih * 0.45f};
+	const auto   At = [&](const Spot& sp) { return ImVec2 {i0.x + sp.x * sc, i0.y + sp.y * sc}; };
+	const Spot*  spots  = xb_art ? kSpotsXb : kSpotsPs;
+	const int    nspots = xb_art ? static_cast<int>(std::size(kSpotsXb)) : static_cast<int>(std::size(kSpotsPs));
+
+	// Behind it: a warm glow and a shadow under it.
+	Radial(dl, icenter, iw * 0.95f, ih * 1.05f, Ca(150, 112, 58, 0.30f * t_in), Ca(110, 80, 40, 0.12f * t_in), Ca(60, 40, 20, 0.0f));
+	Radial(dl, {cx, i0.y + ih * 0.97f}, iw * 0.55f, ih * 0.12f, Ca(0, 0, 0, 0.55f * t_in), Ca(0, 0, 0, 0.25f * t_in), Ca(0, 0, 0, 0.0f));
+	// The triggers' silhouettes behind L1 / R1 (not seen from the front): dark caps rising behind the bumpers.
+	const float dim_all = capturing ? 0.55f : 1.0f;
+	for (int side = 0; side < 2; side++) {
+		const Spot&  sp = spots[side == 0 ? 0 : 8];
+		const ImVec2 c  = At(sp);
+		const float  w2 = 40.0f * sc, top = c.y - 11.0f * sc, bot = c.y + 24.0f * sc;
+		dl->AddRectFilled({c.x - w2, top}, {c.x + w2, bot}, Ca(30, 28, 27, 0.97f * t_in * dim_all), 16.0f * sc, ImDrawFlags_RoundCornersTop);
+		dl->AddRectFilledMultiColor({c.x - w2 + 3.0f * sc, top + 4.0f * sc}, {c.x + w2 - 3.0f * sc, top + 12.0f * sc}, Ca(255, 240, 210, 0.10f * t_in * dim_all),
+		                            Ca(255, 240, 210, 0.10f * t_in * dim_all), Ca(255, 240, 210, 0.0f), Ca(255, 240, 210, 0.0f));
+		dl->AddRect({c.x - w2, top}, {c.x + w2, bot}, Ca(150, 132, 100, 0.45f * t_in * dim_all), 16.0f * sc, ImDrawFlags_RoundCornersTop, std::max(1.0f, e));
+	}
+	if (art.tex != nullptr) {
+		const int tint = capturing ? 108 : 205;
+		dl->AddImage(art.tex->GetTexRef(), i0, {i0.x + iw, i0.y + ih}, {0, 0}, {1, 1},
+		             Ca(tint, tint - 9, tint - 26, t_in));
+	} else { // (no PNG: a plain outline, the nodes still show where each button is)
+		dl->AddRect(i0, {i0.x + iw, i0.y + ih * 0.6f}, Ca(180, 160, 120, 0.4f * t_in), 60.0f * e, 0, 2.0f * e);
+	}
+
+	// The plates: two columns of 8 beside the drawing (and the touchpad's above it), 70 apart from 40.
+	const float pw = 330.0f * e, ph = 58.0f * e;
+	const float colx[2] = {std::round(cx - iw * 0.5f - 64.0f * e - pw), std::round(cx + iw * 0.5f + 64.0f * e)};
+	int         row[2]  = {0, 0};
+	struct Placed {
+		const Spot* sp;
+		ImVec2      a, b, node;
+		int         index;
+	};
+	std::vector<Placed> placed;
+	for (int i = 0; i < nspots; i++) {
+		const Spot& sp = spots[i];
+		Placed      p {&sp, {}, {}, At(sp), i};
+		if (sp.side == 2) {
+			const float w = 270.0f * e, h = 52.0f * e;
+			p.a = {std::round(cx - w * 0.5f), std::round(Y(34))};
+			p.b = {p.a.x + w, p.a.y + h};
+		} else {
+			const int k = row[sp.side]++;
+			p.a       = {colx[sp.side], std::round(Y(40.0f + static_cast<float>(k) * 70.0f))};
+			p.b       = {p.a.x + pw, p.a.y + ph};
+		}
+		placed.push_back(p);
+	}
+
+	// Their lines first (under the nodes and the plates), then everything else.
+	ImGuiContext& g    = *ImGui::GetCurrentContext();
+	const float   tsec = static_cast<float>(std::fmod(now, 1000.0));
+	const float   fl   = 1.0f - Clamp01(static_cast<float>((now - g_flash_at) / 0.9));
+	std::vector<float> hot(placed.size(), 0.0f), press(placed.size(), 0.0f), flash(placed.size(), 0.0f), appear(placed.size(), 0.0f);
+	for (size_t i = 0; i < placed.size(); i++) {
+		const std::string phys = placed[i].sp->phys;
+		float&            pv   = g_press[phys];
+		const float       dt   = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
+		pv += ((Held(pad, phys) ? 1.0f : 0.0f) - pv) * std::min(1.0f, dt * (Held(pad, phys) ? 30.0f : 6.0f));
+		press[i]  = pv;
+		flash[i]  = (g_flash_a == "*" || phys == g_flash_a || phys == g_flash_b) ? fl : 0.0f;
+		appear[i] = Ease(static_cast<float>((now - g_shown_at - 0.08 - 0.025 * placed[i].index) / 0.30));
+		// The plate's hit area and the node's (mouse only): an item each, the plate's reachable with the D-pad / stick.
+		ImGui::PushID(placed[i].sp->phys);
+		ImGui::SetCursorScreenPos(placed[i].a);
+		if (g_focus_req && phys == "rightshoulder") {
+			ImGui::SetKeyboardFocusHere();
+			g_focus_req = false;
+		}
+		bool clicked = ImGui::InvisibleButton("##plate", {placed[i].b.x - placed[i].a.x, placed[i].b.y - placed[i].a.y}, ImGuiButtonFlags_EnableNav);
+		bool on      = ImGui::IsItemHovered() || (ImGui::IsItemFocused() && g.NavCursorVisible);
+		const ImGuiID id = ImGui::GetItemID();
+		const float   nr = 18.0f * e;
+		ImGui::SetCursorScreenPos({placed[i].node.x - nr, placed[i].node.y - nr});
+		ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+		clicked = ImGui::InvisibleButton("##node", {nr * 2.0f, nr * 2.0f}) || clicked;
+		ImGui::PopItemFlag();
+		on      = on || ImGui::IsItemHovered();
+		hot[i]  = Anim::Hot(id, on && !capturing);
+		if (clicked && can_start) StartCapture(phys);
+		ImGui::PopID();
+	}
+	for (size_t i = 0; i < placed.size(); i++) {
+		const Placed& p    = placed[i];
+		const bool    src  = capturing && g_src == p.sp->phys;
+		const float   dim  = capturing && !src ? 0.22f : 1.0f;
+		const float   draw = Ease(static_cast<float>((now - g_shown_at - 0.16 - 0.025 * p.index) / 0.34));
+		if (draw <= 0.0f) continue;
+		const float  h = std::max({hot[i], src ? 1.0f : 0.0f, flash[i]});
+		ImVec2       p0, p1;
+		if (p.sp->side == 2) p0 = {(p.a.x + p.b.x) * 0.5f, p.b.y}, p1 = {p0.x, p0.y + 14.0f * e};
+		else if (p.sp->side == 0) p0 = {p.b.x, (p.a.y + p.b.y) * 0.5f}, p1 = {p0.x + 26.0f * e, p0.y};
+		else p0 = {p.a.x, (p.a.y + p.b.y) * 0.5f}, p1 = {p0.x - 26.0f * e, p0.y};
+		// The line grows from the plate to the node (entrance).
+		const float  l1 = std::hypot(p1.x - p0.x, p1.y - p0.y), l2 = std::hypot(p.node.x - p1.x, p.node.y - p1.y);
+		float        len = (l1 + l2) * draw;
+		ImVec2       pts[3] = {p0, p1, p.node};
+		int          n      = 3;
+		if (len < l1) pts[1] = {p0.x + (p1.x - p0.x) * len / l1, p0.y + (p1.y - p0.y) * len / l1}, n = 2;
+		else if (len < l1 + l2) {
+			const float k = (len - l1) / l2;
+			pts[2]        = {p1.x + (p.node.x - p1.x) * k, p1.y + (p.node.y - p1.y) * k};
+		}
+		dl->AddPolyline(pts, n, Ca(0, 0, 0, 0.55f * dim * draw), 0, (3.4f + 1.0f * h) * e);
+		dl->AddPolyline(pts, n, Ca(214 + static_cast<int>(30 * h), 182 + static_cast<int>(30 * h), 118 + static_cast<int>(30 * h), (0.55f + 0.45f * h) * dim),
+		                0, (1.3f + 0.9f * h) * e);
+		if (draw < 1.0f) continue;
+		// The node: a gold ring with a dark eye; hot: a pulsing halo; held on the controller: a white-gold burst.
+		const ImVec2 c  = p.node;
+		const float  pr = press[i];
+		if (h > 0.0f) {
+			const float pulse = 0.5f + 0.5f * std::sin(tsec * 4.2f);
+			Radial(dl, c, (34.0f + 8.0f * pulse) * e, (34.0f + 8.0f * pulse) * e, Ca(255, 220, 150, 0.75f * h * dim), Ca(240, 190, 110, 0.28f * h * dim),
+			       Ca(240, 190, 110, 0.0f), 32);
+			dl->AddCircle(c, (12.0f + 9.0f * pulse) * e, Ca(255, 228, 170, (0.85f - 0.6f * pulse) * h * dim), 40, 1.6f * e);
+		}
+		if (pr > 0.01f)
+			Radial(dl, c, 40.0f * e, 40.0f * e, Ca(255, 246, 220, 0.85f * pr), Ca(255, 210, 140, 0.35f * pr), Ca(255, 200, 120, 0.0f), 32);
+		dl->AddCircleFilled(c, 7.5f * e, Ca(0, 0, 0, 0.65f * dim), 24);
+		dl->AddCircle(c, 5.6f * e, Ca(236 + static_cast<int>(19 * h), 206 + static_cast<int>(30 * h), 146 + static_cast<int>(60 * pr), dim), 24,
+		              std::max(1.0f, (1.6f + 0.6f * h) * e));
+		dl->AddCircleFilled(c, (2.2f + 1.2f * std::max(h, pr)) * e, Ca(255, 236, 190, dim), 16);
+		if (flash[i] > 0.0f) { // (just swapped: a ring bursting out)
+			const float k = 1.0f - flash[i];
+			dl->AddCircle(c, (10.0f + 56.0f * Ease(k)) * e, Ca(255, 226, 160, flash[i]), 48, (3.0f - 2.0f * k) * e);
+			Radial(dl, c, 46.0f * e, 46.0f * e, Ca(255, 240, 200, 0.7f * flash[i]), Ca(255, 210, 140, 0.25f * flash[i]), Ca(255, 200, 120, 0.0f), 32);
+		}
+	}
+	// The plates.
+	for (size_t i = 0; i < placed.size(); i++) {
+		const Placed& p   = placed[i];
+		const bool    src = capturing && g_src == p.sp->phys;
+		const float   ap  = appear[i];
+		if (ap <= 0.0f) continue;
+		const float   dim   = capturing && !src ? 0.30f : 1.0f;
+		const float   h     = std::max(hot[i], src ? 1.0f : 0.0f);
+		const float   slide = (1.0f - ap) * 28.0f * e * (p.sp->side == 0 ? -1.0f : (p.sp->side == 1 ? 1.0f : 0.0f));
+		const ImVec2  a {p.a.x + slide, p.a.y}, b {p.b.x + slide, p.b.y};
+		const float   al = ap * dim;
+		const float   ch = 9.0f * e;
+		for (int k = 1; k <= 3 && h > 0.0f; k++) { // (the glow around it)
+			const float gr = static_cast<float>(k) * 3.0f * e;
+			Slab(dl, {a.x - gr, a.y - gr}, {b.x + gr, b.y + gr}, ch + gr, 0, 0, Ca(240, 196, 112, 0.24f / static_cast<float>(k) * h * al), 2.4f * e);
+		}
+		Slab(dl, a, b, ch, Ca(40 + static_cast<int>(34 * h), 37 + static_cast<int>(28 * h), 33 + static_cast<int>(14 * h), 0.96f * ap),
+		     Ca(17 + static_cast<int>(8 * h), 16 + static_cast<int>(6 * h), 15, 0.96f * ap), Ca(214, 182, 118, (0.38f + 0.62f * h) * al), std::max(1.0f, (1.3f + 0.4f * h) * e));
+		if (flash[i] > 0.0f) Slab(dl, a, b, ch, Ca(236, 200, 130, 0.38f * flash[i] * al), Ca(236, 200, 130, 0.10f * flash[i] * al), 0, 0.0f);
+		dl->AddLine({a.x + ch + 2 * e, a.y + 1.5f * e}, {b.x - ch - 2 * e, a.y + 1.5f * e}, Ca(255, 240, 210, 0.10f * al), std::max(1.0f, e)); // (top bevel)
+		// The medallion at its inner end (by the line), the button's mark in it.
+		const bool   rightward = p.sp->side == 0; // (left column: the medallion on the right, the text right-aligned before it)
+		const float  mr        = 19.0f * e;
+		const ImVec2 mc        = p.sp->side == 2 ? ImVec2 {a.x + 34.0f * e, (a.y + b.y) * 0.5f}
+		                                         : ImVec2 {rightward ? b.x - 34.0f * e : a.x + 34.0f * e, (a.y + b.y) * 0.5f};
+		const float  pr        = press[i];
+		dl->AddCircleFilled(mc, mr, Ca(14, 13, 12, al), 32);
+		dl->AddCircle(mc, mr, Ca(222 + static_cast<int>(30 * std::max(h, pr)), 190 + static_cast<int>(30 * std::max(h, pr)), 128, (0.7f + 0.3f * h) * al), 32,
+		              std::max(1.0f, 1.5f * e));
+		if (pr > 0.01f) dl->AddCircleFilled(mc, mr - 2.0f * e, Ca(255, 226, 160, 0.30f * pr * al), 32);
+		Glyph(dl, p.sp->phys, mc, mr * 0.78f, Ca(236 + static_cast<int>(19 * h), 222 + static_cast<int>(14 * h), 196, al), ps, e);
+		// The action (Cinzel) and, under it, the button's name.
+		const std::string control = m.contains(p.sp->phys) ? m.at(p.sp->phys) : DefaultFor(p.sp->phys);
+		const bool        none    = control == "None";
+		const float       ns = std::round(23.0f * e), cs = std::round(16.0f * e);
+		const float       tw = pw - 34.0f * e - mr - 30.0f * e;
+		const std::string act = Fit(cinzel, ns, ActionName(control), p.sp->side == 2 ? 270.0f * e - 34.0f * e - mr - 22.0f * e : tw);
+		std::string       cap = Fit(body, cs, ButtonName(p.sp->phys, ps), tw);
+		if (cap == ActionName(control)) cap.clear(); // (the touchpad: its name is its action)
+		const float       aw2 = cinzel->CalcTextSizeA(ns, FLT_MAX, 0.0f, act.c_str()).x;
+		const float       cw  = body->CalcTextSizeA(cs, FLT_MAX, 0.0f, cap.c_str()).x;
+		const float       ty  = cap.empty() ? std::round((a.y + b.y - ns) * 0.5f) : std::round((a.y + b.y) * 0.5f - (ns + cs + 1.0f * e) * 0.5f) - 1.0f * e;
+		const float       tx_a = rightward ? mc.x - mr - 14.0f * e - aw2 : mc.x + mr + 14.0f * e;
+		const float       tx_c = rightward ? mc.x - mr - 14.0f * e - cw : mc.x + mr + 14.0f * e;
+		const ImU32       acol = none ? Ca(150, 142, 130, al) : Ca(240 + static_cast<int>(15 * h), 230 + static_cast<int>(12 * h), 208 + static_cast<int>(10 * h), al);
+		dl->AddText(cinzel, ns, {std::round(tx_a), ty}, acol, act.c_str());
+		dl->AddText(body, cs, {std::round(tx_c), ty + ns + 1.0f * e}, Ca(176, 166, 148, 0.95f * al), cap.c_str());
+		// Not its default: a small gold lozenge at the outer end.
+		if (control != DefaultFor(p.sp->phys)) {
+			const float dx = p.sp->side == 1 || p.sp->side == 2 ? b.x - 14.0f * e : a.x + 14.0f * e;
+			Diamond(dl, {dx, (a.y + b.y) * 0.5f}, 4.5f * e, Ca(236, 200, 130, 0.9f * al));
+		}
+	}
+
+	// The countdown on the button being changed: a gold ring emptying clockwise, a spark at its end, embers rising off it,
+	// the seconds in Cinzel in its middle (each new second pops in).
+	if (capturing) {
+		const Spot* sp = nullptr;
+		for (int i = 0; i < nspots; i++)
+			if (g_src == spots[i].phys) sp = &spots[i];
+		if (sp != nullptr) {
+			const ImVec2 c    = At(*sp);
+			const float  frac = Clamp01(left / static_cast<float>(kPadCaptureSeconds));
+			const float  in   = Ease(static_cast<float>((now - g_started) / 0.25));
+			const float  R    = (44.0f + 10.0f * (1.0f - in)) * e;
+			const float  el   = static_cast<float>(now - g_started);
+			Radial(dl, c, R * 2.1f, R * 2.1f, Ca(0, 0, 0, 0.55f * in), Ca(0, 0, 0, 0.35f * in), Ca(0, 0, 0, 0.0f), 40);
+			Radial(dl, c, R * 1.7f, R * 1.7f, Ca(255, 190, 100, 0.0f), Ca(255, 190, 100, 0.20f * in), Ca(255, 170, 80, 0.0f), 48);
+			dl->AddCircleFilled(c, R - 4.0f * e, Ca(12, 11, 10, 0.86f * in), 64);
+			dl->AddCircle(c, R, Ca(255, 255, 255, 0.10f * in), 96, 6.0f * e);
+			dl->AddCircle(c, R - 9.0f * e, Ca(214, 182, 118, 0.35f * in), 64, std::max(1.0f, 1.0f * e));
+			const float a0 = -kPi * 0.5f, a1 = a0 + 2.0f * kPi * frac;
+			if (frac > 0.0f) {
+				dl->PathArcTo(c, R, a0, a1, 96);
+				dl->PathStroke(Ca(150, 112, 60, 0.6f * in), 0, 10.0f * e); // (a darker under-stroke: depth)
+				dl->PathArcTo(c, R, a0, a1, 96);
+				dl->PathStroke(Ca(240, 210, 150, in), 0, 5.5f * e);
+				const ImVec2 tip {c.x + std::cos(a1) * R, c.y + std::sin(a1) * R};
+				Radial(dl, tip, 16.0f * e, 16.0f * e, Ca(255, 248, 225, 0.95f * in), Ca(255, 210, 130, 0.45f * in), Ca(255, 190, 100, 0.0f), 24);
+				dl->AddCircleFilled(tip, 3.2f * e, Ca(255, 252, 240, in), 16);
+			}
+			// Embers: 26, each born on the ring, rising and fading (a pure function of the time: no state).
+			for (int i = 0; i < 26; i++) {
+				const float period = 1.0f + 0.7f * Hash(i, 1);
+				const float ph     = std::fmod(el + Hash(i, 2) * period, period) / period;
+				const float ang    = Hash(i, 3) * 2.0f * kPi + std::floor((el + Hash(i, 2) * period) / period) * 2.4f;
+				if (ang - a0 > 2.0f * kPi * frac + 0.3f && ph < 0.05f) continue;
+				const float  rr = R * (1.0f + 0.1f * ph);
+				const ImVec2 q {c.x + std::cos(ang) * rr + std::sin(ph * 6.0f + static_cast<float>(i)) * 6.0f * e, c.y + std::sin(ang) * rr - ph * ph * 70.0f * e};
+				const float  aa = std::sin(ph * kPi) * (0.55f + 0.45f * Hash(i, 4)) * in;
+				const float  sz = (1.0f + 1.5f * Hash(i, 5)) * e * (1.0f - 0.45f * ph);
+				Radial(dl, q, sz * 4.5f, sz * 4.5f, Ca(255, 170, 80, 0.30f * aa), Ca(255, 140, 60, 0.10f * aa), Ca(255, 120, 40, 0.0f), 12);
+				dl->AddCircleFilled(q, sz, Ca(255, static_cast<int>(222 - 70 * ph), static_cast<int>(150 - 80 * ph), aa), 8);
+			}
+			// The seconds.
+			const int         secs = static_cast<int>(std::ceil(std::max(0.0f, left)));
+			const float       into = static_cast<float>(secs) - left; // 0 as a new second shows .. 1
+			const float       k    = 1.0f + 0.35f * (1.0f - Ease(Clamp01(into / 0.25f)));
+			const std::string num  = std::to_string(secs);
+			const float       fs   = std::round(44.0f * e);
+			const ImVec2      ts   = cinzel->CalcTextSizeA(fs, FLT_MAX, 0.0f, num.c_str());
+			const int         first = dl->VtxBuffer.Size;
+			dl->AddText(cinzel, fs, {std::round(c.x - ts.x * 0.5f), std::round(c.y - ts.y * 0.52f)}, Ca(250, 236, 200, in * Clamp01(0.4f + into * 3.0f)), num.c_str());
+			Anim::ScaleVertices(dl, first, c, k);
+		}
+	}
+
+	// Above: the title (page) and the controller's name.
+	if (page) {
+		const std::string title = Upper(I18n::T("Mapear mando"));
+		const float       ts    = std::round(46.0f * e);
+		const float       tw    = Spaced(nullptr, cinzel, ts, {0, 0}, 0, title, 6.0f * e);
+		Spaced(dl, cinzel, ts, {std::round(cx - tw * 0.5f), std::round(o.y + 26.0f * e)}, Ca(232, 206, 150, t_in), title, 6.0f * e);
+		const float ry = std::round(o.y + 86.0f * e);
+		const float rw = 300.0f * e * t_in;
+		dl->AddLine({cx - rw, ry}, {cx - 12.0f * e, ry}, Ca(214, 182, 118, 0.6f * t_in), std::max(1.0f, e));
+		dl->AddLine({cx + 12.0f * e, ry}, {cx + rw, ry}, Ca(214, 182, 118, 0.6f * t_in), std::max(1.0f, e));
+		Diamond(dl, {cx, ry}, 5.0f * e, Ca(236, 206, 146, t_in));
+		Diamond(dl, {cx - rw, ry}, 2.5f * e, Ca(214, 182, 118, 0.7f * t_in));
+		Diamond(dl, {cx + rw, ry}, 2.5f * e, Ca(214, 182, 118, 0.7f * t_in));
+	}
+	{
+		std::string who;
+		if (pad != nullptr) {
+			const char* name = SDL_GameControllerName(pad);
+			who              = std::string(I18n::T("Mando:")) + " " + (name != nullptr ? name : "?");
+		} else {
+			who = I18n::T("No hay ningún mando conectado.");
+		}
+		const float  fs = std::round(18.0f * e);
+		const ImVec2 ts = body->CalcTextSizeA(fs, FLT_MAX, 0.0f, who.c_str());
+		const float  wy = page ? o.y + 98.0f * e : Y(6);
+		dl->AddText(body, fs, {std::round(cx - ts.x * 0.5f), std::round(wy)}, pad != nullptr ? Ca(170, 160, 142, t_in) : Ca(255, 199, 77, t_in), who.c_str());
+	}
+
+	// Below: the prompt while it waits, else the last result; then Restaurar (and Volver), then the help line.
+	{
+		const float sy = Y(606);
+		if (capturing) {
+			const std::string lead = std::string(I18n::T("Pulsa el botón del mando para:")) + " ";
+			const std::string act  = ActionName(m.contains(g_src) ? m.at(g_src) : DefaultFor(g_src));
+			const float       fs = std::round(24.0f * e), as = std::round(28.0f * e);
+			const float       lw = body->CalcTextSizeA(fs, FLT_MAX, 0.0f, lead.c_str()).x;
+			const float       aw3 = cinzel->CalcTextSizeA(as, FLT_MAX, 0.0f, act.c_str()).x;
+			const float       x  = std::round(cx - (lw + aw3) * 0.5f);
+			dl->AddText(body, fs, {x, std::round(sy + (as - fs) * 0.6f)}, Ca(240, 232, 214, 1.0f), lead.c_str());
+			dl->AddText(cinzel, as, {x + lw, std::round(sy)}, Ca(240, 210, 150, 1.0f), act.c_str());
+			const std::string sub = I18n::T("El mismo botón, Esc o clic derecho: cancelar");
+			const float       ss  = std::round(18.0f * e);
+			const ImVec2      st  = body->CalcTextSizeA(ss, FLT_MAX, 0.0f, sub.c_str());
+			dl->AddText(body, ss, {std::round(cx - st.x * 0.5f), std::round(sy + 42.0f * e)}, Ca(176, 166, 148, 1.0f), sub.c_str());
+			Bump();
+		} else if (!g_msg.empty()) {
+			const float  fs  = std::round(21.0f * e);
+			const std::string msg = Fit(body, fs, g_msg, size.x - 40.0f * e);
+			const ImVec2 ts  = body->CalcTextSizeA(fs, FLT_MAX, 0.0f, msg.c_str());
+			ImVec4       col = ImGui::ColorConvertU32ToFloat4(g_msg_col);
+			dl->AddText(body, fs, {std::round(cx - ts.x * 0.5f), std::round(sy + 8.0f * e)}, Ca(static_cast<int>(col.x * 255), static_cast<int>(col.y * 255),
+			                                                                                  static_cast<int>(col.z * 255), 1.0f), msg.c_str());
+		}
+		ImGui::BeginDisabled(capturing);
+		const float bw = 300.0f * e, bh = 52.0f * e, gap = 22.0f * e;
+		const float by = Y(682);
+		const float bx = page ? cx - bw - gap * 0.5f : cx - bw * 0.5f;
+		if (StoneButton("##restore", I18n::T("Restaurar por defecto"), {std::round(bx), std::round(by)}, {std::round(bx + bw), std::round(by + bh)}, e) && can_start) {
+			if (!s.pad_map.empty()) m = Parse(""), changed = true;
+			g_msg      = I18n::T("Restaurados los botones por defecto.");
+			g_msg_col  = IM_COL32(236, 206, 146, 255);
+			g_flash_a  = "*";
+			g_flash_b.clear();
+			g_flash_at = now;
+		}
+		if (page && StoneButton("##back", I18n::T("Volver"), {std::round(cx + gap * 0.5f), std::round(by)}, {std::round(cx + gap * 0.5f + bw), std::round(by + bh)}, e) &&
+		    close != nullptr)
+			*close = true;
+		ImGui::EndDisabled();
+		const std::string help = page ? I18n::T("Elige un botón y pulsa en tu mando el nuevo en 5 s: se intercambian.   ·   B o Esc: volver")
+		                              : I18n::T("Elige un botón y pulsa en tu mando el nuevo en 5 s: se intercambian.");
+		const float  hs = std::round(17.0f * e);
+		const ImVec2 ht = body->CalcTextSizeA(hs, FLT_MAX, 0.0f, help.c_str());
+		dl->AddText(body, hs, {std::round(cx - ht.x * 0.5f), std::round(Y(762))}, Ca(150, 142, 128, t_in), help.c_str());
+	}
+	// The rectangle as one item (the window's size and scrolling).
+	ImGui::SetCursorScreenPos(o);
+	ImGui::Dummy(size);
+	if (changed) {
+		s.pad_map = Format(m);
+		Commit(s);
+	}
+	Bump(); // (animated: pulses, the controller's live buttons)
 	return changed;
+}
+
+// In the Controles tab: the screen as wide as the tab, without the title. True when the map changed.
+bool Draw(Settings& s, float unit) {
+	const float  w = ImGui::GetContentRegionAvail().x;
+	const ImVec2 size {w, std::round(w * 800.0f / 1600.0f)};
+	const float  a = g_alpha;
+	g_alpha        = ImGui::GetStyle().Alpha;
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the plates light up themselves)
+	const bool changed = Screen(s, ImGui::GetCursorScreenPos(), size, unit, false, nullptr);
+	ImGui::PopStyleColor();
+	g_alpha        = a;
+	return changed;
+}
+
+// F2 > Mapear mando: full screen over the game, darkened (a vignette, a warm light behind the controller, slow ash);
+// false when it closes (Volver; B / Esc are the window thread's).
+bool Page(float width, float height, float unit) {
+	if (Anim::g_page_seen != g_f1_page.load()) {
+		Anim::g_page_seen = g_f1_page.load();
+		Anim::g_page_at   = Anim::Now();
+	}
+	const float t = Anim::EaseOut(Anim::Progress(Anim::g_page_at.load(), 0.30));
+	g_alpha       = std::max(0.01f, t);
+	ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
+	ImGui::SetNextWindowSize({width, height}, ImGuiCond_Always);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the plates light up themselves)
+	ImGui::Begin("Mapear mando", nullptr,
+	             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse);
+	auto* dl = ImGui::GetWindowDrawList();
+	// The backdrop: the game darkened, darker at the edges (a vignette), ash drifting up slowly.
+	dl->AddRectFilled({0, 0}, {width, height}, Ca(6, 5, 5, 0.90f));
+	Radial(dl, {width * 0.5f, height * 0.5f}, width * 0.75f, height * 0.75f, Ca(0, 0, 0, 0.0f), Ca(0, 0, 0, 0.10f), Ca(0, 0, 0, 0.75f), 64);
+	dl->AddRectFilledMultiColor({0, 0}, {width, height * 0.18f}, Ca(0, 0, 0, 0.55f), Ca(0, 0, 0, 0.55f), Ca(0, 0, 0, 0.0f), Ca(0, 0, 0, 0.0f));
+	dl->AddRectFilledMultiColor({0, height * 0.8f}, {width, height}, Ca(0, 0, 0, 0.0f), Ca(0, 0, 0, 0.0f), Ca(0, 0, 0, 0.6f), Ca(0, 0, 0, 0.6f));
+	const float ts = static_cast<float>(std::fmod(Anim::Now(), 10000.0));
+	for (int i = 0; i < 40; i++) {
+		const float period = 9.0f + 8.0f * Hash(i, 7);
+		const float ph     = std::fmod(ts + Hash(i, 8) * period, period) / period;
+		const float x      = width * Hash(i, 9) + std::sin(ph * 6.0f + static_cast<float>(i)) * 24.0f * unit;
+		const float y      = height * (1.05f - 1.15f * ph);
+		const float aa     = std::sin(ph * 3.14159265f) * (0.10f + 0.22f * Hash(i, 10));
+		const float sz     = (0.8f + 1.6f * Hash(i, 11)) * unit;
+		dl->AddCircleFilled({x, y}, sz, Ca(255, 196, 130, aa), 8);
+	}
+	ImGui::PushFont(Body(), std::round(20.0f * unit));
+	bool       close  = false;
+	const float margin = 24.0f * unit;
+	(void)Screen(g_edit, {margin, margin}, {width - margin * 2.0f, height - margin * 2.0f}, unit, true, &close);
+	ImGui::PopFont();
+	ImGui::End();
+	ImGui::PopStyleColor(2);
+	ImGui::PopStyleVar(2);
+	g_alpha = 1.0f;
+	return !close;
 }
 } // namespace PadMap
 
@@ -998,7 +1994,8 @@ bool SliderRow(const char* label, float& v, float lo, float hi, const char* form
 // ---- (des-upstream-1106) Procedural icons for the menus (no images, no game art): drawn with the draw list at any size,
 // a line weight that follows the size, in one colour. `c`: the centre, `s`: the box's side. ----
 namespace Icons {
-enum Kind { Back, Trophy, Pad, Keyboard, Power, Monitor, Layers, Sliders, Sun, Gauge, Chip, Gear, Speaker, Flame, Eye };
+enum Kind { Back, Trophy, Pad, Keyboard, Power, Monitor, Layers, Sliders, Sun, Gauge, Chip, Gear, Speaker, Flame, Eye,
+            Skull, Sword, Shield, Soul, Ring, Potion, Helm, Chest }; // (trucos7: Helm, Chest) // (trucos) the cheats' own, drawn here (no game art)
 
 void Draw(ImDrawList* dl, Kind kind, ImVec2 c, float s, ImU32 col) {
 	const float h = s * 0.5f, w = std::max(1.0f, s * 0.085f);
@@ -1114,6 +2111,73 @@ void Draw(ImDrawList* dl, Kind kind, ImVec2 c, float s, ImU32 col) {
 			dl->PathStroke(col, ImDrawFlags_Closed, w);
 			dl->AddCircleFilled(c, h * 0.25f, col);
 			break;
+		// (trucos) Original line icons in the engraved-metal look (the caller draws a dark offset copy under them).
+		case Skull:
+			dl->PathArcTo(P(0, -0.15f), h * 0.62f, 3.3f, 6.12f, 20);
+			dl->PathLineTo(P(0.38f, 0.45f));
+			dl->PathLineTo(P(-0.38f, 0.45f));
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddCircleFilled(P(-0.25f, -0.1f), h * 0.15f, col);
+			dl->AddCircleFilled(P(0.25f, -0.1f), h * 0.15f, col);
+			dl->AddTriangleFilled(P(0, 0.08f), P(-0.08f, 0.24f), P(0.08f, 0.24f), col);
+			for (int i = -1; i <= 1; i++) dl->AddLine(P(i * 0.16f, 0.45f), P(i * 0.16f, 0.72f), col, w);
+			dl->AddLine(P(-0.3f, 0.72f), P(0.3f, 0.72f), col, w);
+			break;
+		case Sword:
+			dl->AddQuadFilled(P(-0.07f, -0.9f), P(0.07f, -0.9f), P(0.07f, 0.3f), P(-0.07f, 0.3f), col);
+			dl->AddTriangleFilled(P(-0.07f, -0.9f), P(0.07f, -0.9f), P(0, -1.0f), col);
+			dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, w * 1.6f);
+			dl->AddLine(P(0, 0.34f), P(0, 0.72f), col, w * 1.3f);
+			dl->AddCircleFilled(P(0, 0.82f), h * 0.1f, col);
+			break;
+		case Shield:
+			dl->PathLineTo(P(-0.65f, -0.7f));
+			dl->PathLineTo(P(0.65f, -0.7f));
+			dl->PathBezierCubicCurveTo(P(0.68f, 0.1f), P(0.4f, 0.55f), P(0, 0.88f), 14);
+			dl->PathBezierCubicCurveTo(P(-0.4f, 0.55f), P(-0.68f, 0.1f), P(-0.65f, -0.7f), 14);
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddLine(P(0, -0.55f), P(0, 0.6f), col, w);
+			dl->AddLine(P(-0.45f, -0.15f), P(0.45f, -0.15f), col, w);
+			break;
+		case Soul: // a wisp: a teardrop of light with a bright core
+			dl->PathLineTo(P(0, -0.92f));
+			dl->PathBezierCubicCurveTo(P(0.55f, -0.3f), P(0.62f, 0.7f), P(0, 0.72f), 14);
+			dl->PathBezierCubicCurveTo(P(-0.62f, 0.7f), P(-0.55f, -0.3f), P(0, -0.92f), 14);
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddCircleFilled(P(0, 0.25f), h * 0.24f, col);
+			break;
+		case Ring:
+			dl->AddCircle(P(0, 0.2f), h * 0.55f, col, 28, w * 1.6f);
+			dl->AddQuadFilled(P(0, -0.75f), P(0.22f, -0.5f), P(0, -0.28f), P(-0.22f, -0.5f), col);
+			break;
+		case Helm: // (trucos7) a closed great helm with a visor slit
+			dl->PathArcTo(P(0, -0.1f), h * 0.62f, 3.14159f, 6.2832f, 20);
+			dl->PathLineTo(P(0.62f, 0.75f));
+			dl->PathLineTo(P(-0.62f, 0.75f));
+			dl->PathStroke(col, ImDrawFlags_Closed, w);
+			dl->AddLine(P(-0.45f, 0.05f), P(0.45f, 0.05f), col, w * 1.4f);
+			dl->AddLine(P(0, -0.7f), P(0, -0.05f), col, w);
+			for (int i = -1; i <= 1; i += 2) dl->AddCircleFilled(P(0.3f * i, 0.45f), w * 0.9f, col);
+			break;
+		case Chest: // (trucos7) an iron-bound chest (the shop)
+			dl->AddRect(P(-0.8f, -0.15f), P(0.8f, 0.7f), col, 0, 0, w);
+			dl->PathArcTo(P(0, -0.15f), h * 0.8f, 3.14159f, 6.2832f, 20);
+			dl->PathStroke(col, 0, w);
+			dl->AddLine(P(-0.8f, -0.15f), P(0.8f, -0.15f), col, w);
+			dl->AddRectFilled(P(-0.12f, -0.05f), P(0.12f, 0.25f), col);
+			dl->AddLine(P(-0.45f, -0.75f), P(-0.45f, 0.7f), col, w * 0.8f);
+			dl->AddLine(P(0.45f, -0.75f), P(0.45f, 0.7f), col, w * 0.8f);
+			break;
+		case Potion:
+			dl->AddRect(P(-0.14f, -0.85f), P(0.14f, -0.55f), col, 0, 0, w);
+			dl->PathLineTo(P(-0.14f, -0.55f));
+			dl->PathLineTo(P(-0.14f, -0.3f));
+			dl->PathArcTo(P(0, 0.25f), h * 0.58f, -1.95f, 1.95f + 3.14159f, 28);
+			dl->PathLineTo(P(0.14f, -0.3f));
+			dl->PathLineTo(P(0.14f, -0.55f));
+			dl->PathStroke(col, 0, w);
+			dl->AddCircleFilled(P(0, 0.35f), h * 0.38f, col);
+			break;
 	}
 }
 
@@ -1123,7 +2187,7 @@ int ForSection(const char* title) {
 	    {"Imagen", Monitor},        {"Frame generation", Layers}, {"Calidad gráfica", Sliders}, {"Ray tracing", Sun},
 	    {"Modos Souls", Flame},     {"Pantalla", Monitor},        {"Rendimiento", Gauge},       {"Controles", Pad},
 	    {"Tu equipo", Chip},        {"Configurador", Gear},       {"Ajustes del juego", Gear},  {"Sonido", Speaker},
-	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip}};
+	    {"Trofeos", Trophy},        {"Gráficos", Eye},            {"Sistema", Chip},  {"Conexión online", Soul}};
 	for (const auto& [name, kind]: map)
 		if (std::strcmp(name, title) == 0) return kind;
 	return -1;
@@ -1198,6 +2262,26 @@ void Flourish(ImDrawList* dl, ImVec2 c, float s, ImU32 col, float wgt) {
 	}
 }
 // A divider: a hairline fading to both ends, a flourish in the middle.
+// (trucos4) A vignette over the whole screen: the edges darkened towards the corners (four gradients), alpha 0..1.
+void Vignette(ImDrawList* dl, float w, float h, float alpha) {
+	const ImU32 dark = IM_COL32(0, 0, 0, static_cast<int>(200 * alpha)), clear = IM_COL32(0, 0, 0, 0);
+	const float ex = std::round(w * 0.22f), ey = std::round(h * 0.26f);
+	dl->AddRectFilledMultiColor({0, 0}, {ex, h}, dark, clear, clear, dark);
+	dl->AddRectFilledMultiColor({w - ex, 0}, {w, h}, clear, dark, dark, clear);
+	dl->AddRectFilledMultiColor({0, 0}, {w, ey}, dark, dark, clear, clear);
+	dl->AddRectFilledMultiColor({0, h - ey}, {w, h}, clear, clear, dark, dark);
+}
+// (trucos4) A thin aged-gold double frame with corner flourishes, inset `m` px in [a, b].
+void Frame(ImDrawList* dl, ImVec2 a, ImVec2 b, float unit, float alpha, float m) {
+	const float t = std::max(1.0f, std::round(unit));
+	const ImVec2 o {std::round(a.x + m), std::round(a.y + m)}, p {std::round(b.x - m), std::round(b.y - m)};
+	dl->AddRect(o, p, C(kBrassDim, alpha * 0.8f), 0, 0, t);
+	dl->AddRect({o.x + 4 * t, o.y + 4 * t}, {p.x - 4 * t, p.y - 4 * t}, C(kBrass, alpha * 0.45f), 0, 0, t);
+	for (int i = 0; i < 4; i++) {
+		const ImVec2 c {i & 1 ? p.x : o.x, i & 2 ? p.y : o.y};
+		Flourish(dl, c, 18 * unit, C(kBrass, alpha * 0.9f), t);
+	}
+}
 void Divider(ImDrawList* dl, float x0, float x1, float y, float unit, float alpha) {
 	const float mid = (x0 + x1) * 0.5f, gap = 30.0f * unit;
 	const ImU32 on = C(kBrass, 0.75f * alpha), off = C(kBrass, 0.0f);
@@ -1419,107 +2503,106 @@ bool IconButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, in
 	return pressed;
 }
 
-// (bb-style-f1) The F2 menu's top-level options as Bloodborne's hub cards, side by side: a dark plate with a bronze
-// border, a warm light from above when focused, a medallion with the icon (halo, turning beads), the label in Cinzel,
-// letter-spaced and centred (gold, parchment when focused), an ornamental rule under it; focus lifts the card 16 px and
-// grows it 4 %, a shine sweeps once; on open the cards rise in one after another (ease-out-back, `index` x 70 ms).
-// An ImGui button underneath: mouse click, and D-pad / stick / arrow keys left-right move between the cards (one row).
+// (trucos11) Icons::Kind -> the aged-metal icon of ds-style.h.
+DsStyle::Icon StyleIcon(Icons::Kind k) {
+	switch (k) {
+		case Icons::Back: return DsStyle::Icon::Back;
+		case Icons::Trophy: return DsStyle::Icon::Trophy;
+		case Icons::Pad: return DsStyle::Icon::Pad;
+		case Icons::Keyboard: return DsStyle::Icon::Keyboard;
+		case Icons::Power: return DsStyle::Icon::Power;
+		case Icons::Sword: return DsStyle::Icon::Sword;
+		case Icons::Shield: return DsStyle::Icon::Shield;
+		case Icons::Helm: return DsStyle::Icon::Helm;
+		case Icons::Ring: return DsStyle::Icon::Ring;
+		case Icons::Potion: return DsStyle::Icon::Potion;
+		case Icons::Soul: return DsStyle::Icon::Soul;
+		case Icons::Sun: return DsStyle::Icon::Sun;
+		case Icons::Skull: return DsStyle::Icon::Skull;
+		case Icons::Chest: return DsStyle::Icon::Chest;
+		case Icons::Flame: return DsStyle::Icon::Flame;
+		case Icons::Gear: return DsStyle::Icon::Gear;
+		case Icons::Eye: return DsStyle::Icon::Eye;
+		default: return DsStyle::Icon::Gear;
+	}
+}
+// (trucos13) The ash over F2 and its pages: one system, stepped once per ImGui frame; it shies away from the mouse or
+// the focused card and scatters when the menu opens or a page changes.
+DsStyle::Ash g_ash;
+ImVec2       g_ash_repel {-1e9f, -1e9f};
+void AshFrame(ImDrawList* bg, float width, float height, float alpha) {
+	static int    last_frame = -1;
+	static double seen_open = 0, seen_page = 0;
+	const int     frame     = ImGui::GetFrameCount();
+	if (frame != last_frame) {
+		last_frame = frame;
+		const double o = Anim::g_opened_at.load(), pg = Anim::g_page_at.load();
+		if (o != seen_open || pg != seen_page) {
+			seen_open = o, seen_page = pg;
+			g_ash.Burst({width * 0.5f, height * 0.55f}, 260.0f * std::min(width / 1920.0f, height / 1080.0f));
+		}
+		const ImVec2 m = ImGui::GetIO().MousePos;
+		const ImVec2 r = ImGui::IsMousePosValid(&m) && ImGui::GetIO().MouseDelta.x * ImGui::GetIO().MouseDelta.x + ImGui::GetIO().MouseDelta.y * ImGui::GetIO().MouseDelta.y > 0.0f ? m : g_ash_repel;
+		g_ash.Update(std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.05f), Souls::Time(), r, width, height);
+		g_ash.Draw(bg, alpha, Souls::Time());
+	}
+}
+// (trucos11) The F2 card, Demon's Souls remake look (ds-style.h): a dark plate with a thin border; focused, a candle light
+// breathing from inside, gold corner brackets; an aged-metal medallion; the label in tracked Cinzel capitals. Entry:
+// a plain fade with a short rise (no bounce), staggered card by card.
 bool CardButton(const char* label, Icons::Kind icon, ImVec2 size, float unit, int index, bool danger = false) {
-	static std::map<ImGuiID, double> focus_at;
-	const float k   = Anim::Progress(Anim::g_opened_at.load() + 0.07 * index, 0.5);
+	const float k   = Anim::Progress(Anim::g_opened_at.load() + 0.06 * index, 0.45);
 	if (k < 1.0f) Bump();
-	const float x1  = k - 1.0f, c1 = 1.70158f, c3 = c1 + 1.0f;
-	const float ent = 1.0f + c3 * x1 * x1 * x1 + c1 * x1 * x1; // EaseOutBack
+	const float ent = 1.0f - (1.0f - k) * (1.0f - k) * (1.0f - k); // ease-out cubic
 	ImGui::PushID(label);
 	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0, 0, 0, 0});
 	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0, 0, 0, 0});
 	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0, 0, 0, 0});
-	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the card's own focus look)
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0});
 	const bool pressed = ImGui::Button("##card", size);
 	ImGui::PopStyleColor(4);
 	const ImGuiID id = ImGui::GetItemID();
 	const bool    on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
 	const float   v  = Anim::Hot(id, on);
-	if (on && v < 0.05f) focus_at[id] = Anim::Now();
+	if (v > 0.0f && v < 1.0f) Bump();
+	Bump(); // (the candle light breathes)
+	// (trucos12) Parallax: the cards drift a little opposite to the focused one (eased); the focused card rises with a
+	// warm god-ray over it and a pulsing soul aura around it.
+	static float s_focus = 0.0f, s_focus_target = 0.0f;
+	if (on) s_focus_target = static_cast<float>(index);
+	if (index == 0) s_focus += (s_focus_target - s_focus) * 0.15f;
+	if (std::fabs(s_focus_target - s_focus) > 0.01f) Bump();
+	const float  par  = std::round((index - s_focus) * -6.0f * unit);
 	const ImVec2 ra = ImGui::GetItemRectMin(), rb = ImGui::GetItemRectMax();
-	const float  cw = rb.x - ra.x, ch = rb.y - ra.y;
-	const float  lift = -16.0f * unit * v + (1.0f - ent) * 80.0f * unit;
-	const float  sc   = 1.0f + 0.04f * v;
-	const ImVec2 c {(ra.x + rb.x) * 0.5f, (ra.y + rb.y) * 0.5f + lift};
-	const ImVec2 a {c.x - cw * 0.5f * sc, c.y - ch * 0.5f * sc}, b {c.x + cw * 0.5f * sc, c.y + ch * 0.5f * sc};
+	const float  rise = std::round((1.0f - ent) * 24.0f * unit - 18.0f * unit * v);
+	const ImVec2 a {ra.x + par, ra.y + rise}, b {rb.x + par, rb.y + rise};
 	auto*        dl = ImGui::GetWindowDrawList();
-	const float  al = ImGui::GetStyle().Alpha * std::clamp(k * 1.6f, 0.0f, 1.0f);
-	const auto   G  = [&](float x) { return IM_COL32(228, 192, 122, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
-	const auto   Br = [&](float x) { return IM_COL32(158, 112, 62, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
-	const auto   Pa = [&](float x) { return IM_COL32(236, 228, 212, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
-	const auto   Cl = [&](int r, int g, int bb, float x) { return IM_COL32(r, g, bb, static_cast<int>(255.0f * std::clamp(x * al, 0.0f, 1.0f))); };
-	const float  rr = 6.0f * unit;
-	// The plate (Bloodborne's Panel: dark, a soft shadow, a bronze frame warming with the focus, an inner hairline).
-	for (int s = 3; s >= 1; s--) dl->AddRectFilled({a.x - s * 3 * unit, a.y - s * 2 * unit}, {b.x + s * 3 * unit, b.y + s * 5 * unit}, Cl(0, 0, 0, 0.12f), rr + s * 3 * unit);
-	dl->AddRectFilledMultiColor(a, b, Cl(22, 19, 18, 0.94f), Cl(22, 19, 18, 0.94f), Cl(12, 10, 10, 0.96f), Cl(12, 10, 10, 0.96f));
-	if (danger && v > 0.0f) dl->AddRectFilled(a, b, Cl(120, 40, 30, 0.22f * v), rr);
-	if (ImGui::IsItemActive()) dl->AddRectFilled(a, b, G(0.10f), rr);
-	dl->AddRect(a, b, danger ? Cl(230, 120, 100, 0.45f + 0.5f * v) : (v > 0.5f ? G(0.6f + 0.4f * v) : Br(0.75f)), rr, 0, std::max(1.0f, 1.4f * unit));
-	dl->AddRect({a.x + 6 * unit, a.y + 6 * unit}, {b.x - 6 * unit, b.y - 6 * unit}, G(0.10f + 0.20f * v), rr * 0.6f, 0, std::max(1.0f, 0.8f * unit));
-	if (v > 0.01f) dl->AddRectFilledMultiColor({a.x + 8 * unit, a.y + 8 * unit}, {b.x - 8 * unit, a.y + ch * 0.45f}, G(0.10f * v), G(0.10f * v), G(0.0f), G(0.0f));
-	// The medallion and its icon.
-	const ImVec2 m {c.x, a.y + (b.y - a.y) * 0.36f};
-	const float  mr = std::min(cw * 0.28f, ch * 0.20f) * sc;
+	const float  al = ImGui::GetStyle().Alpha * std::clamp(k * 1.4f, 0.0f, 1.0f);
 	const float  t  = Souls::Time();
-	for (int g = 4; g >= 1; g--) dl->AddCircleFilled(m, mr + g * 6 * unit, G(0.025f * (0.3f + v)), 48);
-	dl->AddCircleFilled(m, mr, Cl(14, 12, 12, 0.95f), 64);
-	dl->AddCircle(m, mr, Br(0.9f), 64, std::max(1.0f, 1.6f * unit));
-	dl->AddCircle(m, mr - 7 * unit, G(0.35f + 0.5f * v), 64, std::max(1.0f, unit));
-	for (int d = 0; d < 24; d++) {
-		const float ang = d * 0.2618f + t * 0.25f * (0.3f + v);
-		dl->AddCircleFilled({m.x + std::cos(ang) * (mr + 10 * unit), m.y + std::sin(ang) * (mr + 10 * unit)}, 1.4f * unit, G(0.25f + 0.6f * v));
-	}
-	const ImU32 ic = danger ? Cl(236, 140, 110, 0.75f + 0.25f * v) : G(0.75f + 0.25f * v);
-	Icons::Draw(dl, icon, {m.x + 1, m.y + 1}, mr * 0.85f, Cl(0, 0, 0, 0.6f));
-	Icons::Draw(dl, icon, m, mr * 0.85f, ic);
-	// The label: Cinzel (Demon's own bundled copy, the font Bloodborne's titles use), letter-spaced, fitted to the card.
-	ImFont* f   = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
-	float   px  = std::round(28.0f * unit);
-	const float sp = 2.0f * unit;
-	const auto  spaced_w = [&](float size) {
-		float w = 0;
-		for (const char* p = label; *p;) {
-			const unsigned char u8 = static_cast<unsigned char>(*p);
-			const int n = u8 < 0x80 ? 1 : (u8 >> 5) == 6 ? 2 : (u8 >> 4) == 14 ? 3 : 4;
-			w += f->CalcTextSizeA(size, FLT_MAX, 0.0f, p, p + n).x + sp;
-			p += n;
-		}
-		return std::max(0.0f, w - sp);
-	};
-	const float maxw = cw - 28.0f * unit;
-	if (const float w = spaced_w(px); w > maxw) px = std::max(12.0f, std::floor(px * maxw / w));
-	const float ty = a.y + (b.y - a.y) * 0.66f;
-	float       x  = c.x - spaced_w(px) * 0.5f;
-	const ImU32 tc = danger ? Cl(240, 150, 125, 1.0f) : (v > 0.5f ? Pa(1.0f) : G(1.0f));
-	for (const char* p = label; *p;) {
-		const unsigned char u8 = static_cast<unsigned char>(*p);
-		const int n = u8 < 0x80 ? 1 : (u8 >> 5) == 6 ? 2 : (u8 >> 4) == 14 ? 3 : 4;
-		dl->AddText(f, px, {std::floor(x + 1), std::floor(ty + 1)}, Cl(0, 0, 0, 0.7f), p, p + n);
-		dl->AddText(f, px, {std::floor(x), std::floor(ty)}, tc, p, p + n);
-		x += f->CalcTextSizeA(px, FLT_MAX, 0.0f, p, p + n).x + sp;
-		p += n;
-	}
-	// The ornamental rule (Bloodborne's OrnLine: a line fading out each side, a diamond in the middle).
-	{
-		const float oy = ty + px + 18.0f * unit, hw = cw * 0.32f * 0.5f, oa = 0.5f + 0.5f * v, d = 4.0f * unit;
-		dl->AddRectFilledMultiColor({c.x - hw, oy - 0.5f * unit}, {c.x - d * 1.6f, oy + 0.5f * unit}, Br(0.0f), Br(oa), Br(oa), Br(0.0f));
-		dl->AddRectFilledMultiColor({c.x + d * 1.6f, oy - 0.5f * unit}, {c.x + hw, oy + 0.5f * unit}, Br(oa), Br(0.0f), Br(0.0f), Br(oa));
-		dl->AddQuadFilled({c.x, oy - d}, {c.x + d, oy}, {c.x, oy + d}, {c.x - d, oy}, G(oa));
-	}
-	// A shine sweeping once across on focus.
-	const float fs = static_cast<float>(Anim::Now() - focus_at[id]);
-	if (on && fs < 0.9f) {
-		Bump();
-		const float sx = a.x - cw * 0.5f + (fs / 0.9f) * cw * 2.0f;
-		dl->PushClipRect(a, b, true);
-		dl->AddQuadFilled({sx, a.y}, {sx + cw * 0.18f, a.y}, {sx - cw * 0.22f, b.y}, {sx - cw * 0.40f, b.y}, Cl(255, 240, 200, 0.07f));
-		dl->PopClipRect();
-	}
+	DsStyle::GodRay(dl, a, b, v, al, t);
+	DsStyle::SoulAura(dl, a, b, v, al, t);
+	DsStyle::CandlePlate(dl, a, b, v, 0.0f, al, t + index, unit);
+	if (danger && v > 0.01f) dl->AddRectFilled(a, b, IM_COL32(120, 30, 24, static_cast<int>(40 * v * al)));
+	const float cw = b.x - a.x, ch = b.y - a.y;
+	const ImVec2 mc {(a.x + b.x) * 0.5f, a.y + ch * 0.38f};
+	const float  mr = std::round(std::min(cw * 0.31f, ch * 0.21f));
+	DsStyle::Medallion(dl, StyleIcon(icon), mc, mr, al, v, t, 0.0f);
+	DsStyle::Sparks(dl, mc, mr, v, al, t); // (trucos13)
+	if (on) g_ash_repel = mc;
+	ImFont*           f   = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+	const std::string up  = DsStyle::Upper(label);
+	float             px  = std::round(22.0f * unit);
+	const float       tr  = std::round(3.0f * unit);
+	const float       maxw = cw - 24.0f * unit;
+	if (const float w = DsStyle::TrackedWidth(f, px, up.c_str(), tr); w > maxw) px = std::max(12.0f, std::floor(px * maxw / w));
+	const float lw = DsStyle::TrackedWidth(f, px, up.c_str(), tr);
+	const ImU32 tc = danger ? IM_COL32(236, 150, 128, static_cast<int>(255 * al)) : (v > 0.5f ? DsStyle::C(DsStyle::kBone, al) : DsStyle::C(DsStyle::kGold, al));
+	DsStyle::TrackedText(dl, f, px, {std::round(a.x + (cw - lw) * 0.5f + 1), std::round(a.y + ch * 0.74f + 1)}, IM_COL32(0, 0, 0, static_cast<int>(200 * al)), up.c_str(), tr);
+	if (v > 0.3f) // (trucos12) bloom on the gold label
+		for (int d = 0; d < 4; d++)
+			DsStyle::TrackedText(dl, f, px, {std::round(a.x + (cw - lw) * 0.5f) + (d % 2 ? 2 : -2), std::round(a.y + ch * 0.74f) + (d / 2 ? 2 : -2)},
+			                     DsStyle::C(DsStyle::kGoldHi, al * v * 0.12f), up.c_str(), tr);
+	DsStyle::TrackedText(dl, f, px, {std::round(a.x + (cw - lw) * 0.5f), std::round(a.y + ch * 0.74f)}, tc, up.c_str(), tr);
 	ImGui::PopID();
 	return pressed;
 }
@@ -1569,6 +2652,7 @@ void ApplyLive(const Settings& s) {
 	const int level       = 0; // (ds-pc-port37) Metricas is the launcher's window (metricas.ps1); the in-game panel stays on F8
 	for (int i = 0; i < 3 && PerfOverlay::Level() != level; i++) PerfOverlay::CycleLevel();
 	PortLive::rt_off = LiveRtOff(g_rt.launched, s); // (10-28) RT passes off live
+	PadMap::SetLive(s.pad_map);                      // (remap-f2) e.g. Restablecer + Aplicar
 }
 
 // (10-28) What needs a restart: as NeedsRestart, but the ray tracing turned off live does not.
@@ -1585,6 +2669,7 @@ bool NeedsRestartLive(const Settings& launched, const Settings& now) {
 	if ((off & 1) != 0) n.rt_ss_refl = launched.rt_ss_refl;
 	// (11-10) The mouse's sensitivity and anti-dead-zone apply live with keyboard and mouse on.
 	if (launched.kbm && n.kbm) n.kbm_sens = launched.kbm_sens, n.kbm_antidz = launched.kbm_antidz;
+	n.pad_map = launched.pad_map; // (remap-f2) the pad map applies live (HostPadMapSetLive)
 	return NeedsRestart(launched, n);
 }
 
@@ -1649,7 +2734,11 @@ void CheckWork() {
 	const std::string cur  = Update::CurrentVersion();
 	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
-	if (r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
+	// (11-23) A folder that knows its zip (version-zip.txt): up to date only with that very zip; a zip replaced in the same
+	// release (same tag, another zip name) is offered.
+	const std::string iz = Update::InstalledZip();
+	if (!iz.empty() && iz != r.asset) SetUpd(UpdateUi::Available, both + "\nNueva version " + r.asset + " \xE2\x80\x94 Cruz para actualizar");
+	else if (!iz.empty() || r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
 	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
 	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
 #else
@@ -1737,42 +2826,60 @@ void OpenCheck() {
 	StartWorker(CheckWork);
 }
 
-// (ds-pc-port17) At start: a silent check; a newer published port version shows a notice right away (update or later).
-std::atomic<bool> g_notice_ready {false};
-bool              g_notice_done = false;
+// (update1) No check at start any more (the notice came back every time): the red "Actualizar versión" button above the
+// game folder checks GitHub on demand and this window gives the answer (up to date / new version: Sí, No / error).
+enum NoticeKind { NoticeNone, NoticeChecking, NoticeUpToDate, NoticeAvailable, NoticeError };
+std::atomic<int> g_notice_kind {NoticeNone};
 std::string       g_notice_text;
 
-void StartupCheck() {
+void ManualCheck() {
 #if defined(_WIN32)
-	static std::once_flag once;
-	std::call_once(once, [] {
-		std::thread([] {
-			Update::Release r;
-			std::string     error;
-			if (!Update::CheckLatest(&r, &error)) return;
-			const std::string cur = Update::CurrentVersion();
-			const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
-			if (r.tag == cur || (!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) return;
+	if (g_upd.busy.load() || g_notice_kind.load() == NoticeChecking) return;
+	g_notice_kind = NoticeChecking;
+	std::thread([] {
+		Update::Release r;
+		std::string     error;
+		if (!Update::CheckLatest(&r, &error)) {
 			{
 				std::scoped_lock lock(g_upd.mutex);
-				if (g_upd.busy.load()) return;
-				g_upd.release = r;
-				g_notice_text = std::string(I18n::T("Hay una version nueva: ")) + (r.name.empty() ? r.tag : r.name + " (" + r.tag + ")") +
-				                I18n::T(". Tienes: ") + cur + ".";
+				g_notice_text = std::string(I18n::T("No se pudo comprobar: ")) + error;
 			}
-			g_notice_ready = true;
+			g_notice_kind = NoticeError;
 			Bump();
-		}).detach();
-	});
+			return;
+		}
+		const std::string cur = Update::CurrentVersion();
+		const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
+		const std::string iz = Update::InstalledZip(); // (11-23) the zip this folder came from: only that one is "latest"
+		const bool latest = !iz.empty() ? iz == r.asset
+		                                : (r.tag == cur || (!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso()));
+		{
+			std::scoped_lock lock(g_upd.mutex);
+			if (latest) g_notice_text = I18n::T("Tienes la última versión.");
+			else {
+				g_upd.release = r;
+				char line[512];
+				std::snprintf(line, sizeof(line), I18n::T("Hay una versión nueva (%s). ¿Quieres actualizar?"), r.tag.c_str());
+				g_notice_text = line;
+			}
+		}
+		g_notice_kind = latest ? NoticeUpToDate : NoticeAvailable;
+		Bump();
+	}).detach();
+#else
+	g_notice_text = "Solo en Windows.";
+	g_notice_kind = NoticeError;
 #endif
 }
 
-void UpdateNotice(float width, float height) {
-	if (g_notice_done || !g_notice_ready.load()) return;
+// Returns true when "Sí" started the update (the caller opens the options, where its progress is shown).
+bool UpdateNotice(float width, float height) {
+	const int kind = g_notice_kind.load();
+	if (kind == NoticeNone) return false;
 	std::string text;
 	{
 		std::scoped_lock lock(g_upd.mutex);
-		text = g_notice_text;
+		text = kind == NoticeChecking ? std::string(I18n::T("Buscando la última versión...")) : g_notice_text;
 	}
 	ImGui::SetNextWindowPos({width * 0.5f, height * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
 	ImGui::SetNextWindowSize({std::min(width - 32.0f, 620.0f * g_unit), 0});
@@ -1783,15 +2890,24 @@ void UpdateNotice(float width, float height) {
 	ImGui::TextUnformatted(text.c_str());
 	ImGui::PopTextWrapPos();
 	ImGui::Spacing();
-	if (ImGui::Button(I18n::T("Actualizar ahora"), {220 * g_unit, 40 * g_unit})) {
-		g_notice_done = true;
-		g_tab_request = 4;
-		SetUpd(UpdateUi::Working, "Descargando...");
-		StartWorker(InstallWork);
+	bool started = false;
+	if (kind == NoticeChecking) {
+		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {380 * g_unit, 10 * g_unit}, "");
+	} else if (kind == NoticeAvailable) {
+		if (ImGui::Button(I18n::T("Sí"), {160 * g_unit, 40 * g_unit}) && !g_upd.busy.load()) {
+			g_notice_kind = NoticeNone;
+			g_tab_request = 4;
+			SetUpd(UpdateUi::Working, "Descargando...");
+			StartWorker(InstallWork);
+			started = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button(I18n::T("No##upd"), {160 * g_unit, 40 * g_unit}) || ImGui::IsKeyPressed(ImGuiKey_Escape)) g_notice_kind = NoticeNone;
+	} else {
+		if (ImGui::Button(I18n::T("Aceptar"), {160 * g_unit, 40 * g_unit}) || ImGui::IsKeyPressed(ImGuiKey_Escape)) g_notice_kind = NoticeNone;
 	}
-	ImGui::SameLine();
-	if (ImGui::Button(I18n::T("Mas tarde"), {160 * g_unit, 40 * g_unit})) g_notice_done = true;
 	ImGui::End();
+	return started;
 }
 
 // (10-27b) The start menu's shader block: the static precompile's state, its progress bar and its button.
@@ -2035,6 +3151,26 @@ void DrawPcTab(float unit) {
 	}
 }
 
+// (rtx1b) The resolution choices labelled with their height and "panorámica" when not 16:9 (2560x1080 sat next to
+// 2560x1440 and was picked by mistake: a 1080p output), and in full screen only the modes the monitor offers (SDL's list
+// of the first display; when SDL has none, every size as before).
+std::string ResLabel(const std::string& id) {
+	int w = 0, h = 0;
+	if (std::sscanf(id.c_str(), "%dx%d", &w, &h) != 2 || w <= 0 || h <= 0) return id;
+	return id + " (" + std::to_string(h) + "p" + (w * 9 != h * 16 ? std::string(", ") + I18n::T("panorámica") : std::string()) + ")";
+}
+bool MonitorHasMode(const char* id) {
+	int w = 0, h = 0;
+	if (std::sscanf(id, "%dx%d", &w, &h) != 2) return true;
+	const int n = SDL_GetNumDisplayModes(0);
+	if (n <= 0) return true;
+	for (int i = 0; i < n; ++i) {
+		SDL_DisplayMode mode {};
+		if (SDL_GetDisplayMode(0, i, &mode) == 0 && mode.w == w && mode.h == h) return true;
+	}
+	return false;
+}
+
 // (10-28) Resolucion (F2 > Gráficos > Imagen): full screen, the desktop's or a monitor mode; window, its size.
 void ResolutionRow(Settings& s) {
 	static const char* sizes[] = {"1280x720", "1600x900", "1920x1080", "2560x1080", "2560x1440", "3440x1440", "3840x1600", "3840x2160"};
@@ -2047,13 +3183,14 @@ void ResolutionRow(Settings& s) {
 		                    (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
 	}
 	for (const char* z: sizes) {
+		if (s.fullscreen && !MonitorHasMode(z)) continue; // (rtx1b)
 		ids.emplace_back(z);
-		labels.emplace_back(z);
+		labels.emplace_back(ResLabel(z));
 	}
 	std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
 	if (std::find(ids.begin(), ids.end(), value) == ids.end()) {
 		ids.push_back(value);
-		labels.push_back(value);
+		labels.push_back(ResLabel(value));
 	}
 	std::vector<Choice> res;
 	for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
@@ -2075,6 +3212,13 @@ void ResolutionRow(Settings& s) {
 
 // (10-28) The Configurador: the detected hardware, "Optimizar según tu equipo" (Optimize, ds-settings.cpp) and "Continuar".
 // (10-28b) `in_tab`: inside the launcher's Sistema tab (no title, no "Continuar").
+namespace ChatUi { // (chat1) below
+bool ToastActive();
+}
+namespace Multiplayer { // (online5) below
+void SettingsBlock(float unit);
+void Card(float unit); // (online11) the launcher's / F2's "Conexión online" section
+}
 void DrawConfigurator(float unit, bool in_tab = false) {
 	const ImVec4 ink {0.93f, 0.91f, 0.88f, 1.0f};
 	const auto&  pc = g_rt.pc;
@@ -2233,14 +3377,14 @@ void Draw(float width, float height) {
 	// left, the focused row's description on the right.
 	// (10-28b) The launcher (before the game): Imagen, Calidad gráfica, Ray tracing, Controles, Sistema (the Configurador
 	// folded in) and Trofeos; the same sections and rows as F2, so both write the same settings.ini the same way.
-	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
-	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Ajustes del juego"};
+	const char* game_tabs[kTabCount]     = {"Gráficos", "Pantalla", "Sonido", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
+	const char* launcher_tabs[kTabCount] = {"Imagen", "Calidad gráfica", "Ray tracing", "Controles", "Sistema", "Trofeos", "Conexión online", "Ajustes del juego"};
 	const char* const* tabs = g_start_mode ? launcher_tabs : game_tabs;
-	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {10}}; // (10-28) no Modos Souls
-	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {10}};
+	static const std::vector<int> game_groups[kTabCount] = {{0, 1, 2, 3}, {5}, {}, {7}, {6, 8}, {}, {11}, {10}}; // (10-28) no Modos Souls
+	static const std::vector<int> launcher_groups[kTabCount] = {{5, 0, 1}, {2}, {3}, {7}, {9, 6, 8}, {}, {11}, {10}};
 	const std::vector<int>* groups = g_start_mode ? launcher_groups : game_groups;
-	static const char* section_names[11] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
-	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego"};
+	static const char* section_names[12] = {"Imagen", "Frame generation", "Calidad gráfica", "Ray tracing", "Modos Souls",
+	                                        "Pantalla", "Rendimiento", "Controles", "Tu equipo", "Configurador", "Ajustes del juego", "Conexión online"};
 	g_unit = unit;
 	const float footer  = (g_start_mode ? 250 : 150) * unit;
 	const bool  nvidia  = g_rt.pc.nvidia;
@@ -2328,7 +3472,7 @@ void Draw(float width, float height) {
 						if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
 					if (fixed)
 						ImGui::TextColored(kWarn, "%s", s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
-						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (35 reales, 70 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
 					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
 					ChoiceRow("Frame generation", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
@@ -2402,41 +3546,18 @@ void Draw(float width, float height) {
 					          "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).");
 					ChoiceRow("Ondas del agua en reflejos", s.rt_refl_waves != l.rt_refl_waves, kRtReflWaves, kRtReflWavesCount, s.rt_refl_waves,
 					          "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.");
-					ChoiceRow("Luz RT", s.rt_ssgi != l.rt_ssgi, kRtLightLevels, kRtLightLevelCount, s.rt_ssgi,
-					          "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.");
-					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kRtLevels, kRtLevelCount, s.godrays,
-					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Apagarla es inmediato."))
+					// (rtq2) The old ray-tracing rows are retired (Reflejos RT, Nitidez, Ondas, Luz RT, Luz volumetrica, Particulas
+					// volumetricas, Reflejos estables; forced off in ds-settings.cpp). Only Suelo estable and Reflejos RT nuevos.
+					if (ChoiceRow("Luz volumétrica", changed_not_live(l.godrays != s.godrays, 4), kVolLevels, kVolLevelCount, s.godrays,
+					              "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Ultra: volumen a media resolución (rayos más definidos), más muestras y la niebla del propio juego más densa y más dirigida hacia la luz (~+1 ms). Apagarla es inmediato."))
 						live_changed = true;
 					ChoiceRow("Partículas volumétricas", s.motes != l.motes, kMotesLevels, kMotesLevelCount, s.motes, "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms."); // (motes-1031)
-					// (ds-pc-port9 / ds-pc-port10) No Path tracing, Luz de antorchas RT or Destellos de lente in the port.
+					// (ds-pc-port9 / ds-pc-port10) No Luz de antorchas RT or Destellos de lente in the port (the old screen-space "Path tracing" is gone; pt1 adds the hardware one above).
 					ChoiceRow("Humo y partículas", s.smoke != l.smoke, kSmokeLevels, kSmokeLevelCount, s.smoke,
 					          "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.");
 					// (ds-pc-port9) No Sombras RT in the port.
 					ImGui::EndDisabled();
-					CheckRow("RT por hardware (experimental)", s.rt_hw_exp != l.rt_hw_exp, s.rt_hw_exp,
-					         "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
-					if (s.rt_hw_exp) {
-						ImGui::BeginDisabled(s.pure_game);
-						{
-							std::string x = s.rt_reflections ? "1" : "0";
-							if (ChoiceRow("Reflejos (RT real)", changed_not_live(s.rt_reflections != l.rt_reflections || (s.rt_reflections && !l.rt_hw_exp), 1), kYesNo, kYesNoCount, x,
-							              "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas. Apagarlo es inmediato.")) {
-								s.rt_reflections = x == "1";
-								live_changed     = true;
-							}
-						}
-						const bool sun_was = s.rt_sun;
-						{
-							std::string x = s.rt_sun ? "1" : "0";
-							if (ChoiceRow("Sombras sol (RT real)", s.rt_sun != l.rt_sun || (s.rt_sun && !l.rt_hw_exp), kYesNo, kYesNoCount, x,
-							              "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica ni las Sombras RT."))
-								s.rt_sun = x == "1";
-						}
-						// (vol25) Luz volumetrica / Sombras RT and Sombras sol share the engine's sun pass: choosing one turns the other off.
-						if (s.rt_sun && !sun_was) s.godrays = "0", s.rt_shadows = "0";
-						ImGui::EndDisabled();
-					}
-					if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
+					// (rtq2) No "RT por hardware (experimental)" / Reflejos (RT real) / Sombras sol (RT real): retired.
 					if (CheckRow("Juego original (sin efectos añadidos)", s.pure_game != l.pure_game, s.pure_game,
 					             "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian."))
 						live_changed = true;
@@ -2532,18 +3653,11 @@ void Draw(float width, float height) {
 					ImGui::Dummy({16.0f * g_unit, 0});
 					ImGui::SameLine();
 					ImGui::TextColored(kGold, "%s", I18n::T("Opciones de rendimiento"));
-					CheckRow("Registros PM4 directos", s.perf_pm4_regfile != g_rt.launched.perf_pm4_regfile, s.perf_pm4_regfile,
-					         "Guarda directamente los registros de la GPU que no necesitan procesarse (comprobado al empezar). Menos trabajo de CPU por dibujo. Experimental (KYTY_PM4_REGFILE).");
-					CheckRow("Subidas a la GPU en dos hilos", s.perf_upload_lanes != g_rt.launched.perf_upload_lanes, s.perf_upload_lanes,
-					         "Reparte la protección de memoria de las subidas a la GPU entre dos hilos. Ayuda en zonas con mucha carga de texturas en CPUs de 8 núcleos o más. Experimental (KYTY_UPLOAD_LANES).");
+					// (11-22) Registros PM4 directos, Subidas en dos hilos, Copias anticipadas y agrupadas: always on in code (ds-settings.cpp), no boxes.
 					CheckRow("El render ayuda con las subidas", s.perf_upload_help != g_rt.launched.perf_upload_help, s.perf_upload_help,
 					         "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
 					CheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate != g_rt.launched.perf_spin_gate, s.perf_spin_gate,
 					         "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
-					CheckRow("Copias de la GPU anticipadas", s.perf_eager_feedback != g_rt.launched.perf_eager_feedback, s.perf_eager_feedback,
-					         "Devuelve a la memoria del juego las copias ya terminadas de la GPU antes de que las pida, evitando esperas. Puede quitar tirones. Experimental (KYTY_EAGER_FEEDBACK).");
-					CheckRow("Copias de la GPU agrupadas", s.perf_feedback_batch != g_rt.launched.perf_feedback_batch, s.perf_feedback_batch,
-					         "Graba juntas las copias de la GPU de cada bloque de comandos en vez de una a una. Experimental (KYTY_FEEDBACK_BATCH).");
 					CheckRow("Shaders lane-local ampliados", s.perf_lane_wide != g_rt.launched.perf_lane_wide, s.perf_lane_wide,
 					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
 					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
@@ -2596,11 +3710,7 @@ void Draw(float width, float height) {
 					if (CheckRow("Vibración", false, s.rumble, "Vibración del mando (en vivo).")) live_changed = true;
 					if (SliderRow("Fuerza de la vibración", s.rumble_gain, 1.0f, 8.0f, "%.1f", "Fuerza de la vibración del mando (en vivo).")) live_changed = true;
 					ImGui::Spacing();
-					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) {
-						(void)PadMap::Draw(s, unit);
-						if (s.pad_map != l.pad_map && !g_start_mode)
-							ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", I18n::T("   (requiere reinicio)"));
-					}
+					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) (void)PadMap::Draw(s, unit); // (remap-f2: saved and live at once)
 					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? I18n::T("Mando: botones de serie.") : I18n::T("Mando: remapeado."));
 					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
 					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
@@ -2639,6 +3749,7 @@ void Draw(float width, float height) {
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
+				case 11: Multiplayer::Card(unit); break; // (online11) its own section in the launcher and F2
 				default: break;
 			}
 			}
@@ -2809,9 +3920,9 @@ std::string    g_steam_text;
 std::mutex     g_steam_mutex;
 std::atomic<bool> g_steam_busy {false};
 
-const ImVec4 kInkL {0.97f, 0.96f, 0.93f, 1.0f};
+const ImVec4 kInkL {0.93f, 0.90f, 0.83f, 1.0f}; // (launcher1) old parchment (was near white)
 const ImVec4 kDimL {0.86f, 0.84f, 0.80f, 1.0f}; // (ds-pc-port9) secondary text, still high contrast
-const ImVec4 kGoldL {0.87f, 0.77f, 0.55f, 1.0f};
+const ImVec4 kGoldL {0.80f, 0.69f, 0.48f, 1.0f}; // (launcher1) tarnished gold (was brighter)
 
 struct LBox {
 	ImVec2 at {};
@@ -3055,8 +4166,18 @@ void BoxBegin(const char* title, float w = 420, bool card = false) {
 	g_lbox.card = card;
 	ImGui::BeginGroup();
 	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), g_lbox.at.y + U(card ? 12 : 6)});
-	ImGui::PushFont(g_font_display, U(card ? 25 : 20));
+	ImGui::PushFont(g_font_display, std::round(U(card ? 25 : 20))); // (launcher1) whole-pixel sizes: crisp
 	ImGui::TextColored(kGoldL, "%s", I18n::T(title));
+	{
+		// (launcher1) A fine rule under the title, fading out to the right, with a small lozenge at its start.
+		const ImVec2 tmin = ImGui::GetItemRectMin(), tmax = ImGui::GetItemRectMax();
+		const float  ly   = std::floor(tmax.y + U(3)) + 0.5f, lx = std::floor(tmin.x);
+		const float  lw   = g_lbox.w - U(24);
+		const float  r    = std::round(U(2.5f));
+		dl->AddQuadFilled({lx, ly - r}, {lx + r, ly}, {lx, ly + r}, {lx - r, ly}, IM_COL32(204, 176, 122, 200));
+		dl->AddRectFilledMultiColor({lx + r + U(3), ly - 0.5f}, {lx + lw, ly + 0.5f}, IM_COL32(204, 176, 122, 150), IM_COL32(204, 176, 122, 0),
+		                            IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 150));
+	}
 	ImGui::PopFont();
 	ImGui::SetCursorScreenPos({g_lbox.at.x, g_lbox.at.y + U(card ? 46 : 32)});
 	ImGui::Dummy({g_lbox.w, 0});
@@ -3182,40 +4303,124 @@ bool LSlider(float y, const char* label, float& v, float lo, float hi, const cha
 }
 
 // The launcher's buttons: the primary one gold with dark text, the others dark with a grey border.
+// (launcher1) JUGAR in Demon's Souls' manner: a dark stone slab in a fine double frame of tarnished gold with notched
+// corners and small lozenges, thin flourishes running out from the inscription, the inscription itself in Cinzel, the
+// colour of old parchment, on whole pixels. Hover / focus: a soft warm halo breathes around the slab and the letters
+// brighten (eased, ~110 ms, real time); pressed: the slab darkens and the inscription sinks one pixel. Only the drawing
+// changed: the click, the focus and the tooltip are the same ImGui::Button as before.
+void DrawSoulsButton(ImDrawList* dl, ImVec2 a, ImVec2 b, ImFont* font, float font_size, const char* t, float hot, bool held) {
+	const float  u     = g_unit;
+	const float  al    = ImGui::GetStyle().Alpha;
+	const auto   C     = [al](int r, int g, int bl, float alpha) {
+        return IM_COL32(r, g, bl, static_cast<int>(std::clamp(alpha, 0.0f, 1.0f) * 255.0f * al));
+	};
+	const float  px    = std::max(1.0f, std::round(u)); // a hairline, whole pixels
+	a                  = {std::floor(a.x) + 0.5f, std::floor(a.y) + 0.5f};
+	b                  = {std::floor(b.x) - 0.5f, std::floor(b.y) - 0.5f};
+	// (a, b: the item on whole pixels, the hairlines centred on them)
+	const float  cut   = std::round(7.0f * u); // the notched corners
+	const ImVec2 mid   = {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
+	// The halo: wide, faint, warm; grows with the hover (eased) and a slow breath while it lasts.
+	if (hot > 0.0f) {
+		const float breath = 0.85f + 0.15f * std::sin(static_cast<float>(Anim::Now()) * 2.4f);
+		for (int k = 6; k >= 1; k--) {
+			const float g = k * 3.0f * u * hot;
+			dl->AddRectFilled({a.x - g, a.y - g}, {b.x + g, b.y + g}, C(214, 170, 92, 0.035f * hot * breath), cut + g);
+		}
+	}
+	// The slab: a cold stone gradient, darker at the bottom; pressed: darker still.
+	const float k_press = held ? 0.72f : 1.0f;
+	const auto  stone   = [&](float v, float alpha) {
+        const int c = static_cast<int>(v * k_press);
+        return C(c + 4, c + 2, c, alpha);
+	};
+	ImVec2 poly[8] = {{a.x + cut, a.y}, {b.x - cut, a.y}, {b.x, a.y + cut}, {b.x, b.y - cut},
+	                  {b.x - cut, b.y}, {a.x + cut, b.y}, {a.x, b.y - cut}, {a.x, a.y + cut}};
+	dl->AddConvexPolyFilled(poly, 8, stone(18, 0.93f));
+	dl->AddRectFilledMultiColor({a.x + cut * 0.5f, a.y + px}, {b.x - cut * 0.5f, mid.y}, stone(46 + 18 * hot, 0.55f), stone(46 + 18 * hot, 0.55f),
+	                            stone(22, 0.0f), stone(22, 0.0f));
+	// A warm wash rising from the bottom edge while hot (the light of a bonfire on the stone).
+	if (hot > 0.0f)
+		dl->AddRectFilledMultiColor({a.x + cut * 0.5f, mid.y}, {b.x - cut * 0.5f, b.y - px}, C(200, 150, 70, 0.0f), C(200, 150, 70, 0.0f),
+		                            C(200, 150, 70, 0.16f * hot), C(200, 150, 70, 0.16f * hot));
+	// The double frame: outer tarnished gold, inner fainter, both hairlines.
+	const ImU32 gold_o = C(176 + static_cast<int>(40 * hot), 148 + static_cast<int>(36 * hot), 96 + static_cast<int>(22 * hot), 0.92f);
+	const ImU32 gold_i = C(150, 126, 84, 0.45f + 0.25f * hot);
+	dl->AddPolyline(poly, 8, gold_o, ImDrawFlags_Closed, px);
+	const float in = std::round(4.0f * u);
+	ImVec2      ip[8] = {{a.x + cut + in * 0.4f, a.y + in}, {b.x - cut - in * 0.4f, a.y + in}, {b.x - in, a.y + cut + in * 0.4f},
+	                     {b.x - in, b.y - cut - in * 0.4f}, {b.x - cut - in * 0.4f, b.y - in}, {a.x + cut + in * 0.4f, b.y - in},
+	                     {a.x + in, b.y - cut - in * 0.4f}, {a.x + in, a.y + cut + in * 0.4f}};
+	dl->AddPolyline(ip, 8, gold_i, ImDrawFlags_Closed, px);
+	// Lozenges at the middle of the long sides and at both ends.
+	const auto lozenge = [&](ImVec2 c, float r, ImU32 col) {
+		dl->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, col);
+	};
+	const float lr = std::round(3.5f * u);
+	lozenge({mid.x, a.y}, lr, gold_o);
+	lozenge({mid.x, b.y}, lr, gold_o);
+	lozenge({a.x, mid.y}, lr, gold_o);
+	lozenge({b.x, mid.y}, lr, gold_o);
+	// The inscription: measured on whole pixels, flourishes out from it to the inner frame.
+	const ImVec2 ts  = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, t);
+	const float  sink = held ? px : 0.0f;
+	const ImVec2 p   = {std::floor(mid.x - ts.x * 0.5f), std::floor(mid.y - ts.y * 0.5f) + sink};
+	const float  gap = std::round(14.0f * u);
+	const float  fy  = std::floor(mid.y) + 0.5f + sink;
+	const float  run = std::max(0.0f, (p.x - gap) - (a.x + in + std::round(14.0f * u)));
+	if (run > 4.0f * u) {
+		const float l0 = p.x - gap - run, r0 = p.x + ts.x + gap;
+		// Fading out towards the frame (two segments, the outer fainter) and a small lozenge at the inner end.
+		dl->AddLine({l0, fy}, {l0 + run * 0.5f, fy}, C(170, 142, 92, 0.30f + 0.2f * hot), px);
+		dl->AddLine({l0 + run * 0.5f, fy}, {p.x - gap, fy}, C(190, 160, 104, 0.65f + 0.3f * hot), px);
+		dl->AddLine({r0 + run * 0.5f, fy}, {r0 + run, fy}, C(170, 142, 92, 0.30f + 0.2f * hot), px);
+		dl->AddLine({r0, fy}, {r0 + run * 0.5f, fy}, C(190, 160, 104, 0.65f + 0.3f * hot), px);
+		lozenge({p.x - gap + lr * 0.5f, fy}, lr * 0.8f, gold_o);
+		lozenge({r0 - lr * 0.5f, fy}, lr * 0.8f, gold_o);
+	}
+	// A dark bed under the letters (legible over the stone), then the parchment letters; hot: warmer and a faint glow.
+	dl->AddText(font, font_size, {p.x, p.y + px}, C(0, 0, 0, 0.85f), t);
+	if (hot > 0.0f) {
+		const float o = std::round(1.0f * u);
+		for (int dx = -1; dx <= 1; dx++)
+			for (int dy = -1; dy <= 1; dy++)
+				if (dx != 0 || dy != 0) dl->AddText(font, font_size, {p.x + dx * o, p.y + dy * o}, C(230, 180, 96, 0.10f * hot), t);
+	}
+	dl->AddText(font, font_size, p, C(218 + static_cast<int>(26 * hot), 206 + static_cast<int>(22 * hot), 178 + static_cast<int>(10 * hot), 1.0f), t);
+}
+
 bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* font, float font_size, const char* tip = nullptr) {
 	ImGui::SetCursorScreenPos(at);
-	if (primary) {
+	// (launcher1) The primary button in the display face is drawn by DrawSoulsButton: ImGui's own frame transparent.
+	const bool souls = primary && font == g_font_display && font != nullptr;
+	if (souls) {
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0, 0, 0, 0});
+	} else if (primary) {
 		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.69f, 0.55f, 0.27f, 0.92f});
 		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.81f, 0.67f, 0.38f, 0.96f});
 		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.60f, 0.47f, 0.22f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0.08f, 0.06f, 0.04f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Border, kGoldL);
 	} else {
-		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.82f});
-		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.90f});
-		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.24f, 0.27f, 0.33f, 1.0f});
+		// (launcher1) Stone grey and tarnished gold (was blue-grey).
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.075f, 0.072f, 0.068f, 0.84f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.15f, 0.135f, 0.115f, 0.90f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.21f, 0.19f, 0.15f, 1.0f});
 		ImGui::PushStyleColor(ImGuiCol_Text, kInkL);
-		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.43f, 0.43f, 0.39f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.50f, 0.44f, 0.33f, 0.85f});
 	}
 	ImGui::PushFont(font, font_size);
-	// (ds-pc-port12) The primary button in the display face: the label drawn engraved into the gold (dark letters, a
-	// light edge under them and a soft dark one above), on whole pixels so it stays crisp.
-	const bool engraved = primary && font == g_font_display;
-	if (engraved) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {0, 0, 0, 0});
 	const bool clicked = ImGui::Button(I18n::T(text), size);
-	Anim::Highlight(g_unit); // (step5) eased hover / focus glow, border and accent bar (real time)
-	if (engraved) {
-		ImGui::PopStyleColor();
-		auto*        dl  = ImGui::GetWindowDrawList();
-		const char*  t   = I18n::T(text);
-		const ImVec2 ts  = ImGui::CalcTextSize(t);
-		const ImVec2 mn  = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-		const ImVec2 p   = {std::floor(mn.x + (mx.x - mn.x - ts.x) * 0.5f), std::floor(mn.y + (mx.y - mn.y - ts.y) * 0.5f)};
-		const float  off = std::max(1.0f, std::round(font_size / 28.0f));
-		dl->AddText(font, font_size, {p.x, p.y + off}, IM_COL32(255, 238, 196, 150), t);   // the light lower edge
-		dl->AddText(font, font_size, {p.x, p.y - off}, IM_COL32(40, 26, 8, 90), t);        // the shade above
-		dl->AddText(font, font_size, p, IM_COL32(22, 14, 5, 255), t);                      // the letters
-		dl->AddText(font, font_size, {p.x + 0.5f * off, p.y}, IM_COL32(22, 14, 5, 160), t); // a touch more weight
+	if (souls) {
+		const bool on = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
+		DrawSoulsButton(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), font, font_size, I18n::T(text),
+		                Anim::Hot(ImGui::GetItemID(), on), ImGui::IsItemActive());
+	} else {
+		Anim::Highlight(g_unit); // (step5) eased hover / focus glow, border and accent bar (real time)
 	}
 	ImGui::PopFont();
 	ImGui::PopStyleColor(5);
@@ -3297,13 +4502,14 @@ void ResolutionChoices(const Settings& s, std::vector<std::string>* ids, std::ve
 		                     (g_rt.pc.screen_h > 0 ? " (" + std::to_string(g_rt.pc.screen_h) + "p)" : std::string()));
 	}
 	for (const char* z: sizes) {
+		if (s.fullscreen && !MonitorHasMode(z)) continue; // (rtx1b)
 		ids->emplace_back(z);
-		labels->emplace_back(z);
+		labels->emplace_back(ResLabel(z));
 	}
 	const std::string value = s.fullscreen ? s.resolution : std::to_string(s.width) + "x" + std::to_string(s.height);
 	if (std::find(ids->begin(), ids->end(), value) == ids->end()) {
 		ids->push_back(value);
-		labels->push_back(value);
+		labels->push_back(ResLabel(value));
 	}
 }
 
@@ -3343,7 +4549,7 @@ void LauncherImage(Settings& s) {
 		ImGui::PushFont(g_font_semi, U(14));
 		ImGui::TextColored(kGoldL, "%s", I18n::T(OutputHeight(s, g_rt.pc) >= 2160 ? "Cinemático sin tope 30" : "Modo rendimiento"));
 		ImGui::PopFont();
-		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciones: modo rendimiento.");
+		Tip("4K: el modo rendimiento del juego (cinemáticas sin el tope de 30) con la calidad cinemática: iluminación completa y teselado denso. Otras resoluciónes: modo rendimiento.");
 		RowEnd(my, 22);
 	}
 	{
@@ -3357,7 +4563,7 @@ void LauncherImage(Settings& s) {
 		}
 		LRow("Reescalado", static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 		     [](const ResMode& m) { return m.label; },
-		     "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
+		     "Reescalado: dibuja el 3D a menos resolución y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
 		     146, 260, true);
 	}
 	ImGui::BeginDisabled(!nvidia);
@@ -3365,7 +4571,7 @@ void LauncherImage(Settings& s) {
 	        nvidia ? "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)" : "Sin DLSS: tu grafica no es NVIDIA.");
 	ImGui::EndDisabled();
 	LChoice("Nitidez", kSharpness, kSharpnessCount, s.sharpness,
-	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido.");
+	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolución de la pantalla. Más alto: mas nitido, pero puede marcar bordes y ruido.");
 	// (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering on the foveated grid) and which nvngx_dlssnr.dll it may load.
 	ImGui::BeginDisabled(!nvidia);
 	LChoice("DLSS 5", kDlss5Levels, kDlss5LevelCount, s.dlss5, nvidia ? kDlss5Tip : "Sin DLSS 5: tu grafica no es NVIDIA.");
@@ -3480,10 +4686,9 @@ void LauncherRayTracing(Settings& s) {
 	     "Más nitidez en los reflejos RT (superficies y agua). Normal: como ahora. Alta: rayos a resolución completa en Bajo/Medio, menos desenfoque y menos mezcla con frames anteriores (~+0,3-0,8 ms). Máxima: además sin tablero de ajedrez, el desenfoque mínimo y el historial más corto; los espejos conservan el detalle, puede verse algo más de ruido (~+0,6-1,5 ms).", fx, fw);
 	LRow("Ondas agua reflejos", kRtReflWavesCount, kRtReflWaves, s.rt_refl_waves, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Cuánto mueven las ondas del agua el rayo del reflejo (el agua se ve igual). Como ahora: sin cambios. Suaves: 40 % de la ondulación, reflejos más limpios. Espejo: el agua refleja como un espejo plano. Sin coste.", fx, fw);
-	LRow("Luz RT", kRtLightLevelCount, kRtLightLevels, s.rt_ssgi, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Iluminación por rayos sobre la imagen (luz rebotada y sombreado de contacto). Solo funciona con DLSS, XeSS o FSR. Cuesta FPS. Experimental.", fx, fw);
-	LRow("Luz volumétrica", kRtLevelCount, kRtLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms.", fx, fw);
+	// (rtq2) The old ray-tracing rows are retired (forced off in ds-settings.cpp): only Suelo estable and Reflejos RT nuevos.
+	LRow("Luz volumétrica", kVolLevelCount, kVolLevels, s.godrays, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
+	     "Luz volumétrica por rayos: rayos de sol que entran por ventanas y puertas, y halo de luz en la niebla alrededor de antorchas. Solo con DLSS, XeSS o FSR. Bajo ~0,4 ms, Medio ~0,8 ms, Alto ~1,2 ms. Ultra: volumen a media resolución (rayos más definidos), más muestras y la niebla del propio juego más densa y más dirigida hacia la luz (~+1 ms).", fx, fw);
 	LRow("Partículas volum.", kMotesLevelCount, kMotesLevels, s.motes, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
 	     "Motas de polvo en suspensión iluminadas por los rayos de sol y el halo de antorchas y lámparas (la luz volumétrica); flotan despacio y quedan fijas en el mundo. Sutil / Media / Densa: cuántas. Solo con DLSS, XeSS o FSR. ~0,2-0,5 ms.", fx, fw); // (motes-1031)
 	// (ds-pc-port10) Luz de antorchas RT and Destellos de lente are gone from the port (always off).
@@ -3491,29 +4696,7 @@ void LauncherRayTracing(Settings& s) {
 	     "Humo y partículas más realistas sobre las del propio juego: Suave = el humo, la niebla de partículas y las chispas ya no cortan en línea dura donde tocan suelo y paredes (se funden en ~35 cm). Solo con DLSS, XeSS o FSR. ~0,3 ms.",
 	     fx, fw);
 	ImGui::EndDisabled();
-	LCheckRow("RT por hardware (experimental)", s.rt_hw_exp,
-	          "Activa las opciones de trazado de rayos por hardware (Reflejos y Sombras sol por RT real). Experimental: puede tener fallos y cuesta mucha GPU y VRAM. Necesita GPU con RT.");
-	if (s.rt_hw_exp) {
-		ImGui::BeginDisabled(s.pure_game);
-		{
-			std::string x = s.rt_reflections ? "1" : "0";
-			if (LRow("Reflejos (RT real)", kYesNoCount, kYesNo, x, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-			         "Reflejos con trazado de rayos: refleja también lo que está fuera de pantalla o tapado, con sus texturas.", fx, fw))
-				s.rt_reflections = x == "1";
-		}
-		const bool sun_was = s.rt_sun;
-		{
-			std::string x = s.rt_sun ? "1" : "0";
-			if (LRow("Sombras sol (RT real)", kYesNoCount, kYesNo, x, [](const Choice& c) { return c.id; }, [](const Choice& c) { return c.label; },
-			         "Sombras del sol con trazado de rayos: sombras de contacto y las que faltaban. No se puede usar a la vez que la Luz volumétrica ni las Sombras RT.",
-			         fx, fw))
-				s.rt_sun = x == "1";
-		}
-		// (vol25) Luz volumetrica / Sombras RT and Sombras sol share the engine's sun pass: choosing one turns the other off.
-		if (s.rt_sun && !sun_was) s.godrays = "0", s.rt_shadows = "0";
-		ImGui::EndDisabled();
-	}
-	if (s.rt_sun && s.rt_hw_exp && (s.godrays != "0" || s.rt_shadows != "0")) s.rt_sun = false;
+	// (rtq2) No "RT por hardware (experimental)" rows: retired.
 	LCheckRow("Juego original (sin efectos añadidos)", s.pure_game,
 	          "Apaga todos los efectos visuales que añade el emulador (ray tracing, luz volumétrica, humo, SSGI, reflejos RT). Se ve el juego tal cual. Rendimiento, reescalador, DLSS 5, frame generation y latencia no cambian.");
 	BoxEnd();
@@ -3631,6 +4814,9 @@ void LauncherPerformance(Settings& s) {
 		LCheck(y, "Todos los núcleos", s.all_ccds, "Solo para Ryzen con dos bloques de núcleos (CCD), como un 7950X3D o un 5900X; en otros procesadores no cambia nada. Apagado: el juego usa solo el bloque con más caché (memoria rápida dentro del procesador), que suele dar más FPS y menos tirones. Encendido: usa todos los núcleos. Déjalo apagado salvo que notes que encendido te va mejor.", 216);
 		RowEnd(y);
 	}
+	// (11-14) Pruebas: la gráfica limitada a 8 GB de memoria de vídeo (KYTY_SIMULATE_VRAM_MB=8192).
+	LCheckRow("Simular gráfica de 8 GB (pruebas)", s.simulate_vram8,
+	          "Solo para pruebas: el juego usa como mucho 8 GB de memoria de vídeo, como en una gráfica de 8 GB, aunque la tuya tenga más. Se aplica al iniciar el juego.");
 	{
 		// (perfopts-1107) Opciones de rendimiento: upstream KytyPS5's opt-in switches, off = as before.
 		const float y = RowY() + U(4);
@@ -3641,18 +4827,12 @@ void LauncherPerformance(Settings& s) {
 		Tip("Ajustes experimentales que buscan más FPS o menos tirones de distintas formas. Todos apagados = el juego va como siempre. La ganancia suele ser pequeña y depende de tu PC: prueba uno a uno. Se aplican al iniciar el juego. Si algo va mal, apágalos.");
 		RowEnd(y, 30);
 	}
-	LCheckRow("Menos trabajo por cada dibujo", s.perf_pm4_regfile,
-	          "El juego manda a la gráfica miles de órdenes en cada imagen. Con esto, los ajustes sencillos que no hace falta traducir se apuntan directamente, sin pasar por el traductor. Ahorra algo de procesador: puede dar unos pocos FPS más si tu procesador es lo que te limita. No cambia la imagen. Experimental: si ves fallos gráficos, apágalo.");
-	LCheckRow("Enviar texturas con dos hilos", s.perf_upload_lanes,
-	          "Cuando llegan texturas y datos nuevos a la gráfica, parte de su preparación se reparte entre dos hilos (tareas que el procesador hace a la vez) en vez de uno. Puede quitar tirones en zonas con mucha carga de texturas. Útil con procesadores de 8 núcleos o más; con menos núcleos puede no notarse. Experimental.");
+	// (11-22) "Menos trabajo por cada dibujo", "Enviar texturas con dos hilos", "Devolver antes las copias de la gráfica" and
+	// "Agrupar las copias de la gráfica": always on in code (ds-settings.cpp), no boxes.
 	LCheckRow("Ayuda extra si el procesador va justo", s.perf_upload_help,
 	          "Cuando el procesador va muy ocupado, el hilo que dibuja cada imagen hace él mismo los envíos de texturas pendientes en vez de quedarse esperando. En procesadores de 4 a 6 núcleos y portátiles puede dar unos FPS más (en pruebas, hasta un 4 %). Con un procesador sobrado casi nunca actúa: ahí da igual.");
 	LCheckRow("Liberar el procesador cuando va saturado", s.perf_spin_gate,
 	          "Unos hilos de ayuda del emulador esperan trabajo dando vueltas sin parar (gastan procesador sin hacer nada útil). Con esto dejan de hacerlo cuando quedan menos de 3 núcleos libres, y ese procesador vuelve al juego. En procesadores de 4 a 6 núcleos reduce bastante los bajones de FPS y los tirones. Con muchos núcleos casi nunca actúa. Recomendado en portátiles y PCs modestos.");
-	LCheckRow("Devolver antes las copias de la gráfica", s.perf_eager_feedback,
-	          "Cuando la gráfica termina una copia de datos que el juego leerá después, se le devuelve en cuanto está lista en vez de esperar a que la pida. Así el juego no se queda esperando: puede quitar algunos tirones. No cambia la imagen. Experimental: si notas fallos, apágalo.");
-	LCheckRow("Agrupar las copias de la gráfica", s.perf_feedback_batch,
-	          "Esas mismas copias de datos de la gráfica se preparan juntas, por bloques, en vez de una a una. Un poco menos de trabajo para el procesador; la ganancia es pequeña. No cambia la imagen. Experimental: si notas fallos, apágalo.");
 	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
 	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
 	// (11-12) "Simular 16 GB RAM" removed too (the owner).
@@ -3753,7 +4933,7 @@ void LauncherControls(Settings& s) {
 // (ds-pc-port9) Modos Souls (Launcher-souls.ps1's group): one at most; choosing one applies its preset (ApplyPreset:
 // the graphics, the upscaler and every ray tracing row to No); unticking it goes back to Maximo.
 void LauncherSoulsModes(Settings& s) {
-	BoxBegin("Modos Souls");
+	BoxBegin("Graficas de 12 y 16 GB");
 	struct Mode {
 		const char* id;
 		const char* label;
@@ -3761,40 +4941,67 @@ void LauncherSoulsModes(Settings& s) {
 	};
 	static const Mode modes[] = {
 	    {"ligero", "Modo Souls ligero",
-	     "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p, con el antialiasing de XeSS o de FSR (sin reescalar)."},
+	     "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p con FSR 4 Calidad. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
 	    {"equilibrado", "Modo Souls equilibrado",
-	     "Para graficas de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas."},
+	     "Para graficas de 10 GB de VRAM o mas, de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas."},
 	    {"ultra", "Modo Souls ultra",
-	     "Para RTX 5060 / 5060 Ti / 5070 / 5070 Ti y RX 9070 / 9070 XT: todo al maximo, Detail Very High, Luz RT y Oclusion en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	     "Para graficas de 12 y 16 GB de VRAM (RTX 5060 Ti 16 GB / 5070 / 5070 Ti, RX 9070 / 9070 XT): todo al maximo, Detail Very High, Luz RT y Oclusion en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"extremo", "Modo Souls extremo",
-	     "Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	     "Para graficas de 16 GB de VRAM. Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"ligero-plus", "Modo Souls ligero +",
-	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 35 FPS estables y frame generation de AMD x2 (70 en pantalla): mas fluido y algo menos de latencia."},
+	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 40 FPS estables y frame generation de AMD x2 (80 en pantalla): mas fluido y algo menos de latencia. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
 	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
-	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."}};
+	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."},
+	    {"sin-tirones", "Optimizado 16 GB RAM / 8 GB VRAM",
+	     "Para PCs de 16 GB de RAM y graficas de 8 GB como RTX 3060 Ti, RTX 3070, RTX 4060, RTX 4060 Ti 8 GB, RTX 5060, RX 6600 XT, RX 6650 XT o RX 7600. 40 FPS estables con frame generation de AMD x2 (80 en pantalla), 1080p con FSR 4 Calidad. Menos carga y menos tirones: sin calcomanias proyectadas, reflejos y desvanecimiento en Normal, sin desenfoque de movimiento. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."}};
 	const auto pick = [&](float y, const Mode& m, float x) {
 		bool on = s.souls_mode == m.id;
 		if (!LCheck(y, m.label, on, m.tip, x)) return;
 		ApplyPreset(&s, on ? m.id : "ninguno");
 		s.souls_mode = on ? m.id : "ninguno";
 	};
-	// Launcher-souls.ps1's places: ligero | equilibrado, ultra | extremo, PC low profile.
-	for (size_t i = 0; i < 4; i += 2) {
-		const float y = RowY();
-		pick(y, modes[i], 12);
-		pick(y, modes[i + 1], 216);
-		RowEnd(y);
-	}
+	// (11-22) The 8 GB modes together: ligero | ligero +, then Optimizado (its own row: a long name); then
+	// equilibrado | ultra, extremo | low profile. (modes[]: 0 ligero, 1 equilibrado, 2 ultra, 3 extremo, 4 ligero +,
+	// 5 low, 6 optimizado)
+	// (11-26, el usuario) Los de 8 GB en su propio apartado, con el aviso de no cambiar sus ajustes.
+	const auto rows = [&](const int (*order)[2], int count) {
+		for (int i = 0; i < count; i++) {
+			const float y = RowY();
+			pick(y, modes[order[i][0]], 12);
+			if (order[i][1] >= 0) pick(y, modes[order[i][1]], 216);
+			RowEnd(y);
+		}
+	};
+	// (11-26, el usuario) Apartados por memoria de la grafica: 8 GB (+16 GB de RAM), 10 GB o mas, 12 y 16 GB; low profile aparte.
+	static const int doce[1][2] = {{2, 3}};
+	rows(doce, 1);
+	BoxEnd();
+	BoxBegin("Graficas de 10 GB o mas");
+	static const int diez[1][2] = {{1, -1}};
+	rows(diez, 1);
+	BoxEnd();
+	BoxBegin("PCs modestos");
+	static const int bajo[1][2] = {{5, -1}};
+	rows(bajo, 1);
+	BoxEnd();
+	BoxBegin("Graficas de 8 GB y 16 GB de RAM");
+	static const int ocho[2][2] = {{0, -1}, {6, -1}}; // (11-26) sin "ligero +": solo Souls ligero y Optimizado
+	rows(ocho, 2);
 	{
 		const float y = RowY();
-		pick(y, modes[4], 12);
-		pick(y, modes[5], 216);
-		RowEnd(y);
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
+		ImGui::TextColored(kWarn, "%s", I18n::T("Ajustes preparados especialmente para graficas de 8 GB y 16 GB de RAM (1080p con FSR 4 Calidad). No es conveniente cambiarlos: subirlos puede llenar la memoria de video y dar tirones o texturas que tardan en cargar."));
+		ImGui::PopTextWrapPos();
+		// (11-26) Alto real del texto (3 lineas con letra grande): la linea de la frame generation va debajo, sin pisarlo.
+		const float alto = ImGui::GetItemRectMax().y - y + U(6);
+		ImGui::SetCursorScreenPos({g_lbox.at.x, y});
+		ImGui::Dummy({g_lbox.w, alto});
 	}
 	if (FixedFg(s)) {
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
-		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : s.souls_mode == "ligero-plus" ? "Frame generation fija: AMD x2 (35 reales, 70 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
+		ImGui::TextColored(kGoldL, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Frame generation fija: AMD x2 (45 reales, 90 en pantalla)." : (s.souls_mode == "ligero-plus" || s.souls_mode == "sin-tirones") ? "Frame generation fija: AMD x2 (40 reales, 80 en pantalla)." : "Frame generation fija: AMD x2 (30 reales, 60 en pantalla)."));
 		RowEnd(y, 28);
 	}
 	BoxEnd();
@@ -3950,73 +5157,975 @@ void LauncherUpdateBox() {
 	BoxEnd();
 }
 
-// Trofeos: the count and % and, opened, the list (inside the options).
-void LauncherTrophiesBox() {
-	static std::vector<TrophyRow> rows;
-	static double                 loaded_at = -100.0;
-	if (ImGui::GetTime() - loaded_at > 3.0) {
-		rows      = LoadTrophyRows();
-		loaded_at = ImGui::GetTime();
-		std::stable_sort(rows.begin(), rows.end(), [](const TrophyRow& a, const TrophyRow& b) { return a.earned && !b.earned; });
-	}
-	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
-	int  total = 0, have = 0, earned = 0;
-	for (const auto& r: rows) {
-		total += points(r.grade);
-		if (r.earned) {
-			have += points(r.grade);
-			earned++;
-		}
-	}
-	const int pct = total > 0 ? have * 100 / total : 0;
-	char      title[128];
-	if (!rows.empty())
-		std::snprintf(title, sizeof(title), "%s   %d / %d   (%d%%)  %s", I18n::T("Trofeos"), earned, static_cast<int>(rows.size()), pct, g_show_trophies ? "^" : "v");
-	else std::snprintf(title, sizeof(title), "%s  %s", I18n::T("Trofeos"), g_show_trophies ? "^" : "v");
-	const float y = RowY();
-	ImGui::SetCursorScreenPos({g_lbox.at.x, y});
-	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.094f, 0.11f, 0.15f, 0.92f});
-	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.17f, 0.20f, 0.25f, 0.95f});
-	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.55f, 0.53f, 0.48f, 1.0f});
-	ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, {0.0f, 0.5f});
-	ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {U(48), U(4)});
-	ImGui::PushFont(g_font_semi, U(16));
-	if (ImGui::Button((std::string(title) + "###trophies").c_str(), {U(420), U(40)})) g_show_trophies = !g_show_trophies;
-	ImGui::PopFont();
-	ImGui::PopStyleVar(2);
-	ImGui::PopStyleColor(3);
-	Libs::Trophy::DrawCup(ImGui::GetWindowDrawList(), g_lbox.at.x + U(10), y + U(6), U(28), Libs::Trophy::CupColor(2));
-	RowEnd(y, 46);
-	if (!g_show_trophies) return;
-	const float ly = RowY();
-	ImGui::SetCursorScreenPos({g_lbox.at.x, ly});
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.04f, 0.045f, 0.06f, 0.95f});
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {U(8), U(4)});
-	ImGui::BeginChild("##trophylist", {U(420), U(300)}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
-	if (rows.empty()) {
-		ImGui::TextWrapped("%s", I18n::T("Aún no hay trofeos: aparecen al jugar."));
-	} else {
-		ImGui::TextColored(kGoldL, I18n::T("%d%% completado   -   %d / %d"), pct, earned, static_cast<int>(rows.size()));
-		ImGui::ProgressBar(total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f, {-1.0f, U(8)}, "");
-		static const ImVec4 grade_col[5] = {{0.7f, 0.7f, 0.7f, 1.0f}, {0.72f, 0.82f, 0.95f, 1.0f}, {0.96f, 0.80f, 0.32f, 1.0f},
-		                                    {0.84f, 0.86f, 0.88f, 1.0f}, {0.86f, 0.56f, 0.32f, 1.0f}};
-		static const char*  grade_txt[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
-		for (const auto& r: rows) {
-			const int  g      = r.grade >= 1 && r.grade <= 4 ? r.grade : 0;
-			const bool secret = r.hidden && !r.earned;
-			ImGui::PushID(r.id);
-			ImGui::TextColored(r.earned ? grade_col[g] : ImVec4 {0.62f, 0.62f, 0.62f, 1.0f}, "%s", I18n::T(grade_txt[g]));
-			ImGui::SameLine(U(96));
-			ImGui::TextColored(r.earned ? kInkL : ImVec4 {0.66f, 0.66f, 0.66f, 1.0f}, "%s", secret ? I18n::T("Trofeo oculto") : r.name.c_str());
-			if (!secret) Tip(r.detail.c_str());
-			ImGui::PopID();
-		}
-	}
-	ImGui::EndChild();
-	ImGui::PopStyleVar();
-	ImGui::PopStyleColor();
-	RowEnd(ly, 306);
+// ---- (trofeos-exe) TROFEOS at the launcher's bottom left: a tab (the cup, TROFEOS in Cinzel, earned / total, the
+// percent by PS5 points and a fine progress line) that unfolds a panel upwards (a curtain revealed from the tab, the
+// rows entering one after another, a gold glow on the row under the mouse or the pad's focus). Each trophy: its icon
+// (trophy-icons/tropNNN.png; greyed when not earned), its name in Cinzel, its grade and the date and time it was earned
+// (trophies.json keeps the unix time of each unlock); hidden ones not earned as "Trofeo oculto". Clicking or pressing A
+// on a row unfolds its description. Data: LoadTrophyRows (trophies-list.json, the same as F2), read once when the
+// launcher opens (two small JSON files) and again each time the panel opens; the icons are decoded and scaled on a
+// worker thread the first time the panel opens, into one atlas texture (colour and grey versions), so the launcher's
+// start costs nothing more. Pad: View / Share opens and closes it, the D-pad moves, A unfolds, B closes; Esc closes. ----
+namespace TrophyPage {
+std::string DateText(int64_t t); // ("Obtenido el 18/11/2026 20:43", below)
+} // namespace TrophyPage
+
+namespace LauncherTrophy {
+
+struct Row {
+	TrophyRow t;
+	int64_t   when = 0; // unix time of the unlock (0: unknown)
+};
+
+struct IconJob {
+	std::mutex            mutex;
+	bool                  done = false;
+	std::atomic<bool>     cancel {false};
+	int                   cell = 0, pad = 2, stride = 0, cols = 0, width = 0, height = 0;
+	std::vector<uint8_t>  pixels; // RGBA8
+	std::map<int, int>    slots;  // trophy id -> slot (colour at 2 * slot, grey at 2 * slot + 1)
+};
+
+std::vector<Row>         g_rows;
+int                      g_earned = 0, g_pct = 0;
+int                      g_game_total = 0;    // (rando1) the game's trophies only (the "X / 38"): the randomizer's apart
+int                      g_rando_first = -1;  // (rando1) index of the first "Trofeos Randomizer" row (they go last), -1 none
+int                      g_grade_have[5] = {}, g_grade_all[5] = {};
+bool                     g_loaded = false;
+std::filesystem::path    g_dir;
+bool                     g_open = false;
+double                   g_changed_at = -100.0, g_opened_at = -100.0;
+float                    g_k = 0.0f, g_k_from = 0.0f; // 0 closed .. 1 open (eased)
+int                      g_sel = -1;                 // the row whose description is unfolded
+std::map<int, float>     g_expand;
+bool                     g_focus_panel = false, g_focus_first = false, g_focus_back = false, g_scroll_top = false;
+std::shared_ptr<IconJob> g_job;
+std::thread              g_worker;
+ImTextureData*           g_atlas = nullptr;
+std::shared_ptr<IconJob> g_art; // g_atlas' geometry and slots
+double                   g_atlas_at = 0.0;
+ImTextureID              g_linear_id = ImTextureID_Invalid;
+
+ImU32 Ca(int r, int g, int b, float a) {
+	return IM_COL32(r, g, b, static_cast<int>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f));
 }
+
+float Px(float v) {
+	return std::round(U(v));
+}
+
+std::filesystem::path FindDir() {
+	std::error_code       ec;
+	std::filesystem::path best;
+	for (const auto& d: std::filesystem::directory_iterator("_SaveData", ec)) {
+		const auto f = d.path() / "trophies-list.json";
+		if (std::filesystem::exists(f, ec) && (best.empty() || f < best)) best = f;
+	}
+	return best.empty() ? best : best.parent_path();
+}
+
+void Reload() {
+	g_loaded = true;
+	g_dir    = FindDir();
+	std::map<int, int64_t> times;
+	if (!g_dir.empty()) {
+		if (std::ifstream f(g_dir / "trophies.json", std::ios::binary); f) {
+			const auto j = nlohmann::json::parse(f, nullptr, false);
+			if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
+				for (const auto& [k, v]: j["unlocked"].items()) times[std::atoi(k.c_str())] = v.is_number() ? v.get<int64_t>() : 0;
+		}
+	}
+	auto rows = LoadTrophyRows();
+	g_rows.clear();
+	g_rows.reserve(rows.size());
+	for (auto& r: rows) {
+		if (Libs::Trophy::IsRando(r.id)) continue; // (rando-oculto 11-23) the randomizer's trophies hidden from the launcher
+		Row x;
+		if (r.earned)
+			if (auto it = times.find(r.id); it != times.end()) x.when = it->second;
+		x.t = std::move(r);
+		g_rows.push_back(std::move(x));
+	}
+	// Earned first, the most recent on top; then the rest in the game's order. (rando1) The randomizer's trophies after
+	// all the game's, in their own section.
+	std::stable_sort(g_rows.begin(), g_rows.end(), [](const Row& a, const Row& b) {
+		const bool ra = Libs::Trophy::IsRando(a.t.id), rb = Libs::Trophy::IsRando(b.t.id);
+		if (ra != rb) return rb;
+		if (a.t.earned != b.t.earned) return a.t.earned;
+		if (a.t.earned) return a.when > b.when;
+		return a.t.id < b.t.id;
+	});
+	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
+	int  total = 0, have = 0;
+	g_earned   = 0;
+	for (int g = 0; g < 5; g++) g_grade_have[g] = g_grade_all[g] = 0;
+	g_game_total  = 0;
+	g_rando_first = -1;
+	for (int i = 0; i < static_cast<int>(g_rows.size()); i++)
+		if (Libs::Trophy::IsRando(g_rows[static_cast<size_t>(i)].t.id)) {
+			g_rando_first = i;
+			break;
+		}
+	for (const auto& r: g_rows) {
+		if (Libs::Trophy::IsRando(r.t.id)) continue; // (rando1) not in the game's count nor percent
+		g_game_total++;
+		const int g = r.t.grade >= 1 && r.t.grade <= 4 ? r.t.grade : 0;
+		total += points(g);
+		g_grade_all[g]++;
+		if (r.t.earned) {
+			have += points(g);
+			g_earned++;
+			g_grade_have[g]++;
+		}
+	}
+	g_pct = total > 0 ? have * 100 / total : (g_game_total == 0 ? 0 : g_earned * 100 / g_game_total);
+}
+
+// One icon into its cell: an area average (premultiplied, so the edges keep no dark fringe), then the gutter.
+void PutIcon(IconJob& job, int slot, const unsigned char* src, int sw, int sh, bool grey) {
+	const int c  = job.cell;
+	const int x0 = (slot % job.cols) * job.stride + job.pad, y0 = (slot / job.cols) * job.stride + job.pad;
+	for (int y = 0; y < c; y++) {
+		const float fy0 = static_cast<float>(y) * sh / c, fy1 = static_cast<float>(y + 1) * sh / c;
+		for (int x = 0; x < c; x++) {
+			const float fx0 = static_cast<float>(x) * sw / c, fx1 = static_cast<float>(x + 1) * sw / c;
+			float       acc[4] = {0, 0, 0, 0}, wsum = 0;
+			for (int sy = static_cast<int>(fy0); sy < std::min(sh, static_cast<int>(std::ceil(fy1))); sy++) {
+				const float wy = std::min(fy1, sy + 1.0f) - std::max(fy0, static_cast<float>(sy));
+				for (int sx = static_cast<int>(fx0); sx < std::min(sw, static_cast<int>(std::ceil(fx1))); sx++) {
+					const float          w = wy * (std::min(fx1, sx + 1.0f) - std::max(fx0, static_cast<float>(sx)));
+					const unsigned char* p = src + (static_cast<size_t>(sy) * sw + sx) * 4;
+					const float          a = p[3] / 255.0f;
+					acc[0] += p[0] * a * w;
+					acc[1] += p[1] * a * w;
+					acc[2] += p[2] * a * w;
+					acc[3] += a * w;
+					wsum += w;
+				}
+			}
+			float r = 0, g = 0, b = 0, a = 0;
+			if (wsum > 0 && acc[3] > 0) {
+				r = acc[0] / acc[3];
+				g = acc[1] / acc[3];
+				b = acc[2] / acc[3];
+				a = acc[3] / wsum;
+			}
+			if (grey) {
+				// Not earned: desaturated and darkened, a little warm (old stone).
+				const float l = (0.30f * r + 0.59f * g + 0.11f * b) * 0.58f;
+				r = l * 1.04f;
+				g = l;
+				b = l * 0.90f;
+			}
+			unsigned char* d = job.pixels.data() + (static_cast<size_t>(y0 + y) * job.width + x0 + x) * 4;
+			d[0] = static_cast<unsigned char>(std::clamp(r, 0.0f, 255.0f));
+			d[1] = static_cast<unsigned char>(std::clamp(g, 0.0f, 255.0f));
+			d[2] = static_cast<unsigned char>(std::clamp(b, 0.0f, 255.0f));
+			d[3] = static_cast<unsigned char>(std::clamp(a * 255.0f, 0.0f, 255.0f));
+		}
+	}
+	// The gutter: the cell's edge pixels repeated (the linear filter never reads a neighbour).
+	for (int y = -job.pad; y < c + job.pad; y++)
+		for (int x = -job.pad; x < c + job.pad; x++) {
+			if (x >= 0 && x < c && y >= 0 && y < c) continue;
+			const int      cx = std::clamp(x, 0, c - 1), cy = std::clamp(y, 0, c - 1);
+			const uint8_t* s  = job.pixels.data() + (static_cast<size_t>(y0 + cy) * job.width + x0 + cx) * 4;
+			uint8_t*       d  = job.pixels.data() + (static_cast<size_t>(y0 + y) * job.width + x0 + x) * 4;
+			std::memcpy(d, s, 4);
+		}
+}
+
+// The worker: every trophy's PNG decoded and scaled to the size it is drawn at (colour and grey), in one atlas.
+void BuildIcons(std::shared_ptr<IconJob> job, std::filesystem::path dir, std::vector<int> ids) {
+	const int n     = static_cast<int>(ids.size());
+	job->stride     = job->cell + 2 * job->pad;
+	job->cols       = std::max(1, static_cast<int>(std::ceil(std::sqrt(2.0 * std::max(1, n)))));
+	const int lines = (2 * std::max(1, n) + job->cols - 1) / job->cols;
+	job->width      = job->cols * job->stride;
+	job->height     = lines * job->stride;
+	job->pixels.assign(static_cast<size_t>(job->width) * job->height * 4, 0);
+	int loaded = 0;
+	for (int i = 0; i < n && !job->cancel.load(); i++) {
+		if (Libs::Trophy::IsRando(ids[i])) { // (rando1) the randomizer's medal, drawn in code
+			std::vector<uint8_t> medal;
+			Libs::Trophy::RandoMedal(256, ids[i], &medal); // (rando3) each trophy its own medal
+			PutIcon(*job, 2 * i, medal.data(), 256, 256, false);
+			PutIcon(*job, 2 * i + 1, medal.data(), 256, 256, true);
+			job->slots[ids[i]] = i;
+			loaded++;
+			continue;
+		}
+		std::string bytes;
+		for (int pick: {ids[i], ids[i] == Libs::Trophy::kNexusTrophyId ? 1 : -1}) {
+			if (pick < 0) break;
+			char name[32];
+			std::snprintf(name, sizeof(name), "trop%03d.png", pick);
+			std::ifstream in(dir / "trophy-icons" / name, std::ios::binary);
+			if (!in) continue;
+			bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+			if (!bytes.empty()) break;
+		}
+		if (bytes.empty()) continue;
+		int  w = 0, h = 0, ch = 0;
+		auto px = stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()), static_cast<int>(bytes.size()), &w, &h, &ch, 4);
+		if (px == nullptr || w <= 0 || h <= 0) {
+			if (px != nullptr) stbi_image_free(px);
+			continue;
+		}
+		PutIcon(*job, 2 * i, px, w, h, false);
+		PutIcon(*job, 2 * i + 1, px, w, h, true);
+		stbi_image_free(px);
+		job->slots[ids[i]] = i;
+		loaded++;
+	}
+	std::printf("[port] launcher trophies: %d of %d icons loaded (%dx%d atlas)\n", loaded, n, job->width, job->height);
+	std::fflush(stdout);
+	std::scoped_lock lock(job->mutex);
+	job->done = true;
+}
+
+void EnsureIcons() {
+	if (g_atlas != nullptr) {
+		// (the SDL renderer's texture: bilinear; set again if the texture was created again after a device reset)
+		if (g_atlas->Status == ImTextureStatus_OK && g_atlas->GetTexID() != ImTextureID_Invalid && g_atlas->GetTexID() != g_linear_id) {
+			SDL_SetTextureScaleMode(reinterpret_cast<SDL_Texture*>(static_cast<intptr_t>(g_atlas->GetTexID())), SDL_ScaleModeLinear);
+			g_linear_id = g_atlas->GetTexID();
+		}
+		return;
+	}
+	if (g_job == nullptr) {
+		if (g_art != nullptr || g_dir.empty() || g_rows.empty()) return; // (g_art without an atlas: no icon files, the cups)
+		std::vector<int> ids;
+		for (const auto& r: g_rows) ids.push_back(r.t.id);
+		g_job       = std::make_shared<IconJob>();
+		g_job->cell = std::clamp(static_cast<int>(Px(54)), 32, 192);
+		g_worker    = std::thread(BuildIcons, g_job, g_dir, std::move(ids));
+		return;
+	}
+	{
+		std::scoped_lock lock(g_job->mutex);
+		if (!g_job->done) return;
+	}
+	if (g_worker.joinable()) g_worker.join();
+	auto job = std::move(g_job);
+	g_job    = nullptr;
+	if (job->slots.empty() || job->width <= 0 || job->height <= 0) {
+		g_art = job; // (no icon: the cups are drawn; not tried again)
+		g_art->pixels.clear();
+		g_atlas = nullptr;
+		return;
+	}
+	auto* tex = IM_NEW(ImTextureData)();
+	tex->Create(ImTextureFormat_RGBA32, job->width, job->height);
+	std::memcpy(tex->GetPixels(), job->pixels.data(), job->pixels.size());
+	tex->UseColors = true;
+	ImGui::RegisterUserTexture(tex);
+	job->pixels.clear();
+	job->pixels.shrink_to_fit();
+	g_atlas    = tex;
+	g_art      = std::move(job);
+	g_atlas_at = ImGui::GetTime();
+}
+
+// The launcher closes (before the renderer goes): the worker stopped, the atlas freed, everything as at the start.
+void Shutdown() {
+	if (g_job != nullptr) g_job->cancel = true;
+	if (g_worker.joinable()) g_worker.join();
+	g_job = nullptr;
+	FreeTexture(g_atlas);
+	g_art.reset();
+	g_linear_id = ImTextureID_Invalid;
+	g_rows.clear();
+	g_expand.clear();
+	g_loaded = g_open = false;
+	g_k = g_k_from = 0.0f;
+	g_sel        = -1;
+	g_changed_at = g_opened_at = -100.0;
+	g_focus_panel = g_focus_first = g_focus_back = false;
+}
+
+bool IsOpen() {
+	return g_open;
+}
+
+void Open(bool by_pad) {
+	if (g_open) return;
+	Reload();
+	g_k_from      = g_k;
+	g_open        = true;
+	g_changed_at  = ImGui::GetTime();
+	if (g_k < 0.05f) { // (the rows enter again, from the top, only from closed)
+		g_opened_at  = g_changed_at;
+		g_scroll_top = true;
+	}
+	g_focus_panel = true;
+	g_focus_first = by_pad;
+}
+
+void Close(bool by_pad) {
+	if (!g_open) return;
+	g_k_from     = g_k;
+	g_open       = false;
+	g_changed_at = ImGui::GetTime();
+	g_focus_back = by_pad;
+}
+
+void Toggle(bool by_pad) {
+	if (g_open) Close(by_pad);
+	else Open(by_pad);
+}
+
+// Text with extra letter spacing (the inscriptions): drawn glyph by glyph. Returns its width.
+float Spaced(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* text, float spacing) {
+	if (font == nullptr) font = ImGui::GetFont();
+	float       x = at.x;
+	const char* p = text;
+	const char* e = text + std::strlen(text);
+	while (p < e) {
+		unsigned int c = 0;
+		const int    n = ImTextCharFromUtf8(&c, p, e);
+		if (n <= 0) break;
+		if (dl != nullptr) dl->AddText(font, size, {std::floor(x), at.y}, col, p, p + n);
+		x += font->CalcTextSizeA(size, FLT_MAX, 0.0f, p, p + n).x + spacing;
+		p += n;
+	}
+	return x - at.x - (p > text ? spacing : 0.0f);
+}
+
+// The text cut with "..." to fit `max_w`.
+std::string Fit(ImFont* font, float size, const std::string& text, float max_w) {
+	if (font == nullptr) font = ImGui::GetFont();
+	if (font->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str()).x <= max_w) return text;
+	const float dots = font->CalcTextSizeA(size, FLT_MAX, 0.0f, "...").x;
+	std::string out  = text;
+	while (!out.empty()) {
+		size_t cut = out.size() - 1;
+		while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) cut--; // (a whole UTF-8 character)
+		out.resize(cut);
+		while (!out.empty() && out.back() == ' ') out.pop_back();
+		if (font->CalcTextSizeA(size, FLT_MAX, 0.0f, out.c_str()).x + dots <= max_w) break;
+	}
+	return out + "...";
+}
+
+void Lozenge(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+	dl->AddQuadFilled({c.x, c.y - r}, {c.x + r, c.y}, {c.x, c.y + r}, {c.x - r, c.y}, col);
+}
+
+// A chevron (^ at angle 0) centred at c, turned by `angle` radians.
+void Chevron(ImDrawList* dl, ImVec2 c, float s, float angle, ImU32 col, float thick) {
+	const float cs = std::cos(angle), sn = std::sin(angle);
+	const auto  P  = [&](float x, float y) { return ImVec2 {c.x + x * cs - y * sn, c.y + x * sn + y * cs}; };
+	const ImVec2 pts[3] = {P(-s, s * 0.5f), P(0, -s * 0.5f), P(s, s * 0.5f)};
+	dl->AddPolyline(pts, 3, col, ImDrawFlags_None, thick);
+}
+
+// A small padlock (not earned) with its centre at c.
+void Padlock(ImDrawList* dl, ImVec2 c, float s, float a) {
+	dl->AddCircleFilled(c, s * 1.05f, Ca(8, 8, 10, 0.92f * a));
+	dl->AddCircle(c, s * 1.05f, Ca(150, 136, 110, 0.65f * a), 0, std::max(1.0f, s * 0.10f));
+	const ImU32 col = Ca(196, 184, 160, a);
+	dl->PathArcTo({c.x, c.y - s * 0.12f}, s * 0.30f, 3.14159265f, 2.0f * 3.14159265f, 10);
+	dl->PathStroke(col, ImDrawFlags_None, std::max(1.0f, s * 0.13f));
+	dl->AddLine({c.x - s * 0.30f, c.y - s * 0.12f}, {c.x - s * 0.30f, c.y + s * 0.05f}, col, std::max(1.0f, s * 0.13f));
+	dl->AddLine({c.x + s * 0.30f, c.y - s * 0.12f}, {c.x + s * 0.30f, c.y + s * 0.05f}, col, std::max(1.0f, s * 0.13f));
+	dl->AddRectFilled({c.x - s * 0.46f, c.y + s * 0.02f}, {c.x + s * 0.46f, c.y + s * 0.56f}, col, s * 0.10f);
+}
+
+// The panel's reveal: every command clipped to below `top` (the curtain rising from the tab) and the vertices faded.
+void Reveal(ImDrawList* dl, int first_vtx, float top, float alpha) {
+	if (dl == nullptr) return;
+	for (auto& cmd: dl->CmdBuffer) {
+		cmd.ClipRect.y = std::max(cmd.ClipRect.y, top);
+		if (cmd.ClipRect.w < cmd.ClipRect.y) cmd.ClipRect.w = cmd.ClipRect.y;
+	}
+	if (alpha >= 0.999f) return;
+	for (int i = first_vtx; i < dl->VtxBuffer.Size; i++) {
+		ImU32&      c = dl->VtxBuffer[i].col;
+		const float a = static_cast<float>((c >> IM_COL32_A_SHIFT) & 0xFF) * alpha;
+		c             = (c & ~IM_COL32_A_MASK) | (static_cast<ImU32>(a + 0.5f) << IM_COL32_A_SHIFT);
+	}
+}
+
+const char* GradeName(int g) {
+	static const char* names[5] = {"", "Platino", "Oro", "Plata", "Bronce"};
+	return g >= 1 && g <= 4 ? I18n::T(names[g]) : "";
+}
+
+// The tab (always) and, open or closing, the panel above it. column_x: the left edge of the launcher's column.
+void Draw(float width, float height, float column_x) {
+	if (!g_loaded) Reload();
+	auto&        io  = ImGui::GetIO();
+	const double now = ImGui::GetTime();
+	if (!g_popup.load()) {
+		if (ImGui::IsKeyPressed(ImGuiKey_GamepadBack, false)) Toggle(true);
+		else if (g_open && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) Close(true);
+	}
+	{
+		const float t = static_cast<float>((now - g_changed_at) / (g_open ? 0.38 : 0.24));
+		g_k = g_open ? g_k_from + (1.0f - g_k_from) * Anim::EaseOutQuint(t) : g_k_from * (1.0f - Anim::EaseOut(t));
+	}
+	if (g_open || g_k > 0.0f) EnsureIcons();
+
+	ImFont*      cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	ImFont*      serif  = g_font_serif != nullptr ? g_font_serif : ImGui::GetFont();
+	ImFont*      semi   = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont();
+	const ImU32  gold   = IM_COL32(222, 196, 140, 255);
+	const float  tx = Px(16), tw = Px(400), th = Px(60);
+	const float  ty = std::round(height - U(34) - th);
+	const float  frac = static_cast<float>(g_pct) / 100.0f;
+
+	// ---- The tab ----
+	bool tab_hovered = false;
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##trophy-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse |
+	                                          ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##trophy-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		tab_hovered        = ImGui::IsItemHovered();
+		if (tab_hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const bool  on  = tab_hovered || ImGui::IsItemFocused() || ImGui::IsItemActive();
+		const float hot = std::max(Anim::Hot(ImGui::GetItemID(), on), g_k * 0.6f);
+		Tip("Tus trofeos: los obtenidos con su fecha y hora, y los que faltan. En el mando, el bot\xC3\xB3n View / Share los abre y los cierra.");
+		if (clicked) Toggle(!ImGui::IsMouseReleased(ImGuiMouseButton_Left));
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) { // the glow around it
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(240, 200, 120, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(70, 56, 32, 0.30f + 0.25f * hot),
+		                            Ca(70, 56, 32, 0.10f), Ca(70, 56, 32, 0.0f), Ca(70, 56, 32, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		// The medallion with the cup.
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		dl->AddCircleFilled(mc, mr, IM_COL32(22, 18, 12, 255), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		dl->AddCircle(mc, mr - Px(3), Ca(222, 196, 140, 0.18f), 32, 1.0f);
+		const float cs = std::round(mr * 1.25f);
+		Libs::Trophy::DrawCup(dl, mc.x - cs * 0.5f, mc.y - cs * 0.48f, cs, Libs::Trophy::CupColor(g_earned > 0 ? 2 : 0));
+		// TROFEOS, then the counter and the percent.
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), I18n::T("TROFEOS"), U(2.5f));
+		char count[64];
+		if (!g_rows.empty()) std::snprintf(count, sizeof(count), "%d / %d", g_earned, g_game_total);
+		else std::snprintf(count, sizeof(count), "-");
+		const float cw = Spaced(dl, cinzel, Px(16), {lx, a.y + Px(32)}, IM_COL32(236, 226, 204, 240), count, U(1));
+		if (!g_rows.empty()) {
+			char pct[16];
+			std::snprintf(pct, sizeof(pct), "%d%%", g_pct);
+			Lozenge(dl, {std::round(lx + cw + Px(12)), std::round(a.y + Px(32) + Px(16) * 0.55f)}, Px(3), Ca(204, 176, 122, 0.8f));
+			Spaced(dl, cinzel, Px(16), {lx + cw + Px(24), a.y + Px(32)}, gold, pct, U(1));
+		}
+		// The fine progress line along the bottom.
+		const float px0 = lx, px1 = b.x - Px(46), py = std::round(b.y - Px(8));
+		dl->AddRectFilled({px0, py}, {px1, py + Px(2)}, IM_COL32(255, 255, 255, 28));
+		if (frac > 0.0f)
+			dl->AddRectFilledMultiColor({px0, py}, {px0 + (px1 - px0) * frac, py + Px(2)}, IM_COL32(150, 112, 52, 255), IM_COL32(240, 206, 136, 255),
+			                            IM_COL32(240, 206, 136, 255), IM_COL32(150, 112, 52, 255));
+		// The chevron: up (the panel opens upwards), turned down when open.
+		Chevron(dl, {std::round(b.x - Px(24)), std::round(a.y + th * 0.5f)}, Px(7), 3.14159265f * g_k, Ca(222, 196, 140, 0.7f + 0.3f * hot),
+		        std::max(1.5f, U(1.8f)));
+	}
+	ImGui::End();
+
+	// ---- The panel ----
+	if (!g_open && g_k <= 0.0f) {
+		if (g_focus_back) {
+			g_focus_back = false;
+			ImGui::SetWindowFocus("##launcher-bottom");
+		}
+		return;
+	}
+	const float pw  = std::clamp(column_x - tx - Px(24), Px(340), Px(580));
+	const float pb  = std::round(ty - Px(10));
+	const float ph  = std::round(std::min(U(720), pb - Px(18)));
+	const float pt  = pb - ph;
+	const bool  closing = !g_open;
+	if (g_focus_panel) ImGui::SetNextWindowFocus();
+	ImGui::SetNextWindowPos({tx, pt});
+	ImGui::SetNextWindowSize({pw, ph});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##trophy-panel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse |
+	                                            ImGuiWindowFlags_NoFocusOnAppearing | (closing ? ImGuiWindowFlags_NoInputs : 0));
+	ImGui::PopStyleVar();
+	g_focus_panel     = false;
+	auto*  dl         = ImGui::GetWindowDrawList();
+	const ImVec2 a {tx, pt}, b {tx + pw, pb};
+	const float  rr   = Px(8);
+	// Shadow, body, the warm light from above, the double gold edge and the corner brackets.
+	dl->PushClipRect({0, 0}, {width, height}, false);
+	for (int k = 1; k <= 4; k++) {
+		const float g = static_cast<float>(k) * U(4);
+		dl->AddRectFilled({a.x - g, a.y - g + U(4)}, {b.x + g, b.y + g + U(4)}, IM_COL32(0, 0, 0, 26), rr + g);
+	}
+	dl->PopClipRect();
+	dl->AddRectFilled(a, b, IM_COL32(11, 10, 10, 238), rr);
+	dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + Px(170)}, IM_COL32(64, 50, 28, 92), IM_COL32(64, 50, 28, 60),
+	                            IM_COL32(64, 50, 28, 0), IM_COL32(64, 50, 28, 0));
+	dl->AddRect(a, b, IM_COL32(204, 176, 122, 160), rr, 0, std::max(1.0f, U(1.25f)));
+	dl->AddRect({a.x + Px(5), a.y + Px(5)}, {b.x - Px(5), b.y - Px(5)}, IM_COL32(204, 176, 122, 38), Px(5), 0, 1.0f);
+	{
+		const float in = Px(10), len = Px(20), th2 = std::max(1.0f, U(1.5f));
+		const ImU32 c  = IM_COL32(222, 196, 140, 190);
+		const ImVec2 corners[4] = {{a.x + in, a.y + in}, {b.x - in, a.y + in}, {a.x + in, b.y - in}, {b.x - in, b.y - in}};
+		for (int k = 0; k < 4; k++) {
+			const float sx = (k % 2 == 0) ? 1.0f : -1.0f, sy = (k < 2) ? 1.0f : -1.0f;
+			const ImVec2 p = corners[k];
+			dl->AddLine(p, {p.x + sx * len, p.y}, c, th2);
+			dl->AddLine(p, {p.x, p.y + sy * len}, c, th2);
+			Lozenge(dl, {p.x + sx * Px(5), p.y + sy * Px(5)}, Px(2.5f), c);
+		}
+	}
+	// The header: TROFEOS and the percent, how many, the bar, each grade's count, a rule.
+	const float hx = a.x + Px(26), hw = pw - Px(52);
+	Spaced(dl, cinzel, Px(27), {hx, a.y + Px(20)}, gold, I18n::T("TROFEOS"), U(4));
+	{
+		char pct[16];
+		std::snprintf(pct, sizeof(pct), "%d%%", g_pct);
+		const float w = Spaced(nullptr, cinzel, Px(30), {0, 0}, 0, pct, U(1.5f));
+		Spaced(dl, cinzel, Px(30), {hx + hw - w, a.y + Px(17)}, IM_COL32(240, 230, 208, 255), pct, U(1.5f));
+	}
+	{
+		char line[128];
+		std::snprintf(line, sizeof(line), I18n::T("%d de %d trofeos obtenidos"), g_earned, g_game_total);
+		dl->AddText(serif, Px(15), {hx, a.y + Px(58)}, IM_COL32(206, 196, 176, 230), line);
+	}
+	{
+		const float by = std::round(a.y + Px(86)), bh = Px(8);
+		const float fill = frac * Anim::EaseOut(static_cast<float>((now - g_opened_at - 0.15) / 0.9));
+		dl->AddRectFilled({hx, by}, {hx + hw, by + bh}, IM_COL32(255, 255, 255, 18), bh * 0.5f);
+		dl->AddRect({hx, by}, {hx + hw, by + bh}, IM_COL32(204, 176, 122, 70), bh * 0.5f, 0, 1.0f);
+		if (fill > 0.0f) {
+			const float fx = hx + hw * fill;
+			dl->AddRectFilledMultiColor({hx + 1, by + 1}, {fx, by + bh - 1}, IM_COL32(128, 92, 40, 255), IM_COL32(236, 200, 128, 255),
+			                            IM_COL32(200, 160, 92, 255), IM_COL32(100, 72, 30, 255));
+			// A slow shimmer running along the filled part.
+			const float sw = Px(60), sx = hx + std::fmod(static_cast<float>(now) * U(110), hw + sw) - sw;
+			dl->PushClipRect({hx, by}, {fx, by + bh}, true);
+			dl->AddRectFilledMultiColor({sx, by}, {sx + sw * 0.5f, by + bh}, IM_COL32(255, 240, 200, 0), IM_COL32(255, 240, 200, 90),
+			                            IM_COL32(255, 240, 200, 90), IM_COL32(255, 240, 200, 0));
+			dl->AddRectFilledMultiColor({sx + sw * 0.5f, by}, {sx + sw, by + bh}, IM_COL32(255, 240, 200, 90), IM_COL32(255, 240, 200, 0),
+			                            IM_COL32(255, 240, 200, 0), IM_COL32(255, 240, 200, 90));
+			dl->PopClipRect();
+			Lozenge(dl, {std::round(fx), by + bh * 0.5f}, Px(6), IM_COL32(250, 226, 170, 255));
+			Lozenge(dl, {std::round(fx), by + bh * 0.5f}, Px(3), IM_COL32(120, 86, 36, 255));
+		}
+	}
+	{
+		const float gy = std::round(a.y + Px(108)), cell = hw / 4.0f;
+		for (int g = 1; g <= 4; g++) {
+			const float x = hx + cell * (g - 1);
+			Libs::Trophy::DrawCup(dl, x, gy, Px(20), Libs::Trophy::CupColor(g, g_grade_have[g] > 0 ? 1.0f : 0.45f));
+			char n[32];
+			std::snprintf(n, sizeof(n), "%d/%d", g_grade_have[g], g_grade_all[g]);
+			dl->AddText(semi, Px(14), {x + Px(26), gy + Px(2)}, Libs::Trophy::CupColor(g, g_grade_have[g] > 0 ? 1.0f : 0.6f), n);
+		}
+	}
+	{
+		const float ry = std::round(a.y + Px(140)) + 0.5f, mid = hx + hw * 0.5f;
+		dl->AddRectFilledMultiColor({hx, ry - 0.5f}, {mid, ry + 0.5f}, IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 170),
+		                            IM_COL32(204, 176, 122, 170), IM_COL32(204, 176, 122, 0));
+		dl->AddRectFilledMultiColor({mid, ry - 0.5f}, {hx + hw, ry + 0.5f}, IM_COL32(204, 176, 122, 170), IM_COL32(204, 176, 122, 0),
+		                            IM_COL32(204, 176, 122, 0), IM_COL32(204, 176, 122, 170));
+		Lozenge(dl, {std::round(mid), ry}, Px(4), IM_COL32(222, 196, 140, 220));
+	}
+	// The list (a child: ImGui scrolls it to the pad's focus; the wheel eases).
+	const float  list_top = std::round(a.y + Px(152)), list_bottom = std::round(b.y - Px(40));
+	ImDrawList*  list_dl  = nullptr;
+	ImGui::SetCursorScreenPos({a.x + Px(12), list_top});
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0, 0, 0, 0});
+	ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4 {0, 0, 0, 0}); // (the rows draw their own focus glow)
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, Px(2)});
+	ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, Px(8));
+	if (g_scroll_top) ImGui::SetNextWindowScroll({0.0f, 0.0f}); // (opened from closed: the list from the top)
+	g_scroll_top = false;
+	ImGui::BeginChild("##trophy-list", {pw - Px(24), list_bottom - list_top}, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+	Anim::SmoothScroll();
+	list_dl = ImGui::GetWindowDrawList();
+	if (g_rows.empty()) {
+		const char*  msg = I18n::T("A\xC3\xBAn no hay trofeos: aparecen al jugar.");
+		const float  w   = ImGui::GetContentRegionAvail().x;
+		const ImVec2 ts  = serif->CalcTextSizeA(Px(17), FLT_MAX, w - Px(20), msg);
+		list_dl->AddText(serif, Px(17), {ImGui::GetCursorScreenPos().x + (w - ts.x) * 0.5f, ImGui::GetCursorScreenPos().y + Px(40)},
+		                 IM_COL32(206, 196, 176, 230), msg, nullptr, w - Px(20));
+		ImGui::Dummy({w, Px(120)});
+	}
+	const float dt   = std::clamp(io.DeltaTime, 0.0f, 0.1f);
+	const float isz  = std::round(U(54));
+	const float h0   = Px(80);
+	for (int i = 0; i < static_cast<int>(g_rows.size()); i++) {
+		const Row&  r      = g_rows[static_cast<size_t>(i)];
+		if (i == g_rando_first) { // (rando1) the "Trofeos Randomizer" section's title
+			int got = 0, all = 0;
+			for (int k = g_rando_first; k < static_cast<int>(g_rows.size()); k++, all++)
+				if (g_rows[static_cast<size_t>(k)].t.earned) got++;
+			char         title[96];
+			std::snprintf(title, sizeof(title), "TROFEOS RANDOMIZER  %d / %d", got, all);
+			const ImVec2 hp = ImGui::GetCursorScreenPos();
+			const float  hw = ImGui::GetContentRegionAvail().x;
+			ImGui::Dummy({hw, Px(48)});
+			list_dl->AddLine({hp.x + Px(8), hp.y + Px(14)}, {hp.x + hw - Px(8), hp.y + Px(14)}, IM_COL32(204, 176, 122, 110), 1.0f);
+			list_dl->AddText(serif, Px(18), {hp.x + Px(12), hp.y + Px(20)}, IM_COL32(222, 196, 140, 240), title);
+		}
+		const bool  secret = r.t.hidden && !r.t.earned;
+		const int   g      = r.t.grade >= 1 && r.t.grade <= 4 ? r.t.grade : 0;
+		const float lw     = ImGui::GetContentRegionAvail().x;
+		const float tx0    = Px(12) + isz + Px(18); // the text's left, from the row's
+		const float wrap   = std::max(Px(80), lw - tx0 - Px(40));
+		const std::string desc = secret ? std::string(I18n::T("Se revelar\xC3\xA1 al obtenerlo.")) : r.t.detail;
+		const float desc_size  = Px(16);
+		const float desc_h     = desc.empty() ? 0.0f : serif->CalcTextSizeA(desc_size, FLT_MAX, wrap, desc.c_str()).y + Px(14);
+		float&      e          = g_expand[r.t.id];
+		{
+			const float to = g_sel == r.t.id ? 1.0f : 0.0f;
+			e += (to - e) * std::min(1.0f, dt * 11.0f);
+			if (std::fabs(to - e) < 0.002f) e = to;
+		}
+		const float  ee = e * e * (3.0f - 2.0f * e); // (smoothstep)
+		const float  h  = std::round(h0 + desc_h * ee);
+		const ImVec2 at = ImGui::GetCursorScreenPos();
+		ImGui::PushID(r.t.id);
+		if (g_focus_first && i == 0) ImGui::SetKeyboardFocusHere();
+		const bool pressed = ImGui::InvisibleButton("##row", {lw, h}, ImGuiButtonFlags_EnableNav); // (EnableNav: the pad reaches it)
+		const bool hovered = ImGui::IsItemHovered();
+		const bool on      = hovered || ImGui::IsItemFocused();
+		const float hot    = Anim::Hot(ImGui::GetItemID(), on);
+		if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		if (pressed && !closing) g_sel = g_sel == r.t.id ? -1 : r.t.id;
+		ImGui::PopID();
+		if (at.y > list_bottom + Px(10) || at.y + h < list_top - Px(10)) continue; // (out of view: only its space)
+		// The entrance: each row a little after the one above (0.045 s), sliding in from the left and fading in.
+		const float delay = 0.12f + 0.045f * static_cast<float>(std::min(i, 16));
+		const float ein   = Anim::EaseOut(static_cast<float>((now - g_opened_at - delay) / 0.34));
+		if (ein <= 0.0f) continue;
+		const float  al = ein;
+		const float  ox = std::round((1.0f - ein) * -U(28));
+		const ImVec2 ra {at.x + ox, at.y}, rb {at.x + ox + lw, at.y + h};
+		// The glow (hover / focus) and the selected row's steady light.
+		const float lit = std::max(hot, g_sel == r.t.id ? 0.45f : 0.0f);
+		if (lit > 0.0f) {
+			for (int k = 1; k <= 2; k++) {
+				const float gg = static_cast<float>(k) * U(1.5f);
+				list_dl->AddRect({ra.x + gg, ra.y + gg}, {rb.x - gg, rb.y - gg}, Ca(240, 200, 120, 0.10f / k * hot * al), Px(6));
+			}
+			list_dl->AddRectFilledMultiColor(ra, rb, Ca(222, 196, 140, 0.16f * lit * al), Ca(222, 196, 140, 0.03f * lit * al),
+			                                 Ca(222, 196, 140, 0.03f * lit * al), Ca(222, 196, 140, 0.16f * lit * al));
+			list_dl->AddRect(ra, rb, Ca(236, 206, 146, 0.55f * hot * al), Px(5), 0, std::max(1.0f, U(1.25f)));
+			const float bar = (rb.y - ra.y) * (0.5f - 0.40f * lit);
+			list_dl->AddRectFilled({ra.x, ra.y + bar}, {ra.x + Px(3), rb.y - bar}, Ca(244, 214, 150, lit * al), Px(2));
+		} else if (r.t.earned) {
+			list_dl->AddRectFilledMultiColor(ra, {ra.x + lw * 0.5f, rb.y}, Ca(70, 56, 32, 0.22f * al), Ca(70, 56, 32, 0.0f), Ca(70, 56, 32, 0.0f),
+			                                 Ca(70, 56, 32, 0.22f * al));
+		}
+		// The icon in its frame.
+		const ImVec2 i0 {std::floor(ra.x + Px(12)), std::floor(ra.y + (h0 - isz) * 0.5f)}, i1 {i0.x + isz, i0.y + isz};
+		list_dl->AddRectFilled({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Ca(6, 6, 8, al), Px(4));
+		if (r.t.earned)
+			list_dl->AddRect({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Libs::Trophy::CupColor(g, (0.75f + 0.25f * hot) * al), Px(4), 0,
+			                 std::max(1.0f, U(1.5f)));
+		else list_dl->AddRect({i0.x - Px(3), i0.y - Px(3)}, {i1.x + Px(3), i1.y + Px(3)}, Ca(110, 102, 88, 0.6f * al), Px(4), 0, 1.0f);
+		bool drew_icon = false;
+		if (!secret && g_atlas != nullptr && g_art != nullptr) {
+			if (auto it = g_art->slots.find(r.t.id); it != g_art->slots.end()) {
+				const int    slot = 2 * it->second + (r.t.earned ? 0 : 1);
+				const float  u0   = static_cast<float>((slot % g_art->cols) * g_art->stride + g_art->pad) / g_art->width;
+				const float  v0   = static_cast<float>((slot / g_art->cols) * g_art->stride + g_art->pad) / g_art->height;
+				const float  u1   = u0 + static_cast<float>(g_art->cell) / g_art->width;
+				const float  v1   = v0 + static_cast<float>(g_art->cell) / g_art->height;
+				const float  fade = std::clamp(static_cast<float>((now - g_atlas_at) / 0.3), 0.0f, 1.0f);
+				const float  lum  = r.t.earned ? 1.0f : 0.85f + 0.15f * hot;
+				list_dl->AddImage(g_atlas->GetTexRef(), i0, i1, {u0, v0}, {u1, v1}, Ca(static_cast<int>(255 * lum), static_cast<int>(255 * lum),
+				                                                                      static_cast<int>(255 * lum), fade * al));
+				drew_icon = fade >= 1.0f;
+			}
+		}
+		if (secret) {
+			const ImVec2 qs = cinzel->CalcTextSizeA(Px(30), FLT_MAX, 0.0f, "?");
+			list_dl->AddText(cinzel, Px(30), {std::round(i0.x + (isz - qs.x) * 0.5f), std::round(i0.y + (isz - qs.y) * 0.5f)}, Ca(150, 140, 120, al), "?");
+		} else if (!drew_icon) {
+			const float cs = std::round(isz * 0.62f);
+			Libs::Trophy::DrawCup(list_dl, i0.x + (isz - cs) * 0.5f, i0.y + (isz - cs) * 0.5f, cs, Libs::Trophy::CupColor(r.t.earned ? g : 0, al * 0.9f));
+		}
+		if (!r.t.earned && !secret) Padlock(list_dl, {i1.x - Px(2), i1.y - Px(2)}, Px(9), al);
+		// The name, the grade and the date.
+		const float  nx    = ra.x + tx0;
+		const float  ns    = Px(18);
+		const std::string name = Fit(cinzel, ns, secret ? std::string(I18n::T("Trofeo oculto")) : r.t.name, lw - tx0 - Px(40));
+		list_dl->AddText(cinzel, ns, {nx, ra.y + Px(15)}, r.t.earned ? Ca(240, 230, 208, al) : Ca(150, 144, 134, al), name.c_str());
+		{
+			const float ly = ra.y + Px(46);
+			Lozenge(list_dl, {std::round(nx + Px(4)), std::round(ly + Px(8))}, Px(4), Libs::Trophy::CupColor(g, (r.t.earned ? 1.0f : 0.5f) * al));
+			const char* gname = GradeName(g);
+			list_dl->AddText(semi, Px(14), {nx + Px(14), ly}, Libs::Trophy::CupColor(g, (r.t.earned ? 1.0f : 0.6f) * al), gname);
+			const float gw   = semi->CalcTextSizeA(Px(14), FLT_MAX, 0.0f, gname).x;
+			const std::string when = r.t.earned ? TrophyPage::DateText(r.when) : std::string(I18n::T("Sin obtener"));
+			list_dl->AddText(semi, Px(14), {nx + Px(14) + gw + Px(8), ly}, Ca(150, 140, 120, al), "\xC2\xB7");
+			list_dl->AddText(serif, Px(14), {nx + Px(14) + gw + Px(20), ly}, r.t.earned ? Ca(206, 196, 176, al) : Ca(130, 124, 114, al), when.c_str());
+		}
+		Chevron(list_dl, {std::round(rb.x - Px(20)), std::round(ra.y + h0 * 0.5f)}, Px(5), 3.14159265f * (1.0f - ee),
+		        Ca(222, 196, 140, (0.35f + 0.6f * std::max(hot, ee)) * al), std::max(1.2f, U(1.4f)));
+		// The description, unfolding under the row.
+		if (ee > 0.01f && !desc.empty()) {
+			const float dy = ra.y + h0 - Px(4);
+			list_dl->PushClipRect({ra.x, ra.y}, {rb.x, rb.y}, true);
+			list_dl->AddRectFilled({nx - Px(10), dy}, {nx - Px(9), dy + desc_h - Px(12)}, Ca(204, 176, 122, 0.6f * ee * al));
+			list_dl->AddText(serif, desc_size, {nx, dy + (1.0f - ee) * -Px(6)}, secret ? Ca(170, 160, 140, ee * al) : Ca(224, 214, 194, ee * al),
+			                 desc.c_str(), nullptr, wrap);
+			list_dl->PopClipRect();
+		}
+		// A fine rule under the row.
+		list_dl->AddRectFilledMultiColor({ra.x + Px(10), rb.y + Px(1)}, {rb.x - Px(10), rb.y + Px(2)}, Ca(204, 176, 122, 0.22f * al),
+		                                 Ca(204, 176, 122, 0.0f), Ca(204, 176, 122, 0.0f), Ca(204, 176, 122, 0.22f * al));
+	}
+	g_focus_first = false;
+	ImGui::EndChild();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+	{
+		const char*  hint = I18n::T("Clic o A: ver la descripci\xC3\xB3n   \xC2\xB7   B o Esc: cerrar");
+		const ImVec2 hs   = semi->CalcTextSizeA(Px(13), FLT_MAX, 0.0f, hint);
+		dl->AddText(semi, Px(13), {std::round(a.x + (pw - hs.x) * 0.5f), std::round(b.y - Px(28))}, IM_COL32(200, 188, 164, 170), hint);
+	}
+	const bool panel_hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+	ImGui::End();
+	// A click anywhere else closes it.
+	if (g_open && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !panel_hovered && !tab_hovered) Close(false);
+	// The reveal: the curtain rises from the tab (and falls back when closing), with a gold edge on its way.
+	const float top = pb - ph * g_k;
+	const float alpha = std::clamp(g_k * 1.6f, 0.0f, 1.0f);
+	Reveal(dl, 0, top, alpha);
+	Reveal(list_dl, 0, top, alpha);
+	if (g_k < 0.999f) {
+		auto*       fg = ImGui::GetForegroundDrawList();
+		const float e  = std::sin(3.14159265f * g_k); // (brightest mid-way)
+		fg->AddRectFilledMultiColor({a.x, top - Px(10)}, {b.x, top}, Ca(240, 200, 120, 0.0f), Ca(240, 200, 120, 0.0f), Ca(240, 200, 120, 0.22f * e),
+		                            Ca(240, 200, 120, 0.22f * e));
+		fg->AddLine({a.x + Px(4), top}, {b.x - Px(4), top}, Ca(250, 224, 160, 0.9f * e), std::max(1.0f, U(1.5f)));
+	}
+	if (closing && g_k <= 0.0f && g_focus_back) {
+		g_focus_back = false;
+		ImGui::SetWindowFocus("##launcher-bottom");
+	}
+}
+
+// (online12) ONLINE beside TROFEOS at the launcher's bottom left: same tab look (medallion with a pulsing soul, ONLINE in
+// Cinzel); a click opens the "Conexión online" panel (account, password, server state) over the launcher.
+bool g_online_open = false;
+void DrawOnline(float width, float height) {
+	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	const float th = Px(60), tw = Px(300);
+	const float tx = Px(16) + Px(400) + Px(14);
+	const float ty = std::round(height - U(34) - th);
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##online-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##online-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		const bool hov     = ImGui::IsItemHovered();
+		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || g_online_open);
+		Tip("Conexi\xC3\xB3n online: tu cuenta y contrase\xC3\xB1" "a para jugar con tus amigos (mensajes, manchas, fantasmas, invocaciones).");
+		if (clicked) g_online_open = !g_online_open;
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(150, 190, 255, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(40, 56, 90, 0.30f + 0.25f * hot),
+		                            Ca(40, 56, 90, 0.10f), Ca(40, 56, 90, 0.0f), Ca(40, 56, 90, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
+		dl->AddCircleFilled(mc, mr, IM_COL32(12, 16, 26, 255), 32);
+		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.45f + 0.12f * k + 0.05f * pl), Ca(150, 190, 255, 0.05f * k), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "ONLINE", U(2.5f));
+		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), I18n::T("Cuenta y amigos"), U(1));
+	}
+	ImGui::End();
+	if (!g_online_open) return;
+	const ImVec2 ps {std::min(width * 0.9f, Px(980)), std::min(height * 0.8f, Px(860))};
+	ImGui::SetNextWindowPos({std::round((width - ps.x) * 0.5f), std::round((height - ps.y) * 0.5f)});
+	ImGui::SetNextWindowSize(ps);
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4 {0.05f, 0.05f, 0.06f, 0.96f});
+	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.80f, 0.69f, 0.48f, 0.7f});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, Px(10));
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {Px(28), Px(24)});
+	ImGui::Begin("##online-panel", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+	ImGui::BeginChild("##online-body", {0, -Px(64)});
+	Multiplayer::Card(U(1));
+	ImGui::EndChild();
+	if (Anim::Button(I18n::T("Cerrar"), {Px(220), Px(48)}, U(1))) g_online_open = false;
+	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) g_online_open = false;
+	ImGui::End();
+	ImGui::PopStyleVar(2);
+	ImGui::PopStyleColor(2);
+}
+
+// (cleanbtn) "SIN TRUCOS" beside ONLINE at the launcher's bottom left: the same tab look as DrawOnline (medallion with a
+// soul, caps in Cinzel). It is NOT a panel but a toggle: a click flips g_saved.no_cheats and saves it to settings.ini at
+// once (the very save the old in-panel NoCheatsBlock box did). The medallion stays lit while no_cheats is ON, so the state
+// is visible without opening anything. Launcher only (as DrawOnline). Behaviour unchanged: ON still hides every F2 cheat and
+// forces them off at run time; this only moves the control out of the Conexión online panel onto the bottom bar.
+void DrawNoCheats(float width, float height) {
+	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	const float th = Px(60), tw = Px(300);
+	const float tx = (Px(16) + Px(400) + Px(14)) + Px(300) + Px(14); // ONLINE's tx + its width + the same Px(14) gap
+	const float ty = std::round(height - U(34) - th);
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##nocheats-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                           ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		const bool on = g_saved.no_cheats;
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##nocheats-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav);
+		const bool hov     = ImGui::IsItemHovered();
+		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || on);
+		Tip("Oculta y desactiva todos los trucos del men\xC3\xBA F2 (armas, objetos, almas, nivel...). \xC3\x9Atil para jugar limpio online.");
+		if (clicked) {
+			// Same save as the old NoCheatsBlock, only toggling instead of reading a checkbox.
+			const bool now = !g_saved.no_cheats;
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+			for (Settings* s: {&on_disk, &g_saved, &g_edit})
+				s->no_cheats = now;
+			(void)SaveSettings(g_rt.ini_path, on_disk);
+			std::printf("[port] sin_trucos=%d\n", now ? 1 : 0);
+		}
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(150, 190, 255, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(40, 56, 90, 0.30f + 0.25f * hot),
+		                            Ca(40, 56, 90, 0.10f), Ca(40, 56, 90, 0.0f), Ca(40, 56, 90, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
+		dl->AddCircleFilled(mc, mr, IM_COL32(12, 16, 26, 255), 32);
+		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.45f + 0.12f * k + 0.05f * pl), Ca(150, 190, 255, 0.05f * k), 32);
+		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
+		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "SIN TRUCOS", U(2.5f));
+		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), on ? "Activado" : "Desactivado", U(1));
+	}
+	ImGui::End();
+}
+
+// (rando1) RANDOMIZER beside SIN TRUCOS: a click turns it on / off (offline, cheats off, "Trofeos Randomizer"); a right
+// click draws a new seed. The seed is kept in settings.ini (randomizer_semilla): the same seed, the same draw.
+void DrawRandomizer(float width, float height) {
+	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
+	const float th = Px(60), tw = Px(300);
+	const float tx = (Px(16) + Px(400) + Px(14)) + Px(300) + Px(14) + Px(300) + Px(14); // SIN TRUCOS' tx + its width + the gap
+	const float ty = std::round(height - U(34) - th);
+	ImGui::SetNextWindowPos({tx, ty});
+	ImGui::SetNextWindowSize({tw, th});
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+	ImGui::Begin("##rando-tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+	                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoFocusOnAppearing);
+	ImGui::PopStyleVar();
+	{
+		const bool on = g_saved.randomizer;
+		ImGui::SetCursorScreenPos({tx, ty});
+		const bool clicked = ImGui::InvisibleButton("##rando-tab-button", {tw, th}, ImGuiButtonFlags_EnableNav | ImGuiButtonFlags_MouseButtonLeft |
+		                                                                               ImGuiButtonFlags_MouseButtonRight);
+		const bool right   = clicked && ImGui::IsMouseReleased(ImGuiMouseButton_Right);
+		const bool hov     = ImGui::IsItemHovered();
+		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || on);
+		Tip("Randomizer: partida sin conexi\xC3\xB3n y sin trucos, con los Trofeos Randomizer al derrotar a cada archidemonio. "
+		    "Clic derecho: semilla nueva.");
+		if (clicked) {
+			Settings on_disk;
+			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+			const bool now  = right ? true : !g_saved.randomizer;
+			int        seed = g_saved.randomizer_seed;
+			if (right || (now && seed == 0)) seed = 1 + static_cast<int>(static_cast<unsigned>(std::time(nullptr) * 2654435761u) % 999999u);
+			for (Settings* s: {&on_disk, &g_saved, &g_edit}) {
+				s->randomizer      = now;
+				s->randomizer_seed = seed;
+			}
+			(void)SaveSettings(g_rt.ini_path, on_disk);
+			std::printf("[port] randomizer=%d semilla=%d\n", now ? 1 : 0, seed);
+		}
+		auto*        dl = ImGui::GetWindowDrawList();
+		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
+		const float  rr = Px(6);
+		dl->PushClipRect({0, 0}, {width, height}, false);
+		for (int k = 1; k <= 3; k++) {
+			const float g = static_cast<float>(k) * U(2.5f);
+			dl->AddRect({a.x - g, a.y - g}, {b.x + g, b.y + g}, IM_COL32(230, 180, 90, static_cast<int>(30.0f / k * hot)), rr + g, 0, U(2));
+		}
+		dl->PopClipRect();
+		dl->AddRectFilled(a, b, IM_COL32(9, 9, 11, 228), rr);
+		dl->AddRectFilledMultiColor({a.x + rr * 0.5f, a.y + 1}, {b.x - rr * 0.5f, a.y + th * 0.55f}, Ca(90, 60, 30, 0.30f + 0.25f * hot),
+		                            Ca(90, 60, 30, 0.10f), Ca(90, 60, 30, 0.0f), Ca(90, 60, 30, 0.0f));
+		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
+		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
+		// The medal: iron disc, gold rim, crossed blades and the soul in the middle (as the trophies' icon).
+		const float  mr = std::round(th * 0.34f);
+		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
+		dl->AddCircleFilled(mc, mr, IM_COL32(20, 19, 23, 255), 32);
+		dl->AddCircle(mc, mr * 0.92f, Ca(200, 150, 70, 0.75f + 0.25f * hot), 32, std::max(1.5f, U(2.4f)));
+		for (int s = -1; s <= 1; s += 2) {
+			const ImVec2 p0 {mc.x - s * mr * 0.55f, mc.y + mr * 0.55f}, p1 {mc.x + s * mr * 0.48f, mc.y - mr * 0.48f};
+			dl->AddLine(p0, p1, IM_COL32(170, 176, 190, 235), std::max(1.5f, U(2.2f)));
+			const ImVec2 gc {p0.x + (p1.x - p0.x) * 0.18f, p0.y + (p1.y - p0.y) * 0.18f};
+			dl->AddLine({gc.x - mr * 0.16f, gc.y - s * mr * 0.16f}, {gc.x + mr * 0.16f, gc.y + s * mr * 0.16f}, IM_COL32(205, 160, 80, 240),
+			            std::max(1.5f, U(2.0f)));
+		}
+		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.10f + 0.07f * k + 0.03f * pl), Ca(200, 228, 255, 0.10f * k), 24);
+		dl->AddCircleFilled(mc, mr * 0.12f, IM_COL32(245, 250, 255, 255), 16);
+		const float lx = mc.x + mr + Px(16);
+		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", U(2.5f));
+		char sub[64];
+		if (on) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 semilla %d", g_saved.randomizer_seed);
+		else std::snprintf(sub, sizeof(sub), "Desactivado");
+		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(236, 214, 190, 230), sub, U(1));
+	}
+	ImGui::End();
+}
+} // namespace LauncherTrophy
 
 // (ds-pc-port11) Text with a dark outline (shadow) for the shaders' panel: legible over the panel and over the gold bar.
 void ShadowText(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* text, float wrap, bool outline = false) {
@@ -4183,7 +6292,8 @@ void DrawLauncher(float width, float height) {
 	Settings& s = g_edit;
 	// Esc: the open list, then the options, then the launcher (as Salir).
 	if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !g_popup.load()) {
-		if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
+		if (LauncherTrophy::IsOpen()) LauncherTrophy::Close(true); // (trofeos-exe) the trophy panel first
+		else if (g_upd.state != UpdateUi::Idle && !g_upd.busy.load()) SetUpd(UpdateUi::Idle, "");
 		else if (g_show_settings) g_show_settings = false;
 		else g_start_result = -1;
 	}
@@ -4234,6 +6344,7 @@ void DrawLauncher(float width, float height) {
 	}
 	float bottom_h = U(58 + 8 + 40 + 16);
 	bottom_h += U(44); // (11-10) the "skip the intro" row
+	bottom_h += U(44); // (update1) the red "Actualizar versión" row
 	if (g_rt.pick_folder) bottom_h += U(44); // (port26) the game folder row
 	if (shader_row) bottom_h += sh_h + U(14);
 	if (!when.empty()) bottom_h += U(26);
@@ -4265,6 +6376,26 @@ void DrawLauncher(float width, float height) {
 			on_disk.skip_intro = s.skip_intro;
 			g_status = SaveSettings(g_rt.ini_path, on_disk) ? "Guardado en settings.ini" : "No se pudo guardar settings.ini";
 		}
+		RowEnd(y, 44);
+	}
+	{
+		// (update1) "Actualizar versión" in red, just above the game folder: checks GitHub only when pressed (ManualCheck).
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x, y});
+		ImGui::PushStyleColor(ImGuiCol_Button, ImVec4 {0.42f, 0.05f, 0.04f, 0.88f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4 {0.60f, 0.08f, 0.06f, 0.94f});
+		ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4 {0.72f, 0.10f, 0.07f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4 {1.0f, 0.86f, 0.82f, 1.0f});
+		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4 {0.90f, 0.22f, 0.18f, 0.95f});
+		ImGui::PushFont(g_font_semi, U(15));
+		ImGui::BeginDisabled(g_upd.busy.load());
+		const bool upd = ImGui::Button(I18n::T("Actualizar versión"), {U(420), U(36)});
+		Anim::Highlight(g_unit);
+		ImGui::EndDisabled();
+		ImGui::PopFont();
+		ImGui::PopStyleColor(5);
+		Tip("Busca en GitHub si hay una versión nueva del port y te pregunta si quieres instalarla. Al arrancar ya no se comprueba nada.");
+		if (upd) ManualCheck();
 		RowEnd(y, 44);
 	}
 	if (g_rt.pick_folder) {
@@ -4358,7 +6489,7 @@ void DrawLauncher(float width, float height) {
 	{
 		const float y = RowY();
 		g_focus_once  = false;
-		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_display, U(35),
+		if (LButton(pv.running && !pv.playable ? "JUGAR (sin esperar)" : "JUGAR", {g_lbox.at.x, y}, {U(420), U(58)}, true, g_font_display, std::round(U(32)),
 		            pv.running ? "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones)."
 		                       : "Guarda los ajustes en settings.ini y empieza el juego.")) {
 			// (No game folder: the picker at once; a valid one chosen, saved and played.)
@@ -4456,7 +6587,7 @@ void DrawLauncher(float width, float height) {
 		{
 			g_lbox.at = {origin.x + U(8), RowY()};
 			g_lbox.w  = U(420);
-			LauncherTrophiesBox();
+			// (trofeos-exe) Trofeos left the options: the tab at the bottom left (LauncherTrophy::Draw, below).
 			const float by = RowY();
 			ImGui::BeginDisabled(g_upd.busy.load());
 			if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(40)}, false, g_font_semi, U(15),
@@ -4488,6 +6619,12 @@ void DrawLauncher(float width, float height) {
 		ImGui::End();
 	}
 
+	// (trofeos-exe) TROFEOS at the bottom left, above the version line; its panel unfolds upwards.
+	LauncherTrophy::Draw(width, height, px);
+	LauncherTrophy::DrawOnline(width, height); // (online12) ONLINE beside TROFEOS
+	LauncherTrophy::DrawNoCheats(width, height); // (cleanbtn) SIN TRUCOS beside ONLINE: toggles g_saved.no_cheats
+	// (rando-oculto 11-23) RANDOMIZER hidden from the launcher until it works: LauncherTrophy::DrawRandomizer(width, height);
+
 	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
 	{
 		char ver[256];
@@ -4495,8 +6632,7 @@ void DrawLauncher(float width, float height) {
 		const std::string line = std::string(ver) + "  \xC2\xB7  " + Update::BuildStamp();
 		bg->AddText({U(12), height - U(26)}, IM_COL32(220, 214, 200, 230), line.c_str());
 	}
-	StartupCheck();
-	UpdateNotice(width, height);
+	if (UpdateNotice(width, height)) g_show_settings = true;
 
 	g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId);
 	if (ctx.ColorStack.Size > colors_before) ImGui::PopStyleColor(ctx.ColorStack.Size - colors_before);
@@ -4506,7 +6642,8 @@ void DrawLauncher(float width, float height) {
 }
 
 bool WantsOverlay() {
-	return MetricsPanel::Shown() || g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing(); // (ds-pc-port38: the fade-out)
+	return MetricsPanel::Shown() || g_open.load(std::memory_order_relaxed) || Resume::SaveAndQuitActive() || Anim::Closing() || // (ds-pc-port38: the fade-out)
+	       ChatUi::ToastActive(); // (chat1) a notice on screen
 }
 
 // (port34) F2 > Ver trofeos: every trophy of the game, as the PS5's trophy page. Drawn with draw lists in one window of
@@ -4827,6 +6964,9 @@ bool Draw(float width, float height, float unit) {
 	ImFont*     body = FindFont("segoeui");
 	if (body == nullptr) body = ImGui::GetFont();
 	dl->AddRectFilled({0, 0}, {width, height}, Col(0, 0, 0, 0.55f * in));
+	DsStyle::Backdrop(dl, {0, 0}, {width, height}, in, Souls::Time()); // (trucos11) the same stone-and-fog backdrop as the other pages
+	DsStyle::Motes(dl, {0, 0}, {width, height}, in * 0.7f, Souls::Time(), 30);
+	const int trophy_first = dl->VtxBuffer.Size; (void)trophy_first;
 
 	const float margin = std::max(24.0f * u, std::min(width, height) * 0.035f);
 	const float pw     = std::min(width - margin * 2.0f, 1680.0f * u);
@@ -5167,6 +7307,8 @@ bool Draw(float width, float height, float unit) {
 				dl->AddRectFilledMultiColor({l0.x, l1.y - 18 * u}, {l1.x, l1.y}, Col(17, 18, 22, 0), Col(17, 18, 22, 0), Col(17, 18, 22, in), Col(17, 18, 22, in));
 		}
 	}
+	// (trucos8) The entry as the other pages: zoom from 92 % about the centre with the fade (PageZoom's).
+	if (in < 1.0f) Anim::ScaleVertices(dl, 0, {width * 0.5f, height * 0.5f}, 0.92f + 0.08f * in);
 	ImGui::End();
 	ImGui::PopStyleVar(2);
 	return !back;
@@ -5302,8 +7444,8 @@ void Sample(LogState& L,
 	const std::string souls = s.souls_mode;
 	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
-	                        : souls == "low" ? "Modo Souls PC low profile" : "Personalizado";
-	const bool  fixed = souls == "ligero" || souls == "ligero-plus" || souls == "equilibrado" || souls == "low";
+	                        : souls == "low" ? "Modo Souls PC low profile" : souls == "sin-tirones" ? "Optimizado 16 GB / 8 GB" : "Personalizado";
+	const bool  fixed = FixedFg(s); // (11-22) the optimizado mode too
 	std::string fg_label = fixed ? modo : FrameGenLabel(s.framegen);
 	std::string al       = "No";
 	if (fixed) al = "Ultra";
@@ -5754,12 +7896,21 @@ void SaveNow() {
 // that size (ImGui 1.92 dynamic fonts: never an upscaled atlas), near-white text on a darker plate, larger controls,
 // and the page slides in from the right with a fade.
 int g_style_vars = 0, g_style_colors = 0;
+float g_page_t = 1.0f; // (trucos7) the page's entry progress (Begin): PageZoom scales the page from 92 % with it
+// (trucos7) The page's entry: everything the page window drew grows from 92 % about the screen centre while it fades in
+// (vertex scale: glyphs stay baked at their size; at 1.0 the vertices are untouched: crisp).
+void PageZoom() {
+	if (g_page_t >= 1.0f) return;
+	const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+	Anim::ScaleVertices(ImGui::GetWindowDrawList(), 0, {wp.x + ws.x * 0.5f, wp.y + ws.y * 0.5f}, 0.92f + 0.08f * g_page_t);
+}
 bool Begin(const char* title, float width, float height, float unit) {
 	if (Anim::g_page_seen != g_f1_page.load()) {
 		Anim::g_page_seen = g_f1_page.load();
 		Anim::g_page_at   = Anim::Now();
 	}
 	const float t = Anim::EaseOut(Anim::Progress(Anim::g_page_at.load(), Anim::kPage));
+	g_page_t      = t;
 	if (t < 1.0f) Bump();
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(170 * t)));
 	ImFont* font = FindFont("segoeui");
@@ -5779,7 +7930,7 @@ bool Begin(const char* title, float width, float height, float unit) {
 	var1(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, unit));
 	col(ImGuiCol_Text, ImVec4 {0.97f, 0.96f, 0.93f, 1.0f});
 	col(ImGuiCol_TextDisabled, ImVec4 {0.74f, 0.72f, 0.68f, 1.0f});
-	col(ImGuiCol_WindowBg, ImVec4 {0.025f, 0.025f, 0.03f, 0.97f});
+	col(ImGuiCol_WindowBg, ImVec4 {0, 0, 0, 0}); // (trucos11: the backdrop is drawn under the page)
 	col(ImGuiCol_Border, ImVec4 {0.87f, 0.77f, 0.55f, 0.40f});
 	col(ImGuiCol_FrameBg, ImVec4 {0.11f, 0.11f, 0.13f, 1.0f});
 	col(ImGuiCol_FrameBgHovered, ImVec4 {0.17f, 0.16f, 0.15f, 1.0f});
@@ -5797,14 +7948,36 @@ bool Begin(const char* title, float width, float height, float unit) {
 	col(ImGuiCol_Separator, ImVec4 {0.87f, 0.77f, 0.55f, 0.35f});
 	col(ImGuiCol_NavCursor, kGold);
 	// (Full screen, as the trophy page; it slides in 64 px from the right.)
-	ImGui::SetNextWindowPos({std::round((1.0f - t) * 64.0f * unit), 0}, ImGuiCond_Always);
+	ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always); // (trucos7: zoom + fade, PageZoom; was a 64 px slide)
 	ImGui::SetNextWindowSize({width, height}, ImGuiCond_Always);
 	ImGui::Begin(title, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
-	ImGui::PushFont(nullptr, std::round(46.0f * unit));
-	ImGui::TextColored(kGold, "%s", I18n::T(title));
-	ImGui::PopFont();
-	ImGui::Separator();
-	ImGui::Spacing();
+	{
+		// (trucos4) The page in the Demon's Souls look: vignette, an aged-gold double frame, the title engraved in Cinzel
+		// (whole-pixel size and position: crisp) over an ornamental divider.
+		ImDrawList*  dl = ImGui::GetWindowDrawList();
+		const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+		// (trucos11) The page: the stone-and-fog backdrop (ds-style.h) full screen, the title in large tracked bone-white
+		// capitals, a rhombus rule; the page fades in with a slight zoom (PageZoom), cross-fading over the menu.
+		DsStyle::Backdrop(ImGui::GetBackgroundDrawList(), {0, 0}, {width, height}, t, Souls::Time());
+		DsStyle::FogLayers(ImGui::GetBackgroundDrawList(), {0, 0}, {width, height}, t, Souls::Time());
+		DsStyle::Embers(ImGui::GetBackgroundDrawList(), {0, 0}, {width, height}, t * 0.6f, Souls::Time(), 40);
+		AshFrame(ImGui::GetBackgroundDrawList(), width, height, t); // (trucos13)
+		ImFont*           tf  = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+		const float       tsz = std::round(58.0f * unit);
+		const std::string tt  = DsStyle::Upper(I18n::T(title));
+		const ImVec2      at  = ImGui::GetCursorScreenPos();
+		// (trucos12) The title letter by letter with a brief gold flash; a light sweeps across the page as it opens.
+		const float since = static_cast<float>(Anim::Now() - Anim::g_page_at.load());
+		const float tw    = DsStyle::IlluminatedTitle(dl, tf, tsz, {std::round(at.x + tsz * 0.1f), std::round(at.y)}, tt.c_str(), t, since, Souls::Time()); // (trucos13)
+		if (since < 1.2f) Bump();
+		DsStyle::LightSweep(ImGui::GetForegroundDrawList(), {0, 0}, {width, height}, since / 0.8f, 1.0f);
+		DsStyle::Filigree(dl, {wp.x + std::round(60 * unit), wp.y + std::round(40 * unit)}, std::round(150 * unit), 1, 1, t, Souls::Time(), unit);
+		DsStyle::Filigree(dl, {wp.x + ws.x - std::round(60 * unit), wp.y + std::round(40 * unit)}, std::round(150 * unit), -1, 1, t, Souls::Time(), unit);
+		ImGui::Dummy({tw, tsz + 10 * unit});
+		const float dy = std::round(ImGui::GetCursorScreenPos().y);
+		DsStyle::DiamondRule(dl, at.x, at.x + std::min(ws.x - 2 * (at.x - wp.x), std::max(900 * unit, tw)), dy, t, unit);
+		ImGui::Dummy({1, 18 * unit});
+	}
 	return true;
 }
 bool Footer(float unit) {
@@ -5813,7 +7986,7 @@ bool Footer(float unit) {
 	const ImVec2 bs {std::round(240 * unit), std::round(54 * unit)};
 	if (Anim::Button(I18n::T("Guardar"), bs, unit)) SaveNow();
 	ImGui::SameLine();
-	if (g_saved.pad_map != g_rt.launched.pad_map || g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map ||
+	if (g_saved.kbm != g_rt.launched.kbm || g_saved.kbm_map != g_rt.launched.kbm_map || // (remap-f2: the pad map is live)
 	    g_saved.kbm_sens != g_rt.launched.kbm_sens || g_saved.kbm_antidz != g_rt.launched.kbm_antidz ||
 	    g_saved.kbm_camera != g_rt.launched.kbm_camera || g_saved.kbm_warp != g_rt.launched.kbm_warp) {
 		if (Anim::Button(I18n::T("Reiniciar ahora"), bs, unit)) RequestRestart();
@@ -5827,6 +8000,7 @@ bool Footer(float unit) {
 		ImGui::SameLine();
 		ImGui::TextColored(kDim, "%s", g_note.c_str());
 	}
+	PageZoom(); // (trucos7)
 	ImGui::End();
 	ImGui::PopStyleColor(g_style_colors);
 	ImGui::PopStyleVar(g_style_vars);
@@ -5835,13 +8009,11 @@ bool Footer(float unit) {
 	return !close;
 }
 
+// (remap2) The controller drawn full screen, its buttons marked on it (PadMap::Page): no list, nothing to scroll.
 bool DrawPad(float width, float height, float unit) {
-	Begin("Mapear mando", width, height, unit);
-	ImGui::BeginChild("##padpage", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened); Anim::SmoothScroll(); // (ds-pc-port41) the D-pad / stick move row by row inside the list and the page follows the focus
-	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
-	(void)PadMap::Draw(g_edit, unit);
-	ImGui::EndChild();
-	return Footer(unit);
+	g_page_scroll = 0;
+	g_popup       = false; // (no list of its own: Circle / B goes back)
+	return PadMap::Page(width, height, unit);
 }
 
 bool DrawKbm(float width, float height, float unit) {
@@ -5955,17 +8127,2085 @@ bool DrawKbm(float width, float height, float unit) {
 }
 } // namespace F1Pages
 
+// ---- (trucos6) The item lists from the game's OWN files in the user's game folder, read at run time (nothing copied):
+//   <game>/cp11demonssouls/dvdroot/param/gameparam/gameparam.parambnd  (BND3: EquipParamWeapon / Protector / Accessory /
+//     Goods / Magic .param; legacy PARAM: row count u16 at +0xa, rows {id, data offset, name offset} from +0x30)
+//   <game>/cp11demonssouls/dvdroot/msg/<language>/item.msgbnd          (BND3 of FMG: names by id, UTF-16)
+// Row layouts from dvdroot/paramdef/paramdef.paramdefbnd (field 0xb0 bytes, internal name at +0x90): EquipParamWeapon
+// 184 bytes: iconId u16 +4, originEquipWep s32 +140 (the variant it is made from: Daga+1 10001 -> 10000; a path:
+// "Rompemalla afilada+1" 10241 -> 10200 ... -> the base 10200's origin); Protector iconIdM u16 +4; Accessory iconId +4;
+// Goods iconId u16 +0, goodsType u8 +2; Magic iconId s32 +4. FMG (the DeS layout): group count +0xc, string-offset
+// table at [+0x18], groups {offset index, first id, last id} from +0x20; an offset below 0x20 is an empty string.
+// Checked on PPSA01341 01.007.000's files: 1882 weapon rows, Daga 10000..10009, Rompemalla afilada+1 10241 (origin 10200).
+namespace ItemDb {
+struct Item {
+	int         id = 0, icon = -1, origin = -1, root = 0, level = 0;
+	bool        dup = false; // (trucos10) left out of the shop: a repeat / variant / test row (Load's last pass)
+	int         model = 0;          // (trucos14) equipModelId (weapons / armour +2): the asset folder's number
+	std::string bp, bp2;            // (trucos17) the remake's own name strings in the param row (bpPreviewKey / bpPreviewSuffix)
+	int         price = 0, sub = 0; // (trucos7) basicPrice (souls); sub: weaponCategory (12 = shield) / magic 0 sorcery, 1 miracle
+	std::string desc;               // (trucos7) the game's own lore text (item.msgbnd *うんちく.fmg, else *説明.fmg)
+	std::string name, path; // path: the name without its "+n" (weapons: the upgrade path's own name)
+};
+struct Db {
+	bool              tried = false, ok = false;
+	std::string       why;
+	std::vector<Item> cat[5]; // Armas, Armaduras, Anillos, Objetos, Magias y milagros
+};
+Db g_db;
+
+using Bytes = std::string;
+bool ReadFile(const std::filesystem::path& p, Bytes* out) {
+	std::ifstream in(p, std::ios::binary);
+	if (!in) return false;
+	out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	return !out->empty();
+}
+template <class T> bool Get(const Bytes& b, size_t at, T* v) {
+	if (at + sizeof(T) > b.size()) return false;
+	std::memcpy(v, b.data() + at, sizeof(T));
+	return true;
+}
+// BND3 (format 0x74: 24-byte entries from +0x20 {flags, size, offset, id, name offset, size}): name -> bytes.
+std::vector<std::pair<std::string, Bytes>> Bnd3(const Bytes& b) {
+	std::vector<std::pair<std::string, Bytes>> out;
+	uint32_t n = 0;
+	if (b.size() < 0x20 || b.compare(0, 4, "BND3") != 0 || !Get(b, 0x10, &n) || n > 4096) return out;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t e[6] {};
+		if (!Get(b, 0x20 + i * 24, &e)) break;
+		if (e[2] + static_cast<uint64_t>(e[1]) > b.size() || e[4] >= b.size()) continue;
+		const size_t end = b.find('\0', e[4]);
+		out.emplace_back(b.substr(e[4], end == Bytes::npos ? 0 : end - e[4]), b.substr(e[2], e[1]));
+	}
+	return out;
+}
+std::string Utf16ToUtf8(const char* p, size_t units) {
+	std::string s;
+	for (size_t i = 0; i < units; i++) {
+		uint32_t c = static_cast<uint8_t>(p[2 * i]) | (static_cast<uint8_t>(p[2 * i + 1]) << 8);
+		if (c >= 0xd800 && c < 0xe000) c = '?';
+		if (c < 0x80) s += static_cast<char>(c);
+		else if (c < 0x800) s += static_cast<char>(0xc0 | (c >> 6)), s += static_cast<char>(0x80 | (c & 0x3f));
+		else s += static_cast<char>(0xe0 | (c >> 12)), s += static_cast<char>(0x80 | ((c >> 6) & 0x3f)), s += static_cast<char>(0x80 | (c & 0x3f));
+	}
+	return s;
+}
+std::map<int, std::string> Fmg(const Bytes& b) {
+	std::map<int, std::string> out;
+	uint32_t groups = 0, table = 0;
+	if (!Get(b, 0xc, &groups) || !Get(b, 0x18, &table) || groups > 100000) return out;
+	for (uint32_t g = 0; g < groups; g++) {
+		int32_t v[3] {};
+		if (!Get(b, 0x20 + g * 12, &v) || v[2] < v[1] || v[2] - v[1] > 1000000) break;
+		for (int32_t k = 0; k <= v[2] - v[1]; k++) {
+			uint32_t so = 0;
+			if (!Get(b, table + static_cast<size_t>(v[0] + k) * 4, &so) || so < 0x20 || so >= b.size()) continue;
+			size_t e = so;
+			while (e + 1 < b.size() && (b[e] != 0 || b[e + 1] != 0)) e += 2;
+			if (e > so) out[v[1] + k] = Utf16ToUtf8(b.data() + so, (e - so) / 2);
+		}
+	}
+	return out;
+}
+const Bytes* Find(const std::vector<std::pair<std::string, Bytes>>& files, const char* tail) {
+	for (const auto& [n, b]: files)
+		if (n.size() >= std::strlen(tail) && n.compare(n.size() - std::strlen(tail), Bytes::npos, tail) == 0) return &b;
+	return nullptr;
+}
+void Load() {
+	if (g_db.tried) return;
+	g_db.tried = true;
+	const auto load_t0 = std::chrono::steady_clock::now(); // (trucos8) measured: a disk cache only if this is over ~1 s
+	struct Said {
+		std::chrono::steady_clock::time_point t0;
+		~Said() {
+			std::printf("[trucos] lista: lectura y analisis en %lld ms\n",
+			            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
+		}
+	} said {load_t0};
+	// (trucos9) The game folder the emulator runs (settings carpeta_juego: the same one the launch passes, its "Game args"
+	// line reads <it>/packagecmdlineargs.txt), as UTF-8 -> a wide path on Windows (spaces / case kept as written).
+	const std::filesystem::path root = std::filesystem::u8path(g_rt.launched.game) / "cp11demonssouls" / "dvdroot";
+	const auto params_path = root / "param" / "gameparam" / "gameparam.parambnd";
+	Bytes params, msg;
+	if (!ReadFile(params_path, &params)) {
+		g_db.why = "gameparam.parambnd no encontrado";
+		std::error_code ec;
+		std::printf("[trucos] lista: no se pudo leer %s (existe: %d, %s)\n", params_path.u8string().c_str(),
+		            std::filesystem::exists(params_path, ec) ? 1 : 0, std::strerror(errno));
+		return;
+	}
+	std::printf("[trucos] lista: leido %s (%zu bytes)\n", params_path.u8string().c_str(), params.size());
+	// The names in the menu's language when the game has it, else Spanish, else English.
+	const std::string& ml = g_rt.launched.menu_language; // (the menu's language id: es, en, pt-BR, fr, it, de)
+	const char* first = ml.rfind("en", 0) == 0 ? "english" : ml.rfind("pt", 0) == 0 ? "portuguese" : ml.rfind("fr", 0) == 0 ? "french"
+	                  : ml.rfind("it", 0) == 0 ? "italian" : ml.rfind("de", 0) == 0 ? "german" : "spanish";
+	const char* order[] = {first, "spanish", "english", "na_english", "engus"};
+	for (const char* l: order) {
+		const auto mp = root / "msg" / l / "item.msgbnd";
+		if (ReadFile(mp, &msg)) {
+			std::printf("[trucos] lista: leido %s (%zu bytes)\n", mp.u8string().c_str(), msg.size());
+			break;
+		}
+		std::printf("[trucos] lista: no esta %s\n", mp.u8string().c_str());
+	}
+	const auto pfiles = Bnd3(params);
+	const auto mfiles = Bnd3(msg);
+	std::printf("[trucos] lista: BND3 params %zu ficheros (%s), BND3 textos %zu ficheros (%s)\n", pfiles.size(), params.compare(0, 4, "BND3") == 0 ? "BND3" : "cabecera desconocida",
+	            mfiles.size(), msg.size() >= 4 && msg.compare(0, 4, "BND3") == 0 ? "BND3" : "cabecera desconocida");
+	// FMG files of item.msgbnd, by their (Japanese) names: goods, weapons, armor, rings, magic.
+	const auto fmg = [&](const char* tail) {
+		const Bytes* b = Find(mfiles, tail);
+		return b != nullptr ? Fmg(*b) : std::map<int, std::string> {};
+	};
+	// (trucos9) The FMG names inside item.msgbnd are SHIFT-JIS bytes (the BND3 keeps the PS3 names as they are), not
+	// UTF-8: with UTF-8 tails no file matched and every list came out empty (log 20261120-043912-622: "armas 0 ...").
+	const auto n_goods = fmg("\x83\x41\x83\x43\x83\x65\x83\x80\x96\xBC" ".fmg");             // アイテム名
+	const auto n_weap  = fmg("\x95\x90\x8A\xED\x96\xBC" ".fmg");                             // 武器名
+	const auto n_arm   = fmg("\x96\x68\x8B\xEF\x96\xBC" ".fmg");                             // 防具名
+	const auto n_ring  = fmg("\x83\x41\x83\x4E\x83\x5A\x83\x54\x83\x8A\x96\xBC" ".fmg"); // アクセサリ名
+	const auto n_mag   = fmg("\x96\x82\x96\x40\x96\xBC" ".fmg");                             // 魔法名
+	std::printf("[trucos] lista: item.msgbnd %zu bytes, %zu ficheros FMG; nombres: armas %zu, armaduras %zu, anillos %zu, objetos %zu, magias %zu\n",
+	            msg.size(), mfiles.size(), n_weap.size(), n_arm.size(), n_ring.size(), n_goods.size(), n_mag.size());
+	// (trucos7) Lore texts: アイテム / 武器 / 防具 / アクセサリ / 魔法 + うんちく.fmg (lore), else + 説明.fmg (short).
+	const char* kUn = "\x82\xA4\x82\xF1\x82\xBF\x82\xAD" ".fmg", *kSe = "\x90\xE0\x96\xBE" ".fmg"; // (Shift-JIS, trucos9)
+	const char* kPre[] = {"\x95\x90\x8A\xED", "\x96\x68\x8B\xEF", "\x83\x41\x83\x4E\x83\x5A\x83\x54\x83\x8A",
+	                      "\x83\x41\x83\x43\x83\x65\x83\x80", "\x96\x82\x96\x40"};
+	std::map<int, std::string> lore[5];
+	for (int c = 0; c < 5; c++) {
+		lore[c] = fmg((std::string(kPre[c]) + kSe).c_str());
+		for (auto& [k, v]: fmg((std::string(kPre[c]) + kUn).c_str())) lore[c][k] = v;
+	}
+	struct Spec { const char* file; int cat, icon_off, icon_size; const std::map<int, std::string>* names; int price_off; };
+	// (trucos7) basicPrice: EquipParamWeapon +172, Protector +48, Accessory +20, Goods +12 (paramdef); Magic has none.
+	const Spec specs[] = {{"EquipParamWeapon.param", 0, 4, 2, &n_weap, 172}, {"EquipParamProtector.param", 1, 4, 2, &n_arm, 48},
+	                      {"EquipParamAccessory.param", 2, 4, 2, &n_ring, 20}, {"EquipParamGoods.param", 3, 0, 2, &n_goods, 12},
+	                      {"Magic.param", 4, 4, 4, &n_mag, -1}};
+	for (const auto& sp: specs) {
+		const Bytes* b = Find(pfiles, sp.file);
+		uint16_t     n = 0;
+		if (b == nullptr || !Get(*b, 0xa, &n)) {
+			std::printf("[trucos] lista: PARAM %s no esta en gameparam.parambnd\n", sp.file);
+			continue;
+		}
+		std::printf("[trucos] lista: PARAM %s %u filas, %zu nombres\n", sp.file, static_cast<unsigned>(n), sp.names->size());
+		std::map<int, int> origin;
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t r[3] {};
+			if (!Get(*b, 0x30 + i * 12, &r)) break;
+			const auto nm = sp.names->find(static_cast<int>(r[0]));
+			if (nm == sp.names->end() || nm->second.empty()) continue; // (rows without a name: tests, unused)
+			Item it;
+			it.id   = static_cast<int>(r[0]);
+			it.name = nm->second;
+			if (sp.icon_size == 2) {
+				uint16_t v = 0;
+				if (Get(*b, r[1] + sp.icon_off, &v)) it.icon = v;
+			} else {
+				int32_t v = 0;
+				if (Get(*b, r[1] + sp.icon_off, &v)) it.icon = v;
+			}
+			if (sp.cat == 0) {
+				int32_t o = -1;
+				if (Get(*b, r[1] + 140, &o)) it.origin = o;
+			}
+			// The "+n" of the name: the level; the rest: the path (weapons) or the name.
+			it.path        = it.name;
+			const size_t p = it.name.rfind('+');
+			if (p != std::string::npos && p + 1 < it.name.size() && std::all_of(it.name.begin() + p + 1, it.name.end(), ::isdigit)) {
+				it.level = std::atoi(it.name.c_str() + p + 1);
+				it.path  = it.name.substr(0, p);
+			}
+			if (sp.price_off >= 0) {
+				int32_t v = 0;
+				if (Get(*b, r[1] + sp.price_off, &v)) it.price = std::max(0, v);
+			}
+			if (sp.cat == 0) it.sub = static_cast<uint8_t>(b->size() > r[1] + 6 ? (*b)[r[1] + 6] : 0); // weaponCategory +6
+			if (sp.cat == 1) it.sub = static_cast<uint8_t>(b->size() > r[1] + 8 ? (*b)[r[1] + 8] : 0); // (trucos14) protectorCategory +8
+			if (sp.cat <= 1) {
+				uint16_t m = 0;
+				if (Get(*b, r[1] + 2, &m)) it.model = m; // equipModelId +2 (paramdef)
+			}
+			// (trucos17) The remake's string fields (paramdef type "string": a u32 offset from the param file's start):
+			// Goods / Accessory bpPreviewKey +64 ("KingsSoul", "PrisonKey"...), Weapon bpPreviewSuffix +176 ("dagger"),
+			// Protector bpPreviewSuffix +144 / _Female +152. The game builds Tex_InvIcon_ from them (0xbd530 goods:
+			// row +0x40; 0xbd920 weapons: row +0xb0; 0xbe190 rings: row +0x40).
+			{
+				const auto str_at = [&](uint32_t field, std::string* out) {
+					uint32_t so = 0;
+					if (!Get(*b, r[1] + field, &so) || so == 0 || so >= b->size()) return;
+					const size_t e = b->find('\0', so);
+					if (e != Bytes::npos && e - so < 128) out->assign(b->data() + so, e - so);
+				};
+				if (sp.cat == 2 || sp.cat == 3) str_at(64, &it.bp);
+				if (sp.cat == 0) str_at(176, &it.bp);
+				if (sp.cat == 1) str_at(144, &it.bp), str_at(152, &it.bp2);
+			}
+			if (sp.cat == 4) it.sub = static_cast<uint8_t>(b->size() > r[1] ? (*b)[r[1]] : 0);         // ezStateBehaviorType +0
+			{
+				const int lc = sp.cat == 0 ? 0 : sp.cat == 1 ? 1 : sp.cat == 2 ? 2 : sp.cat == 3 ? 3 : 4;
+				const auto d = lore[lc].find(it.id);
+				if (d != lore[lc].end()) it.desc = d->second;
+			}
+			g_db.cat[sp.cat].push_back(it);
+		}
+	}
+	// Weapons: each variant's root (follow originEquipWep to the row without one).
+	{
+		std::map<int, int> org;
+		for (const auto& it: g_db.cat[0]) org[it.id] = it.origin;
+		for (auto& it: g_db.cat[0]) {
+			int r = it.id;
+			for (int guard = 0; guard < 64; guard++) {
+				const auto o = org.find(r);
+				if (o == org.end() || o->second < 0 || org.count(o->second) == 0) break;
+				r = o->second;
+			}
+			it.root = r;
+		}
+	}
+	// (trucos10) One entry per item: weapons / shields only the base (no originEquipWep, no "+n"); every category drops
+	// rows the game never translated (Japanese placeholders), test / debug rows ("Prueba", "test", "dummy", "Catalizador
+	// universal") and any repeat of a name already listed (the first row, the lowest id, is kept).
+	for (int c = 0; c < 5; c++) {
+		std::set<std::string> seen;
+		for (auto& it: g_db.cat[c]) {
+			std::string low = it.name;
+			for (auto& ch: low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+			bool bad = it.name.rfind("Catalizador universal", 0) == 0 || low.find("prueba") != std::string::npos ||
+			           low.find("test") != std::string::npos || low.find("dummy") != std::string::npos;
+			for (unsigned char ch: it.name)
+				if (ch >= 0xe3) bad = true;
+			if (c == 0 && (it.origin >= 0 || it.level != 0)) bad = true;
+			it.dup = bad || !seen.insert(it.name).second;
+		}
+	}
+	{
+		int n[7] {};
+		for (const auto& it: g_db.cat[0])
+			if (!it.dup) n[it.sub == 12 ? 1 : 0]++;
+		for (int c = 1; c <= 3; c++)
+			for (const auto& it: g_db.cat[c]) n[c + 1] += it.dup ? 0 : 1;
+		for (const auto& it: g_db.cat[4])
+			if (!it.dup) n[it.sub == 1 ? 6 : 5]++;
+		std::printf("[trucos] tienda (una entrada por objeto): armas %d, escudos %d, armaduras %d, anillos %d, objetos %d, magias %d, milagros %d\n",
+		            n[0], n[1], n[2], n[3], n[4], n[5], n[6]);
+	}
+	g_db.ok = !g_db.cat[0].empty();
+	std::printf("[trucos] lista desde los ficheros del juego: armas %zu, armaduras %zu, anillos %zu, objetos %zu, magias %zu\n",
+	            g_db.cat[0].size(), g_db.cat[1].size(), g_db.cat[2].size(), g_db.cat[3].size(), g_db.cat[4].size());
+	if (!g_db.ok) g_db.why = "sin datos";
+}
+} // namespace ItemDb
+
+// ---- (trucos) F2 > Trucos: the game's OWN debug switches and the player's soul count, from the port's thread.
+// Every address is eboot 01.007.000 (vaddr; at run time + 0x900000000, as rtx1-convars.h), found in the eboot (NOTAS.md):
+//  - The bool convars cp11_characters_* (Bluepoint's bpe::ConVar, constructors in 0x355700-0x356100): each keeps its
+//    value in a static byte (the constructor's 3rd argument, rdx) that the game code reads with cmpb $1:
+//    playerNoDamage 0x27cbd50 (read in the damage routine at 0x32d689: when set and the hit one is the player, vtable
+//    +0x120, the HP subtraction at 0x32d6fd is skipped), playerNoDead 0x27cbc60 (read at 0x325972, 0x32ae5a, 0x32d7af,
+//    0x32fd13), playerNoStaminaConsume 0x27cbf30 (read at 0x331a68 in the stamina cost), playerExterminate 0x27cbb70
+//    (read at 0x32d588: when the attacker is the player the damage becomes 999999.0, the float at 0x237ec28).
+//  - Souls: the handler of the game's console command cp11_setSouls (0x4529c0) does
+//    *(*(*(0x27e6948)) + 0x10) + 0x80 = min(souls, 999999999); cp11_addSouls (0x452a20) reads the same int.
+//    Null while there is no player data (title screen): then nothing is read or written.
+// Writes: TryWriteCpuBacking (false: not written, said once in the log). The switches are not saved (off at each start).
+namespace Cheats {
+constexpr uint64_t kBase = 0x900000000ull;
+struct Flag {
+	const char* label;
+	const char* tip;
+	uint64_t    vaddr;
+	Icons::Kind icon;
+	bool        on = false, written = false;
+};
+Flag g_flags[] = {
+    {"Invencible", "Ningún golpe te quita vida.", 0x27cbd50, Icons::Shield},
+    {"No morir", "Aunque la vida llegue a cero, sigues en pie.", 0x27cbc60, Icons::Potion},
+    {"Aguante infinito", "Rodar, atacar y correr no gastan aguante.", 0x27cbf30, Icons::Ring},
+    {"Matar de un golpe", "Cada golpe tuyo hace 999999 de daño.", 0x27cbb70, Icons::Sword},
+    // (trucos21) vaddr 0: not a byte switch; Loader::DemonsSoulsInventory::SetNoWeight (equipment weight class forced
+    // to Light via the game's own override convar at eboot+0x27c1268, item-burden limit lifted).
+    {"Sin límite de peso", "Rueda y corre ligero con cualquier equipo; lleva todos los objetos que quieras.", 0, Icons::Helm},
+};
+bool AnySwitchOn() {
+	for (const auto& f: g_flags)
+		if (f.on) return true;
+	return false;
+}
+std::chrono::steady_clock::time_point g_next {};
+int         g_souls_edit = 0;
+bool        g_souls_loaded = false;
+std::string g_note;
+
+// The address of the soul count, or 0 (no player data yet).
+uint64_t SoulsAddress() {
+	uint64_t a = 0, pgd = 0;
+	if (!Libs::LibKernel::Memory::NativeGuardedRead(&a, reinterpret_cast<const void*>(kBase + 0x27e6948ull), 8) || a < 0x10000) return 0;
+	if (!Libs::LibKernel::Memory::NativeGuardedRead(&pgd, reinterpret_cast<const void*>(a + 0x10), 8) || pgd < 0x10000) return 0;
+	return pgd + 0x80;
+}
+bool ReadSouls(int* out) {
+	const uint64_t at = SoulsAddress();
+	int32_t        v  = -1;
+	if (at == 0 || !Libs::LibKernel::Memory::NativeGuardedRead(&v, reinterpret_cast<const void*>(at), 4) || v < 0 || v > 999999999) return false;
+	*out = v;
+	return true;
+}
+// Every frame (DrawInGame); work every 0.5 s: the switches that are on are written again (cheap, one byte each); a
+// switch turned off is written 0 once.
+void Tick() {
+	const auto now = std::chrono::steady_clock::now();
+	if (now < g_next) return;
+	g_next = now + std::chrono::milliseconds(500);
+	// (stats1) "Deshabilitar trucos y mejoras" (launcher, settings.ini sin_trucos=1): every switch forced off (written 0
+	// on the game thread below, once) and the game-thread cheat module locked (items, souls, attributes refused).
+	// (onlineclean) no_cheats OR launched online: lock the game-thread module and force every switch off.
+	const bool blocked = CheatsBlocked();
+	Loader::DemonsSoulsInventory::SetLocked(blocked);
+	if (blocked)
+		for (auto& f: g_flags)
+			f.on = false;
+	// (trucos4) Written by the game thread (Loader::DemonsSoulsInventory, each frame): the port thread's TryWriteCpuBacking
+	// was refused for the eboot's data ("[port] trucos: write refused at eboot+0x27cbd50", log 20261120-032627-014).
+	for (auto& f: g_flags) {
+		if (f.on != f.written) std::printf("[trucos] menu: %s -> %s (eboot+0x%llx)\n", f.label, f.on ? "on" : "off", static_cast<unsigned long long>(f.vaddr));
+		if (f.vaddr == 0) {
+			if (f.on || f.written) Loader::DemonsSoulsInventory::SetNoWeight(f.on); // (trucos21)
+		} else if (f.on || f.written) Loader::DemonsSoulsInventory::SetFlag(f.vaddr, f.on);
+		f.written = f.on;
+	}
+}
+
+// ---- (stats1) Nivel personaje: the 8 attributes, the soul level and what follows from them, read from the player data
+// (pgd = *(*(0x27e6948)+0x10); layout in loader/demonsSoulsInventory.cpp: hp +0x14, max +0x18; mp +0x20, max +0x24;
+// stamina +0x30, max +0x34; attribute i base +0x40+8*i, current +0x44+8*i; souls +0x80; soul level +0x90) with
+// guarded reads on this thread; written by the game thread the way the game's level-up does (SetStats).
+// (stats4) The stored soul level (pgd+0x90) is kept incrementally by the game (0x4ab8b5: += delta per levelled point), not
+// recomputed as sum-80. 0x3007a0 (clamp(sum,81,1079)-80) is a derived/UI helper over a stat block, NOT the stored soul
+// level: a real character reads level == sum(attributes) (verified: level 131, attributes summing to 131). The apply moves
+// the soul level by the same deltas the stats move, so no fixed per-class constant is needed and real saves are accepted.
+const char* const kAttrNames[8] = {"Vitalidad", "Intelecto", "Aguante", "Fuerza", "Destreza", "Magia", "Fe", "Suerte"};
+const char* const kAttrTips[8]  = {"Más vida máxima.", "Más maná máximo y más huecos de hechizos.", "Más aguante y más carga de equipo.",
+                                   "Daño y requisitos de armas pesadas.", "Daño y requisitos de armas ágiles.", "Daño de las hechicerías.",
+                                   "Daño de los milagros y más huecos de milagros.", "Más objetos encontrados y resistencia a la plaga."};
+struct StatsView {
+	bool    ok = false, consistent = false;
+	int32_t base[8] {}, cur[8] {};
+	int32_t level = 0, hp = 0, hp_max = 0, mp = 0, mp_max = 0, sp = 0, sp_max = 0;
+};
+bool ReadStats(StatsView* v) {
+	*v = {};
+	const uint64_t souls_at = SoulsAddress(); // (pgd + 0x80; 0 without player data)
+	if (souls_at == 0) return false;
+	const uint64_t pgd = souls_at - 0x80;
+	int32_t        raw[0x84 / 4] {}; // pgd+0x10 .. pgd+0x94
+	if (!Libs::LibKernel::Memory::NativeGuardedRead(raw, reinterpret_cast<const void*>(pgd + 0x10), sizeof(raw))) return false;
+	const auto at = [&](uint32_t off) { return raw[(off - 0x10) / 4]; };
+	v->hp = at(0x14), v->hp_max = at(0x18), v->mp = at(0x20), v->mp_max = at(0x24), v->sp = at(0x30), v->sp_max = at(0x34);
+	v->level = at(0x90);
+	int  sum = 0;
+	bool range = true;
+	for (int i = 0; i < 8; i++) {
+		v->base[i] = at(0x40 + 8 * i);
+		v->cur[i]  = at(0x44 + 8 * i);
+		sum += v->cur[i];
+		range = range && v->base[i] >= 1 && v->base[i] <= 99 && v->cur[i] >= 1 && v->cur[i] <= 99;
+	}
+	v->ok = true;
+	// (stats4) "consistent" = the values are in range and the stored soul level is sane. It no longer requires
+	// level == sum - 80: that was wrong (0x3007a0's sum-80 is a UI/derived helper, not the stored soul level, which the
+	// game keeps incrementally at pgd+0x90). Real saves (e.g. level 131 with attributes summing to 131) failed it and were
+	// shown as read-only with a false "no cuadran" warning. Range + a sane level is all the game actually guarantees.
+	(void)sum;
+	v->consistent = range && v->level >= 1 && v->level <= 999;
+	return true;
+}
+int  g_attr_edit[8] {};
+bool g_attr_loaded = false;
+int  g_attr_seq    = -1; // the game thread's result counter seen
+std::string g_attr_note;
+bool g_attr_said_bad = false;
+float g_attr_hot[8] {}; // (stats2) per-attribute plate hover glow
+// (stats2) Display order asked by the owner (Vitalidad, Fuerza, Aguante, Destreza, Intelecto, Magia, Fe, Suerte) mapped
+// to the game's attribute index (0 Vit, 1 Int, 2 End, 3 Str, 4 Dex, 5 Mag, 6 Fai, 7 Luck). g_attr_edit stays in game order.
+const int kAttrOrder[8] = {0, 3, 2, 4, 1, 5, 6, 7};
+// Clean menu-style icons (ds-style.h vector set, gold disc like the rest of the menu), one per game index. The real game
+// stat icons live only inside a 335 MB hash-indexed UI atlas with no sprite names, so they cannot be pulled out reliably.
+const DsStyle::Icon kAttrIcon[8] = {DsStyle::Icon::Potion, DsStyle::Icon::Soul, DsStyle::Icon::Shield, DsStyle::Icon::Sword,
+                                    DsStyle::Icon::Ring, DsStyle::Icon::Flame, DsStyle::Icon::Sun, DsStyle::Icon::Stone};
+
+// (stats2) One attribute as a carved plate (ds-style.h look): gold medallion with its icon, the name in Cinzel, the value
+// big in gold with the base in parentheses when changed, and - / + buttons on the right (held: repeat). Edits g_attr_edit
+// (1..99). Returns nothing; the whole block is wrapped in BeginDisabled when the read is not consistent.
+void AttrRow(int gi, float unit, const StatsView& v) {
+	int&         e  = g_attr_edit[gi];
+	ImGui::PushID(gi);
+	ImDrawList*  dl = ImGui::GetWindowDrawList();
+	const float  al = ImGui::GetStyle().Alpha, t = Souls::Time();
+	const ImVec2 at = ImGui::GetCursorScreenPos();
+	const float  w  = ImGui::GetContentRegionAvail().x;
+	const float  h  = std::round(78 * unit);
+	// (stats3) THE navigable item, the same idiom the rest of the F2 menu uses (Cheats::Row, SelectorRow): one full-row
+	// ImGui::Selectable. So the menu's own keyboard / gamepad navigation reaches it (D-pad up / down moves between the
+	// attribute rows). The earlier - / + were absolutely-placed ImGui::Button widgets that the menu's navigation never
+	// reached (and they sat inside a BeginDisabled), so neither the pad nor a click changed anything.
+	const bool clicked = ImGui::Selectable("##arow", false, 0, {w, h});
+	const bool focused = ImGui::IsItemFocused();
+	const bool hoverrow = ImGui::IsItemHovered();
+	float&     vh = g_attr_hot[gi];
+	const float target = (focused || hoverrow) ? 1.0f : 0.0f;
+	vh += (target - vh) * 0.2f;
+	if (std::fabs(vh - target) > 0.01f) Bump();
+	const ImVec2 a {std::round(at.x), std::round(at.y)}, b {std::round(at.x + w), std::round(at.y + h - 8 * unit)};
+	const float  gh = b.y - a.y;
+	// Right-side stepper: the - glyph, the value, the + glyph.
+	const float plus_c  = b.x - std::round(40 * unit);
+	const float minus_c = plus_c - std::round(150 * unit);
+	const float val_cx  = (plus_c + minus_c) * 0.5f;
+	// Change the value: Left / Right (D-pad, left stick, arrows; repeats while held) when the row is focused, as
+	// SelectorRow does; or a click / Cross on the stepper's left (down) or right (up) half.
+	int step = 0;
+	if (focused) {
+		if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickLeft))
+			step = -1;
+		if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) || ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyPressed(ImGuiKey_GamepadLStickRight))
+			step = +1;
+	}
+	if (clicked) {
+		// A click on the stepper (right side): left half down, right half up. Cross with no mouse move counts as up.
+		const float mx = ImGui::GetIO().MousePos.x;
+		if (!ImGui::IsMouseDown(0) && !ImGui::IsMouseReleased(0)) step = +1; // activated by Cross / Enter, not the mouse
+		else if (mx >= minus_c - std::round(34 * unit)) step = mx < val_cx ? -1 : +1;
+	}
+	if (step != 0) {
+		e = std::clamp(e + step, 1, 99);
+		Bump();
+	}
+	// Plate + medallion + name, drawn over the selectable (as Cheats::Row).
+	DsStyle::CandlePlate(dl, a, b, vh, 0.0f, al, t + gi, unit);
+	const ImVec2 c {std::round(a.x + 28 * unit + gh * 0.34f), std::round((a.y + b.y) * 0.5f)};
+	DsStyle::Medallion(dl, kAttrIcon[gi], c, std::round(gh * 0.36f), al, vh, t, 0.0f);
+	ImFont*     tf = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+	const float ts = std::round(30 * unit);
+	const float tx = std::round(c.x + gh * 0.36f + 30 * unit);
+	DsStyle::Title(dl, tf, ts, {tx, std::round((a.y + b.y) * 0.5f - ts * 0.62f)}, I18n::T(kAttrNames[gi]), al, 0.05f);
+	// - / + glyphs, brighter when the row is focused so you see which one Left / Right move.
+	const ImU32  arrow = DsStyle::C(focused ? DsStyle::kGoldHi : DsStyle::kBoneDim, al);
+	const float  asz = std::round(28 * unit), cy = std::round((a.y + b.y) * 0.5f);
+	const ImVec2 mm = tf->CalcTextSizeA(asz, FLT_MAX, 0, "-");
+	dl->AddText(tf, asz, {std::round(minus_c - mm.x * 0.5f), std::round(cy - mm.y * 0.5f)}, arrow, "-");
+	const ImVec2 pm = tf->CalcTextSizeA(asz, FLT_MAX, 0, "+");
+	dl->AddText(tf, asz, {std::round(plus_c - pm.x * 0.5f), std::round(cy - pm.y * 0.5f)}, arrow, "+");
+	// Value, big and gold, with the base in parentheses when changed.
+	char num[16];
+	std::snprintf(num, sizeof(num), "%d", e);
+	const float  ns = std::round(34 * unit);
+	const ImVec2 nsz = tf->CalcTextSizeA(ns, FLT_MAX, 0, num);
+	dl->AddText(tf, ns, {std::round(val_cx - nsz.x * 0.5f), std::round(cy - ns * 0.5f)},
+	            DsStyle::C(e != v.base[gi] ? DsStyle::kGoldHi : DsStyle::kBone, al), num);
+	if (e != v.base[gi]) {
+		char base[24];
+		std::snprintf(base, sizeof(base), "(%d)", v.base[gi]);
+		const float  bs = std::round(18 * unit);
+		const ImVec2 bsz = tf->CalcTextSizeA(bs, FLT_MAX, 0, base);
+		dl->AddText(tf, bs, {std::round(val_cx - bsz.x * 0.5f), std::round(b.y - bs - 2 * unit)}, DsStyle::C(DsStyle::kBoneDim, al), base);
+	}
+	Tip(kAttrTips[gi]);
+	ImGui::PopID();
+}
+
+void LevelSection(float unit) {
+	ImGui::Spacing();
+	ImGui::Separator();
+	ImGui::PushFont(DisplayFont(), std::round(34 * unit));
+	ImGui::TextColored(kGold, "%s", I18n::T("Nivel personaje"));
+	ImGui::PopFont();
+	StatsView  v;
+	const bool have   = ReadStats(&v);
+	const bool online = g_rt.launched.multiplayer; // (the game was started with the online on: no stat edits there)
+	if (online) {
+		ImGui::TextColored(kDim, "%s", I18n::T("No disponible con la conexión online activada (evita expulsiones y desincronizar a otros jugadores)."));
+		return;
+	}
+	if (!have) {
+		g_attr_loaded = false;
+		ImGui::TextColored(kDim, "%s", I18n::T("El nivel se puede cambiar cuando estás dentro de la partida."));
+		return;
+	}
+	int seq = 0;
+	const int result = Loader::DemonsSoulsInventory::StatsResult(&seq);
+	if (g_attr_seq < 0) g_attr_seq = seq;
+	if (seq != g_attr_seq) { // the game thread answered: show it and read the new values
+		g_attr_seq    = seq;
+		g_attr_loaded = false;
+		g_attr_note   = I18n::T(result == 1 ? "Nivel cambiado." : result == -2 ? "No se cambió: los valores del juego no son los esperados." : "No se pudo: entra en la partida primero.");
+	}
+	if (!g_attr_loaded) {
+		for (int i = 0; i < 8; i++)
+			g_attr_edit[i] = v.base[i];
+		g_attr_loaded = true;
+	}
+	if (!v.consistent && !g_attr_said_bad) {
+		g_attr_said_bad = true;
+		std::printf("[trucos] nivel: lectura no coherente (nivel %d; atributos %d %d %d %d %d %d %d %d): solo lectura\n", v.level, v.cur[0], v.cur[1], v.cur[2],
+		            v.cur[3], v.cur[4], v.cur[5], v.cur[6], v.cur[7]);
+	}
+	int sum_new = 0, sum_cur = 0;
+	for (int i = 0; i < 8; i++)
+		sum_new += g_attr_edit[i], sum_cur += v.base[i];
+	const int level_new = std::clamp(sum_new - sum_cur + v.level, 1, 999); // (stats4) current level + sum(deltas), as the game's level-up (0x4ab8b5); matches ApplyStats' write
+	// (stats2) The soul level big at the top: a gold Soul medallion, the number in Cinzel, and the "-> N" preview while editing.
+	ImDrawList*  dl = ImGui::GetWindowDrawList();
+	const float  al = ImGui::GetStyle().Alpha, tm = Souls::Time();
+	ImFont*      tf = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+	{
+		const ImVec2 at  = ImGui::GetCursorScreenPos();
+		const float  hh  = std::round(96 * unit);
+		const float  mr  = std::round(hh * 0.40f);
+		const ImVec2 mc {std::round(at.x + 20 * unit + mr), std::round(at.y + hh * 0.5f)};
+		DsStyle::Medallion(dl, DsStyle::Icon::Soul, mc, mr, al, 0.6f, tm, 0.8f);
+		const float lx = std::round(mc.x + mr + 26 * unit);
+		DsStyle::SmallCaps(dl, tf, std::round(20 * unit), {lx, std::round(at.y + 14 * unit)}, I18n::T("Nivel de alma"), DsStyle::C(DsStyle::kBoneDim, al));
+		char big[16];
+		std::snprintf(big, sizeof(big), "%d", v.level);
+		const float ls = std::round(54 * unit);
+		DsStyle::GoldTitle(dl, tf, ls, {lx, std::round(at.y + 34 * unit)}, big, al, tm, 0.04f);
+		const ImVec2 lsz = tf->CalcTextSizeA(ls, FLT_MAX, 0, big);
+		if (level_new != v.level) {
+			const float ax = std::round(lx + lsz.x + 20 * unit);
+			dl->AddText(tf, std::round(30 * unit), {ax, std::round(at.y + 46 * unit)}, DsStyle::C(DsStyle::kBoneDim, al), "->");
+			char nn[16];
+			std::snprintf(nn, sizeof(nn), "%d", level_new);
+			DsStyle::GoldTitle(dl, tf, ls, {std::round(ax + 44 * unit), std::round(at.y + 34 * unit)}, nn, al, tm, 0.04f);
+		}
+		ImGui::Dummy({0, hh});
+	}
+	// Vida / Maná / Aguante, max recomputed by the game.
+	char line[256];
+	std::snprintf(line, sizeof(line), "%s %d / %d          %s %d / %d          %s %d / %d", I18n::T("Vida"), v.hp, v.hp_max, I18n::T("Maná"), v.mp,
+	              v.mp_max, I18n::T("Aguante"), v.sp, v.sp_max);
+	ImGui::TextColored(kDim, "%s", line);
+	ImGui::Spacing();
+	// (stats3) The 8 attributes, in the owner's order. They are interactive even when the read looks off: the actual write
+	// (Aplicar -> SetStats -> ApplyStats on the game thread) re-checks every value and the soul-level formula and refuses
+	// safely, so nothing wrong is written; the row is no longer disabled (that is what stopped the pad from moving them).
+	for (int slot = 0; slot < 8; slot++)
+		AttrRow(kAttrOrder[slot], unit, v);
+	ImGui::Spacing();
+	const ImVec2 bs {std::round(200 * unit), std::round(44 * unit)};
+	ImGui::PushID("nivel");
+	if (Anim::Button(I18n::T("Aplicar"), bs, unit)) {
+		const bool sent = Loader::DemonsSoulsInventory::SetStats(g_attr_edit);
+		if (sent) Port::MarkCheatsUsed("Nivel personaje"); // (trucos-online)
+		g_attr_note = I18n::T(sent ? "Aplicando..." : "No se pudo: entra en la partida primero.");
+		std::printf("[trucos] nivel: pedido %d %d %d %d %d %d %d %d (nivel %d -> %d)\n", g_attr_edit[0], g_attr_edit[1], g_attr_edit[2], g_attr_edit[3],
+		            g_attr_edit[4], g_attr_edit[5], g_attr_edit[6], g_attr_edit[7], v.level, level_new);
+	}
+	ImGui::SameLine();
+	if (Anim::Button(I18n::T("Deshacer"), bs, unit)) g_attr_loaded = false, g_attr_note.clear();
+	ImGui::PopID();
+	if (!v.consistent) ImGui::TextColored(kDim, "%s", I18n::T("Aviso: los valores leídos no cuadran con el nivel del juego; al aplicar, el juego puede rechazarlo."));
+	ImGui::TextColored(kDim, "%s", I18n::T("Vida, maná y aguante máximos los recalcula el propio juego, como al subir de nivel en el Nexo. Bajar Intelecto o Fe puede quitar huecos de hechizos."));
+	if (!g_attr_note.empty()) ImGui::TextColored(kDim, "%s", g_attr_note.c_str());
+}
+
+// (trucos7) One cheat as a full-width carved plate: the engraved icon in a soul-lit medallion (it breathes when the cheat
+// is on), the name in Cinzel, what it does under it, and a switch on the right (off: dark iron; on: gold track with a
+// glowing soul knob). The whole plate toggles (click, A / Cross, Enter); the logic is the same `f.on` as before.
+float g_row_hot[8] {}, g_row_on[8] {};
+void Row(Flag& f, float unit, int index) {
+	ImGui::PushID(index);
+	const float  h  = std::round(96 * unit);
+	const ImVec2 at = ImGui::GetCursorScreenPos();
+	const float  w  = ImGui::GetContentRegionAvail().x;
+	if (ImGui::Selectable("##row", false, 0, {w, h})) f.on = !f.on;
+	const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+	float& vh = g_row_hot[index & 7];
+	float& vo = g_row_on[index & 7];
+	vh += ((hot ? 1.0f : 0.0f) - vh) * 0.2f;
+	vo += ((f.on ? 1.0f : 0.0f) - vo) * 0.2f;
+	if (std::fabs(vh - (hot ? 1.0f : 0.0f)) > 0.01f || std::fabs(vo - (f.on ? 1.0f : 0.0f)) > 0.01f) Bump();
+	// (trucos11) ds-style.h: the candle-lit plate, an aged-metal medallion (a soul glow while on), the name in tracked
+	// bone-white Cinzel, what it does in muted bone, small-caps state and the iron / soul-light switch.
+	ImDrawList*  dl = ImGui::GetWindowDrawList();
+	const float  al = ImGui::GetStyle().Alpha, t = Souls::Time();
+	const ImVec2 a {std::round(at.x), std::round(at.y)}, b {std::round(at.x + w), std::round(at.y + h - 10 * unit)};
+	DsStyle::CandlePlate(dl, a, b, vh, 0.0f, al, t + index, unit);
+	const float  rh = b.y - a.y;
+	const ImVec2 c {std::round(a.x + 34 * unit + rh * 0.36f), std::round((a.y + b.y) * 0.5f)};
+	DsStyle::Medallion(dl, StyleIcon(f.icon), c, std::round(rh * 0.38f), al, vh, t, vo);
+	ImFont*     tf = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+	const float ts = std::round(34 * unit), ds = std::round(22 * unit);
+	const float tx = std::round(c.x + rh * 0.38f + 34 * unit);
+	DsStyle::Title(dl, tf, ts, {tx, std::round(a.y + 12 * unit)}, I18n::T(f.label), al, 0.05f);
+	dl->AddText(ImGui::GetFont(), ds, {tx + 2, std::round(a.y + 22 * unit + ts)}, DsStyle::C(DsStyle::kBoneDim, al), I18n::T(f.tip));
+	const float  sw = std::round(100 * unit), sh = std::round(40 * unit);
+	const ImVec2 s0 {std::round(b.x - 50 * unit - sw), std::round((a.y + b.y - sh) * 0.5f)};
+	DsStyle::Toggle(dl, s0, {s0.x + sw, s0.y + sh}, vo, al, t);
+	DsStyle::SmallCaps(dl, tf, std::round(20 * unit), {std::round(s0.x - 150 * unit), std::round((a.y + b.y) * 0.5f - 10 * unit)}, I18n::T(f.on ? "Activo" : "Apagado"),
+	                   f.on ? DsStyle::C(DsStyle::kGoldHi, al) : DsStyle::C(DsStyle::kBoneDim, al));
+	ImGui::PopID();
+}
+
+bool Draw(float width, float height, float unit) {
+	using namespace F1Pages;
+	if (CheatsBlocked()) return false; // (stats1) "Deshabilitar trucos y mejoras"; (onlineclean) el online tambien lo fuerza
+	Begin("Trucos", width, height, unit);
+	Bump(); // (the icons' glow breathes)
+	ImGui::BeginChild("##trucos", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
+	Anim::SmoothScroll();
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
+	ImGui::TextColored(kDim, "%s", I18n::T("Solo para jugar sin conexión. Se apagan al cerrar el juego."));
+	ImGui::Spacing();
+	int i = 0;
+	for (auto& f: g_flags) Row(f, unit, i++);
+	ImGui::Spacing();
+	ImGui::Separator();
+	// Souls: read when the page opens and on Leer; written on Aplicar.
+	{
+		const float  side = std::round(40 * unit);
+		const ImVec2 at   = ImGui::GetCursorScreenPos();
+		ImGui::Dummy({side, side});
+		const ImVec2 c {std::round(at.x + side * 0.5f), std::round(at.y + side * 0.5f)};
+		const float  pulse = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 1.7f);
+		ImDrawList*  dl    = ImGui::GetWindowDrawList();
+		for (int k = 3; k >= 1; k--)
+			dl->AddCircleFilled(c, side * (0.3f + 0.12f * k), ImGui::GetColorU32(ImVec4 {0.72f, 0.82f, 1.0f, ImGui::GetStyle().Alpha * (0.03f + 0.04f * pulse)}), 32);
+		Icons::Draw(dl, Icons::Soul, c, side * (0.78f + 0.04f * pulse), ImGui::GetColorU32(ImVec4 {0.86f, 0.90f, 0.98f, ImGui::GetStyle().Alpha}));
+		ImGui::SameLine();
+		ImGui::AlignTextToFramePadding();
+		ImGui::TextUnformatted(I18n::T("Almas"));
+		ImGui::SameLine();
+		if (!g_souls_loaded) g_souls_loaded = ReadSouls(&g_souls_edit);
+		const bool have = SoulsAddress() != 0;
+		ImGui::BeginDisabled(!have);
+		ImGui::SetNextItemWidth(std::round(300 * unit));
+		ImGui::InputInt("##almas", &g_souls_edit, 1000, 100000);
+		Anim::Highlight(unit);
+		g_souls_edit = std::clamp(g_souls_edit, 0, 999999999);
+		ImGui::SameLine();
+		const ImVec2 bs {std::round(170 * unit), std::round(44 * unit)};
+		if (Anim::Button(I18n::T("Aplicar"), bs, unit)) {
+			const bool ok = Loader::DemonsSoulsInventory::SetSouls(g_souls_edit);
+			if (ok) Port::MarkCheatsUsed("Almas"); // (trucos-online)
+			g_note = I18n::T(ok ? "Almas cambiadas." : "No se pudo: entra en la partida primero.");
+		}
+		ImGui::SameLine();
+		if (Anim::Button(I18n::T("Leer"), bs, unit)) g_souls_loaded = ReadSouls(&g_souls_edit);
+		ImGui::EndDisabled();
+		if (!have) ImGui::TextColored(kDim, "%s", I18n::T("Las almas se pueden editar cuando estás dentro de la partida."));
+		if (!g_note.empty()) ImGui::TextColored(kDim, "%s", g_note.c_str());
+	}
+	LevelSection(unit); // (stats1) Nivel personaje
+	// (trucos7) Items and spells: their own F2 section now, "Armas y objetos" (Shop::Draw).
+	ImGui::EndChild();
+	ImGui::Separator();
+	bool close = Anim::Button(I18n::T("Volver"), {std::round(240 * unit), std::round(54 * unit)}, unit);
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", I18n::T("L1 / L2: desplazarse   Círculo / Esc: volver"));
+	PageZoom(); // (trucos7)
+	ImGui::End();
+	ImGui::PopStyleColor(g_style_colors);
+	ImGui::PopStyleVar(g_style_vars);
+	g_style_colors = g_style_vars = 0;
+	ImGui::PopFont();
+	if (close) {
+		g_souls_loaded = false;
+		g_note.clear();
+		g_attr_loaded = false; // (stats1)
+		g_attr_note.clear();
+	}
+	return !close;
+}
+} // namespace Cheats
+
+namespace ShopIcons { // (trucos14) below
+void Tick();
+bool Draw(ImDrawList* dl, int id, ImVec2 c, float r, float alpha);
+bool DrawBig(ImDrawList* dl, int id, ImVec2 c, float r, float alpha); // (iconos-hd)
+bool Has(int id);
+} // namespace ShopIcons
+
+// ---- (trucos7) F2 > "Armas y objetos": a shop over the game's own item tables (ItemDb: the user's game files, read once
+// on a worker thread the first time F2 opens, a few MB parsed: then instant). Bought items are added by the game's own
+// routines on the game thread (Loader::DemonsSoulsInventory: AddItem 0x432be0 / LearnMagic 0x44c590). Weapons and
+// shields: only the base (+0, normal path: originEquipWep -1 and no "+n"); the game's blacksmith upgrades them with the
+// forge stones, which are sold under Objetos. Price: the param's basicPrice (souls) or free.
+namespace Shop {
+namespace Inv = Loader::DemonsSoulsInventory;
+std::atomic<int> g_state {0}; // 0 not loaded, 1 loading, 2 ready
+void StartLoad() {
+	int expected = 0;
+	if (g_state.compare_exchange_strong(expected, 1))
+		std::thread([] {
+			ItemDb::Load();
+			g_state = 2;
+			Bump();
+		}).detach();
+}
+struct Cat {
+	const char* name;
+	Icons::Kind icon;
+	int         db;
+	Inv::Kind   kind;
+};
+const Cat kCats[] = {{"Armas", Icons::Sword, 0, Inv::Kind::Weapon},     {"Escudos", Icons::Shield, 0, Inv::Kind::Weapon},
+                     {"Armaduras", Icons::Helm, 1, Inv::Kind::Armor},    {"Anillos", Icons::Ring, 2, Inv::Kind::Ring},
+                     {"Objetos", Icons::Potion, 3, Inv::Kind::Goods},    {"Magias", Icons::Soul, 4, Inv::Kind::Magic},
+                     {"Milagros", Icons::Sun, 4, Inv::Kind::Magic}};
+constexpr int kCatCount = 7;
+bool Shown(int c, const ItemDb::Item& it) {
+	if (it.dup) return false; // (trucos10)
+	for (unsigned char ch: it.name)
+		if (ch >= 0xe3) return false; // (rows the game never translated: Japanese placeholders, debug items)
+	if (it.name.rfind("Catalizador universal", 0) == 0) return false;
+	if (c <= 1) return it.origin < 0 && it.level == 0 && ((c == 1) == (it.sub == 12)); // weaponCategory 12: shields
+	if (c == 2 && it.sub > 3) return false; // (trucos18) protectorCategory > 3: hairstyles / face rows, not armour
+	if (c == 5) return it.sub == 0; // ezStateBehaviorType 0: sorcery
+	if (c == 6) return it.sub == 1; // 1: miracle
+	return true;
+}
+int         g_cat = 0, g_sel = -1, g_qty = 1;
+// (trucos19) Pad / keyboard navigation in three steps: 0 the categories, 1 the item list, 2 the purchase (quantity,
+// Comprar). X / Enter goes one step in (the focus jumps there), Circle / Esc one step back (Back(), from the window
+// thread); the columns not at the current step take no navigation, so the focus never wanders to them. The mouse can
+// still click anywhere (a click sets the step it belongs to).
+std::atomic<int>  g_level {0};
+std::atomic<bool> g_refocus {true}; // the step's own item gets the focus at the next frame
+// Circle / Esc on the shop: true when it went back one step inside the shop (false: leave the page).
+bool Back() {
+	int l = g_level.load();
+	if (l <= 0) return false;
+	g_level   = l - 1;
+	g_refocus = true;
+	return true;
+}
+bool        g_free = false;
+char        g_find[64] = "";
+std::string g_note;
+float       g_cat_anim[kCatCount] {};
+struct Pending {
+	bool        active = false;
+	int         seq = 0, id = 0, cost = 0;
+	std::string name;
+};
+Pending g_pending;
+
+void BigIcon(ImDrawList* dl, Icons::Kind k, ImVec2 c, float size, float hot, float al) {
+	DsStyle::Medallion(dl, StyleIcon(k), c, std::round(size * 0.46f), al, hot, Souls::Time(), hot); // (trucos11)
+}
+
+bool Draw(float width, float height, float unit) {
+	using namespace F1Pages;
+	StartLoad();
+	ShopIcons::Tick(); // (trucos14) the real pictures (worker thread, cached)
+	// (trucos8) A purchase waiting for the game's answer: charge on "added", nothing on "refused".
+	if (g_pending.active && Inv::ResultSeq() != g_pending.seq) {
+		int       rid = 0;
+		const int r   = Inv::Last(&rid);
+		g_pending.active = false;
+		if (r > 0 && rid == g_pending.id) {
+			int souls = 0;
+			if (g_pending.cost > 0 && Cheats::ReadSouls(&souls)) Inv::SetSouls(std::max(0, souls - g_pending.cost));
+			Port::MarkCheatsUsed("Armas y objetos"); // (trucos-online)
+			g_note = std::string(I18n::T("Hecho: ")) + g_pending.name;
+		} else {
+			g_note = I18n::T("El juego no lo acept\xC3\xB3: no se han cobrado almas.");
+		}
+		std::printf("[trucos] tienda: %s -> %s\n", g_pending.name.c_str(), r > 0 && rid == g_pending.id ? "added, cobrado" : "refused, sin cobrar");
+	}
+	Begin("Armas y objetos", width, height, unit);
+	Bump();
+	const float al = ImGui::GetStyle().Alpha;
+	const float list_h = ImGui::GetContentRegionAvail().y - std::round(84 * unit);
+	// Left: the categories, big engraved icons; the chosen one glows.
+	const int level = g_level.load();
+	const bool refocus = g_refocus.exchange(false);
+	ImGui::PushItemFlag(ImGuiItemFlags_NoNav, level != 0); // (trucos19) only the current step's column navigates
+	ImGui::BeginChild("##cats", {std::round(320 * unit), list_h}, ImGuiChildFlags_NavFlattened);
+	for (int c = 0; c < kCatCount; c++) {
+		ImGui::PushID(c);
+		const ImVec2 at  = ImGui::GetCursorScreenPos();
+		const float  row = std::round(72 * unit);
+		{
+			const ImVec2 pa = ImGui::GetCursorScreenPos();
+			DsStyle::CandlePlate(ImGui::GetWindowDrawList(), pa, {pa.x + ImGui::GetContentRegionAvail().x, pa.y + row - 6 * unit}, g_cat_anim[c] * (g_cat == c ? 0.0f : 1.0f),
+			                     g_cat == c ? 1.0f : 0.0f, al, Souls::Time() + c, unit); // (trucos11)
+		}
+		ImGui::PushStyleColor(ImGuiCol_Header, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 {0, 0, 0, 0});
+		ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4 {0, 0, 0, 0});
+		if (refocus && level == 0 && c == g_cat) ImGui::SetKeyboardFocusHere();
+		const bool picked = ImGui::Selectable("##c", g_cat == c, 0, {0, row});
+		ImGui::PopStyleColor(3);
+		if (picked) {
+			if (g_cat != c) g_sel = -1, g_find[0] = 0;
+			g_cat     = c;
+			g_level   = 1; // (trucos19) into the list
+			g_refocus = true;
+		}
+		const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused() || g_cat == c;
+		g_cat_anim[c] += ((hot ? 1.0f : 0.0f) - g_cat_anim[c]) * 0.18f;
+		ImDrawList* dl = ImGui::GetWindowDrawList();
+		BigIcon(dl, kCats[c].icon, {std::round(at.x + row * 0.55f), std::round(at.y + row * 0.5f)}, row * 0.86f, g_cat_anim[c], al);
+		ImFont* f = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+		const float fs = std::round(30 * unit);
+		DsStyle::SmallCaps(dl, f, fs, {std::round(at.x + row * 1.2f), std::round(at.y + (row - fs) * 0.5f)}, I18n::T(kCats[c].name),
+		                   g_cat == c ? DsStyle::C(DsStyle::kBone, al) : DsStyle::C(DsStyle::kGold, al)); // (trucos11)
+		ImGui::PopID();
+	}
+	ImGui::EndChild();
+	ImGui::PopItemFlag();
+	ImGui::SameLine();
+	// Middle: the list.
+	const float mid_w = std::round((ImGui::GetContentRegionAvail().x - 16 * unit) * 0.5f);
+	ImGui::PushItemFlag(ImGuiItemFlags_NoNav, level != 1);
+	ImGui::BeginChild("##shoplist", {mid_w, list_h}, ImGuiChildFlags_NavFlattened);
+	ImGui::SetNextItemWidth(-std::round(130 * unit)); // (online6: room for "Pegar")
+	ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true); // (the search box: mouse / click only, the pad never lands in it)
+	ImGui::InputTextWithHint("##find", I18n::T("Buscar"), g_find, sizeof(g_find));
+	bool list_focus_done = false;
+	Anim::Highlight(unit);
+	FieldTools("##findtools", g_find, sizeof(g_find)); // (online6) right click / Pegar
+	ImGui::PopItemFlag();
+	std::string f = g_find;
+	for (auto& ch: f) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	const ItemDb::Item* chosen = nullptr;
+	if (g_state.load() != 2) {
+		ImGui::TextColored(kDim, "%s", I18n::T("Leyendo las tablas del juego..."));
+	} else if (!ItemDb::g_db.ok) {
+		ImGui::TextColored(kWarn, "%s", I18n::T("No se pudieron leer los ficheros del juego (gameparam.parambnd / item.msgbnd)."));
+	} else {
+		const auto& cat = kCats[g_cat];
+		const float row = std::round(52 * unit);
+		// (11-22) Armour by set: the pieces of one set (the same equipModelId: one parts folder per set) together, in the
+		// order helmet, chest, arms, legs (protectorCategory 0-3); the sets in the game's own order (their first row).
+		// The other categories keep the game's order.
+		static std::vector<const ItemDb::Item*> armour_sorted;
+		static size_t                           armour_n = static_cast<size_t>(-1);
+		const auto&                             all      = ItemDb::g_db.cat[cat.db];
+		std::vector<const ItemDb::Item*>        plain;
+		const std::vector<const ItemDb::Item*>* list = &plain;
+		if (cat.db == 1) {
+			if (armour_n != all.size()) {
+				armour_n = all.size();
+				armour_sorted.clear();
+				std::map<int, size_t> first; // set (model) -> its first row
+				for (size_t i = 0; i < all.size(); i++) first.emplace(all[i].model != 0 ? all[i].model : -1 - static_cast<int>(i), i);
+				for (const auto& it: all) armour_sorted.push_back(&it);
+				std::stable_sort(armour_sorted.begin(), armour_sorted.end(), [&](const ItemDb::Item* x, const ItemDb::Item* y) {
+					const size_t fx = first[x->model != 0 ? x->model : -1 - static_cast<int>(x - all.data())];
+					const size_t fy = first[y->model != 0 ? y->model : -1 - static_cast<int>(y - all.data())];
+					if (fx != fy) return fx < fy;
+					return x->sub < y->sub;
+				});
+			}
+			list = &armour_sorted;
+		} else {
+			plain.reserve(all.size());
+			for (const auto& it: all) plain.push_back(&it);
+		}
+		for (const ItemDb::Item* itp: *list) {
+			const auto& it = *itp;
+			if (!Shown(g_cat, it)) continue;
+			if (!f.empty()) {
+				std::string low = it.name;
+				for (auto& ch: low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+				if (low.find(f) == std::string::npos) continue;
+			}
+			if (g_sel == it.id) chosen = &it;
+			ImGui::PushID(it.id);
+			const ImVec2 at = ImGui::GetCursorScreenPos();
+			if (refocus && level == 1 && !list_focus_done && (g_sel == it.id || g_sel < 0)) {
+				ImGui::SetKeyboardFocusHere(); // (the chosen item, else the first)
+				ImGui::SetScrollHereY(0.5f);
+				list_focus_done = true;
+			}
+			if (ImGui::Selectable("##i", g_sel == it.id, 0, {0, row})) {
+				g_sel     = it.id, g_qty = 1, g_note.clear();
+				g_level   = 2; // (trucos19) to the purchase
+				g_refocus = true;
+			}
+			if (ImGui::IsItemFocused() && g_sel != it.id && ImGui::GetIO().NavActive) g_sel = it.id, chosen = &it;
+			Anim::Highlight(unit);
+			ImDrawList*  dl = ImGui::GetWindowDrawList();
+			const ImVec2 c {std::round(at.x + row * 0.5f), std::round(at.y + row * 0.5f)};
+			if (g_sel == it.id || ImGui::IsItemHovered() || ImGui::IsItemFocused())
+				DsStyle::CandlePlate(dl, at, {at.x + ImGui::GetContentRegionAvail().x, at.y + row}, 1.0f, 0.0f, al * 0.9f, Souls::Time(), unit); // (trucos11)
+			if (!ShopIcons::Draw(dl, it.id, c, std::round(row * 0.5f), al)) // (trucos14) the game's own picture when there is one
+				DsStyle::Medallion(dl, StyleIcon(cat.icon), c, std::round(row * 0.4f), al, g_sel == it.id ? 1.0f : 0.0f, Souls::Time());
+			const float ty = std::round(at.y + (row - ImGui::GetFontSize()) * 0.5f);
+			dl->AddText({std::round(at.x + row + 8 * unit), ty}, ImGui::GetColorU32(ImGuiCol_Text), it.name.c_str());
+			char price[32];
+			std::snprintf(price, sizeof(price), "%d", it.price);
+			const char* pt = (g_free || it.price == 0) ? I18n::T("Gratis") : price;
+			const float pw = ImGui::CalcTextSize(pt).x;
+			dl->AddText({std::round(at.x + ImGui::GetContentRegionAvail().x - pw - 8 * unit), ty}, Souls::C(Souls::kSoul, al * 0.85f), pt);
+			ImGui::PopID();
+		}
+	}
+	ImGui::EndChild();
+	ImGui::PopItemFlag();
+	ImGui::SameLine();
+	// Right: the chosen item, its lore text and the purchase.
+	ImGui::PushItemFlag(ImGuiItemFlags_NoNav, level != 2);
+	ImGui::BeginChild("##detail", {0, list_h}, ImGuiChildFlags_NavFlattened);
+	if (chosen != nullptr) {
+		ImDrawList*  dl = ImGui::GetWindowDrawList();
+		const ImVec2 at = ImGui::GetCursorScreenPos();
+		const float  big = std::round(150 * unit);
+		{
+			const ImVec2 sc {std::round(at.x + big * 0.6f), std::round(at.y + big * 0.55f)};
+			DsStyle::Showcase(dl, StyleIcon(kCats[g_cat].icon), sc, std::round(big * 0.46f), al, Souls::Time()); // (trucos12)
+			// (trucos14) The game's picture over the showcase's recess, when it has one.
+			if (ShopIcons::Has(chosen->id)) {
+				dl->AddCircleFilled(sc, std::round(big * 0.46f * 0.84f), DsStyle::C(DsStyle::kInk, al), 64); // (cover the generic icon)
+				ShopIcons::DrawBig(dl, chosen->id, sc, std::round(big * 0.5f), al); // (iconos-hd) full resolution
+			}
+		}
+		ImGui::Dummy({big * 1.2f, big * 1.1f});
+		ImFont* tf = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
+		const float ts = std::round(36 * unit);
+		const ImVec2 tp = ImGui::GetCursorScreenPos();
+		Souls::Etched(dl, tf, ts, {std::round(tp.x), std::round(tp.y)}, chosen->name.c_str(), al);
+		ImGui::Dummy({1, ts + 6 * unit});
+		Souls::Divider(dl, tp.x, tp.x + ImGui::GetContentRegionAvail().x, std::round(ImGui::GetCursorScreenPos().y), unit, al);
+		ImGui::Dummy({1, 12 * unit});
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(ImVec4 {0.82f, 0.80f, 0.74f, 1.0f}, "%s", chosen->desc.c_str());
+		ImGui::PopTextWrapPos();
+		ImGui::Spacing();
+		const bool stack = kCats[g_cat].kind == Inv::Kind::Goods;
+		if (stack) {
+			ImGui::SetNextItemWidth(std::round(260 * unit));
+			ImGui::SliderInt(I18n::T("Cantidad"), &g_qty, 1, 99); // (left / right on the pad change it)
+			Anim::Highlight(unit);
+		} else {
+			g_qty = 1;
+		}
+		const int cost = g_free ? 0 : chosen->price * g_qty;
+		int       souls = 0;
+		const bool have = Cheats::ReadSouls(&souls);
+		if (cost > 0) ImGui::TextColored(kGold, "%s %d   (%s %d)", I18n::T("Precio:"), cost, I18n::T("tienes"), have ? souls : 0);
+		else ImGui::TextColored(kGold, "%s", I18n::T("Gratis"));
+		const bool ready = Inv::Ready() && have;
+		ImGui::BeginDisabled(!ready);
+		if (refocus && level == 2) ImGui::SetKeyboardFocusHere(); // (trucos19) the focus lands on Comprar
+		if (Anim::Button(I18n::T(kCats[g_cat].kind == Inv::Kind::Magic ? "Aprender" : "Comprar"), {std::round(300 * unit), std::round(56 * unit)}, unit)) {
+			if (cost > souls) g_note = I18n::T("No tienes almas suficientes.");
+			else if (g_pending.active) g_note = I18n::T("Espera: el juego est\xC3\xA1 a\xC3\xB1" "adiendo el anterior.");
+			else if (Inv::Add(kCats[g_cat].kind, chosen->id, g_qty)) {
+				// (trucos8) Charged only once the game's routine said "added" for this id (Inv::Result, below).
+				g_pending = {true, Inv::ResultSeq(), chosen->id, cost, chosen->name};
+				g_note    = I18n::T("Enviado al juego...");
+				std::printf("[trucos] tienda: %s (id %d) x%d pedido, %d almas al confirmar\n", chosen->name.c_str(), chosen->id, g_qty, cost);
+			} else g_note = I18n::T("No se pudo: entra en la partida primero.");
+		}
+		ImGui::EndDisabled();
+		if (!ready) ImGui::TextColored(kDim, "%s", I18n::T("Disponible con la partida cargada."));
+		if (!g_note.empty()) ImGui::TextColored(kDim, "%s", g_note.c_str());
+	} else {
+		ImGui::TextColored(kDim, "%s", I18n::T("Elige un objeto de la lista."));
+	}
+	ImGui::EndChild();
+	ImGui::PopItemFlag();
+	ImGui::Separator();
+	ImGui::PushItemFlag(ImGuiItemFlags_NoNav, level != 0); // (the footer: only from the categories step)
+	bool close = Anim::Button(I18n::T("Volver"), {std::round(240 * unit), std::round(54 * unit)}, unit);
+	ImGui::SameLine();
+	ImGui::Checkbox(I18n::T("Gratis (sin gastar almas)"), &g_free);
+	Anim::Highlight(unit);
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", I18n::T("Círculo / Esc: volver"));
+	ImGui::PopItemFlag();
+	if (close) g_level = 0, g_refocus = true; // (trucos19) the next visit starts at the categories
+	PageZoom();
+	ImGui::End();
+	ImGui::PopStyleColor(g_style_colors);
+	ImGui::PopStyleVar(g_style_vars);
+	g_style_colors = g_style_vars = 0;
+	ImGui::PopFont();
+	return !close;
+}
+} // namespace Shop
+// ---- (trucos14) The real item pictures, from the user's own game files at run time (nothing copied into the port):
+//   <game>/ui/textures/_ps5/global.ctal: 1 byte n, n bytes of path, u32 count, then count x {u32 key, 4 x (u, v) floats,
+//     u32 page} (40 bytes); key = FNV-1a 32 of the UPPER-CASE texture name (checked: "TEX_INVICON_PLACEHOLDER",
+//     "TEX_INVICON_PURESTONE", "TEX_INVICON_WP_A_99999_REPAIRALL" ... all found). Corners may be listed rotated: the
+//     rectangle is their min / max.
+//   <game>/ui/textures/_ps5/_ps5/global_pages.ctxr: 77-byte header, then 5 pages of 4096 x 4096 RGBA8 (premultiplied),
+//     64 KiB "standard" tiles of 128 x 128 (the emulator's gpu_tiler_standard64 for 4-byte elements); only the tiles an
+//     icon touches are read (by offset), never the 320 MiB.
+//   Names: "Tex_InvIcon_<asset>" (the eboot's format at 0x245bf62, built by 0xbceb0). Weapons and shields: the asset is
+//     the folder <game>/weapons/wp_<x>_<equipModelId %04d>_<name> (EquipParamWeapon equipModelId +2: Daga 100 ->
+//     wp_a_0100_dagger), listed at run time. Armour: <game>/parts/<hd|bd|am|lg>_<m|f>_<equipModelId %04d>... (Protector
+//     protectorCategory +8, equipModelId +2), when such a folder exists. Rings, goods and spells: no mapping known yet
+//     (generic medallion).
+// The shop's pictures go into ONE ImGui texture (2048 x 2048, 256 cells of 128 x 128; the overlay's descriptor pool is
+// small), built on a worker thread the first time the shop opens and cached in <exe>/_TempData/tienda-iconos.bin.
+// (iconos-hd) The game's pictures are 260 x 300 (483 of the atlas' 1229 entries, every Tex_InvIcon_ checked): the 128 px
+// cells (120 px pictures) suit the list's 52 px rows, but the detail's picture is drawn at 150 * unit px (300 px at
+// 4K) and was that 120 px picture upscaled (blurry). The detail now gets its own slot under the cells (kBig x kBig,
+// rows kHeight..kTexH of the same texture: no new descriptor), filled on a worker thread from global_pages.ctxr for
+// the chosen item at the size it is drawn (1:1 up to the game's 260 x 300), uploaded with a WantUpdates of that slot.
+// The cells and their cache file are unchanged (the cache stays valid).
+namespace ShopIcons {
+constexpr int kCell = 128, kSide = 2048, kHeight = 3072, kPerRow = kSide / kCell, kMax = kPerRow * (kHeight / kCell), kPage = 4096; // (trucos15: 384 cells)
+constexpr int kBig = 320, kTexH = kHeight + kBig; // (iconos-hd) the detail's slot: x 0..kBig, y kHeight..kTexH
+struct Rect {
+	int x0, y0, x1, y1, page;
+};
+struct State {
+	std::atomic<int>                 phase {0}; // 0 not started, 1 building, 2 pixels ready (texture not made), 3 texture made, -1 failed
+	std::vector<uint8_t>             pixels;    // kSide x kHeight RGBA (straight alpha)
+	std::map<int, int>               cell;      // item id -> cell (weapons / shields / armour)
+	ImTextureData*                   tex = nullptr;
+	ImGuiContext*                    ctx = nullptr;
+	// (iconos-hd) The detail's picture at full resolution.
+	std::map<int, Rect>   src;       // item id -> its rectangle in global_pages.ctxr (written before phase 2, then read-only)
+	std::filesystem::path ctxr_path; // (idem)
+	std::atomic<bool>     big_busy {false};
+	std::mutex            big_m;     // guards the big_done_* fields (the worker -> the UI thread)
+	bool                  big_done = false, big_done_ok = false;
+	int                   big_done_id = -1, big_done_s = 0;
+	std::vector<uint8_t>  big_px;    // kBig x kBig RGBA, the worker's result
+	int                   big_id = -1, big_s = 0; // in the texture's slot now (UI thread only)
+	bool                  big_ok = false;
+};
+State g;
+
+uint32_t Fnv1aUpper(const std::string& s) {
+	uint32_t h = 0x811c9dc5u;
+	for (unsigned char c: s) h = (h ^ static_cast<uint8_t>(std::toupper(c))) * 0x01000193u;
+	return h;
+}
+uint32_t Swizzle64(uint32_t x, uint32_t y) { // standard64, 4-byte elements (gpu_tiler_standard64.inc)
+	return ((x << 2) & 0x00cu) ^ ((x << 5) & 0x080u) ^ ((x << 6) & 0x200u) ^ ((x << 7) & 0x800u) ^ ((x << 8) & 0x2000u) ^ ((x << 9) & 0x8000u) ^
+	       ((y << 4) & 0x070u) ^ ((y << 5) & 0x100u) ^ ((y << 6) & 0x400u) ^ ((y << 7) & 0x1000u) ^ ((y << 8) & 0x4000u);
+}
+std::map<uint32_t, Rect> ReadCtal(const std::filesystem::path& p) {
+	std::map<uint32_t, Rect> out;
+	ItemDb::Bytes            b;
+	if (!ItemDb::ReadFile(p, &b) || b.empty()) return out;
+	const size_t n = static_cast<uint8_t>(b[0]);
+	uint32_t     count = 0;
+	if (!ItemDb::Get(b, 1 + n, &count) || count > 100000) return out;
+	for (uint32_t i = 0; i < count; i++) {
+		const size_t o = 1 + n + 4 + static_cast<size_t>(i) * 40;
+		uint32_t     key = 0, page = 0;
+		float        uv[8] {};
+		if (!ItemDb::Get(b, o, &key) || !ItemDb::Get(b, o + 4, &uv) || !ItemDb::Get(b, o + 36, &page)) break;
+		float u0 = 1, v0 = 1, u1 = 0, v1 = 0;
+		for (int k = 0; k < 4; k++) u0 = std::min(u0, uv[2 * k]), u1 = std::max(u1, uv[2 * k]), v0 = std::min(v0, uv[2 * k + 1]), v1 = std::max(v1, uv[2 * k + 1]);
+		out[key] = {static_cast<int>(std::lround(u0 * kPage)), static_cast<int>(std::lround(v0 * kPage)), static_cast<int>(std::lround(u1 * kPage)),
+		            static_cast<int>(std::lround(v1 * kPage)), static_cast<int>(page)};
+	}
+	return out;
+}
+// The pixels of a rectangle of global_pages.ctxr (straight alpha, w x h), the tiles it touches read by offset.
+bool ReadSrc(std::ifstream& in, const Rect& r, std::map<uint64_t, std::string>& tiles, std::vector<uint8_t>* src) {
+	const int w = r.x1 - r.x0, h = r.y1 - r.y0;
+	if (w <= 0 || h <= 0 || w > 1024 || h > 1024 || r.page < 0 || r.page > 15) return false;
+	src->assign(static_cast<size_t>(w) * h * 4, 0);
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			const uint32_t gx = r.x0 + x, gy = r.y0 + y;
+			const uint64_t tile = static_cast<uint64_t>(r.page) * 1024u + (gy / 128) * (kPage / 128) + gx / 128;
+			auto           it   = tiles.find(tile);
+			if (it == tiles.end()) {
+				std::string t(65536, '\0');
+				in.seekg(static_cast<std::streamoff>(77 + static_cast<uint64_t>(r.page) * kPage * kPage * 4 + ((gy / 128) * (kPage / 128) + gx / 128) * 65536ull));
+				in.read(t.data(), 65536);
+				if (!in) return false;
+				it = tiles.emplace(tile, std::move(t)).first;
+			}
+			const uint8_t* p = reinterpret_cast<const uint8_t*>(it->second.data()) + Swizzle64(gx % 128, gy % 128);
+			uint8_t*       d = &(*src)[(static_cast<size_t>(y) * w + x) * 4];
+			const int      a = p[3];
+			for (int c = 0; c < 3; c++) d[c] = a > 0 ? static_cast<uint8_t>(std::min(255, p[c] * 255 / a)) : 0;
+			d[3] = static_cast<uint8_t>(a);
+		}
+	return true;
+}
+// src (w x h) scaled by s (<= 1; box filter, alpha-weighted colour so the edges keep no dark fringe) into dst (a
+// stride-pixel-wide RGBA buffer) with its top-left corner at (ox, oy). s = 1 is an exact copy.
+void Scale(const std::vector<uint8_t>& src, int w, int h, float s, uint8_t* dst, int stride, int ox, int oy) {
+	const int dw = std::max(1, static_cast<int>(w * s)), dh = std::max(1, static_cast<int>(h * s));
+	for (int y = 0; y < dh; y++)
+		for (int x = 0; x < dw; x++) {
+			const int sx0 = static_cast<int>(x / s), sx1 = std::max(sx0 + 1, static_cast<int>((x + 1) / s)), sy0 = static_cast<int>(y / s), sy1 = std::max(sy0 + 1, static_cast<int>((y + 1) / s));
+			float     acc[4] {};
+			int       n = 0;
+			for (int yy = sy0; yy < std::min(sy1, h); yy++)
+				for (int xx = sx0; xx < std::min(sx1, w); xx++, n++) {
+					const uint8_t* q = &src[(static_cast<size_t>(yy) * w + xx) * 4];
+					for (int c = 0; c < 3; c++) acc[c] += q[c] * (q[3] / 255.0f);
+					acc[3] += q[3];
+				}
+			if (n == 0) continue;
+			uint8_t*    d = &dst[(static_cast<size_t>(oy + y) * stride + ox + x) * 4];
+			const float a = acc[3] / n;
+			for (int c = 0; c < 3; c++) d[c] = a > 0.5f ? static_cast<uint8_t>(std::min(255.0f, acc[c] / n * 255.0f / a)) : 0;
+			d[3] = static_cast<uint8_t>(a);
+		}
+}
+// One icon into its cell: read, scaled (box) to fit 120 px, centred (the list's pictures; unchanged by iconos-hd).
+bool Blit(std::ifstream& in, const Rect& r, int cell, std::map<uint64_t, std::string>& tiles) {
+	std::vector<uint8_t> src;
+	if (!ReadSrc(in, r, tiles, &src)) return false;
+	const int   w = r.x1 - r.x0, h = r.y1 - r.y0;
+	const float s  = std::min(120.0f / w, 120.0f / h);
+	const int   dw = std::max(1, static_cast<int>(w * s)), dh = std::max(1, static_cast<int>(h * s));
+	Scale(src, w, h, s, g.pixels.data(), kSide, (cell % kPerRow) * kCell + (kCell - dw) / 2, (cell / kPerRow) * kCell + (kCell - dh) / 2);
+	return true;
+}
+void Build() {
+	const auto t0   = std::chrono::steady_clock::now();
+	const auto game = std::filesystem::u8path(g_rt.launched.game);
+	const auto ctal = game / "ui" / "textures" / "_ps5" / "global.ctal";
+	const auto ctxr = game / "ui" / "textures" / "_ps5" / "_ps5" / "global_pages.ctxr";
+	std::error_code ec;
+	const auto      ctxr_size = std::filesystem::file_size(ctxr, ec);
+	if (ec) {
+		std::printf("[trucos] iconos: no se pudo abrir %s\n", ctxr.u8string().c_str());
+		g.phase = -1;
+		return;
+	}
+	const auto atlas = ReadCtal(ctal);
+	// The asset folders the game has (names only).
+	std::vector<std::string> weapons, parts;
+	const auto list_dirs = [&](const std::filesystem::path& dir, std::vector<std::string>* out) {
+		for (const auto& e: std::filesystem::directory_iterator(dir, ec))
+			if (e.is_directory(ec)) {
+				const auto u = e.path().filename().u8string(); // (char8_t in C++20)
+				out->emplace_back(u.begin(), u.end());
+			}
+	};
+	list_dirs(game / "weapons", &weapons);
+	list_dirs(game / "parts", &parts);
+	// id -> texture name.
+	std::vector<std::pair<int, std::string>> want;
+	char                                     pre[32];
+	for (const auto& it: ItemDb::g_db.cat[0]) {
+		if (it.dup) continue;
+		// (trucos17) The row's own suffix: wp_<letter>_<model>_<bpPreviewSuffix> (98 of the shop's 99 in 01.007.000).
+		if (!it.bp.empty()) {
+			bool hit = false;
+			for (char c = 'a'; c <= 'z' && !hit; c++) {
+				char n[96];
+				std::snprintf(n, sizeof(n), "Tex_InvIcon_wp_%c_%04d_%s", c, it.model, it.bp.c_str());
+				if (atlas.count(Fnv1aUpper(n))) want.emplace_back(it.id, n), hit = true;
+			}
+			if (hit) continue;
+		}
+		std::snprintf(pre, sizeof(pre), "_%04d_", it.model);
+		for (const auto& w: weapons)
+			if (w.size() > 9 && w.compare(0, 3, "wp_") == 0 && w.compare(4, 6, pre) == 0 && atlas.count(Fnv1aUpper("Tex_InvIcon_" + w))) {
+				want.emplace_back(it.id, "Tex_InvIcon_" + w);
+				break;
+			}
+	}
+	static const char* kPart[] = {"hd", "bd", "am", "lg"};
+	for (const auto& it: ItemDb::g_db.cat[1]) {
+		if (it.dup || it.sub < 0 || it.sub > 3) continue;
+		{
+			// (trucos17) The row's suffixes first: <part>_<m|f|a>_<model>_<bpPreviewSuffix(_Female)>.
+			std::string hit;
+			for (const std::string* sfx: {&it.bp, &it.bp2})
+				for (const char* gch: {"m", "f", "a"})
+					if (hit.empty() && !sfx->empty()) {
+						char n[96];
+						std::snprintf(n, sizeof(n), "Tex_InvIcon_%s_%s_%04d_%s", kPart[it.sub], gch, it.model, sfx->c_str());
+						if (atlas.count(Fnv1aUpper(n))) hit = n;
+					}
+			if (!hit.empty()) {
+				want.emplace_back(it.id, hit);
+				continue;
+			}
+		}
+		for (const char* gch: {"m", "f", "a"}) { // (trucos15: "a" = both, e.g. am_a_boletariaknight_blue; order hd/bd/am/lg confirmed: 71 of 112 named, chainmail's four parts extracted)
+			std::snprintf(pre, sizeof(pre), "%s_%s_%04d", kPart[it.sub], gch, it.model);
+			std::string found;
+			if (atlas.count(Fnv1aUpper(std::string("Tex_InvIcon_") + pre))) found = pre;
+			for (const auto& p: parts)
+				if (found.empty() && p.compare(0, std::strlen(pre), pre) == 0 && atlas.count(Fnv1aUpper("Tex_InvIcon_" + p))) found = p;
+			if (!found.empty()) {
+				want.emplace_back(it.id, "Tex_InvIcon_" + found);
+				break;
+			}
+		}
+	}
+	// (trucos15) Rings, goods and spells: the texture is the item's ENGLISH name in CamelCase ("Poison Cloud" ->
+	// Tex_InvIcon_PoisonCloud, found in the atlas). The English names come from the user's msg/english/item.msgbnd (or
+	// na_english / engus); a name is used only when its hash is in the atlas (no guess can pick a wrong picture).
+	{
+		ItemDb::Bytes en;
+		for (const char* l: {"na_english", "english", "engus"}) // (trucos16: the game ships na_english)
+			if (ItemDb::ReadFile(game / "cp11demonssouls" / "dvdroot" / "msg" / l / "item.msgbnd", &en)) break;
+		const auto files = ItemDb::Bnd3(en);
+		const auto fmg   = [&](const char* tail) {
+            const ItemDb::Bytes* b = ItemDb::Find(files, tail);
+            return b != nullptr ? ItemDb::Fmg(*b) : std::map<int, std::string> {};
+		};
+		const std::map<int, std::string> en_names[3] = {fmg("\x83\x41\x83\x4E\x83\x5A\x83\x54\x83\x8A\x96\xBC" ".fmg"), // rings
+		                                                fmg("\x83\x41\x83\x43\x83\x65\x83\x80\x96\xBC" ".fmg"),         // goods
+		                                                fmg("\x96\x82\x96\x40\x96\xBC" ".fmg")};                             // spells
+		const auto camel = [](const std::string& n, bool keep_case) {
+			std::string out;
+			bool        up = true;
+			for (unsigned char c: n) {
+				if (std::isalnum(c)) {
+					out += static_cast<char>(up ? std::toupper(c) : (keep_case ? c : std::tolower(c)));
+					up = false;
+				} else if (c != '\'') up = true;
+			}
+			return out;
+		};
+		int found[3] {}, by_key[2] {};
+		for (int k = 0; k < 3; k++)
+			for (const auto& it: ItemDb::g_db.cat[k + 2]) {
+				if (it.dup) continue;
+				// (trucos17) Rings and goods: the row's bpPreviewKey (126 of 126 goods, 26 of 26 rings in 01.007.000).
+				if (!it.bp.empty() && atlas.count(Fnv1aUpper("Tex_InvIcon_" + it.bp))) {
+					want.emplace_back(it.id, "Tex_InvIcon_" + it.bp);
+					by_key[k < 2 ? k : 1]++;
+					continue;
+				}
+				const auto e = en_names[k].find(it.id);
+				if (e == en_names[k].end()) continue;
+				// (trucos16) "Tex_InvIcon_" alone is in the atlas: never for an empty name.
+				for (const std::string& cand: {camel(e->second, true), camel(e->second, false)})
+					if (!cand.empty() && atlas.count(Fnv1aUpper("Tex_InvIcon_" + cand))) {
+						want.emplace_back(it.id, "Tex_InvIcon_" + cand);
+						found[k]++;
+						break;
+					}
+			}
+		std::printf("[trucos] iconos por clave del param: anillos %d, objetos %d; por nombre ingles (%s): anillos %d, objetos %d, magias/milagros %d\n",
+		            by_key[0], by_key[1], en.empty() ? "sin item.msgbnd ingles" : "item.msgbnd ingles", found[0], found[1], found[2]);
+	}
+	if (want.size() > static_cast<size_t>(kMax)) want.resize(kMax);
+	// (iconos-hd) Each item's rectangle, for the detail's full-resolution picture (with or without the cache).
+	g.ctxr_path = ctxr;
+	for (const auto& [id, n]: want)
+		if (const auto r = atlas.find(Fnv1aUpper(n)); r != atlas.end()) g.src[id] = r->second;
+	// The cache: valid for the same names and the same game files.
+	const auto cache = std::filesystem::u8path(g_rt.exe_dir) / "_TempData" / "tienda-iconos.bin";
+	// (trucos18) The cache key starts with the mapping's version: a new port build with another mapping rebuilds it by
+	// itself (the id=name list below also changes it whenever a name changes).
+	constexpr const char* kIconMapVersion = "iconmap-3";
+	std::string key  = std::string(kIconMapVersion) + "|" + std::to_string(ctxr_size) + "|" + std::to_string(atlas.size());
+	for (const auto& [id, n]: want) key += "|" + std::to_string(id) + "=" + n;
+	g.pixels.assign(static_cast<size_t>(kSide) * kHeight * 4, 0);
+	bool cached = false;
+	{
+		std::ifstream c(cache, std::ios::binary);
+		uint32_t      kl = 0;
+		if (c && c.read(reinterpret_cast<char*>(&kl), 4) && kl == key.size()) {
+			std::string k(kl, '\0');
+			if (c.read(k.data(), kl) && k == key && c.read(reinterpret_cast<char*>(g.pixels.data()), static_cast<std::streamsize>(g.pixels.size()))) cached = true;
+		}
+	}
+	int ok = 0;
+	if (!cached) {
+		std::ifstream                   in(ctxr, std::ios::binary);
+		std::map<uint64_t, std::string> tiles;
+		for (size_t i = 0; i < want.size(); i++) {
+			const auto r = atlas.find(Fnv1aUpper(want[i].second));
+			if (r != atlas.end() && Blit(in, r->second, static_cast<int>(i), tiles)) ok++;
+			if (tiles.size() > 256) tiles.clear(); // (at most 16 MiB of tiles held)
+		}
+		std::filesystem::create_directories(cache.parent_path(), ec);
+		std::ofstream o(cache, std::ios::binary);
+		const uint32_t kl = static_cast<uint32_t>(key.size());
+		o.write(reinterpret_cast<const char*>(&kl), 4);
+		o.write(key.data(), kl);
+		o.write(reinterpret_cast<const char*>(g.pixels.data()), static_cast<std::streamsize>(g.pixels.size()));
+	} else {
+		ok = static_cast<int>(want.size());
+	}
+	for (size_t i = 0; i < want.size(); i++) g.cell[want[i].first] = static_cast<int>(i);
+	std::printf("[trucos] iconos reales: %zu objetos con icono, %d dibujados, %s, %lld ms\n", want.size(), ok,
+	            cached ? "desde la cache" : "leidos de global_pages.ctxr", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
+	g.phase = 2;
+	Bump();
+}
+// The UI thread: starts the build once (after the item tables), makes the texture when the pixels are ready.
+void Tick() {
+	int expected = 0;
+	if (Shop::g_state.load() == 2 && ItemDb::g_db.ok && g.phase.compare_exchange_strong(expected, 1)) std::thread(Build).detach();
+	if (g.phase.load() == 2) {
+		g.tex = IM_NEW(ImTextureData)();
+		g.tex->Create(ImTextureFormat_RGBA32, kSide, kTexH); // (iconos-hd) the cells + the detail's slot under them (zeroed by Create)
+		std::memcpy(g.tex->GetPixels(), g.pixels.data(), g.pixels.size()); // (rows of kSide: the cells are the first kHeight rows)
+		g.tex->UseColors = true;
+		ImGui::RegisterUserTexture(g.tex);
+		g.ctx = ImGui::GetCurrentContext();
+		std::vector<uint8_t>().swap(g.pixels);
+		g.phase = 3;
+	}
+}
+bool Has(int id) {
+	return g.phase.load() == 3 && g.tex != nullptr && g.ctx == ImGui::GetCurrentContext() && g.cell.count(id) != 0;
+}
+// Draws the item's real picture centred in [c - r, c + r]; false when it has none (the caller draws the medallion).
+bool Draw(ImDrawList* dl, int id, ImVec2 c, float r, float alpha) {
+	if (g.phase.load() != 3 || g.tex == nullptr || g.ctx != ImGui::GetCurrentContext()) return false;
+	const auto it = g.cell.find(id);
+	if (it == g.cell.end()) return false;
+	const float  u0 = static_cast<float>((it->second % kPerRow) * kCell) / kSide, v0 = static_cast<float>((it->second / kPerRow) * kCell) / kTexH;
+	const float  d  = static_cast<float>(kCell) / kSide, dv = static_cast<float>(kCell) / kTexH; // (iconos-hd: the texture is kTexH tall)
+	dl->AddImage(g.tex->GetTexRef(), {std::round(c.x - r), std::round(c.y - r)}, {std::round(c.x + r), std::round(c.y + r)}, {u0, v0}, {u0 + d, v0 + dv},
+	             IM_COL32(255, 255, 255, static_cast<int>(255 * alpha)));
+	return true;
+}
+// (iconos-hd) The worker: item id's picture from global_pages.ctxr into an s x s square (top-left of a kBig x kBig
+// buffer), framed as the cells (picture 120 / 128 of the square), scaled 1:1 at most (the game's own pixels at 4K).
+void BuildBig(int id, int s) {
+	std::vector<uint8_t> out(static_cast<size_t>(kBig) * kBig * 4, 0);
+	bool                 ok = false;
+	if (const auto r = g.src.find(id); r != g.src.end()) {
+		std::ifstream                   in(g.ctxr_path, std::ios::binary);
+		std::map<uint64_t, std::string> tiles;
+		std::vector<uint8_t>            src;
+		if (in && ReadSrc(in, r->second, tiles, &src)) {
+			const int   w = r->second.x1 - r->second.x0, h = r->second.y1 - r->second.y0;
+			const float fit = s * 120.0f / kCell;
+			const float k   = std::min({1.0f, fit / w, fit / h});
+			const int   dw = std::max(1, static_cast<int>(w * k)), dh = std::max(1, static_cast<int>(h * k));
+			Scale(src, w, h, k, out.data(), kBig, std::max(0, (s - dw) / 2), std::max(0, (s - dh) / 2));
+			ok = true;
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(g.big_m);
+		g.big_px      = std::move(out);
+		g.big_done    = true;
+		g.big_done_ok = ok;
+		g.big_done_id = id;
+		g.big_done_s  = s;
+	}
+	g.big_busy = false;
+	Bump();
+}
+// (iconos-hd) The detail's picture: the full-resolution one once its worker is done, the cell's meanwhile (and when it
+// fails). Same placement as Draw. False when the item has no picture.
+bool DrawBig(ImDrawList* dl, int id, ImVec2 c, float r, float alpha) {
+	if (!Has(id)) return false;
+	// A finished picture into the texture's slot (the whole slot, so nothing of the previous one is left).
+	{
+		std::lock_guard<std::mutex> lock(g.big_m);
+		if (g.big_done) {
+			g.big_done = false;
+			if (g.big_done_ok && g.tex->GetPixels() != nullptr && g.big_px.size() == static_cast<size_t>(kBig) * kBig * 4) {
+				for (int y = 0; y < kBig; y++)
+					std::memcpy(g.tex->GetPixelsAt(0, kHeight + y), &g.big_px[static_cast<size_t>(y) * kBig * 4], static_cast<size_t>(kBig) * 4);
+				// (the backend uploads UpdateRect; while WantCreate is pending the whole texture goes up anyway)
+				if (g.tex->Status == ImTextureStatus_OK || g.tex->Status == ImTextureStatus_WantUpdates) {
+					g.tex->Updates.resize(0);
+					g.tex->UpdateRect = {0, static_cast<unsigned short>(kHeight), static_cast<unsigned short>(kBig), static_cast<unsigned short>(kBig)};
+					g.tex->Updates.push_back(g.tex->UpdateRect);
+					g.tex->SetStatus(ImTextureStatus_WantUpdates);
+				}
+			}
+			g.big_id = g.big_done_id, g.big_s = g.big_done_s, g.big_ok = g.big_done_ok;
+		}
+	}
+	const int s = std::clamp(static_cast<int>(std::lround(2.0f * r)), 32, kBig);
+	if ((g.big_id != id || g.big_s != s) && g.src.count(id) != 0) {
+		bool expected = false;
+		if (g.big_busy.compare_exchange_strong(expected, true)) std::thread(BuildBig, id, s).detach();
+	}
+	if (g.big_id != id || !g.big_ok || g.big_s <= 0) return Draw(dl, id, c, r, alpha);
+	const float v0 = static_cast<float>(kHeight) / kTexH, du = static_cast<float>(g.big_s) / kSide, dv = static_cast<float>(g.big_s) / kTexH;
+	dl->AddImage(g.tex->GetTexRef(), {std::round(c.x - r), std::round(c.y - r)}, {std::round(c.x + r), std::round(c.y + r)}, {0.0f, v0}, {du, v0 + dv},
+	             IM_COL32(255, 255, 255, static_cast<int>(255 * alpha)));
+	return true;
+}
+} // namespace ShopIcons
+
 // (ds-pc-port8) In the game: F2's save and quit, a panel in the middle of the screen until the game closes.
 // (ds-pc-port38) `closing`: the fade-out after F2 / Esc closed it (drawn disabled, no input taken).
 // (bb-style-f1) The cursor is kept at every level of F2: each screen (0 the option bar, 1 Mando, 2 Teclado y ratón,
 // 3 Trofeos) remembers the item that had the keyboard / pad focus; when a screen comes back (back from an option, from a
 // sub-screen, or F2 opened again in this session) that item gets the focus again instead of ImGui's first item.
+// ---- (online5) MULTIJUGADOR: F2 card + page, and the same settings in the launcher's Configurador. settings.ini
+// [Multijugador] (multijugador / multijugador_servidor / _cuenta / _clave): any start (JUGAR.cmd too) plays online.
+// The server (ds-online.cpp: "Demon's Souls.exe" --servidor): TCP 31413 accounts, TCP 31415 game + WebAPI, UDP 3758 relay.
+// ---- (chat1) CHAT y AMIGOS: in "Conexión online" (launcher and F2). A worker asks the server (/kyty/chat) every 2.5 s
+// for the messages waiting and who is connected; in the game a notice shows in a corner when a message arrives or a
+// friend connects. Friends: settings.ini multijugador_amigos. Messages live on the server's memory only.
+namespace ChatUi {
+namespace On = Port::Online;
+struct Line {
+	std::string from, text;
+	bool        mine = false;
+};
+std::mutex                                       g_cm;
+std::map<std::string, std::vector<Line>>         g_convo;  // the other player -> lines
+std::map<std::string, int>                       g_unread; // the other player -> messages not seen
+std::vector<std::string>                         g_online;
+std::set<std::string>                            g_was_online, g_friends;
+bool                                             g_first_list = true, g_have_list = false;
+struct ToastItem {
+	std::string title, body;
+	bool        friend_on = false; // a friend connected (a soul) or a message (a speech mark)
+	double      at = 0.0;          // shown since (Anim::Now)
+};
+std::deque<ToastItem>                            g_toasts;
+std::deque<std::pair<std::string, std::string>>  g_outbox; // to, text
+std::string                                      g_error, g_me, g_open_with;
+double                                           g_drawn_at = 0.0;
+char                                             g_input[256] = "";
+std::atomic<bool>                                g_started {false};
+
+std::set<std::string> Split(const std::string& s) {
+	std::set<std::string> out;
+	std::string           cur;
+	for (char c: s + ",") {
+		if (c == ',' || c == ';' || c == ' ') {
+			if (!cur.empty()) out.insert(cur);
+			cur.clear();
+		} else cur += c;
+	}
+	return out;
+}
+constexpr double kToastSeconds = 6.0;
+// (chat2) A soft chime, made once in memory (two bell-like notes, a fifth apart), played without waiting.
+void Chime(bool friend_on) {
+#if defined(_WIN32)
+	static std::vector<uint8_t> wav[2];
+	auto& w = wav[friend_on ? 1 : 0];
+	if (w.empty()) {
+		const int   rate = 44100, n = rate * 7 / 10;
+		const float f1 = friend_on ? 659.25f : 783.99f, f2 = friend_on ? 987.77f : 1046.5f; // E5-B5 / G5-C6
+		std::vector<int16_t> pcm(n);
+		for (int i = 0; i < n; i++) {
+			const float t  = static_cast<float>(i) / rate;
+			const float a1 = std::exp(-t * 6.0f), t2 = t - 0.12f, a2 = t2 > 0 ? std::exp(-t2 * 5.0f) : 0.0f;
+			const float attack = std::min(1.0f, t * 200.0f);
+			float v = attack * (a1 * (std::sin(6.2831853f * f1 * t) + 0.3f * std::sin(6.2831853f * f1 * 2 * t)) +
+			                    a2 * (std::sin(6.2831853f * f2 * t2) + 0.25f * std::sin(6.2831853f * f2 * 2 * t2)));
+			pcm[i] = static_cast<int16_t>(std::clamp(v * 0.18f, -1.0f, 1.0f) * 32767);
+		}
+		auto put32 = [&](uint32_t v) { for (int k = 0; k < 4; k++) w.push_back(static_cast<uint8_t>(v >> (8 * k))); };
+		auto put16 = [&](uint16_t v) { w.push_back(static_cast<uint8_t>(v)); w.push_back(static_cast<uint8_t>(v >> 8)); };
+		const uint32_t bytes = static_cast<uint32_t>(n * 2);
+		for (char c: std::string("RIFF")) w.push_back(static_cast<uint8_t>(c));
+		put32(36 + bytes);
+		for (char c: std::string("WAVEfmt ")) w.push_back(static_cast<uint8_t>(c));
+		put32(16); put16(1); put16(1); put32(rate); put32(rate * 2); put16(2); put16(16);
+		for (char c: std::string("data")) w.push_back(static_cast<uint8_t>(c));
+		put32(bytes);
+		const auto* b = reinterpret_cast<const uint8_t*>(pcm.data());
+		w.insert(w.end(), b, b + bytes);
+	}
+	PlaySoundW(reinterpret_cast<LPCWSTR>(w.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+#else
+	(void)friend_on;
+#endif
+}
+// (11-23) The chat history kept on disk, per account: chat-historial-<cuenta>.txt next to the exe (the last 200 lines
+// of each conversation). Before: only in memory, gone when the game closed. One line: other TAB mine TAB from TAB text,
+// with \\ \t \n escaped. (g_cm held)
+std::filesystem::path HistoryPath() { return PortRoot() / std::filesystem::u8path("chat-historial-" + g_me + ".txt"); }
+std::string HistEsc(const std::string& v) {
+	std::string o;
+	for (char c: v) o += c == '\\' ? std::string("\\\\") : c == '\t' ? std::string("\\t") : c == '\n' ? std::string("\\n") : c == '\r' ? std::string() : std::string(1, c);
+	return o;
+}
+std::string HistUnesc(const std::string& v) {
+	std::string o;
+	for (size_t i = 0; i < v.size(); i++) {
+		if (v[i] == '\\' && i + 1 < v.size()) {
+			const char n = v[++i];
+			o += n == 't' ? '\t' : n == 'n' ? '\n' : n;
+		} else {
+			o += v[i];
+		}
+	}
+	return o;
+}
+void SaveHistory() {
+	if (g_me.empty()) return;
+	std::error_code ec;
+	const auto      path = HistoryPath();
+	auto            tmp  = path;
+	tmp += ".tmp";
+	{
+		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+		if (!out) return;
+		for (const auto& [other, lines]: g_convo) {
+			const size_t from = lines.size() > 200 ? lines.size() - 200 : 0;
+			for (size_t i = from; i < lines.size(); i++)
+				out << HistEsc(other) << '\t' << (lines[i].mine ? '1' : '0') << '\t' << HistEsc(lines[i].from) << '\t' << HistEsc(lines[i].text) << '\n';
+		}
+	}
+	std::filesystem::rename(tmp, path, ec);
+}
+void LoadHistory() {
+	if (g_me.empty()) return;
+	std::ifstream in(HistoryPath(), std::ios::binary);
+	std::string   line;
+	while (std::getline(in, line)) {
+		std::vector<std::string> f;
+		size_t                   a = 0;
+		for (size_t b; (b = line.find('\t', a)) != std::string::npos && f.size() < 3; a = b + 1) f.push_back(line.substr(a, b - a));
+		f.push_back(line.substr(a));
+		if (f.size() != 4) continue;
+		g_convo[HistUnesc(f[0])].push_back({HistUnesc(f[2]), HistUnesc(f[3]), f[1] == "1"});
+	}
+}
+
+void Toast(const std::string& title, const std::string& body, bool friend_on) { // (g_cm held)
+	g_toasts.push_back({title, body.size() > 140 ? body.substr(0, 137) + "..." : body, friend_on, Anim::Now()});
+	while (g_toasts.size() > 3) g_toasts.pop_front();
+	Chime(friend_on);
+}
+// Starts the worker once (multijugador on and an account): from the launcher's / F2's card and every presented frame.
+void Start() {
+	// (chat2) KYTY_CHAT_DEMO=1: two sample notices in the game (20 s and 30 s after the first frame), to see them alone.
+	static std::atomic<bool> demo_once {false};
+	if (const char* d = std::getenv("KYTY_CHAT_DEMO"); d != nullptr && d[0] == '1' && !demo_once.exchange(true))
+		std::thread([] {
+			std::this_thread::sleep_for(std::chrono::seconds(20));
+			{ std::lock_guard lock(g_cm); Toast("Amigo de prueba", I18n::T("Tu amigo se ha conectado"), true); }
+			Bump();
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+			{ std::lock_guard lock(g_cm); Toast(std::string(I18n::T("Mensaje de ")) + "Amigo de prueba", "Te espero en la Puerta de Boletaria, ¿te invoco?", false); }
+			Bump();
+		}).detach();
+	if (g_started.load(std::memory_order_relaxed) || !g_saved.multiplayer || g_saved.online_name.empty() || g_saved.online_password.empty()) return;
+	if (g_started.exchange(true)) return;
+	const std::string name = g_saved.online_name, pass = g_saved.online_password;
+	{
+		std::lock_guard lock(g_cm);
+		g_me      = name;
+		g_friends = Split(g_saved.online_friends);
+		if (g_convo.empty()) LoadHistory(); // (11-23) the conversations of the last times
+	}
+	std::thread([name, pass] {
+		const std::string host = On::ServerHost() + ":" + std::to_string(On::kDefaultPort);
+		for (;;) {
+			std::string to, text;
+			{
+				std::lock_guard lock(g_cm);
+				if (!g_outbox.empty()) {
+					to   = g_outbox.front().first;
+					text = g_outbox.front().second;
+					g_outbox.pop_front();
+				}
+			}
+			std::vector<On::ChatMessage> in;
+			std::vector<std::string>     on;
+			std::string                  err;
+			const bool                   ok = On::Chat(host, name, pass, to, text, &in, &on, &err);
+			bool                         more = false;
+			{
+				std::lock_guard lock(g_cm);
+				if (!ok) {
+					g_error = std::string(I18n::T("Chat: ")) + err;
+					if (!to.empty() && err == "el servidor no responde") g_outbox.emplace_front(to, text); // (sent again)
+					else if (!to.empty()) g_convo[to].push_back({"", std::string(I18n::T("(no enviado: ")) + err + ")", true}), SaveHistory();
+				} else {
+					g_error.clear();
+					const bool shown = Anim::Now() - g_drawn_at < 0.5;
+					for (const auto& m: in) {
+						g_convo[m.from].push_back({m.from, m.text, false});
+						if (!(shown && g_open_with == m.from)) g_unread[m.from]++;
+						Toast(std::string(I18n::T("Mensaje de ")) + m.from, m.text, false);
+					}
+					if (!in.empty()) SaveHistory(); // (11-23)
+					std::set<std::string> now(on.begin(), on.end());
+					if (!g_first_list)
+						for (const auto& n: now)
+							if (n != name && !g_was_online.count(n) && g_friends.count(n)) Toast(n, I18n::T("Tu amigo se ha conectado"), true);
+					g_first_list = false;
+					g_was_online = std::move(now);
+					g_online     = std::move(on);
+					g_have_list  = true;
+				}
+				more = !g_outbox.empty();
+			}
+			Bump();
+			std::this_thread::sleep_for(std::chrono::milliseconds(more ? 150 : 2500));
+		}
+	}).detach();
+}
+void SaveFriends() { // (UI thread; g_cm held by the caller)
+	std::string list;
+	for (const auto& f: g_friends) list += (list.empty() ? "" : ",") + f;
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	for (Settings* s: {&on_disk, &g_saved, &g_edit}) s->online_friends = list;
+	(void)SaveSettings(g_rt.ini_path, on_disk);
+}
+bool ToastActive() {
+	std::lock_guard lock(g_cm);
+	const double now = Anim::Now();
+	while (!g_toasts.empty() && g_toasts.front().at + kToastSeconds < now) g_toasts.pop_front();
+	return !g_toasts.empty();
+}
+// (chat2) The notices: a card that slides in from the right (top right), dark stone with a gold edge, a glowing soul
+// (friend) or a speech mark (message), the name in gold and the text below; it eases out after 6 s.
+void DrawToasts(float width, float height) {
+	std::vector<ToastItem> list;
+	{
+		std::lock_guard lock(g_cm);
+		list.assign(g_toasts.begin(), g_toasts.end());
+	}
+	if (list.empty()) return;
+	const float  unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
+	ImFont*      f    = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont();
+	const float  ts   = std::round(25 * unit), bs = std::round(21 * unit), pad = std::round(18 * unit), w = std::round(460 * unit);
+	const float  icon = std::round(64 * unit);
+	auto*        dl   = ImGui::GetForegroundDrawList();
+	float        y    = std::round(96 * unit);
+	const double now  = Anim::Now();
+	for (const auto& it: list) {
+		const float age = static_cast<float>(now - it.at), left = static_cast<float>(kToastSeconds) - age;
+		const float in  = Anim::EaseOutQuint(std::clamp(age / 0.45f, 0.0f, 1.0f));
+		const float out = std::clamp(left / 0.4f, 0.0f, 1.0f);
+		const float a   = std::min(in, out * out);
+		const float dx  = (1.0f - in) * std::round(120 * unit) + (1.0f - out) * std::round(40 * unit);
+		const float tw  = w - pad * 3 - icon;
+		const ImVec2 t1 = f->CalcTextSizeA(ts, FLT_MAX, tw, it.title.c_str());
+		const ImVec2 t2 = f->CalcTextSizeA(bs, FLT_MAX, tw, it.body.c_str());
+		const float  h  = std::max(icon, t1.y + std::round(6 * unit) + t2.y) + pad * 2;
+		const ImVec2 p0 {std::round(width - w - 28 * unit + dx), y}, p1 {p0.x + w, y + h};
+		const float  r  = 12 * unit;
+		for (int k = 3; k >= 1; k--) // soft shadow
+			dl->AddRectFilled({p0.x - k * 3 * unit, p0.y - k * 2 * unit}, {p1.x + k * 3 * unit, p1.y + k * 5 * unit}, IM_COL32(0, 0, 0, static_cast<int>(40 * a)), r + k * 3 * unit);
+		dl->AddRectFilledMultiColor(p0, p1, IM_COL32(30, 28, 34, static_cast<int>(240 * a)), IM_COL32(22, 21, 26, static_cast<int>(240 * a)),
+		                            IM_COL32(14, 14, 18, static_cast<int>(240 * a)), IM_COL32(20, 19, 24, static_cast<int>(240 * a)));
+		dl->AddRect(p0, p1, IM_COL32(222, 196, 140, static_cast<int>(210 * a)), r, 0, std::max(1.0f, 1.6f * unit));
+		dl->AddRect({p0.x + 4 * unit, p0.y + 4 * unit}, {p1.x - 4 * unit, p1.y - 4 * unit}, IM_COL32(222, 196, 140, static_cast<int>(60 * a)), r * 0.7f, 0, 1.0f);
+		// the icon: a breathing glow
+		const ImVec2 c {p0.x + pad + icon * 0.5f, p0.y + h * 0.5f};
+		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(now) * 3.0f);
+		const ImVec4 col = it.friend_on ? ImVec4 {0.62f, 0.95f, 0.70f, 1.0f} : ImVec4 {0.72f, 0.82f, 1.0f, 1.0f};
+		for (int k = 3; k >= 1; k--)
+			dl->AddCircleFilled(c, icon * (0.22f + 0.09f * k + 0.03f * pl), ImGui::GetColorU32(ImVec4 {col.x, col.y, col.z, a * 0.07f * k}), 32);
+		Icons::Draw(dl, it.friend_on ? Icons::Soul : Icons::Ring, c, icon * 0.62f, ImGui::GetColorU32(ImVec4 {col.x, col.y, col.z, a}));
+		// the text
+		const float tx = p0.x + pad * 2 + icon, ty = p0.y + (h - (t1.y + std::round(6 * unit) + t2.y)) * 0.5f;
+		dl->AddText(f, ts, {tx + 1, ty + 1}, IM_COL32(0, 0, 0, static_cast<int>(160 * a)), it.title.c_str(), nullptr, tw);
+		dl->AddText(f, ts, {tx, ty}, IM_COL32(236, 206, 140, static_cast<int>(255 * a)), it.title.c_str(), nullptr, tw);
+		dl->AddText(f, bs, {tx, ty + t1.y + std::round(6 * unit)}, IM_COL32(232, 226, 214, static_cast<int>(235 * a)), it.body.c_str(), nullptr, tw);
+		y = p1.y + std::round(14 * unit);
+	}
+	Bump(); // (the animation)
+}
+// The players list with chat / friend buttons, and the open conversation. `fallback`: the server's /kyty/estado names.
+void Draw(float unit, const std::vector<std::string>& fallback) {
+	Start();
+	std::lock_guard lock(g_cm);
+	g_drawn_at = Anim::Now();
+	if (!g_saved.multiplayer || g_saved.online_name.empty()) {
+		ImGui::TextColored(kDim, "%s", I18n::T("Para chatear: activa el multijugador y crea tu cuenta (abajo)."));
+		return;
+	}
+	const std::vector<std::string>& on = g_have_list ? g_online : fallback;
+	std::set<std::string>           shown;
+	ImGui::TextColored(kDimL, "%s", (std::string(I18n::T("Jugadores conectados: ")) + std::to_string(on.size())).c_str());
+	auto row = [&](const std::string& name, bool online) {
+		ImGui::PushID(name.c_str());
+		const ImVec2 at = ImGui::GetCursorScreenPos();
+		const float  r  = std::round(7 * unit), lh = ImGui::GetTextLineHeight();
+		ImGui::GetWindowDrawList()->AddCircleFilled({at.x + r, at.y + lh * 0.5f + std::round(4 * unit)}, r,
+		                                            online ? IM_COL32(80, 220, 110, 255) : IM_COL32(110, 110, 110, 255));
+		ImGui::Dummy({r * 2 + std::round(8 * unit), lh});
+		ImGui::SameLine();
+		const bool me = name == g_me;
+		std::string label = name + (me ? std::string(I18n::T(" (tú)")) : "") + (g_friends.count(name) ? std::string(I18n::T("  ★ amigo")) : "");
+		if (int n = g_unread.count(name) ? g_unread[name] : 0; n > 0) label += "  (" + std::to_string(n) + ")";
+		// (11-23) Online / offline written out; a friend who is online in green (name and state) to spot at a glance.
+		label += online ? std::string(I18n::T("  - en línea")) : std::string(I18n::T("  - desconectado"));
+		const bool friend_on = online && !me && g_friends.count(name) != 0;
+		ImGui::TextColored(friend_on ? ImVec4 {0.35f, 0.90f, 0.45f, 1.0f} : online ? ImVec4 {0.93f, 0.91f, 0.88f, 1.0f} : kDim, "%s", label.c_str());
+		if (!me) {
+			const ImVec2 bs {std::round(150 * unit), 0};
+			ImGui::SameLine(std::round(520 * unit));
+			if (Anim::Button(g_open_with == name ? I18n::T("Cerrar chat") : I18n::T("Chatear"), bs, unit)) {
+				g_open_with = g_open_with == name ? std::string() : name;
+				g_unread[name] = 0;
+			}
+			ImGui::SameLine();
+			const bool fr = g_friends.count(name) != 0;
+			if (Anim::Button(fr ? I18n::T("Quitar amigo") : I18n::T("Añadir amigo"), {std::round(190 * unit), 0}, unit)) {
+				if (fr) g_friends.erase(name);
+				else g_friends.insert(name);
+				SaveFriends();
+			}
+		}
+		ImGui::PopID();
+		shown.insert(name);
+	};
+	for (const auto& n: on) if (g_friends.count(n)) row(n, true); // (11-23) connected friends first
+	for (const auto& n: on) if (!g_friends.count(n)) row(n, true);
+	for (const auto& f: g_friends)
+		if (!shown.count(f)) row(f, false); // friends not connected: gray
+	if (!g_error.empty()) ImGui::TextColored(kDim, "%s", g_error.c_str());
+	if (g_open_with.empty()) return;
+	// The conversation.
+	g_unread[g_open_with] = 0;
+	ImGui::Spacing();
+	ImGui::TextColored(kGold, "%s", (std::string(I18n::T("Chat con ")) + g_open_with).c_str());
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.07f, 0.09f, 0.9f});
+	ImGui::BeginChild("##chatlog", {0, std::round(260 * unit)}, ImGuiChildFlags_Borders);
+	for (const auto& l: g_convo[g_open_with]) {
+		const ImVec4 col = l.mine ? ImVec4 {0.72f, 0.82f, 1.0f, 1.0f} : ImVec4 {0.93f, 0.91f, 0.88f, 1.0f};
+		ImGui::PushStyleColor(ImGuiCol_Text, col);
+		ImGui::TextWrapped("%s: %s", l.mine ? I18n::T("Tú") : l.from.c_str(), l.text.c_str());
+		ImGui::PopStyleColor();
+	}
+	if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) ImGui::SetScrollHereY(1.0f);
+	ImGui::EndChild();
+	ImGui::PopStyleColor();
+	ImGui::SetNextItemWidth(-std::round(170 * unit));
+	bool send = ImGui::InputText("##chatin", g_input, sizeof(g_input), ImGuiInputTextFlags_EnterReturnsTrue);
+	ImGui::SameLine();
+	send |= Anim::Button(I18n::T("Enviar"), {std::round(150 * unit), 0}, unit);
+	if (send && g_input[0] != 0) {
+		g_outbox.emplace_back(g_open_with, g_input);
+		g_convo[g_open_with].push_back({g_me, g_input, true});
+		SaveHistory(); // (11-23)
+		g_input[0] = 0;
+		ImGui::SetKeyboardFocusHere(-1);
+	}
+}
+// (11-22) Next to the account name: the friends connected now, each a button that opens the chat with them (the
+// conversation shows in the chat box below, as from its list). Nothing when there is no account or none is connected.
+void FriendsInline(float unit) {
+	std::lock_guard lock(g_cm);
+	if (!g_saved.multiplayer || g_saved.online_name.empty() || !g_have_list) return;
+	std::vector<std::string> on;
+	for (const auto& n: g_online)
+		if (n != g_me && g_friends.count(n)) on.push_back(n);
+	if (on.empty()) return;
+	ImGui::SameLine(0, std::round(18 * unit));
+	ImGui::TextColored(ImVec4 {0.45f, 0.86f, 0.52f, 1.0f}, "%s", I18n::T("Amigos conectados:"));
+	for (const auto& n: on) {
+		ImGui::SameLine();
+		ImGui::PushID(n.c_str());
+		std::string label = n;
+		if (int k = g_unread.count(n) ? g_unread[n] : 0; k > 0) label += " (" + std::to_string(k) + ")";
+		if (ImGui::SmallButton(label.c_str())) {
+			g_open_with  = n;
+			g_unread[n]  = 0;
+		}
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", I18n::T("Abrir el chat con este amigo"));
+		ImGui::PopID();
+	}
+}
+} // namespace ChatUi
+
+namespace Multiplayer {
+namespace On = Port::Online;
+std::mutex  g_m;
+std::string g_state_json, g_public_ip, g_lan_ip, g_note, g_test;
+bool        g_server_up = false, g_local_up = false, g_firewall = false, g_autostart = false;
+std::atomic<bool> g_busy {false}, g_busy_ip {false};
+std::chrono::steady_clock::time_point g_next {};
+char        g_server[128] = "", g_name[32] = "", g_pass[64] = "";
+bool        g_inited = false;
+float       g_pulse_t = 0.0f;
+
+void Note(const std::string& s) {
+	std::lock_guard lock(g_m);
+	g_note = s;
+}
+std::string Host() { // (online10) fixed server: this PC's own when it runs it, else the owner's via DuckDNS
+	return g_local_up ? std::string("127.0.0.1") : std::string(On::kPublicServer);
+}
+bool IsLocal() {
+	const auto h = Host();
+	return h == "127.0.0.1" || h == "localhost";
+}
+void Refresh() { // (worker) the server's state, this PC's server, firewall, autostart
+	if (g_busy.exchange(true)) return;
+	const std::string host = Host();
+	std::thread([host] {
+		const std::string st    = On::ServerState(host + ":" + std::to_string(On::kDefaultPort));
+		const bool        local = On::Probe("127.0.0.1:" + std::to_string(On::kDefaultPort), nullptr);
+		const bool        fw    = On::FirewallReady();
+		const bool        as    = On::Autostart();
+		{
+			std::lock_guard lock(g_m);
+			g_state_json = st;
+			g_server_up  = !st.empty();
+			g_local_up   = local;
+			g_firewall   = fw;
+			g_autostart  = as;
+		}
+		g_busy = false;
+		Bump();
+	}).detach();
+}
+void FindIps() {
+	if (g_busy_ip.exchange(true)) return;
+	std::thread([] {
+		const std::string lan = On::LanIp(), pub = On::PublicIp();
+		{
+			std::lock_guard lock(g_m);
+			g_lan_ip = lan, g_public_ip = pub;
+		}
+		g_busy_ip = false;
+		Bump();
+	}).detach();
+}
+void Save(bool on) {
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	for (Settings* s: {&on_disk, &g_saved, &g_edit}) {
+		s->multiplayer     = on;
+		s->online_server   = Host();
+		s->online_name     = g_name;
+		s->online_password = g_pass;
+	}
+	(void)SaveSettings(g_rt.ini_path, on_disk);
+}
+// The flat values of a key in the server's /kyty/estado JSON (a tiny reader for our own answer).
+std::vector<std::string> Strings(const std::string& json, const std::string& array_key) {
+	std::vector<std::string> out;
+	const auto               a = json.find("\"" + array_key + "\":[");
+	if (a == std::string::npos) return out;
+	const auto e = json.find(']', a);
+	for (size_t at = json.find('"', a + array_key.size() + 4); at != std::string::npos && at < e;) {
+		const auto z = json.find('"', at + 1);
+		out.push_back(json.substr(at + 1, z - at - 1));
+		at = json.find('"', z + 1);
+	}
+	return out;
+}
+long long Number(const std::string& json, const std::string& key) {
+	const auto a = json.find("\"" + key + "\":");
+	return a == std::string::npos ? -1 : std::atoll(json.c_str() + a + key.size() + 3);
+}
+
+// The settings rows (the launcher's Configurador and the F2 page).
+void SettingsBlock(float unit) {
+	if (!g_inited) {
+		g_inited = true;
+		std::snprintf(g_server, sizeof(g_server), "%s", g_saved.online_server.c_str());
+		std::snprintf(g_name, sizeof(g_name), "%s", g_saved.online_name.c_str());
+		std::snprintf(g_pass, sizeof(g_pass), "%s", g_saved.online_password.c_str());
+		FindIps();
+	}
+	if (std::chrono::steady_clock::now() >= g_next) {
+		g_next = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+		Refresh();
+	}
+	std::string note;
+	{
+		std::lock_guard lock(g_m);
+		note = g_note;
+	}
+	const ImVec2 bs {std::round(300 * unit), std::round(50 * unit)};
+	// (trucos-online) Cheats in use: the box shows off and cannot be turned on (online and cheats never together).
+	const bool   cheats = CheatsInUse() || g_saved.randomizer; // (rando1) the randomizer plays offline too
+	bool         on     = g_saved.multiplayer && !cheats;
+	if (ImGui::Checkbox(I18n::T("Conexión online"), &on)) {
+		if (on && g_saved.randomizer) {
+			Note(I18n::T("Desactiva el Randomizer para jugar online."));
+		} else if (on && cheats) {
+			Note(I18n::T("Desactiva los trucos (o reinicia sin usarlos) para jugar online."));
+			std::printf("[port] online: no se puede activar, hay trucos en uso\n");
+		} else {
+			Save(on);
+			Note(on ? I18n::T("Multijugador activado. Se aplica al reiniciar el juego.") : I18n::T("Multijugador apagado: el juego vuelve a ser sin conexión al reiniciar."));
+		}
+	}
+	Anim::Highlight(unit);
+	if (cheats) ImGui::TextColored(kGold, "%s", I18n::T("Desactiva los trucos (o reinicia sin usarlos) para jugar online."));
+	ImGui::TextColored(kDim, "%s", (std::string(I18n::T("Servidor: ")) + On::kPublicServer + I18n::T(" (todos los jugadores al mismo)")).c_str()); // (online10)
+	ImGui::SetNextItemWidth(std::round(420 * unit));
+	ImGui::InputTextWithHint(I18n::T("Cuenta"), I18n::T("nombre (letras y números)"), g_name, sizeof(g_name));
+	Anim::Highlight(unit);
+	FieldTools("##g_name", g_name, sizeof(g_name)); // (online6) Pegar
+	ChatUi::FriendsInline(unit); // (11-22) the friends connected, next to the name: a click opens their chat
+	ImGui::SetNextItemWidth(std::round(420 * unit));
+	ImGui::InputTextWithHint(I18n::T("Contraseña"), "", g_pass, sizeof(g_pass), ImGuiInputTextFlags_Password);
+	Anim::Highlight(unit);
+	FieldTools("##g_pass", g_pass, sizeof(g_pass)); // (online6) Pegar
+	ImGui::BeginDisabled(g_busy.load());
+	if (Anim::Button(I18n::T("Crear cuenta"), bs, unit)) {
+		const std::string host = Host(), name = g_name, pass = g_pass;
+		std::thread([host, name, pass] {
+			std::string error;
+			const bool  ok = On::CreateAccount(host, name, pass, &error);
+			Note(ok ? std::string(I18n::T("Cuenta creada: ")) + name : std::string(I18n::T("No se pudo crear la cuenta: ")) + error);
+			Bump();
+		}).detach();
+		Save(g_saved.multiplayer);
+	}
+	ImGui::SameLine();
+	if (Anim::Button(I18n::T("Guardar"), bs, unit)) {
+		Save(g_saved.multiplayer);
+		Note(I18n::T("Guardado. Se aplica al reiniciar el juego."));
+	}
+	ImGui::EndDisabled();
+	// (online7) what is written is kept without "Guardar": once no field is being edited, a server, account or password
+	// different from the saved one goes to settings.ini (the game reads it at its next start).
+	if (!ImGui::IsAnyItemActive() && (g_saved.online_server != Host() || g_saved.online_name != g_name || g_saved.online_password != g_pass)) {
+		Save(g_saved.multiplayer);
+		Note(I18n::T("Guardado. Se aplica al reiniciar el juego."));
+	}
+	if (!note.empty()) ImGui::TextColored(kGold, "%s", note.c_str());
+}
+
+// (online11) The server's state as a pulsing seal: soul blue connected, ember no answer.
+void Seal(float unit, bool up) {
+	// the server's state: a pulsing seal (soul blue: connected; ember: no answer), players and sessions.
+	{
+		ImDrawList*  dl   = ImGui::GetWindowDrawList();
+		const float  side = std::round(54 * unit);
+		const ImVec2 at   = ImGui::GetCursorScreenPos();
+		ImGui::Dummy({side, side});
+		g_pulse_t       = static_cast<float>(ImGui::GetTime());
+		const float  pl = 0.5f + 0.5f * std::sin(g_pulse_t * (up ? 2.2f : 5.0f));
+		const ImVec2 c {std::round(at.x + side * 0.5f), std::round(at.y + side * 0.5f)};
+		const ImVec4 col = up ? ImVec4 {0.72f, 0.82f, 1.0f, 1.0f} : ImVec4 {0.95f, 0.45f, 0.25f, 1.0f};
+		for (int k = 3; k >= 1; k--)
+			dl->AddCircleFilled(c, side * (0.25f + 0.1f * k + 0.05f * pl), ImGui::GetColorU32(ImVec4 {col.x, col.y, col.z, ImGui::GetStyle().Alpha * 0.06f * k}), 32);
+		Icons::Draw(dl, Icons::Soul, c, side * (0.7f + 0.05f * pl), ImGui::GetColorU32(ImVec4 {col.x, col.y, col.z, ImGui::GetStyle().Alpha}));
+		ImGui::SameLine();
+		ImGui::BeginGroup();
+		const std::string head = std::string(I18n::T("Servidor ")) + Host() + ":31415  -  " + (up ? I18n::T("conectado") : I18n::T("no responde"));
+		ImGui::TextColored(up ? kGold : kDim, "%s", head.c_str());
+		const std::string mode = g_saved.multiplayer ? std::string(I18n::T("Multijugador activado (cuenta ")) + g_saved.online_name + ")"
+		                                             : std::string(I18n::T("Multijugador apagado: sin conexión, como siempre"));
+		ImGui::TextColored(kDim, "%s", mode.c_str());
+		ImGui::EndGroup();
+	}
+}
+// (stats1 -> cleanbtn) "Deshabilitar trucos y mejoras": el control se movió fuera de este panel al medallón "SIN TRUCOS"
+// de la barra inferior del lanzador (LauncherTrophy::DrawNoCheats). El comportamiento de ocultar/forzar los trucos (F2
+// oculta Trucos y Armas y objetos; Cheats::Tick los fuerza apagados con g_saved.no_cheats) no cambia; solo se movió la UI.
+
+// (online11) "Conexión online" in the launcher and F2: title, seal, players, then account and password.
+void Card(float unit) {
+	Bump();
+	bool up, local;
+	std::string st;
+	{
+		std::lock_guard lock(g_m);
+		up = g_server_up, local = g_local_up, st = g_state_json;
+	}
+	(void)local;
+	ImGui::PushFont(DisplayFont(), 40.0f * unit);
+	ImGui::TextColored(kGold, "%s", I18n::T("Conexión online"));
+	ImGui::PopFont();
+	ImGui::TextColored(kDim, "%s", I18n::T("Mensajes, manchas de sangre, fantasmas e invocaciones con tus amigos. Todos en el mismo servidor."));
+	ImGui::Spacing();
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.10f, 0.11f, 0.14f, 0.85f});
+	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
+	ImGui::BeginChild("##oncard", {0, 0}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding | ImGuiChildFlags_AutoResizeY);
+	Seal(unit, up);
+	if (up) ChatUi::Draw(unit, Strings(st, "jugadores")); // (chat1) the players (green: connected), chat and friends
+	ImGui::EndChild();
+	ImGui::PopStyleVar();
+	ImGui::PopStyleColor();
+	ImGui::Spacing();
+	SettingsBlock(unit);
+	// (cleanbtn) "Deshabilitar trucos y mejoras" ya no vive aquí: ahora es el medallón "SIN TRUCOS" de la barra inferior
+	// del lanzador (LauncherTrophy::DrawNoCheats), visible sin abrir este panel.
+}
+
+bool Page(float width, float height, float unit) {
+	using namespace F1Pages;
+	Begin("Multijugador", width, height, unit);
+	ImGui::BeginChild("##multi", {0, -std::round(84 * unit)}, ImGuiChildFlags_NavFlattened);
+	Anim::SmoothScroll();
+	if (const int d = g_page_scroll.exchange(0); d != 0) ImGui::SetScrollY(ImGui::GetScrollY() + d * ImGui::GetWindowHeight() * 0.6f);
+	Bump();
+	std::string st, pub, lan;
+	bool        up, local, fw, as;
+	{
+		std::lock_guard lock(g_m);
+		st = g_state_json, pub = g_public_ip, lan = g_lan_ip;
+		up = g_server_up, local = g_local_up, fw = g_firewall, as = g_autostart;
+	}
+	Seal(unit, up);
+	if (up) {
+		// (11-23) In the game too: the players (friends online in green, first), the chat with the keyboard and friends,
+		// as in the launcher (before: only a text line with the names, no chat in the game).
+		ChatUi::Draw(unit, Strings(st, "jugadores"));
+		ImGui::Spacing();
+		const auto sessions = Number(st, "sesiones") >= 0 ? 0 : 0;
+		(void)sessions;
+		size_t     n_ses = 0;
+		for (size_t a = st.find("\"sessionId\""); a != std::string::npos; a = st.find("\"sessionId\"", a + 1)) n_ses++;
+		InfoLine(I18n::T("Partidas (sesiones) abiertas"), std::to_string(n_ses), kDimL);
+		InfoLine(I18n::T("Mensajes / manchas guardados"), std::to_string(std::max(0LL, Number(st, "mensajes"))) + " / " + std::to_string(std::max(0LL, Number(st, "manchas"))), kDimL);
+	}
+	if (g_saved.multiplayer != g_rt.launched.multiplayer || g_saved.online_server != g_rt.launched.online_server || g_saved.online_name != g_rt.launched.online_name ||
+	    g_saved.online_password != g_rt.launched.online_password) {
+		ImGui::TextColored(kDim, "%s", I18n::T("El cambio se aplica al reiniciar el juego."));
+		ImGui::SameLine();
+		if (Anim::Button(I18n::T("Reiniciar ahora"), {std::round(260 * unit), std::round(44 * unit)}, unit)) RequestRestart();
+	}
+	ImGui::Spacing();
+	ImGui::Separator();
+	SettingsBlock(unit);
+	ImGui::Spacing();
+	ImGui::Separator();
+	// This PC as the server (the host).
+	ImGui::TextColored(kGold, "%s", I18n::T("Este PC como servidor (anfitrión)"));
+	InfoLine(I18n::T("Servidor en este PC"), local ? I18n::T("encendido (TCP 31413, 31415; UDP 3758)") : I18n::T("apagado"), local ? kGold : kDim);
+	const ImVec2 bs {std::round(330 * unit), std::round(50 * unit)};
+	if (Anim::Button(local ? I18n::T("Apagar el servidor") : I18n::T("Encender el servidor"), bs, unit)) {
+		if (local) {
+			On::StopServer();
+			Note(I18n::T("Servidor apagado."));
+		} else {
+			std::thread([] { Note(On::EnsureHost(On::kDefaultPort) ? I18n::T("Servidor encendido.") : I18n::T("El servidor no arranca: ¿algún puerto ocupado?")); Bump(); }).detach();
+		}
+		g_next = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+	}
+	ImGui::SameLine();
+	bool always = as;
+	if (ImGui::Checkbox(I18n::T("Siempre encendido (arranca con Windows)"), &always)) {
+		Note(On::SetAutostart(always, On::kDefaultPort) ? (always ? I18n::T("Arrancará con Windows.") : I18n::T("Ya no arranca con Windows.")) : I18n::T("No se pudo cambiar."));
+		if (always && !local) std::thread([] { On::EnsureHost(On::kDefaultPort); Bump(); }).detach();
+		g_next = {};
+	}
+	InfoLine(I18n::T("Firewall de Windows"), fw ? I18n::T("permitido") : I18n::T("sin permiso"), fw ? kGold : kDim);
+	if (!fw) {
+		ImGui::SameLine();
+		if (Anim::Button(I18n::T("Permitir (pide permiso una vez)"), bs, unit))
+			std::thread([] { Note(On::AddFirewallRule(On::kDefaultPort) ? I18n::T("Firewall: permitido.") : I18n::T("Firewall: no se aceptó el permiso.")); g_next = {}; Bump(); }).detach();
+	}
+	InfoLine(I18n::T("IP pública (para tus amigos)"), g_busy_ip.load() ? std::string(I18n::T("buscando...")) : (pub.empty() ? std::string("?") : pub), kDimL);
+	InfoLine(I18n::T("IP en tu red"), lan.empty() ? std::string("?") : lan, kDimL);
+	{
+		ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+		ImGui::TextColored(kDim, "%s", I18n::T("Router (solo el anfitrión): TCP 31413, TCP 31415 y UDP 3758 hacia la IP de este PC. Los amigos no abren nada: el juego entre jugadores pasa por el servidor."));
+		ImGui::PopTextWrapPos();
+	}
+	ImGui::EndChild();
+	ImGui::Separator();
+	bool close = Anim::Button(I18n::T("Volver"), {std::round(240 * unit), std::round(54 * unit)}, unit);
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", I18n::T("L1 / L2: desplazarse   Círculo / Esc: volver"));
+	PageZoom();
+	ImGui::End();
+	ImGui::PopStyleColor(g_style_colors);
+	ImGui::PopStyleVar(g_style_vars);
+	g_style_colors = g_style_vars = 0;
+	ImGui::PopFont();
+	return !close;
+}
+} // namespace Multiplayer
+
 namespace KeepFocus {
 struct Mem {
 	ImGuiID      id = 0;
 	ImGuiWindow* window = nullptr;
 };
-Mem g_mem[4];
+Mem g_mem[7]; // (trucos: 4 the Trucos page, 5 Armas y objetos; online5: 6 Multijugador)
 int g_screen = -1, g_frame = -10;
 // Called once per drawn screen, after its items were submitted.
 void After(int screen) {
@@ -5996,10 +10236,14 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	const float unit = std::max(std::min(width / 1920.0f, height / 1080.0f), 0.5f);
 	ImGui::GetIO().MouseDrawCursor = !closing;
 	if (closing && (g_f1_page.load() != 0 || g_trophy_page.load())) return; // (a page closes at once)
+	if (CheatsBlocked() && (g_f1_page.load() == 3 || g_f1_page.load() == 4)) g_f1_page = 0; // (stats1/onlineclean) Trucos / Armas y objetos hidden
 	if (const int page = g_f1_page.load(); page != 0) {
-		const bool open = page == 1 ? F1Pages::DrawPad(width, height, unit) : F1Pages::DrawKbm(width, height, unit);
-		KeepFocus::After(page == 1 ? 1 : 2);
+		const bool open = page == 1 ? F1Pages::DrawPad(width, height, unit) : page == 3 ? Cheats::Draw(width, height, unit)
+		                : page == 4 ? Shop::Draw(width, height, unit) : page == 5 ? Multiplayer::Page(width, height, unit)
+		                            : F1Pages::DrawKbm(width, height, unit);
+		KeepFocus::After(page == 1 ? 1 : page == 3 ? 4 : page == 4 ? 5 : page == 5 ? 6 : 2);
 		if (!open) {
+			if (page == 3) Cheats::g_souls_loaded = false;
 			g_f1_page       = 0;
 			Anim::g_page_at = Anim::Now(); // (ds-pc-port38) the menu fades in again
 			F1Pages::g_note.clear();
@@ -6024,7 +10268,17 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	// (perfopts-1107) The idle animations (soul motes, fog, the breathing sigil, the candle flicker) redraw while open.
 	Bump();
 	Anim::g_page_seen = 0;
-	ImGui::GetBackgroundDrawList()->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(140 * t)));
+	// (trucos11) Entry: from black, then the stone-and-fog backdrop fades in over the game (ds-style.h Backdrop: blue-black
+	// stone, slow fog banks, grain, strong vignette) with faint rising soul motes. No bounce, no slide.
+	{
+		ImDrawList* bg = ImGui::GetBackgroundDrawList();
+		const float tm = Souls::Time();
+		DsStyle::Backdrop(bg, {0, 0}, {width, height}, 0.88f * t, tm);
+		DsStyle::FogLayers(bg, {0, 0}, {width, height}, t, tm); // (trucos12) layered fog with slow parallax
+		DsStyle::Embers(bg, {0, 0}, {width, height}, t * 0.6f, tm); // (trucos12) embers and soul motes, flickering
+		AshFrame(bg, width, height, t);                              // (trucos13) turbulent ash
+		if (!closing && t < 1.0f) bg->AddRectFilled({0, 0}, {width, height}, IM_COL32(0, 0, 0, static_cast<int>(255 * (1.0f - t) * 0.6f)));
+	}
 	// (des-fog-hq) No fog, motes or vignette behind the F2 menu: the plain dim of the game image only (the ambience is
 	// the pre-game launcher's alone).
 	g_menu_rect_hook = nullptr;
@@ -6055,23 +10309,23 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		const float  side = ImGui::GetFontSize() * 1.7f;
 		const ImVec2 at   = ImGui::GetCursorScreenPos();
 		const float  al   = ImGui::GetStyle().Alpha;
-		Souls::Monolith(menu_dl, {at.x + side * 0.4f, at.y + side * 0.5f}, side, unit, al);
+		DsStyle::Medallion(menu_dl, DsStyle::Icon::Flame, {at.x + side * 0.45f, at.y + side * 0.5f}, side * 0.45f, al, 0.0f, Souls::Time(), 0.6f); // (trucos11)
 		ImGui::Dummy({side * 0.95f, side});
 		ImGui::SameLine();
 		ImFont*      title_font = DisplayFont() != nullptr ? DisplayFont() : ImGui::GetFont();
 		const float  title_size = std::round(ImGui::GetFontSize() * 1.3f);
 		const char*  title      = I18n::T("Demon's Souls PC");
 		const ImVec2 tsz        = title_font->CalcTextSizeA(title_size, FLT_MAX, 0.0f, title);
-		const ImVec2 tp {ImGui::GetCursorScreenPos().x, at.y + (side - tsz.y) * 0.5f};
+		const ImVec2 tp {std::round(ImGui::GetCursorScreenPos().x), std::round(at.y + (side - tsz.y) * 0.5f)}; // (trucos2) whole pixels: crisp Cinzel
 		// A warm candle glow behind the title, flickering.
 		const float fl = Souls::Flicker();
-		for (int k = 3; k >= 1; k--)
-			menu_dl->AddRectFilled({tp.x - 10 * unit * k, tp.y + tsz.y * 0.2f - 4 * unit * k}, {tp.x + tsz.x + 10 * unit * k, tp.y + tsz.y * 0.8f + 4 * unit * k},
-			                       Souls::C(Souls::kCandle, al * 0.022f * fl), 20 * unit);
-		Souls::Etched(menu_dl, title_font, title_size, tp, title, al * (0.9f + 0.1f * fl));
-		ImGui::Dummy({tsz.x, side});
+		(void)fl;
+		const std::string tup = DsStyle::Upper(title); // (trucos11) bone-white tracked capitals over a rhombus rule
+		const float tw = DsStyle::IlluminatedTitle(menu_dl, title_font, title_size, tp, tup.c_str(), al,
+		                                           static_cast<float>(Anim::Now() - Anim::g_opened_at.load()), Souls::Time()); // (trucos13)
+		ImGui::Dummy({std::max(tsz.x, tw), side});
 		const float dy = at.y + side + 10 * unit;
-		Souls::Divider(menu_dl, at.x, at.x + 420 * unit, dy, unit, al);
+		DsStyle::DiamondRule(menu_dl, at.x, at.x + std::max(420 * unit, tw + side), dy, al, unit);
 		ImGui::SetCursorScreenPos({at.x, dy + 4 * unit});
 		ImGui::Dummy({420 * unit, 12 * unit});
 	}
@@ -6085,7 +10339,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 		(void)SaveSettings(g_rt.ini_path, on_disk);
 	}
 	// (bb-style-f1) The options side by side as Bloodborne's hub cards (CardButton); same order, labels and actions.
-	const ImVec2 bs {std::round(270 * unit), std::round(340 * unit)};
+	const ImVec2 bs {std::round(196 * unit), std::round(330 * unit)}; // (trucos7: 7 cards; online5: 8, narrower)
 	ImGui::Dummy({1.0f, 24.0f * unit}); // (room for the focused card's lift)
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {28 * unit, 14 * unit});
 	if (CardButton(I18n::T("Volver al juego"), Icons::Back, bs, unit, 0)) SetOpen(false);
@@ -6107,7 +10361,15 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 	ImGui::SameLine();
 	if (CardButton(I18n::T("Teclado y ratón"), Icons::Keyboard, bs, unit, 3)) g_f1_page = 2;
 	ImGui::SameLine();
-	if (CardButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 4, true)) {
+	if (!CheatsBlocked()) { // (stats1/onlineclean) no_cheats o el online: sin Trucos ni Armas y objetos
+		if (CardButton(I18n::T("Trucos"), Icons::Skull, bs, unit, 4)) g_f1_page = 3; // (trucos)
+		ImGui::SameLine();
+		if (CardButton(I18n::T("Armas y objetos"), Icons::Chest, bs, unit, 5)) g_f1_page = 4; // (trucos7) the shop
+		ImGui::SameLine();
+	}
+	if (CardButton(I18n::T("Multijugador"), Icons::Soul, bs, unit, 6)) g_f1_page = 5; // (online5)
+	ImGui::SameLine();
+	if (CardButton(I18n::T("Cerrar el juego"), Icons::Power, bs, unit, 7, true)) {
 		// Just closes: nothing saved, nothing skipped (the game's own saves are already on disk).
 #if defined(_WIN32)
 		// Not ExitProcess: it runs the DLLs' detach routines (the GPU driver's, Streamline's) on this thread while the
@@ -6143,7 +10405,17 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 				const float e = static_cast<float>(k) * 9.0f * unit;
 				menu_dl->AddRectFilled({wp.x - e, wp.y - e}, {wp.x + ws.x + e, wp.y + ws.y + e}, Souls::C(Souls::kSoul, (1.0f - t) * 0.06f), 10 * unit + e);
 			}
-		Souls::Panel(menu_dl, wp, {wp.x + ws.x, wp.y + ws.y}, unit, al, 10 * unit);
+		DsStyle::Panel(menu_dl, wp, {wp.x + ws.x, wp.y + ws.y}, al, unit); // (trucos11)
+		{
+			// (trucos12) Gothic gold filigree in the four corners and a crest (scroll wings and a rosette) on the top edge.
+			const ImVec2 pb {wp.x + ws.x, wp.y + ws.y};
+			const float  fs = std::round(150 * unit), tm = Souls::Time();
+			DsStyle::Filigree(menu_dl, wp, fs, 1, 1, al, tm, unit);
+			DsStyle::Filigree(menu_dl, {pb.x, wp.y}, fs, -1, 1, al, tm, unit);
+			DsStyle::Filigree(menu_dl, {wp.x, pb.y}, fs, 1, -1, al, tm, unit);
+			DsStyle::Filigree(menu_dl, pb, fs, -1, -1, al, tm, unit);
+			DsStyle::Crest(menu_dl, {std::round(wp.x + ws.x * 0.5f), wp.y}, std::round(260 * unit), al, tm, unit);
+		}
 		Glide::Draw(menu_dl, unit, al);
 		menu_dl->PopClipRect();
 		menu_dl->ChannelsMerge();
@@ -6161,6 +10433,7 @@ void DrawInGameMenu(float width, float height, bool closing = false) {
 void DrawInGame(float width, float height) {
 	if (g_open.load()) g_popup = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId); // (ds-pc-port42: the game's own frames, last frame's state)
 	MetricsPanel::Draw(width, height); // (ds-pc-port41) under the menu too
+	ChatUi::DrawToasts(width, height); // (chat1) a message or a friend connecting, top right
 	if (g_open.load() && !Resume::SaveAndQuitActive()) {
 		DrawInGameMenu(width, height);
 		return;
@@ -6209,6 +10482,8 @@ void Presented() {
 		CloseSplash();
 	}
 	Resume::Presented(); // (ds-pc-port8) JUGAR after F2: the automatic Continue
+	Cheats::Tick();      // (trucos) each presented frame (DrawInGame runs only with the overlay up); work every 0.5 s
+	ChatUi::Start();     // (chat1) once: the chat's worker (messages and friends' notices in the game)
 }
 
 void WindowCreated(SDL_Window* window) {
@@ -6288,6 +10563,13 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	g_edit         = *settings;
 	g_start_mode   = true;
 	g_start_result = 0;
+	// (launcher1) Pixel-exact launcher on scaled desktops (125 / 150 / 200 %): the same hints the game's window sets
+	// (window.cpp), now before the launcher's SDL video init. Without them the process was DPI-unaware while the launcher
+	// ran: SDL got the desktop in scaled-down units, ImGui drew into that smaller surface and Windows stretched the whole
+	// window back to the screen (bitmap scaling: every letter blurred). The awareness is per process: the game's window,
+	// created afterwards, asks for the same one.
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
 		std::printf("[port] start menu: SDL failed (%s): straight to the game\n", SDL_GetError());
 		g_start_mode = false;
@@ -6348,12 +10630,15 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 				std::error_code ec;
 				const auto      ttf = fonts / name;
 				if (std::filesystem::exists(ttf, ec)) {
-					// (11-12) Sharper text: oversampled, sub-pixel placed, a touch heavier.
+					// (launcher1) Crisp text: ImGui 1.92 rasterizes every glyph at the exact size it is drawn at, so the
+					// glyphs go 1:1 on whole pixels (PixelSnapH, no oversampling). Before: OversampleH 3 / V 2 with
+					// sub-pixel placement, drawn through the atlas' linear filter - every letter resampled (soft edges,
+					// the vertical 2x halved by the filter). A touch heavier for the dark, busy art behind.
 					ImFontConfig cfg;
-					cfg.OversampleH       = 3;
-					cfg.OversampleV       = 2;
-					cfg.PixelSnapH        = false;
-					cfg.RasterizerMultiply = 1.12f;
+					cfg.OversampleH        = 1;
+					cfg.OversampleV        = 1;
+					cfg.PixelSnapH         = true;
+					cfg.RasterizerMultiply = 1.15f;
 					return io.Fonts->AddFontFromFileTTF(ttf.string().c_str(), 0.0f, &cfg);
 				}
 			}
@@ -6373,9 +10658,11 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 				if (data != nullptr && size > 0) {
 					ImFontConfig cfg;
 					cfg.FontDataOwnedByAtlas = false; // (the resource stays mapped for the process' life)
-					cfg.OversampleH          = 3;
-					cfg.OversampleV          = 2;
-					cfg.GlyphExtraAdvanceX   = 1.5f;
+					cfg.OversampleH          = 1; // (launcher1) 1:1 on whole pixels, as the text faces
+					cfg.OversampleV          = 1;
+					cfg.PixelSnapH           = true;
+					cfg.RasterizerMultiply   = 1.08f;
+					cfg.GlyphExtraAdvanceX   = 2.0f; // (whole pixels: the inscription's letter spacing)
 					g_font_display           = io.Fonts->AddFontFromMemoryTTF(data, static_cast<int>(size), 0.0f, &cfg);
 				}
 			}
@@ -6395,9 +10682,26 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	}
 	SDL_ShowCursor(SDL_ENABLE);
 	CloseSplash();
+	// (launcher1) Even frame pacing: VSync presents at the screen's rate; the launcher draws every n-th refresh, n the
+	// whole divisor that keeps it at 60 fps or just above (60 Hz: 60, 120 Hz: 60, 144 Hz: 72, 165 Hz: 82.5), so every
+	// frame lasts the same number of refreshes (no judder) and the CPU / GPU are not spent on 144-240 identical frames.
+	// The wait is a high-resolution waitable timer (no busy loop); it also caps a launcher whose VSync is not honoured
+	// (minimized, covered, a driver forcing it off) instead of letting it spin at thousands of frames a second.
+	int refresh_hz = 60;
+	if (SDL_DisplayMode mode {}; SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.refresh_rate >= 50) refresh_hz = mode.refresh_rate;
+	const int    every_n   = std::max(1, static_cast<int>(std::floor(refresh_hz / 60.0 + 0.1)));
+	const double frame_s   = static_cast<double>(every_n) / refresh_hz - 0.0015; // (a little early: VSync does the last bit)
+	HANDLE       pace_wait = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+	if (pace_wait == nullptr) pace_wait = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+	const Uint64 pace_freq = SDL_GetPerformanceFrequency();
+	Uint64       pace_last = SDL_GetPerformanceCounter();
+	const Uint64 fade_t0   = pace_last;
+	std::printf("[port] launcher: %d Hz, drawn every %d refresh(es) (%.1f fps)\n", refresh_hz, every_n, static_cast<double>(refresh_hz) / every_n);
 	while (g_start_result == 0) {
 		SDL_Event e;
 		while (SDL_PollEvent(&e) == 1) {
+			if (PadCaptureFeed(e)) continue; // (remap-f2) a pad button being captured for "Mapear mando"
+			if (e.type == SDL_CONTROLLERBUTTONDOWN) g_pad_last = static_cast<int>(e.cbutton.which);
 			ImGui_ImplSDL2_ProcessEvent(&e);
 			if (e.type == SDL_QUIT) g_start_result = -1;
 			if (e.type == SDL_RENDER_DEVICE_RESET || e.type == SDL_RENDER_TARGETS_RESET) {
@@ -6462,12 +10766,29 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 		ImGui::NewFrame();
 		if (g_config_mode) Draw(io.DisplaySize.x, io.DisplaySize.y);
 		else DrawLauncher(io.DisplaySize.x, io.DisplaySize.y);
+		if (!g_config_mode) {
+			// (launcher1) The launcher rises out of black (0.6 s, ease-out cubic): the art, the fog and the column together.
+			const float t = static_cast<float>(static_cast<double>(SDL_GetPerformanceCounter() - fade_t0) / pace_freq / 0.6);
+			if (t < 1.0f)
+				ImGui::GetForegroundDrawList()->AddRectFilled({0, 0}, io.DisplaySize,
+				                                              IM_COL32(0, 0, 0, static_cast<int>(255.0f * (1.0f - Anim::EaseOut(t)))));
+		}
 		ImGui::Render();
 		SDL_RenderSetScale(renderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
 		SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 		SDL_RenderClear(renderer);
 		ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 		SDL_RenderPresent(renderer);
+		{
+			// (launcher1) The pacing above: wait out the rest of this frame's slot, then let VSync align it.
+			const double spent = static_cast<double>(SDL_GetPerformanceCounter() - pace_last) / pace_freq;
+			if (const double rest = frame_s - spent; rest > 0.0005 && pace_wait != nullptr) {
+				LARGE_INTEGER due {};
+				due.QuadPart = -static_cast<LONGLONG>(rest * 1e7); // (relative, 100 ns units)
+				if (SetWaitableTimer(pace_wait, &due, 0, nullptr, nullptr, FALSE) != 0) WaitForSingleObject(pace_wait, 100);
+			}
+			pace_last = SDL_GetPerformanceCounter();
+		}
 		// (des-fix-1110) The launcher's black-frame flicker, diagnosed: the illustration's texture not uploaded after the draw
 		// (the frame showed only the clear colour). At most once a second.
 		if (g_background != nullptr && g_background->Status != ImTextureStatus_OK) {
@@ -6479,6 +10800,7 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 			}
 		}
 	}
+	if (pace_wait != nullptr) CloseHandle(pace_wait);
 	if (g_start_result > 0) *settings = g_edit;
 	// (ds-pc-port8) As Launcher-souls.ps1 (each change written at once): Salir / Esc keep the changes too.
 	if (g_start_result < 0 && !g_config_mode) Save();
@@ -6493,6 +10815,8 @@ bool RunStartMenu(const Runtime& runtime, Settings* settings) {
 	Ambience::Shutdown(); // (des-fog-hq) fog and ash freed before the game starts
 	FreeTexture(g_knight);
 	g_knight_tried = false;
+	LauncherTrophy::Shutdown(); // (trofeos-exe) its icon worker stopped, its atlas freed
+	PadMap::Shutdown();         // (remap2) the controller drawings freed
 	// (11-10) g_font_display too: it was left pointing into the destroyed launcher context, and the in-game menu (F2:
 	// headers and cards through DisplayFont()) then used a freed ImFont - ImGui wrote through it into freed memory
 	// (heap corruption: the game crashing in its job worker or the GPU lost right after the menu opened, or a crash

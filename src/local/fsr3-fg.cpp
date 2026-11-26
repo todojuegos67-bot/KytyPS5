@@ -36,6 +36,9 @@
 #endif
 #endif
 
+#define VRAM_EMU_OWNER ::VramEmu::kFg
+#include "local/vram-emu.h" // (VRAM-EMU) sus asignaciones de VMA y CreateImage apuntadas con su dueno
+
 namespace Libs::Graphics::Fsr3 {
 
 #if defined(_WIN32)
@@ -1344,7 +1347,7 @@ void BeforePresent(GraphicContext& graphics, const FrameGen::FrameInputs* inputs
 	}
 	std::lock_guard lock(g_mutex);
 	const auto now    = std::chrono::steady_clock::now();
-	const bool movie  = VideoOut::MoviePlaying() || VideoOut::CutsceneHeld() || !VideoOut::PlayerInputSeen(); // (before the first button: the logo and intro)
+	const bool movie  = VideoOut::MoviePlaying() || VideoOut::CutsceneFgOff() || !VideoOut::PlayerInputSeen(); // (cutfg) cutscenes generated // (before the first button: the logo and intro)
 	const bool usable_now = inputs != nullptr && inputs->valid && !movie && !g_fg_failed;
 	// (11-07 hang: after the F1 menu the TAA pass came and went every other frame and generation was switched on and off
 	// each frame - HUD layer registered and dropped with it - until the device was lost. Generation now comes back on only

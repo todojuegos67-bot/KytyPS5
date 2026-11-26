@@ -41,6 +41,15 @@ void                   KytyTextureGcThresholds(uint64_t total_budget, uint64_t& 
 [[nodiscard]] bool     KytyGcLiveBudget();
 [[nodiscard]] uint64_t KytyGcLiveBudgetValue(const GraphicContext& graphics);
 
+// (vram8, 11-23) The "[vram8]" line's counters: array images of 256 MiB or more made (their bytes), and the views of a
+// block-compressed texture pool not widened to every layer to the T#'s last (KYTY_VRAM8_BC_BOUND), with the bytes the
+// widening would have added.
+namespace Vram8 {
+inline std::atomic<uint64_t> big_n {0}, big_bytes {0}, kept_n {0}, kept_bytes {0};
+// (vram8 gc) Collector passes skipped because the video memory still had room, and passes run.
+inline std::atomic<uint64_t> gc_skipped {0}, gc_runs {0};
+} // namespace Vram8
+
 class TextureCache {
 public:
 	// Every image as a tab-separated row (live "images <path>").
@@ -140,6 +149,17 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
+	// KYTY_NATIVE_MEMORY=1 (GpuResourceManager::SweepCpuWrites): InvalidateMemory for whole pages the write watch saw
+	// written, which knows no bytes. An image GPU work wrote that only shares a page at its first or last page with what
+	// the game wrote is left alone (its write fault saw a byte outside the image: the image stayed valid); a page all
+	// inside an image invalidates it as before.
+	void               InvalidateCpuWrittenPages(uint64_t address, uint64_t size);
+	// KYTY_NATIVE_MEMORY=1 (GPU thread; GpuResourceManager::NativeFlushGpuWrites): whether GPU work wrote an image since the
+	// last call below, and those images (render targets, storage images, copy destinations) downloaded to their guest
+	// memory (TryDownloadImage: written back when the GPU is done; the caller waits for that). Returns the images whose
+	// download was recorded, adds their bytes to `bytes` and the refused ones to `refused`.
+	[[nodiscard]] bool NativeHasGpuWrites() const noexcept { return !m_native_written.empty(); }
+	uint64_t           NativeDownloadWritten(uint64_t* bytes, uint64_t* refused);
 	// `fill`: the GPU wrote the range with that one 32-bit value (a compute fill): the images over it note it
 	// (Image::MarkBufferFilled).
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const char* source = "",
@@ -148,6 +168,29 @@ public:
 	// An image over the range holds data the GPU wrote to it (a download of the range must come
 	// from the image, not from the buffer).
 	[[nodiscard]] bool HasGpuWrittenImageOverlap(uint64_t address, uint64_t size);
+	// (etapa2, 11-23) True on a small video memory heap (8 GB cards and simular_vram_8gb): KYTY_VRAM8_BC_BOUND's default.
+	[[nodiscard]] bool SmallVramHeap() const;
+	// (etapa 2.1, 11-23, KYTY_TEX_DIRECTA; local/tex-directa.h) Escritura directa a la GPU de un trozo del streaming
+	// de texturas que el juego acaba de copiar a VirtualMemo (memcpy eboot+0x901459): sube ya los subresources (mip/capa)
+	// de la imagen que cubren [address, address+size), con el mismo plan de tiles que la subida normal
+	// (2.1d: subida parcial vigilada como RefreshTextureLevels, marca el rango limpio). `expected_hash` sin uso.
+	// Devuelve un TexDirecta::Result. Hilo de render.
+	[[nodiscard]] int DirectUploadRange(uint64_t address, uint64_t size, uint64_t expected_hash, uint32_t* diff_fmt,
+	                                    uint32_t* diff_tile, uint64_t* diff_offset);
+	// (N2+N3, KYTY_TEX_NATIVA; local/tex-nativa.h) Sube a su textura nativa los bytes de un trozo que el juego copio (memcpy
+	// 0x901459) y que NO se escribieron en la RAM emulada: destilado de tiles desde esos bytes, rango limpio. Si no se
+	// puede (sin imagen nativa, tile partido, plan no valido) los escribe en la RAM y marca la imagen sucia, como siempre.
+	// True: subido directo. Hilo de render.
+	// (11-25c) base != 0: la base del T# de la CTexture del trozo; su imagen nativa se toma de su registro (sin buscar).
+	// (11-25d) Sin la espera en el anillo (t_us/wait): codigo muerto desde la 11-25b.
+	bool NativeUploadHost(uint64_t address, uint64_t size, uint64_t ring_offset, uint64_t seq, uint64_t base = 0);
+	bool NativeUploadHostLocked(uint64_t address, uint64_t size, uint64_t ring_offset, uint64_t seq, Image* known,
+	                            uint64_t base = 0);
+	[[nodiscard]] bool IsNativeSparse(const Image& image) const; // (11-25c) imagen dispersa por mip de una CTexture
+	void NativeApplyPending(Image& image); // (11-25) trozos del anillo de esta imagen, antes de usarla
+	// (N2+N3c) El anillo de subida fijo de los trozos nativos (creado una vez) y la liberacion de lo que la GPU ya uso.
+	void NativeRingPrepare();
+	void NativeRingCollect();
 	enum class ReadOnlyBufferOverlap { None, CpuSampled, Unsafe };
 	[[nodiscard]] ReadOnlyBufferOverlap ClassifyReadOnlyBufferOverlap(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
@@ -184,6 +227,8 @@ public:
 	// `touch`: TextureOffload::Touch; `async`: written back by the offload worker when the GPU is done, touches waiting
 	// till then). Takes m_lock unless the caller holds it.
 	void RestoreOffloaded(uint64_t vaddr, uint64_t size, uint8_t touch, bool async = false);
+	// (ram17) The native offload's dropped bytes over an upload's guest range back first (textureCache.cpp).
+	void RestoreBeforeUpload(uint64_t vaddr, uint64_t size);
 	struct OffloadCheck;
 	struct OffloadRestore;
 	std::vector<std::unique_ptr<OffloadRestore>> m_offload_restores;   // asynchronous restores (until done)
@@ -196,10 +241,24 @@ public:
 	// KYTY_GPU_ONLY_OFFLOAD: formats (guest format, tiling, bgra16) a check proved (or found to differ) the download of.
 	std::unordered_set<uint64_t>                m_offload_good_formats;
 	std::unordered_set<uint64_t>                m_offload_bad_formats;
+	// (ram1b) KYTY_RAM_NATIVE_TEX=1|2 (ram-native-tex.h), once a flip from RunGarbageCollector: every 120 flips the guest
+	// copy of the arrays' layers and the render targets the cache holds, clean at two scans, to the disk store (=1); every
+	// 5 s the "[rnt]" line and (=2) one sparse image's verification (RntVerify).
+	void RntScan(uint64_t tick);
+	void RntVerify();
+	struct RntCheck;
+	std::vector<std::unique_ptr<RntCheck>>      m_rnt_checks;
+	std::unordered_map<uint64_t, uint64_t>      m_rnt_clean;        // image serial -> the first scan it was eligible at
+	uint64_t                                    m_rnt_verify_after = 0; // the serial the next verification starts after
 	// RunGarbageCollector's line on the PC's memory, when it moved.
 	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleImages(uint64_t tick);
+	// (M7) Gestor central de memoria: candidatas del gestor, copias RAM, linea [tex-dedup] (RunGarbageCollector, m_lock).
+	void GestorPass(uint64_t tick);
+	// (M7, TEX-DEDUP) Fuente con el mismo contenido para compartir su VkImage; alta tras InsertImage (m_lock).
+	[[nodiscard]] ImageId TexDedupFuente(const ImageInfo& info, uint64_t hash);
+	[[nodiscard]] ImageId TexDedupAlta(ImageId id, const ImageInfo& info, uint64_t hash, bool may_fail);
 	// The latest tick of a GPU-written image's download that will write guest memory overlapping
 	// the range once the GPU completes it (on the priority thread); 0 when none is pending.
 	[[nodiscard]] uint64_t PendingDownloadTick(uint64_t address, uint64_t size);
@@ -233,6 +292,10 @@ private:
 		uint32_t fill_value = 0xffffffffu;
 		uint64_t fill_size  = 0;
 		bool     fill_known = false;
+		// KYTY_SAMPLE_PENDING_HTILE_CLEAR (upstream 5a65bfb): the slice whose depth a sample cleared while its clear stays
+		// pending for the target bind's stencil (bit 0: one-layer surfaces only), and the clears applied (the line's count).
+		uint32_t sample_depth_done = 0;
+		uint64_t sample_clears     = 0;
 	};
 
 	struct OverlapResult {
@@ -256,6 +319,7 @@ private:
 	};
 	std::vector<FailedImage>  m_failed_images;
 	uint64_t                  m_failed_tick = 0; // (+1: 0 is none)
+	uint64_t                  m_pres_freed_bytes = 0, m_pres_native_evicted = 0, m_pres_native_evicted_bytes = 0; // (VRAM-PRES)
 	[[nodiscard]] bool        RecentlyFailed(const ImageInfo& info) const;
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
@@ -317,6 +381,12 @@ private:
 	// The holes' pages inside [begin, end) only (page-aligned); the others stay released.
 	void               RetrackHoles(Image& image, uint64_t begin, uint64_t end);
 	void               FinishRefresh(Image& image);
+	// (N2+N3) Los rangos "solo en la GPU" de una textura nativa nunca se suben desde la RAM: se quitan de lo sucio.
+	void               NativeGuardDirty(Image& image);
+	// (N2+N3c) Antes de borrar una imagen con bytes "solo en la GPU": se descargan y se escriben en la RAM emulada.
+	// (N2+N3g) keep_on_fail: si no se pueden recuperar los bytes "solo en la GPU", devuelve false y no los da por perdidos.
+	bool               NativeRestoreBeforeDelete(Image& image, bool keep_on_fail = false);
+	static constexpr size_t NativeEvictMax = 2; // (N2+N3g) expulsiones con descarga sincrona por pasada
 	// The dirty subresources over [window_begin, window_end) only (a whole one where it crosses an end).
 	[[nodiscard]] bool UploadImagePartial(Image& image, uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
 	// A whole upload of a large image a piece of guest memory at a time; false: not such an image (ObtainBufferForImage's).
@@ -338,6 +408,10 @@ private:
 	                                         uint64_t& end);
 	// A sampled view's refresh of its levels (the others stay dirty); false: RefreshImage's.
 	[[nodiscard]] bool RefreshTextureLevels(ImageId id, const ImageViewInfo& view);
+	// (SUBIDA-REP) Refresco de una textura grande por capas repartido entre fotogramas (local/subida-rep.h); false:
+	// RefreshImage's. MarcarContenido: la imagen ya tiene contenido valido en la GPU (se puede aplazar su refresco).
+	[[nodiscard]] bool SubidaRepartida(ImageId id);
+	void               MarcarContenido(const Image& image);
 	void               UpdatePartialHashes(Image& image, bool all);
 	[[nodiscard]] bool CheckPartialHashes(const Image& image);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
@@ -355,9 +429,43 @@ private:
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ResolveBlockTexelOverlap(const ImageInfo& requested, ImageId cached_id);
+	// (upstream 495e2a8) Why the uncompressed `texels` cannot be the texels of the block-compressed `blocks`; null: they
+	// can. `common_levels`: the levels both hold (ExpandImage's copy), `texels` may have more.
+	[[nodiscard]] static const char* BlockTexelRefusal(const ImageInfo& texels, const ImageInfo& blocks,
+	                                                   bool common_levels = false);
+	// KYTY_BLOCK_CLASS_OVERLAP_REPLACE (textureCache.cpp): an image at the requested address of the other block class
+	// whose bytes are not the requested one's is replaced, not returned for it.
+	[[nodiscard]] static bool BlockClassOverlapReplaceOn();
+	void                      ReplaceBlockClassOverlap(const ImageInfo& requested, ImageId cached_id, const char* why);
+	uint64_t                  m_block_class_replaced = 0; // (since start-up)
+	uint64_t                  m_block_class_logged   = 0; // (the count the last summary line gave)
+	uint64_t                  m_block_class_tick     = 0; // (the collector tick of that line)
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        PrepareDccClear(ImageId id, const ImageDesc& desc);
+	// KYTY_SAMPLE_PENDING_HTILE_CLEAR (textureCache.cpp, upstream 5a65bfb): a one-layer depth surface sampled with its
+	// HTile fast clear pending gets the clear first (FindTexture, m_lock held).
+	struct HtileSampleClear {
+		uint32_t slices = 0; // (1: the surface's one slice; 0: no clear)
+		uint64_t meta   = 0; // the HTile's address
+		float    value  = 0.0f;
+		bool     keep   = false; // the fill clears a compressed stencil too: the bit stays for the target bind
+	};
+	[[nodiscard]] static uint64_t         HtileSampleMeta(const Image& image, const ImageDesc& desc, bool* stencil_compressed);
+	[[nodiscard]] static HtileSampleClear HtileFillClearLocked(const MetaDataInfo& record, uint64_t meta,
+	                                                           bool stencil_compressed);
+	[[nodiscard]] bool HtileWouldClearLocked(uint64_t meta, bool stencil_compressed, Spec::State* spec, HtileSampleClear* clear);
+	[[nodiscard]] HtileSampleClear        HtileSampleClearLocked(const Image& image, const ImageDesc& desc);
+	void                                  ApplyHtileSampleClear(ImageId id, const HtileSampleClear& clear);
+
+public:
+	// KYTY_SAMPLE_PENDING_HTILE_CLEAR (default 1; read once): on.
+	[[nodiscard]] static bool SampleHtileClearOn();
+	// (With it on) Whether FindTexture would clear this sampled depth view first: the native and table paths, which bind
+	// without it, leave such a use to the normal path. `meta`: the HTile's address; `consume`: that clear consumes the bit.
+	[[nodiscard]] bool SampleHtileClearPending(const Image& image, const ImageDesc& desc, uint64_t* meta, bool* consume);
+
+private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          RefillUpload(Image& image);
 	[[nodiscard]] TextureTransferPlan
@@ -381,7 +489,8 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
+	// `written_pages`: InvalidateCpuWrittenPages' (whole pages the write watch saw written).
+	void               InvalidateCpuAliases(uint64_t address, uint64_t size, bool written_pages = false);
 	[[nodiscard]] bool TryDownloadImage(ImageId id);
 
 	GraphicContext&                                   m_graphics;
@@ -421,6 +530,9 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// KYTY_NATIVE_MEMORY: the serials of the images GPU work wrote since the last NativeDownloadWritten (NoteNativeGpuWrite).
+	std::unordered_set<uint64_t>                      m_native_written;
+	void                                              NoteNativeGpuWrite(const Image& image);
 	// UploadImagePartial: the transfer plan of each large image it uploads (by Image::serial);
 	// a 256-layer mip-mapped array has 2816 subresources to plan otherwise on every refresh.
 	struct PartialPlan {
@@ -428,6 +540,7 @@ private:
 		std::shared_ptr<TextureTransferPlan> plan;
 	};
 	std::unordered_map<uint64_t, PartialPlan> m_partial_plans;
+	std::unique_ptr<Buffer>                    m_native_ring; // (N2+N3c) KYTY_TEX_NATIVA
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	std::atomic<uint64_t>                             m_meta_epoch {1};
 	// The m_surface_metas keys as bits of a 1024-bit filter: a clear bit proves an address holds
@@ -503,6 +616,10 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+
+public:
+	// (F5 pase 2, sombras nativas) The cache lock for DsNatStart (a free function of renderCompute.cpp).
+	[[nodiscard]] TrackingSpinLock& DsNatLock() noexcept { return m_lock; }
 };
 
 } // namespace Libs::Graphics

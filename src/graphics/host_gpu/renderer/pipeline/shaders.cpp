@@ -45,6 +45,7 @@
 #include <xxhash.h>
 
 #include "shader-warmup-cache.h"
+#include "p7-compat.h" // (p7, KYTY_P7: C3/C4 subgroup sizes)
 
 namespace Libs::Graphics {
 
@@ -1159,6 +1160,10 @@ void CreatePipelineInternal(
 	if (PixelWave64Required(graphics)) {
 		frag_subgroup_size.requiredSubgroupSize = 64;
 		frag_shader_stage_info.pNext            = &frag_subgroup_size;
+	} else if (const auto required = P7::S().fragment_required; required != 0) {
+		// (p7, C4: AMD 64 - a wave64 pixel shader's lane operations as translated -, Intel 32; local/p7-compat.h.)
+		frag_subgroup_size.requiredSubgroupSize = required;
+		frag_shader_stage_info.pNext            = &frag_subgroup_size;
 	}
 
 	vk::PipelineShaderStageCreateInfo tess_control_shader_stage_info {};
@@ -1555,6 +1560,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto subgroup  = wave_size == 64u && input_info.host_subgroup_size == 32u ? 32u : wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
 	    subgroup >= graphics.min_subgroup_size && subgroup <= graphics.max_subgroup_size) {
+		comp_subgroup_size.requiredSubgroupSize = subgroup;
+		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	} else if (P7::S().compute_required != 0 && subgroup == P7::S().compute_required) {
+		// (p7, C3: a GPU that cannot run 64 lanes and may pick fewer than 32 - Intel's 8/16 -: the 32 the translation
+		// emulates wave64 on (two GCN lanes an invocation) or a wave32 program is written for. Before, nothing was required
+		// there: the driver chose. No VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT: its rule on the host
+		// workgroup's x size cannot be checked here (an emulated program with derivatives runs 2 x n). local/p7-compat.h.)
 		comp_subgroup_size.requiredSubgroupSize = subgroup;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}

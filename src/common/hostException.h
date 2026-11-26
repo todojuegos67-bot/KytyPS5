@@ -39,6 +39,9 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// (fix7) True once InstallHandler has put the process-wide handler in place (a guarded copy resumes only then).
+bool HandlerInstalled() noexcept;
+
 // Guard-page violations (Windows): the touched address and the native context; true resumes the faulting thread.
 using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
 

@@ -6,6 +6,15 @@
 2 RCDATA "demons-souls.ico"
 // (ds-pc-port12) Cinzel (SIL OFL 1.1, LICENSES/Cinzel-OFL.txt): the serif display face of JUGAR and the section titles.
 3 RCDATA "cinzel.ttf"
+// (heap-seg, 11-24) The application manifest (resource 1, RT_MANIFEST 24): the process heap as the Windows segment
+// heap (Windows 10 2004 and later; older ones ignore it). Log 20261124-082750: the C++ heap 1792 MiB committed, 885
+// in use, 747 free, but only 62 MiB of it in free runs of 64 KiB or more (the NT heap keeps the rest committed and in
+// RAM; the one KYTY_MEM1_HEAP_ONCE pass held its lock 1054 ms); its RAM went 970 -> 1357 MiB in Boletaria. The
+// segment heap decommits the whole free pages of its blocks itself, with no lock walk.
+// (hp, 11-25) On: log 20261125-215220 (IFEO FrontEndHeapDebugOptions=8) had the segment heap active (HeapWalk finds no
+// free blocks in it: the "libre 0.00" of [mem1] is that, not a failure). The exe links with /MANIFEST:NO (CMakeLists.txt),
+// so this is its only manifest (no duplicate RT_MANIFEST 1).
+1 24 "ds-port.manifest"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION 1,0,0,0

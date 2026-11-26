@@ -328,6 +328,10 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	auto& cache = m_context.GetTextureCache();
 	r.image_id = cache.FindImage(r.desc);
 	BindRenderTarget(r.image_id);
+	// (F5 pase 2, B1) Para DsShadowCopyLayer: la imagen que usa de verdad este draw como profundidad.
+	m_ds_last_depth_id   = r.image_id;
+	m_ds_last_depth_addr = buffer.GetRegisters().GetDepthRenderTarget().z_write_base_addr;
+	++m_ds_last_depth_seq;
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
+#include "par-queues.h"
 
 #include <memory>
 #include <vector>
@@ -38,12 +39,15 @@ public:
 	KYTY_CLASS_NO_COPY(RenderMutex);
 
 	// The calling thread (the GPU thread) takes the owner's side from now on, until it resigns (outside any lock).
+	// (par1, KYTY_PAR_QUEUES=1: the ACB thread too. Two owners: only the holder of the queue lock (par-queues.h) is
+	// ever inside, so the owner's fields below stay one owner's at a time.)
 	void BecomeOwner();
 	void ResignOwner();
 
 	void Lock() {
 		if (!t_owner) return RequesterLock();
 		if (m_owner_depth++ != 0) return;
+		ParQueues::CheckHeld("RenderMutex"); // (par1: nothing unless KYTY_PAR_QUEUES=1 on a translating thread)
 		m_busy.store(1, std::memory_order_relaxed);
 		// (The store before the load in program order: the requester's flush is what orders them on the CPU.)
 		std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -70,6 +74,7 @@ private:
 	// The requesters' (written under the mutex): one holds the mutex and waits for the owner to leave; an owner exists.
 	alignas(64) std::atomic<uint32_t> m_requested {0};
 	bool                              m_owner_exists = false;
+	uint32_t                          m_owner_count  = 0; // (par1: two with KYTY_PAR_QUEUES=1)
 	bool                              m_asymmetric   = false; // (the host can flush other processors' stores)
 	inline static thread_local bool     t_owner           = false;
 	inline static thread_local uint32_t t_requester_depth = 0;

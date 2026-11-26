@@ -18,7 +18,8 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 static std::atomic<uint32_t> g_translator_features {TranslatorFeatures};
-static std::atomic<uint32_t> g_device_features {TranslatorFeatures};
+// (The pixel interlock only where the device setup allows it: a translation without a device, the tests', has none.)
+static std::atomic<uint32_t> g_device_features {TranslatorFeatures & ~TranslatorFeaturePixelInterlock};
 static std::atomic<uint32_t> g_device_required {0};
 
 void SetTranslatorFeatures(uint32_t features) {
@@ -46,9 +47,10 @@ uint32_t TranslatorFeatureSet() {
 	static const int slots_at_use = forced("KYTY_TABLE_SLOTS_AT_USE");
 	static const int min_max      = forced("KYTY_NATIVE_FLOAT_MIN_MAX");
 	static const int lane_wide    = forced("KYTY_LANE_LOCAL_WIDE");
+	static const int interlock    = forced("KYTY_PIXEL_INTERLOCK");
 	const auto       stored       = g_translator_features.load(std::memory_order_relaxed);
-	auto             features     = (stored & g_device_features.load(std::memory_order_relaxed)) |
-	                     g_device_required.load(std::memory_order_relaxed);
+	const auto       device       = g_device_features.load(std::memory_order_relaxed);
+	auto             features     = (stored & device) | g_device_required.load(std::memory_order_relaxed);
 	const auto       apply        = [&](int value, uint32_t feature) {
 		if (value >= 0) features = value != 0 ? features | feature : features & ~feature;
 	};
@@ -56,6 +58,8 @@ uint32_t TranslatorFeatureSet() {
 	apply(slots_at_use, TranslatorFeatureTableSlotsAtUse);
 	apply(min_max, TranslatorFeatureNativeFloatMinMax);
 	apply(lane_wide, TranslatorFeatureLaneLocalWide);
+	// (Forced on only where the device has it: a pipeline of it fails elsewhere.)
+	apply(interlock, TranslatorFeaturePixelInterlock & device);
 	return features;
 }
 

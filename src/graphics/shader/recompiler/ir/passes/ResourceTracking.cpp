@@ -91,7 +91,8 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
+	explicit Tracker(Program& program, bool storage_reads)
+	    : m_program(program), m_info(program.info), m_storage_reads(storage_reads) {
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -112,6 +113,7 @@ public:
 				Collect(inst);
 			}
 		}
+		RouteStorageReads();
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -159,6 +161,15 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+	};
+
+	// An image operation of a direct descriptor (RouteStorageReads).
+	struct ImageUse {
+		Inst*       handle   = nullptr;
+		uint32_t    memory   = 0;
+		uint32_t    resource = 0;
+		ValueOpcode op       = ValueOpcode::Void;
+		bool        has_mip  = false;
 	};
 
 	struct IndirectImagePlan {
@@ -2008,6 +2019,7 @@ private:
 			Fail(flags.pc, "image resource limit exceeded");
 		}
 		AddHandlePatch(handle, resource, flags.pc);
+		NoteImageUse(indirect, {handle, flags.index, resource, op, memory.image_has_mip});
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
@@ -2031,6 +2043,56 @@ private:
 
 	const DescriptorSource* Source(uint32_t source) const {
 		return source < m_sources.size() ? &m_sources[source] : nullptr;
+	}
+
+	// (RouteStorageReads) An image operation of a direct descriptor. (Its own function: Collect keeps its PGO profile.)
+	void NoteImageUse(const IndirectImagePlan* indirect, const ImageUse& use) {
+		if (m_storage_reads && indirect == nullptr) m_image_uses.push_back(use);
+	}
+
+	// (`storage_reads`) The loads of a sampled image whose descriptor the shader also stores through read the storage image
+	// it stores to (the same source, dimension, texel size and one mip level, no atomics): SPIR-V's OpImageRead of the
+	// coherent storage image, in the pixel interlock (Spirv::UsesPixelInterlock: a storage image the shader reads). A load
+	// of its mip levels, or one whose handle or metadata another operation shares, keeps the sampled image. The sampled
+	// image stays in the list: its other operations, the renderer's binding of it (Sampled and Storage of one source:
+	// the general layout, descriptors.cpp) as before.
+	void RouteStorageReads() {
+		if (!m_storage_reads) return;
+		const auto exclusive = [&](const ImageUse& use) {
+			return std::ranges::count_if(m_image_uses, [&](const ImageUse& other) {
+				       return other.handle == use.handle || other.memory == use.memory;
+			       }) == 1;
+		};
+		for (const auto& use: m_image_uses) {
+			if (use.op != ValueOpcode::ImageRead || use.has_mip) continue;
+			const auto& sampled = m_info.images[use.resource];
+			if (sampled.resource_class != ImageResourceClass::Sampled || sampled.depth_compare || sampled.cube ||
+			    sampled.indirect_root != ImageResource::NoIndirectImage ||
+			    (sampled.dimension != Decoder::ImageDimension::Dim1D &&
+			     sampled.dimension != Decoder::ImageDimension::Dim1DArray &&
+			     sampled.dimension != Decoder::ImageDimension::Dim2D &&
+			     sampled.dimension != Decoder::ImageDimension::Dim2DArray &&
+			     sampled.dimension != Decoder::ImageDimension::Dim3D))
+				continue;
+			uint32_t storage = UINT32_MAX;
+			for (uint32_t index = 0; index < m_info.images.size(); index++) {
+				const auto& image = m_info.images[index];
+				if (image.resource_class == ImageResourceClass::Storage && image.source == sampled.source &&
+				    image.dimension == sampled.dimension && image.mip_mode == ImageMipMode::None && !image.atomic &&
+				    !image.cube && image.r128 == sampled.r128 && image.indirect_root == ImageResource::NoIndirectImage) {
+					storage = index;
+					break;
+				}
+			}
+			if (storage == UINT32_MAX || !exclusive(use)) continue;
+			for (auto& patch: m_handle_patches) {
+				if (patch.handle == use.handle) patch.resource = storage;
+			}
+			for (auto& patch: m_memory_patches) {
+				if (patch.index == use.memory) patch.resource = storage;
+			}
+			m_info.images[storage].read = true;
+		}
 	}
 
 	void LinkImageAliases() {
@@ -2076,6 +2138,8 @@ private:
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
+	std::vector<ImageUse>          m_image_uses;
+	bool                           m_storage_reads = false;
 	std::vector<IndirectImagePlan> m_indirect_images;
 	std::unordered_map<const Inst*, std::string> m_indirect_reasons;
 	std::string                                  m_indirect_reason;
@@ -2083,8 +2147,8 @@ private:
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+void TrackResources(Program& program, bool storage_reads) {
+	Tracker(program, storage_reads).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -20,6 +20,9 @@
 
 namespace Libs::Graphics {
 
+class Image;  // (render1 F2)
+class Buffer; // (render1 F2)
+
 namespace HW {
 class Context;
 class UserConfig;
@@ -140,6 +143,9 @@ public:
 	[[nodiscard]] uint64_t GraphicsGeneration() const noexcept { return m_graphics_generation; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// (F5 pase 2, KYTY_NATIVO_SOMBRAS_INPASS) El render pass abierto y su estado (BeginRendering), para dibujar dentro.
+	[[nodiscard]] bool               IsRendering() const noexcept { return m_rendering; }
+	[[nodiscard]] const RenderState& CurrentRenderState() const noexcept { return m_render_state; }
 	// Only the dispatch path can bypass a pending dependency, after preparing
 	// resources. Every other host command drains it through Handle().
 	[[nodiscard]] vk::CommandBuffer ChainHandle() const;
@@ -220,6 +226,8 @@ private:
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	// (etapa1, KYTY_TEX_ANTICIPADA) Crea antes de su primer draw las texturas que el juego creo (descriptors.cpp).
+	void TexAnticipadaDrain();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -232,6 +240,41 @@ public:
 	                     uint32_t thread_group_z, uint32_t mode, Spec::State& record);
 	// An R_SUPER_RESOLUTION packet's upscale (graphics/guest_gpu/superResolution.h; renderSuperResolution.cpp).
 	void RunSuperResolution(CommandBuffer& buffer, const SuperResolution::Packet& packet);
+	// (render4, KYTY_DS_LINEAR_COPY_HOOK; local/ds-linear-copy-hook.h) The game's linear copy as its function announced
+	// it in the command buffer (`commands`, `commands_bytes`: the announcement and the game's own packets after it),
+	// made as DispatchDirect makes the copy shader's dispatch from its registers. False: not made (the game's packets
+	// run). The GPU thread's executor only.
+	[[nodiscard]] bool DsLinearCopy(CommandBuffer& buffer, uint64_t dst, uint64_t src, uint32_t count, uint32_t period,
+	                                uint64_t commands, uint64_t commands_bytes);
+	// (copia1, KYTY_COPIA1=1; local/copia1.h) A run of consecutive sealed announcements made as DsLinearCopy makes each,
+	// in their order, under one check of its terms, one render lock and one census scope. Returns how many were made:
+	// the first `made` of them; the one after (if any) was not made and its game's packets run, and the rest are left
+	// to the command processor again.
+	struct DsLinearCopyItem {
+		uint64_t dst = 0, src = 0;
+		uint32_t count = 0, period = 0;
+		uint64_t commands = 0, commands_bytes = 0;
+	};
+	[[nodiscard]] uint32_t DsLinearCopyBatch(CommandBuffer& buffer, const DsLinearCopyItem* items, uint32_t n);
+	// (F5 pase 1, KYTY_NATIVO_PASE_SSRCLEAR; local/ds-nativo-pase.h) The SSRClear pass made natively: the image of the
+	// texture whose T# (8 dwords) the game's clear announced, cleared to 0 with Vulkan. False: not made (the game's
+	// packets run). The GPU thread's executor only.
+	[[nodiscard]] bool DsNativeClear(CommandBuffer& buffer, const uint32_t* tsharp);
+	// (F5 pase 2, B1, KYTY_NATIVO_PASE_SOMBRAS=3; local/ds-nativo-sombras.h) Copia la capa `layer` de la imagen de
+	// profundidad de las sombras (direccion `address`) a una imagen propia: la imagen de la cache pasa a TransferSrc con
+	// su Transit y vuelve a su estado previo. Solo comprueba el mecanismo (nada se dibuja). El ejecutor del hilo de la GPU.
+	[[nodiscard]] bool DsShadowCopyLayer(CommandBuffer& buffer, uint64_t address, uint32_t layer, const char** why);
+	// (F5 pase 2, =3 / =1; dsSombrasNativas.inc) Sombras en cascada nativas. DsNatMark: una marca NATV del gancho de
+	// 0xab57d0 (inicio o fin de un cubo; `kind_pass` = tipo | pase << 8). DsNatBeforeDraw: antes de cada draw; en el
+	// primero del cubo copia la capa emulada a la imagen propia; true (solo =1, cascada ya validada): no hacer el draw.
+	// El ejecutor de draws del hilo de la GPU.
+	void               DsNatMark(CommandBuffer& buffer, uint32_t kind_pass, uint32_t seq);
+	[[nodiscard]] bool DsNatBeforeDraw(CommandBuffer& buffer, uint64_t index_addr, uint32_t index_count);
+	[[nodiscard]] bool DsNatWants() const noexcept; // (un cubo de sombras marcado en curso: ProcessPm4 llama a DsNatBeforeDraw)
+	// (B1) La imagen de profundidad del ultimo draw (ResolveRenderDepthTarget: la misma busqueda del draw) y su direccion.
+	ImageId  m_ds_last_depth_id {};
+	uint64_t m_ds_last_depth_addr = 0;
+	uint64_t m_ds_last_depth_seq  = 0; // (sube en cada ResolveRenderDepthTarget: =1 exige uno dentro del cubo)
 
 	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
 	void PrepareBindingsInto(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -376,6 +419,16 @@ private:
 	                                 uint64_t index_bytes, vk::IndexType index_type, bool keep_clears,
 	                                 const NativeXprDirect* direct = nullptr);
 	[[nodiscard]] bool NativeXprDraw(CommandBuffer& buffer, const NativeXprDrawArgs& args);
+	// (render1 F2) Before a table / native record emission binds anything: whether this draw goes into the native batch
+	// (`refuse` < Render1::Reasons: it cannot, for that reason); after the emission: its item.
+	[[nodiscard]] bool Render1Begin(CommandBuffer& buffer, const NativeXprDrawState& draw_state, uint32_t refuse);
+	[[nodiscard]] bool Render1Begin2(CommandBuffer& buffer, const NativeXprDrawState& draw_state, Image& image, uint32_t depth_index);
+	void Render1Add(CommandBuffer& buffer, const NativeXprDrawState& draw_state, const PipelineCache::Pipeline& pipeline,
+	                vk::DescriptorSet set, std::span<const uint32_t> offsets, vk::ShaderStageFlags push_stages,
+	                std::span<const uint32_t> push, bool index_bound, vk::Buffer index_buffer, uint64_t index_offset,
+	                uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
+	                std::span<const std::pair<Buffer*, uint64_t>> arguments, std::span<const uint32_t> group_sizes,
+	                std::span<const uint64_t> commands);
 
 public:
 	// Runtime entry points for the command processor (kyty_local_native_xpr_mode).
@@ -395,6 +448,16 @@ public:
 	// caller's ShaderReadObserver fills with the SRT evaluation's reads.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>>* NativeXprReadLog();
 	void NativeXprEndPacket();
+	// (render1 F2, KYTY_RENDER1=2; local/render1-native.inc) The native depth batch: open, ended (drawn natively into
+	// the shadow image and compared; `why`: Render1::End), and a draw of it not reproduced (`reason`: Render1::Reason).
+	[[nodiscard]] bool Render1BatchOpen() const noexcept;
+	void               Render1EndBatch(CommandBuffer& buffer, uint32_t why);
+	void               Render1Taint(uint32_t reason);
+	// (render1 F3, KYTY_RENDER1=3; local/render1-native.inc) A p0/p1 depth draw run (paired, Render1::t_current) drawn
+	// ONLY the native way, into the game's own targets, where the packet is: true when drawn (the normal path then
+	// neither translates nor records it); false: the normal path draws it, the reason counted.
+	[[nodiscard]] bool Render1Draw(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands, uint64_t index_base,
+	                               uint64_t index_bytes, vk::IndexType index_type);
 	// Graphics registers may have changed without the observer seeing it.
 	void NativeXprForgetState();
 	// A clean draw (only user data and index state changed) after a table draw whose bindings still stand:
@@ -456,6 +519,7 @@ private:
 	// before its program was prepared, and its dispatches since (every 64th takes the normal path again).
 	std::atomic<uint64_t> m_linear_copy_shader {0}, m_linear_copy_generation {0};
 	uint32_t              m_linear_copy_uses = 0;
+	uint32_t              m_linear_copy_hook_uses = 0; // (render4: DsLinearCopy's; every 64th is left to the game's packets)
 	// The metadata surfaces compute dispatches cleared (TryConsumeComputeMetaClear), by their shader and user data: a
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)

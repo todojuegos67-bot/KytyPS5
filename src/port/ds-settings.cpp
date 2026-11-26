@@ -1,8 +1,10 @@
 #include "port/ds-settings.h"
 
 #include "port/ds-tables.h"
+#include "port/ds-online.h"
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <cctype>
 #include <cmath>
@@ -13,6 +15,7 @@
 #include <iterator>
 #include <map>
 #include <sstream>
+#include <ctime> // (rando1)
 
 namespace Port {
 
@@ -89,6 +92,10 @@ const int    kAntiLagDlssgCount = 3;
 const Choice kRtReflLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}, {"5", "Extremo"},
                               {"6", "H\xC3\xAD" "brido"}}; // (refl-hybrid-1028) Hibrido = Alto + the hardware fill
 const int    kRtReflLevelCount = 7;
+// (pt1) Path tracing (BB_PATHTRACING): sombras del sol trazadas por hardware y (pt1e) el relleno de "Reflejos RT" donde su rayo
+// de pantalla falla; No = nada cambia.
+const Choice kPathTracingLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}};
+const int    kPathTracingLevelCount = 5;
 const Choice kRtReflSharp[] = {{"0", "Normal"}, {"1", "Alta"}, {"2", "M\xC3\xA1xima"}}; // (refl-sharp-1031)
 const int    kRtReflSharpCount = 3;
 const Choice kMotesLevels[] = {{"0", "No"}, {"1", "Sutil"}, {"2", "Media"}, {"3", "Densa"}}; // (motes-1031)
@@ -98,6 +105,14 @@ const int    kRtReflWavesCount = 3;
 const Choice kRtLightLevels[] = {{"0", "No"}, {"1", "Media"}, {"2", "Alta"}, {"3", "Ultra"}, {"4", "Extremo"}};
 const int    kRtLightLevelCount = 5;
 const Choice kRtLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}};
+extern const Choice kVolLevels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
+extern const int    kVolLevelCount = 5;
+const Choice kRtx1Levels[] = {{"0", "No"}, {"1", "Bajo"}, {"2", "Medio"}, {"3", "Alto"}, {"4", "Ultra"}}; // (rtx1)
+const int    kRtx1LevelCount = 5;
+const Choice kRtq2OnOff[] = {{"0", "No"}, {"1", "Sí"}}; // (rtq2) Suelo estable
+const int    kRtq2OnOffCount = 2;
+const Choice kRtnLevels[] = {{"0", "No"}, {"1", "Sí"}, {"2", "Depuración"}}; // (rtq2 b)
+const int    kRtnLevelCount = 3;
 // (ds-particles-1029) No, Suave. (ds-pc-port10) Its "Antorchas" level (the smoke lit by the torch light) is gone with
 // the torch light: an old 2 is Suave.
 const Choice kSmokeLevels[] = {{"0", "No"}, {"1", "Suave"}};
@@ -119,8 +134,9 @@ const Choice kSoulsModes[] = {{"ninguno", "Personalizado (ningun modo)"},
                               {"equilibrado", "Modo Souls equilibrado"},
                               {"ultra", "Modo Souls ultra"},
                               {"extremo", "Modo Souls extremo"},
-                              {"low", "Modo Souls PC low profile (900p, todo en bajo)"}};
-const int    kSoulsModeCount = 7;
+                              {"low", "Modo Souls PC low profile (900p, todo en bajo)"},
+                              {"sin-tirones", "Optimizado 16 GB RAM / 8 GB VRAM"}};
+const int    kSoulsModeCount = 8;
 const Choice kMetrics[] = {{"0", "No"}, {"1", "FPS"}, {"2", "FPS + detalle"}};
 const int    kMetricsCount = 3;
 const Choice kLanguages[] = {{"3", "Espanol (Espana)"}, {"20", "Espanol (Latinoamerica)"}, {"1", "English (US)"},
@@ -195,6 +211,19 @@ const char* FrameGenLabel(const std::string& id) {
 	return FindFg(id)->label;
 }
 
+// (rtq2) The old ray-tracing options are retired (no menu or launcher row): forced off whatever settings.ini or a preset
+// holds. Kept: Suelo estable, Reflejos RT nuevos, Luz volumetrica (godrays), Particulas volumetricas and Reflejos RT
+// (reflejos_rt, nitidez, ondas: the user's choice back).
+static void RetireOldRt(Settings* s) {
+	// (rtback) Luz RT (luz_rt_pantalla) honoured again, as in 9589439. Suelo estable / Reflejos RT nuevos did not exist
+	// there: off, so the same settings.ini gives the same RT as 9589439.
+	s->floor_stable = s->rt_nuevo = "0";
+	s->refl_stable = s->shadow_rtx = s->ao_rtx = "0"; // Reflejos estables, Sombras mejoradas, Oclusion mejorada (rtx1)
+	s->path_tracing = "0";
+	s->rt_hw_exp = false;   // RT por hardware (experimental) and its rows
+	s->rt_reflections = false;
+}
+
 bool LoadSettings(const std::string& path, Settings* s) {
 	std::ifstream in(path);
 	if (!in) return false;
@@ -258,7 +287,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("calidad", s->quality);
 	str("reducir_texturas", s->texture_reduce);
 	boo("simular_vram_8gb", s->simulate_vram8);
-	s->simulate_vram8 = false; // (11-12) option removed: always off, whatever the file says
+	// (11-14) Option back in the launcher (Simular gráfica de 8 GB, pruebas): the file's value counts.
 	boo("todos_los_ccd", s->all_ccds);
 	boo("carga_shaders_maxima", s->shader_turbo);
 	str("precompilar_hilos", s->precompile_threads);
@@ -269,6 +298,16 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
 	str("extra", s->extra);
+	boo("multijugador", s->multiplayer);
+	str("multijugador_servidor", s->online_server);
+	if (s->online_server.empty()) s->online_server = "127.0.0.1";
+	str("multijugador_cuenta", s->online_name);
+	str("multijugador_clave", s->online_password);
+	str("multijugador_amigos", s->online_friends); // (chat1)
+	boo("sin_trucos", s->no_cheats); // (stats1)
+	boo("randomizer", s->randomizer); // (rando1)
+	s->randomizer = false; // (rando-oculto 11-23) off and hidden from the launcher until it works
+	num("randomizer_semilla", s->randomizer_seed);
 	boo("antilag", s->antilag);
 	// (before 10-27 "antilag" was a box, written 0 by default: the launcher's default, auto, either way)
 	str("antilag_modo", s->antilag_mode);
@@ -283,6 +322,11 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("rt_oclusion", s->rt_ao);
 	str("luz_volumetrica", s->godrays);
 	str("particulas_volumetricas", s->motes);
+	str("reflejos_estables", s->refl_stable); // (rtx1)
+	str("sombras_mejoradas", s->shadow_rtx);  // (rtx1)
+	str("oclusion_mejorada", s->ao_rtx);      // (rtx1)
+	str("suelo_estable", s->floor_stable);    // (rtq2)
+	str("reflejos_rt_nuevos", s->rt_nuevo);   // (rtq2 b)
 	boo("juego_original", s->pure_game);
 	str("bordes_sombras", s->shadow_edges);
 	str("sombra_rincones", s->corner_shadow);
@@ -305,8 +349,12 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("teclado_raton", s->kbm);
 	num("raton_sensibilidad", s->kbm_sens);
 	num("raton_antizona", s->kbm_antidz);
+	num("raton_sens_x", s->kbm_sens_x); // (raton2)
+	num("raton_sens_y", s->kbm_sens_y);
 	str("mapa_teclado", s->kbm_map);
 	str("mapa_mando", s->pad_map);
+	str("mando_zona_muerta", s->pad_deadzone);
+	boo("mando_forzar_generico", s->pad_force_generic);
 	str("ajustes_juego", s->game_settings);
 	str("rt_antorchas", s->rt_lamps);
 	num("raton_velocidad_camara_forzada", s->kbm_camera); // (step5: a new key; the old raton_velocidad_camara=10 forced the pad too)
@@ -317,14 +365,15 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("ahorro_memoria_v3", s->ram16_boost); // (port28) new key: the old one was on by default
 	s->ram16_boost = false; // (11-13) options removed: Ahorro de memoria RAM and Modo seguro
 	s->safe_gpu    = false;
-	boo("rend_registros_pm4", s->perf_pm4_regfile);
-	boo("rend_subidas_dos_hilos", s->perf_upload_lanes);
 	boo("rend_ayuda_subidas", s->perf_upload_help);
 	boo("rend_espera_hilos", s->perf_spin_gate);
-	boo("rend_feedback_anticipado", s->perf_eager_feedback);
-	boo("rend_feedback_agrupado", s->perf_feedback_batch);
+	// (11-22) rend_registros_pm4, rend_subidas_dos_hilos_v2, rend_feedback_anticipado and rend_feedback_agrupado: always on
+	// in code (no boxes); an old value in settings.ini is not read.
+	s->perf_pm4_regfile = s->perf_upload_lanes = s->perf_eager_feedback = s->perf_feedback_batch = true;
 	boo("rend_shaders_lane_local", s->perf_lane_wide);
 	str("reflejos_rt", s->rt_ss_refl);
+	str("path_tracing", s->path_tracing); // (pt1)
+	if (s->rt_ss_refl == "6") s->rt_ss_refl = "3"; // (rtback, as 9589439) Hibrido gone: its screen-space part, Alto
 	str("nitidez_reflejos_rt", s->rt_refl_sharp);
 	str("ondas_agua_reflejos", s->rt_refl_waves);
 	str("luz_rt_pantalla", s->rt_ssgi);
@@ -340,6 +389,9 @@ bool LoadSettings(const std::string& path, Settings* s) {
 		v           = n >= 0 && n <= max && !v.empty() && std::isdigit(static_cast<unsigned char>(v[0])) != 0 ? std::to_string(n) : "0";
 	};
 	clamp_level(s->rt_ss_refl, 6);
+	clamp_level(s->path_tracing, 4); // (pt1)
+	s->path_tracing = "0"; // (rtq1) Path tracing retired: always off (no launcher or menu row; the dormant code stays)
+	RetireOldRt(s); // (rtq2)
 	clamp_level(s->rt_refl_sharp, 2);
 	clamp_level(s->motes, 3);
 	clamp_level(s->rt_refl_waves, 2);
@@ -453,7 +505,7 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Con la frame generation de NVIDIA: reflex (recomendado), normal o ultra (el nuestro, con Reflex apagado)\n"
 	  << "antilag_dlssg=" << s.antilag_dlssg << "\n\n"
 	  << "[Graficos]\n"
-	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, ligero + 35 reales x2 AMD, para monitores de mas de 60 Hz, FSR Calidad, texturas y sombras medio);\n"
+	  << "; Modos Souls: ninguno; low (PC low profile: 900p con FSR, todo en bajo, 30 reales x2 AMD); ligero (graficas de 8 GB: 30 reales x2 AMD, ligero + 40 reales x2 AMD, para monitores de mas de 60 Hz, FSR Calidad, texturas y sombras medio);\n"
 	  << "; equilibrado (45 reales x2 AMD, texturas, distancia y sombras alto); ultra (RTX 5060-5070 Ti, RX 9070);\n"
 	  << "; extremo (RTX 5080 / 5090: todo al maximo). Los FPS dependen de tu GPU y tu CPU.\n"
 	  << "; Ligero, equilibrado y low mandan sobre frame_generation (AMD x2 fija; el reescalado DLSS si se puede usar).\n"
@@ -513,8 +565,18 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "rt_particulas=" << b(s.rt_particles) << "\n"
 	  << "rt_metal=" << b(s.rt_metal) << "\n"
 	  << "rt_oclusion=" << b(s.rt_ao) << "\n"
-	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto (excluye rt_sombras_sol)\n"
+	  << "; Luz volumetrica: 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra (volumen a media resolucion + niebla del juego mas densa; excluye rt_sombras_sol)\n"
 	  << "luz_volumetrica=" << s.godrays << "\n"
+	  << "; Reflejos estables (suelos sin la onda al mover la camara): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "reflejos_estables=" << s.refl_stable << "\n"
+	  << "; Suelo estable (el reflejo del suelo sigue la superficie, no el relieve: sin onda al mover la camara; el agua no cambia): 0 no, 1 si\n"
+	  << "suelo_estable=" << s.floor_stable << "\n"
+	  << "; Reflejos RT nuevos (ray tracing por hardware solo donde el juego refleja): 0 no, 1 si, 2 depuracion (encima al 50 %: verde rayo usado, azul zona del juego sin acierto)\n"
+	  << "reflejos_rt_nuevos=" << s.rt_nuevo << "\n"
+	  << "; Sombras mejoradas (antorchas y velas, contacto y cascadas del sol): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "sombras_mejoradas=" << s.shadow_rtx << "\n"
+	  << "; Oclusion mejorada (oclusion ambiental del juego mas marcada y mas lejos): 0 no, 1 bajo, 2 medio, 3 alto, 4 ultra\n"
+	  << "oclusion_mejorada=" << s.ao_rtx << "\n"
 	  << "; Particulas volumetricas (motas de polvo iluminadas por la luz volumetrica): 0 no, 1 sutil, 2 media, 3 densa\n"
 	  << "particulas_volumetricas=" << s.motes << "\n"
 	  << "; Juego original: 1 apaga todos los efectos visuales que anade el emulador\n"
@@ -524,10 +586,17 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "teclado_raton=" << b(s.kbm) << "\n"
 	  << "raton_sensibilidad=" << Num(s.kbm_sens) << "\n"
 	  << "raton_antizona=" << Num(s.kbm_antidz) << "\n"
+	  << "; Camara nativa (KYTY_CAM1): multiplicador horizontal / vertical. Todo lo de raton se aplica en directo al guardar\n"
+	  << "raton_sens_x=" << Num(s.kbm_sens_x) << "\n"
+	  << "raton_sens_y=" << Num(s.kbm_sens_y) << "\n"
 	  << "; Teclas: Cross=F;R1=Mouse:Left;... (vacio = las de serie, estilo Souls)\n"
 	  << "mapa_teclado=" << s.kbm_map << "\n"
 	  << "; Mando remapeado: a=Cross;b=Circle;... (boton fisico de SDL = control de PS5; vacio = normal)\n"
 	  << "mapa_mando=" << s.pad_map << "\n"
+	  << "; Zona muerta de los sticks: auto (Xbox 24%, otros mandos 15%, PlayStation sin ella) o un porcentaje 0-50\n"
+	  << "mando_zona_muerta=" << s.pad_deadzone << "\n"
+	  << "; Mando no reconocido o con botones/ejes cambiados: 1 = mapeo generico (orden Xbox 360)\n"
+	  << "mando_forzar_generico=" << b(s.pad_force_generic) << "\n"
 	  << "; Ajustes del juego (los del lanzador del emulador): gs_sun=3;gs_spot=1;... (gs_x=0 = como viene el juego; sin la clave = su predeterminado, gs_spot apagadas)\n"
 	  << "ajustes_juego=" << s.game_settings << "\n"
 	  << "; Forzar la velocidad de camara del juego (0 = la del menu del juego; 5-15 tambien cambia la del mando)\n"
@@ -542,18 +611,11 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Mejoras para equipos de 16 GB de RAM: perfil de 16 GB (solo en PCs de 20 GB de RAM o menos)\n"
 	  << "ahorro_memoria_v3=" << b(s.ram16_boost) << "\n"
 	  << "; Opciones de rendimiento (0 = como siempre; 1 = la mejora experimental de KytyPS5 upstream)\n"
-	  << "; Registros PM4 directos (KYTY_PM4_REGFILE)\n"
-	  << "rend_registros_pm4=" << b(s.perf_pm4_regfile) << "\n"
-	  << "; Subidas a la GPU en dos hilos (KYTY_UPLOAD_LANES=2)\n"
-	  << "rend_subidas_dos_hilos=" << b(s.perf_upload_lanes) << "\n"
+	  << "; Siempre activas (sin opcion): registros PM4 directos, subidas en dos hilos, copias de la GPU anticipadas y agrupadas\n"
 	  << "; El hilo de render ayuda con las subidas si la CPU va cargada (KYTY_UPLOAD_HELP=2)\n"
 	  << "rend_ayuda_subidas=" << b(s.perf_upload_help) << "\n"
 	  << "; Los hilos de ayuda dejan de esperar activos si la CPU va cargada (KYTY_SPIN_GATE=1)\n"
 	  << "rend_espera_hilos=" << b(s.perf_spin_gate) << "\n"
-	  << "; Copias de la GPU devueltas antes de que el juego las pida (KYTY_EAGER_FEEDBACK)\n"
-	  << "rend_feedback_anticipado=" << b(s.perf_eager_feedback) << "\n"
-	  << "; Copias de la GPU agrupadas (KYTY_FEEDBACK_BATCH)\n"
-	  << "rend_feedback_agrupado=" << b(s.perf_feedback_batch) << "\n"
 	  << "; Shaders lane-local ampliados (KYTY_LANE_LOCAL_WIDE; recompila parte de los shaders)\n"
 	  << "rend_shaders_lane_local=" << b(s.perf_lane_wide) << "\n\n"
 	  << "[Interfaz]\n"
@@ -568,6 +630,20 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
 	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"
+	  << "[Multijugador]\n"
+	  << "; 1: online con el servidor propio (mensajes, manchas, fantasmas, cooperativo, invasiones). 0: sin conexion, como siempre\n"
+	  << "multijugador=" << b(s.multiplayer) << "\n"
+	  << "; Direccion del servidor: 127.0.0.1 si este PC es el servidor; si no, la IP publica del anfitrion\n"
+	  << "multijugador_servidor=" << s.online_server << "\n"
+	  << "multijugador_cuenta=" << s.online_name << "\n"
+	  << "multijugador_clave=" << s.online_password << "\n"
+	  << "; Amigos del chat (nombres de cuenta separados por comas)\n"
+	  << "multijugador_amigos=" << s.online_friends << "\n"
+	  << "; Deshabilitar trucos y mejoras: 1 el menu F2 no ofrece trucos, armas, objetos, almas ni nivel, y todos quedan apagados\n"
+	  << "sin_trucos=" << b(s.no_cheats) << "\n"
+	  << "; Randomizer: 1 partida sin conexion con los Trofeos Randomizer (y los trucos apagados); semilla 0 = una nueva cada vez\n"
+	  << "randomizer=" << b(s.randomizer) << "\n"
+	  << "randomizer_semilla=" << s.randomizer_seed << "\n\n"
 	  << "[Avanzado]\n"
 	  << "; Interruptores del emulador: KYTY_X=1;KYTY_Y=2 (KYTY_X= lo quita). Solo para pruebas.\n"
 	  << "extra=" << s.extra << "\n";
@@ -621,6 +697,8 @@ const GameSetting kGameSettings[] = {
 	 "Adaptacion de la vista: la exposicion cambia poco a poco al pasar de zonas oscuras a claras. No: exposicion fija. No cuesta FPS. Manda sobre la casilla Eye Adaptation."},
 	{"gs_aasharp", "Postprocesado", false, "Nitidez del antialiasing", {"r_aaSharpenStrengthStatic=1.2;r_aaSharpenStrengthMotion=1.2;r_aaHistorySharpeningStrength=0.5", "r_aaSharpenStrengthStatic=2.0;r_aaSharpenStrengthMotion=2.0;r_aaHistorySharpeningStrength=0.7", "r_aaSharpenStrengthStatic=2.5;r_aaSharpenStrengthMotion=2.5;r_aaHistorySharpeningStrength=0.8", "r_aaSharpenStrengthStatic=3.5;r_aaSharpenStrengthMotion=3.5;r_aaHistorySharpeningStrength=0.9", "r_aaSharpenStrengthStatic=5.0;r_aaSharpenStrengthMotion=5.0;r_aaHistorySharpeningStrength=1.0"},
 	 "Nitidez del antialiasing temporal del juego: Bajo 1,2, Medio 2,0, Alto 2,5 (de fabrica), Ultra 3,5, Extremo 5,0 (la del historial de 0,5 a 1,0). No cuesta FPS; mucha puede marcar bordes y brillos. Manda sobre AA Sharpness."},
+	{"gs_texcache", "Memoria", true, "Guardar texturas que no se usan", {"cacheUnusedTextures=false", "cacheUnusedTextures=true", nullptr, nullptr, nullptr},
+	 "El juego guarda en la RAM las texturas de zonas por las que ya pasaste, por si vuelves, hasta 8 GB (texturePoolSizeMiBs). Si (de fabrica): vuelve antes a esas zonas. No: las suelta y la RAM sube mucho menos; misma calidad de texturas, alguna puede tardar un poco en cargar al volver. Recomendado No en PCs de 16 GB."},
 };
 
 const GameSetting* GameSettings(size_t* count) {
@@ -670,6 +748,8 @@ std::string GameSettingsConvars(const Settings& s) {
 }
 
 std::string ShadowFilterLevel(const Settings& s) {
+	// (rtx1b) Only "Bordes sombras": rtx1 raised it from Sombras mejoradas and that changed the driver cache key (a cold
+	// pipeline cache, PCSS lighting shaders made on the render thread: [L] 20261119-040338, 24 pipelines, 18.2 s, no frame).
 	return s.shadow_edges == "1" || s.shadow_edges == "2" || s.shadow_edges == "3" ? s.shadow_edges : std::string();
 }
 
@@ -681,6 +761,9 @@ std::string DriverCacheKey(const Settings& s) {
 
 bool LowRam(const Settings& s, const PcInfo& pc) {
 	// (10-28) "Mejoras para equipos de 16 GB de RAM" (on by default) on a PC of 20 GB or less, or simulated.
+	// (picos3) On by itself on a PC of 20 GB or less: without it a 16 GB PC got no 6 GB kept in RAM (KYTY_RESIDENT_MB) and
+	// Windows paged the game's memory out while playing - 100-450 ms frames reading it back (backing_read).
+	if (pc.ram_gb > 0 && pc.ram_gb <= 20) return true;
 	return s.simulate_ram16 || s.ram16_boost; // (port28) usable on any PC (off by default; Optimizar turns it on at 20 GB or less)
 }
 
@@ -735,7 +818,20 @@ void RecommendFor(PcInfo* pc) {
 	}
 }
 
-LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcInfo& pc) {
+// (trucos-online) ds-settings.h
+static std::atomic<bool> g_cheats_used {false};
+void MarkCheatsUsed(const char* what) {
+	if (!g_cheats_used.exchange(true)) {
+		std::printf("[port] trucos: usados en esta sesion (%s): online bloqueado hasta reiniciar sin trucos\n", what != nullptr ? what : "?");
+		std::fflush(stdout);
+	}
+}
+bool CheatsUsed() { return g_cheats_used.load(); }
+
+LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const PcInfo& pc) {
+	Settings retired = s_in;
+	RetireOldRt(&retired); // (rtq2) a preset applied in this session may have set an old RT option
+	const Settings& s = retired;
 	LaunchPlan plan;
 	Env        env;
 	const bool demons = title_id.empty() || title_id.rfind("PPSA0134", 0) == 0;
@@ -743,7 +839,7 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// Souls ligero / equilibrado / PC low profile: AMD x2 whatever frame_generation says, the game flipped at 30 / 45 / 30.
 	// (10-23) No DLSS on a graphics card that is not NVIDIA (the launcher does not offer it).
 	const bool  fixed_fg = FixedFg(s);
-	std::string fg_id    = fixed_fg ? std::string("amd-x2") : s.framegen; // (11-12) ligero + is 35x2 now
+	std::string fg_id    = fixed_fg ? std::string("amd-x2") : s.framegen; // (11-14) ligero + is 40x2 now
 	if (!pc.nvidia && fg_id.rfind("dlss", 0) == 0) {
 		fg_id = "sin-fg";
 		plan.notes.emplace_back("DLSS frame generation needs NVIDIA: without frame generation");
@@ -804,23 +900,30 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-11) Souls ligero +: the pad read 4 ms later than ligero's (39 ms before its 30 fps flip slot, the game's ~7 ms
 	// of CPU plus margin): about 4 ms less input latency.
 	if (fixed_fg)
-		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : s.souls_mode == "ligero-plus" ? "37" : "43"); // (11-12) ligero 30x2 (43), ligero + 35x2 (37) // (10-25) Anti-Lag+
+		sets.emplace_back("KYTY_PAD_LATE_MS", s.souls_mode == "equilibrado" ? "29" : (s.souls_mode == "ligero-plus" || s.souls_mode == "sin-tirones") ? "33" : "43"); // (11-12) ligero 30x2 (43); (11-14) ligero + 40x2 (33) // (10-25) Anti-Lag+
 	// (des-particles-fg) Souls ligero (30x2) and ligero + (30x3) only: the particle layer's motion vectors for AMD frame
 	// generation (particle-mv.cpp): fire, sparks, rain, mist and spells interpolated instead of shown at the real 30.
 	// (11-11) Off by default until verified in game (the first build lost the device): KYTY_FG_PARTICLE_MV=1 by hand.
 	// if (fixed_fg && (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus")) sets.emplace_back("KYTY_FG_PARTICLE_MV", "1");
 	// (10-26) The RAM flush is gone (hitches): none of it, and out of the config too.
-	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_STAGING_RING_MB", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
+	// (11-21) KYTY_STAGING_RING_MB no longer cleared here: it wiped the 128 MiB ring of PCs of 20 GB or less set below
+	// (the 16 GB logs showed 768 MiB).
+	for (const char* k: {"KYTY_MEMCUT", "KYTY_REBAR_STAGING", "KYTY_RAM_TARGET_MB", "KYTY_RAM_FLUSH_SECONDS",
 	                     "KYTY_RAM_FLUSH_MB", "KYTY_RAM_FLUSH_LEVEL"})
 		sets.emplace_back(k, "");
 	if (s.safe_gpu) sets.emplace_back("KYTY_COMPUTE_CHAIN", "0");
 	// (perfopts-1107) Opciones de rendimiento: only set when chosen (off leaves the environment as it was).
-	if (s.perf_pm4_regfile) sets.emplace_back("KYTY_PM4_REGFILE", "1");
-	if (s.perf_upload_lanes) sets.emplace_back("KYTY_UPLOAD_LANES", "2");
+	// (11-22) Always on (the user's tests: "Menos trabajo por cada dibujo"); no box any more, an old settings.ini value is ignored.
+	sets.emplace_back("KYTY_PM4_REGFILE", "1");
+	// (11-21) Once kept off on PCs of 20 GB or less (a 16 GB run at 0.5 GB free ended in a Windows bug check, 0x1A of
+	// 11-14); every PC again since: that reboot was the memory (native memory now on).
+	// (11-22) Always on (the user's tests: "Enviar texturas con dos hilos"); no box any more, an old settings.ini value is ignored.
+	sets.emplace_back("KYTY_UPLOAD_LANES", "2"); // (11-21) every PC again: the reboot was the memory (native memory now on)
 	if (s.perf_upload_help) sets.emplace_back("KYTY_UPLOAD_HELP", "2");
 	if (s.perf_spin_gate) sets.emplace_back("KYTY_SPIN_GATE", "1");
-	if (s.perf_eager_feedback) sets.emplace_back("KYTY_EAGER_FEEDBACK", "1");
-	if (s.perf_feedback_batch) sets.emplace_back("KYTY_FEEDBACK_BATCH", "1");
+	// (11-22) Always on: the user's tests (copias anticipadas + agrupadas) gave smoother gameplay; the old boxes no longer turn them off.
+	sets.emplace_back("KYTY_EAGER_FEEDBACK", "1");
+	sets.emplace_back("KYTY_FEEDBACK_BATCH", "1");
 	if (s.perf_lane_wide) sets.emplace_back("KYTY_LANE_LOCAL_WIDE", "1");
 	// Anti-Lag (10-24): with the AMD frame generation, AMD's Anti-Lag 2 on an AMD card (default) or ours (2 frames queued, Ultra 1);
 	// the fixed Souls modes always ours in Ultra. With NVIDIA's frame generation, Reflex (default) or ours with Reflex off.
@@ -882,16 +985,36 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		sets.emplace_back("KYTY_RT_REFLECTIONS_SHARP", "");
 		sets.emplace_back("KYTY_RT_REFLECTIONS_WATER_WAVES", "");
 	}
+	// (pt1) Path tracing: BB_PATHTRACING=1 + its preset; No (or Juego original): both empty, nothing of it runs.
+	{
+		static const char* quality[] = {"", "low", "medium", "high", "ultra"};
+		const int          level     = s.pure_game ? 0 : std::clamp(std::atoi(s.path_tracing.c_str()), 0, 4);
+		sets.emplace_back("BB_PATHTRACING", level > 0 ? "1" : "");
+		sets.emplace_back("BB_PATHTRACING_QUALITY", quality[level]);
+	}
 	sets.emplace_back("KYTY_DLSSG_PRESET", "C");
 	sets.emplace_back("KYTY_FG_PACING", "0");        // (10-21) the emulator's frame pacing (stuck at 20 FPS) off
-	sets.emplace_back("KYTY_DS_SIXTY_STEP", "0");    // (10-22) cinematic as on PS5
+	// (cine60) 60 FPS always: every graphics mode at the 59.94 fps step and flip rate 0 (loader/demonsSoulsRenderSize.cpp
+	// InstallSixtyStep), so the game's Cinematic mode no longer sets sceVideoOutSetFlipRate(1) and its cutscene sequencer
+	// advances 1/59.94 a frame at 60 flips (correct speed, as the performance mode already did) instead of 1/30 held to
+	// 30 by KYTY_CINEMATIC_FLIP_RATE. The performance mode's entries are unchanged (59.94, flip 0). That floor stays as
+	// the safety net if the patch finds no known build. KYTY_CINE_LIMIT=1 in the environment: as before (the game's step).
+	{
+		static const bool cine_limit = [] {
+			const char* v = std::getenv("KYTY_CINE_LIMIT");
+			return v != nullptr && std::strcmp(v, "1") == 0;
+		}();
+		sets.emplace_back("KYTY_DS_SIXTY_STEP", cine_limit ? "0" : "1");
+		plan.notes.emplace_back(cine_limit ? "cine60: off (KYTY_CINE_LIMIT=1): the game's cutscene step, Cinematic mode cutscenes at 30"
+		                                   : "cine60: on: cutscenes and loading at 60 in every graphics mode (KYTY_CINE_LIMIT=1: as before)");
+	}
 	sets.emplace_back("KYTY_DS_VARIABLE_STEP", "1"); // (10-21) physics at each frame's real time
 	// Upscaler sharpness: (10-24) ligero 75 %, (10-24) PC low profile 100 %.
 	std::string sharp = s.sharpness == "auto" ? std::string() : s.sharpness;
 	if (s.souls_mode == "low") sharp = "1";
 	else if (s.souls_mode == "ligero" || s.souls_mode == "ligero-plus") sharp = "0.75";
 	if (!sharp.empty()) sets.emplace_back("KYTY_UPSCALE_SHARPNESS", sharp);
-	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : s.souls_mode == "ligero-plus" ? "35" : "30"); // (11-12) ligero 30x2, ligero + 35x2
+	if (fixed_fg) sets.emplace_back("KYTY_FLIP_FPS", s.souls_mode == "equilibrado" ? "45" : (s.souls_mode == "ligero-plus" || s.souls_mode == "sin-tirones") ? "40" : "30"); // (11-12) ligero 30x2; (11-14) ligero + 40x2
 	if (unlocked && with_fg) sets.emplace_back("KYTY_FRAMEGEN_BASE", "0");
 	if (s.af16) sets.emplace_back("KYTY_FORCE_AF", "16");
 	if (s.texture_sharpness == "2") {
@@ -933,9 +1056,20 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
 				sets.emplace_back(k, "0");
 	}
-	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3");
+	const bool godrays = !s.pure_game && (s.godrays == "1" || s.godrays == "2" || s.godrays == "3" || s.godrays == "4"); // (rtx1: 4 Ultra)
 	const bool shadows = false; // (ds-pc-port9) Sombras RT retired
 	if (godrays) sets.emplace_back("KYTY_GODRAYS", s.godrays);
+	// (rtq2 b) Reflejos RT nuevos (rt-nuevo.cpp): the KYTY_HWRT scene (no visual change by itself) + KYTY_RTN. Compilacion 1:
+	// 1 on (compilacion 2: composited by the game in its IBL), 2 the same + the debug overlay.
+	if (!s.pure_game && (s.rt_nuevo == "1" || s.rt_nuevo == "2")) {
+		sets.emplace_back("KYTY_RT_HW_EXPERIMENTAL", "1");
+		sets.emplace_back("KYTY_HWRT", "1");
+		sets.emplace_back("KYTY_RTN", s.rt_nuevo);
+		if (!s.rt_hw_exp) // (the other hardware passes stay off, as with Reflejos RT Hibrido)
+			for (const char* k: {"KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW", "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO",
+			                     "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN", "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_RT_SUN"})
+				sets.emplace_back(k, "0");
+	}
 	const bool motes = !s.pure_game && (s.motes == "1" || s.motes == "2" || s.motes == "3"); // (motes-1031)
 	sets.emplace_back("KYTY_MOTES", motes ? s.motes : "");
 	if (shadows) {
@@ -1174,6 +1308,10 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// the emulator's own defaults, no shader gate, and no SPIR-V disk store (the emulator has none: off). The warmup on 16
 	// threads, launch.json's KYTY_SHADER_WARMUP_THREADS.
 	env.Set("KYTY_SPIRV_DISK", "0");
+	// (velas1) The deferred decals (candle light, blood, dirt) need the pixel interlock or they flicker; it was turned off
+	// whenever the static store had been precompiled without it (a clean install: "the static pipeline store was made
+	// without it"). On by default except on AMD's Windows driver (issue #355, faces), which keeps its own check.
+	if (!pc.amd) env.Default("KYTY_PIXEL_INTERLOCK", "1");
 	// (ds-pc-port47) Root cause of the port-only hitches: ds-perf-1031's V-Cache pin (not in the emulator, de604751) set
 	// KYTY_RENDER_CPUS to CPUs 2-15 of the 16 the port's process ran on, and every background thread keeps off those
 	// (AvoidCpuList): the shader prefetch, warmup and every async pipeline worker squeezed onto CPUs 0-1 (port logs:
@@ -1191,7 +1329,13 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	// (11-13) No fast memory moves: the user saw the PC reboot when memory was freed/moved quickly (working-set trims,
 	// release passes). The RAM budget and the RAM guard's release passes are off; memory stays where the game put it.
 	env.Default("KYTY_RAM_BUDGET_MB", "0");
-	env.Default("KYTY_RAM_GUARD", "0");
+	// (11-14) RAM guard back on, caches only: under pressure (zone changes) it frees what holds nothing in use (heap free
+	// blocks, idle scratch, images unused for 600 flips, idle pipelines). Never the working set nor guest memory
+	// (KYTY_RAM_FLUSH_TRIM stays off): no paging, so not the 0x1A of 11-14.
+	env.Default("KYTY_RAM_GUARD", "1");
+	// (11-14, rama ds-native-1) Memoria nativa: memoria del juego privada con MEM_WRITE_WATCH, sin vista duplicada ni
+	// cambios de permisos de página (causa del bug check 0x1A). En [Avanzado] extra, KYTY_NATIVE_MEMORY=0 la apaga.
+	env.Default("KYTY_NATIVE_MEMORY", "0"); // (11-14, 11-21) off: on, this tree runs at ~2 fps (the working native memory is another branch)
 	// (11-13) The low-RAM profile turns itself on with 20 GiB or less and would enable runtime releases (soft release,
 	// RAM diet): off, nothing is freed or moved while playing.
 	env.Default("KYTY_SOFT_RELEASE", "0");
@@ -1205,8 +1349,12 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	if (pc.ram_gb > 0 && pc.ram_gb <= 20) env.Default("KYTY_STAGING_RING_MB", "128");
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
-		env.Default("KYTY_RESIDENT_MB", "6144");
+		env.Default("KYTY_RESIDENT_MB", "8192"); // (picos5) 8 GB: with 7 the ~200 MB buffer uploads read paged-out guest memory (backing_read 60-120 ms every few s); (picos4) 7 GB, was 6: the game holds ~8 GB while playing; Windows paged the rest out
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
+		// (ram16-t6, 11-23) Start-up compute warm: only the pipelines the game used in earlier sessions. Log 20261123-082215:
+		// all 4722 recipes cost +3.9 GB resident (emulator 8.2 GB), the 16 GB PC then played with 150-440 MiB available and
+		// all game threads stalled together (321 ms) on Windows' memory manager. KYTY_TIRON6_SEEDS_ONLY=0 turns it off.
+		env.Default("KYTY_TIRON6_SEEDS_ONLY", "1");
 		env.Default("KYTY_BACKING_FILE", "0");
 		// (11-13) The guest copy of GPU-only images is dropped once they are on the card: RAM not held twice.
 		env.Default("KYTY_GPU_ONLY_OFFLOAD", "0");
@@ -1233,6 +1381,67 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 		                     "KYTY_TORCH_HW", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_SMOKE", "KYTY_DOF"})
 			env.Set(k, "0");
 	}
+	// (online5) [Multijugador]: the online switches (libs/network.cpp, libs/libNet.cpp, loader/gameArgs.cpp). Our server:
+	// TCP 31415 (game server + WebAPI), TCP 31413 (accounts), UDP 3758 (P2P relay). Off: offline as before.
+	// (trucos-online) Cheats used in this process: the launch is offline (no KYTY_ONLINE / server switches).
+	if (s.multiplayer && CheatsUsed()) {
+		std::printf("[port] online: desactivado porque hay trucos activos\n");
+		std::fflush(stdout);
+	} else if (s.multiplayer && s.randomizer) { // (rando1) the randomizer is offline, as the cheats
+		std::printf("[port] online: desactivado porque el randomizer esta activo\n");
+		std::fflush(stdout);
+	} else if (s.multiplayer) {
+		const std::string host = Port::Online::ServerHost(); // (online10) one server for everyone (DuckDNS; 127.0.0.1 on the owner's PC)
+		env.Set("KYTY_ONLINE", "1");
+		env.Set("KYTY_ONLINE_SERVER", host + ":31415");
+		env.Set("KYTY_ONLINE_NAME", s.online_name);
+		env.Set("KYTY_ONLINE_PASSWORD", s.online_password);
+	}
+	// (rando1) The randomizer: offline (above) and its trophies (libs/libNet.cpp); the seed for the enemy draw.
+	if (s.randomizer) {
+		env.Set("KYTY_DS_RANDOMIZER", "1");
+		const long long seed = s.randomizer_seed != 0 ? s.randomizer_seed : static_cast<long long>(std::time(nullptr) % 1000000);
+		env.Set("KYTY_DS_RANDOMIZER_SEED", std::to_string(seed));
+		std::printf("[port] randomizer: activo, semilla %lld (sin conexion, trucos apagados)\n", seed);
+	}
+	// (11-21) The switches the test folder played with for days (native memory KYTY_RAIZ, the RAM savings RAM16 / RAM17 /
+	// RAM2 / RAM_NATIVE_TEX, the hitch fixes TIRON1-13...): on by default for everyone, first; settings.ini extra goes
+	// after them and can still change any (KEY=value, KEY= removes it). They were only in that folder's settings.ini.
+	{
+		static const char* kDefaults = "KYTY_FG_PARTICLE_MV=1;KYTY_TEXTURE_OFFLOAD=1;KYTY_GPU_ONLY_OFFLOAD=1;KYTY_OFFLOAD_PAGEOUT=1;KYTY_BIG_WINDOW=1;KYTY_VOLATILE_EXTRA_ALLOCATORS=HeapAllocator,PageAllocator,Bucket;KYTY_FAULT_STATS=0;KYTY_TEXTURE_PROBE=0;KYTY_BUFFER_PROBE=0;KYTY_RESIDENCY_LOG=0;KYTY_RAM_GUARD=1;KYTY_RAM_LINE=1;KYTY_RENDER_STATS=0;KYTY_RAIZ=1;KYTY_DS_FREED_RELEASE=1;KYTY_PM_LOCK_HOLDERS=0;KYTY_REG_LANE=1;KYTY_DRAW_FLAGS=1;KYTY_CENSUS_LIGHT=1;KYTY_RAIZ_SETTLE=1;KYTY_PARPADEO6=1;KYTY_REND1=1;KYTY_RAM16=1;KYTY_RAM17=1;KYTY_CAM1=1;KYTY_RAM_NATIVE_TEX=1;KYTY_PIXEL_INTERLOCK=1;KYTY_RAM2=1;KYTY_TIRON1=1;KYTY_RTREFL_LEJOS=1;KYTY_TIRON6=1;KYTY_TIRON8=1;KYTY_TIRON9=1;KYTY_TIRON10=1;KYTY_TIRON11=1;KYTY_TIRON12=1;KYTY_TIRON13=1;KYTY_RTREFL_MATERIAL=0;KYTY_RTREFL_ONDA=0;KYTY_RAM18_COLD_S=60;KYTY_RAM16_CENSUS_S=0";
+		std::stringstream list(kDefaults);
+		std::string       pair;
+		while (std::getline(list, pair, ';')) {
+			pair          = Trim(pair);
+			const auto eq = pair.find('=');
+			if (eq == std::string::npos || eq == 0) continue;
+			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
+		}
+	}
+	// (11-23) PCs of more than 20 GB of RAM (a user: up to 31 GB after 15 min; no limit there, KYTY_RAM_BUDGET_MB=0): the
+	// census of the game's memory in RAM by allocator ("[ram16-censo]", a background thread, ~6 ms a pass) every 60 s,
+	// so their log says which part grows; the "[ram]" / "[ram+]" lines (every 10 s) already run on every PC. Nothing is
+	// freed or moved. PCs of 20 GB or less unchanged (census off, as before). extra= below can still change it.
+	if (pc.ram_gb > 20) env.Set("KYTY_RAM16_CENSUS_S", "60");
+	// (11-23, memoria-nativa) PCs of 20 GB or less: (1) the C++ heap's free blocks (~0.9 GB committed after the shader
+	// prefetch) given back ONCE, when the prefetch is done, before the intro (KYTY_MEM1_HEAP_ONCE, ram-guard.cpp; no
+	// periodic passes: one froze the game 1.8-2.5 s on 11-17); (2) the censuses that tell where each GB is: the game's
+	// memory by allocator every 60 s ("[ram16-censo]", ~6 ms on a background thread) and the streamed textures' zone
+	// ("[mem1-vm]", MEM1's, read only). KYTY_MEM1=0 / KYTY_MEM1_HEAP_ONCE=0 / KYTY_RAM16_CENSUS_S=0 in extra= turn them off.
+	if (false && pc.ram_gb <= 20) { // (11-26 limpieza) apagado: la release no lo tenia; KYTY_MEM1=1 en extra= lo enciende
+		env.Set("KYTY_MEM1", "1");
+		// (hp, 11-25) KYTY_MEM1_HEAP_ONCE no longer set: the exe's manifest makes the process heap (malloc/new) the segment
+		// heap, which decommits its free pages itself; the pass froze the heap 1.1 s and gave back 46-186 MiB. extra='s
+		// KYTY_MEM1_HEAP_ONCE=1 still runs it. KYTY_HEAP_LINEA=1: the "[heap]" line (ram-guard.cpp), =0 in extra= off.
+		// KYTY_SCRATCH_SUELTA (soft-release.cpp, on unless =0): idle per-thread scratch buffers freed.
+		env.Set("KYTY_HEAP_LINEA", "1");
+		env.Set("KYTY_RAM16_CENSUS_S", "60");
+		// (mem1 etapa 2) The native offload's store in video memory and the streamed textures' zone (VirtualMemo, which the
+		// game's CPU never reads) out of RAM once no emulator window read it for 30 s (local/vram-store.h,
+		// graphics/host_gpu/vramStore.cpp). Only with a discrete GPU whose driver budget has 1 GiB or more beyond the caches'
+		// budget and its margin (off by itself on 8 GB cards); KYTY_MEM1_STAGE2=0 in extra= turns it off.
+		env.Set("KYTY_MEM1_STAGE2", "1");
+	}
 	// settings.ini [Avanzado] extra: as -Set (KEY= removes it).
 	{
 		std::stringstream list(s.extra);
@@ -1243,6 +1452,122 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 			if (eq == std::string::npos || eq == 0) continue;
 			env.Set(Trim(pair.substr(0, eq)), Trim(pair.substr(eq + 1)));
 		}
+	}
+	// (texpool1) KYTY_DS_TEXTURE_POOL_MB=N in [Avanzado] extra: the game's own texture streaming budget
+	// (convar texturePoolSizeMiBs, 8192 by default; eboot+0xac9ea0 only loads a mip that fits and lowers mips when over).
+	// extra= splits at ';', so a convar list cannot be given there: this adds the one convar. Off unless set.
+	if (demons) {
+		// (texpool-vram 11-23) [G] The game's own streaming budget sized to the PC's video memory, as a native PC port
+		// ships it: convar texturePoolSizeMiBs (default written at eboot+0xad4abb in FUN_00ad3070, default 0x2000 = 8192 MiB,
+		// the PS5's unified memory). The streamed textures (CTexture::SetCurrentStreamingChunk 0x901330: commit 0x7f9f70
+		// op 0, memcpy 0x901459, release op 2; CTexture::Create 0x8fe9de streams the base mips) live in VirtualMemo, and
+		// log 130426 shows 3.30 GB committed there of which only ~0.6 GB backs a GPU image (2.10 GB never drawn since
+		// loaded). Unset: 3072 MiB with 8 GB of video memory or less (or simular_vram_8gb), 4096 MiB above; "0": the
+		// game's 8192; N: N MiB.
+		std::string pool_mb = env.Get("KYTY_DS_TEXTURE_POOL_MB");
+		const int   vram_gb = s.simulate_vram8 ? 8 : static_cast<int>((pc.vram + (512ull << 20)) >> 30);
+		if (false && pool_mb.empty() && vram_gb > 0) pool_mb = vram_gb <= 8 ? "3072" : "4096";
+		if (!pool_mb.empty() && pool_mb != "0") {
+			env.AppendConvars("texturePoolSizeMiBs=" + pool_mb);
+			std::printf("[texpool] pool de texturas del juego %s MiB (texturePoolSizeMiBs, de fabrica 8192) para %d GB de VRAM\n", pool_mb.c_str(), vram_gb);
+		}
+	}
+	// (ibl0) KYTY_DS_IBL_TEMPORAL=0 in [Avanzado] extra: the game's IBL / SSR temporal off (convar r_enableIBLTemporal,
+	// render config +0x770). [G] RenderIBL FUN_009d66d0 reads it (with r_iblResolution +0x76c) to alternate the half-width
+	// columns frame to frame and blend with the previous frame; the frame setup FUN_00a14886 keeps it only with the
+	// game's TAA (r_aaMethod +0xaa0 == 1). The doubled reflection while turning: the reflections' own history. Off unless set.
+	if (demons && env.Get("KYTY_DS_IBL_TEMPORAL") == "0") env.AppendConvars("r_enableIBLTemporal=false");
+	// (ssr0) KYTY_DS_SSR_OFF=1 in [Avanzado] extra: the game's own SSR off (r_ssrEnableOverrides with no ray: cutoff and
+	// length ~0, one iteration). Its normal-mapped blobs move as the camera turns (the "wave" on level floors); with our RT
+	// reflections on, ours replaces it (needs KYTY_RT_REFLECTIONS_GUIDE=0: the guide is that SSR). Off unless set.
+	if (demons && env.Get("KYTY_DS_SSR_OFF") == "1")
+		env.AppendConvars("r_ssrEnableOverrides=true;r_ssrMaxIterations=1;r_ssrMaxRayLength=0.01;r_ssrCutoffDistance=0.01");
+	// (rtx1) Reflejos estables / Luz volumetrica Ultra / Sombras mejoradas / Oclusion mejorada (0 = nothing, as before).
+	// Last of the convars (they win over Detalle / Sombras / Ajustes del juego); a key the user put in [Avanzado] extra wins.
+	if (demons && !s.pure_game) {
+		const auto lv  = [](const std::string& v) { return std::clamp(std::atoi(v.c_str()), 0, 4); };
+		const auto put = [&](const char* k, const std::string& v) {
+			if (s.extra.find(std::string(k) + "=") == std::string::npos) env.Set(k, v);
+		};
+		// (rtx1b) [L] 20261119-040338: "+r_enableSpotShadows=false" came after ours (gs_spot's default in
+		// KYTY_GAME_CONVARS_EXTRA, applied after KYTY_GAME_CONVARS): ours go last of the EXTRA list.
+		const auto last_cv = [&](const std::string& cv) {
+			const std::string old = env.Get("KYTY_GAME_CONVARS_EXTRA");
+			env.Set("KYTY_GAME_CONVARS_EXTRA", old.empty() ? cv : old + ";" + cv);
+		};
+		// (sintirones) Demon's Souls optimizado: the projected decals (blood, dirt) off, last so it wins.
+		if (s.souls_mode == "sin-tirones") last_cv("r_projectedDecalEnable=false");
+		const auto rt_refl_on = [&] {
+			const std::string r = env.Get("KYTY_RT_REFLECTIONS");
+			return !r.empty() && r != "0";
+		};
+		// Reflejos estables. [L] 20261118-114603 (the game's SSR cut, ours "not guided"): "camera vs G-buffer frame (rtrefl1,
+		// fix off): neither 92 of 600" = 15 % of the frames reprojected with another frame's camera, the wave of OUR pass;
+		// every test ran with that fix off. [L] 20261118-094400 (the video): "game SSR confident 33-36 %, blobby on level
+		// floors 7-15 %" = the GAME's SSR, [G/ISA] CS 9fb5cc274b5e4f82 pc 0xc44: kRTT_SSR read with IMAGE_LOAD at (x>>1,
+		// y>>1) (half resolution, point, no filter; 640x360 at a 720p render) behind a 16x16 tile mask, along the
+		// normal-mapped G-buffer normal. [G] r_ssrMethod (+0x788) is the engine's own switch: SSRPreRender FUN_009d6030
+		// and RenderSSR FUN_009d5120 run only at 1 (HiZ), RenderIBL FUN_009d66d0 takes its no-SSR variant at 0 (Off).
+		// (rtx1c) No level turns the game's SSR off any more: r_ssrMethod=Off is global and took the water's reflections
+		// with it ([L] 20261119-042737 + the user). Nor does any level raise Reflejos RT's strength / sharpness (Ultra 4 +
+		// Maxima looked overdone: "shown 74 %" of floor samples). Per surface, the game's SSR on level non-water floors is
+		// already replaced at its share by our flat ray while the guide is on (des-refl2 "flat fix"), which stays on here.
+		//   1 Bajo:  rtrefl1: our reflections with the camera of the G-buffer's own frame + the parallax history.
+		//   2 Medio: + r_ssrSinglePixelStep=true ([G] +0x78c, a flag of SSRRaymarch's constants: the game's march at
+		//            every pixel instead of Hi-Z jumps: fewer stair-steps in its reflection, water included).
+		//   3 Alto:  + r_ssrPlaneRejectEnable=true ([G] +0x78e: the game's own rejection of hits on the reflecting plane).
+		//   4 Ultra: + Reflejos RT on at Alto (3) if they were off (never above what the user chose).
+		// (rtq2) Suelo estable: one instruction of the game's IBL (graphics/shader/recompiler/Rtq2Patch.h).
+		if (s.floor_stable == "1") put("KYTY_RTQ2_IBL", "1");
+		if (const int r = lv(s.refl_stable); r > 0) {
+			put("KYTY_RTREFL1", "1");
+			if (r >= 2) last_cv("r_ssrSinglePixelStep=true");
+			if (r >= 3) last_cv("r_ssrPlaneRejectEnable=true");
+			if (r >= 4 && !rt_refl_on()) put("KYTY_RT_REFLECTIONS", "3");
+		}
+		// Luz volumetrica Ultra: godrays.cpp level 4 (KYTY_GODRAYS=4 above) + the game's froxel fog (Fog FUN_00994310)
+		// denser and more forward-scattering, relative to its own values (rtx1-convars.h).
+		if (s.godrays == "4") put("KYTY_RTX1_FOG", "4");
+		// Sombras mejoradas: the presets of Ajustes del juego (gs_spot / gs_contact / gs_sun), [G] convars of FUN_00944dc0
+		// (r_enableSpotShadows +0xf0, r_contactShadows* +0x91..0x9c, sunShadow* +0xd4..0xec); filtering by ShadowFilterLevel.
+		//   1: torch / candle shadows on (the port's default had them off: "+r_enableSpotShadows=false" in every log), contact 0.06
+		//   2: + contact 0.10, sun 250 m in 2 cascades (the game's factory cut)
+		//   3: + contact 0.30 (thicker, softer edge), sun 400 m in 4 cascades
+		//   4: + sun 1000 m in 4 cascades (the game's maximum; CPU: ~+10-15 % shadow draws)
+		//   (rtx1b) No shadow filter here (that is Bordes sombras: its own pipeline cache, a cold start).
+		static const char* shadow_cv[] = {
+		    "",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.06",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.1;r_virtualGeometryNumShadowCascades=2;"
+		    "sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;sunShadowLightDistance=1000",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;"
+		    "r_contactShadowsSoftness=0.2;r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;"
+		    "sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000",
+		    "r_enableSpotShadows=true;r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;"
+		    "r_contactShadowsSoftness=0.2;r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;"
+		    "sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000"};
+		if (const int sh = lv(s.shadow_rtx); sh > 0) last_cv(shadow_cv[sh]);
+		// Oclusion mejorada: the game's ambient shadowing range (gs_ambient Alto / Ultra / Ultra / Extremo) + its SSAO
+		// (Gtao_Intensity, Hbao_Radius, Hbao_MaxAOLinearDepth) relative to its own values, live (rtx1-convars.h).
+		static const char* ao_cv[] = {"", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=100;r_ambientShadowCutoffFadeDistance=20",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40",
+		                              "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100"};
+		if (const int ao = lv(s.ao_rtx); ao > 0) {
+			last_cv(ao_cv[ao]);
+			put("KYTY_RTX1_AO", std::to_string(ao));
+		}
+	}
+	// (rtx1b) KYTY_RENDERDOC=1 (rdoc1): no hardware RT. [L] 20261119-041214 ends right after "HWRT: VK_KHR_acceleration_structure
+	// + VK_KHR_ray_query enabled": the device with those under RenderDoc does not come up. Reflejos RT at most Alto (3), no
+	// hardware fill; every KYTY_HWRT* pass off (each has its screen-space or no-pass fallback).
+	if (env.Get("KYTY_RENDERDOC") == "1") {
+		for (const char* k: {"KYTY_HWRT", "KYTY_RT_HW_EXPERIMENTAL", "KYTY_RT_REFLECTIONS_HYBRID", "KYTY_HWRT_REFL", "KYTY_HWRT_SHADOW",
+		                     "KYTY_HWRT_LIGHTS", "KYTY_HWRT_PARTICLES", "KYTY_HWRT_GI", "KYTY_HWRT_AO", "KYTY_HWRT_CONTACT", "KYTY_HWRT_SOFTSUN",
+		                     "KYTY_HWRT_WATER", "KYTY_HWRT_VOLSHADOW", "KYTY_AO_HW"})
+			env.Set(k, "0");
+		if (const std::string r = env.Get("KYTY_RT_REFLECTIONS"); !r.empty() && std::atoi(r.c_str()) > 3) env.Set("KYTY_RT_REFLECTIONS", "3");
+		env.Set("BB_PATHTRACING", "");
 	}
 	// (11-13) The fire and particle blending as before: with KYTY_FG_PARTICLE_MV=1 the native particle vectors always on
 	// (a run came up with KYTY_FG_PARTICLE_NATIVE=0 from outside the settings and ghosting around fire); only an explicit
@@ -1270,11 +1595,18 @@ LaunchPlan BuildLaunch(const Settings& s, const std::string& title_id, const PcI
 	}
 	// (10-23) Controls: keyboard and mouse, the pad's remap. (10-25) A little less sensitivity in 30x2 / 45x2.
 	env.Set("KYTY_PAD_MAP", s.pad_map);
+	env.Set("KYTY_PAD_DEADZONE", s.pad_deadzone.empty() || s.pad_deadzone == "auto" ? "" : s.pad_deadzone);
+	env.Set("KYTY_PAD_FORCE_GENERIC", s.pad_force_generic ? "1" : "");
 	env.Set("KYTY_KBM", s.kbm ? "1" : "");
 	env.Set("KYTY_KBM_MAP", s.kbm ? s.kbm_map : "");
 	const float sens = (s.kbm_sens > 0 ? s.kbm_sens : 1.0f) * (fixed_fg ? 0.92f : 1.0f);
 	env.Set("KYTY_KBM_SENS", s.kbm ? Num(sens) : "");
 	env.Set("KYTY_KBM_ANTIDZ", s.kbm ? Num(s.kbm_antidz >= 0 ? s.kbm_antidz : 0.15f) : "");
+	// (raton3) Native mouse camera by default (yaw and pitch written where the game reads the stick, no stick inertia), as Bloodborne; KYTY_CAM1=0 in the environment: as before.
+	if (s.kbm) env.Default("KYTY_CAM1", "1");
+	// (raton2) Only when not 1, so a KYTY_CAM1_SENS_X / _Y of the environment still wins at 1.
+	if (s.kbm && s.kbm_sens_x > 0 && s.kbm_sens_x != 1.0f) env.Set("KYTY_CAM1_SENS_X", Num(s.kbm_sens_x));
+	if (s.kbm && s.kbm_sens_y > 0 && s.kbm_sens_y != 1.0f) env.Set("KYTY_CAM1_SENS_Y", Num(s.kbm_sens_y));
 	// (10-28) The launcher's: Camara instantanea, Calibrar camara (once) and the mouse's camera speed (a game convar).
 	env.Set("KYTY_KBM_WARP", s.kbm && s.kbm_warp ? "1" : "");
 	env.Set("KYTY_KBM_CALIBRATE", s.kbm_calibrate ? "1" : "");
@@ -1322,26 +1654,29 @@ bool NeedsRestart(const Settings& l, const Settings& n) {
 	       l.detail != n.detail || l.reflections != n.reflections || l.object_fade != n.object_fade || l.aa_sharp != n.aa_sharp ||
 	       l.shadow_edges != n.shadow_edges || l.corner_shadow != n.corner_shadow || l.rt_reflections != n.rt_reflections ||
 	       l.rt_sun != n.rt_sun || l.rt_fog != n.rt_fog || LampLevel(l) != LampLevel(n) || l.rt_metal != n.rt_metal ||
-	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
+	       l.rt_ao != n.rt_ao || l.godrays != n.godrays || l.motes != n.motes || l.refl_stable != n.refl_stable || l.floor_stable != n.floor_stable || l.rt_nuevo != n.rt_nuevo || l.shadow_rtx != n.shadow_rtx || l.ao_rtx != n.ao_rtx || l.pure_game != n.pure_game || l.motion_blur != n.motion_blur || l.dof != n.dof || l.vignette != n.vignette ||
 	       l.bloom != n.bloom || l.eye_adapt != n.eye_adapt || l.af16 != n.af16 || l.texture_sharpness != n.texture_sharpness ||
 	       l.kbm != n.kbm || l.kbm_sens != n.kbm_sens || l.kbm_antidz != n.kbm_antidz || l.kbm_map != n.kbm_map ||
 	       l.pad_map != n.pad_map || l.game_settings != n.game_settings || l.kbm_camera != n.kbm_camera || l.kbm_warp != n.kbm_warp || l.ram16_boost != n.ram16_boost || l.perf_pm4_regfile != n.perf_pm4_regfile || l.perf_upload_lanes != n.perf_upload_lanes || l.perf_upload_help != n.perf_upload_help || l.perf_spin_gate != n.perf_spin_gate || l.perf_eager_feedback != n.perf_eager_feedback || l.perf_feedback_batch != n.perf_feedback_batch || l.perf_lane_wide != n.perf_lane_wide || l.profile16 != n.profile16 || l.simulate_ram16 != n.simulate_ram16 ||
 	       l.safe_gpu != n.safe_gpu || l.quality != n.quality || l.texture_reduce != n.texture_reduce ||
 	       l.simulate_vram8 != n.simulate_vram8 || l.all_ccds != n.all_ccds || l.shader_turbo != n.shader_turbo || l.extra != n.extra ||
-	       l.rt_ss_refl != n.rt_ss_refl || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
+	       l.rt_ss_refl != n.rt_ss_refl || l.path_tracing != n.path_tracing || l.rt_refl_sharp != n.rt_refl_sharp || l.rt_refl_waves != n.rt_refl_waves || l.rt_ssgi != n.rt_ssgi || l.rt_shadows != n.rt_shadows || l.ao != n.ao || l.smoke != n.smoke || l.ibl != n.ibl || l.tess != n.tess ||
 	       l.torch != n.torch || l.lens_flare != n.lens_flare || l.rt_hw_exp != n.rt_hw_exp || l.dlss5 != n.dlss5 ||
 	       l.dlss5_unsigned != n.dlss5_unsigned || l.dlss5_strength != n.dlss5_strength ||
 	       (l.sharpness == "auto") != (n.sharpness == "auto");
 }
 
 bool FixedFg(const Settings& s) {
-	return s.souls_mode == "ligero" || s.souls_mode == "ligero-plus" || s.souls_mode == "equilibrado" || s.souls_mode == "low";
+	return s.souls_mode == "ligero" || s.souls_mode == "ligero-plus" || s.souls_mode == "equilibrado" || s.souls_mode == "low" ||
+	       s.souls_mode == "sin-tirones"; // (11-22) Demon's Souls optimizado: AMD x2 at 40 too
 }
 
 void RtAllOff(Settings* s) {
 	s->rt_reflections = s->rt_sun = s->rt_fog = s->rt_particles = s->rt_metal = s->rt_ao = false;
 	// (10-28) and the screen-space set / new passes (rt_experimental itself stays as chosen)
 	s->rt_ss_refl = s->rt_ssgi = s->rt_shadows = s->ao = s->torch = s->godrays = s->rt_lamps = s->motes = "0";
+	s->path_tracing = "0"; // (pt1)
+	s->refl_stable = s->shadow_rtx = s->ao_rtx = "0"; // (rtx1)
 	s->lens_flare = false;
 }
 
@@ -1377,7 +1712,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->motion_blur = false;
 		s->dof = s->bloom = s->vignette = s->eye_adapt = true;
 		s->res            = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default (was FSR 3.1 Calidad)
-		s->pure_game      = true;           // (11-11) and Juego original (no added effects)
+		s->pure_game      = false;          // (rtq2) no preset turns on Juego original (it turned Suelo estable / RT nuevos off)
 		s->sharpness      = "0.75";
 		s->fullscreen     = true;           // (11-12) 1080p by default in Souls ligero / ligero +
 		s->resolution     = "1920x1080";
@@ -1394,11 +1729,11 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->sharpness = "1";
 		s->res       = "fsr4-calidad"; // (11-11) FSR 4 Calidad (was DLSS Calidad K) and Juego original
 		s->dlss_preset = "K";
-		s->pure_game = true;
+		s->pure_game = false; // (rtq2) no preset turns on Juego original
 	} else if (preset == "ultra") {
 		max();
 		s->res = "fsr4-calidad"; // (11-11) FSR 4 Calidad by default, and Juego original
-		s->pure_game = true;
+		s->pure_game = false; // (rtq2) no preset turns on Juego original
 		s->detail   = "muy-alto";
 		s->aa_sharp = "ultra"; // (10-23) costs nothing
 	} else if (preset == "extremo") {
@@ -1409,6 +1744,32 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->aa_sharp    = "ultra";
 		s->af16        = true;
 		if (s->texture_sharpness == "0") s->texture_sharpness = "1";
+	} else if (preset == "sin-tirones") {
+		// (sintirones) Ultra-like image with what loads the render thread trimmed: the projected decals off (convar in ApplyEnv:
+		// ~4860 of ~11000 draws a frame at 1-1, measured 45 -> 60 fps there), object fade / reflections Normal (fewer far
+		// objects and passes), tessellation Bajo (below), no motion blur; textures, shadows and distance kept high.
+		max();
+		s->shadows     = "alto";
+		s->detail      = "alto";
+		s->object_fade = "normal";
+		s->reflections = "normal";
+		s->af16        = true;
+		post_on();
+		s->motion_blur = false;
+		// (11-22) 1080p with FSR 4 Calidad by default (changeable by hand afterwards).
+		s->res        = "fsr4-calidad";
+		s->fullscreen = true;
+		s->resolution = "1920x1080";
+		// (11-22) The user's own settings for this mode: Juego original on, extra sharp textures, Teselado Medio (below).
+		s->texture_sharpness = "2";
+		s->pure_game   = true;
+		// (11-22 04:34) The user's screenshot of the mode: Texturas Medio, Distancia Alto (the rest as above).
+		s->texture_reduce = "1";
+		s->quality        = "high";
+		// (11-22) and his in-game settings, sharpness and smoke (his settings.ini of 11-22 04:00).
+		s->sharpness     = "0.75";
+		s->game_settings = "gs_spot=1;gs_gi=2;gs_dist=2;gs_ssr=3";
+		s->smoke         = "1";
 	} else if (preset == "low") {
 		// Set-PresetLowProfile: 900p-ish with FSR Calidad, everything low; what costs nearly nothing at its best.
 		s->texture_reduce    = "2";
@@ -1437,11 +1798,37 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->tess = "alto";
 	} else {
 		s->ibl  = "mitad";
-		s->tess = (preset == "ligero" || preset == "ligero-plus") ? "bajo" : "medio"; // (11-12) ligero / + : Teselado Bajo
+		s->tess = (preset == "ligero" || preset == "ligero-plus") ? "bajo" : "medio"; // (11-22) sin-tirones: Medio, the user's choice // (11-12) ligero / + : Teselado Bajo
 	}
 	// (10-28, the emulator launcher's rule) Every mode / preset: every RT effect No (Reflejos RT, Luz RT, Luz volumetrica,
 	// Oclusion ambiental, Luz de antorchas RT, Destellos de lente, Sombras RT and the hardware rows); enabled by hand after.
 	RtAllOff(s);
+	// (11-26, el usuario) Souls ligero, ligero + y Optimizado: los ajustes de su lanzador de hoy (settings.ini 11-26 00:02),
+	// 1080p con FSR 4 Calidad por defecto.
+	if (preset == "ligero" || preset == "ligero-plus" || preset == "sin-tirones") {
+		s->fullscreen        = true;
+		s->resolution        = "1920x1080";
+		s->res               = "fsr4-calidad";
+		s->sharpness         = "0.75";
+		s->ibl               = "mitad";
+		s->tess              = "optimizado";
+		s->texture_reduce    = "o";
+		s->quality           = "low";
+		s->shadows           = "optimizado";
+		s->detail            = "optimizado";
+		s->reflections       = "optimizado";
+		s->object_fade       = "normal";
+		s->aa_sharp          = "optimizado";
+		s->shadow_edges      = "0";
+		s->corner_shadow     = "0";
+		s->motion_blur       = false;
+		s->dof = s->vignette = s->bloom = s->eye_adapt = true;
+		s->af16              = true;
+		s->texture_sharpness = "2";
+		s->pure_game         = true;
+		s->smoke             = "1";
+		s->game_settings     = "gs_sun=2;gs_spot=1;gs_contact=2;gs_gi=1;gs_dist=2;gs_ssr=2;gs_tess=2;gs_fogden=2";
+	}
 }
 
 

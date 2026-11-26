@@ -130,6 +130,17 @@ bool                   TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t
 // The backing bytes of a guest range inside one mapping (readable regardless of the guest
 // range's protection), or null.
 const uint8_t*         TryGetBackingPointer(uint64_t vaddr, uint64_t size);
+// (raiz2, KYTY_RAIZ) Guest bytes [guest, guest + size) into host storage, whatever the protection of their pages (no
+// guest fault handling): straight through the guest pages (Common::GuardedCopy), a window over the no-access ones
+// where that stops. Without KYTY_RAIZ: NativeGuardedAccess's copy (a plain copy without native memory).
+bool                   NativeGuardedRead(void* destination, const void* guest, uint64_t size);
+// (raiz2, KYTY_RAIZ) TryGetBackingPointer for the upload worker, whose copies are NativeGuardedRead's: with KYTY_RAIZ
+// also over pages a tracker may have protected (TryGetBackingPointer refuses those). Read it with NativeGuardedRead
+// only. Without KYTY_RAIZ: TryGetBackingPointer.
+const uint8_t*         TryGetUploadSourcePointer(uint64_t vaddr, uint64_t size);
+// (tiron8, KYTY_TIRON8) access(context) with guest [guest, guest + size) readable: one NativeGuardedAccess window (RAIZ's
+// no-access pages opened READ-ONLY, the gate held until access returns); without native read faults, access alone.
+void                   NativeWindowRun(const void* guest, uint64_t size, void (*access)(void*), void* context);
 // The end of the backing mapping `vaddr` is in (0: none): a range up to it has one backing pointer.
 uint64_t               BackingMappingEnd(uint64_t vaddr);
 // KYTY_GUEST_LAZY_COMMIT (local/guest-lazy-commit.h): the never-touched pages of [address, address + size) committed,
@@ -141,7 +152,68 @@ bool                   PrefaultGuestRange(const void* address, uint64_t size);
 // or unmap runs in their page-table pages meanwhile). A page touched again faults back in.
 void                   TrimGuestRange(uint64_t vaddr, uint64_t size);
 // The backing view (every guest mapping's bytes, at their backing offset): its base and size; false when there is none.
+// (KYTY_NATIVE_MEMORY=1: there is none - false, base 0 -; each mapping's bytes are at its own guest address.)
 bool                   BackingView(uint64_t* base, uint64_t* size);
+// KYTY_NATIVE_MEMORY=1 (Windows, off by default; read once): the game's direct and flexible memory is private memory
+// at its guest address (VirtualAlloc2 over the placeholder, MEM_WRITE_WATCH), not views of a page-file section.
+// TryGetBackingPointer and the other backing accessors then return the guest address itself: they no longer bypass
+// the guest pages' protection. A physical range is never mapped at two addresses (such a map is refused), and its bytes
+// do not outlive its mapping (a range mapped again reads zeros).
+bool                   NativeMemoryEnabled();
+// Native memory: [vaddr, vaddr + size)'s write-watch bits cleared after a write by the emulator itself.
+void                   NativeForgetWrites(uint64_t vaddr, uint64_t size);
+// (ram15, KYTY_NATIVE_TEXTURE_OFFLOAD: local/texture-offload.h with native memory) Windows, native memory only.
+// NativeOffloadDrop: the committed private pages of [vaddr, vaddr + size) reset (MEM_RESET: their bytes dropped, no
+// page-file or compression copy kept; commit unchanged) and taken out of the working set, a MiB at a time with the
+// guest memory quiet (RunQuietWith, as KYTY_DS_FREED_RELEASE). Returns the bytes reset; *refused: those not reset.
+uint64_t               NativeOffloadDrop(uint64_t vaddr, uint64_t size, uint64_t* refused);
+// NativeOffloadWrite: `data` written over guest [vaddr, vaddr + size) whatever its pages' protection, through a write
+// window (NativeGuardedAccess, as the emulator's other writes; no map lock taken). False: a part was not written.
+bool                   NativeOffloadWrite(uint64_t vaddr, const void* data, uint64_t size);
+// NativeOffloadOpen: the pages of a touch that could not wait for its restore given access (read-only, or read-write
+// for a write), under the gate as every protection change of guest memory.
+bool                   NativeOffloadOpen(uint64_t vaddr, uint64_t size, bool write);
+// The hook every window of the emulator's over guest memory calls first (NativeGuardedAccess): `gate_held` when the
+// calling thread holds the protection gate already (a window inside a window). Null: none (the default).
+using native_window_hook_t = void (*)(uint64_t vaddr, uint64_t size, bool writes, bool gate_held);
+void                   SetNativeWindowHook(native_window_hook_t hook);
+// (anuncio1, KYTY_RAIZ_ANNOUNCE=1 with KYTY_RAIZ_VERIFY=1: the audit of the pages no protection watches) Native memory
+// only; no lock of the emulator's is taken (a plain ResetWriteWatch / GetWriteWatch: safe under a tracker region's
+// lock or a cache's). NativeAnnounceReset: the write-watch bits of [vaddr, vaddr + size) cleared, mapping by mapping (a
+// page at a time when the range spans allocations), even with KYTY_RAIZ. NativeAnnounceWritten: the pages of the range
+// written since their last reset, read without reset, at most `max` of them put in `pages` (page addresses, in order);
+// returns how many were found (it may be more than `max`). A range part of which is not mapped reports nothing there.
+void                   NativeAnnounceReset(uint64_t vaddr, uint64_t size);
+uint64_t               NativeAnnounceWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max);
+// (nativo2, KYTY_DS_NATIVE_HEAP) As NativeAnnounceWritten, but the write watch of the pages read is RESET (what the next
+// call finds was written after this one). All of the range's written pages are counted (the return value) even past
+// `max`: a caller given more than `max` must take the whole range as written (those pages' bits are reset too).
+// *failed: some allocation of the range has no write watch (its writes cannot be told: the caller takes it as written).
+uint64_t               NativeTakeWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max, bool* failed);
+// Called once per 4 KiB page written since the last reset (NativeWriteWatch), in address order.
+using native_write_watch_func_t = void (*)(uint64_t page_vaddr, void* user);
+// The pages of [vaddr, vaddr + size) written (by anyone: the game, the emulator, the OS) since the last reset, each
+// given to `callback` (after every lock is released: the callback may map, unmap or protect); `reset`: their
+// write-tracking state cleared at the same time (atomically per 16 MiB). Only the parts covered by guest mappings are
+// looked at. False: native memory is off, or some part of the range could not be queried (its pages are not reported).
+bool                   NativeWriteWatch(uint64_t vaddr, uint64_t size, native_write_watch_func_t callback, void* user,
+                                        bool reset);
+// (ww2) NativeWriteWatch for `count` ranges [first, second) at once, under one hold of the address space's lock: the
+// written pages appended to `pages` (no callback: nothing may be called under the lock). `failed` (may be null): the
+// index of each range a part of which could not be queried. False: native memory is off, or some range failed.
+bool                   NativeWriteWatchRanges(const std::pair<uint64_t, uint64_t>* ranges, size_t count, bool reset,
+                                              std::vector<uint64_t>* pages, std::vector<uint32_t>* failed);
+// (ww2) Since start: GetWriteWatch calls, and those refused and made again an allocation's region at a time.
+void                   NativeWriteWatchCounters(uint64_t* calls, uint64_t* retries);
+// (nativemem1) KYTY_WRITE_WATCH=1 together with KYTY_NATIVE_MEMORY=1 (Windows; off by default; read at first use):
+// native memory with the read faults kept. CPU writes are seen only by the write watch (no read-only protection
+// ever), but the pages GPU work wrote stay no-access as without native memory: a CPU read of them faults and reads the
+// GPU's bytes back (no eager write-back, no flush at labels and flips). The emulator's own copies over such pages (no
+// backing view to bypass them) open them for the copy alone, under a lock every protection change takes too.
+bool                   NativeReadFaultsEnabled();
+// (nativemem1) Counters since start: protection changes of guest memory (trackers' and the guest's), and the ones the
+// emulator's own copies made (each copy over protected pages: 2 per run, opened and restored) with those copies.
+void                   NativeProtectCounters(uint64_t* protects, uint64_t* copy_protects, uint64_t* copies);
 // Diagnostics (live `ranges`): the guest's virtual ranges (start, size, direct memory offset, protection, memory type,
 // kind, the name the game gave them) to `path`.
 bool                   WriteGuestRanges(const char* path);
@@ -217,6 +289,29 @@ void                   InstallGpuResources(Graphics::GpuResourceManager* resourc
 // Whether the address is in a view a partial unmap is mapping again (Windows; statistics: remap_window_writes).
 [[nodiscard]] bool     InRemapWindow(uint64_t vaddr) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// (policy2, KYTY_DS_READBACK_HOOK) What the read faults of [vaddr, vaddr + size) would do, at once for all of it: the
+// GPU-written bytes there are read back into guest memory and its pages become readable (GpuResourceManager::
+// ReadbackRange). False: nothing to read back there, or not done (the reads fault as always). A guest thread.
+[[nodiscard]] bool TryReadbackRange(uint64_t vaddr, uint64_t size) noexcept;
+// (SIN-VIGILAR-GANCHO) The same readback for a range with NO read watcher (pages CPUHEAP-/DEFAULTTAGG-SIN-VIGILAR left
+// readable while the GPU owns them: no fault brings their GPU bytes). Done only when a page of it is GPU-written
+// (GpuResourceManager::ReadbackRange's own check; BufferCache::ReadMemory waits for the GPU work as a fault would).
+// For the readers' hooks only. False: watched (TryReadbackRange's case), nothing GPU-written, or not done.
+[[nodiscard]] bool TryReadbackRangeUnwatched(uint64_t vaddr, uint64_t size) noexcept;
+// (raiz12, KYTY_RAIZ_SETTLE; local/raiz.h) A game thread about to read GPU results in [vaddr, vaddr + size): with
+// KYTY_RAIZ_SETTLE=1 (default with KYTY_RAIZ) they are read back if the GPU still owns them, their deferred releases
+// applied here, and every put-in of kept GPU bytes over them waited for, so the game cannot read their old bytes; =2
+// only counts what it finds at entry. `site`: Raiz::SettleSiteKind. Returns RaizSettle* flags.
+// (parpadeo6) `mode`: -1 (default) KYTY_RAIZ_SETTLE's; 1 or 2 that mode whatever KYTY_RAIZ_SETTLE says (KYTY_PARPADEO6
+// settles the XPR chunk bits with 1). Still nothing without KYTY_RAIZ (no kept bytes, no put-ins there).
+enum RaizSettleFlags : uint32_t {
+	RaizSettleBusy     = 1u, // a put-in was under way over the range at entry
+	RaizSettlePending  = 2u, // kept GPU bytes were not in yet at entry (their pages no-access)
+	RaizSettleReadback = 4u, // read back here
+	RaizSettleWaited   = 8u, // waited for a put-in or for kept bytes
+	RaizSettleLeft     = 16u // still under way / kept after the wait's cap
+};
+uint32_t RaizSettleRange(uint64_t vaddr, uint64_t size, uint32_t site, int mode = -1) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

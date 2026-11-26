@@ -62,6 +62,10 @@ uint64_t RecordedWork();
 // Commands that change memory or images (draws, dispatches, copies, clears) and packets the calling thread
 // recorded: unchanged = nothing but barriers and rendering scopes recorded.
 uint64_t RecordedWrites();
+// (par1, KYTY_PAR_QUEUES=1) The calling thread's own stream (a ProducerScope's; null: none), and another thread
+// records into it from now on (null: stops). The two threads must never record at the same time (the queue lock).
+void* CurrentProducer();
+void  AdoptProducer(void* stream);
 class ProducerScope {
 public:
     ProducerScope();

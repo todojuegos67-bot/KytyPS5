@@ -20,7 +20,7 @@ constexpr uint32_t Magic = 0x4e4c5052u; // "RPLN"
 // A field added to one of these types must be added here too (Save, Load and Same). The sizes are the 64-bit Windows
 // build's (Microsoft's STL; libstdc++'s containers have other sizes: the Linux build checks nothing here).
 #if defined(_MSC_VER) || defined(_WIN32)
-static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 496, "ResourcePlan changed: update resource-plan-serial");
+static_assert(sizeof(void*) != 8 || sizeof(IR::ResourcePlan) == 512, "ResourcePlan changed: update resource-plan-serial"); // (up1120: 496 + 16, upstream 3f9a46c)
 static_assert(sizeof(void*) != 8 || sizeof(IR::ShaderInfo) == 192, "ShaderInfo changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::ImageResource) == 88, "ImageResource changed: update resource-plan-serial");
 static_assert(sizeof(void*) != 8 || sizeof(IR::StageInput) == 56, "StageInput changed: update resource-plan-serial");
@@ -299,6 +299,7 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 		return false;
 	std::vector<IR::Inst*> insts;
 	insts.reserve(count);
+	plan.value_storage.reserve(count); // (one block: IR::PlanValues)
 	for (uint32_t i = 0; i < count; ++i) {
 		IR::ValueOpcode opcode {};
 		uint64_t        flags = 0;
@@ -349,6 +350,8 @@ bool Load(std::span<const uint8_t> bytes, IR::ResourcePlan& plan, bool* defer_li
 	plan.requires_specialization_memory = (bits & 1u) != 0;
 	plan.srt_plan_complete              = (bits & 2u) != 0;
 	plan.resource_tracking_complete     = (bits & 4u) != 0;
+	// (A plan an earlier build wrote holds its program's every memory info: only its values' are kept.)
+	IR::CompactPlanMemoryInfo(plan);
 	const bool linear = (bits & 8u) != 0;
 	if (defer_linear != nullptr) {
 		*defer_linear = linear;

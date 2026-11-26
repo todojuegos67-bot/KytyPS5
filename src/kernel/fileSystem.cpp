@@ -17,7 +17,10 @@
 #include "loader/demonsSoulsWarp.h"
 #include "loader/gameArgs.h"
 #include "graphics/presentation/videoOut.h"
+#include "local/f0-measure.h" // (esperas, KYTY_ESPERAS: the game thread's file calls)
+#include "local/rando-msb.h" // (randomizer)
 #include "local/soft-release.h"
+#include "local/tiron4-counters.h" // (tiron4)
 
 #include <algorithm>
 #include <atomic>
@@ -488,7 +491,9 @@ bool IntroMovieBlocked(const char* path) {
 }
 
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+	F0Measure::WaitScope f0w_(8, KYTY_F0_RET()); // (esperas: the game thread's file call, KYTY_ESPERAS)
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(true); // (tiron4: ms in the guest's file calls)
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -628,6 +633,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 					open_name = std::move(copy);
 				} else if (auto args = Loader::GameArgs::RedirectRead(file->real_name); !args.empty()) {
 					open_name = std::move(args);
+				} else if (RandoMsb::CrossOn()) { // (randomizer, fase 2: el MSB con enemigos de otros mundos)
+					if (auto cross = RandoMsb::RedirectRead(Common::PathToString(file->real_name)); !cross.empty()) {
+						open_name = std::move(cross);
+						RandoMsb::TraceRead(Common::PathToString(file->real_name), true);
+					}
+				}
+				if (RandoMsb::Enabled() && open_name == file->real_name) { // (randomizer: traza)
+					RandoMsb::TraceRead(Common::PathToString(file->real_name), false);
 				}
 			}
 			result = file->f.Open(open_name, rw_mode);
@@ -727,8 +740,66 @@ static uint32_t ReadIntoGuest(Common::File& f, void* buf, uint32_t nbytes) {
 	return total;
 }
 
+// (randomizer, fase 1) Un MSB de mapa leído entero desde el inicio se baraja en memoria (local/rando-msb.h); el archivo
+// del disco no se toca. Apagado: un bool estático por lectura.
+static void RandomizeMsbRead(const std::filesystem::path& name, int64_t offset, void* buf, uint32_t got) {
+	if (RandoMsb::TraceLevel() >= 2) { // (randomizer, traza 2: cada lectura de MSB/legacy_instances)
+		const auto t = Common::PathToString(name);
+		RandoMsb::TraceChunk(t, offset, got, got, RandoMsb::CrossOn() && !RandoMsb::RedirectRead(t).empty());
+	}
+	if (offset != 0 || got < 0x40 || !RandoMsb::Enabled()) return;
+	const auto text = Common::PathToString(name);
+	if (!RandoMsb::IsMsbPath(text)) return;
+	std::vector<uint8_t> copy(got);
+	std::memcpy(copy.data(), buf, got);
+	if (!RandoMsb::Shuffle(text, copy)) return;
+	const auto destination = reinterpret_cast<uint64_t>(buf);
+	Memory::InvalidateMemoryForWrite(destination, got);
+	std::memcpy(buf, copy.data(), got);
+	Memory::FinishHostOverwrite(destination, got, true);
+}
+
+// (ram20, KYTY_RAM20=1 with native memory) A file write of a guest buffer: WriteFile reads it in kernel mode, where a
+// page RAM20 (or RAM16/17/18) took - no-access, its bytes on disk - makes the write fail short with no fault (a save or a
+// trophy file cut), and a page whose bytes were reset but not yet watched would be written as zeros. So the buffer goes
+// through a host bounce, read by NativeGuardedRead (straight through readable pages; a window - whose hook brings the
+// taken bytes back from the disk store first - over the no-access ones), and the bounce is written. A chunk the guarded
+// read cannot read whole is written from the guest buffer as before. Off: the plain write (one static bool read).
+static bool GuestWriteBounceOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_RAM20");
+		return v != nullptr && v[0] == '1' && v[1] == '\0' && Memory::NativeMemoryEnabled();
+	}();
+	return on;
+}
+
+static void WriteFromGuest(Common::File& f, const void* buf, uint32_t nbytes, uint32_t* written) {
+	if (!GuestWriteBounceOn() || nbytes == 0) {
+		f.Write(buf, nbytes, written);
+		return;
+	}
+	constexpr uint32_t                Chunk = 4u << 20u;
+	thread_local SoftRelease::Scratch bounce_scratch("guest write bounce");
+	const auto                        bounce_hold = bounce_scratch.Use();
+	auto&                             bounce      = bounce_scratch.bytes;
+	uint32_t                          total       = 0;
+	while (total < nbytes) {
+		const uint32_t want = std::min(nbytes - total, Chunk);
+		if (bounce.size() < want) bounce.resize(want);
+		const auto* source = static_cast<const uint8_t*>(buf) + total;
+		uint32_t    got    = 0;
+		if (Memory::NativeGuardedRead(bounce.data(), source, want)) f.Write(bounce.data(), want, &got);
+		else f.Write(source, want, &got);
+		total += got;
+		if (got < want) break;
+	}
+	*written = total;
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+	F0Measure::WaitScope f0w_(8, KYTY_F0_RET()); // (esperas: the game thread's file call, KYTY_ESPERAS)
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(false, nbytes); // (tiron4: ms in the guest's file calls)
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EPERM;
@@ -774,6 +845,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	file->mutex.Lock();
 
 	bool       is_invalid = file->f.IsInvalid();
+	const auto read_at    = is_invalid ? int64_t {-1} : static_cast<int64_t>(file->f.Tell()); // (randomizer)
 	const auto bytes_read = ReadIntoGuest(file->f, buf, static_cast<uint32_t>(nbytes));
 
 	file->mutex.Unlock();
@@ -783,6 +855,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EIO;
 	}
 
+	RandomizeMsbRead(file->real_name, read_at, buf, bytes_read);
 	if (file->cinematic) Libs::VideoOut::NoteCinematic(nullptr);
 	LogKernelRead("read", file->real_name, nbytes, -1, bytes_read);
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
@@ -840,7 +913,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written); // (ram20)
 	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -859,7 +932,9 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 }
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+	F0Measure::WaitScope f0w_(8, KYTY_F0_RET()); // (esperas: the game thread's file call, KYTY_ESPERAS)
 	PRINT_NAME();
+	const Tiron4::FileScope tiron4_scope(false, nbytes); // (tiron4: ms in the guest's file calls)
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EPERM;
@@ -909,6 +984,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EIO;
 	}
 
+	RandomizeMsbRead(file->real_name, offset, buf, bytes_read);
 	if (file->cinematic) Libs::VideoOut::NoteCinematic(nullptr);
 	LogKernelRead("pread", file->real_name, nbytes, offset, bytes_read);
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
@@ -951,7 +1027,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	auto     pos           = file->f.Tell();
 	uint32_t bytes_written = 0;
 	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
+	WriteFromGuest(file->f, buf, static_cast<uint32_t>(nbytes), &bytes_written); // (ram20)
 	if (bytes_written < nbytes && !is_invalid) ReportWriteFailure("write", file->real_name, bytes_written, nbytes);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -1070,6 +1146,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		// Debug warp and game console variables: a read gets a copy of another size (KernelOpen).
 		auto redirected = Loader::DemonsSoulsWarp::RedirectedSize(real_file_name);
 		if (!redirected) redirected = Loader::GameArgs::RedirectedSize(real_file_name);
+		if (!redirected && RandoMsb::CrossOn()) redirected = RandoMsb::RedirectedSize(Common::PathToString(real_file_name));
 		stat.st_size = static_cast<int64_t>(redirected ? *redirected : info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;

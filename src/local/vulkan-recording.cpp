@@ -4,6 +4,8 @@
 #include "live-counters.h"
 #include "live-trace-gpu.h"
 #include "local-platform.h"
+#include "par-audit.h"  // (A0b) diagnostic only: KYTY_AUDIT off by default
+#include "par-queues.h" // (A0b) ParQueues::t_side: which translating thread encodes (0 DCB, 1 ACB)
 #include "time-census.h"
 
 #include <array>
@@ -138,6 +140,7 @@ public:
     void Command(Function function) {
         static_assert(std::is_nothrow_move_constructible_v<Function>);
         static_assert(std::is_nothrow_destructible_v<Function>);
+        ParAudit::Timed audit_encode(ParQueues::t_side < 0 ? 0 : ParQueues::t_side); // (A0b) counts; times 1 in 64
         auto* header = static_cast<Header*>(Allocate(sizeof(Header), alignof(Header)));
         void* payload = Allocate(sizeof(Function), alignof(Function));
         if (!valid) return;
@@ -263,24 +266,30 @@ private:
         uint64_t current = 0;
         for (;;) {
             if ((current & 4095u) == 0) KeepAffinity();
-            for (auto ready = published.load(std::memory_order_acquire); current == ready;
-                 ready = published.load(std::memory_order_acquire)) {
-                const uint32_t spins = kyty_local_recording_spin.load(std::memory_order_relaxed);
-                for (uint32_t spin = 0; spin < spins && ready == current; ++spin) {
-                    _mm_pause();
-                    ready = published.load(std::memory_order_acquire);
+            {
+                ParAudit::Idle audit_idle(published.load(std::memory_order_acquire) == current); // (A0b) worker idle
+                for (auto ready = published.load(std::memory_order_acquire); current == ready;
+                     ready = published.load(std::memory_order_acquire)) {
+                    const uint32_t spins = kyty_local_recording_spin.load(std::memory_order_relaxed);
+                    for (uint32_t spin = 0; spin < spins && ready == current; ++spin) {
+                        _mm_pause();
+                        ready = published.load(std::memory_order_acquire);
+                    }
+                    if (ready != current) break;
+                    sleeping.store(true, std::memory_order_seq_cst);
+                    if (published.load(std::memory_order_seq_cst) == current)
+                        published.wait(current, std::memory_order_seq_cst);
+                    sleeping.store(false, std::memory_order_relaxed);
                 }
-                if (ready != current) break;
-                sleeping.store(true, std::memory_order_seq_cst);
-                if (published.load(std::memory_order_seq_cst) == current)
-                    published.wait(current, std::memory_order_seq_cst);
-                sleeping.store(false, std::memory_order_relaxed);
             }
             if (stopping.load(std::memory_order_acquire)) return;
             auto& chunk = chunks[current % ChunkCount];
             for (auto offset = chunk.first; offset != End;) {
                 const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + offset);
-                header->execute(chunk.data.data() + header->payload);
+                {
+                    ParAudit::Timed audit_replay(2); // (A0b) the driver call of one recorded command, 1 in 64 timed
+                    header->execute(chunk.data.data() + header->payload);
+                }
                 if (header->destroy) header->destroy(chunk.data.data() + header->payload);
                 offset = header->next;
             }
@@ -293,11 +302,18 @@ private:
     }
 };
 
-thread_local std::unique_ptr<Stream> producer;
+thread_local std::unique_ptr<Stream> owned_producer;
+// (par1, KYTY_PAR_QUEUES=1) The ACB thread records into the GPU thread's stream (AdoptProducer): one stream, one open
+// command buffer, in the order the queue lock gives; only the lock's holder records, so the stream keeps one producer
+// at a time.
+thread_local Stream* adopted_producer = nullptr;
+// This thread's stream: its own, or the one it adopted (null: none).
+inline Stream* Producer() { return owned_producer ? owned_producer.get() : adopted_producer; }
 Stream* RecordingStream() {
+    auto* producer = Producer();
     if (producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0) {
         producer->was_recording = true;
-        return producer.get();
+        return producer;
     }
     return nullptr;
 }
@@ -305,7 +321,7 @@ void InvalidateRawState() {
     if (executing) executing->state_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 [[gnu::noinline]] void BeforeDirect() {
-    if (producer) {
+    if (auto* producer = Producer()) {
         // Diagnostic (live timecensus, source DirectDrain): direct calls made while packets are pending.
         if (producer->Pending()) KYTY_TIME_CENSUS(DirectDrain, 0);
         producer->BeforeDirect();
@@ -330,9 +346,9 @@ void* ReplaceBindPipeline(void* entry) {
 uint64_t WorkCalls() { return g_work_calls; }
 uint64_t RecordedWork() { return g_work_calls + g_packets; }
 uint64_t RecordedWrites() { return g_writing_calls + g_packets; }
-void Drain() { if (producer) producer->Drain(); }
+void Drain() { if (auto* producer = Producer()) producer->Drain(); }
 bool PacketsEnabled() {
-    return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
+    return Producer() && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0;
 }
 uint64_t StateEpoch() {
     return executing ? executing->state_epoch.load(std::memory_order_relaxed) : UINT64_MAX;
@@ -353,7 +369,7 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
     });
 }
 bool DeferredSubmitEnabled() {
-    return producer && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
+    return Producer() && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
         kyty_local_deferred_submit_mode.load(std::memory_order_relaxed) != 0;
 }
 bool EnqueueDeferred(ReplayPacket replay, std::span<const Segment> segments, bool publish) {
@@ -388,13 +404,18 @@ void WaitDeferredSubmits() {
          done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
-    if (producer) producer->BeforeDirect();
+    if (auto* producer = Producer()) producer->BeforeDirect();
     replay(segments, original);
 }
 void InvalidateReplayState() { InvalidateRawState(); }
 ProducerScope::ProducerScope() {
-    if (producer) std::abort();
-    producer = std::make_unique<Stream>();
+    if (owned_producer || adopted_producer) std::abort();
+    owned_producer = std::make_unique<Stream>();
 }
-ProducerScope::~ProducerScope() { producer.reset(); }
+ProducerScope::~ProducerScope() { owned_producer.reset(); }
+void* CurrentProducer() { return owned_producer.get(); }
+void AdoptProducer(void* stream) {
+    if (owned_producer) std::abort();
+    adopted_producer = static_cast<Stream*>(stream);
+}
 } // namespace LocalVulkanRecording

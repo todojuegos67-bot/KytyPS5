@@ -23,11 +23,33 @@
 #include <cstring>
 #include <limits>
 
+#define VRAM_EMU_OWNER ::VramEmu::kTiler
+#include "local/vram-emu.h" // (VRAM-EMU) sus vmaCreateBuffer/vmaDestroyBuffer apuntados como "tiler"
+
 namespace Libs::Graphics {
 
 // The tile manager whose pool the periodic RAM flush releases (ram-guard.h), and the lock the flush holds meanwhile.
 static std::atomic<TileManager*> g_flush_tile_manager {nullptr};
 static std::mutex                g_flush_tile_mutex;
+// (VRAM-EMU, KYTY_EMU_TILER_POOL=1 por defecto; =0 como antes) Log 20261125-202747: el pool de scratch del tiler guarda
+// hasta min(512 MiB, presupuesto/32) (~182 MiB con 5820) de VRAM que solo soltaba el vaciado periodico tras 30 s sin uso.
+// Ahora, una vez por segundo (vma.cpp RefreshMemoryBudget), lo guardado y sin reusar desde hace 5 s vuelve al driver. Una
+// rafaga de detiles sigue reusando (se reusa en milisegundos); el tope no cambia (sin tirones por bloques nuevos en rafaga).
+static thread_local int          t_flush_age_s = 30;  // edad minima para soltar: 30 s (vaciado de RAM), 5 s (VRAM-EMU)
+static std::atomic<uint64_t>     g_tiler_pool_bytes {0}; // lo guardado tras la ultima pasada (para [vram-emu])
+static std::atomic<uint64_t>     g_tiler_pool_budget {0};
+static std::atomic<uint64_t (*)(uint64_t, uint64_t*)> g_tiler_flush_fn {nullptr}; // TileManager::FlushScratchPool (privada)
+static bool EmuTilerPoolOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_EMU_TILER_POOL");
+		const bool  r = v == nullptr || v[0] != '0';
+		std::printf("[vram-emu-tiler] KYTY_EMU_TILER_POOL=%d: scratch del tiler sin uso %s\n", r ? 1 : 0,
+		            r ? "5 s vuelve al driver (antes: 30 s, solo con el vaciado de RAM)" : "como antes (30 s)");
+		std::fflush(stdout);
+		return r;
+	}();
+	return on;
+}
 
 uint64_t TileManager::FlushScratchPool(uint64_t budget, uint64_t* held_us) {
 	std::scoped_lock flush_lock(g_flush_tile_mutex);
@@ -37,7 +59,7 @@ uint64_t TileManager::FlushScratchPool(uint64_t budget, uint64_t* held_us) {
 	uint64_t                   bytes = 0;
 	{
 		const auto       start = std::chrono::steady_clock::now();
-		const auto       old   = start - std::chrono::seconds(30);
+		const auto       old   = start - std::chrono::seconds(t_flush_age_s);
 		std::scoped_lock lock(self->m_scratch_mutex);
 		for (auto it = self->m_scratch_pool.begin(); it != self->m_scratch_pool.end() && bytes < budget;) {
 			if (it->pooled_at > old) {
@@ -49,12 +71,44 @@ uint64_t TileManager::FlushScratchPool(uint64_t budget, uint64_t* held_us) {
 			it = self->m_scratch_pool.erase(it);
 		}
 		self->m_scratch_pool_bytes -= std::min(self->m_scratch_pool_bytes, bytes);
+		g_tiler_pool_bytes.store(self->m_scratch_pool_bytes, std::memory_order_relaxed);
 		if (held_us != nullptr)
 			*held_us = static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
 	}
 	for (const auto& item: taken) vmaDestroyBuffer(self->m_graphics.allocator, item.buffer, item.allocation);
 	return bytes;
+}
+
+// (VRAM-EMU) Lo guardado en el pool (tras la ultima pasada) y la pasada de cada segundo (vma.cpp RefreshMemoryBudget).
+uint64_t TilerPoolBytes() { return g_tiler_pool_bytes.load(std::memory_order_relaxed); }
+uint64_t TilerTrimIdle() {
+	if (!EmuTilerPoolOn()) return 0;
+	static uint64_t total = 0, window = 0, peak = 0;
+	static auto     last  = std::chrono::steady_clock::now();
+	const uint64_t  before = g_tiler_pool_bytes.load(std::memory_order_relaxed);
+	auto* const    flush   = g_tiler_flush_fn.load(std::memory_order_acquire);
+	if (flush == nullptr) return 0;
+	t_flush_age_s          = 5;
+	const uint64_t freed   = flush(~uint64_t {0}, nullptr);
+	t_flush_age_s          = 30;
+	total += freed;
+	window += freed;
+	peak = std::max(peak, before);
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last >= std::chrono::seconds(30)) {
+		last = now;
+		std::printf("[vram-emu-tiler] 30 s, MiB: scratch del tiler guardado: el mayor %llu -> ahora %llu (tope %llu); vuelto al "
+		            "driver por llevar 5 s sin uso %llu (total %llu); con KYTY_EMU_TILER_POOL=0 seguiria guardado hasta 30 s\n",
+		            static_cast<unsigned long long>(peak >> 20u),
+		            static_cast<unsigned long long>(g_tiler_pool_bytes.load(std::memory_order_relaxed) >> 20u),
+		            static_cast<unsigned long long>(g_tiler_pool_budget.load(std::memory_order_relaxed) >> 20u),
+		            static_cast<unsigned long long>(window >> 20u), static_cast<unsigned long long>(total >> 20u));
+		std::fflush(stdout);
+		window = 0;
+		peak   = 0;
+	}
+	return freed;
 }
 
 // Freed scratch buffers kept for reuse: at most this much.
@@ -64,6 +118,8 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics), m_scheduler(scheduler) {
 	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
 	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
+	g_tiler_pool_budget.store(m_scratch_pool_budget, std::memory_order_relaxed);
+	g_tiler_flush_fn.store(&TileManager::FlushScratchPool, std::memory_order_release);
 	// The periodic RAM flush (ram-guard.h): the buffers pooled 30 s and not reused.
 	g_flush_tile_manager.store(this, std::memory_order_release);
 	{
@@ -223,6 +279,7 @@ void TileManager::DeferDestroy(Scratch scratch) {
 			if (m_scratch_pool_bytes + capacity <= m_scratch_pool_budget) {
 				m_scratch_pool.push_back({scratch.buffer, scratch.allocation, capacity});
 				m_scratch_pool_bytes += capacity;
+				g_tiler_pool_bytes.store(m_scratch_pool_bytes, std::memory_order_relaxed);
 				return;
 			}
 		}

@@ -23,6 +23,8 @@ bool               HostInputKbmWarpDegrees(uint64_t shown_seq, double* yaw, doub
 uint64_t           HostInputKbmOnFlip();
 void               HostInputFocus(bool focused);
 void               HostInputKbmSetLive(float sens_factor, float antidz);
+// (remap-f2) The pad map (KYTY_PAD_MAP's text, "" = default buttons) changed live by the F2 menu (window.cpp).
+void               HostPadMapSetLive(const char* map);
 bool               HostInputMouseMotion(int dx, int dy);
 bool               HostInputMouseWheel(int y);
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);

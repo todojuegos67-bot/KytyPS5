@@ -1,8 +1,15 @@
+#include "local/envio1.h" // (envio1: table-xpr.inc)
+#include "local/ds-nativo-sombras.h" // (F5 pase 2, =3/=1: el estado dinamico de los draws de la cascada marcada)
+#include "local/f0-measure.h" // (f0: table-xpr.inc, KYTY_F0)
+#include "local/trad1.h" // (trad1: table-xpr.inc, KYTY_TRAD1)
+#include "local/live-control.h" // (trad1b: LiveControl::g_flips, the [trad1] line's frames)
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"
+#include "local/pathtrace.h" // (pt1: table-xpr.inc, native-xpr.inc, render1-native.inc)
 #include "local/rt-water.h"
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "native/native-render.h" // (f5b: verified passes' targets, KYTY_NATIVE_PASSES)
 #include "live-trace-gpu.h"
 
 #include "common/assert.h"
@@ -39,6 +46,11 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "live-census.h"
+#include "trusted-depth.h" // (trust1: table-xpr.inc)
+#include "render1.h" // (render1 F2: native-xpr.inc, table-xpr.inc, render1-native.inc)
+#include "port-r.h" // (port-r, KYTY_PORT_R=2: table-xpr.inc compares the draws of eboot+0xab57d0)
+#include "p7-compat.h" // (p7, KYTY_P7: C1 in table-xpr.inc)
+#include "gpu_tiler_shaders/render1_cmp_spv.h" // (render1 F2: render1-native.inc)
 #include "live-counters.h"
 #include "device-fault.h"
 #include "frame-capture.h"
@@ -73,6 +85,9 @@
 #include <unordered_set>
 #include <vector>
 #include <xxhash.h>
+
+// (arranque-ligero 2) pipelineCache.cpp: the graphics pipelines made before play.
+extern std::atomic<uint64_t> g_kyty_ligero_precreados;
 
 namespace Libs::Graphics {
 
@@ -520,6 +535,22 @@ static ResolvedDynamicState ResolveGraphicsDynamicParams(const Buffer& buffer, b
 		                         ? VK_TRUE
 		                         : VK_FALSE;
 	}
+	// (F5 pase 2, =3/=1; renderer/dsSombrasNativas.inc) Un draw de un cubo de sombras marcado: su estado, para el dibujo
+	// nativo de esa cascada (el viewport 0: la capa la elige DB_DEPTH_VIEW, no un indice de viewport).
+	if (const uint32_t pass = DsNativoSombras::g_nat_dyn_target.load(std::memory_order_relaxed); pass < 4u) {
+		auto&       d = DsNativoSombras::g_nat_dyn_pass[pass];
+		const auto& v = out.viewports[0];
+		const auto& c = out.scissors[0];
+		d.vp[0] = v.x, d.vp[1] = v.y, d.vp[2] = v.width, d.vp[3] = v.height, d.vp[4] = v.minDepth, d.vp[5] = v.maxDepth;
+		d.sc[0] = c.offset.x, d.sc[1] = c.offset.y;
+		d.sc[2] = static_cast<int32_t>(c.extent.width), d.sc[3] = static_cast<int32_t>(c.extent.height);
+		d.depth_test    = out.depth_test;
+		d.depth_write   = out.depth_write;
+		d.depth_compare = static_cast<uint32_t>(out.depth_compare);
+		d.bias_enable   = out.depth_bias_enable;
+		d.bias_constant = out.bias_constant, d.bias_clamp = out.bias_clamp, d.bias_slope = out.bias_slope;
+		DsNativoSombras::g_nat_dyn_mask.fetch_or(1u << pass, std::memory_order_release);
+	}
 	return out;
 }
 
@@ -762,6 +793,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
+		NativeRender::NoteTarget(target.image_id.index, target.image_id.generation, target.desc.view_info.base_level,
+		                         target.desc.view_info.base_layer, false); // (f5b: a verified pass's target)
 		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
 		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
 		                     target.target_slot, image.info.data.address, image.info.data.size,
@@ -802,6 +835,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
+		NativeRender::NoteTarget(depth.image_id.index, depth.image_id.generation, depth.desc.view_info.base_level,
+		                         depth.desc.view_info.base_layer, true); // (f5b: a verified pass's target)
 		const auto& metadata   = depth.desc.info.metadata;
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
@@ -1511,6 +1546,38 @@ static bool AsyncDrawSyncSmall() {
 	return enabled;
 }
 static std::atomic<uint64_t> g_async_draws_skipped {0};
+// KYTY_BIND_NOSPIN=1 (off by default): the render thread stops spinning on pipelines that are still compiling.
+// Log 20261124-120220-003: in every frame with a pipeline on the worker (53 of 206 slow frames) the draw spent the
+// whole KYTY_ASYNC_DRAW_WAIT_MS budget (async_draw_wait_us = 3000 in all of them) and still skipped draws
+// (async_draw_skips 1-1069): a driver compile takes 100 ms or more, a 3 ms spin almost never sees it finish. That
+// spin is timed inside draw.bindings (3 of its ~5 ms in those frames). With it on, once a wait ran out without the
+// pipeline, no draw waits again until the last requested compile has finished (the same draws are skipped a frame or two,
+// as they already were). The [bind] line: wait ms per frame, waits avoided and the ready-pipeline hit rate.
+static bool BindNoSpin() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BIND_NOSPIN");
+		const bool on = value != nullptr && *value != '\0' && std::string_view(value) != "0";
+		std::printf("[bind] KYTY_BIND_NOSPIN=%s: %s\n", on ? "1" : "0",
+		            on ? "ON (no spin on compiling pipelines)" : "off");
+		return on;
+	}();
+	return enabled;
+}
+static bool                  g_bind_spin_blocked = false; // a wait ran out; cleared when nothing is pending
+static uint64_t              g_bind_stat_frame = 0, g_bind_stat_frames = 0, g_bind_wait_us = 0, g_bind_avoided = 0;
+static uint64_t              g_bind_tries = 0, g_bind_ready = 0;
+static void BindStatsFrame(uint64_t frame) {
+	if (frame == g_bind_stat_frame) return;
+	g_bind_stat_frame = frame;
+	if (++g_bind_stat_frames < 300) return;
+	const double f = static_cast<double>(g_bind_stat_frames);
+	std::printf("[bind] %s: espera de pipelines %.2f ms/frame, esperas evitadas %.1f/frame, pipeline listo %.1f%% (%llu de %llu)\n",
+	            BindNoSpin() ? "NOSPIN" : "normal", static_cast<double>(g_bind_wait_us) / 1000.0 / f,
+	            static_cast<double>(g_bind_avoided) / f,
+	            g_bind_tries ? 100.0 * static_cast<double>(g_bind_ready) / static_cast<double>(g_bind_tries) : 100.0,
+	            static_cast<unsigned long long>(g_bind_ready), static_cast<unsigned long long>(g_bind_tries));
+	g_bind_stat_frames = g_bind_wait_us = g_bind_avoided = g_bind_tries = g_bind_ready = 0;
+}
 
 bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
@@ -1696,6 +1763,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                                       state.programs.pixel, false);
 		};
 		async_pipeline = try_create();
+		BindStatsFrame(m_context.FrameNumber());
+		++g_bind_tries;
+		if (async_pipeline != nullptr) ++g_bind_ready;
+		if (g_bind_spin_blocked) {
+			const auto& pending = cache.PipelineWaiting(); // (the last requested compile; true once it finished)
+			if (pending == nullptr || pending->load(std::memory_order_acquire)) g_bind_spin_blocked = false;
+		}
 		// The wait is a budget per frame, not per draw: a draw waited up to 3 ms each, and a view with dozens of
 		// objects whose pipelines were compiling spent 20-100 ms a frame spinning here (the same places every
 		// run: draw.bindings in the slow frames, the render thread busy and the GPU idle).
@@ -1705,7 +1779,9 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			wait_frame = frame;
 			waited     = std::chrono::microseconds {0};
 		}
-		if (async_pipeline == nullptr && waited < AsyncDrawWait()) {
+		if (async_pipeline == nullptr && waited < AsyncDrawWait() && BindNoSpin() && g_bind_spin_blocked) {
+			++g_bind_avoided;
+		} else if (async_pipeline == nullptr && waited < AsyncDrawWait()) {
 			const auto waiting  = cache.PipelineWaiting();
 			const auto start    = std::chrono::steady_clock::now();
 			const auto deadline = start + (AsyncDrawWait() - waited);
@@ -1716,9 +1792,33 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
 			waited += spent;
 			LiveCounters::Add(LiveCounters::AsyncDrawWaitUs, static_cast<uint64_t>(spent.count()));
+			g_bind_wait_us += static_cast<uint64_t>(spent.count());
 			async_pipeline = try_create();
+			if (async_pipeline == nullptr) g_bind_spin_blocked = true;
 		}
-		if (async_pipeline == nullptr) {
+		// (arranque-ligero 2, KYTY_ARRANQUE_LIGERO=2) Never skipped: the draw falls to the blocking compile below (a few
+		// ms once). A skipped draw left the fog and effects of a new world missing or popping for a few frames.
+		static const bool ligero_sin_saltos = [] {
+			const char* value = std::getenv("KYTY_ARRANQUE_LIGERO");
+			return value != nullptr && value[0] == '2';
+		}();
+		if (async_pipeline == nullptr && ligero_sin_saltos) {
+			// (The worker already has it: waited for, not compiled twice. Bounded: past 2 s, the blocking compile.)
+			const auto waiting  = cache.PipelineWaiting();
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+			while (waiting != nullptr && !waiting->load(std::memory_order_acquire) &&
+			       std::chrono::steady_clock::now() < deadline) {
+				std::this_thread::yield();
+			}
+			async_pipeline = try_create();
+			static std::atomic<uint64_t> avoided {0};
+			const auto n = avoided.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((n & (n - 1)) == 0) {
+				std::printf("[arranque-ligero] precreados %llu criticos, saltos evitados %llu\n",
+				            static_cast<unsigned long long>(g_kyty_ligero_precreados.load(std::memory_order_relaxed)),
+				            static_cast<unsigned long long>(n));
+			}
+		} else if (async_pipeline == nullptr) {
 			LiveCounters::Add(LiveCounters::AsyncDrawSkips);
 			const auto skipped = g_async_draws_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
 			if ((skipped & (skipped - 1)) == 0) {
@@ -2066,6 +2166,17 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 #endif
 #include "native-xpr.inc"
 #include "table-xpr.inc"
+#include "render1-native.inc" // (render1 F2, KYTY_RENDER1=2)
+#endif
+#ifndef KYTY_LOCAL_VULKAN_RECORDING
+// (render1 F2: without the native paths there is no batch)
+bool RenderExecutor::Render1BatchOpen() const noexcept { return false; }
+void RenderExecutor::Render1EndBatch(CommandBuffer& /*buffer*/, uint32_t /*why*/) {}
+void RenderExecutor::Render1Taint(uint32_t /*reason*/) {}
+bool RenderExecutor::Render1Draw(CommandBuffer& /*buffer*/, bool /*clean*/, std::span<const uint64_t> /*commands*/,
+                                 uint64_t /*index_base*/, uint64_t /*index_bytes*/, vk::IndexType /*index_type*/) {
+	return false;
+}
 #endif
 
 bool BuildDrawIndexRun(std::span<const DrawIndexArgs> draws, DrawIndexRun& run) {
@@ -2446,6 +2557,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
+	TexAnticipadaDrain(); // (etapa1, KYTY_TEX_ANTICIPADA) texturas creadas por el juego, antes de su primer draw
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveCensus::Scope census(LiveCensus::Draw, sh_ctx.GetVs().gs_regs.data_addr, sh_ctx.GetPs().ps_regs.data_addr);

@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/image/sparseImage.h" // (P5)
 #include "async-upload.h"
 #include "blackbox.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -14,6 +15,8 @@
 #include "live-trace-gpu.h"
 #include "local-platform.h"
 #include "lane-sync.h"
+#include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/f0-measure.h" // (f0: KYTY_F0)
 
 #include <algorithm>
 #include <atomic>
@@ -603,6 +606,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command_clock    = g_cpu_dirty_clock.load(std::memory_order_acquire);
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_command.m_buffer), true); // (f0)
 	LiveTrace::g_mark_command = static_cast<VkCommandBuffer>(m_command.m_buffer);
 	return m_command;
 }
@@ -701,6 +705,7 @@ vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t
 		// (Committed for the open buffer's submission: the pool reuses it once that completes.)
 		m_prologue.m_buffer = m_command_pool.Commit();
 		m_prologue.Begin();
+		F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_prologue.m_buffer), false); // (f0)
 		// The copies after everything submitted before (which may read or write their destinations).
 		VulkanMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -762,6 +767,10 @@ void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t va
 }
 
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
+	if (F0Measure::On()) // (f0: the end stamps, recorded before the buffers end)
+		for (const auto& entry: entries) F0Measure::BufferSubmit(static_cast<VkCommandBuffer>(entry.buffer), entry.ended, m_lane);
+	// (P5) Los ligados de texturas nativas pendientes, en un solo vkQueueBindSparse; esta entrega los espera (abajo).
+	SparseFlushPendingBinds(m_graphics, *this);
 	if (m_next_wait_semaphore != nullptr) {
 		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
 			submit.AddWait(m_next_wait_semaphore, m_next_wait_value);
@@ -1033,17 +1042,31 @@ void CommandScheduler::EnableLanes() {
 	if (const char* war = std::getenv("KYTY_ACQ_WAR"); war != nullptr && *war == '0') LaneSync::g_war = false;
 	LaneSync::g_lane = 0;
 	LaneSync::g_cur_tick = m_master.CurrentTick();
-	std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)\n");
+	if (Serie1::WantsLanes() && !Serie1::AsyncComputeEnv())
+		std::printf("[serie1] KYTY_SERIE1=1: segunda cola Vulkan activa SOLO para el cull del XPR (DCB de computo con etiqueta); "
+		            "las colas de computo del juego siguen en la cola grafica. Orden por semaforos (marcas de datos de "
+		            "lane-sync.h); la cola grafica espera siempre al cull (modo seguro). Linea [serie1] cada 5 s.\n");
+	else
+		std::printf("Async compute: the game's compute queues go to a second Vulkan queue (KYTY_ASYNC_COMPUTE)%s\n",
+		            Serie1::WantsLanes() ? " (and the XPR culling, KYTY_SERIE1=1)" : "");
 }
 
 void CommandScheduler::SetLane(int lane) {
 	if (lane != 0 && !m_lanes) lane = 0;
 	if (lane == m_lane) return;
 	if (t_recorder != nullptr) throw RecorderRefusal {"SetLane"};
-	if (!m_command.IsInvalid()) Submit();
+	// (serie2) A buffer that was open is submitted on its lane and the next one begun on the new lane, as Flush does
+	// (Submit + BeginNext). Before, the scheduler was left with no open buffer (m_command.m_buffer == nullptr): fine for
+	// GuestGpu::Process, whose BufferInit -> Begin begins one, but not for BufferCache::BeginGuestReadback, which changes
+	// lane (KYTY_ACQ_READBACK_LANE, on with KYTY_SERIE1=1) and records the copy at once (Buffer::CopyFrom ->
+	// CommandBuffer::Handle: EXIT_IF(IsInvalid()), context.cpp:34), and changes it back after its Flush - between two
+	// packets of a translation that then records into no buffer. 20261116-112448-084.
+	const bool was_open = !m_command.IsInvalid();
+	if (was_open) Submit();
 	m_lane           = lane;
 	LaneSync::g_lane = lane;
 	LaneSync::g_cur_tick = m_master.CurrentTick();
+	if (was_open) BeginNext();
 }
 
 // The cross-lane waits the open command buffer's uses asked for (LaneSync::Note), on the other lane's timeline.
@@ -1064,6 +1087,11 @@ void CommandScheduler::AddLaneWaits(SubmitInfo& submit) {
 		return value != nullptr && *value == '1';
 	}();
 	if (m_lane == 1 && no_gfx_wait) LaneSync::g_required[0] = 0;
+	// (serie1) A culling's lane-1 submission: did it overtake graphics work still pending (local/serie1.h)?
+	if (m_lane == 1 && Serie1::g_open_cull) {
+		const uint64_t newest = m_master.LastTick(0);
+		Serie1::NoteCullSubmit(LaneSync::g_required[0], newest, newest != 0 && m_master.IsFree(newest));
+	}
 	if (const auto need = LaneSync::g_required[other]; need != 0) {
 		// (A tick of the other lane not submitted yet cannot be waited for: it is the other lane's open buffer's, which
 		// was submitted when the lane changed; never the case here.)

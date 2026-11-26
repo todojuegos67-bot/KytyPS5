@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include <array>
 #include <bit>
 #include <algorithm>
 #include <filesystem>
@@ -98,28 +99,34 @@ template<class A> void Workgroup(A& a, ShaderWorkgroupInputInfo& s) {
     Array(a, s.threads_num);
     Fields(a, s.lds_size_dwords, s.scratch_size_dwords, s.host_subgroup_size, s.wave_size);
 }
+// A vertex input info as a record holds it: what translation and pipeline creation read of it (its slots below
+// resources_num; not the draw's vertex buffers, which the pipeline's vertex input state holds folded), also the form a
+// graphics pipeline's remake keeps it in (PipelineCache::GraphicsRemake). A Writer only reads `s`.
+template<class A> bool VisitVertexInput(A& a, ShaderVertexInputInfo& s) {
+    Fields(a, s.resources_num, s.fetch_attrib_reg, s.fetch_buffer_reg,
+        s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.start_instance_sgpr, s.fetch_external,
+        s.fetch_embedded, s.clip_space.enabled);
+    Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
+    Workgroup(a, s.mesh);
+    Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
+        s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
+    if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
+        s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
+    for (int i = 0; i < s.resources_num; ++i) {
+        Array(a, s.resources[i].fields);
+        auto& dst = s.resources_dst[i];
+        Fields(a, dst.register_start, dst.registers_num, dst.attr_id, dst.fetch_index);
+    }
+    return a.Good();
+}
 template<class A> bool Visit(A& a, Record& r) {
     Fields(a, r.stage, r.hash, r.user_data_count, r.push_cursor);
     if (!Words(a, r.code, 256 * 1024) || !Words(a, r.back_code, 256 * 1024) ||
         !Words(a, r.static_key, 1024) || r.code.empty() || r.user_data_count > 108 ||
         r.push_cursor > 65536) return false;
     if (r.stage == ShaderType::Vertex || r.stage == ShaderType::Mesh) {
-        auto& s = r.vertex;
-        Fields(a, s.resources_num, s.fetch_attrib_reg, s.fetch_buffer_reg,
-            s.scratch_size_dwords, s.pa_cl_vs_out_cntl, s.start_instance_sgpr, s.fetch_external,
-            s.fetch_embedded, s.clip_space.enabled);
-        Array(a, s.clip_space.scale); Array(a, s.clip_space.offset); Array(a, s.clip_space.half_extent);
-        Workgroup(a, s.mesh);
-        Fields(a, s.mesh.input_primitive, s.mesh.primitives_per_group, s.mesh.vertices_per_group,
-            s.mesh.max_vertices, s.mesh.max_primitives, s.mesh.provoking_vertex);
-        if (!a.Good() || s.resources_num < 0 || s.resources_num > s.RES_MAX ||
-            s.start_instance_sgpr < -1 || s.start_instance_sgpr >= 8 + 32) return false;
-        for (int i = 0; i < s.resources_num; ++i) {
-            Array(a, s.resources[i].fields);
-            auto& dst = s.resources_dst[i];
-            Fields(a, dst.register_start, dst.registers_num, dst.attr_id, dst.fetch_index);
-        }
-        if ((r.stage == ShaderType::Mesh) != (s.mesh.threads_num[0] != 0)) return false;
+        if (!VisitVertexInput(a, r.vertex) || (r.stage == ShaderType::Mesh) != (r.vertex.mesh.threads_num[0] != 0))
+            return false;
     } else if (r.stage == ShaderType::Pixel) {
         auto& s = r.pixel;
         Fields(a, s.lod_stats_subgroup, s.input_num, s.ps_system_input_base,
@@ -215,12 +222,14 @@ public:
     static constexpr size_t MaxBytes = 256 * 1024 * 1024;
     static constexpr uint32_t MaxRecords = 65536, MaxPipelines = 262144;
     bool Enabled() const { return !path.empty(); }
+    // By index. Those the recording was loaded with hold no words once ReleaseLoaded dropped them.
     std::vector<std::vector<uint32_t>> records, pipelines;
     ~Cache() { StopWriter(); }
 
     bool Open(const std::filesystem::path& location, std::string signature) {
         StopWriter();
         records.clear(); pipelines.clear(); record_index.clear(); pipeline_index.clear();
+        shapes.clear(); source = {}; loaded = {}; released = {};
         changed = false; total_bytes = 8;
         path = location; identity = "KytyShaderWarmup3:" + signature;
         if (!std::filesystem::exists(path)) return true;
@@ -256,21 +265,25 @@ public:
         if (record.stage == ShaderType::Pixel && record.pixel.ps_alpha_to_mask != 0u) return NoShader;
         Writer writer;
         if (!Visit(writer, record) || !ValidKey(record)) return NoShader;
-        return AddWords(std::move(writer.words), false);
+        return AddWords(std::move(writer.words), false, {record.stage, record.vertex.resources_num});
     }
     void AddPipeline(PipelineRecord& record) {
         if (!Enabled()) return;
         Writer writer;
-        if (!VisitPipeline(writer, record) || !ValidPipeline(writer.words, records)) return;
-        AddWords(std::move(writer.words), true);
+        if (!VisitPipeline(writer, record) || !ValidPipeline(writer.words, shapes)) return;
+        AddWords(std::move(writer.words), true, {});
     }
 
     void StartWriter() {
         if (!Enabled() || worker.joinable()) return;
-        // Copy once at startup. The render thread subsequently enqueues only a
-        // new immutable record; serialization/checksums/disk I/O run here.
-        worker = std::jthread([this, saved = records, saved_pipelines = pipelines,
-                              dirty = changed](std::stop_token stop) mutable {
+        // The entries the source lacks (the file each save copies the others from: Source) where the cache holds them,
+        // viewed, not copied: an entry's words never move or change once added (the vectors of entries only grow, which
+        // moves each entry's buffer along, not its words), and Open, Save and the destructor stop the writer before
+        // anything is dropped. A copy held the whole recording twice for as long as the game ran (1.07 played through:
+        // 19,212 inputs and 23,967 recipes, ~100 MiB). The render thread subsequently enqueues only a new immutable
+        // entry; serialization/checksums/disk I/O run here.
+        worker = std::jthread([this, saved = source, added = Views(records, source.records),
+                              added_pipelines = Views(pipelines, source.pipelines), dirty = changed](std::stop_token stop) mutable {
             for (;;) {
                 std::vector<Pending> updates;
                 {
@@ -279,24 +292,56 @@ public:
                     updates.swap(pending);
                 }
                 for (auto& update : updates) {
-                    (update.pipeline ? saved_pipelines : saved).push_back(std::move(update.words));
+                    (update.pipeline ? added_pipelines : added).push_back(update.words);
                     dirty = true;
                 }
                 if (dirty) {
-                    writer_ok = SaveSnapshot(saved, saved_pipelines);
-                    if (writer_ok) dirty = false;
+                    writer_ok = SaveSnapshot(saved, added, added_pipelines);
+                    if (writer_ok) {
+                        dirty = false;
+                        added.clear(); added_pipelines.clear(); // (now the source's)
+                    }
                 }
                 if (stop.stop_requested()) break;
             }
+            source = std::move(saved); // (StopWriter joins before it is read)
         });
     }
 
     bool Save() {
         StopWriter();
         if (!Enabled() || !changed) return true;
-        const bool ok = SaveSnapshot(records, pipelines);
+        const bool ok = SaveSnapshot(source, Views(records, source.records), Views(pipelines, source.pipelines));
         if (ok) changed = false;
         return ok;
+    }
+
+    // Drops the words of the entries the recording was loaded with (Open, Adopt) once the start-up warmup is done with
+    // them (warm_records, warm_recipes): each save copies them from the file (Source), the look-ups find them by their
+    // hash and size, ValidPipeline reads the records' shapes. Held, they were the whole recording for the session: a
+    // game played through, ~100 MiB (1.07: 19,212 inputs and 23,967 recipes). Under the owner's lock, as Add.
+    void ReleaseLoaded() {
+        for (const bool pipeline : {false, true}) {
+            auto& entries = pipeline ? pipelines : records;
+            auto& sizes = released[pipeline ? 1 : 0];
+            const size_t count = std::min<size_t>(loaded[pipeline ? 1 : 0], entries.size());
+            for (size_t i = sizes.size(); i < count; ++i) {
+                sizes.push_back(uint32_t(entries[i].size()));
+                std::vector<uint32_t>().swap(entries[i]);
+            }
+        }
+    }
+
+    // A reader of the shader records alone (the shader prefetch's static inputs): the pipeline recipes and the look-up
+    // indexes dropped, nothing added or saved after. The prefetch never reads the recipes, which the 1.07 inputs held
+    // 78,428 of (58 MiB) for the whole session.
+    void KeepRecordsOnly() {
+        StopWriter();
+        std::vector<std::vector<uint32_t>>().swap(pipelines);
+        Index().swap(record_index);
+        Index().swap(pipeline_index);
+        std::vector<Shape>().swap(shapes);
+        path.clear();
     }
 
     // A seed file (tools/local/static-precompile): the same schema under its own identity line, with
@@ -318,13 +363,31 @@ public:
     }
 
 private:
-    struct Pending { bool pipeline; std::vector<uint32_t> words; };
+    struct Pending { bool pipeline; std::span<const uint32_t> words; }; // (the cache's own words: StartWriter)
     using Index = std::unordered_multimap<uint64_t, uint32_t>;
+    // What ValidPipeline reads of a record: its stage, and its vertex input's resources_num.
+    struct Shape {
+        ShaderType stage = ShaderType::Unknown;
+        int resources_num = 0;
+    };
+    // The file holding the first `records` records and `pipelines` recipes: the one the recording was loaded from, then
+    // each one saved. A save copies them from it (its words checked against its checksum) and adds the entries since.
+    struct Source {
+        std::filesystem::path path;
+        std::string identity; // (its first line)
+        uint64_t checksum = 0;
+        uint32_t records = 0, pipelines = 0;
+        uint64_t record_words = 0, pipeline_words = 0; // (the entries' words, each one's size word included)
+    };
     std::filesystem::path path;
     std::string identity;
     bool changed = false, writer_ok = true;
     size_t total_bytes = 8;
     Index record_index, pipeline_index;
+    std::vector<Shape> shapes;                     // (each record's)
+    Source source;                                 // (the writer's while it runs)
+    std::array<uint32_t, 2> loaded {};             // (the records and recipes Load read)
+    std::array<std::vector<uint32_t>, 2> released; // (the sizes of the records and recipes ReleaseLoaded emptied)
     std::mutex writer_mutex;
     std::condition_variable_any writer_cv;
     std::vector<Pending> pending;
@@ -348,18 +411,22 @@ private:
             }
         }
     }
-    uint32_t AddWords(std::vector<uint32_t> words, bool pipeline) {
+    uint32_t AddWords(std::vector<uint32_t> words, bool pipeline, Shape shape) {
         auto& entries = pipeline ? pipelines : records;
         auto& index = pipeline ? pipeline_index : record_index;
+        const auto& sizes = released[pipeline ? 1 : 0];
         const auto hash = Hash(words);
         const auto [begin, end] = index.equal_range(hash);
+        // (An entry ReleaseLoaded emptied: found by its hash and size.)
         for (auto it = begin; it != end; ++it)
-            if (entries[it->second] == words) return it->second;
+            if (it->second < sizes.size() ? sizes[it->second] == words.size() : entries[it->second] == words)
+                return it->second;
         if (entries.size() >= (pipeline ? MaxPipelines : MaxRecords) ||
             total_bytes + words.size() * 4 + 4 > MaxBytes - identity.size() - 8) return NoShader;
         const auto id = uint32_t(entries.size());
         total_bytes += words.size() * 4 + 4;
         entries.push_back(std::move(words)); index.emplace(hash, id); changed = true;
+        if (!pipeline) shapes.push_back(shape);
         if (worker.joinable()) {
             std::lock_guard lock(writer_mutex);
             pending.push_back({pipeline, entries.back()});
@@ -369,25 +436,40 @@ private:
     // Nothing changes unless the whole file is valid.
     bool Load(const std::filesystem::path& location, const std::string& signature) {
         std::vector<uint32_t> contents;
-        std::vector<std::vector<uint32_t>> loaded, loaded_pipelines;
-        if (!ReadFile(location, signature, contents) || !Parse(contents, loaded, loaded_pipelines)) return false;
-        records = std::move(loaded); pipelines = std::move(loaded_pipelines);
+        std::vector<std::vector<uint32_t>> loaded_records, loaded_pipelines;
+        Layout layout;
+        uint64_t checksum = 0;
+        if (!ReadFile(location, signature, contents, &checksum) ||
+            !Parse(contents, loaded_records, loaded_pipelines, &layout)) return false;
+        records = std::move(loaded_records); pipelines = std::move(loaded_pipelines); shapes = std::move(layout.shapes);
+        loaded = {uint32_t(records.size()), uint32_t(pipelines.size())};
+        source = {location, signature, checksum, loaded[0], loaded[1], layout.record_words,
+                  contents.size() - 2 - layout.record_words};
         Reindex(); return true;
     }
+    // Where Parse found the records' words end (the record count's word not included), and their shapes.
+    struct Layout {
+        std::vector<Shape> shapes;
+        uint64_t record_words = 0;
+    };
     // Records, then pipeline recipes valid against them, and nothing after.
     static bool Parse(const std::vector<uint32_t>& contents, std::vector<std::vector<uint32_t>>& out_records,
-                      std::vector<std::vector<uint32_t>>& out_pipelines) {
+                      std::vector<std::vector<uint32_t>>& out_pipelines, Layout* layout = nullptr) {
         Reader reader {contents};
-        if (!ReadRecords(reader, out_records)) return false;
+        std::vector<Shape> record_shapes;
+        if (!ReadRecords(reader, out_records, record_shapes)) return false;
+        const uint64_t record_words = reader.cursor - 1;
         uint32_t count = 0; reader(count);
         if (!reader.Good() || count > MaxPipelines) return false;
         out_pipelines.resize(count);
         for (auto& words : out_pipelines)
-            if (!Words(reader, words, 4096) || !ValidPipeline(words, out_records)) return false;
-        return reader.Good() && reader.cursor == contents.size();
+            if (!Words(reader, words, 4096) || !ValidPipeline(words, record_shapes)) return false;
+        if (!reader.Good() || reader.cursor != contents.size()) return false;
+        if (layout != nullptr) *layout = {std::move(record_shapes), record_words};
+        return true;
     }
     static bool ReadFile(const std::filesystem::path& location, const std::string& signature,
-                         std::vector<uint32_t>& contents) {
+                         std::vector<uint32_t>& contents, uint64_t* out_checksum = nullptr) {
         std::ifstream file(location, std::ios::binary | std::ios::ate);
         if (!file) return false;
         const auto size = file.tellg();
@@ -398,55 +480,135 @@ private:
         contents.resize(bytes / 4);
         file.seekg(0); file.read(saved.data(), saved.size()); file.read(reinterpret_cast<char*>(&checksum), 8);
         file.read(reinterpret_cast<char*>(contents.data()), bytes);
+        if (out_checksum != nullptr) *out_checksum = checksum;
         return file && saved == signature && XXH3_64bits(contents.data(), bytes) == checksum;
     }
-    static bool ReadRecords(Reader& reader, std::vector<std::vector<uint32_t>>& loaded) {
+    static bool ReadRecords(Reader& reader, std::vector<std::vector<uint32_t>>& loaded, std::vector<Shape>& out_shapes) {
         uint32_t count = 0; reader(count);
         if (!reader.Good() || count > MaxRecords) return false;
         loaded.resize(count);
+        out_shapes.reserve(count);
         for (auto& record : loaded) {
             if (!Words(reader, record, 1024 * 1024)) return false;
             Record decoded; Reader entry {record};
             if (!Visit(entry, decoded) || entry.cursor != record.size() || !ValidKey(decoded)) return false;
+            out_shapes.push_back({decoded.stage, decoded.vertex.resources_num});
         }
         return reader.Good();
     }
-    static bool ValidPipeline(const std::vector<uint32_t>& words,
-                              const std::vector<std::vector<uint32_t>>& shaders) {
+    // Against the records' shapes (each record valid: Visit read it).
+    static bool ValidPipeline(const std::vector<uint32_t>& words, std::span<const Shape> record_shapes) {
         PipelineRecord r; Reader reader {words};
         if (!VisitPipeline(reader, r) || reader.cursor != words.size()) return false;
         const auto stage = [&](uint32_t index) {
-            return index < shaders.size() ? ShaderType(shaders[index][0]) : ShaderType::Unknown;
+            return index < record_shapes.size() ? record_shapes[index].stage : ShaderType::Unknown;
         };
         if (r.compute != NoShader) return stage(r.compute) == ShaderType::Compute;
         if (stage(r.vertex) != ShaderType::Vertex && stage(r.vertex) != ShaderType::Mesh) return false;
         if (r.pixel != NoShader && stage(r.pixel) != ShaderType::Pixel) return false;
-        Record vertex; Reader input {shaders[r.vertex]};
-        return Visit(input, vertex) && (vertex.stage == ShaderType::Mesh
+        return stage(r.vertex) == ShaderType::Mesh
             ? r.vertex_input.attribute_count == 0 && r.vertex_input.binding_count == 0
-            : r.vertex_input.attribute_count == vertex.vertex.resources_num);
+            : r.vertex_input.attribute_count == record_shapes[r.vertex].resources_num;
     }
-    bool SaveSnapshot(std::vector<std::vector<uint32_t>>& saved,
-                      std::vector<std::vector<uint32_t>>& saved_pipelines) {
-        Writer writer;
-        for (auto* entries : {&saved, &saved_pipelines}) {
-            uint32_t count = uint32_t(entries->size()); writer(count);
-            for (auto& record : *entries)
-                if (!Words(writer, record, 1024 * 1024) ||
-                    writer.words.size() * 4 > MaxBytes - identity.size() - 8) return false;
+    static std::vector<std::span<const uint32_t>> Views(const std::vector<std::vector<uint32_t>>& entries,
+                                                        size_t from = 0) {
+        return std::vector<std::span<const uint32_t>>(entries.begin() + std::ptrdiff_t(std::min(from, entries.size())),
+                                                      entries.end());
+    }
+    // The source's entries copied from its file (its words checked against its checksum as they are read), then the
+    // entries since: each list's count, then each entry as Words writes it (its size, then its words). Written to a
+    // temporary file, its checksum taken as it goes and put in at the end, which then replaces the recording: nothing
+    // is replaced unless every part was read, checked and written. On success `from` describes the file written.
+    bool SaveSnapshot(Source& from, const std::vector<std::span<const uint32_t>>& added,
+                      const std::vector<std::span<const uint32_t>>& added_pipelines) {
+        uint64_t total_words = 2 + from.record_words + from.pipeline_words;
+        for (const auto* entries : {&added, &added_pipelines}) {
+            for (const auto entry : *entries) {
+                if (entry.size() > 1024 * 1024) return false;
+                total_words += 1 + entry.size();
+            }
+        }
+        if (total_words * 4 > MaxBytes - identity.size() - 8) return false;
+        const bool copies = from.records + from.pipelines > 0;
+        std::ifstream in;
+        if (copies) {
+            in.open(from.path, std::ios::binary);
+            std::string line(from.identity.size(), '\0');
+            uint64_t checksum = 0;
+            in.read(line.data(), std::streamsize(line.size()));
+            in.read(reinterpret_cast<char*>(&checksum), 8);
+            if (!in || line != from.identity || checksum != from.checksum) return false;
         }
         std::error_code ec;
         if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path(), ec);
         if (ec) return false;
         auto temporary = path; temporary += ".tmp";
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        const auto bytes = writer.words.size() * 4;
-        const uint64_t checksum = XXH3_64bits(writer.words.data(), bytes);
-        file.write(identity.data(), identity.size()); file.write(reinterpret_cast<const char*>(&checksum), 8);
-        file.write(reinterpret_cast<const char*>(writer.words.data()), bytes); file.close();
-        if (!file) return false;
+        XXH3_state_t* written_hash = XXH3_createState();
+        XXH3_state_t* read_hash = XXH3_createState();
+        bool ok = written_hash != nullptr && read_hash != nullptr && XXH3_64bits_reset(written_hash) == XXH_OK &&
+                  XXH3_64bits_reset(read_hash) == XXH_OK;
+        uint64_t checksum = 0;
+        if (ok) {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            file.write(identity.data(), std::streamsize(identity.size()));
+            file.write(reinterpret_cast<const char*>(&checksum), 8); // (its place: written at the end)
+            const auto put = [&](const void* data, size_t bytes) {
+                ok = ok && XXH3_64bits_update(written_hash, data, bytes) == XXH_OK;
+                file.write(static_cast<const char*>(data), std::streamsize(bytes));
+            };
+            const auto take = [&](void* data, size_t bytes) {
+                in.read(static_cast<char*>(data), std::streamsize(bytes));
+                ok = ok && in && XXH3_64bits_update(read_hash, data, bytes) == XXH_OK;
+            };
+            std::vector<char> buffer;
+            for (const bool pipeline : {false, true}) {
+                const auto& entries = pipeline ? added_pipelines : added;
+                const uint32_t had = pipeline ? from.pipelines : from.records;
+                const uint32_t count = had + uint32_t(entries.size());
+                put(&count, sizeof(count));
+                if (copies) {
+                    uint32_t source_count = 0;
+                    take(&source_count, sizeof(source_count));
+                    ok = ok && source_count == had;
+                    buffer.resize(size_t {1} << 20u);
+                    for (uint64_t left = (pipeline ? from.pipeline_words : from.record_words) * 4; ok && left > 0;) {
+                        const auto bytes = size_t(std::min<uint64_t>(left, buffer.size()));
+                        take(buffer.data(), bytes);
+                        if (ok) put(buffer.data(), bytes);
+                        left -= bytes;
+                    }
+                }
+                for (const auto entry : entries) {
+                    const uint32_t size = uint32_t(entry.size());
+                    put(&size, sizeof(size));
+                    put(entry.data(), entry.size() * 4);
+                }
+            }
+            if (copies)
+                ok = ok && in.peek() == std::char_traits<char>::eof() && XXH3_64bits_digest(read_hash) == from.checksum;
+            checksum = XXH3_64bits_digest(written_hash);
+            file.seekp(std::streamoff(identity.size()));
+            file.write(reinterpret_cast<const char*>(&checksum), 8);
+            file.close();
+            ok = ok && !file.fail();
+        }
+        in.close();
+        XXH3_freeState(written_hash);
+        XXH3_freeState(read_hash);
+        if (!ok) {
+            std::filesystem::remove(temporary, ec);
+            return false;
+        }
         std::filesystem::rename(temporary, path, ec);
-        return !ec;
+        if (ec) return false;
+        from.path = path;
+        from.identity = identity;
+        from.checksum = checksum;
+        from.records += uint32_t(added.size());
+        from.pipelines += uint32_t(added_pipelines.size());
+        for (const auto entry : added) from.record_words += 1 + entry.size();
+        for (const auto entry : added_pipelines) from.pipeline_words += 1 + entry.size();
+        return true;
     }
 };
 

@@ -16,7 +16,11 @@ void SetThreadName(const char* name);
 // The OS id of the calling thread (Linux: gettid, Windows: GetCurrentThreadId).
 uint32_t ThreadId();
 
-// Pins the calling thread to a comma-separated CPU list ("1,2,3"); an empty or invalid
+// A CPU list as read ("0,8-15" -> "0,8,9,10,11,12,13,14,15"; "none" when it names no CPU 0..63): what start-up lines
+// print, so a list read otherwise than meant shows.
+std::string CpuListResolved(const char* list);
+
+// Pins the calling thread to a comma-separated CPU list ("1,2,3", ranges "8-15"); an empty or invalid
 // list leaves the affinity alone.
 void PinThreadToCpuList(const char* list);
 
@@ -186,6 +190,9 @@ void      KeepResident();
 // How the trim runs its system call: set by the guest memory (kernel/memory.cpp) so that no mapping, unmapping or
 // protection change of the guest's views runs meanwhile (Windows' memory manager bug-checked, 0x1A, PCs that trim).
 void      SetTrimRunner(void (*runner)(void (*call)()));
+// `call` through the trim runner: no guest map, unmap or protection change runs meanwhile (paging pages while their
+// protection changes is the bug check 0x1A reproducer). Without a runner, `call` directly.
+void      RunTrimQuiet(void (*call)());
 // The RAM budget (ram-guard.h, KYTY_RAM_BUDGET_MB): the working set trimmed down to target_bytes now (a hard maximum set
 // and made soft again in one call through the trim runner: pages leave only while no guest map, unmap or protection
 // change runs; they go to the standby list / page file and fault back in on use), keeping a hard minimum of min_bytes
@@ -215,6 +222,10 @@ bool OpenVideoMemoryAdapter(const uint8_t* luid);
 bool QueryVideoMemory(uint64_t* usage, uint64_t* budget);
 // The process's system memory the GPU uses (Task Manager's shared GPU memory).
 bool QuerySharedGpuMemory(uint64_t* usage);
+// (VRAM-REAL) Dedicated video memory in use on that GPU by every process (Task Manager's performance tab), refreshed
+// every 2 s by its own thread, and of it what the other processes hold (all less this process's DXGI usage); false
+// until the first reading or where there is none.
+bool QueryAdapterDedicatedUsage(uint64_t* all, uint64_t* others);
 
 // The file's Authenticode signature is valid (no network: revocation not checked) and its signer is NVIDIA
 // Corporation: NVIDIA's DLLs the emulator loads (Streamline for frame generation, DLSS). false elsewhere.

@@ -229,6 +229,12 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+		// (upstream 30e958b) A guarded copy that reached a guard page (a guest stack's, through a stale pointer) stops
+		// there, as at a page without access: before the guard-page handler, which would report that stack's overflow.
+		if (exception_record->NumberParameters >= 2 &&
+		    ResumeGuardedCopyAtGuard(exception->ContextRecord, exception_record->ExceptionInformation[1])) {
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
 		const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
 		return handler != nullptr && exception_record->NumberParameters >= 2 &&
 		               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
@@ -500,6 +506,10 @@ bool InstallHandler(Handler handler) {
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
+}
+
+bool HandlerInstalled() noexcept {
+	return g_install_state.load(std::memory_order_acquire) == 2;
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS

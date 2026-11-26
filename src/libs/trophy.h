@@ -14,6 +14,19 @@ namespace Libs::Trophy {
 // grade: 1 platinum, 2 gold, 3 silver, 4 bronze (as the NpTrophy2 API's), 0 unknown
 // (1030c) The port's own trophy (not the game's): the Nexus reached for the first time. Not needed for the platinum.
 constexpr int kNexusTrophyId = 100;
+// (rando1) "Trofeos Randomizer": the port's own, one per archdemon defeated with the randomizer on (200 .. 216, the
+// order of kRandoBosses in trophy.cpp) and one for all of them (217). Outside the game's set: never count for the
+// platinum nor in the game's "X / 38".
+constexpr int kRandoFirst = 200;
+constexpr int kRandoAll   = 217;
+inline bool   IsRando(int id) { return id >= kRandoFirst && id <= kRandoAll; }
+// The randomizer trophy of a boss fight (the game's UDS activity id: "Phlx", "ToKn"...), -1 for any other activity.
+int RandoTrophyForActivity(const std::string& activity);
+// Every boss trophy (200 .. 216) unlocked: the last one (217) is due.
+bool RandoAllBosses();
+// The randomizer medal (original art drawn in code), RGBA8 bytes, size x size.
+void RandoMedal(int size, std::vector<uint8_t>* rgba);
+void RandoMedal(int size, int trophy_id, std::vector<uint8_t>* rgba); // (rando3) that trophy's own medal
 
 struct Info {
 	int         id    = -1;

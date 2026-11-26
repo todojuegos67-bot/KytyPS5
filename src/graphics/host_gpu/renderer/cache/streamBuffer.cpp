@@ -8,6 +8,7 @@
 #include "local/mem-guard.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
+#include "local/vram-drv.h" // (VRAM-DRV)
 #endif
 
 #include <atomic>
@@ -20,6 +21,9 @@
 #include <thread>
 #include <vector>
 #include <vk_mem_alloc.h>
+
+#define VRAM_EMU_OWNER ::VramEmu::kOtro
+#include "local/vram-emu.h" // (VRAM-EMU) cada Buffer apuntado por su uso (Buffer::Buffer, SetNext)
 
 extern "C" {
 // KYTY_BUFFER_RECLAIM: 1: a retired buffer's memory is freed on a worker thread. Freeing a
@@ -196,7 +200,13 @@ std::atomic<uint64_t> g_forced_spill_bytes {[] {
 	return false;
 }
 
+// (BUF-RAM) BufferCache::BufRamPass: el siguiente bufer del juego de este hilo va a memoria del sistema (tipos sin
+// DEVICE_LOCAL), por el mismo camino que KYTY_TEST_BUFFER_SPILL_MB.
+thread_local bool g_buf_ram_next = false;
+
 } // namespace
+
+void BufferForceSystemMemory(bool on) { g_buf_ram_next = on; }
 
 struct Buffer::Sparse {
 	uint64_t                    page_size   = 0;
@@ -290,7 +300,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	// full, so that its move back can be watched (BufferCache::MoveSpilledBufferBack). (A GPU without such types: no
 	// change.)
 	const bool forced_spill =
-	    usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && TakeForcedSpill(size);
+	    usage == MemoryUsage::DeviceLocal && with_bda && cpu_address != 0 && (g_buf_ram_next || TakeForcedSpill(size));
 	if (forced_spill) {
 		const auto& memory = graphics.physical_device_memory_properties;
 		for (uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
@@ -306,6 +316,11 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
+	// (VRAM-EMU) Dueno de esta asignacion (si no va al pool de bufferes del juego, que se cuenta aparte).
+	(void)::VramEmu::SetNext(usage == MemoryUsage::Stream        ? ::VramEmu::kAnillos
+	                         : usage != MemoryUsage::DeviceLocal ? ::VramEmu::kOtro
+	                         : cpu_address != 0                  ? ::VramEmu::kBufJuegoFuera
+	                                                             : ::VramEmu::kBufEmu);
 	const auto        create        = [&] {
 		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
@@ -347,7 +362,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
 		m_in_system_memory = true;
-		graphics.ReportMemoryFallback(forced_spill ? "a GPU buffer is in system memory (KYTY_TEST_BUFFER_SPILL_MB)"
+		if (!g_buf_ram_next) graphics.ReportMemoryFallback(forced_spill ? "a GPU buffer is in system memory (KYTY_TEST_BUFFER_SPILL_MB)"
 		                                           : "a GPU buffer is in system memory",
 		                              size);
 	}
@@ -388,7 +403,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address, vk::Buffer buffer,
+               vk::DeviceMemory memory, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::Upload), m_cpu_address(cpu_address),
+      m_buffer(buffer), m_size(size), m_coherent(true), m_in_system_memory(true), m_imported(memory) {}
+
 Buffer::~Buffer() {
+	if (m_imported) { // (tiron7: freed after the GPU work that read it, BufferCache)
+		const auto native_device = static_cast<VkDevice>(m_graphics->device);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, static_cast<VkDeviceMemory>(m_imported), nullptr);
+		return;
+	}
 	DeviceFault::NoteDestroyed(m_device_address);
 	if (m_sparse) {
 		const auto native_device = static_cast<VkDevice>(m_graphics->device);
@@ -561,6 +587,7 @@ void Buffer::MakeResident(uint64_t offset, uint64_t size) {
 			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
 			allocate.memoryTypeIndex = sparse.memory_type;
 			VkDeviceMemory chunk     = VK_NULL_HANDLE;
+			VramDrv::Scope vram_drv(VramDrv::CatSparseBuf); // (VRAM-DRV)
 			// (Refused: release passes and more tries, then the clear out-of-memory message, MemGuard.)
 			for (int attempt = 0; VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device),
 			                                                                     &allocate, nullptr, &chunk) != VK_SUCCESS;

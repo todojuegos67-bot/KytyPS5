@@ -29,6 +29,8 @@ bool MoviePlaying() noexcept;
 bool CinematicPlaying() noexcept;
 // A held in-engine cutscene (KYTY_CUTSCENE_HOLD; until the player moves after its files were read).
 bool CutsceneHeld() noexcept;
+// (cutfg) A held in-engine cutscene with frame generation off (KYTY_CUTSCENE_FG=0; default on: generated like gameplay).
+bool CutsceneFgOff() noexcept;
 // Dynamic frame generation (10-21): the game's 3D view flipped at most `fps` a second, switched at runtime (0: none).
 // Takes effect only when the virtual vblank is a whole multiple of fps (840 Hz: 60 = 14 vblanks, 56 = 15), and never
 // during cinematics, movies or menus. Returns the fps held (0 when refused or none).

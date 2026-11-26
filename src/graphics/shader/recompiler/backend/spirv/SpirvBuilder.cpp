@@ -60,6 +60,10 @@ void Builder::Recycle(std::vector<uint32_t>&& module) {
 	GiveBack(module, t_sections.module);
 }
 
+void Builder::ReleaseThreadPool() {
+	t_sections = {};
+}
+
 uint32_t Builder::AllocateId() {
 	return m_next_id++;
 }

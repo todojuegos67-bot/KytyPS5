@@ -22,9 +22,21 @@
 #include "local/skip-shader.h"
 #include "common/assert.h"
 #include "frame-capture.h"
+#include "par-audit.h" // (A0b) diagnostic only: KYTY_AUDIT off by default
 #include "kernel/memory.h"
+#include "ds-linear-copy-hook.h"
+#include "copia1.h" // (copia1)
 #include "live-census.h"
+#include "otros2.h" // (otros2)
+#include "gancho2.h" // (gancho2)
+#include "port1.h" // (port1)
+#include "port2-report.h" // (port2)
+#include "p7-report.h" // (p7, KYTY_P7)
+#include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
+#include "f0-measure.h" // (f0)
 #include "live-counters.h"
+#include "tiron1.h" // (tiron1)
+#include "tiron3.h" // (lab1 tiron3, KYTY_TIRON3)
 #include "lane-sync.h"
 #include "live-trace.h"
 #include "libs/controller.h"
@@ -34,6 +46,9 @@
 #include "perf-overlay.h"
 #include "slow-log.h"
 #include "time-census.h"
+#include "ds-sombras-ab.h" // (sombras-ab, KYTY_NATIVO_SOMBRAS_AB)
+#include "trusted-depth.h" // (trust1)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE)
 
 #include <algorithm>
 #include <array>
@@ -104,6 +119,403 @@ inline void NoteRenderIdle(int64_t now_ns) {
 	(void)g_render_idle_since.compare_exchange_strong(expected, now_ns, std::memory_order_relaxed);
 }
 
+// (render2) KYTY_RENDER_STATS=1 (off by default): a [render] line every 5 s with the render thread's mean time per
+// frame over ALL the frames of those 5 s, by the same call kinds and phases as the SLOW Frame lines (which only show
+// frames of 20 ms or more: the frames where something new is stored or compiled, not the steady ones the frame rate
+// is made of). "other" is the submissions' time outside draws, dispatches and native draws: the PM4 walk, register
+// writes and what has no scope of its own. Costs two clock reads a frame and one line every 5 s. Render thread.
+inline void RenderStats(int64_t flip_ns) {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_RENDER_STATS");
+		return text != nullptr && *text != '\0' && std::string_view(text) != "0";
+	}();
+	if (!on) return;
+	using C = LiveCounters::Id;
+	static constexpr std::array counted {C::TableDraws,      C::TableContinued,   C::TableDispatches,  C::TableEvaluations,
+	                                     C::TableStores,     C::TableStoreDeferred, C::TableDrawNative, C::XprTries,
+	                                     C::XprHits,         C::XprStores,        C::DirectDraws,      C::RenderPasses,
+	                                     C::ComputePipelines, C::GraphicsPipelines, C::AsyncDrawSkips,  C::ProtectCallsRender,
+	                                     C::UploadBytes,
+	                                     // (render3) what the uploads are made of: the write windows and their pages,
+	                                     // the pages protected again, the copies, the BDA preparations and their region
+	                                     // synchronizations (microseconds on this thread), the upload worker's time.
+	                                     C::UploadCopies,    C::InOrderUploads,   C::WindowFault,      C::WindowPages,
+	                                     C::WriteFault,      C::UnprotectPages,   C::ReprotectPages,   C::RegionSyncs,
+	                                     C::RegionSkips,     C::RegionSyncUs,     C::BufferSyncUs,     C::BdaRangeCalls,
+	                                     C::BdaRanges,       C::BdaRangeMiB,      C::BdaFullSyncs,     C::BdaRebuilds,
+	                                     C::BufferRegistrations, C::UploadBusyUs, C::UploadCallUs,     C::Submissions,
+	                                     C::TableWrittenMemo, C::TableRingCopies, C::TableRingBytes};
+	struct Snapshot {
+		int64_t                                         time_ns = 0, idle_ns = 0, upload_wait_ns = 0;
+		// (render3) the PM4 walk by packet class, the BDA memo's hits and misses, the big-window windows.
+		std::array<uint64_t, LiveCensus::Pm4Classes>    pm4_cycles {}, pm4_packets {};
+		std::array<uint64_t, 2>                         bda_memo {};
+		std::array<uint64_t, 3>                         big_window {};
+		// (render4) the dispatches and PM4 runs by queue, the blocks' V#s, the linear copy hook's counters.
+		std::array<std::array<uint64_t, 2>, 2>          queue_dispatches {}, queue_runs {};
+		std::array<uint64_t, 5>                         table_blocks {};
+		std::array<uint64_t, DsLinearCopyHook::Counters> copy_hook {};
+		// (thread1) the draw calls by kind, those continued, the table draws by target; the two-thread what-if
+		// (LiveCensus::Par2): each side's cycles, slices, waits, the cycles held back and the virtual cycles.
+		std::array<uint64_t, 4>                         xpr_calls {};
+		std::array<uint64_t, 2>                         continued_calls {};
+		std::array<std::array<uint64_t, 2>, LiveCensus::DrawTargets> draw_targets {};
+		std::array<uint64_t, 2>                         par2_side {}, par2_waits {};
+		std::array<std::array<uint64_t, 2>, 2>          par2_slices {};
+		uint64_t                                        par2_stalled = 0, par2_elapsed = 0;
+		uint64_t                                        tsc = 0, thread_cycles = 0, flips = 0;
+		std::array<uint64_t, LiveCensus::Kinds>         kinds {};
+		std::array<uint64_t, LiveCensus::Kinds>         calls {};
+		std::array<uint64_t, LiveCensus::Phases>        dispatch_phases {}, draw_phases {};
+		std::array<std::array<uint64_t, LiveCensus::Phases>, 2> table_phases {};
+		std::array<uint64_t, 4>                         xpr {};
+		std::array<int64_t, LiveCensus::Waits>          waits {};
+		std::array<uint64_t, counted.size()>            counts {};
+	};
+	static Snapshot last;
+	static uint64_t frames = 0;
+	++frames;
+	if (last.time_ns != 0 && flip_ns - last.time_ns < 5'000'000'000ll) return;
+	Snapshot now;
+	now.time_ns        = flip_ns;
+	now.idle_ns        = g_render_idle_ns;
+	now.upload_wait_ns = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
+	now.tsc            = __rdtsc();
+	now.thread_cycles  = LocalPlatform::CurrentThreadCycles();
+	for (size_t i = 0; i < LiveCensus::Kinds; ++i) {
+		now.kinds[i] = LiveCensus::g_kind_cycles[i];
+		now.calls[i] = LiveCensus::g_kind_calls[i];
+	}
+	for (size_t i = 0; i < LiveCensus::Phases; ++i) {
+		now.dispatch_phases[i] = LiveCensus::g_dispatch_phase_cycles[i];
+		now.draw_phases[i]     = LiveCensus::g_draw_phase_cycles[i];
+		now.table_phases[0][i] = LiveCensus::g_table_phase_cycles[0][i];
+		now.table_phases[1][i] = LiveCensus::g_table_phase_cycles[1][i];
+	}
+	for (size_t i = 0; i < 4; ++i) now.xpr[i] = LiveCensus::g_xpr_cycles[i];
+	for (size_t i = 0; i < LiveCensus::Waits; ++i) now.waits[i] = LiveCensus::g_waits_ns[i];
+	for (size_t i = 0; i < counted.size(); ++i) now.counts[i] = LiveCounters::Value(counted[i]);
+	for (size_t i = 0; i < LiveCensus::Pm4Classes; ++i) {
+		now.pm4_cycles[i]  = LiveCensus::g_pm4_cycles[i];
+		now.pm4_packets[i] = LiveCensus::g_pm4_packets[i];
+	}
+	for (size_t i = 0; i < now.bda_memo.size(); ++i) now.bda_memo[i] = LiveCensus::g_bda_memo[i];
+	for (size_t i = 0; i < now.big_window.size(); ++i)
+		now.big_window[i] = LiveCensus::g_big_window[i].load(std::memory_order_relaxed);
+	for (size_t q = 0; q < 2; ++q)
+		for (size_t i = 0; i < 2; ++i) {
+			now.queue_dispatches[q][i] = LiveCensus::g_queue_dispatches[q][i];
+			now.queue_runs[q][i]       = LiveCensus::g_queue_runs[q][i];
+		}
+	for (size_t i = 0; i < now.table_blocks.size(); ++i) now.table_blocks[i] = LiveCensus::g_table_blocks[i];
+	for (size_t i = 0; i < now.copy_hook.size(); ++i)
+		now.copy_hook[i] = DsLinearCopyHook::g_counters[i].load(std::memory_order_relaxed);
+	// (thread1)
+	for (size_t i = 0; i < now.xpr_calls.size(); ++i) now.xpr_calls[i] = LiveCensus::g_xpr_calls[i];
+	for (size_t i = 0; i < now.continued_calls.size(); ++i) now.continued_calls[i] = LiveCensus::g_continued_calls[i];
+	for (size_t t = 0; t < LiveCensus::DrawTargets; ++t)
+		for (size_t i = 0; i < 2; ++i) now.draw_targets[t][i] = LiveCensus::g_draw_targets[t][i];
+	for (size_t q = 0; q < 2; ++q) {
+		now.par2_side[q]  = LiveCensus::Par2::g_side_cycles[q];
+		now.par2_waits[q] = LiveCensus::Par2::g_waits[q];
+		for (size_t i = 0; i < 2; ++i) now.par2_slices[q][i] = LiveCensus::Par2::g_slices[q][i];
+	}
+	now.par2_stalled = LiveCensus::Par2::g_stalled;
+	now.par2_elapsed = LiveCensus::Par2::g_elapsed;
+	if (last.time_ns != 0 && frames != 0 && now.tsc > last.tsc) {
+		const double n       = static_cast<double>(frames);
+		const double wall_ms = static_cast<double>(now.time_ns - last.time_ns) / 1e6;
+		// (ms per TSC cycle over these 5 s; a frame's share of each kind.)
+		const double per_cycle = wall_ms / static_cast<double>(now.tsc - last.tsc) / n;
+		const auto   kind      = [&](size_t i) { return static_cast<double>(now.kinds[i] - last.kinds[i]) * per_cycle; };
+		const auto   each      = [&](size_t i) { return static_cast<double>(now.calls[i] - last.calls[i]) / n; };
+		const double submission = kind(LiveCensus::Submission), dispatch = kind(LiveCensus::Dispatch);
+		const double draw = kind(LiveCensus::Draw), xpr = kind(LiveCensus::NativeXpr);
+		std::printf("[render] %.1f s, %llu frames (%.1f fps): frame %.2f ms, cpu %.2f, idle %.2f | submissions %.2f = native "
+		            "draws %.2f (%.0f calls) + dispatches %.2f (%.0f) + normal draws %.2f (%.0f) + other %.2f; guest "
+		            "commands %.2f, command sync %.2f",
+		            wall_ms / 1e3, static_cast<unsigned long long>(frames), n * 1e3 / wall_ms, wall_ms / n,
+		            now.thread_cycles != 0 && last.thread_cycles != 0
+		                ? static_cast<double>(now.thread_cycles - last.thread_cycles) * per_cycle
+		                : 0.0,
+		            static_cast<double>(now.idle_ns - last.idle_ns) / 1e6 / n, submission, xpr, each(LiveCensus::NativeXpr),
+		            dispatch, each(LiveCensus::Dispatch), draw, each(LiveCensus::Draw), submission - xpr - dispatch - draw,
+		            kind(LiveCensus::GuestCommand), kind(LiveCensus::CommandSync));
+		std::printf(" | xpr");
+		for (size_t i = 0; i < 4; ++i)
+			if (const double ms = static_cast<double>(now.xpr[i] - last.xpr[i]) * per_cycle; ms >= 0.005)
+				std::printf(" %zu=%.2f", i, ms);
+		std::printf(" | dispatch");
+		for (size_t i = 0; i < LiveCensus::Phases; ++i)
+			if (const double ms = static_cast<double>(now.dispatch_phases[i] - last.dispatch_phases[i]) * per_cycle; ms >= 0.005)
+				std::printf(" %s=%.2f", LiveCensus::DispatchPhaseNames[i], ms);
+		std::printf(" | draw");
+		for (size_t i = 0; i < LiveCensus::Phases; ++i)
+			if (const double ms = static_cast<double>(now.draw_phases[i] - last.draw_phases[i]) * per_cycle; ms >= 0.005)
+				std::printf(" %s=%.2f", LiveCensus::DrawPhaseNames[i], ms);
+		// (table-xpr.inc's scopes: 0 the whole try; draws: 1 evaluate and gather, 2 set, 3 buffers and blocks, 9 and 4
+		// emission, 5 to 7 set proofs, 10 and 11 held-buffer misses; dispatches: 1 evaluate and gather, 2 set, 3 blocks,
+		// 4 emission. Nested scopes count in both. render3, inside 3: draws 12 the BDA preparation (its uploads), 13 the
+		// blocks; dispatches 5 the BDA preparation, 6 the blocks, 7 the indirect arguments. thread1, draws: 14 what
+		// NativeXprTry does before the table try (pending operations, lock, sets retired, state key), 15 the table
+		// try's lookups up to TableDraw (inside 0).)
+		static constexpr const char* table_names[2] = {"table draws", "table dispatches"};
+		for (size_t t = 0; t < 2; ++t) {
+			std::printf(" | %s", table_names[t]);
+			for (size_t i = 0; i < LiveCensus::Phases; ++i)
+				if (const double ms = static_cast<double>(now.table_phases[t][i] - last.table_phases[t][i]) * per_cycle; ms >= 0.005)
+					std::printf(" %zu=%.2f", i, ms);
+		}
+		static constexpr const char* waits[] = {"gpu", "readback", "download", "compile", "record"};
+		std::printf(" | waits");
+		for (size_t i = 0; i < LiveCensus::Waits; ++i)
+			if (const double ms = static_cast<double>(now.waits[i] - last.waits[i]) / 1e6 / n; ms >= 0.005)
+				std::printf(" %s=%.2f", waits[i], ms);
+		std::printf(" upload=%.2f | per frame", static_cast<double>(now.upload_wait_ns - last.upload_wait_ns) / 1e6 / n);
+		for (size_t i = 0; i < counted.size(); ++i)
+			if (const auto delta = now.counts[i] - last.counts[i]; delta != 0)
+				std::printf(" %s=%.1f", LiveCounters::Names[counted[i]], static_cast<double>(delta) / n);
+		// (render3) Where "other" goes: the PM4 walk by packet class, ms a frame from a packet's start to the next one's
+		// (so "draws" and "dispatches" hold the native draws, normal draws and dispatches above plus their packets'
+		// own walk; the register packets, NOPs and the rest are "other") and the packets a frame.
+		std::printf(" | pm4");
+		for (size_t i = 0; i < LiveCensus::Pm4Classes; ++i)
+			if (const auto packets = now.pm4_packets[i] - last.pm4_packets[i], cycles = now.pm4_cycles[i] - last.pm4_cycles[i];
+			    packets != 0 || cycles != 0)
+				std::printf(" %s=%.2f (%.0f)", LiveCensus::Pm4ClassNames[i], static_cast<double>(cycles) * per_cycle,
+				            static_cast<double>(packets) / n);
+		// (render3) KYTY_BDA_MEMO's hits and misses, and the big-window granules' windows (flat 1 MiB ones; grown ones
+		// and their pages, KYTY_BIG_WINDOW_GROW), a frame.
+		std::printf(" | bda_memo hits=%.1f misses=%.1f | big_window flat=%.1f grown=%.1f grown_pages=%.1f",
+		            static_cast<double>(now.bda_memo[0] - last.bda_memo[0]) / n,
+		            static_cast<double>(now.bda_memo[1] - last.bda_memo[1]) / n,
+		            static_cast<double>(now.big_window[0] - last.big_window[0]) / n,
+		            static_cast<double>(now.big_window[1] - last.big_window[1]) / n,
+		            static_cast<double>(now.big_window[2] - last.big_window[2]) / n);
+		// (render4) The dispatches by queue: a frame's dispatches and their ms in the graphics queue (dcb) and in the
+		// async compute queues (acb), and the whole PM4 runs of each (packets, draws and dispatches: what a queue costs
+		// this thread).
+		std::printf(" | queues");
+		static constexpr const char* queue_names[2] = {"dcb", "acb"};
+		for (size_t q = 0; q < 2; ++q)
+			std::printf(" %s dispatches=%.0f (%.2f ms) run=%.2f ms", queue_names[q],
+			            static_cast<double>(now.queue_dispatches[q][0] - last.queue_dispatches[q][0]) / n,
+			            static_cast<double>(now.queue_dispatches[q][1] - last.queue_dispatches[q][1]) * per_cycle,
+			            static_cast<double>(now.queue_runs[q][1] - last.queue_runs[q][1]) * per_cycle);
+		// (render4) The 8 compute shaders with most dispatches: the program's hash (or @ its address when the dispatch's
+		// path had no program; linear_copy: the linear copy's register check), dispatches a frame and their ms. The
+		// table is these 5 s' and is emptied here (this thread is its only writer).
+		{
+			std::array<LiveCensus::ShaderStat, 8> top {};
+			size_t                                shaders = 0;
+			for (auto& entry: LiveCensus::g_shader_stats) {
+				if (entry.calls == 0) continue;
+				++shaders;
+				auto candidate = entry;
+				for (auto& slot: top)
+					if (candidate.calls > slot.calls) std::swap(candidate, slot);
+				entry = {};
+			}
+			std::printf(" | cs %zu shaders, top", shaders);
+			for (const auto& slot: top) {
+				if (slot.calls == 0) break;
+				const double dispatches = static_cast<double>(slot.calls) / n;
+				const double ms         = static_cast<double>(slot.cycles) * per_cycle;
+				if (slot.shader == LiveCensus::LinearCopyShader) std::printf(" linear_copy=%.0f (%.2f)", dispatches, ms);
+				else if ((slot.shader >> 48u) == 0)
+					std::printf(" @%llx=%.0f (%.2f)", static_cast<unsigned long long>(slot.shader), dispatches, ms);
+				else std::printf(" %016llx=%.0f (%.2f)", static_cast<unsigned long long>(slot.shader), dispatches, ms);
+			}
+			if (LiveCensus::g_shader_stats_dropped != 0)
+				std::printf(" dropped=%llu", static_cast<unsigned long long>(LiveCensus::g_shader_stats_dropped));
+			LiveCensus::g_shader_stats_dropped = 0;
+		}
+		// (render4) The blocks' V#s a frame (table dispatches' phase 6, table draws' phase 13): written ones and those
+		// of them that went through ObtainBuffer; read-only ones, those resolved again and those proved clean again.
+		{
+			const auto blocks = [&](size_t i) { return static_cast<double>(now.table_blocks[i] - last.table_blocks[i]) / n; };
+			std::printf(" | blocks written=%.0f obtained=%.0f read=%.0f resolved=%.0f reproved=%.0f", blocks(0), blocks(1),
+			            blocks(2), blocks(3), blocks(4));
+		}
+		// (render4) KYTY_DS_LINEAR_COPY_HOOK, a frame: the game's linear copies (calls), the packets sealed, the copies
+		// made from them (taken) and those left to the game's packets (passed); with any, why packets were not sealed and
+		// the verify mode's results.
+		if (now.copy_hook[DsLinearCopyHook::Calls] != 0) {
+			using H = DsLinearCopyHook::Counter;
+			const auto hook = [&](H i) { return static_cast<double>(now.copy_hook[i] - last.copy_hook[i]) / n; };
+			std::printf(" | ds_copy_hook calls=%.1f sealed=%.1f taken=%.1f passed=%.1f", hook(H::Calls), hook(H::Sealed),
+			            hook(H::Taken), hook(H::Passed));
+			static constexpr std::array<std::pair<H, const char*>, 6> rest {{{H::NotPlain, "not_plain"},
+			                                                                {H::NoRoom, "no_room"},
+			                                                                {H::OtherPackets, "other_packets"},
+			                                                                {H::VerifySame, "verify_same"},
+			                                                                {H::VerifyDifferent, "verify_different"},
+			                                                                {H::VerifyRefused, "verify_refused"}}};
+			for (const auto& [id, name]: rest)
+				if (now.copy_hook[id] != last.copy_hook[id]) std::printf(" %s=%.1f", name, hook(id));
+		}
+		// (thread1) What a frame's draws are: the draw calls by kind (runs of DRAW_INDEX_INDIRECT and multi draws,
+		// direct indexed draws, draws of vertices: the "xpr" times above are theirs, in that order) and how many of
+		// them a clean continuation took; the table draws by what they draw into, calls and draws (depth_layered: a
+		// depth image of 4 layers or more alone - the sun's cascades; depth: another depth image alone; color: the rest).
+		{
+			const auto calls = [&](size_t i) { return static_cast<double>(now.xpr_calls[i] - last.xpr_calls[i]) / n; };
+			const auto continued = [&](size_t i) {
+				return static_cast<double>(now.continued_calls[i] - last.continued_calls[i]) / n;
+			};
+			std::printf(" | draw calls runs=%.0f (continued %.0f) direct=%.0f (continued %.0f) vertices=%.0f | draws into",
+			            calls(0), continued(0), calls(1), continued(1), calls(2));
+			for (size_t t = 0; t < LiveCensus::DrawTargets; ++t)
+				std::printf(" %s=%.0f (%.0f)", LiveCensus::DrawTargetNames[t],
+				            static_cast<double>(now.draw_targets[t][0] - last.draw_targets[t][0]) / n,
+				            static_cast<double>(now.draw_targets[t][1] - last.draw_targets[t][1]) / n);
+		}
+		// (thread1) The two-thread what-if (LiveCensus::Par2; nothing runs differently): a frame's slices by side (dcb
+		// the graphics queue, acb the async compute queues), ms and slices (and those that stopped at a wait); the ms
+		// both sides would take on a thread each with the game's labels kept in order and a free hand-over
+		// (two_threads: the split's ceiling is serial - two_threads); the ms a side was held back waiting for a label of
+		// the other (stalled); the waits satisfied by a label written here and those of them that held their side back.
+		{
+			const auto side = [&](size_t q) { return static_cast<double>(now.par2_side[q] - last.par2_side[q]) * per_cycle; };
+			const auto slices = [&](size_t q, size_t i) {
+				return static_cast<double>(now.par2_slices[q][i] - last.par2_slices[q][i]) / n;
+			};
+			std::printf(" | par2 serial=%.2f ms (dcb %.2f, %.0f slices, %.0f at a wait; acb %.2f, %.0f slices, %.0f at a wait) "
+			            "two_threads=%.2f ms stalled=%.2f ms label_waits=%.0f held=%.0f",
+			            side(0) + side(1), side(0), slices(0, 0), slices(0, 1), side(1), slices(1, 0), slices(1, 1),
+			            static_cast<double>(now.par2_elapsed - last.par2_elapsed) * per_cycle,
+			            static_cast<double>(now.par2_stalled - last.par2_stalled) * per_cycle,
+			            static_cast<double>(now.par2_waits[0] - last.par2_waits[0]) / n,
+			            static_cast<double>(now.par2_waits[1] - last.par2_waits[1]) / n);
+		}
+		// (render5) The switches' modes and their verifications' differences since start (each must stay 0; the
+		// [render5] line has them a frame).
+		std::printf(" | render5 census_light=%u reg_lane=%u (different %llu) draw_flags=%u (mismatches %llu)",
+		            Render5::Mode(Render5::CensusLight), Render5::Mode(Render5::RegLane),
+		            static_cast<unsigned long long>(Render5::g_lane[Render5::LaneDifferent]), Render5::Mode(Render5::DrawFlags),
+		            static_cast<unsigned long long>(Render5::g_flags[Render5::FlagMismatches].load(std::memory_order_relaxed)));
+		std::printf("\n");
+		std::fflush(stdout);
+	} else {
+		// (render4) No line (the first window): the shaders' table starts with the next.
+		for (auto& entry: LiveCensus::g_shader_stats) entry = {};
+		LiveCensus::g_shader_stats_dropped = 0;
+	}
+	last   = now;
+	frames = 0;
+}
+
+// (render5) A [render5] line every 5 s while any of KYTY_CENSUS_LIGHT, KYTY_REG_LANE, KYTY_DRAW_FLAGS is on (render5.h),
+// whatever KYTY_RENDER_STATS says, a frame's share: the census scopes skipped (1) or that 1 would skip (2, with what
+// they cost at the scope cost measured at start); the register lane's runs and packets, and with 2 the guest commands
+// and feedback write-backs it would postpone and its differences from the walk (must be 0); the draw flags' checks and
+// mismatches (2; must be 0). Render thread.
+inline void Render5Report(int64_t flip_ns) {
+	static int64_t  last_ns   = 0;
+	static uint64_t last_tsc  = 0, frames = 0;
+	static std::array<uint64_t, Render5::LaneCounters>   last_lane {};
+	static std::array<uint64_t, Render5::CensusCounters> last_census {};
+	static std::array<uint64_t, Render5::FlagCounters>   last_flags {};
+	++frames;
+	if (last_ns != 0 && flip_ns - last_ns < 5'000'000'000ll) return;
+	const uint32_t census = Render5::Mode(Render5::CensusLight), lane = Render5::Mode(Render5::RegLane),
+	               flags = Render5::Mode(Render5::DrawFlags);
+	const uint64_t tsc = __rdtsc();
+	if (last_ns != 0 && (census | lane | flags) != 0 && frames != 0 && tsc > last_tsc) {
+		const double n          = static_cast<double>(frames);
+		const double ms_per_tsc = static_cast<double>(flip_ns - last_ns) / 1e6 / static_cast<double>(tsc - last_tsc);
+		const auto   lane_d     = [&](uint32_t i) { return static_cast<double>(Render5::g_lane[i] - last_lane[i]) / n; };
+		const auto   census_d   = [&](uint32_t i) { return static_cast<double>(Render5::g_census[i] - last_census[i]) / n; };
+		const auto   flags_d    = [&](uint32_t i) {
+			return static_cast<double>(Render5::g_flags[i].load(std::memory_order_relaxed) - last_flags[i]) / n;
+		};
+		std::printf("[render5] %.1f s, %llu frames (%.1f fps) | census_light=%u skipped=%.0f would_skip=%.0f",
+		            static_cast<double>(flip_ns - last_ns) / 1e9, static_cast<unsigned long long>(frames), n * 1e9 / static_cast<double>(flip_ns - last_ns), census,
+		            census_d(Render5::CensusSkipped), census_d(Render5::CensusWouldSkip));
+		if (Render5::g_census_scope_cycles != 0)
+			std::printf(" (~%.2f ms a frame at %llu cycles a scope)",
+			            census_d(Render5::CensusWouldSkip) * static_cast<double>(Render5::g_census_scope_cycles) * ms_per_tsc,
+			            static_cast<unsigned long long>(Render5::g_census_scope_cycles));
+		std::printf(" | reg_lane=%u runs=%.0f packets=%.0f postponed_commands=%.1f postponed_feedback=%.1f different=%.0f", lane,
+		            lane_d(Render5::LaneRuns), lane_d(Render5::LanePackets), lane_d(Render5::LanePostponed),
+		            lane_d(Render5::LaneFeedback), lane_d(Render5::LaneDifferent));
+		std::printf(" | draw_flags=%u checks=%.0f mismatches=%.0f\n", flags, flags_d(Render5::FlagChecks),
+		            flags_d(Render5::FlagMismatches));
+		std::fflush(stdout);
+	}
+	for (uint32_t i = 0; i < Render5::LaneCounters; ++i) last_lane[i] = Render5::g_lane[i];
+	for (uint32_t i = 0; i < Render5::CensusCounters; ++i) last_census[i] = Render5::g_census[i];
+	for (uint32_t i = 0; i < Render5::FlagCounters; ++i) last_flags[i] = Render5::g_flags[i].load(std::memory_order_relaxed);
+	last_ns  = flip_ns;
+	last_tsc = tsc;
+	frames   = 0;
+}
+
+// (mdraw C0/C1) KYTY_MDRAW_STATS=1 / KYTY_MDRAW_SKIP=1|2 (LiveCensus::Mdraw in live-census.h, measured in table-xpr.inc
+// TableDraw): an [mdraw] line every 5 s, per frame over the window: the render thread's frame, cpu, idle and
+// submissions (as the [render] line takes them: with SKIP=2 the ON and OFF windows' cpu compared is the real saving),
+// the table calls, the multi-draw groups by size (calls), the members (calls a group would drop) and their measured
+// cycles (whole call, emission, preparation), why groups ended, what differs inside them. Render thread (Flip).
+inline void MdrawReport(int64_t flip_ns) {
+	if (!LiveCensus::Mdraw::Active()) return;
+	namespace Md = LiveCensus::Mdraw;
+	static int64_t  last_ns = 0, last_idle = 0;
+	static uint64_t last_tsc = 0, last_thread = 0, last_submission = 0, frames = 0;
+	++frames;
+	if (last_ns != 0 && flip_ns - last_ns < 5'000'000'000ll) return;
+	const uint64_t tsc        = __rdtsc();
+	const uint64_t thread     = LocalPlatform::CurrentThreadCycles();
+	const uint64_t submission = LiveCensus::g_kind_cycles[LiveCensus::Submission];
+	Md::Close(); // (the open group, counted in this window)
+	auto&          c    = Md::g_c;
+	const uint32_t skip = Md::SkipMode();
+	if (last_ns != 0 && frames != 0 && tsc > last_tsc) {
+		const double n          = static_cast<double>(frames);
+		const double wall_ms    = static_cast<double>(flip_ns - last_ns) / 1e6;
+		const double ms_per_tsc = wall_ms / static_cast<double>(tsc - last_tsc);
+		const auto   each       = [&](uint64_t value) { return static_cast<double>(value) / n; };
+		const auto   ms         = [&](uint64_t cycles) { return static_cast<double>(cycles) * ms_per_tsc / n; };
+		const char*  window     = skip == 0 ? "stats" : skip == 1 ? "SKIP" : Md::g_window_on ? "ON" : "OFF";
+		const double us_member  = c.members != 0 ? static_cast<double>(c.member_cycles) * ms_per_tsc * 1e3 / static_cast<double>(c.members) : 0.0;
+		const double us_call    = c.calls != 0 ? static_cast<double>(c.all_cycles) * ms_per_tsc * 1e3 / static_cast<double>(c.calls) : 0.0;
+		std::printf("[mdraw] %s %.1f s, %llu frames (%.1f fps): frame %.2f ms, cpu %.2f, idle %.2f, submissions %.2f | calls %.0f "
+		            "draws %.0f groups %.1f members %.1f (draws %.1f) skipped %.1f (draws %.1f) | hist",
+		            window, wall_ms / 1e3, static_cast<unsigned long long>(frames), n * 1e3 / wall_ms, wall_ms / n,
+		            last_thread != 0 && thread != 0 ? static_cast<double>(thread - last_thread) * ms_per_tsc / n : 0.0,
+		            static_cast<double>(g_render_idle_ns - last_idle) / 1e6 / n, ms(submission - last_submission),
+		            each(c.calls), each(c.draws), each(c.groups), each(c.members), each(c.member_draws), each(c.skipped),
+		            each(c.skipped_draws));
+		for (uint32_t i = 0; i < Md::Buckets; ++i) std::printf(" %s=%.1f", Md::BucketNames[i], each(c.hist[i]));
+		std::printf(" | t_total_candidatos %.3f ms t_emision %.3f t_preparacion_por_draw %.3f | us_member %.3f us_call %.3f "
+		            "emision_call %.3f ms | ahorro_potencial_ms %.3f = %.1f eliminables x %.3f us | breaks",
+		            ms(c.member_cycles), ms(c.member_emit), ms(c.member_prep), us_member, us_call, ms(c.all_emit),
+		            each(c.members) * us_member / 1e3, each(c.members), us_member);
+		for (uint32_t i = 0; i < Md::Breaks; ++i)
+			if (c.breaks[i] != 0) std::printf(" %s=%.1f", Md::BreakNames[i], each(c.breaks[i]));
+		std::printf(" | fields");
+		for (uint32_t i = 0; i < Md::Fields; ++i)
+			if (c.fields[i] != 0) std::printf(" %s=%.1f", Md::FieldNames[i], each(c.fields[i]));
+		std::printf(" | ud_member");
+		for (uint32_t i = 0; i < 32; ++i)
+			if (c.ud_member[0][i] != 0) std::printf(" vs%u=%.1f", i, each(c.ud_member[0][i]));
+		std::printf(" | ud_break");
+		for (uint32_t st = 0; st < 2; ++st)
+			for (uint32_t i = 0; i < 32; ++i)
+				if (c.ud_break[st][i] != 0) std::printf(" %s%u=%.1f", st == 0 ? "vs" : "ps", i, each(c.ud_break[st][i]));
+		std::printf("\n");
+		std::fflush(stdout);
+		if (skip == 2) Md::g_window_on = !Md::g_window_on; // (the next window the other way)
+	}
+	c                  = Md::Counters {};
+	Md::g_last.valid   = false; // (groups do not cross windows)
+	last_ns            = flip_ns;
+	last_idle          = g_render_idle_ns;
+	last_tsc           = tsc;
+	last_thread        = thread;
+	last_submission    = submission;
+	frames             = 0;
+}
+
 // Render thread. With KYTY_HITCH_LOG_MS (or KYTY_SLOW_LOG_MS), a frame (flip to flip) that long and
 // at least 20 ms is a SLOW line too, on the same TSC timeline: the hitch the slow calls before it explain.
 // The line also has the frame's render-thread wait for guest work, what some counters did in it and its
@@ -117,6 +529,29 @@ inline void Flip() {
 	g_flips.store(flip + 1, std::memory_order_release);
 	// (KYTY_FPS_HUD's frame-time graph: the frame and the render thread's busy part of it.)
 	PerfOverlay::NoteFlip(flip_ns, g_render_idle_ns);
+	RenderStats(flip_ns); // (render2, KYTY_RENDER_STATS)
+	ParAudit::OnFlip(); // (A0b) window clock and report, KYTY_AUDIT only
+	MdrawReport(flip_ns); // (mdraw C0/C1, KYTY_MDRAW_STATS / KYTY_MDRAW_SKIP; one relaxed load when off)
+	if (LiveCensus::RenderStatsOn()) Otros1::Report(flip_ns, 0.0); // (otros1, KYTY_OTROS1)
+	if (LiveCensus::RenderStatsOn()) Otros2::Report(flip_ns);      // (otros2, KYTY_OTROS2)
+	if (LiveCensus::RenderStatsOn()) Gancho2::Report(flip_ns);     // (gancho2, KYTY_GANCHO2)
+	Port1::Report(flip_ns);                                         // (port1, KYTY_PORT1; one load when off)
+	Port2::Report(flip_ns);                                         // (port2, KYTY_PORT2; one load when off)
+	P7::Report(flip_ns);                                            // (p7, KYTY_P7; one load when off)
+	Tiron3::OnFlip(flip_ns, g_render_tid.load(std::memory_order_relaxed), g_stack_low, g_stack_high); // (lab1 tiron3)
+	G1::Flip(flip_ns);                                              // (g1, KYTY_G1_PROBE / KYTY_G1_STATE; one load when off)
+	if (F5p1Techo::On()) // (f5p1 techo, KYTY_F5P1_TECHO)
+		F5p1Techo::Report(flip_ns, g_render_idle_ns, LiveCensus::g_kind_cycles[LiveCensus::Submission]);
+	if (F0Measure::On()) // (f0, KYTY_F0)
+		F0Measure::Flip(flip_ns, g_render_idle_ns,
+		                LiveCensus::g_waits_ns[LiveCensus::WaitGpu] + LiveCensus::g_waits_ns[LiveCensus::WaitReadback] +
+		                    LiveCensus::g_waits_ns[LiveCensus::WaitDownload],
+		                Port2::Mode() == 1 ? (Port2::g_window_on.load(std::memory_order_relaxed) ? 1 : 2) : G1::AbWindow()); // (g1: STATE=1's windows)
+	LiveCensus::Par2::Flipped(); // (trust1: the two-thread what-if's frame ends at this flip)
+	TrustedDepth::OnFlip(flip_ns); // (trust1: the [trust1] line, KYTY_RENDER_STATS / KYTY_DS_TRUSTED_DEPTH)
+	Render5Report(flip_ns); // (render5)
+	DsSombrasAb::OnFlip(flip_ns, g_render_idle_ns, LiveCensus::g_waits_ns[LiveCensus::WaitCompile]); // (sombras-ab; nada si apagado)
+	Copia1::NoteFrame();    // (copia1: the [copia1] line's frames)
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;
 		static constexpr std::array counted {C::XprStores, C::XprStored, C::XprStorePending, C::XprRefuseBind,
@@ -195,7 +630,9 @@ inline void Flip() {
 				using G = LiveCounters::Id;
 				static constexpr std::array guest {G::WindowFault, G::WriteFault, G::ReadFault, G::Reprotect, G::Unprotect,
 				                                   G::ProtectCalls, G::SyncReadsGuest, G::SyncDownloads, G::GuestCommands,
-				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs};
+				                                   G::BackingLockWaitUs, G::BackingWriteWaitUs, G::UploadWaitUs,
+				                                   G::ProtectCallsRender, G::ProtectCallsGfx, G::RenderReadFaults, G::SyncReadsRender,
+				                                   G::AddressSpaceWaitKtRender, G::TimelineQueriesRender, G::QueueLockUs, G::TranslateUs};
 				static std::array<uint64_t, guest.size()> last_guest {};
 				std::printf("[fps+]");
 				for (size_t i = 0; i < guest.size(); ++i) {
@@ -264,6 +701,37 @@ inline void Flip() {
 			                                   .count()));
 			std::fflush(stdout);
 		}
+		// (tiron1, KYTY_TIRON1=1) The frame by cause, from the SLOW Frame line's sources; a [tiron1] line every 5 s.
+		if (Tiron1::On() && last != std::chrono::steady_clock::time_point {}) {
+			Tiron1::FrameCost cost;
+			cost.ms = ms;
+			if (ms > 25.0) {
+				const double per_cycle = tsc > last_tsc ? ms / static_cast<double>(tsc - last_tsc) : 0.0;
+				const auto   kind_ms   = [&](size_t kind) {
+                    return static_cast<double>(LiveCensus::g_kind_cycles[kind] - last_kind_cycles[kind]) * per_cycle;
+				};
+				const auto count = [&](C id) -> uint64_t {
+					for (size_t i = 0; i < counted.size(); ++i)
+						if (counted[i] == id) return LiveCounters::Value(id) - last_counts[i];
+					return 0;
+				};
+				const auto wait_ms = [&](size_t wait) { return static_cast<double>(LiveCensus::g_waits_ns[wait] - last_waits[wait]) / 1e6; };
+				cost.idle           = static_cast<double>(g_render_idle_ns - last_idle) / 1e6;
+				cost.draw           = kind_ms(LiveCensus::Draw);
+				cost.xpr            = kind_ms(LiveCensus::NativeXpr);
+				cost.programs       = kind_ms(LiveCensus::GraphicsPrograms) +
+				                static_cast<double>(LiveCensus::g_dispatch_phase_cycles[0] - last_dispatch_phases[0]) * per_cycle;
+				cost.dispatch_table = static_cast<double>(LiveCensus::g_dispatch_phase_cycles[10] - last_dispatch_phases[10]) * per_cycle;
+				cost.compile        = wait_ms(LiveCensus::WaitCompile);
+				cost.gpu_waits      = wait_ms(LiveCensus::WaitGpu) + wait_ms(LiveCensus::WaitReadback) +
+				                 wait_ms(LiveCensus::WaitDownload) + wait_ms(LiveCensus::WaitRecord);
+				cost.upload_wait    = static_cast<double>(LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed) - last_upload_wait) / 1e6;
+				cost.image_init     = static_cast<double>(count(C::ImageInitUs)) / 1000.0;
+				cost.store_deferred = count(C::TableStoreDeferred);
+				cost.xpr_stores     = count(C::XprStores);
+			}
+			Tiron1::NoteFrame(cost, now);
+		}
 		last      = now;
 		last_tsc  = tsc;
 		last_idle = g_render_idle_ns;
@@ -278,6 +746,9 @@ inline void Flip() {
 		for (size_t i = 0; i < LiveCensus::Waits; ++i) last_waits[i] = LiveCensus::g_waits_ns[i];
 		for (size_t i = 0; i < counted.size(); ++i) last_counts[i] = LiveCounters::Value(counted[i]);
 	}
+	// (agente2) Standard output is fully buffered (ds-main.cpp): what any thread printed since the last flip reaches
+	// the log now, in one write (a crash loses at most one frame of lines). Nothing buffered: a lock and a test.
+	std::fflush(stdout);
 }
 
 inline double ThreadCpuSeconds(uint64_t thread) {

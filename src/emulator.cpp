@@ -22,10 +22,18 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/trim.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
+#include "local/alloc-grande.h"
+#include "local/commit-line.h"
 #include "local/local-platform.h"
+
+// alloc-grande.h brings <windows.h>, whose DeleteFile macro renames Common::File::DeleteFile
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
 
 #include <cstdlib>
 #include <filesystem>
@@ -133,6 +141,10 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	// (ALLOC-GRANDE, KYTY_ALLOC_GRANDE=1: solo mide) Quien pide los bloques de 256 MiB o mas, antes de los graficos.
+	AllocGrande::Start();
+	// (COMMIT-LINE, KYTY_COMMIT_LINE=1 por defecto: solo mide) [commit] cada 10 s: commit del proceso y del sistema, RAM.
+	CommitLine::Start();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
@@ -218,6 +230,7 @@ void Run(const RunOptions& options) {
 	Libs::InitAll(rt->Symbols());
 
 	Libs::Trophy::Preload();
+	Libs::Trim::Start(); // (recorte1: KYTY_TRIM=1 only)
 
 	LoadElf(options.elf);
 

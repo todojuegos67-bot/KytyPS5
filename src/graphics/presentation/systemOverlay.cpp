@@ -30,6 +30,24 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <climits>
+#include <memory>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -422,6 +440,66 @@ PFN_vkVoidFunction LoadVulkanFunction(const char* name, void* user_data) {
 	return graphics.instance.getProcAddr(name);
 }
 
+// (up1120, upstream 5b2af6f) A font file mapped read-only, for the atlas to read in place (ImFontConfig::
+// FontDataOwnedByAtlas false; ImGui only reads a font's data). The atlas loads glyphs as they are drawn, so only the pages
+// of the tables and glyphs used are read in, and they are the file's (clean pages the system drops and reads again), where
+// AddFontFromFileTTF kept a heap copy of each whole file for as long as the overlay lived (~20 MiB for msyh.ttc).
+// Null data: not mapped (the caller reads it as before).
+class MappedFontFile {
+public:
+	explicit MappedFontFile(const std::string& path) {
+#ifdef _WIN32
+		HANDLE file = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+		                            FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) {
+			return;
+		}
+		LARGE_INTEGER size {};
+		if (::GetFileSizeEx(file, &size) != 0 && size.QuadPart > 0 && size.QuadPart <= INT_MAX) {
+			if (HANDLE mapping = ::CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr); mapping != nullptr) {
+				m_data = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+				::CloseHandle(mapping); // (the view keeps the mapping)
+				m_size = m_data != nullptr ? static_cast<size_t>(size.QuadPart) : 0;
+			}
+		}
+		::CloseHandle(file);
+#else
+		const int file = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+		if (file < 0) {
+			return;
+		}
+		struct stat info {};
+		if (::fstat(file, &info) == 0 && info.st_size > 0 && info.st_size <= INT_MAX) {
+			void* data = ::mmap(nullptr, static_cast<size_t>(info.st_size), PROT_READ, MAP_PRIVATE, file, 0);
+			if (data != MAP_FAILED) {
+				m_data = data;
+				m_size = static_cast<size_t>(info.st_size);
+			}
+		}
+		::close(file); // (the mapping keeps the file)
+#endif
+	}
+	~MappedFontFile() {
+		if (m_data == nullptr) {
+			return;
+		}
+#ifdef _WIN32
+		::UnmapViewOfFile(m_data);
+#else
+		::munmap(m_data, m_size);
+#endif
+	}
+	MappedFontFile(const MappedFontFile&)            = delete;
+	MappedFontFile& operator=(const MappedFontFile&) = delete;
+
+	[[nodiscard]] void* Data() const { return m_data; }
+	[[nodiscard]] int   Size() const { return static_cast<int>(m_size); }
+
+private:
+	void*  m_data = nullptr;
+	size_t m_size = 0;
+};
+
 void CheckVulkanResult(VkResult result) {
 	EXIT_IF(result != VK_SUCCESS);
 }
@@ -674,11 +752,11 @@ struct SystemOverlay::Impl {
 			return file != nullptr;
 		};
 		if (exists(fonts + "segoeuib.ttf")) {
-			hud_font = io.Fonts->AddFontFromFileTTF((fonts + "segoeuib.ttf").c_str(), 32.0f);
+			hud_font = AddFontFile(fonts + "segoeuib.ttf", ImFontConfig());
 		}
 		// (ds-pc-port41) Consolas Bold for the PC port's Metricas panel (metricas.ps1's face); found by name there.
 		if (exists(fonts + "consolab.ttf")) {
-			(void)io.Fonts->AddFontFromFileTTF((fonts + "consolab.ttf").c_str(), 32.0f);
+			(void)AddFontFile(fonts + "consolab.ttf", ImFontConfig());
 		}
 		// The dialogs draw the game's own texts (save names and their detail, messages), which are not
 		// ASCII: the system's CJK face where Windows has one, with the ranges those texts use. Plain
@@ -687,9 +765,7 @@ struct SystemOverlay::Impl {
 			if (!exists(fonts + face)) {
 				continue;
 			}
-			dialog_font = io.Fonts->AddFontFromFileTTF(
-			    (fonts + face).c_str(), 32.0f, nullptr,
-			    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+			dialog_font = AddFontFile(fonts + face, ImFontConfig(), io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
 			if (dialog_font != nullptr) {
 				break;
 			}
@@ -700,6 +776,27 @@ struct SystemOverlay::Impl {
 		style.WindowRounding = 10.0f;
 		style.FrameRounding  = 6.0f;
 		style.ItemSpacing    = {8.0f, 8.0f};
+	}
+
+	// (up1120, upstream 5b2af6f) A font file at 32 px, read in place (MappedFontFile, kept until the context is
+	// destroyed), else read whole as AddFontFromFileTTF does; named after the file as AddFontFromFileTTF names it.
+	ImFont* AddFontFile(const std::string& path, ImFontConfig config, const ImWchar* ranges = nullptr) {
+		auto& io = ImGui::GetIO();
+		if (config.Name[0] == '\0') {
+			const size_t slash = path.find_last_of("/\\");
+			std::snprintf(config.Name, sizeof(config.Name), "%s",
+			              path.c_str() + (slash == std::string::npos ? 0 : slash + 1));
+		}
+		auto file = std::make_unique<MappedFontFile>(path);
+		if (file->Data() == nullptr) {
+			return io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f, &config, ranges);
+		}
+		config.FontDataOwnedByAtlas = false;
+		ImFont* font = io.Fonts->AddFontFromMemoryTTF(file->Data(), file->Size(), 32.0f, &config, ranges);
+		if (font != nullptr) {
+			font_files.push_back(std::move(file));
+		}
+		return font;
 	}
 
 	void EnsureVulkan(vk::Format format, uint32_t image_count) {
@@ -1482,6 +1579,8 @@ struct SystemOverlay::Impl {
 	OverlaySession                        session;
 	vk::Extent2D                          extent {};
 	std::chrono::steady_clock::time_point last_frame;
+	// (up1120) The files AddFontFile mapped: the atlas reads them until ~Impl's DestroyContext; the members go after it.
+	std::vector<std::unique_ptr<MappedFontFile>> font_files;
 };
 
 SystemOverlay::SystemOverlay(GraphicContext& graphics): m_impl(std::make_unique<Impl>(graphics)) {}

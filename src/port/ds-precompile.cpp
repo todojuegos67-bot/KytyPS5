@@ -338,6 +338,23 @@ void KeepStoreCurrentForSameHints() {
 	std::fflush(stdout);
 }
 
+// (11-22) A new folder with the shader folder copied in (_PipelineCache): the zip's seed file came out newer than the
+// copied store, which made it "outdated" and asked for the whole precompile again. The seed file is made from the game's
+// files (the same for every build of the port): a store of this GPU and driver whose hints are the same (.hints-sum, its
+// precompile completed) keeps covering it, so the seed file gets the store's date back.
+void KeepStoreCurrentForNewerSeeds() {
+	const fs::path store = StoreFile();
+	std::error_code ec;
+	if (store.empty() || g_setup.seeds.empty() || !fs::exists(g_setup.seeds, ec)) return;
+	const std::string saved = ReadAll(fs::path(store.wstring() + L".hints-sum"));
+	if (saved.empty() || saved != HintsSum()) return;
+	const auto store_time = fs::last_write_time(store, ec);
+	if (ec || fs::last_write_time(g_setup.seeds, ec) <= store_time) return;
+	fs::last_write_time(g_setup.seeds, store_time - std::chrono::seconds(1), ec);
+	std::printf("[port] precompile: the shader folder was copied in (seed file newer than the store, same hints): no precompile\n");
+	std::fflush(stdout);
+}
+
 // The old (10-27c) way's driver cache, warmed with every static recipe: one multi-GB file the game loaded whole at every
 // start, saved whole during play. Gone once the static store is current (the launcher's way below holds those pipelines).
 void RemoveOldWarmedCache() {
@@ -387,6 +404,18 @@ void Work() {
 	if (g_setup.refresh) {
 		SetText("Preparando shaders: la carpeta del juego...");
 		g_setup.refresh(g_setup);
+	}
+	{ // (precomp-fix) No game folder (a new install chooses it at JUGAR): every shard failed with exit 2 (--game "").
+		std::error_code gec;
+		if (g_setup.game.empty() || !fs::exists(fs::u8path(g_setup.game) / "eboot.bin", gec)) {
+			std::printf("[port] precompile: no game folder (%s); not started\n", g_setup.game.c_str());
+			std::fflush(stdout);
+			std::scoped_lock lock(g_mutex);
+			g_view.failed  = true;
+			g_view.running = false;
+			g_view.text    = "Primero elige la carpeta del juego (boton \"Elegir carpeta del juego...\") y vuelve a pulsar Preparar shaders.";
+			return;
+		}
 	}
 	const fs::path& root  = g_setup.root;
 	const fs::path& seeds = g_setup.seeds;
@@ -818,6 +847,7 @@ bool CacheCurrent() {
 	SetEnvironmentVariableW(L"KYTY_WARM_DRIVER_CACHE_KEY", nullptr);
 	SetEnvironmentVariableW(L"KYTY_SHADOW_FILTER", g_setup.shadow_filter.empty() ? nullptr : std::wstring(g_setup.shadow_filter.begin(), g_setup.shadow_filter.end()).c_str());
 	KeepStoreCurrentForSameHints();
+	KeepStoreCurrentForNewerSeeds(); // (11-22)
 	// (ds-pc-port37) Current as the launcher's: the static store is this GPU's and driver's and not older than the seeds.
 	const int code = RunOne("precompile-status", L"--seeds " + Quote(g_setup.seeds) + L" --status");
 	const std::string text = ReadAll(g_logs / L"precompile-status.out.log");

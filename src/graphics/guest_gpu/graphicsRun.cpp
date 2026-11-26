@@ -1,9 +1,16 @@
 #include "local/skip-shader.h"
+#include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
+#include "local/censo-pm4.h" // (w18, KYTY_CENSO_PM4: [censo-pm4])
+#include "local/envio1.h"
+#include "local/envio2.h"
+#include "local/envio3.h"
 #include "local/sync-stats.h"
+#include "local/copia1.h" // (copia1)
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "local/anti-lag.h"
 
 #include "common/assert.h"
+#include "common/guardedCopy.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -30,20 +37,49 @@
 #include "live-trace.h"
 #include "live-trace-gpu.h"
 #include "live-census.h"
+#include "otros2.h" // (otros2)
+#include "gancho2.h" // (gancho2)
+#include "port1.h" // (port1, KYTY_PORT1)
+#include "port2.h" // (port2, KYTY_PORT2)
+#include "f0-measure.h" // (f0, KYTY_F0)
+#include "native/native-render.h" // (f5, KYTY_NATIVE_RENDER)
+#include "native/verify-gpu.h" // (f5b, KYTY_NATIVE_PASSES ..:2)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE)
+#include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
+#include "render5.h"
 #include "draw-state-observer.h"
 #include "frame-capture.h"
 #include "hud-anchor.h"
 #include "live-control.h"
+#include "trusted-depth.h" // (trust1)
+#include "ds-linear-copy-hook.h"
+#include "local/ds-nativo-pase.h" // (F5 pase 1, KYTY_NATIVO_PASE_SSRCLEAR)
+#include "local/ds-nativo-sombras.h" // (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=2: volcado del VS de sombras)
+#include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: [censo-dcb])
+#include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
+#include "render1.h" // (render1 F0+F1)
+#include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
 #include "performance-switches.h"
 #include "speculation-state.h"
 #include "xpr-capture.h"
+#include "par-queues.h" // (par1, KYTY_PAR_QUEUES)
+#include "local-platform.h"
+#include "parpadeo.h" // (parpadeo2)
+#include "parpadeo7.h" // (parpadeo7)
+#include "local/juego3.h" // (juego3, KYTY_JUEGO3)
+#include "p7-compat.h" // (p7, KYTY_P7)
+#include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/parpadeo8.h" // (parpadeo8, w21: el tick del ultimo cull para 0xa1f290)
+#include "local/frame-nativo2.h" // (FRAME-NATIVO2 v13: g_guest_consumed)
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <bit>
 #include <x86intrin.h>
@@ -55,6 +91,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -136,6 +173,8 @@ void GuestGpu::Shutdown() {
 	if (m_shutdown_complete) {
 		return;
 	}
+	// (parpadeo7) Its helper first: it posts to this queue, and copies what it holds while the GPU thread still runs.
+	if (Parpadeo7::On() || Juego3::On()) m_renderer.GetBufferCache().StopPrefetchHelper(); // (juego3: its prefetch too)
 	{
 		Common::LockGuard lock(m_queue_mutex);
 		m_accepting = false;
@@ -169,7 +208,22 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
-	m_work_available.Signal();
+	// (par1: two threads wait on it; the GPU thread runs the guest commands)
+	if (ParQueues::On()) m_work_available.SignalAll();
+	else m_work_available.Signal();
+}
+
+// (parpadeo7) No Drain of the caller's recording (it hands none over) and no run in place on the GPU thread: the
+// command may record and flush, which the packet being translated must not see.
+bool GuestGpu::PostCommand(Common::UniqueFunction<void>&& command) {
+	if (!command) return false;
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) return false;
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	if (ParQueues::On()) m_work_available.SignalAll();
+	else m_work_available.Signal();
+	return true;
 }
 
 // Packets that only change state or record draws and dispatches.
@@ -189,6 +243,58 @@ static constexpr auto KeepsDeferredProtectionBits = [] {
 static bool KeepsDeferredProtection(uint32_t opcode) {
 	return ((KeepsDeferredProtectionBits[(opcode >> 6u) & 3u] >> (opcode & 63u)) & 1u) != 0;
 }
+
+// (render3, KYTY_RENDER_STATS) A packet's class for the [render] line's "pm4" part (LiveCensus::Pm4Clock).
+static uint32_t Pm4ClassOf(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2: return LiveCensus::Pm4Draw;
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return LiveCensus::Pm4Dispatch;
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_SH_REG_INDIRECT: return LiveCensus::Pm4ShReg;
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: return LiveCensus::Pm4ContextReg;
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return LiveCensus::Pm4UconfigReg;
+		case Pm4::IT_NOP: return LiveCensus::Pm4Nop;
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_INDIRECT_BUFFER_CNST: return LiveCensus::Pm4IndirectBuffer;
+		default: return LiveCensus::Pm4Other;
+	}
+}
+
+// (render5) KYTY_REG_LANE (render5.h): the packets the register lane takes - register writes and index / instance /
+// indirect base state. Their handlers only set the command processor's registers and fields (never a memory access, a
+// wait, a suspension or another buffer), and each keeps the deferred protections pending (KeepsDeferredProtection).
+static constexpr auto RegLaneBits = [] {
+	std::array<uint64_t, 4> bits {};
+	for (const uint32_t opcode: {Pm4::IT_SET_SH_REG, Pm4::IT_SET_CONTEXT_REG, Pm4::IT_SET_UCONFIG_REG,
+	                             Pm4::IT_SET_UCONFIG_REG_INDEX, Pm4::IT_INDEX_BASE, Pm4::IT_INDEX_BUFFER_SIZE,
+	                             Pm4::IT_INDEX_TYPE, Pm4::IT_NUM_INSTANCES, Pm4::IT_SET_BASE})
+		bits[opcode / 64u] |= uint64_t {1} << (opcode % 64u);
+	return bits;
+}();
+static bool RegLaneOpcode(uint32_t opcode) {
+	return ((RegLaneBits[(opcode >> 6u) & 3u] >> (opcode & 63u)) & 1u) != 0;
+}
+// A packet the lane takes at dword `at` of `total`: a whole type-3 lane packet without the predicate bit (a predicated
+// one goes back to the walk, which decides whether it is skipped).
+static bool RegLanePacket(const uint32_t* commands, uint32_t at, uint32_t total) {
+	if (at >= total || total - at < 2) return false;
+	const uint32_t header = commands[at];
+	return (header >> 30u) == 3u && (header & 1u) == 0 && RegLaneOpcode((header >> 8u) & 0xffu) &&
+	       KYTY_PM4_LEN(header) <= total - at;
+}
+// Packets a lane run takes at most before the walk's per-packet work runs again (the guest commands and the copy
+// feedback between packets wait at most this long: ~64 register packets, a few microseconds).
+constexpr uint32_t RegLaneMaxPackets = 64;
 
 static bool DrawsOrDispatches(uint32_t opcode) {
 	return opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
@@ -242,10 +348,18 @@ static void PrefetchNextDraw(const uint32_t* packet, uint32_t remaining_dw) {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	// (par1fix, KYTY_PAR_QUEUES=1) The guest commands are the GPU thread's only: the ACB thread runs none (its walk's
+	// call returns here). Before, both threads ran them between packets: the ACB thread saw the pending count of a command
+	// the GPU thread's loop (ThreadRun) then took, and found the queue empty under the mutex - the EXIT_IF below
+	// (20261116-074057, loading). One consumer again, as with one thread.
+	if (ParQueues::t_side == 1) return;
+	Juego3::NoteGpuThread(); // (juego3: its CPU per window)
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
+			// (The count is read outside the mutex: with one consumer it cannot be ahead of the queue, but stay safe.)
+			if (ParQueues::On() && m_commands.empty()) break;
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
@@ -266,6 +380,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
+	Juego3::Scope juego3_wait(Juego3::TagSendSync); // (juego3: the game thread waiting for the GPU thread's turn)
 	// The caller spins a while (~20 us, about the time a guest readback command waits for its turn and runs) before it
 	// sleeps: waking a sleeping caller cost the GPU thread a system call each, ~200 a frame at 1-1 (same process: GPU
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
@@ -347,6 +462,7 @@ void GuestGpu::Done() {
 			return;
 		}
 		WaitForIdle();
+		FrameNativo2::g_guest_consumed.fetch_add(1, std::memory_order_acq_rel); // (FRAME-NATIVO2 v13: sin tuberia, todo traducido)
 	}
 	m_graphics_done = true;
 	m_done_num++;
@@ -606,6 +722,108 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+// KYTY_NATIVE_MEMORY, at each flip (once a frame): what the guest wrote since the last sweep is seen
+// (GpuResourceManager::SweepCpuWrites), and all the GPU wrote is put in guest memory before the game can learn the frame
+// is done (GpuResourceManager::NativeFlushGpuWrites). Nothing otherwise.
+static void NativeFlipSync(GpuResourceManager& resources, bool state_only) {
+	if (state_only || !PageManager::NativeWriteWatch()) return;
+	resources.NoteFlipForWatchStats(); // (ww2: the "Write watch+" line counts per frame)
+	resources.SweepCpuWrites();
+	resources.NativeFlushGpuWrites();
+}
+
+// (ww2, KYTY_WRITE_WATCH_MODE=poll) The last word each command processor wrote at an address (WriteGuestMemory: labels,
+// end-of-pipe values), a slot an address (a collision forgets the older one). A WAIT_REG_MEM satisfied while memory
+// holds exactly what a processor wrote there was satisfied by the GPU side - one queue's commands write a label,
+// another's wait for it (Demon's Souls: the skinning and particle queues against the graphics queue) - and hands over
+// nothing the game wrote: no sweep of the write watch after it (CommandProcessor::WaitRegMem). Anything else - a
+// value the game wrote, an address never written here, one written in more than 64 bytes - sweeps as before.
+// (The game writing, over a label of the GPU side, the very value last written there, as its own signal, would be
+// missed: the same value says nothing new to a waiter on the console either.)
+namespace {
+struct ProcessorLabels {
+	static constexpr size_t Slots = 4096;
+	std::mutex              mutex;
+	uint64_t                address[Slots] = {};
+	uint32_t                word[Slots]    = {};
+
+	static size_t SlotOf(uint64_t at) noexcept { return static_cast<size_t>((at >> 2u) * 0x9E3779B97F4A7C15ull >> 52u) % Slots; }
+
+	void Note(uint64_t at, const void* src, uint32_t size) noexcept {
+		if (size == 0 || size > 64 || (at & 3u) != 0 || (size & 3u) != 0) return;
+		std::lock_guard lock(mutex);
+		for (uint32_t offset = 0; offset < size; offset += 4) {
+			const auto slot = SlotOf(at + offset);
+			address[slot]   = at + offset;
+			std::memcpy(&word[slot], static_cast<const uint8_t*>(src) + offset, 4);
+		}
+	}
+	// Whether every word of [at, at + size) was last written here with the bytes of `value`.
+	[[nodiscard]] bool Holds(uint64_t at, const void* value, uint32_t size) noexcept {
+		if (size == 0 || (at & 3u) != 0 || (size & 3u) != 0) return false;
+		std::lock_guard lock(mutex);
+		for (uint32_t offset = 0; offset < size; offset += 4) {
+			const auto slot = SlotOf(at + offset);
+			if (address[slot] != at + offset || std::memcmp(&word[slot], static_cast<const uint8_t*>(value) + offset, 4) != 0)
+				return false;
+		}
+		return true;
+	}
+};
+ProcessorLabels g_processor_labels;
+
+// (p7, C5: KYTY_P7_C5=1, local/p7-compat.h) Labels written when the GPU has run the work recorded before them: the
+// write is a priority operation of the open command buffer's tick (CommandScheduler::DeferPriorityOperation: run in
+// order, once that tick is complete), not a store at translation. A later immediate write of the command processor to
+// an address with a label still pending goes the same way, behind it (the order of the two is kept). Only on the GPU
+// thread, without speculation or KYTY_PAR_QUEUES (their own write logs) and without a recorder.
+struct DeferredLabels {
+	std::mutex                                                   mutex;
+	std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> pending; // address -> (labels pending, bytes)
+	std::atomic<uint32_t>                                        count {0};
+	CommandScheduler*                                            scheduler = nullptr;
+
+	[[nodiscard]] bool Overlaps(uint64_t at, uint32_t size) {
+		std::lock_guard lock(mutex);
+		for (const auto& [address, entry]: pending)
+			if (at < address + entry.second && address < at + size) return true;
+		return false;
+	}
+};
+DeferredLabels g_deferred_labels;
+} // namespace
+
+static bool DeferLabelWrite(CommandScheduler& scheduler, void* dst, const void* src, uint32_t size) {
+	if (size == 0 || size > 8 || Spec::t_record != nullptr || Spec::Current() != nullptr || ParQueues::On() ||
+	    kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 || !GuestGpu::IsGpuThread() ||
+	    CommandScheduler::ThreadRecorder() != nullptr || !scheduler.Active())
+		return false;
+	uint64_t value = 0;
+	std::memcpy(&value, src, size);
+	const auto at = reinterpret_cast<uint64_t>(dst);
+	{
+		std::lock_guard lock(g_deferred_labels.mutex);
+		auto& entry  = g_deferred_labels.pending[at];
+		entry.first += 1;
+		entry.second = std::max(entry.second, size);
+	}
+	g_deferred_labels.scheduler = &scheduler;
+	g_deferred_labels.count.fetch_add(1, std::memory_order_acq_rel);
+	scheduler.DeferPriorityOperation([at, value, size] {
+		std::memcpy(reinterpret_cast<void*>(at), &value, size);
+		// (nativo4: also with KYTY_DS_NATIVE_ALL - a wait satisfied by a label the command processor wrote is no hand-over.)
+		if (PageManager::WatchPolled() || Libs::Graphics::GpuResourceManager::NativeAllOn()) g_processor_labels.Note(at, &value, size);
+		{
+			std::lock_guard lock(g_deferred_labels.mutex);
+			if (const auto found = g_deferred_labels.pending.find(at);
+			    found != g_deferred_labels.pending.end() && --found->second.first == 0)
+				g_deferred_labels.pending.erase(found);
+		}
+		g_deferred_labels.count.fetch_sub(1, std::memory_order_acq_rel);
+	});
+	return true;
+}
+
 // A guest memory write of the command processor: now, or when a speculative translation is committed
 // (speculation-state.h), in order with its other writes.
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
@@ -619,8 +837,27 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 		return;
 	}
 	auto* spec = Spec::Current();
+	// (p7, C5: an address a label is still pending for - written at GPU completion -: this write behind it.)
+	if (spec == nullptr && g_deferred_labels.count.load(std::memory_order_acquire) != 0 &&
+	    g_deferred_labels.scheduler != nullptr && GuestGpu::IsGpuThread() &&
+	    g_deferred_labels.Overlaps(reinterpret_cast<uint64_t>(dst), size) &&
+	    DeferLabelWrite(*g_deferred_labels.scheduler, dst, src, size)) {
+		P7::Add(P7::LabelsOrdered);
+		return;
+	}
 	if (spec == nullptr) {
+		// (KYTY_NATIVE_MEMORY: this store's write fault on a page a cache watches invalidated the caches there before the
+		// bytes landed - a GPU-written page read back first -, ahead of the packets after it. No fault comes now, and the
+		// next sweep may be after those packets: the same invalidation, made here.)
+		// (raiz1, KYTY_WRITE_WATCH_MODE=protect - KYTY_RAIZ -: the store faults as without native memory; not here.)
+		if (PageManager::NativeWriteWatch() && !PageManager::WatchProtects() && GuestGpu::IsGpuThread())
+			(void)Libs::LibKernel::Memory::TryPrepareHostWrite(reinterpret_cast<uint64_t>(dst), size);
 		std::memcpy(dst, src, size);
+		LiveCensus::Par2::Write(reinterpret_cast<uint64_t>(dst)); // (thread1, KYTY_RENDER_STATS: measurement only)
+		// (par1, KYTY_PAR_QUEUES=1: a queue of the other translating thread waiting at a WAIT_REG_MEM checks again.)
+		if (ParQueues::On() && g_gpu_state != nullptr) g_gpu_state->ParWake();
+		// (ww2: what a WAIT_REG_MEM there is satisfied by, g_processor_labels.)
+		if (PageManager::WatchPolled() || Libs::Graphics::GpuResourceManager::NativeAllOn()) g_processor_labels.Note(reinterpret_cast<uint64_t>(dst), src, size);
 		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
 		// (The labels a speculation's waits check: none without speculation.)
 		if (kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0)
@@ -642,7 +879,14 @@ static T ReadGuestMemory(const T* address) {
 	    Libs::LibKernel::Memory::ReadFaults(reinterpret_cast<uint64_t>(address), sizeof(T)))
 		return Spec::Refuse("GPU-written guest memory"), T {};
 	auto* spec = Spec::Current();
-	if (spec == nullptr) return *address;
+	if (spec == nullptr) {
+		// (KYTY_NATIVE_MEMORY: a value GPU work wrote - a WAIT_REG_MEM on memory a shader or a copy writes - was read back
+		// by this read's fault; no fault comes now: read back first, as the indirect arguments are.)
+		// (raiz1, mode protect: the read faults as without native memory; not here.)
+		if (PageManager::NativeWriteWatch() && !PageManager::WatchProtects() && GuestGpu::IsGpuThread())
+			(void)Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(address), sizeof(T));
+		return *address;
+	}
 	static_assert(sizeof(T) % 4 == 0);
 	std::array<uint32_t, sizeof(T) / 4> words {};
 	if (reinterpret_cast<uint64_t>(address) % 4 != 0 ||
@@ -697,6 +941,15 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
+		LiveCensus::Par2::Waited(reinterpret_cast<uint64_t>(addr)); // (thread1, KYTY_RENDER_STATS: measurement only)
+		// (KYTY_NATIVE_MEMORY: what the guest wrote before the label it waited for, seen before the packets after it.)
+		// (ww2, KYTY_WRITE_WATCH_MODE=poll: not when the value that satisfies the wait is one a command processor wrote
+		// there itself - the game handed nothing over through this label -, g_processor_labels.)
+		// (nativo4, KYTY_DS_NATIVE_ALL: the same test - such a wait skips the native write-watch sweep.)
+		const bool processor_label = (PageManager::WatchPolled() || Libs::Graphics::GpuResourceManager::NativeAllOn()) &&
+		                             g_processor_labels.Holds(reinterpret_cast<uint64_t>(addr), &value, static_cast<uint32_t>(sizeof(T)));
+		GetGpuResources().SweepCpuWrites(processor_label ? GpuResourceManager::SweepReason::ProcessorWait
+		                                                 : GpuResourceManager::SweepReason::Handover);
 		BdaDirtyRegions::Publish();
 	}
 }
@@ -705,6 +958,8 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
                                                      uint32_t, uint32_t);
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
+
+static void PrefetchXprBits(uint64_t label, GpuResourceManager& resources); // (lab1 p7b2, below)
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
@@ -724,6 +979,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 	LiveTrace::Event(LiveTrace::LabelWrite, reinterpret_cast<uint64_t>(dst),
 	                 src[write_one_address ? dw_num - 1 : 0] | uint64_t {2} << 56u);
+	// (lab1 p7b2) The XPR labels are a WRITE_DATA, not an end-of-pipe write: 0x912960 -> 0x1d18830(cb, 0, 0x53, 2,
+	// label, 1) takes its "param_4 == 2" branch, DcbWriteData(cb, 4, 0, label, &1, 2 dwords) (Ghidra, eboot 01.007.000).
+	// parpadeo7 only looked at WriteAtEndOfPipe, so it never met one (logs 054809 / 062037: "del XPR 0"). Same check
+	// here, before the 1 is written: a 64-bit 1 to one address range.
+	if (Parpadeo7::On() && !m_state_only && !write_one_address && dw_num == 2 && src[0] == 1 && src[1] == 0 &&
+	    Spec::Current() == nullptr)
+		PrefetchXprBits(reinterpret_cast<uint64_t>(dst), GetGpuResources());
 
 	if (write_one_address) {
 		WriteGuestMemory(dst, src + dw_num - 1, sizeof(uint32_t));
@@ -824,6 +1086,14 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	submission.frame_epoch = m_submitted_frame;
 	submission.serial      = ++m_serials[submission.queue_id];
+	// (ww2, KYTY_WRITE_WATCH_MODE=poll: the game wrote all it hands over with this submission before it queued it; a sweep
+	// of the write watch that begins after this needs no other at the submission's first slice, GuestGpu::Process.)
+	submission.sweep_stamp = PageManager::SweepStamp();
+	// (nativo3, KYTY_DS_NATIVE_ALL: without the poll mode its stamp never moves; the native sweep's instead.)
+	if (!PageManager::WatchPolled() && Libs::Graphics::BufferCache::NativeAllOn())
+		submission.sweep_stamp = Libs::Graphics::GpuResourceManager::NativeSweepStamp();
+	// (serie1) KYTY_SERIE1: when the game queued it (the culling's: its passes wait for its label from about now).
+	if (Serie1::Mode() != 0) submission.enqueue_ns = Serie1::NowNs();
 	// (KYTY_SPECULATE=4: the graphics queue's, translated ahead from now on.)
 	if (auto* ahead = m_ahead.load(std::memory_order_acquire); ahead != nullptr && submission.queue_id == 0)
 		ahead->Push({submission.serial, submission.commands, submission.reset_processor,
@@ -836,12 +1106,14 @@ void GuestGpu::Enqueue(Submission submission) {
 	                 submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
-	m_work_available.Signal();
+	// (par1: the GPU thread and the ACB thread wait on it)
+	if (ParQueues::On()) m_work_available.SignalAll();
+	else m_work_available.Signal();
 }
 
 void GuestGpu::WaitForIdle() {
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+	while (m_processing || m_acb_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
 }
@@ -855,8 +1127,20 @@ bool GuestGpu::CanProcessSubmission(const Submission& submission) const {
 			if (!m_queues[id].empty() &&
 			    m_queues[id].front().frame_epoch == submission.frame_epoch) return false;
 		}
+		// (par1: nor while the ACB thread runs one of its frame.)
+		if (m_acb_processing && m_acb_epoch == submission.frame_epoch) return false;
 	}
 	return true;
+}
+
+bool GuestGpu::ParRetry(const Submission& submission) const {
+	return ParQueues::On() && submission.blocked && submission.block_epoch != ParQueues::WakeEpoch();
+}
+
+void GuestGpu::ParWake() {
+	if (!ParQueues::NoteLabelWrite()) return;
+	Common::LockGuard lock(m_queue_mutex);
+	m_work_available.SignalAll();
 }
 
 void GuestGpu::ThreadRun(void* data) {
@@ -870,16 +1154,60 @@ void GuestGpu::ThreadRun(void* data) {
 	BdaDirtyRegions::g_translating = true;
 	LiveTrace::g_mark_thread = true;
 	InitializePerformanceSwitches();
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
+	// (par1) KYTY_PAR_QUEUES=1: this thread translates the graphics queue, the ACB thread (started below) the compute
+	// queues. Not with what translates elsewhere or reads one thread's own recording: speculation, the global barrier
+	// dedupe (it counts this thread's recorded work only), the second Vulkan queue (one open command buffer is shared).
+	if (ParQueues::On()) {
+		ParQueues::t_side = 0;
+		ParQueues::g_side[0].cpu_handle.store(LocalPlatform::CurrentThreadHandle(), std::memory_order_relaxed);
+		kyty_local_speculate_mode.store(0, std::memory_order_relaxed);
+		kyty_local_global_barrier_dedupe.store(0, std::memory_order_relaxed);
+		std::printf("par1: KYTY_PAR_QUEUES=1: compute queues (ACB) on their own thread, graphics (DCB) on this one; "
+		            "KYTY_SPECULATE and the barrier dedupe off, KYTY_ASYNC_COMPUTE's second queue unused%s\n",
+		            Render5::Mode(Render5::RegLane) == 1 ? "" : " (KYTY_REG_LANE is not 1: the threads never overlap)");
+		std::fflush(stdout);
+	}
+	// (p7, KYTY_P7: the live fixes on - C1, C2, C5, C6, C7 -, after every switch above; local/p7-compat.h.)
+	P7::ApplyAtGpuStart();
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !PageManager::NativeWriteWatch()) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
+	}
+	// (envio2) KYTY_ENVIO2=1/2: the compute queues translated on their own thread (local/envio2.h). Not with what else
+	// translates elsewhere or in another order (KYTY_PAR_QUEUES, KYTY_SPECULATE: one effects log per thread) nor with the
+	// second Vulkan queue (its commits go to the one queue, lane 0).
+	if (Envio2::Mode() != 0) {
+		const bool lanes = gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().LanesOn();
+		const bool speculate = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !PageManager::NativeWriteWatch();
+		if (ParQueues::On() || speculate || lanes) {
+			std::printf("envio2: KYTY_ENVIO2 off: needs KYTY_PAR_QUEUES and KYTY_SPECULATE off and one Vulkan queue "
+			            "(par %d, speculate %u, lanes %d)\n",
+			            ParQueues::On() ? 1 : 0, kyty_local_speculate_mode.load(std::memory_order_relaxed), lanes ? 1 : 0);
+		} else {
+			gpu->m_acb_spec = std::make_unique<Speculation>(gpu->m_renderer, static_cast<int>(ComputeQueueBase), [gpu] {
+				Common::LockGuard lock(gpu->m_queue_mutex);
+				gpu->m_work_available.SignalAll();
+			});
+			std::printf("envio2: KYTY_ENVIO2=%u: compute queues (ACB) translated on Kyty.Acb2, committed in order by "
+			            "this thread%s\n",
+			            Envio2::Mode(), Envio2::Mode() == 2 ? " (verification: committed at once, no overlap)" : "");
+			if (Envio3::Mode() != 0)
+				std::printf("envio3: KYTY_ENVIO3=%u: up to %u compute submissions in flight, continuations after waits on "
+				            "Kyty.Acb2, sweeps logged for their commits\n",
+				            Envio3::Mode(), Envio3::MaxInFlight);
+		}
+		std::fflush(stdout);
 	}
 	LiveControl::Start();
 	Blackbox::Start(); // (the crash / freeze black box: logs/blackbox-<stamp>.txt, local/blackbox-run.h)
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
+	void* const recording_stream = LocalVulkanRecording::CurrentProducer();
+#else
+	void* const recording_stream = nullptr;
 #endif
+	if (ParQueues::On()) gpu->m_acb_thread = std::thread(AcbThreadRun, gpu, recording_stream);
 
 	for (;;) {
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
@@ -896,7 +1224,21 @@ void GuestGpu::ThreadRun(void* data) {
 			                                            .count()));
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				// (A flush deferred while the GPU was busy goes before the thread waits: nothing else would submit it.)
-				if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+				// (par1: the scheduler is read only with the queue lock, never taken with the queue mutex held.)
+				if (ParQueues::On()) {
+					gpu->m_queue_mutex.Unlock();
+					bool flushed = false;
+					{
+						ParQueues::WorkScope work;
+						if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+							gpu->m_renderer.GetCommandScheduler().FlushDeferred();
+							flushed = true;
+						}
+					}
+					gpu->m_queue_mutex.Lock();
+					if (flushed) continue;
+					if (!(gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping)) break;
+				} else if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
 					gpu->m_queue_mutex.Unlock();
 					gpu->m_renderer.GetCommandScheduler().FlushDeferred();
 					gpu->m_queue_mutex.Lock();
@@ -911,10 +1253,12 @@ void GuestGpu::ThreadRun(void* data) {
 				LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 				LiveTrace::Event(LiveTrace::RenderIdle, 0, 0);
 			}
-			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_acb_processing) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
 				should_stop = true;
+				gpu->m_acb_stop = true; // (par1)
+				gpu->m_work_available.SignalAll();
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
@@ -922,16 +1266,34 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = true;
 			} else {
 				int selected_queue = -1;
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked &&
+				// (par1, KYTY_PAR_QUEUES=1: the graphics queue only here, the compute queues are the ACB thread's; a
+				// blocked submission is tried again once the other thread wrote a label since its slice began.)
+				const bool     par        = ParQueues::On();
+				const uint32_t candidates = par ? 1u : QueueCount;
+				const uint64_t seen_epoch = par ? ParQueues::WakeEpoch() : 0;
+				for (uint32_t offset = 0; offset < candidates; offset++) {
+					const auto id = par ? 0u : (gpu->m_next_queue + offset) % QueueCount;
+					if (!gpu->m_queues[id].empty() &&
+					    (!gpu->m_queues[id].front().blocked || gpu->ParRetry(gpu->m_queues[id].front())) &&
 					    gpu->CanProcessSubmission(gpu->m_queues[id].front())) {
 						selected_queue = static_cast<int>(id);
 						break;
 					}
 				}
 				if (selected_queue < 0) {
-					if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+					if (par) {
+						gpu->m_queue_mutex.Unlock();
+						bool flushed = false;
+						{
+							ParQueues::WorkScope work;
+							if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+								gpu->m_renderer.GetCommandScheduler().FlushDeferred();
+								flushed = true;
+							}
+						}
+						gpu->m_queue_mutex.Lock();
+						if (flushed) continue;
+					} else if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
 						gpu->m_queue_mutex.Unlock();
 						gpu->m_renderer.GetCommandScheduler().FlushDeferred();
 						gpu->m_queue_mutex.Lock();
@@ -941,7 +1303,21 @@ void GuestGpu::ThreadRun(void* data) {
 					LiveTrace::Event(LiveTrace::RenderIdle, 1, 1);
 					const auto idle = std::chrono::steady_clock::now();
 					LiveControl::NoteRenderIdle(idle.time_since_epoch().count());
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					if (par) {
+						// (par1) Asleep until a label write of the ACB thread (ParWake), a submission, or 100 us.
+						const bool waits = !gpu->m_queues[0].empty();
+						ParQueues::g_sleepers.fetch_add(1, std::memory_order_seq_cst);
+						if (ParQueues::WakeEpoch() == seen_epoch) gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						ParQueues::g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+						if (waits) {
+							ParQueues::g_side[0].label_waits.fetch_add(1, std::memory_order_relaxed);
+							ParQueues::g_side[0].label_wait_ns.fetch_add(
+							    static_cast<uint64_t>((std::chrono::steady_clock::now() - idle).count()),
+							    std::memory_order_relaxed);
+						}
+					} else {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					}
 					LiveControl::g_render_idle_ns += (std::chrono::steady_clock::now() - idle).count();
 					LiveTrace::Event(LiveTrace::RenderIdle, 0, 1);
 					for (auto& queue: gpu->m_queues) {
@@ -962,7 +1338,13 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		if (should_stop) {
-			gpu->m_gfx_cp->BufferWait();
+			// (par1) The ACB thread first: it records into this thread's stream, gone when this thread returns.
+			if (gpu->m_acb_thread.joinable()) gpu->m_acb_thread.join();
+			gpu->m_acb_spec.reset(); // (envio2: its thread; nothing is handed, the queues are empty)
+			{
+				ParQueues::WorkScope work;
+				gpu->m_gfx_cp->BufferWait();
+			}
 			gpu->m_renderer.GetMutex().ResignOwner();
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
@@ -973,13 +1355,17 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			LiveCounters::Add(LiveCounters::GuestCommands);
 			{
+				ParQueues::WorkScope work; // (par1: nothing unless KYTY_PAR_QUEUES=1)
 				LiveCensus::Scope census(LiveCensus::GuestCommand, 0);
+				// (envio2: what a guest command writes while a compute submission is handed is logged for its commit.)
+				Spec::t_effects = gpu->m_acb_spec && gpu->m_acb_spec->Pending() ? &gpu->m_acb_spec->Log() : nullptr;
 				command();
+				Spec::t_effects = nullptr;
 			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
-			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_acb_processing) {
 				gpu->m_idle.SignalAll();
 			}
 			continue;
@@ -989,10 +1375,28 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
 		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
+		// (thread1, KYTY_RENDER_STATS: the slice's time on its side's virtual clock, LiveCensus::Par2; measurement only.)
+		LiveCensus::Par2::Begin(submission.queue_id != 0 ? 1u : 0u);
+		const uint64_t slice_epoch = ParQueues::On() ? ParQueues::WakeEpoch() : 0; // (par1)
+		F0Measure::SliceBegin(submission.queue_id != 0); // (f0: a GPU stamp where the side changes)
+		NativeRender::SliceBegin(submission.queue_id); // (f5, KYTY_NATIVE_RENDER=map)
 		const bool complete = [&] {
+			ParQueues::WorkScope work; // (par1: the queue lock for the slice; nothing unless KYTY_PAR_QUEUES=1)
 			LiveCensus::Scope census(LiveCensus::Submission, submission.queue_id);
 			return gpu->Process(submission);
 		}();
+		NativeRender::SliceEnd(); // (f5)
+		F0Measure::SliceEnd(); // (f0)
+		if (ParQueues::On()) {
+			ParQueues::g_side[0].slices.fetch_add(1, std::memory_order_relaxed);
+			ParQueues::MaybeReport(static_cast<uint64_t>(gpu->m_done_num.load(std::memory_order_relaxed)),
+			                       [](uint64_t handle) { return LocalPlatform::ThreadCpuSeconds(handle); });
+		}
+		LiveCensus::Par2::End(complete);
+		// (trust1) ... and at the game's flip too (CommandProcessor::Flip during this slice): FlipPreparation alone never
+		// came in a game session.
+		if (const bool flipped = LiveCensus::Par2::TakeFlip(); flipped || submission.type == SubmissionType::FlipPreparation)
+			LiveCensus::Par2::Frame();
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
 		                     static_cast<uint32_t>(complete) << 16u,
@@ -1002,7 +1406,8 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveCounters::Add(LiveCounters::Submissions);
 		if (!complete) {
 			LiveCounters::Add(LiveCounters::SubmissionRequeues);
-			submission.blocked = true;
+			submission.blocked     = true;
+			submission.block_epoch = slice_epoch; // (par1)
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -1013,10 +1418,140 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		gpu->m_processing = false;
-		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+		if (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_acb_processing) {
 			gpu->m_idle.SignalAll();
 		}
 	}
+}
+
+// (par1, KYTY_PAR_QUEUES=1) The ACB thread: the compute queues' submissions, round robin, as the GPU thread took them
+// before (ThreadRun), each slice with the queue lock (par-queues.h); a submission stopped at a WAIT_REG_MEM is tried
+// again when the GPU thread writes a label (ParWake) or after 100 us (memory the game's CPU writes). It runs no guest
+// commands of its own accord (ProcessPm4 runs those queued, between packets, as on the GPU thread) and stops when the
+// GPU thread stops (m_acb_stop) with its queues empty.
+void GuestGpu::AcbThreadRun(GuestGpu* gpu, void* stream) {
+	LocalPlatform::SetThreadName("Kyty.Acb");
+	KYTY_PROFILER_THREAD("Thread_Acb");
+	g_gpu_thread      = true;
+	g_gpu_state       = gpu;
+	ParQueues::t_side = 1;
+	ParQueues::g_side[1].cpu_handle.store(LocalPlatform::CurrentThreadHandle(), std::memory_order_relaxed);
+	PageManager::DeferReadProtection(true);
+	gpu->m_renderer.GetMutex().BecomeOwner();
+	BdaDirtyRegions::g_translating = true;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::AdoptProducer(stream);
+#else
+	(void)stream;
+#endif
+	constexpr uint32_t ComputeQueues = QueueCount - 1;
+	for (;;) {
+		PageManager::FlushDeferredProtection();
+		Submission submission;
+		bool       stop = false;
+		{
+			Common::LockGuard lock(gpu->m_queue_mutex);
+			for (;;) {
+				const uint64_t seen     = ParQueues::WakeEpoch();
+				int            selected = -1;
+				bool           queued   = false;
+				for (uint32_t offset = 0; offset < ComputeQueues; ++offset) {
+					const auto id    = 1u + (gpu->m_acb_next_queue - 1u + offset) % ComputeQueues;
+					auto&      queue = gpu->m_queues[id];
+					if (queue.empty()) continue;
+					queued = true;
+					if ((!queue.front().blocked || gpu->ParRetry(queue.front())) && gpu->CanProcessSubmission(queue.front())) {
+						selected = static_cast<int>(id);
+						break;
+					}
+				}
+				if (selected >= 0) {
+					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected)];
+					submission  = std::move(queue.front());
+					queue.pop_front();
+					gpu->m_submission_count--;
+					gpu->m_acb_next_queue = 1u + static_cast<uint32_t>(selected) % ComputeQueues;
+					gpu->m_acb_processing = true;
+					gpu->m_acb_epoch      = submission.frame_epoch;
+					break;
+				}
+				if (gpu->m_acb_stop && !queued) {
+					stop = true;
+					break;
+				}
+				// (A flush either thread deferred goes before this one sleeps: the open command buffer is shared.)
+				gpu->m_queue_mutex.Unlock();
+				bool flushed = false;
+				{
+					ParQueues::WorkScope work;
+					if (gpu->m_renderer.GetCommandScheduler().FlushPending()) {
+						gpu->m_renderer.GetCommandScheduler().FlushDeferred();
+						flushed = true;
+					}
+				}
+				gpu->m_queue_mutex.Lock();
+				if (flushed) continue;
+				const uint64_t start = ParQueues::NowNs();
+				ParQueues::g_sleepers.fetch_add(1, std::memory_order_seq_cst);
+				if (ParQueues::WakeEpoch() == seen && !gpu->m_acb_stop) {
+					if (queued) gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					else gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				}
+				ParQueues::g_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+				if (queued) {
+					ParQueues::g_side[1].label_waits.fetch_add(1, std::memory_order_relaxed);
+					ParQueues::g_side[1].label_wait_ns.fetch_add(ParQueues::NowNs() - start, std::memory_order_relaxed);
+					// (As the GPU thread's 100 us wait: a label the game's CPU writes moves no epoch.)
+					for (uint32_t id = 1; id < QueueCount; ++id)
+						if (!gpu->m_queues[id].empty()) gpu->m_queues[id].front().blocked = false;
+				}
+			}
+		}
+		if (stop) break;
+
+		LiveTrace::Event(LiveTrace::RenderSlice,
+		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
+		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
+		const uint64_t slice_epoch = ParQueues::WakeEpoch();
+		const bool     complete    = [&] {
+            ParQueues::WorkScope work;
+            return gpu->Process(submission);
+		}();
+		ParQueues::g_side[1].slices.fetch_add(1, std::memory_order_relaxed);
+		LiveTrace::Event(LiveTrace::RenderSlice,
+		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
+		                     static_cast<uint32_t>(complete) << 16u,
+		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
+
+		Common::LockGuard lock(gpu->m_queue_mutex);
+		LiveCounters::Add(LiveCounters::Submissions);
+		if (!complete) {
+			LiveCounters::Add(LiveCounters::SubmissionRequeues);
+			submission.blocked     = true;
+			submission.block_epoch = slice_epoch;
+			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			gpu->m_submission_count++;
+		} else {
+			for (uint32_t id = 1; id < QueueCount; ++id)
+				if (!gpu->m_queues[id].empty()) gpu->m_queues[id].front().blocked = false;
+		}
+		gpu->m_acb_processing = false;
+		gpu->m_work_available.SignalAll(); // (the GPU thread's frame boundary, or its stop, may wait for this)
+		if (!gpu->m_processing && gpu->m_commands.empty() && gpu->m_submission_count == 0) gpu->m_idle.SignalAll();
+	}
+	{
+		ParQueues::WorkScope work; // (the other owner is outside the render mutex)
+		gpu->m_renderer.GetMutex().ResignOwner();
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::AdoptProducer(nullptr);
+#endif
+	PageManager::FlushDeferredProtection();
+	PageManager::DeferReadProtection(false);
+	BdaDirtyRegions::g_translating = false;
+	ParQueues::t_side              = -1;
+	g_gpu_state                    = nullptr;
+	g_gpu_thread                   = false;
 }
 
 bool GuestGpu::Process(Submission& submission) {
@@ -1027,13 +1562,74 @@ bool GuestGpu::Process(Submission& submission) {
 		EXIT_IF(submission.frame_epoch != m_consumed_frame);
 		++m_done_num;
 		++m_consumed_frame;
+		FrameNativo2::g_guest_consumed.fetch_add(1, std::memory_order_acq_rel); // (FRAME-NATIVO2 v13: fotograma traducido)
 		m_idle.SignalAll();
+		if (Serie1::Mode() != 0) ++Serie1::g_c.frames; // (serie1; the GPU thread's, as every Serie1 counter)
+		if (ParQueues::On()) m_work_available.SignalAll(); // (par1: the ACB thread waits for the next frame's)
+		if (DsCensoDcb::On()) DsCensoDcb::OnFrameBoundary(); // (w7: [censo-dcb] cada 5 s)
+		Envio1::NoteFrame(); // (envio1, KYTY_ENVIO1=1)
+		CensoPm4::OnFrame(); // (w18)
+		if (const double frames = Envio2::NoteFrame(); frames > 0) Envio3::Print(frames); // (envio2/envio3)
 		return true;
 	}
 	const bool first_slice = !submission.started;
+	// (w7) KYTY_CENSO_DCB=1: el tiempo de este trozo, al sitio del juego que envio la DCB (local/ds-censo-dcb.h).
+	std::optional<DsCensoDcb::Slice> censo_dcb;
+	if (DsCensoDcb::On())
+		censo_dcb.emplace(submission.queue_id == 0 && submission.type == SubmissionType::Graphics, submission.commands.data());
+	// (w11b) [nativo-vgeo]: dispatches por CS dentro de la ACB #4 de a0ed3e.
+	const VgeoNativo::TargetScope vgeo_target(censo_dcb ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed) : 0);
+	// (w18) [censo-pm4]: tiempo por paquete PM4 y por fase en los bloques caros del censo.
+	const CensoPm4::SliceScope censo_pm4(censo_dcb ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed) : 0);
+	// (envio1, KYTY_ENVIO1=1: a compute queue's submission, measured.)
+	const Envio1::AcbScope envio1_acb(submission.queue_id != 0);
+	const Envio2::GpuScope envio2_gpu(submission.queue_id != 0 && m_acb_spec != nullptr); // (envio2)
 	auto& cp = GetProcessor(submission.queue_id);
+	// (serie1) KYTY_SERIE1=1/2: a queue-0 command buffer of the XPR culling's shape (dispatches and a label, no draw, no
+	// indirect buffer, no flip: local/serie1.h). =1: recorded into a command buffer of the second Vulkan queue (lane 1),
+	// translated here as always (same processor, same order); its semaphore waits are the graphics ticks that last wrote
+	// (or used, for its writes) what it touches, and every later graphics submission waits for it (lanes' safe mode).
+	bool serie1_cull = false;
+	if (Serie1::Mode() != 0 && submission.queue_id == 0 && submission.type == SubmissionType::Graphics &&
+	    submission.constant_commands.empty()) {
+		if (first_slice) {
+			submission.serie1_kind = Serie1::Classify(submission.commands);
+			++Serie1::g_c.classified[submission.serie1_kind & 7u];
+		}
+		serie1_cull = submission.serie1_kind == Serie1::Cull;
+		if (first_slice && !serie1_cull) Serie1::NoteGraphicsStart();
+		Serie1::MaybeReport(m_renderer.GetCommandScheduler().GetMasterSemaphore().LanesOn());
+	}
+	const bool serie1_lane = serie1_cull && Serie1::Mode() == 1 && !ParQueues::On() &&
+	                         m_renderer.GetCommandScheduler().GetMasterSemaphore().LanesOn();
+	if (serie1_cull && first_slice) ++(serie1_lane ? Serie1::g_c.culls_lane1 : Serie1::g_c.no_lane);
 	// KYTY_ASYNC_COMPUTE: the game's compute queues on the second Vulkan queue (lane-sync.h).
-	m_renderer.GetCommandScheduler().SetLane(submission.queue_id != 0 ? 1 : 0);
+	// (par1, KYTY_PAR_QUEUES=1: lane 0 always: both threads record into the one open command buffer.)
+	// (serie1: KYTY_SERIE1=1 alone makes the second queue for the culling only: the compute queues stay on lane 0.)
+	static const bool acb_lane = !Serie1::WantsLanes() || Serie1::AsyncComputeEnv();
+	m_renderer.GetCommandScheduler().SetLane(serie1_lane || (submission.queue_id != 0 && !ParQueues::On() && acb_lane) ? 1 : 0);
+	Serie1::g_open_cull = serie1_lane;
+	// KYTY_NATIVE_MEMORY: what the guest wrote before this submission invalidated before the command processor reads any
+	// of its memory (command buffers, descriptors, constants: the guest wrote them before submitting, and the queue's
+	// lock orders those writes before this thread took the submission) and before any of its resources is used
+	// (GpuResourceManager::SweepCpuWrites). At its first slice only: a slice resumed at a WAIT_REG_MEM sweeps when the
+	// wait is satisfied (CommandProcessor::WaitRegMem), the only point where the guest hands memory over meanwhile; one
+	// before each retry of an unsatisfied wait was most of the ~1100 sweeps a second. Nothing otherwise.
+	// (ww2, KYTY_WRITE_WATCH_MODE=poll: no sweep when one began after the game queued this submission - it read every
+	// write the game made before queueing it, PageManager::SweptSince; the queue was a few submissions deep.)
+	if (first_slice) {
+		// (envio3: what it finds CPU-written is logged for the compute submissions in flight, Speculation::Log.)
+		Spec::t_effects = Envio3::Mode() != 0 && m_acb_spec && m_acb_spec->Pending() ? &m_acb_spec->Log() : nullptr;
+		const uint64_t censo_sweep_t0 = DsCensoDcb::On() ? DsCensoDcb::NowNs() : 0; // (w7)
+		CensoPm4::Mark(CensoPm4::KSweep); // (w18)
+		m_renderer.GetGpuResources().SweepCpuWrites((PageManager::SweptSince(submission.sweep_stamp) ||
+		                                             (!PageManager::WatchPolled() && GpuResourceManager::NativeSweptSince(submission.sweep_stamp)))
+		                                                ? GpuResourceManager::SweepReason::CoveredSubmission
+		                                                : GpuResourceManager::SweepReason::Handover);
+		Spec::t_effects = nullptr;
+		if (censo_sweep_t0 != 0) DsCensoDcb::g_sweep_ns.fetch_add(DsCensoDcb::NowNs() - censo_sweep_t0, std::memory_order_relaxed);
+		CensoPm4::Mark(CensoPm4::KSlice); // (w18)
+	}
 
 	if (first_slice && submission.reset_processor) {
 		cp.Reset();
@@ -1047,8 +1643,10 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	// The graphics queue's command buffers, speculation on: speculatively first (speculation.h).
+	// (Not with KYTY_NATIVE_MEMORY: a speculation translates on other threads, ahead of the sweeps of the write watch
+	// that tell the caches what the guest wrote, GpuResourceManager::SweepCpuWrites.)
 	const bool speculate = submission.type == SubmissionType::Graphics && submission.queue_id == 0 &&
-	                       kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
+	                       kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !PageManager::NativeWriteWatch();
 	if (speculate && !m_speculation) m_speculation = std::make_unique<Speculation>(m_renderer);
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {
@@ -1057,7 +1655,9 @@ bool GuestGpu::Process(Submission& submission) {
 		}
 		~EffectsScope() { Spec::t_effects = nullptr; }
 		KYTY_CLASS_NO_COPY(EffectsScope);
-	} effects_scope {m_speculation.get()};
+	} effects_scope {m_speculation ? m_speculation.get()
+	                 : m_acb_spec && m_acb_spec->Pending() ? m_acb_spec.get() // (envio2: one handed or blocked)
+	                                                        : nullptr};
 
 	cp.BufferInit();
 	bool complete = true;
@@ -1192,12 +1792,14 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			CensoPm4::Mark(CensoPm4::KFlush); // (w18)
 			if (progressed) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
 				}
 				// (A slice stopped at a wait goes to the GPU at once: what it waits for may need it.)
-				if (complete) cp.BufferFlushDeferrable();
+				// (serie1: the culling's lane-1 buffer at once too: the game reads its bits next.)
+				if (complete && !serie1_lane) cp.BufferFlushDeferrable();
 				else cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.GetGpuResources().EndSubmission();
@@ -1218,9 +1820,125 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
+			// (envio2, KYTY_ENVIO2) Handed to the ACB thread at its first slice (when it has none): the GPU thread goes
+			// on with the other queues and commits it, in this queue's order, when it takes it again (blocked meanwhile;
+			// the ACB thread's end wakes it). Mode 2: committed at once. What it did not commit goes on the normal way
+			// from where the commit left it (the safe fallback).
+			// (envio3, KYTY_ENVIO3) Several in flight (one per compute queue head, Speculation::Full), and continuations:
+			// a submission at a WAIT_REG_MEM (where a commit stopped, "wait on memory the CPU writes", or a slice resumed
+			// there) has the wait run here - its sweep of CPU writes included, CommandProcessor::WaitRegMem - and the
+			// rest handed to the ACB thread again. Not satisfied: the slice waits, as the normal way would.
+			bool envio2_progress = false;
+			bool envio2_stop     = false; // (the slice ends here: handed, blocked or whole)
+			if (m_acb_spec) {
+				const uint64_t spec_serial = uint64_t {submission.queue_id} << 48u | submission.serial;
+				const bool     envio3      = Envio3::Mode() != 0;
+				const auto     hand        = [&](bool continuation) {
+					if (!m_acb_spec->Hand(spec_serial, cp, submission.commands, submission.command_execution)) return false;
+					submission.envio2_handed = true;
+					submission.envio3_cont   = continuation;
+					if (continuation) Envio2::Add(Envio3::g_totals.continuations);
+					return true;
+				};
+				if (first_slice) {
+					Envio2::Add(Envio2::g_totals.submissions);
+					if (hand(false)) {
+						Envio2::Add(Envio2::g_totals.handed);
+					} else {
+						Envio2::Add(Envio2::g_totals.fallback[Envio2::Busy]);
+					}
+				} else if (!submission.envio2_handed && !m_acb_spec->BlockedHanded(spec_serial)) {
+					// (A slice resumed the normal way: at a wait, envio3 tries a continuation below.)
+					if (!envio3 || !CommandProcessor::AtWait(submission.command_execution))
+						Envio2::Add(Envio2::g_totals.fallback[Envio2::NotFirst]);
+				}
+				for (bool first_round = true;; first_round = false) {
+					auto outcome   = Speculation::Outcome::None;
+					bool committed = false;
+					if (submission.envio2_handed) {
+						if (Envio2::Mode() == 1 && first_slice && first_round) {
+							// (Mode 1: handed in this slice; committed when the GPU thread takes it again.)
+							envio2_stop = true;
+							complete                     = false;
+							break;
+						}
+						submission.envio2_handed = false;
+						uint64_t waited          = 0;
+						outcome   = m_acb_spec->CommitHanded(spec_serial, cp, submission.command_execution, waited);
+						committed = true;
+						if (waited != 0) {
+							Envio2::Add(Envio2::g_totals.forced);
+							Envio2::Add(Envio2::g_totals.forced_ns, waited);
+						}
+						// (The order check: a queue's submissions committed in their order; its continuations after it.)
+						if (submission.serial < m_envio2_last[submission.queue_id] ||
+						    (submission.serial == m_envio2_last[submission.queue_id] && !submission.envio3_cont))
+							Envio2::Add(Envio2::g_totals.order_errors);
+						m_envio2_last[submission.queue_id] = submission.serial;
+					} else if (m_acb_spec->BlockedHanded(spec_serial)) {
+						outcome   = m_acb_spec->ResumeHanded(spec_serial, cp, submission.command_execution);
+						committed = true;
+					}
+					if (committed) {
+						switch (outcome) {
+							case Speculation::Outcome::Whole: Envio2::Add(Envio2::g_totals.whole); break;
+							case Speculation::Outcome::Blocked: Envio2::Add(Envio2::g_totals.fallback[Envio2::Blocked]); break;
+							case Speculation::Outcome::None: Envio2::Add(Envio2::g_totals.fallback[Envio2::None]); break;
+							default: Envio2::Add(Envio2::g_totals.fallback[Envio2::Partly]); break;
+						}
+					}
+					if (outcome == Speculation::Outcome::Blocked) {
+						// (What it committed before the wait goes to the GPU; the submission waits as at a wait of its own.)
+						cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+					if (outcome == Speculation::Outcome::Whole) {
+						envio2_stop = true;
+						complete    = true;
+						m_renderer.GetGpuResources().EndSubmission();
+						cp.BufferFlushDeferrable();
+						break;
+					}
+					envio2_progress |= outcome == Speculation::Outcome::Partly;
+					// (envio3) A continuation: at a wait, after a commit that stopped there or a slice resumed there.
+					if (!envio3 || !CommandProcessor::AtWait(submission.command_execution) ||
+					    (!committed && first_slice))
+						break;
+					if (m_acb_spec->Full()) {
+						Envio2::Add(Envio3::g_totals.cont_full);
+						if (!committed) Envio2::Add(Envio2::g_totals.fallback[Envio2::NotFirst]);
+						break;
+					}
+					uint32_t     dwords = 0;
+					const auto*  packet = CommandProcessor::SuspendedPacket(submission.command_execution, dwords);
+					Pm4Execution wait;
+					if (cp.Process(wait, {packet, dwords}) != Pm4ProcessResult::Complete) {
+						// (Not satisfied yet: the slice waits there, as the normal way's would; what was committed goes.)
+						Envio2::Add(Envio3::g_totals.cont_unsatisfied);
+						if (envio2_progress) cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+					CommandProcessor::SkipSuspendedPacket(submission.command_execution);
+					envio2_progress = true;
+					if (!hand(true)) break; // (the rest the normal way, after the wait)
+					if (Envio2::Mode() == 1) {
+						// (What was committed goes to the GPU now; the rest when the GPU thread takes it again.)
+						cp.BufferFlush();
+						envio2_stop = true;
+						complete    = false;
+						break;
+					}
+				}
+			}
+			if (envio2_stop) break;
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
+			CensoPm4::Mark(CensoPm4::KFlush); // (w18)
+			if (submission.command_execution.MadeProgress() || envio2_progress) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();
 				}
@@ -1245,6 +1963,17 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::FrameBoundary: EXIT("frame boundary already handled\n");
 	}
+	// (serie1) A culling's label is written (translated): the game's wait for it ends; the GPU thread's gap begins.
+	if (serie1_cull && complete) Serie1::NoteLabel(submission.enqueue_ns);
+	// (parpadeo8, w21) El tick que contendra este cull (el buffer abierto se cierra con CurrentTick() o uno mayor): el hilo
+	// del juego sabe en 0xa1f290 si la GPU ya lo corrio (local/parpadeo8.h). Una lectura atomica y dos escrituras.
+	if (serie1_cull && complete) {
+		auto& master = m_renderer.GetCommandScheduler().GetMasterSemaphore();
+		Parpadeo8::NoteCullLabel(
+		    &master, [](const void* m, uint64_t tick) { return static_cast<const MasterSemaphore*>(m)->IsFree(tick); },
+		    master.CurrentTick());
+	}
+	Serie1::g_open_cull = false;
 	// (KYTY_SPECULATE=4: the state after the graphics queue's submission, for a chain that could not follow it.)
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
@@ -1285,6 +2014,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} queue_scope(IsAsyncComputeQueue() ? LiveCensus::QueueAsync : 0);
 	LiveCensus::Scope census(LiveCensus::QueueRun, static_cast<uint64_t>(m_interrupt_event_id));
 	ProcessPm4(execution, 0);
+	CensoPm4::Mark(CensoPm4::KSlice); // (w18)
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -1356,6 +2086,97 @@ static int32_t GsUserSgprAt(uint32_t location) {
 	return id < 32u ? static_cast<int32_t>(id) : -1;
 }
 
+// (render1 F0+F1, KYTY_RENDER1=1; local/render1.h) The DRAW_INDEX_INDIRECT packets about to run (5 dwords each,
+// `packets` of them from `packet`), paired with the hook's markers; then, every 5 s, the [render1] line. Observes only.
+// (F2) Returns how many were paired with a marker of a native pass (p0/p1) and draw depth only; `all`: all of them.
+static uint32_t Render1Observe(const HW::Context& ctx, const uint32_t* packet, uint32_t packets, bool& all) {
+	const auto& depth = ctx.GetDepthControl();
+	bool        color = false;
+	const uint32_t mask = ctx.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8 && !color; ++slot)
+		color = ((mask >> (slot * 4u)) & 0xfu) != 0 && ctx.GetRenderTarget(slot).base.addr != 0;
+	const bool depth_only = depth.z_enable && depth.z_write_enable && !color;
+	uint32_t   native     = 0;
+	all                   = true;
+	for (uint32_t i = 0; i < packets; ++i) {
+		if (packet[i * 5u] != 0xc0032500u) break;
+		const int pass = Render1::ObserveDraw(packet + i * 5u, depth_only);
+		if (depth_only && pass >= 0 && Render1::NativePass(static_cast<uint32_t>(pass))) ++native;
+		else all = false;
+	}
+	Render1::MaybeReport(LiveControl::g_flips.load(std::memory_order_relaxed));
+	return native;
+}
+
+// The rest of a run drawn with the first packet: observed after it (F2: a draw of it not of p0/p1 spoils the batch's
+// comparison; the batch has the whole run).
+static void Render1ObserveRest(const HW::Context& ctx, RenderExecutor& executor, const uint32_t* packet, uint32_t packets,
+                               bool in_spec) {
+	// (F3) Paired already, before the run was drawn (TryNativeXprDraws).
+	if (Render1::Mode() == 3 && !in_spec && Render1::t_current.rest_observed) return;
+	bool       all    = false;
+	const auto native = Render1Observe(ctx, packet, packets, all);
+	if (Render1::Mode() < 2 || in_spec || !Render1::t_current.native) return;
+	if (Render1::Mode() == 3) {
+		Render1::t_step_draws += native;
+		return;
+	}
+	Render1::t_step_draws += native;
+	if (!all) executor.Render1Taint(Render1::RRunMixed);
+}
+
+// (render1 F3) The other draws of a run, by their packets (a run over gancho2's gaps is not 5 dwords a draw), paired
+// before the run is drawn: how many are p0/p1 depth draws; `all`: every one.
+static uint32_t Render1ObservePackets(const HW::Context& ctx, const uint32_t* const* packets, uint32_t count, bool& all) {
+	const auto& depth = ctx.GetDepthControl();
+	bool        color = false;
+	const uint32_t mask = ctx.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8 && !color; ++slot)
+		color = ((mask >> (slot * 4u)) & 0xfu) != 0 && ctx.GetRenderTarget(slot).base.addr != 0;
+	const bool depth_only = depth.z_enable && depth.z_write_enable && !color;
+	uint32_t   native     = 0;
+	all                   = true;
+	for (uint32_t i = 0; i < count; ++i) {
+		const int pass = Render1::ObserveDraw(packets[i], depth_only);
+		if (depth_only && pass >= 0 && Render1::NativePass(static_cast<uint32_t>(pass))) ++native;
+		else all = false;
+	}
+	return native;
+}
+
+// (render1 F2, KYTY_RENDER1=2) One step of the walk that processes a p0/p1 draw packet (and the run it may start): its
+// time, less the native batch's own work, is the normal path's for its draws; a draw the native batch did not take
+// spoils the batch's comparison. Ends the step's state (Render1::t_current).
+struct Render1Step {
+	RenderExecutor* executor = nullptr;
+	uint64_t        start    = 0;
+	void Start(RenderExecutor& ex) {
+		executor                  = &ex;
+		Render1::t_native_cycles = 0;
+		start                     = __rdtsc();
+	}
+	~Render1Step() {
+		if (executor == nullptr) return;
+		const uint64_t cycles = __rdtsc() - start;
+		const uint64_t native = Render1::t_native_cycles;
+		auto&          c      = Render1::t_current;
+		if (Render1::Mode() == 3) {
+			// (F3) The step's whole time, drawn natively or the normal way (by window).
+			if (c.native) Render1::F3EndStep(cycles, Render1::t_step_draws);
+		} else if (c.native) {
+			Render1::g_f2.normal_cycles.fetch_add(cycles > native ? cycles - native : 0, std::memory_order_relaxed);
+			Render1::g_f2.normal_draws.fetch_add(Render1::t_step_draws, std::memory_order_relaxed);
+			if (!c.captured) {
+				if (!c.noted) Render1::Note(Render1::RViaNormal, std::max<uint32_t>(1, Render1::t_step_draws));
+				executor->Render1Taint(Render1::RViaNormal);
+			}
+		}
+		Render1::t_current       = {};
+		Render1::t_native_cycles = 0;
+		Render1::t_step_draws    = 0;
+	}
+};
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	auto* const spec = Spec::Current();
 	// A speculation's refused packet suspends the execution there (speculation.cpp goes on past it, or stops).
@@ -1363,13 +2184,78 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		Spec::Refuse(why);
 		execution.m_suspended = true;
 	};
+	LiveCensus::Pm4Clock pm4_clock; // (render3, KYTY_RENDER_STATS: the walk's time by packet class; nothing otherwise)
+	const uint32_t       lane_mode = Render5::Mode(Render5::RegLane); // (render5, KYTY_REG_LANE)
+	// (otros1, KYTY_OTROS1: with KYTY_RENDER_STATS, the walk's time by packet kind, otros1.h)
+	const bool otros1_on = Otros1::Mode() != 0 && LiveCensus::RenderStatsOn();
+	// (otros2, KYTY_OTROS2: A, otros2.h) The preamble waits past steps that cannot need it; `pre_skips` steps since it
+	// last ran. On any way out of the walk with steps pending, it runs once (the guest commands and write-backs then).
+	const uint32_t otros2_mode = Otros2::Active() && spec == nullptr && g_gpu_state != nullptr ? Otros2::Mode() : 0u;
+	uint32_t       pre_skips   = 0;
+	auto* const    preamble_cache = g_gpu_state != nullptr ? &g_gpu_state->m_renderer.GetBufferCache() : nullptr;
+	const auto     preamble    = [&] {
+        // (w20) Between packets nothing is usually queued: two inline checks instead of two calls (each with its own
+        // checks: GPU thread, par queues, juego3, native memory, the semaphore's tick) on every packet. ACB #4 a0ed3e
+        // ~10700 packets/f, "preambulo+vuelta" 1026 us/f (measured with [censo-pm4], its marks included).
+        if (Juego3::Mode() == 0 && !g_gpu_state->HasPendingCommands() && (preamble_cache == nullptr || !preamble_cache->FeedbackPending())) return;
+        const uint64_t pre0 = otros1_on ? __rdtsc() : 0; // (otros1: the preamble's own time)
+        g_gpu_state->ProcessCommands();
+        // (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
+        g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+        if (otros1_on) {
+            Otros1::g_pre_cycles += __rdtsc() - pre0;
+            ++Otros1::g_pre_calls;
+        }
+	};
+	struct PreambleAtExit {
+		const uint32_t&             skips;
+		const decltype(preamble)&   run;
+		~PreambleAtExit() {
+			if (skips != 0) {
+				++Otros2::g_pre_flush;
+				run();
+			}
+		}
+	} preamble_at_exit {pre_skips, preamble};
 	while (execution.m_buffer_stack.size() > stop_depth) {
+		CensoPm4::Mark(CensoPm4::KPre); // (w18)
+		pm4_clock.Next();
+		G1::WalkStep(); // (g1 NP1, KYTY_G1_PROBE: a draw packet's walk by stretch; one relaxed load when off)
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
 		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
-			g_gpu_state->ProcessCommands();
-			// (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
-			g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+			bool can_wait = false;
+			if (otros2_mode != 0 && pre_skips < Otros2::MaxSkips) {
+				const auto& next = execution.m_buffer_stack.back();
+				if (next.deferred_advance_dw != 0 || next.offset_dw >= next.commands.size()) {
+					can_wait = true; // (no packet runs in this step)
+				} else {
+					const uint32_t header = next.commands[next.offset_dw];
+					can_wait              = Otros2::PreambleCanWait(header, RegLaneOpcode((header >> 8u) & 0xffu)) &&
+					           (header == 0x80000000u || KYTY_PM4_LEN(header) <= next.commands.size() - next.offset_dw);
+				}
+			}
+			if (can_wait && otros2_mode == 2) {
+				// (2) Run anyway; count the steps where it found work that 1 would have postponed.
+				using C             = LiveCounters::Id;
+				const auto before   = LiveCounters::Value(C::GuestCommands) + LiveCounters::Value(C::EagerWritten) +
+				                    LiveCounters::Value(C::EagerStale) + LiveCounters::Value(C::EagerClean) +
+				                    LiveCounters::Value(C::EagerRefused);
+				preamble();
+				const auto after = LiveCounters::Value(C::GuestCommands) + LiveCounters::Value(C::EagerWritten) +
+				                   LiveCounters::Value(C::EagerStale) + LiveCounters::Value(C::EagerClean) +
+				                   LiveCounters::Value(C::EagerRefused);
+				if (after != before) ++Otros2::g_pre_would_postpone;
+				++Otros2::g_pre_skipped;
+			} else if (can_wait) {
+				++pre_skips;
+				++Otros2::g_pre_skipped;
+			} else {
+				pre_skips = 0;
+				preamble();
+			}
 		}
+		G1::WalkMark(G1::WPreamble); // (g1 NP1)
+		CensoPm4::Mark(CensoPm4::KWalk); // (w18)
 		const auto buffer_index = execution.m_buffer_stack.size() - 1;
 		auto&      cursor       = execution.m_buffer_stack[buffer_index];
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
@@ -1391,11 +2277,36 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+		pm4_clock.Class(Pm4ClassOf(opcode));
+		pm4_clock.Key(packet_header); // (otros1)
+		CensoPm4::Packet(CensoPm4::KeyOf(packet_header)); // (w18)
+		G1::WalkDecoded(Pm4ClassOf(opcode) == LiveCensus::Pm4Draw); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
+		if (DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu && DsNativoSombras::Mode() == 2)
+			DsNativoSombras::GpuNotePacket(opcode, packet, remaining_dw, m_sh_ctx.GetCs().cs_regs.data_addr); // (F5 pase 2, =2)
+		// (otros1, KYTY_OTROS1) The register pairs an indirect block carries (its handler and the draw state observer
+		// each read the block).
+		if (otros1_on && (opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+		                  opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT) &&
+		    remaining_dw >= 5) {
+			const uint32_t space = opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ? 0u : opcode == Pm4::IT_SET_SH_REG_INDIRECT ? 1u : 2u;
+			Otros1::g_pairs[space] += packet[4] & 0x3fffu;
+			++Otros1::g_indirect[space];
+		}
 
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
+		}
+
+		// (render1 F2, KYTY_RENDER1=2) A packet that is not state (nor a draw, decided when paired) ends the native batch
+		// first: it is drawn and compared as the pass left the depth.
+		if (Render1::Mode() == 2 && spec == nullptr && !m_state_only) {
+			auto& executor = m_renderer.GetRenderExecutor();
+			if (executor.Render1BatchOpen() &&
+			    !Render1::KeepsBatch(opcode, opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO &&
+			                                     packet_header != DsLinearCopyHook::Header && packet_header != DsNativoPase::Header))
+				executor.Render1EndBatch(CurrentBuffer(), Render1::EOther);
 		}
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
@@ -1443,6 +2354,103 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			m_stop_reached        = true;
 			execution.m_suspended = true;
 			return;
+		}
+		// (render5) KYTY_REG_LANE (render5.h): this register / index state packet and the lane packets right after it in
+		// this buffer (RegLanePacket, up to RegLaneMaxPackets) run here: the walk's checks below do nothing for them
+		// outside a speculation, a state pass, a chunked pass or a stop (none here; the hook's header is a NOP, they keep
+		// the deferred protections), so only the guest commands and the copy feedback the walk runs between packets wait
+		// for the run's end. Each one is observed (draw state observer), counted and handled as the walk does. 2: the
+		// same lane with the walk's per-packet work done between its packets, as the walk does it (what is drawn as with
+		// 0); the guest commands and feedback write-backs that ran there (what 1 postpones) and any packet a check of the
+		// walk would have acted on (a difference) are counted ([render5]).
+		if (lane_mode != 0 && spec == nullptr && !m_state_only && m_chunk_every == 0 && m_stop_at == nullptr &&
+		    g_gpu_state != nullptr && !GraphicsRunDebugDumpEnabled() &&
+		    RegLanePacket(cursor.commands.data(), cursor.offset_dw, total_dw)) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			const bool observe = kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0 &&
+			                     (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) == 0;
+#else
+			const bool observe = false;
+#endif
+			const bool verify = lane_mode == 2;
+			// (2) The walk's work between two packets, and what it did.
+			const auto between = [&] {
+				using C                     = LiveCounters::Id;
+				const auto commands         = LiveCounters::Value(C::GuestCommands);
+				const auto feedback         = LiveCounters::Value(C::EagerWritten) + LiveCounters::Value(C::EagerStale) +
+				                      LiveCounters::Value(C::EagerClean) + LiveCounters::Value(C::EagerRefused);
+				g_gpu_state->ProcessCommands();
+				g_gpu_state->m_renderer.GetBufferCache().WriteBackCompletedFeedback(true);
+				Render5::g_lane[Render5::LanePostponed] += LiveCounters::Value(C::GuestCommands) - commands;
+				Render5::g_lane[Render5::LaneFeedback] += LiveCounters::Value(C::EagerWritten) +
+				                                         LiveCounters::Value(C::EagerStale) +
+				                                         LiveCounters::Value(C::EagerClean) +
+				                                         LiveCounters::Value(C::EagerRefused) - feedback;
+			};
+			uint32_t taken = 0;
+			{
+			// (par1, KYTY_PAR_QUEUES=1) The run's handlers write this processor's registers only (RegLaneBits): made
+			// without the queue lock, beside the other translating thread's work (nothing unless on; not with 2, whose
+			// walk work between the packets needs it).
+			std::optional<ParQueues::UnlockedScope> unlocked;
+			if (!verify && ParQueues::On()) unlocked.emplace();
+			for (;;) {
+				const uint32_t  at     = cursor.offset_dw;
+				const uint32_t* lane   = cursor.commands.data() + at;
+				const uint32_t  rest   = total_dw - at;
+				const uint32_t  header = lane[0];
+				const uint32_t  op     = (header >> 8u) & 0xffu;
+				if (taken != 0) { // (the run's first packet had the walk's work and class already)
+					pm4_clock.Next();
+					if (verify) between();
+					pm4_clock.Class(Pm4ClassOf(op));
+					pm4_clock.Key(header); // (otros1)
+					CensoPm4::Packet(CensoPm4::KeyOf(header)); // (w18)
+				}
+				const auto handler = g_cp_op_func[op];
+				if (verify && (!KeepsDeferredProtection(op) || handler == nullptr || header == DsLinearCopyHook::Header))
+					++Render5::g_lane[Render5::LaneDifferent];
+				if (handler == nullptr) break; // (the walk reports it)
+				m_chunk_last_opcode = op;
+				LiveCounters::AddPm4(op);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+				if (observe)
+					DrawStateObserver::ObservePacket(op, lane, KYTY_PM4_LEN(header) < rest ? KYTY_PM4_LEN(header) : rest, false);
+#endif
+				m_draw_run_skip           = 0;
+				const uint32_t packet_dw = handler(*this, header & ~1u, lane + 1, rest, total_dw) + 1;
+				EXIT_IF(packet_dw > rest);
+				if (execution.m_suspended) {
+					if (execution.m_buffer_stack.size() > buffer_index + 1)
+						execution.m_buffer_stack[buffer_index].deferred_advance_dw = packet_dw;
+					return;
+				}
+				EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1);
+				cursor.offset_dw += packet_dw;
+				execution.m_made_progress = true;
+				++taken;
+				// One-dword NOPs between them, as the walk passes them over.
+				while (taken < RegLaneMaxPackets && cursor.offset_dw < total_dw &&
+				       cursor.commands[cursor.offset_dw] == 0x80000000u) {
+					pm4_clock.Next();
+					if (verify) between();
+					pm4_clock.Class(Pm4ClassOf(0));
+					pm4_clock.Key(0x80000000u); // (otros1)
+					cursor.offset_dw++;
+					++taken;
+				}
+				if (taken >= RegLaneMaxPackets || !RegLanePacket(cursor.commands.data(), cursor.offset_dw, total_dw)) break;
+			}
+			} // (par1: the queue lock again)
+			// (par1) The other thread may have begun its slice meanwhile: the open command buffer, shared, is bound to its
+			// processor's registers then (CommandScheduler::Begin); bound to this one's again before any packet records.
+			if (ParQueues::On() && !verify) {
+				auto& scheduler = GetScheduler();
+				if (!scheduler.Active() || &scheduler.Current().GetRegisters() != &m_ctx) BufferInit();
+			}
+			++Render5::g_lane[Render5::LaneRuns];
+			Render5::g_lane[Render5::LanePackets] += taken;
+			if (taken != 0) continue;
 		}
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
@@ -1498,11 +2506,260 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			}
 		}
 
+		// (port2) KYTY_PORT2 (local/port2.h): a marker the emulator's Agc wrote after a draw / dispatch. Sealed (the state
+		// the binder and the game wrote for the next draw, recorded as a flow when that draw was recorded): applied from the
+		// flow and its span passed over, the walk lands on the next draw; else (not sealed, a speculation, a state pass, a
+		// chunk, a stop, a capture, the record gone) a plain NOP: the span after it is walked as always.
+		if (packet_header == Port2::Header && Port2::Mode() != 0 && Port2::IsMarker(packet, remaining_dw)) {
+			const bool can_apply = spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 &&
+			                       g_gpu_state != nullptr && GuestGpu::IsGpuThread() &&
+			                       kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
+			                       !GraphicsRunDebugDumpEnabled() && !Render1::On() && Port1::Mode() == 0 &&
+			                       !FrameCapture::Active() && !XprCapture::Enabled();
+			cursor.offset_dw += Port2Marker(packet, remaining_dw, can_apply);
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2) The scene hook's CENS marks (6 dwords) around one pass call's draws: the
+		// translation time between them is the pass's cost ([censo-escena]). Passed over.
+		if (packet_header == DsCensoEscena::MarkHeader && DsCensoEscena::IsMark(packet, remaining_dw)) {
+			if (spec == nullptr && !m_state_only && GuestGpu::IsGpuThread()) DsCensoEscena::GpuMark(packet);
+			m_draw_run_skip = 0; // (como las marcas NATV)
+			cursor.offset_dw += DsCensoEscena::MarkDwords;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// (F5 pase 2, =3 / =1) The shadow hook's NATV marks (6 dwords) around one bucket's draws: the native cascade
+		// (renderer/dsSombrasNativas.inc). Passed over; in a speculation or a state pass, nothing else.
+		if (packet_header == DsNativoSombras::MarkHeader && DsNativoSombras::IsNatMark(packet, remaining_dw)) {
+			if (spec == nullptr && !m_state_only && GuestGpu::IsGpuThread() &&
+			    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3)) {
+				CheckBuffer();
+				if (DsNativoSombras::NatDiag() && (packet[3] & 0xFFu) == DsNativoSombras::NatBegin)
+					DsNativoSombras::NatScanDcb(packet, remaining_dw, packet[4]); // (diagnostico)
+				if (DsNativoSombras::Mode() == 1 && DsNativoSombras::NatCascada() && (packet[3] & 0xFFu) == DsNativoSombras::NatBegin)
+					DsNativoSombras::NatScanGroup(packet, remaining_dw, (packet[3] >> 8u) & 0xFFu, packet[4]); // (=1 + CASCADA)
+				m_renderer.GetRenderExecutor().DsNatMark(CurrentBuffer(), packet[3], packet[4]);
+			}
+			m_draw_run_skip = 0;
+			cursor.offset_dw += DsNativoSombras::MarkDwords;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// (F5 pase 2) KYTY_NATIVO_PASE_SOMBRAS=2 (local/ds-nativo-sombras.h): the shadow hook's mark (a 4-dword NOP) before a
+		// cascade's draws. Passed over; the next DrawIndex dumps the VS user data once per cascade.
+		if (packet_header == DsNativoSombras::MarkHeader && DsNativoSombras::IsMark(packet, remaining_dw)) {
+			if (spec == nullptr && !m_state_only && GuestGpu::IsGpuThread()) {
+				DsNativoSombras::g_gpu_pending_index = packet[4] | (uint64_t {packet[5]} << 32u);
+				DsNativoSombras::g_gpu_pending       = packet[3];
+			}
+			cursor.offset_dw += DsNativoSombras::MarkDwords;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// (F5 pase 1) KYTY_NATIVO_PASE_SSRCLEAR (local/ds-nativo-pase.h): the game's SSRClear texture clear announced the
+		// T# its packets after this one clear. 1: cleared natively and those packets passed over; 2: cleared natively and
+		// those packets run too (the emulated image is the one shown). Refused, unsealed, a speculation, a state pass or a
+		// chunked walk: the announcement alone is passed over and the game's packets run as always.
+		if (packet_header == DsNativoPase::Header && DsNativoPase::IsPacket(packet, remaining_dw)) {
+			uint32_t advance = DsNativoPase::PacketDwords;
+			if (spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 && g_gpu_state != nullptr &&
+			    GuestGpu::IsGpuThread() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
+			    DsNativoPase::IsSealed(packet, remaining_dw)) {
+				CheckBuffer();
+				if (m_renderer.GetComputeRenderExecutor().DsNativeClear(CurrentBuffer(), packet + DsNativoPase::TSharpWord)) {
+					if (DsNativoPase::Mode() == 1) {
+						advance += packet[DsNativoPase::SkipWord]; // (up to the dispatch: its EVENT_WRITEs run)
+						DsNativoPase::Count(DsNativoPase::Native);
+					} else {
+						DsNativoPase::Count(DsNativoPase::Verified);
+					}
+				} else {
+					DsNativoPase::Count(DsNativoPase::Refused);
+				}
+				DsNativoPase::Report();
+			}
+			m_draw_run_skip = 0;
+			cursor.offset_dw += advance;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		// (render4) KYTY_DS_LINEAR_COPY_HOOK (local/ds-linear-copy-hook.h): the game's linear copy function announced
+		// the copy its packets after this one make. Made here from the announcement, those packets are passed over
+		// (as a dispatch: the deferred protections stay pending); else the announcement alone is, as if it were not
+		// there, and the game's packets run. Never made in a speculation or a state pass, nor where a chunk's end or
+		// boundary could lie within the packets passed over, nor with KYTY_SPECULATE at all (its state passes run the
+		// game's register packets, and a commit compares the processor's state with theirs).
+		if (packet_header == DsLinearCopyHook::Header && DsLinearCopyHook::IsPacket(packet, remaining_dw)) {
+			uint32_t advance = DsLinearCopyHook::PacketDwords;
+			if (spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 && g_gpu_state != nullptr &&
+			    GuestGpu::IsGpuThread() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
+			    DsLinearCopyHook::IsSealed(packet, remaining_dw)) {
+				const auto     dst    = DsLinearCopyHook::Address(packet, DsLinearCopyHook::DstWord);
+				const auto     src    = DsLinearCopyHook::Address(packet, DsLinearCopyHook::SrcWord);
+				const uint32_t count  = packet[DsLinearCopyHook::CountWord];
+				const uint32_t period = packet[DsLinearCopyHook::PeriodWord];
+				const uint32_t span   = packet[DsLinearCopyHook::SpanWord];
+				const auto     bytes  = uint64_t {DsLinearCopyHook::PacketDwords + span} * sizeof(uint32_t);
+				if (DsLinearCopyHook::Mode() == 2) {
+					// (Verify: the dispatch that follows compares its copy with the announcement's.)
+					DemonsSouls::ExpectLinearCopy(dst, src, count, period, reinterpret_cast<uint64_t>(packet), bytes);
+				} else if (Copia1::On()) {
+					// (copia1, local/copia1.h) This announcement and those right after it (only one-dword NOPs between),
+					// made in one run, in order; `ends[i]`: the offset past copy i's game packets and the NOPs after them.
+					CheckBuffer();
+					std::array<RenderExecutor::DsLinearCopyItem, Copia1::MaxRun> items;
+					std::array<uint32_t, Copia1::MaxRun> starts {}, ends {};
+					uint32_t       n   = 0;
+					uint32_t       at  = cursor.offset_dw;
+					Copia1::Flush  why = Copia1::Full;
+					while (true) {
+						const auto* p    = cursor.commands.data() + at;
+						const auto  left = total_dw - at;
+						if (n != 0) {
+							if (left == 0) { why = Copia1::BufferEnd; break; }
+							if (!DsLinearCopyHook::IsPacket(p, left)) { why = Copia1::OtherPacket; break; }
+							if (!DsLinearCopyHook::IsSealed(p, left)) { why = Copia1::NotSealed; break; }
+						}
+						const uint32_t sp = p[DsLinearCopyHook::SpanWord];
+						items[n]          = {.dst            = DsLinearCopyHook::Address(p, DsLinearCopyHook::DstWord),
+						                     .src            = DsLinearCopyHook::Address(p, DsLinearCopyHook::SrcWord),
+						                     .count          = p[DsLinearCopyHook::CountWord],
+						                     .period         = p[DsLinearCopyHook::PeriodWord],
+						                     .commands       = reinterpret_cast<uint64_t>(p),
+						                     .commands_bytes = uint64_t {DsLinearCopyHook::PacketDwords + sp} * sizeof(uint32_t)};
+						starts[n] = at;
+						at += DsLinearCopyHook::PacketDwords + sp;
+						while (at < total_dw && cursor.commands[at] == 0x80000000u) ++at;
+						ends[n] = at;
+						if (++n == Copia1::MaxRun) { why = Copia1::Full; break; }
+					}
+					const auto t0   = std::chrono::steady_clock::now();
+					const auto made = m_renderer.GetComputeRenderExecutor().DsLinearCopyBatch(CurrentBuffer(), items.data(), n);
+					const auto ns   = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+					for (uint32_t i = 0; i < made; ++i) DsLinearCopyHook::Count(DsLinearCopyHook::Taken);
+					if (made < n) {
+						// (Copy `made` refused: its announcement alone is passed over, its game's packets run; the
+						// announcements after it come to this branch again.)
+						DsLinearCopyHook::Count(DsLinearCopyHook::Passed);
+						why = Copia1::Refused;
+						advance = starts[made] + DsLinearCopyHook::PacketDwords - cursor.offset_dw;
+					} else {
+						advance = ends[n - 1] - cursor.offset_dw;
+					}
+					Copia1::NoteRun(made, static_cast<uint64_t>(ns), why);
+				} else {
+					CheckBuffer();
+					if (m_renderer.GetComputeRenderExecutor().DsLinearCopy(CurrentBuffer(), dst, src, count, period,
+					                                                       reinterpret_cast<uint64_t>(packet), bytes)) {
+						advance += span;
+						DsLinearCopyHook::Count(DsLinearCopyHook::Taken);
+					} else {
+						DsLinearCopyHook::Count(DsLinearCopyHook::Passed);
+					}
+				}
+			}
+			m_draw_run_skip = 0;
+			cursor.offset_dw += advance;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		// Only state, draws and dispatches keep the deferred read protections pending: before a label, a memory write,
 		// a wait or anything else the pages GPU work writes are protected (PageManager::DeferReadProtection).
-		if (!KeepsDeferredProtection(opcode)) PageManager::FlushDeferredProtection();
+		if (!KeepsDeferredProtection(opcode)) {
+			// (FLUSH-ASYNC, KYTY_FLUSH_ASYNC=1) Packets that write no memory, wait for nothing and signal nothing: the
+			// pending no-access ranges go to a worker (joined before the next flush or protection of this thread).
+			if (opcode == Pm4::IT_NOP || opcode == Pm4::IT_EVENT_WRITE || opcode == Pm4::IT_ACQUIRE_MEM ||
+			    opcode == Pm4::IT_INDIRECT_BUFFER || opcode == Pm4::IT_INDIRECT_BUFFER_CNST || opcode == Pm4::IT_CONTEXT_CONTROL ||
+			    opcode == Pm4::IT_CLEAR_STATE || opcode == Pm4::IT_PFP_SYNC_ME)
+				PageManager::FlushDeferredProtectionAsync();
+			else
+				PageManager::FlushDeferredProtection();
+		}
+		// (f5p1 techo, KYTY_F5P1_TECHO=1; local/f5p1-techo.h) In an ON window, a draw of a verified pass 0/1 range of
+		// 0xad8bc0 is passed over (nothing translated, recorded or drawn); everything else runs as always.
+		if (F5p1Techo::On() && !m_state_only) {
+			if (const uint32_t skip = F5p1Techo::SkipDraw(opcode, packet, remaining_dw, cursor.commands.data(), total_dw)) {
+				m_draw_run_skip = 0;
+				cursor.offset_dw += skip;
+				execution.m_made_progress = true;
+				continue;
+			}
+		}
+		// (f5b) The pass cut (native/pass-cut.h): KYTY_NATIVE_TECHO passes over the draws / dispatches of the pass of its
+		// ceiling window; KYTY_NATIVE_PASSES ..:2 snapshots verified passes (state packets, target copies at the scope
+		// marks). One static load per packet when neither is set.
+		// (pt1) BB_PATHTRACING's GPU work at the packet after a game scope mark (TLAS build after GBuffer, shadows before
+		// RenderLights, reflections before RenderIBL). One static load per packet when off.
+		if (PathTrace::Requested() && !m_state_only && spec == nullptr && PathTrace::WorkPending()) PathTrace::RunWork(CurrentBuffer());
+		if (NativeRender::WalkOn() && !m_state_only && spec == nullptr) {
+			if (NativeRender::GpuWorkPending()) NativeRender::RunGpuWork(CurrentBuffer());
+			if (const uint32_t skip =
+			        NativeRender::WalkPacketSlow(opcode, packet, remaining_dw, cursor.commands.data(), total_dw)) {
+				m_draw_run_skip = 0;
+				cursor.offset_dw += skip;
+				execution.m_made_progress = true;
+				continue;
+			}
+		}
+		// (F5 pase 2, =3 / =1; renderer/dsSombrasNativas.inc) Cada draw directo indexado de un cubo de sombras marcado, ANTES
+		// de cualquier camino que lo dibuje (tablas, XPR nativo o el handler): con =3, el primero copia la capa emulada; con
+		// =1, en un cubo reemplazado, el draw de una entrada que dibuja el nativo se salta entero (solo este paquete: los
+		// de estado siguen). Indices como CommandProcessor::DrawIndexOffset / DRAW_INDEX_2.
+		if ((opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) &&
+		    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && (m_state_only || spec != nullptr || !GuestGpu::IsGpuThread()))
+			DsNativoSombras::g_nat_draws_elsewhere[m_state_only ? 0 : spec != nullptr ? 1 : 2].fetch_add(1, std::memory_order_relaxed); // (diagnostico)
+		if ((opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) && !m_state_only && spec == nullptr &&
+		    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && GuestGpu::IsGpuThread() &&
+		    m_renderer.GetRenderExecutor().DsNatWants()) {
+			const uint32_t packet_dw = KYTY_PM4_LEN(packet_header);
+			if (packet_dw >= 5 && packet_dw <= remaining_dw) {
+				const uint64_t isz        = m_index_type_and_size == 0 ? 2 : m_index_type_and_size == 1 ? 4 : 1;
+				const bool     offset2    = opcode == Pm4::IT_DRAW_INDEX_OFFSET_2;
+				const uint64_t index_addr = offset2 ? m_index_base_addr + uint64_t {packet[2]} * isz
+				                                    : (uint64_t {packet[2]} | (uint64_t {packet[3] & 0xFFFFu} << 32u));
+				const uint32_t count      = offset2 ? packet[3] : packet[4];
+				CheckBuffer();
+				DsNativoSombras::g_nat_cur_es = m_sh_ctx.GetVs().es_regs.data_addr; // (diagnostico: el VS de este draw)
+				if (m_renderer.GetRenderExecutor().DsNatBeforeDraw(CurrentBuffer(), index_addr, count)) {
+					m_draw_run_skip = 0;
+					cursor.offset_dw += packet_dw;
+					execution.m_made_progress = true;
+					continue;
+				}
+			}
+		}
+		G1::WalkMark(G1::WChecked); // (g1 NP1: the walk's checks done)
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
+		if (Port1::Mode() != 0) Port1::OnPacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw)); // (port1)
+		// (render1) KYTY_RENDER1=1/2: this draw (a run that takes more packets below observes the rest).
+		Render1Step render1_step; // (F2: the step of a p0/p1 draw; ends with this iteration)
+		if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT && Render1::On() && !m_state_only && packet_header == 0xc0032500u) {
+			bool       all    = false;
+			const auto native = Render1Observe(m_ctx, packet, 1, all);
+			if (Render1::Mode() >= 2 && spec == nullptr) {
+				auto& executor     = m_renderer.GetRenderExecutor();
+				Render1::t_current = {};
+				// (F3) The window this step is drawn in, and its first draw's R.
+				Render1::t_current.f3_on = Render1::g_f3_on.load(std::memory_order_relaxed);
+				Render1::t_current.r     = native == 1 ? Render1::t_last_r : 0;
+				if (native == 1) {
+					Render1::t_current.native = true;
+					Render1::t_current.args   = m_draw_indirect_args_base_addr + packet[1];
+					Render1::t_step_draws     = 1;
+					render1_step.Start(executor);
+				} else if (Render1::Mode() == 2 && executor.Render1BatchOpen()) {
+					executor.Render1EndBatch(CurrentBuffer(), Render1::EDrawOther);
+				}
+			}
+		}
 		if (DrawsOrDispatches(opcode)) PrefetchNextDraw(packet, remaining_dw);
 		if (XprCapture::Enabled()) {
 			if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
@@ -1515,6 +2772,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 		// Native XPR draws; on refusal the normal path stores a record, with the
 		// reads of its SRT evaluation logged until this packet completes.
+		G1::WalkMark(G1::WEntry); // (g1 NP1: the native XPR block begins)
 		std::optional<ShaderReadObserver> native_reads;
 		struct NativeStoreEnd {
 			RenderExecutor* executor = nullptr;
@@ -1530,13 +2788,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			    (packet_header != 0xc0032500u || GraphicsRunDebugDumpEnabled()))
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
 			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
+				G1::WalkMark(G1::WObserved); // (g1 NP1: the observer done, the try begins)
 				const auto consumed =
 				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
+				G1::WalkMark(G1::WTried); // (g1 NP1: the try returned)
 				if (consumed) {
+					if (Port1::Mode() != 0) Port1::OnRun(packet, std::min(consumed, remaining_dw)); // (port1: the run's other packets)
+					if (Render1::On() && !m_state_only && consumed > 5) Render1ObserveRest(m_ctx, m_renderer.GetRenderExecutor(), packet + 5, consumed / 5u - 1u, spec != nullptr);
 					m_draw_run_skip = 0;
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
-					GetScheduler().CompleteDraws(consumed / 5u);
+					GetScheduler().CompleteDraws(Gancho2::t_last_draws); // (gancho2: gaps make it not consumed / 5)
 					continue;
 				}
 				if (spec != nullptr) return refuse("draw");
@@ -1552,7 +2814,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				}
 			} else if (packet_header == 0xc0083800u && !GraphicsRunDebugDumpEnabled()) {
 				// Several indexed indirect draws of consecutive arguments, as a run of DRAW_INDEX_INDIRECT.
+				G1::WalkMark(G1::WObserved); // (g1 NP1)
 				const auto consumed = TryNativeMultiDraw({packet, remaining_dw});
+				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -1572,7 +2836,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				}
 			} else if (packet_header == 0xc0012d00u && !GraphicsRunDebugDumpEnabled()) {
 				// A draw of vertices as a table draw (the normal path stores the pair's state).
+				G1::WalkMark(G1::WObserved); // (g1 NP1)
 				const auto consumed = TryNativeAutoDraw({packet, remaining_dw});
+				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -1583,7 +2849,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
+				G1::WalkMark(G1::WObserved); // (g1 NP1)
 				const auto consumed = TryNativeDirectDraw({packet, remaining_dw});
+				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
@@ -1608,9 +2876,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 			const auto consumed = TryDrawIndirectRun({packet, remaining_dw});
 			if (consumed) {
+				if (Render1::On() && !m_state_only && consumed > 5) Render1ObserveRest(m_ctx, m_renderer.GetRenderExecutor(), packet + 5, consumed / 5u - 1u, spec != nullptr);
 				execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 				execution.m_made_progress = true;
-				GetScheduler().CompleteDraws(consumed / 5u);
+				GetScheduler().CompleteDraws(Port2::t_run_draws); // (port2: not consumed / 5 over markers)
 				continue;
 			}
 		}
@@ -1666,6 +2935,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		    opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI)
 			GetScheduler().CompleteDraws(1);
 	}
+	// (render1 F2) The whole command buffer walked: the native batch ends with it (before any submission).
+	if (Render1::Mode() == 2 && spec == nullptr && stop_depth == 0 && !m_state_only) {
+		auto& executor = m_renderer.GetRenderExecutor();
+		if (executor.Render1BatchOpen()) executor.Render1EndBatch(CurrentBuffer(), Render1::EPm4End);
+	}
 }
 
 void CommandProcessor::SetIndexType(uint32_t index_type_and_size) {
@@ -1712,6 +2986,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 
+			// (KYTY_NATIVE_MEMORY: the predicate GPU work wrote was read back by this read's fault; no fault comes now.)
+			// (raiz1, mode protect: the read faults; not here.)
+			if (PageManager::NativeWriteWatch() && !PageManager::WatchProtects() && !m_state_only && Spec::Current() == nullptr &&
+			    GuestGpu::IsGpuThread())
+				(void)Libs::LibKernel::Memory::SyncGpuCleanBacking(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
+
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 
 			switch (condition) {
@@ -1733,6 +3013,37 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 bool CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	CheckBuffer();
+	if (DsNativoSombras::Mode() == 2 && DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu) {
+		// (F5 pase 2, =2: registros del VS de la cascada marcada y el estado de la GPU de este draw: viewport, recortes,
+		// destino de profundidad y sesgo; solo registros del emulador, nada de memoria del juego en este hilo)
+		char        state[512];
+		const auto& vp = m_ctx.GetScreenViewport();
+		const auto& v0 = vp.viewports[0];
+		const auto& db = m_ctx.GetDepthRenderTarget();
+		const auto& dv = m_ctx.GetDepthDepthView();
+		const auto& sz = m_ctx.GetDepthDepthSizeXY();
+		const auto& po = m_ctx.GetPolyOffset();
+		if (db.z_write_base_addr != 0) DsNativoSombras::g_shadow_depth.store(db.z_write_base_addr, std::memory_order_relaxed);
+		std::snprintf(state, sizeof(state),
+		              "vp0 escala=(%g,%g,%g) desplaz=(%g,%g,%g) z=[%g,%g] recorte_vp=(%d,%d)-(%d,%d) pantalla=(%d,%d)-(%d,%d) "
+		              "ventana=(%d,%d)-(%d,%d) | prof z_read=%llx z_write=%llx capas=%u..%u tam=%ux%u | sesgo escala=%g desplaz=%g "
+		              "clamp=%g",
+		              double(v0.xscale), double(v0.yscale), double(v0.zscale), double(v0.xoffset), double(v0.yoffset),
+		              double(v0.zoffset), double(v0.zmin), double(v0.zmax), v0.viewport_scissor_left, v0.viewport_scissor_top,
+		              v0.viewport_scissor_right, v0.viewport_scissor_bottom, vp.screen_scissor_left, vp.screen_scissor_top,
+		              vp.screen_scissor_right, vp.screen_scissor_bottom, vp.window_scissor_left, vp.window_scissor_top,
+		              vp.window_scissor_right, vp.window_scissor_bottom, static_cast<unsigned long long>(db.z_read_base_addr),
+		              static_cast<unsigned long long>(db.z_write_base_addr), dv.slice_start, dv.slice_max,
+		              static_cast<unsigned>(sz.x_max) + 1u, static_cast<unsigned>(sz.y_max) + 1u, double(po.front_scale),
+		              double(po.front_offset), double(po.clamp));
+		DsNativoSombras::GpuDrawDump(m_sh_ctx.GetVs().es_regs.data_addr, m_sh_ctx.GetVs().ls_regs.data_addr,
+		                             m_sh_ctx.GetVs().hs_regs.data_addr, m_sh_ctx.GetVs().gs_regs.data_addr,
+		                             m_sh_ctx.GetVs().hs_user_sgpr.value, m_sh_ctx.GetVs().hs_user_sgpr.count,
+		                             m_sh_ctx.GetVs().gs_user_sgpr.value, m_sh_ctx.GetVs().gs_user_sgpr.count,
+		                             reinterpret_cast<uint64_t>(args.index_addr), state);
+	}
+	// (F5 pase 2, =3 / =1) DsNatBeforeDraw ya no va aqui: va por paquete en ProcessPm4 (la mayoria de los draws de sombra
+	// los hace el camino de tablas / XPR nativo y nunca llegan a esta funcion: log 20261125-024655-421, ~1 de cada 25).
 
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1852,20 +3163,33 @@ static bool DecalTakesNormalPath(const HW::Context& ctx) {
 
 #endif // KYTY_LOCAL_VULKAN_RECORDING
 
+// (parpadeo2, KYTY_PARPADEO; local/parpadeo.h) An indexed indirect draw run about to be drawn (`args` its argument
+// addresses): what its arguments and indices are at this point. Not a speculation's (the callers check).
+void CommandProcessor::ParpadeoNoteDraws(std::span<const uint64_t> args, uint64_t index_bytes, uint32_t path) {
+	if (!GetScheduler().Active()) return;
+	Parpadeo::OnDraws(GetGpuResources().GetBufferCache(), CurrentBuffer(), GetScheduler(), m_renderer.GetMutex(),
+	                  m_draw_indirect_args_base_addr, args, sizeof(DrawIndexedIndirectArgs), m_index_base_addr, index_bytes,
+	                  static_cast<Parpadeo::Path>(path));
+}
+
 uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, bool clean) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
+	TrustedDepth::ClassClock class_clock(0); // (trust1, KYTY_RENDER_STATS: us per call by class)
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
 	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 	LiveCounters::g_last_dispatch_shader = 0;
 	SyncStats::g_shader = 0;
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	auto& executor = m_renderer.GetRenderExecutor();
+	if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RCalls);
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) { // a recorded frame sees every draw on the normal path
 		executor.NativeXprForgetState();
+		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
 	}
 	if (DecalTakesNormalPath(m_ctx)) {
 		executor.NativeXprForgetState();
+		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
 	}
 	if (packets.size() < 5 || (packets[4] & ~0x20u) != 2u || m_index_type_and_size > 1 ||
@@ -1873,34 +3197,248 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList) {
 		// The cached draw-state key covers only draws the native path saw.
 		executor.NativeXprForgetState();
+		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
 	}
 	// A run: consecutive packets that differ only in the argument offset draw
 	// the same object (no register write between them).
 	constexpr uint32_t max_draws = 64;
 	uint32_t           count     = 1;
-	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
-		const auto* next = packets.data() + count * 5u;
-		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
-		    next[4] != packets[4])
-			break;
-		++count;
-	}
 	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
-	for (uint32_t i = 0; i < count; ++i) commands[i] = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
+	commands[0]       = m_draw_indirect_args_base_addr + packets[1];
+	// (render1 F3) Each draw's packet (the run's other draws are paired before it is drawn).
+	std::array<const uint32_t*, max_draws> draw_packets;
+	draw_packets[0] = packets.data();
+	uint32_t consumed = 5; // dwords the run takes
+	uint32_t gap_draws = 0, gap_skipped = 0; // (gancho2, counted when the run is drawn)
+	// (gancho2, KYTY_GANCHO2; local/gancho2.h) Also over a gap that rewrites what the registers hold (the game's binder
+	// re-emits the user data before every draw, ad8bc0 -> 1d10840): fillers, the game's user-data markers (NOP R_ZERO
+	// "hu", ids 0 / 4 / 0xd) and SET_SH_REG packets. A user-data SGPR is compared with the command processor's own
+	// (value, the type the write would store - the marker then -, count); another SH register with the draw state
+	// observer's shadow. The marker must end as it was. Not in a speculation, a state pass, a stop, a capture.
+	using G2         = Gancho2::Reason;
+	const auto mode2 = Gancho2::Mode();
+	bool       gap_runs = false;
+	if (mode2 != 0) {
+		G2 off = G2::Reasons;
+		if (!Gancho2::Active()) off = G2::ROffWindow;
+		else if (Spec::Current() != nullptr) off = G2::ROffSpec;
+		else if (m_state_only) off = G2::ROffState;
+		else if (m_chunk_every != 0) off = G2::ROffChunk;
+		else if (m_stop_at != nullptr) off = G2::ROffStop;
+		else if (XprCapture::Enabled()) off = G2::ROffCapture;
+		if (off != G2::Reasons) Gancho2::Note(off);
+		gap_runs = off == G2::Reasons;
+	}
+	const auto same_draw = [&](const uint32_t* next) {
+		return next[0] == 0xc0032500u && next[2] == packets[2] && next[3] == packets[3] && next[4] == packets[4];
+	};
+	// The user-data SGPRs of SH register `offset` (null: another register).
+	const auto user_sgprs = [&](uint32_t offset, uint32_t& slot) -> const HW::UserSgprInfo* {
+		if (offset >= Pm4::SPI_SHADER_USER_DATA_PS_0 && offset < Pm4::SPI_SHADER_USER_DATA_PS_0 + 32u) {
+			slot = offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
+			return &m_sh_ctx.GetPs().ps_user_sgpr;
+		}
+		if (offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 && offset < Pm4::SPI_SHADER_USER_DATA_GS_0 + 32u) {
+			slot = offset - Pm4::SPI_SHADER_USER_DATA_GS_0;
+			return &m_sh_ctx.GetVs().gs_user_sgpr;
+		}
+		if (offset >= Pm4::SPI_SHADER_USER_DATA_HS_0 && offset < Pm4::SPI_SHADER_USER_DATA_HS_0 + 32u) {
+			slot = offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
+			return &m_sh_ctx.GetVs().hs_user_sgpr;
+		}
+		return nullptr;
+	};
+	G2 end = G2::REndMax;
+	// (port2) Runs go on over the empty markers of KYTY_PORT2 (not with render1: its observers count 5 dwords a draw).
+	const bool port2_runs = Port2::Mode() != 0 && !Render1::On();
+	while (count < max_draws) {
+		if (consumed + 5u > packets.size()) {
+			end = G2::REndBuffer;
+			break;
+		}
+		const auto* next = packets.data() + consumed;
+		// (port2) An empty marker of the emulator's Agc between two draws of the run (a plain NOP): taken with them.
+		if (port2_runs && consumed + Port2::MarkerDw + 5u <= packets.size() &&
+		    Port2::IsEmptyMarker(next, packets.size() - consumed) && same_draw(next + Port2::MarkerDw)) {
+			draw_packets[count] = next + Port2::MarkerDw;
+			commands[count++]   = m_draw_indirect_args_base_addr + next[Port2::MarkerDw + 1u];
+			consumed += Port2::MarkerDw + 5u;
+			continue;
+		}
+		if (same_draw(next)) {
+			draw_packets[count] = next;
+			commands[count++]   = m_draw_indirect_args_base_addr + next[1];
+			consumed += 5u;
+			continue;
+		}
+		if (!gap_runs) {
+			end = G2::Reasons;
+			break;
+		}
+		uint32_t at = consumed, gap_packets = 0;
+		auto     marker = m_user_data_marker;
+		G2       why    = G2::Reasons; // (Reasons: the gap is a no-op so far)
+		while (at < packets.size() && why == G2::Reasons) {
+			const uint32_t header = packets[at];
+			if (header == 0x80000000u) {
+				++at;
+				++gap_packets;
+				continue;
+			}
+			const uint32_t op = (header >> 8u) & 0xffu;
+			if ((header >> 30u) != 3u || (header & 1u) != 0) break;
+			const uint32_t len = KYTY_PM4_LEN(header);
+			if (len < 2u || len > packets.size() - at) {
+				why = G2::RBadSh;
+				break;
+			}
+			if (op == Pm4::IT_NOP && header != DsLinearCopyHook::Header && KYTY_PM4_R(header) == Pm4::R_ZERO &&
+			    (packets[at + 1u] & 0xffff0000u) == 0x68750000u) {
+				const uint32_t id = packets[at + 1u] & 0xfffu;
+				if (id == 0x4u) marker = HW::UserSgprType::Vsharp;
+				else if (id == 0xdu) marker = HW::UserSgprType::Region;
+				else if (id != 0x0u) {
+					++Gancho2::g_end_packet[512];
+					why = G2::REndPacket;
+					break;
+				}
+				at += len;
+				++gap_packets;
+				continue;
+			}
+			if (op != Pm4::IT_SET_SH_REG) break;
+			const uint32_t offset = packets[at + 1u], values = len - 2u;
+			if (values == 0 || offset == Pm4::SH_NOP || offset >= Pm4::SH_NUM || values > Pm4::SH_NUM - offset) {
+				why = G2::RBadSh;
+				break;
+			}
+			uint32_t    slot = 0;
+			const auto* ud   = user_sgprs(offset, slot);
+			if (ud != nullptr) {
+				if (slot + values > 32u) {
+					why = G2::RBadSh;
+					break;
+				}
+				for (uint32_t i = 0; i < values && why == G2::Reasons; ++i) {
+					const uint32_t v = packets[at + 2u + i];
+					if (ud->value[slot + i] != v) why = G2::RDiffUdValue;
+					else if (ud->type[slot + i] != marker) why = G2::RDiffUdType;
+					else if (slot + i + 1u > ud->count) why = G2::RDiffUdCount;
+					if (why != G2::Reasons) ++Gancho2::g_diff_offset[offset + i];
+				}
+				marker = HW::UserSgprType::Unknown; // (the user-data handlers clear it after the packet)
+			} else {
+				for (uint32_t i = 0; i < values && why == G2::Reasons; ++i)
+					if (!DrawStateObserver::ShHolds(offset + i, packets[at + 2u + i])) {
+						why = G2::RDiffOther;
+						++Gancho2::g_diff_offset[offset + i];
+					}
+			}
+			if (why != G2::Reasons) break;
+			at += len;
+			++gap_packets;
+		}
+		if (why == G2::Reasons) {
+			if (at + 5u > packets.size()) {
+				why = G2::REndBuffer;
+			} else if (!same_draw(packets.data() + at)) {
+				const uint32_t header = packets[at];
+				const uint32_t op     = (header >> 8u) & 0xffu;
+				if (at != consumed && op == Pm4::IT_DRAW_INDEX_INDIRECT) {
+					why = G2::RNoDraw;
+				} else {
+					why = G2::REndPacket;
+					++Gancho2::g_end_packet[op == Pm4::IT_NOP ? 256u + (KYTY_PM4_R(header) & 0xffu) : op];
+				}
+			} else if (marker != m_user_data_marker) {
+				why = G2::RMarkerEnd;
+			}
+		}
+		if (why == G2::Reasons && mode2 == 2) {
+			// (2) The gap through its handlers: the register files and the marker must not change.
+			const size_t         sizes[3] = {sizeof(HW::Context), sizeof(HW::Shader), sizeof(HW::UserConfig)};
+			uint8_t* const       files[3] = {reinterpret_cast<uint8_t*>(&m_ctx), reinterpret_cast<uint8_t*>(&m_sh_ctx),
+			                                 reinterpret_cast<uint8_t*>(&m_ucfg)};
+			std::vector<uint8_t> before[3];
+			for (int o = 0; o < 3; ++o) before[o].assign(files[o], files[o] + sizes[o]);
+			const auto marker_before = m_user_data_marker;
+			for (uint32_t g = consumed; g < at;) {
+				const uint32_t header = packets[g];
+				if (header == 0x80000000u) {
+					++g;
+					continue;
+				}
+				const auto rest = static_cast<uint32_t>(packets.size() - g);
+				g += g_cp_op_func[(header >> 8u) & 0xffu](*this, header & ~1u, packets.data() + g + 1, rest, rest) + 1u;
+			}
+			bool same = m_user_data_marker == marker_before;
+			for (int o = 0; o < 3; ++o)
+				if (std::memcmp(files[o], before[o].data(), sizes[o]) != 0) {
+					same = false;
+					if (Gancho2::g_discrepancias++ < 8)
+						std::printf("[gancho2] DISCREPANCIA gap of %u packets before draw %u: register file %d changed\n",
+						            gap_packets, count, o);
+				}
+			if (!same) {
+				for (int o = 0; o < 3; ++o) std::memcpy(files[o], before[o].data(), sizes[o]);
+				m_user_data_marker = marker_before;
+				why                = G2::RDiscrepancy;
+			}
+		}
+		if (why != G2::Reasons) {
+			end = why;
+			break;
+		}
+		draw_packets[count] = packets.data() + at;
+		commands[count++]   = m_draw_indirect_args_base_addr + packets[at + 1u];
+		consumed            = at + 5u;
+		++gap_draws;
+		gap_skipped += gap_packets;
+	}
+	if (end != G2::Reasons && gap_runs) Gancho2::Note(end);
+	Gancho2::t_last_draws = count;
+	const auto drawn = [&] {
+		Gancho2::g_draws += gap_draws;
+		Gancho2::g_packets += gap_skipped;
+		Gancho2::g_reason[G2::RGapsTaken] += gap_draws;
+		return consumed;
+	};
 	CheckBuffer();
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
+	if (Parpadeo::On() && Spec::Current() == nullptr) // (parpadeo2)
+		ParpadeoNoteDraws({commands.data(), count}, uint64_t {m_index_buffer_size} * element, Parpadeo::PathNative);
+	// (render1 F3, KYTY_RENDER1=3) A paired p0/p1 depth draw: its run's other draws paired now (in both windows, so the
+	// two sides pay the same probe), then, in an "on" window, drawn ONLY the native way when every draw of the run is a
+	// p0/p1 depth draw and the native way takes it (render1-native.inc Render1Draw); otherwise the normal path below.
+	if (Render1::Mode() == 3 && Render1::t_current.native && Spec::Current() == nullptr && !m_state_only) {
+		bool all = true;
+		if (count > 1) Render1::t_step_draws += Render1ObservePackets(m_ctx, draw_packets.data() + 1, count - 1, all);
+		Render1::t_current.rest_observed = true;
+		if (Render1::t_current.f3_on) {
+			if (!all) {
+				Render1::F3Note(Render1::FRunMixed, count);
+				Render1::t_current.f3_noted = true;
+			} else if (executor.Render1Draw(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
+			                                uint64_t {m_index_buffer_size} * element,
+			                                m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32)) {
+				return drawn();
+			}
+		}
+	}
 	if (clean && executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
 	                                    uint64_t {m_index_buffer_size} * element,
 	                                    m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32,
 	                                    nullptr))
-		return count * 5u;
+		return drawn();
 	// On refusal NativeXprTry has asked the normal path to store when that helps.
 	if (!executor.NativeXprTry(CurrentBuffer(), clean, {commands.data(), count}, m_index_base_addr,
 	                           uint64_t {m_index_buffer_size} * element,
-	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32))
+	                           m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32)) {
+		if (gap_draws != 0) Gancho2::Note(G2::RRefusedRun);
 		return 0;
-	return count * 5u;
+	}
+	return drawn();
 #else
 	(void)packets;
 	(void)clean;
@@ -1910,6 +3448,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 
 uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 0);
+	TrustedDepth::ClassClock class_clock(0); // (trust1, KYTY_RENDER_STATS: us per call by class)
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
 	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -1934,6 +3473,8 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	CheckBuffer();
 	const uint64_t element    = m_index_type_and_size == 0 ? 2 : 4;
 	const auto     index_type = m_index_type_and_size == 0 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+	if (Parpadeo::On() && Spec::Current() == nullptr) // (parpadeo2)
+		ParpadeoNoteDraws({commands.data(), count}, uint64_t {m_index_buffer_size} * element, Parpadeo::PathMulti);
 	if (DrawStateObserver::g_shadow.last_clean &&
 	    executor.TableContinue(CurrentBuffer(), {commands.data(), count}, m_index_base_addr,
 	                           uint64_t {m_index_buffer_size} * element, index_type, nullptr))
@@ -1950,6 +3491,7 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 
 uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 1);
+	TrustedDepth::ClassClock class_clock(1); // (trust1, KYTY_RENDER_STATS: us per call by class)
 	LiveTrace::MarkAfter gpu_mark {[&] { return GetScheduler().Current().RawHandle(); }, LiveTrace::MarkNativeXpr,
 	                               m_sh_ctx.GetPs().ps_regs.data_addr};
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -2001,6 +3543,7 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 
 uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 	LiveCensus::Scope census(LiveCensus::NativeXpr, 2);
+	TrustedDepth::ClassClock class_clock(2); // (trust1, KYTY_RENDER_STATS: us per call by class)
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	using Prospero::PrimitiveType;
 	// What CpOpDrawIndexAuto accepts and draws (no vertices: nothing), of a type drawn as it is.
@@ -2049,13 +3592,23 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	    !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return 0;
-	uint32_t count = 1;
-	while (count < max_draws && (count + 1u) * 5u <= packets.size()) {
-		const auto* next = packets.data() + count * 5u;
+	uint32_t count = 1, end = 5;
+	// (port2) Each draw's packet: runs go on over the empty markers of KYTY_PORT2 (not with render1, whose observers
+	// count 5 dwords a draw).
+	std::array<uint32_t, max_draws> at_dw {};
+	const bool                      port2_runs = Port2::Mode() != 0 && !Render1::On();
+	while (count < max_draws) {
+		uint32_t pos = end;
+		if (port2_runs && pos + Port2::MarkerDw + 5u <= packets.size() &&
+		    Port2::IsEmptyMarker(packets.data() + pos, packets.size() - pos))
+			pos += Port2::MarkerDw;
+		if (pos + 5u > packets.size()) break;
+		const auto* next = packets.data() + pos;
 		if (next[0] != 0xc0032500u || next[2] != packets[2] || next[3] != packets[3] ||
 		    next[4] != packets[4])
 			break;
-		++count;
+		at_dw[count++] = pos;
+		end            = pos + 5u;
 	}
 	if (count < 2 || (packets[4] & ~0x20u) != 2u) return 0;
 	// A rejected run must not be prepared N, N-1, ... times on fallback.
@@ -2066,7 +3619,7 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	const uint32_t                       element_size = m_index_type_and_size == 0 ? 2 : 4;
 	uint32_t                             active = 0, last_instances = 0;
 	for (uint32_t i = 0; i < count; ++i) {
-		const uint64_t address = m_draw_indirect_args_base_addr + packets[i * 5u + 1u];
+		const uint64_t address = m_draw_indirect_args_base_addr + packets[at_dw[i] + 1u];
 		argument_addresses[i]  = address;
 		if (address < m_draw_indirect_args_base_addr || (address & 3u) ||
 		    !resources.IsMapped(address, sizeof(DrawIndexedIndirectArgs)) ||
@@ -2074,6 +3627,9 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 			return 0;
 		DrawIndexedIndirectArgs args {};
 		std::memcpy(&args, reinterpret_cast<const void*>(address), sizeof(args));
+		if (Parpadeo::On() && Spec::Current() == nullptr) // (parpadeo2: the arguments read on the CPU)
+			Parpadeo::OnCpuArgs(CurrentBuffer().GetContext().FrameNumber(), m_draw_indirect_args_base_addr, address,
+			                    args.index_count_per_instance);
 		last_instances         = args.instance_count;
 		const uint32_t indices = m_index_buffer_size
 		                             ? std::min(args.index_count_per_instance, m_index_buffer_size)
@@ -2101,7 +3657,272 @@ uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets)
 	}
 	m_num_instances = last_instances;
 	m_draw_run_skip = 0;
-	return count * 5u;
+	Port2::t_run_draws = count; // (port2: the caller completes `count` draws)
+	return end;
+}
+
+// (port2, KYTY_PORT2; local/port2.h) A marker of the emulator's Agc (written after a draw / dispatch; sealed at the next
+// one on the same command buffer with the flow of what lies between). Returns the dwords to pass over.
+uint32_t CommandProcessor::Port2Marker(const uint32_t* packet, uint32_t remaining_dw, bool can_apply) {
+	using Port2::MarkerDw;
+	if (packet[Port2::SpanWord] == 0) { // (not sealed: a plain NOP)
+		Port2::g_gpu_empty.fetch_add(1, std::memory_order_relaxed);
+		return MarkerDw;
+	}
+	if (!can_apply) {
+		Port2::g_gpu_fall[Port2::GOff].fetch_add(1, std::memory_order_relaxed);
+		return MarkerDw;
+	}
+	uint32_t      span = 0;
+	Port2::GFall  why  = Port2::GFalls;
+	const auto*   rec  = Port2::Find(packet, remaining_dw, span, why);
+	if (rec == nullptr) {
+		Port2::g_gpu_fall[why].fetch_add(1, std::memory_order_relaxed);
+		return MarkerDw;
+	}
+	const uint32_t* const begin = packet + MarkerDw;
+	const auto* const     ops   = reinterpret_cast<const uint32_t*>(rec + 1);
+	const uint32_t        words = rec->words;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	const bool observe = kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0 &&
+	                     (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) == 0;
+#else
+	const bool observe = false;
+#endif
+	// The flow, in order, with the walk's handlers. `length`: the span dwords the walk would have taken (a handler that
+	// takes another length than its header's: the walk goes on from where it would be); `types`: operations by type.
+	uint64_t   types[Port2::Types] {};
+	const auto apply = [&](bool with_observer, uint32_t& length) {
+		length = span;
+		for (uint32_t w = 0; w < words;) {
+			const uint32_t word = ops[w];
+			switch (Port2::KindOf(word)) {
+				case Port2::OUd: {
+					const uint32_t stage = Port2::UdStage(word), slot = Port2::UdSlot(word), n = Port2::UdCount(word);
+					const uint32_t* v      = ops + w + 1;
+					const auto      marker = m_user_data_marker;
+					switch (stage) {
+						case Port2::SPs:
+							for (uint32_t i = 0; i < n; ++i) m_sh_ctx.SetPsUserSgpr(slot + i, v[i], marker);
+							break;
+						case Port2::SGs:
+							for (uint32_t i = 0; i < n; ++i) m_sh_ctx.SetGsUserSgpr(slot + i, v[i], marker);
+							break;
+						case Port2::SHs:
+							for (uint32_t i = 0; i < n; ++i) m_sh_ctx.SetHsUserSgpr(slot + i, v[i], marker);
+							break;
+						default:
+							for (uint32_t i = 0; i < n; ++i) m_sh_ctx.SetCsUserSgpr(slot + i, v[i], marker);
+							break;
+					}
+					m_user_data_marker = HW::UserSgprType::Unknown; // (the user-data handlers clear it after the packet)
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+					if (with_observer)
+						for (uint32_t i = 0; i < n; ++i) DrawStateObserver::WriteRegister(1, Port2::UdBase[stage] + slot + i, v[i]);
+#endif
+					++types[Port2::TUd];
+					w += 1u + n;
+					break;
+				}
+				case Port2::OMk: {
+					const uint32_t id = Port2::MkId(word);
+					if (id == 0x4u) m_user_data_marker = HW::UserSgprType::Vsharp;
+					else if (id == 0xdu) m_user_data_marker = HW::UserSgprType::Region;
+					++types[Port2::TMk];
+					w += 1u;
+					break;
+				}
+				case Port2::OGen: {
+					const uint32_t        len  = Port2::GenLen(word);
+					const uint32_t* const copy = ops + w + 1;
+					const uint32_t        op   = (copy[0] >> 8u) & 0xffu;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+					if (with_observer) DrawStateObserver::ObservePacket(op, copy, len, false);
+#endif
+					const uint32_t taken = g_cp_op_func[op](*this, copy[0] & ~1u, copy + 1, len, len) + 1u;
+					m_chunk_last_opcode  = op;
+					++types[Port2::GenType(word) < Port2::Types ? Port2::GenType(word) : Port2::TSh];
+					if (taken != len) {
+						length = Port2::OffOf(word) + taken;
+						return false;
+					}
+					w += 1u + len;
+					break;
+				}
+				default: length = 0; return false; // (never written)
+			}
+		}
+		return true;
+	};
+	m_draw_run_skip = 0; // (as the walk does at any packet that is not an indirect draw)
+	if (Port2::Mode() == 2) {
+		// Verification: the flow on a copy of the registers, then the span's own PM4 through the handlers; compared field
+		// by field, the PM4's state kept.
+		struct Snap {
+			HW::Context      ctx;
+			HW::Shader       sh;
+			HW::UserConfig   uc;
+			HW::UserSgprType marker = HW::UserSgprType::Unknown;
+			uint32_t         index_type = 0, index_size = 0, instances = 0;
+			uint64_t         index_base = 0, draw_args = 0, dispatch_args = 0;
+		};
+		thread_local std::unique_ptr<Snap> before_ptr, flow_ptr;
+		if (!before_ptr) before_ptr = std::make_unique<Snap>();
+		if (!flow_ptr) flow_ptr = std::make_unique<Snap>();
+		Snap&      before = *before_ptr;
+		Snap&      flow   = *flow_ptr;
+		const auto take   = [&](Snap& s) {
+            s.ctx           = m_ctx;
+            s.sh            = m_sh_ctx;
+            s.uc            = m_ucfg;
+            s.marker        = m_user_data_marker;
+            s.index_type    = m_index_type_and_size;
+            s.index_size    = m_index_buffer_size;
+            s.instances     = m_num_instances;
+            s.index_base    = m_index_base_addr;
+            s.draw_args     = m_draw_indirect_args_base_addr;
+            s.dispatch_args = m_dispatch_indirect_args_base_addr;
+		};
+		take(before);
+		uint32_t flow_length = 0;
+		(void)apply(false, flow_length);
+		take(flow);
+		m_ctx                             = before.ctx;
+		m_sh_ctx                          = before.sh;
+		m_ucfg                            = before.uc;
+		m_user_data_marker                = before.marker;
+		m_index_type_and_size             = before.index_type;
+		m_index_buffer_size               = before.index_size;
+		m_num_instances                   = before.instances;
+		m_index_base_addr                 = before.index_base;
+		m_draw_indirect_args_base_addr    = before.draw_args;
+		m_dispatch_indirect_args_base_addr = before.dispatch_args;
+		// The span's PM4, as the walk takes it.
+		uint32_t at = 0;
+		while (at < span) {
+			const uint32_t header = begin[at];
+			if (header == 0x80000000u) {
+				++at;
+				continue;
+			}
+			const uint32_t op   = (header >> 8u) & 0xffu;
+			const uint32_t rest = remaining_dw - MarkerDw - at;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			if (observe) DrawStateObserver::ObservePacket(op, begin + at, std::min(KYTY_PM4_LEN(header), rest), false);
+#endif
+			EXIT_IF(g_cp_op_func[op] == nullptr);
+			at += g_cp_op_func[op](*this, header & ~1u, begin + at + 1, rest, rest) + 1u;
+			m_chunk_last_opcode = op;
+		}
+		// Field by field.
+		bool       field[Port2::Fields] {};
+		const auto& ps = m_sh_ctx.GetPs();
+		const auto& vs = m_sh_ctx.GetVs();
+		const auto& cs = m_sh_ctx.GetCs();
+		const auto& fps = flow.sh.GetPs();
+		const auto& fvs = flow.sh.GetVs();
+		const auto& fcs = flow.sh.GetCs();
+		field[Port2::VCx]    = !(flow.ctx == m_ctx);
+		field[Port2::VUc]    = !(flow.uc == m_ucfg);
+		field[Port2::VUdPs]  = !(fps.ps_user_sgpr == ps.ps_user_sgpr);
+		field[Port2::VUdGs]  = !(fvs.gs_user_sgpr == vs.gs_user_sgpr);
+		field[Port2::VUdHs]  = !(fvs.hs_user_sgpr == vs.hs_user_sgpr);
+		field[Port2::VUdCs]  = !(fcs.cs_user_sgpr == cs.cs_user_sgpr);
+		field[Port2::VShOther] = !(fps.ps_regs == ps.ps_regs) || !(fvs.es_regs == vs.es_regs) || !(fvs.ls_regs == vs.ls_regs) ||
+		                         !(fvs.hs_regs == vs.hs_regs) || !(fvs.gs_regs == vs.gs_regs) ||
+		                         fvs.start_instance_user_sgpr != vs.start_instance_user_sgpr || !(fcs.cs_regs == cs.cs_regs);
+		if (!(flow.sh == m_sh_ctx) && !field[Port2::VUdPs] && !field[Port2::VUdGs] && !field[Port2::VUdHs] && !field[Port2::VUdCs])
+			field[Port2::VShOther] = true;
+		field[Port2::VMarker] = flow.marker != m_user_data_marker;
+		field[Port2::VIndex]  = flow.index_type != m_index_type_and_size || flow.index_size != m_index_buffer_size ||
+		                       flow.instances != m_num_instances || flow.index_base != m_index_base_addr ||
+		                       flow.draw_args != m_draw_indirect_args_base_addr ||
+		                       flow.dispatch_args != m_dispatch_indirect_args_base_addr;
+		field[Port2::VLength] = flow_length != at;
+		// The record against the PM4 as it is now (a write into the span after the seal).
+		for (uint32_t w = 0; w < words && !field[Port2::VChanged];) {
+			const uint32_t word = ops[w], off = Port2::OffOf(word);
+			switch (Port2::KindOf(word)) {
+				case Port2::OUd: {
+					const uint32_t n = Port2::UdCount(word);
+					field[Port2::VChanged] = off + 2u + n > span ||
+					                         begin[off + 1u] != Port2::UdBase[Port2::UdStage(word)] + Port2::UdSlot(word) ||
+					                         std::memcmp(begin + off + 2u, ops + w + 1, 4ull * n) != 0;
+					w += 1u + n;
+					break;
+				}
+				case Port2::OMk:
+					field[Port2::VChanged] = off + 2u > span || (begin[off + 1u] & 0xfffu) != Port2::MkId(word);
+					w += 1u;
+					break;
+				default: {
+					const uint32_t len = Port2::GenLen(word);
+					field[Port2::VChanged] = off + len > span || std::memcmp(begin + off, ops + w + 1, 4ull * len) != 0;
+					w += 1u + len;
+					break;
+				}
+			}
+		}
+		bool any = false;
+		for (uint32_t f = 0; f < Port2::Fields; ++f)
+			if (field[f]) {
+				any = true;
+				Port2::g_field[f].fetch_add(1, std::memory_order_relaxed);
+			}
+		Port2::g_verified.fetch_add(1, std::memory_order_relaxed);
+		if (any) {
+			const auto n = Port2::g_discrepancias.fetch_add(1, std::memory_order_relaxed);
+			if (n < 8) {
+				std::printf("[port2] DISCREPANCIA %llu: marcador 0x%llx, hueco %u dw, %u paquetes; campos:",
+				            static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(reinterpret_cast<uint64_t>(packet)),
+				            span, rec->packets);
+				for (uint32_t f = 0; f < Port2::Fields; ++f)
+					if (field[f]) std::printf(" %s", Port2::FieldNames[f]);
+				// The first user data slot that differs.
+				const HW::UserSgprInfo* pairs[4][2] = {{&fps.ps_user_sgpr, &ps.ps_user_sgpr}, {&fvs.gs_user_sgpr, &vs.gs_user_sgpr},
+				                                       {&fvs.hs_user_sgpr, &vs.hs_user_sgpr}, {&fcs.cs_user_sgpr, &cs.cs_user_sgpr}};
+				for (uint32_t s = 0; s < 4; ++s)
+					for (int i = 0; i < HW::UserSgprInfo::SGPRS_MAX; ++i)
+						if (pairs[s][0]->value[i] != pairs[s][1]->value[i] || pairs[s][0]->type[i] != pairs[s][1]->type[i]) {
+							std::printf(" | etapa %u slot %d: flujo 0x%08x (tipo %d) pm4 0x%08x (tipo %d)", s, i, pairs[s][0]->value[i],
+							            static_cast<int>(pairs[s][0]->type[i]), pairs[s][1]->value[i],
+							            static_cast<int>(pairs[s][1]->type[i]));
+							i = HW::UserSgprInfo::SGPRS_MAX;
+							s = 4;
+						}
+				std::printf("\n");
+				std::fflush(stdout);
+			}
+		}
+		Port2::g_gpu_applied.fetch_add(1, std::memory_order_relaxed);
+		Port2::g_gpu_packets.fetch_add(rec->packets, std::memory_order_relaxed);
+		Port2::g_gpu_dw.fetch_add(span, std::memory_order_relaxed);
+		for (uint32_t t = 0; t < Port2::Types; ++t)
+			if (types[t] != 0) Port2::g_gpu_type[t].fetch_add(types[t], std::memory_order_relaxed);
+		return MarkerDw + at; // (the PM4's own length)
+	}
+	static thread_local uint32_t tick = 0;
+	const bool                   timed = (++tick & 15u) == 0;
+	const uint64_t               t0    = timed ? __rdtsc() : 0;
+	uint32_t                     length = span;
+	if (!apply(observe, length)) {
+		Port2::g_gpu_fall[Port2::GLength].fetch_add(1, std::memory_order_relaxed);
+		if (length == 0 || length > remaining_dw - MarkerDw) length = span; // (never: register handlers take their header's)
+	}
+	// The record was written over meanwhile (16 MiB of newer records in the time of this apply: never expected).
+	if (rec->abs != (packet[Port2::IdWord] | uint64_t {packet[Port2::IdWord + 1]} << 32u))
+		Port2::g_gpu_fall[Port2::GRace].fetch_add(1, std::memory_order_relaxed);
+	if (timed) {
+		Port2::g_gpu_cycles.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+		Port2::g_gpu_timed.fetch_add(1, std::memory_order_relaxed);
+	}
+	types[Port2::TNop] += rec->fillers;
+	Port2::g_gpu_applied.fetch_add(1, std::memory_order_relaxed);
+	Port2::g_gpu_packets.fetch_add(rec->packets, std::memory_order_relaxed);
+	Port2::g_gpu_dw.fetch_add(span, std::memory_order_relaxed);
+	for (uint32_t t = 0; t < Port2::Types; ++t)
+		if (types[t] != 0) Port2::g_gpu_type[t].fetch_add(types[t], std::memory_order_relaxed);
+	return MarkerDw + length;
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
@@ -2110,6 +3931,11 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+	if (Parpadeo::On() && indexed && Spec::Current() == nullptr) { // (parpadeo2)
+		const uint64_t at = m_draw_indirect_args_base_addr + data_offset;
+		ParpadeoNoteDraws({&at, 1}, uint64_t {m_index_buffer_size} * (m_index_type_and_size == 0 ? 2u : 4u),
+		                  Parpadeo::PathNormal);
+	}
 	if (TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, 1,
 	                       indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs), indexed))
 		return;
@@ -2138,6 +3964,9 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
+	if (Parpadeo::On() && Spec::Current() == nullptr) // (parpadeo2: the arguments read on the CPU)
+		Parpadeo::OnCpuArgs(CurrentBuffer().GetContext().FrameNumber(), m_draw_indirect_args_base_addr,
+		                    m_draw_indirect_args_base_addr + data_offset, args.index_count_per_instance);
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
@@ -2201,6 +4030,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(stride_in_bytes < args_size);
+	if (Parpadeo::On() && indexed && Spec::Current() == nullptr) { // (parpadeo2)
+		std::array<uint64_t, 64> at {};
+		const uint32_t           n = std::min<uint32_t>(draw_count, 64);
+		for (uint32_t i = 0; i < n; ++i) at[i] = m_draw_indirect_args_base_addr + data_offset + uint64_t {i} * stride_in_bytes;
+		ParpadeoNoteDraws({at.data(), n}, uint64_t {m_index_buffer_size} * (m_index_type_and_size == 0 ? 2u : 4u),
+		                  Parpadeo::PathNormalMulti);
+	}
 	if (TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, draw_count, stride_in_bytes, indexed))
 		return;
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
@@ -2284,6 +4120,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	{
 		CheckBuffer();
 		frame_num = m_renderer.GetGpu().GetFrameNum();
+		VgeoNativo::OnFrame(frame_num); // (w11)
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.load(std::memory_order_relaxed) < 1024 && log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
@@ -2317,9 +4154,13 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		const uint64_t vgeo_t0 = VgeoNativo::t_in_target ? VgeoNativo::Now() : 0; // (w11b)
+		CensoPm4::Mark(CensoPm4::KExec); // (w18)
 		m_renderer.GetComputeRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                                     thread_group_y, thread_group_z, mode,
 		                                                     indirect_args);
+		if (vgeo_t0 != 0) VgeoNativo::NoteTargetDispatch(cs.data_addr, indirect_args != 0, VgeoNativo::Now() - vgeo_t0);
+		CensoPm4::Mark(CensoPm4::KAfter); // (w18)
 	}
 
 	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -2357,6 +4198,12 @@ void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode
 		uint32_t thread_group_x, thread_group_y, thread_group_z;
 	};
 	EXIT_NOT_IMPLEMENTED(args_addr == 0);
+	// (w11, KYTY_NATIVO_VGEO) The PreRenderJob shaders: the GPU reads their GPU-written arguments, never the CPU.
+	if ((mode & 0x20u) == 0 && (args_addr & 3u) == 0 && VgeoNativo::Fast(m_sh_ctx.GetCs().cs_regs.data_addr)) {
+		VgeoNativo::g_args_skipped.fetch_add(1, std::memory_order_relaxed);
+		DispatchDirect(1, 1, 1, mode, args_addr);
+		return;
+	}
 	// Workgroup dimensions are consumed by Vulkan. Only thread-dimension mode
 	// needs CPU counts for specialization/conversion; do not download GPU-written
 	// arguments solely to pass unused group counts back to the indirect command.
@@ -2431,6 +4278,33 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+// (parpadeo7) KYTY_PARPADEO7=1 (local/parpadeo7.h): a label written with 1 as data. When it is an XPR culling label of a
+// view the game's reads taught (0xa1f290's hook), the chunk bits it hands to the game are read back from now on: one
+// command queued for the GPU thread, run between packets (this packet records nothing for it). Only guarded reads of
+// the view and its frame table here.
+static void PrefetchXprBits(uint64_t label, GpuResourceManager& resources) {
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	const auto read = [](uint64_t address, uint64_t* out) {
+		return address >= 0x10000 && Common::GuardedCopy(out, reinterpret_cast<const void*>(address), sizeof(*out)) == 0;
+	};
+	if (!Parpadeo7::MatchLabel(label, read, ranges)) return;
+	Parpadeo7::JoinRanges(ranges);
+	Parpadeo7::g_c.spans.fetch_add(ranges.size(), std::memory_order_relaxed);
+	if (g_gpu_state == nullptr || ranges.empty()) return;
+	const int64_t label_ns = Parpadeo7::NowNs();
+	(void)g_gpu_state->PostCommand([&resources, spans = ranges, label_ns] { resources.PrefetchGuestReads(spans, label_ns); });
+}
+
+// (juego3) KYTY_JUEGO3's ON windows (local/juego3.h): the ranges the learned compute shaders wrote since the last label,
+// read back from this label on - the same command parpadeo7 queues (run by the GPU thread between packets, never inside
+// this one; the copy right behind the work translated so far, a helper copies the bytes in).
+static void Juego3PrefetchAtLabel(GpuResourceManager& resources) {
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	if (g_gpu_state == nullptr || !Juego3::TakePending(ranges)) return;
+	const int64_t label_ns = Parpadeo7::NowNs();
+	(void)g_gpu_state->PostCommand([&resources, spans = ranges, label_ns] { resources.PrefetchGuestReads(spans, label_ns); });
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -2441,6 +4315,15 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	CheckBuffer();
 	BreakComputeChain();
+	// KYTY_NATIVE_MEMORY: the label, the event and the interrupt below tell the game that the work before is done; all it
+	// wrote goes to guest memory first (GpuResourceManager::NativeFlushGpuWrites). Nothing otherwise.
+	if (!m_state_only) GetGpuResources().NativeFlushGpuWrites();
+	// (parpadeo7) Before the label is written: the readbacks are queued ahead of any the game's reads after it ask.
+	if (Parpadeo7::On() && !m_state_only && event_write_source == 0x02 && static_cast<uint64_t>(value) == 1 &&
+	    Spec::Current() == nullptr)
+		PrefetchXprBits(reinterpret_cast<uint64_t>(dst_gpu_addr), GetGpuResources());
+	// (juego3) After the work that wrote them, before the game sees the label.
+	if (Juego3::FixNow() && !m_state_only && Spec::Current() == nullptr) Juego3PrefetchAtLabel(GetGpuResources());
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);
@@ -2481,10 +4364,24 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
+	// (p7, C5) A data label: written when the GPU has run the work before it (DeferLabelWrite). Its interrupt, if any, is
+	// a priority operation queued after it (Sync::TriggerEopEventAtEndOfPipe): the game sees the label first, as before.
+	const bool label_at_completion = P7::LabelsAtCompletion() && !m_state_only && event_write_source == 0x02;
+	const auto write_label         = [&](void* dst, const void* src, uint32_t size) {
+		if (label_at_completion) {
+			if (DeferLabelWrite(GetScheduler(), dst, src, size)) {
+				P7::Add(P7::LabelsDeferred);
+				return;
+			}
+			P7::Add(P7::LabelsImmediate);
+		}
+		WriteGuestMemory(dst, src, size);
+	};
+
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		WriteGuestMemory(dst, &data, sizeof(data));
+		write_label(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -2534,7 +4431,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					WriteGuestMemory(dst, &value, sizeof(value));
+					write_label(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -2703,7 +4600,10 @@ void CommandProcessor::EmitGlobalBarrier() {
 		// recorded as packets are work too).
 		auto&      last_work = CurrentBuffer().BarrierWork();
 		const auto work      = LocalVulkanRecording::RecordedWork();
-		if (work == last_work && kyty_local_global_barrier_dedupe.load(std::memory_order_relaxed) != 0) return;
+		if (work == last_work && kyty_local_global_barrier_dedupe.load(std::memory_order_relaxed) != 0) {
+			if (P7::Tracking()) P7::Add(P7::GlobalDedupeDrops); // (p7b: counted for the [p7] line)
+			return;
+		}
 		last_work = work + 1; // this barrier's own recorded call
 	}
 #endif
@@ -2725,6 +4625,8 @@ void CommandProcessor::EmitGlobalBarrier() {
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	CheckBuffer();
+	// (KYTY_NATIVE_MEMORY: the event tells the game the work before is done: GpuResourceManager::NativeFlushGpuWrites.)
+	if (!m_state_only) GetGpuResources().NativeFlushGpuWrites();
 
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
 }
@@ -2825,6 +4727,11 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	if (!m_state_only && DsCensoEscena::Mode() != 0) DsCensoEscena::OnFlip(); // (F5 pase 3: [censo-escena] cada 5 s)
+	NativeFlipSync(GetGpuResources(), m_state_only);
+	if (!m_state_only) // (f5, KYTY_NATIVE_RENDER=map; f5b: the per-pass ceiling's windows read the GPU thread's times)
+		NativeRender::Flip(LiveControl::g_render_idle_ns, LiveCensus::g_kind_cycles[LiveCensus::Submission]);
+	if (!m_state_only) PathTrace::Flip(); // (pt1, BB_PATHTRACING: its frame, calibrations and 5 s line; nothing when off)
 	LiveControl::Flip();
 	FrameCapture::OnFlip();
 	CheckBuffer();
@@ -2847,6 +4754,7 @@ void CommandProcessor::Flip() {
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	CheckBuffer();
+	NativeFlipSync(GetGpuResources(), m_state_only);
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n"
@@ -2870,6 +4778,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
                                          void* dst_gpu_addr, uint32_t value) {
 	CheckBuffer();
+	NativeFlipSync(GetGpuResources(), m_state_only);
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::FlipWithInterrupt()\n"
@@ -2897,6 +4806,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	CheckBuffer();
+	NativeFlipSync(GetGpuResources(), m_state_only);
 	if (g_current_processor != nullptr) {
 		EXIT("invalid graphics-thread CPU flip preparation\n");
 	}

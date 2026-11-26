@@ -53,7 +53,11 @@ inline State* Get() {
 	std::lock_guard lock(mutex);
 	if (!ready.load(std::memory_order_relaxed)) {
 		uint64_t base = 0, size = 0;
-		if (!Libs::LibKernel::Memory::BackingView(&base, &size) || base == 0 || size == 0) return nullptr;
+		if (!Libs::LibKernel::Memory::BackingView(&base, &size) || base == 0 || size == 0) {
+			// (KYTY_NATIVE_MEMORY: no backing view, ever: decided for good - off -, not asked again at every call.)
+			if (Libs::LibKernel::Memory::NativeMemoryEnabled()) ready.store(true, std::memory_order_release);
+			return nullptr;
+		}
 		state.base     = base;
 		state.size     = size;
 		state.granules = (size + Granule - 1) >> GranuleBits;

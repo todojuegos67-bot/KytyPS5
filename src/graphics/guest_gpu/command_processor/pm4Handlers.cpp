@@ -16,6 +16,11 @@
 #include "libs/errno.h"
 #include "live-census.h"
 #include "live-counters.h"
+#include "native/native-render.h" // (f5, KYTY_NATIVE_RENDER)
+#include "native/g1-probe.h" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE)
+#include "draw-state-observer.h" // (g1: the observer's generation, native/state-cache.inc)
+#include <xxhash.h> // (g1)
+#include "otros2.h" // (otros2)
 #include "speculation-state.h"
 
 #include <algorithm>
@@ -1835,7 +1840,14 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	}
 
+	// (otros2: op46 by event type, measured only)
+	const bool     timed = Otros2::Mode() != 0 && Otros2::g_timed.load(std::memory_order_relaxed);
+	const uint64_t t0    = timed ? __rdtsc() : 0;
 	cp.TriggerEvent(event_type, event_index, event_address);
+	if (timed) {
+		Otros2::g_event_cycles[event_type] += __rdtsc() - t0;
+		++Otros2::g_event_count[event_type];
+	}
 
 	return packet_size_dw - 1u;
 }
@@ -2265,6 +2277,28 @@ inline void Count(uint32_t fast, uint32_t mismatches) {
 } // namespace
 } // namespace Pm4Regfile
 
+// (otros2, KYTY_OTROS2: B, otros2.h) SET_CONTEXT_REG_INDIRECT decisions per block address (each walking thread its own).
+namespace Otros2Memo {
+struct Op {
+	uint8_t  kind;   // 0 a regfile raw store (object, byte offset `at`), 1 a handler call (register `at`)
+	uint8_t  object;
+	uint32_t at;
+	uint32_t value;
+};
+struct Entry {
+	uint64_t             address = 0;
+	uint32_t             pairs   = 0;
+	uint32_t             rf_mode = ~0u;
+	uint32_t             rf_fast = 0;
+	std::vector<uint8_t> bytes;
+	std::vector<Op>      ops;
+};
+inline constexpr uint64_t                      Entries = 1024;
+inline thread_local std::array<Entry, Entries> t_memo;
+} // namespace Otros2Memo
+
+#include "native/state-cache.inc" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE: the indirect blocks' probe and state delta)
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2283,61 +2317,122 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs"))
-		return KYTY_PM4_LEN(cmd_id) - 1u;
+	G1State::Block g1_block(0u, cp, indirect_num_dw); // (g1, KYTY_G1_PROBE / KYTY_G1_STATE; native/state-cache.inc)
+	const bool     g1_applies = SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectCxRegs");
+	if (g1_block.Synced(indirect_buffer, g1_applies) || !g1_applies) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
 	                             reinterpret_cast<uint8_t*>(&cp.GetUcfg())};
 	uint32_t       rf_fast = 0, rf_mismatches = 0;
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		// Keep the encoded offset for packet control values, and use the normalized offset
-		// only for register dispatch.
-		auto raw_cmd_offset = indirect_buffer[0];
-		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+	// (otros2, KYTY_OTROS2: B, otros2.h) The loop below, `compile` (when given) collecting its decisions.
+	const auto normal = [&](std::vector<Otros2Memo::Op>* compile) {
+		const uint32_t* pairs = indirect_buffer;
+		for (uint32_t i = 0; i < indirect_num_dw; i++, pairs += 2) {
+			// Keep the encoded offset for packet control values, and use the normalized offset
+			// only for register dispatch.
+			auto raw_cmd_offset = pairs[0];
+			auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
+			auto value          = pairs[1];
 
-		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
-			continue;
-		}
-
-		// The sentinel is an encoded descriptor value and must be checked before normalization.
-		if (raw_cmd_offset == 0xffffffffu) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("\t temporary: skipping indirect CX sentinel pair offset = 0xffffffff, value "
-				     "= 0x%08" PRIx32 "\n",
-				     value);
-				logged = true;
-			}
-			continue;
-		}
-
-		if (cmd_offset >= Pm4::CX_NUM) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("\t temporary: skipping unknown indirect CX extended offset = 0x%08" PRIx32
-				     ", value = 0x%08" PRIx32 "\n",
-				     cmd_offset, value);
-			}
-			continue;
-		}
-
-		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
-
-		if (pfunc == nullptr) {
-			ReportIndirectRegister("cx", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
-			continue;
-		}
-
-		if (rf_mode != 0) {
-			if (const auto& d = Pm4Regfile::g_cx[cmd_offset & (Pm4::CX_NUM - 1)]; d.kind != Pm4Regfile::Call) {
-				rf_fast++;
-				Pm4Regfile::Apply(cp, rf_base, d, rf_mode, pfunc, cmd_offset, value, rf_mismatches);
+			if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
 				continue;
 			}
+
+			// The sentinel is an encoded descriptor value and must be checked before normalization.
+			if (raw_cmd_offset == 0xffffffffu) {
+				static bool logged = false;
+				if (!logged) {
+					LOGF("\t temporary: skipping indirect CX sentinel pair offset = 0xffffffff, value "
+					     "= 0x%08" PRIx32 "\n",
+					     value);
+					logged = true;
+				}
+				continue;
+			}
+
+			if (cmd_offset >= Pm4::CX_NUM) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("\t temporary: skipping unknown indirect CX extended offset = 0x%08" PRIx32
+					     ", value = 0x%08" PRIx32 "\n",
+					     cmd_offset, value);
+				}
+				continue;
+			}
+
+			auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
+
+			if (pfunc == nullptr) {
+				ReportIndirectRegister("cx", indirect_address, indirect_num_dw, i, raw_cmd_offset, value);
+				continue;
+			}
+
+			if (rf_mode != 0) {
+				if (const auto& d = Pm4Regfile::g_cx[cmd_offset & (Pm4::CX_NUM - 1)]; d.kind != Pm4Regfile::Call) {
+					rf_fast++;
+					if (compile != nullptr && d.kind == Pm4Regfile::Raw)
+						compile->push_back({0, static_cast<uint8_t>(d.object), d.byte_off, value});
+					Pm4Regfile::Apply(cp, rf_base, d, rf_mode, pfunc, cmd_offset, value, rf_mismatches);
+					continue;
+				}
+			}
+			if (compile != nullptr) compile->push_back({1, 0, cmd_offset & (Pm4::CX_NUM - 1), value});
+			pfunc(cp, cmd_offset, value);
 		}
-		pfunc(cp, cmd_offset, value);
+	};
+	const uint32_t memo_mode = rf_mode != 2 && Otros2::Active() && Otros2::MemoOn() ? Otros2::Mode() : 0u; // (11-21: B off by default)
+	if (memo_mode == 0) {
+		normal(nullptr);
+	} else {
+		const bool     timed = Otros2::g_timed.load(std::memory_order_relaxed);
+		const uint64_t t0    = timed ? __rdtsc() : 0;
+		auto&          e     = Otros2Memo::t_memo[(indirect_address >> 3u) % Otros2Memo::Entries];
+		const size_t   bytes = size_t {indirect_num_dw} * 8u;
+		if (e.address == indirect_address && e.pairs == indirect_num_dw && e.rf_mode == rf_mode &&
+		    std::memcmp(e.bytes.data(), indirect_buffer, bytes) == 0) {
+			const auto replay = [&] {
+				for (const auto& op: e.ops) {
+					if (op.kind == 0) std::memcpy(rf_base[op.object] + op.at, &op.value, 4);
+					else g_hw_ctx_indirect_func[op.at](cp, op.at, op.value);
+				}
+				rf_fast += e.rf_fast;
+			};
+			if (memo_mode == 2) {
+				// (2) The replay's registers against the normal loop's, from the same start.
+				const size_t         sizes[3] = {sizeof(HW::Context), sizeof(HW::Shader), sizeof(HW::UserConfig)};
+				std::vector<uint8_t> before[3], replayed[3];
+				for (int o = 0; o < 3; ++o) before[o].assign(rf_base[o], rf_base[o] + sizes[o]);
+				replay();
+				for (int o = 0; o < 3; ++o) {
+					replayed[o].assign(rf_base[o], rf_base[o] + sizes[o]);
+					std::memcpy(rf_base[o], before[o].data(), sizes[o]);
+				}
+				rf_fast = 0;
+				normal(nullptr);
+				for (int o = 0; o < 3; ++o) {
+					if (std::memcmp(rf_base[o], replayed[o].data(), sizes[o]) == 0) continue;
+					if (Otros2::g_discrepancias++ < 8)
+						std::printf("[otros2] DISCREPANCIA cx_indirect 0x%016llx pairs=%u object=%d\n",
+						            static_cast<unsigned long long>(indirect_address), indirect_num_dw, o);
+				}
+			} else {
+				replay();
+			}
+			++Otros2::g_memo_hit;
+			if (timed) Otros2::g_hit_cycles += __rdtsc() - t0;
+		} else {
+			e.ops.clear();
+			normal(&e.ops);
+			e.address = indirect_address;
+			e.pairs   = indirect_num_dw;
+			e.rf_mode = rf_mode;
+			e.rf_fast = rf_fast;
+			e.bytes.assign(reinterpret_cast<const uint8_t*>(indirect_buffer),
+			               reinterpret_cast<const uint8_t*>(indirect_buffer) + bytes);
+			++Otros2::g_memo_miss;
+			if (timed) Otros2::g_miss_cycles += __rdtsc() - t0;
+		}
 	}
 	Pm4Regfile::Count(rf_fast, rf_mismatches);
 
@@ -2362,8 +2457,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs"))
-		return KYTY_PM4_LEN(cmd_id) - 1u;
+	G1State::Block g1_block(1u, cp, indirect_num_dw); // (g1, KYTY_G1_PROBE / KYTY_G1_STATE; native/state-cache.inc)
+	const bool     g1_applies = SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectShRegs");
+	if (g1_block.Synced(indirect_buffer, g1_applies) || !g1_applies) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2418,8 +2514,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
-	if (!SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs"))
-		return KYTY_PM4_LEN(cmd_id) - 1u;
+	G1State::Block g1_block(2u, cp, indirect_num_dw); // (g1, KYTY_G1_PROBE / KYTY_G1_STATE; native/state-cache.inc)
+	const bool     g1_applies = SyncCommandMemory(indirect_address, uint64_t {indirect_num_dw} * 8u, "IndirectUcRegs");
+	if (g1_block.Synced(indirect_buffer, g1_applies) || !g1_applies) return KYTY_PM4_LEN(cmd_id) - 1u;
 	// (KYTY_PM4_REGFILE: the switch read once a packet; proven raw / ign offsets skip their calls.)
 	const uint32_t rf_mode = Pm4Regfile::Mode(cp);
 	uint8_t* const rf_base[3] = {reinterpret_cast<uint8_t*>(&cp.GetCtx()), reinterpret_cast<uint8_t*>(&cp.GetShCtx()),
@@ -2675,6 +2772,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		}
 	} else {
 		EXIT_IF(data_sel != 3);
+		NativeRender::TimestampPacket(buffer - 1, reinterpret_cast<uint64_t>(dst_gpu_addr)); // (f5: scope marks)
 		if (!keep_native_event_index) {
 			event_index = 0;
 		}

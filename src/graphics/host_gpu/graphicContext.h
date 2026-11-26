@@ -15,6 +15,7 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+struct SparseImageMemory; // (ram1b: renderer/image/sparseImage.cpp)
 class PipelineBinaries;
 class PipelineBinaryWriter;
 class PlayedPipelines;
@@ -44,6 +45,9 @@ struct GraphicContext {
 	// guest lanes an invocation). VulkanInitSubgroupSizeControl decides it (KYTY_COMPUTE_WAVE64).
 	bool                               compute_wave64_native                 = false;
 	bool                               sample_rate_shading_enabled           = false;
+	// (up1118) VK_EXT_fragment_shader_interlock's pixel interlock and storage image reads without a format enabled
+	// (PixelInterlockExtension in vulkanWindow.cpp, ShaderRecompiler::Frontend::TranslatorFeaturePixelInterlock).
+	bool                               fragment_shader_pixel_interlock       = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
@@ -164,6 +168,9 @@ struct GraphicContext {
 	// The video memory heap's budget less its usage (VMA's figures, the largest device-local heap): what a new
 	// device-local allocation can take without going over the budget; 0 without the driver's figures.
 	[[nodiscard]] uint64_t GetVideoMemoryRoom() const;
+	// (vram8 gc, 11-23) The free bytes inside VMA's device-local blocks outside the game buffers' pool: room a new image
+	// takes without the driver's usage growing (the driver counts whole blocks).
+	[[nodiscard]] uint64_t GetVideoBlockSlack() const;
 	// The driver's usage figures read again (VMA otherwise refreshes them every 30 of its own allocations: memory
 	// the driver takes itself, such as pipelines, shows late).
 	void                   RefreshMemoryBudget();
@@ -183,12 +190,19 @@ struct GraphicContext {
 	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
 	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
 	bool                          small_video_memory = false;
+	// (vram-budget) A small video memory heap (CreateAllocator, before the allocator): the largest device-local heap of
+	// 10 GiB or less, or KYTY_SIMULATE_VRAM_MB of 10 GiB or less. VMA blocks of 32 MiB, an image reuse pool of 64 MiB at
+	// most, the driver's figures read again every 30 flips and a floor under the collector's live trigger (textureCache.cpp).
+	bool                          small_vram_heap = false;
 	// The game buffers' own VMA pool (BufferCache), whose blocks BufferCache::Defragment compacts. KYTY_BUFFER_DEFRAG:
 	// on with a small video memory, 0 off, 1 on any GPU. Null: off, game buffers in VMA's default pools.
 	VmaPool                       game_buffer_pool = nullptr;
 	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
 	// (MemoryUsage::SparseDeviceLocal).
 	bool                          sparse_residency_buffers = false;
+	// (ram1b, KYTY_RAM_NATIVE_TEX=1|2 only) Sparse residency 2D images bound on the graphics queue (the game's texture
+	// arrays: video memory for their committed layers only, renderer/image/sparseImage.cpp).
+	bool                          sparse_residency_images = false;
 	// An image only sampled and copied (CreateImage places these apart on such a GPU).
 	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
 		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
@@ -240,6 +254,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// (ram1b) A sparse image's layers' memory (renderer/image/sparseImage.cpp; null: a VMA image, `allocation`).
+	SparseImageMemory*           sparse     = nullptr;
 };
 
 

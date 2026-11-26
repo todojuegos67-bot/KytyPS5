@@ -70,6 +70,8 @@ extern const int     kAntiLagDlssgCount;
 // (10-28, ds-torch-1028's launcher) The screen-space RT set (c3e58bd5) and the new passes: their rows' levels.
 extern const Choice  kRtReflLevels[];  // Reflejos RT: No, Bajo, Medio, Alto, Ultra, Extremo (KYTY_RT_REFLECTIONS 0-5), Hibrido (6: Alto + KYTY_RT_REFLECTIONS_HYBRID)
 extern const int     kRtReflLevelCount;
+extern const Choice  kPathTracingLevels[]; // (pt1) Path tracing: No, Bajo, Medio, Alto, Ultra (BB_PATHTRACING + _QUALITY)
+extern const int     kPathTracingLevelCount;
 extern const Choice  kRtReflSharp[];   // (refl-sharp-1031) Nitidez de reflejos RT: Normal, Alta, Maxima
 extern const int     kRtReflSharpCount;
 extern const Choice  kMotesLevels[];   // (motes-1031) Particulas volumetricas: No, Sutil, Media, Densa
@@ -82,6 +84,14 @@ extern const Choice  kSmokeLevels[]; // No, Suave, Antorchas (Humo y particulas)
 extern const int     kSmokeLevelCount;
 extern const Choice  kRtLevels[];      // No, Bajo, Medio, Alto (Luz volumetrica, Oclusion ambiental, Sombras RT)
 extern const int     kRtLevelCount;
+extern const Choice  kVolLevels[];     // (rtx1) Luz volumetrica: No, Bajo, Medio, Alto, Ultra
+extern const int     kVolLevelCount;
+extern const Choice  kRtq2OnOff[];     // (rtq2) Suelo estable: No, Si
+extern const int     kRtq2OnOffCount;
+extern const Choice  kRtnLevels[];      // (rtq2 b) Reflejos RT nuevos: No, Si, Depuracion
+extern const int     kRtnLevelCount;
+extern const Choice  kRtx1Levels[];    // (rtx1) Reflejos estables / Sombras mejoradas / Oclusion mejorada: No, Bajo, Medio, Alto, Ultra
+extern const int     kRtx1LevelCount;
 extern const Choice  kTorchLevels[];   // Luz de antorchas RT: No, Bajo, Medio, Alto, Hibrido (ds-pc-port10: no longer offered)
 extern const int     kTorchLevelCount;
 // (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering, ds-foveated-1029's foveated grid): No, Suave, Medio, Fuerte
@@ -161,9 +171,16 @@ struct Settings {
 	// (10-28) Antorchas (the launcher's hwlamp4): 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_HWRT_LIGHTS level, with the RT particles).
 	std::string rt_lamps = "";       // empty: from rt_particles (an older settings.ini: Si = 2)
 	std::string motes = "0";         // (motes-1031) particulas_volumetricas: 0 No, 1 Sutil, 2 Media, 3 Densa (KYTY_MOTES)
-	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto (KYTY_GODRAYS + the hidden RT sun pass)
+	std::string godrays = "0";       // Luz volumetrica: 0 No, 1 Bajo, 2 Medio, 3 Alto, 4 Ultra (rtx1) (KYTY_GODRAYS + the hidden RT sun pass)
+	// (rtx1) Three options of 4 levels each (0 = exactly as before), ds-settings.cpp BuildLaunch "(rtx1)":
+	std::string refl_stable = "0";   // reflejos_estables: the floor's reflection without the moving "wave" (rtrefl1, the game's SSR off, Reflejos RT presence)
+	std::string shadow_rtx = "0";    // sombras_mejoradas: torch / candle shadows, contact shadows and sun cascades (no filter: Bordes sombras)
+	std::string rt_nuevo = "0";      // (rtq2 b) reflejos_rt_nuevos: 0 no, 1 si (compilacion 1: solo traza), 2 depuracion (KYTY_RTN)
+	std::string floor_stable = "0";  // (rtq2) suelo_estable: 0 no, 1 si: the game's IBL reflects along the geometric normal (KYTY_RTQ2_IBL)
+	std::string ao_rtx = "0";        // oclusion_mejorada: the game's AO moved relative to its own values + its ambient shadowing range
 	bool        pure_game = false;   // Juego original: every visual pass the emulator adds off
 	// (10-28, ds-torch-1028) The screen-space RT set and the new passes (none needs hardware RT but Hibrido):
+	std::string path_tracing = "0";  // (pt1) path_tracing: 0 No, 1 Bajo, 2 Medio, 3 Alto, 4 Ultra (BB_PATHTRACING=1 + BB_PATHTRACING_QUALITY)
 	std::string rt_ss_refl = "0";    // reflejos_rt: Reflejos RT 0-6 (KYTY_RT_REFLECTIONS; 4-5: more presence; 6 Hibrido)
 	std::string rt_refl_sharp = "0"; // (refl-sharp-1031) nitidez_reflejos_rt: 0 Normal, 1 Alta, 2 Maxima (KYTY_RT_REFLECTIONS_SHARP)
 	std::string rt_refl_waves = "0"; // (refl-sharp-1031) ondas_agua_reflejos: 0 Como ahora, 1 Suaves, 2 Espejo (KYTY_RT_REFLECTIONS_WATER_WAVES)
@@ -185,8 +202,12 @@ struct Settings {
 	bool        kbm = false;         // KYTY_KBM: keyboard and mouse
 	float       kbm_sens = 1.0f;     // KYTY_KBM_SENS
 	float       kbm_antidz = 0.15f;  // KYTY_KBM_ANTIDZ
+	float       kbm_sens_x = 1.0f;   // (raton2) raton_sens_x: KYTY_CAM1_SENS_X (live)
+	float       kbm_sens_y = 1.0f;   // (raton2) raton_sens_y: KYTY_CAM1_SENS_Y (live)
 	std::string kbm_map;             // KYTY_KBM_MAP
 	std::string pad_map;             // KYTY_PAD_MAP
+	std::string pad_deadzone = "auto"; // (pad-dz 23-11) mando_zona_muerta: auto (XInput 24%, otros 15%, PlayStation 0) o 0-50 (KYTY_PAD_DEADZONE)
+	bool        pad_force_generic = false; // (pad-dinput 23-11) mando_forzar_generico: KYTY_PAD_FORCE_GENERIC
 	std::string game_settings;       // (ds-pc-port37) ajustes_juego: "gs_sun=3;gs_spot=1;..." (the launcher's "Ajustes del juego"; "id=0" = the game's own, an absent id = its GameSetting::def, e.g. gs_spot off)
 	int         kbm_camera = 0;  // (step5: 0 = the game's own option; was 10)     // (10-28) cp11_Setting_CameraSpeed with keyboard and mouse (5-15; the launcher's kbmcam2)
 	bool        kbm_warp = false;    // (10-28) Camara instantanea (frame warp): KYTY_KBM_WARP
@@ -195,12 +216,12 @@ struct Settings {
 	bool        configured = false;  // the first-start dialog has been shown
 	bool        ram16_boost = false; // (11-13) on by default on every PC: less RAM // Mejoras para equipos de 16 GB de RAM: the 16 GB profile + the RAM flush (PCs of 20 GB or less)
 	// (perfopts-1107) Opciones de rendimiento: upstream's opt-in switches (all off = the behaviour before them).
-	bool        perf_pm4_regfile = false;   // KYTY_PM4_REGFILE=1
-	bool        perf_upload_lanes = false;  // KYTY_UPLOAD_LANES=2
+	bool        perf_pm4_regfile = true;    // KYTY_PM4_REGFILE=1 (11-22: always on in code, no box; settings.ini not read)
+	bool        perf_upload_lanes = true;   // KYTY_UPLOAD_LANES=2 (21-11 log, upload thread -29%, fewer >50 ms seconds; 11-22: always on, no box)
 	bool        perf_upload_help = false;   // KYTY_UPLOAD_HELP=2
 	bool        perf_spin_gate = false;     // KYTY_SPIN_GATE=1
-	bool        perf_eager_feedback = false; // KYTY_EAGER_FEEDBACK=1
-	bool        perf_feedback_batch = false; // KYTY_FEEDBACK_BATCH=1
+	bool        perf_eager_feedback = true;  // KYTY_EAGER_FEEDBACK=1 (11-22: always on in code, no box)
+	bool        perf_feedback_batch = true;  // KYTY_FEEDBACK_BATCH=1 (11-22: always on in code, no box)
 	bool        perf_lane_wide = false;     // KYTY_LANE_LOCAL_WIDE=1
 	// [Interfaz]
 	std::string metrics = "0"; // KYTY_FPS_HUD 0/1/2
@@ -209,6 +230,15 @@ struct Settings {
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
 	bool        rumble = true;
 	float       rumble_gain = 4.0f;
+	// [Multijugador] (online5) multijugador=1: the online (messages, stains, ghosts, co-op, invasions) through our server
+	bool        multiplayer = false;
+	bool        randomizer = false;    // (rando1) randomizer=1: offline, "Trofeos Randomizer" (KYTY_DS_RANDOMIZER)
+	int         randomizer_seed = 0;   // (rando1) randomizer_semilla: the same seed, the same draw (0: a new one each launch)
+	bool        no_cheats = false; // (stats1) sin_trucos=1: "Deshabilitar trucos y mejoras" (F2: no Trucos / Armas y objetos, every cheat forced off)
+	std::string online_server = "127.0.0.1"; // the server's address (127.0.0.1: this PC is the host; friends: its public IP)
+	std::string online_name;                 // the account (F2 / launcher: "Crear cuenta")
+	std::string online_password;
+	std::string online_friends; // (chat1) multijugador_amigos: account names, comma separated
 	// [Avanzado]
 	std::string extra; // KEY=VALUE;KEY=VALUE (run-windows -Set; KEY= removes it)
 };
@@ -293,6 +323,12 @@ void ApplyPreset(Settings* settings, const std::string& preset); // ligero, maxi
 void RtAllOff(Settings* settings);
 // Souls ligero / equilibrado / PC low profile: frame generation fixed at AMD x2, the game at 30 / 45 / 30.
 bool FixedFg(const Settings& settings);
+
+// (trucos-online) Cheats and online are mutually exclusive. MarkCheatsUsed: a cheat action succeeded in this process
+// (souls set, Nivel personaje applied, something from Armas y objetos; a switch on counts only while it is on); logged once. CheatsUsed: that happened, so
+// online cannot be turned on and a launch from this process starts offline (BuildLaunch / ds-main).
+void MarkCheatsUsed(const char* what);
+bool CheatsUsed();
 
 } // namespace Port
 

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Rtq2Patch.h" // (rtq2: suelo estable)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -33,6 +34,11 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
+
+// The decoded instructions of the thread's last program, their capacity kept for its next one (up to 8 MiB,
+// TranslateProgram): a new vector of ~0.8 MiB for every program was memory the system had to zero-fill (the shader
+// prefetch's threads: 5 GB a minute). ReleaseThreadScratch gives it back.
+thread_local std::vector<Decoder::Instruction> t_instructions;
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
@@ -583,7 +589,10 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
-TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+TranslateResult TranslateProgram(std::span<const uint32_t> code_in, const CompileOptions& options) {
+	// (rtq2) KYTY_RTQ2_IBL: the game's IBL with one instruction replaced (Rtq2Patch.h); every other program as it is.
+	thread_local std::vector<uint32_t> rtq2_patched;
+	const std::span<const uint32_t>    code = Rtq2Patch::Apply(options.shader_hash, code_in, rtq2_patched);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -604,9 +613,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	// The decoded instructions go in the thread's vector of its last program's, its capacity kept (up to 8 MiB): a new one
-	// of ~0.8 MiB for every program was memory the system had to zero-fill (the shader prefetch's threads: 5 GB a minute).
-	static thread_local std::vector<Decoder::Instruction> t_instructions;
+	// The decoded instructions go in the thread's vector of its last program's (t_instructions), its capacity kept.
 	Decoder::Program decoded;
 	decoded.instructions = std::move(t_instructions);
 	struct KeepInstructions {
@@ -754,7 +761,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
 		     IR::ProgramToString(ir).c_str());
 	}
-	IR::TrackResources(ir);
+	IR::TrackResources(ir, options.stage == ShaderType::Pixel &&
+	                           (Frontend::TranslatorFeatureSet() & Frontend::TranslatorFeaturePixelInterlock) != 0);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
@@ -834,6 +842,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 void RecycleSpirv(std::vector<uint32_t>&& spirv) {
 	Spirv::Builder::Recycle(std::move(spirv));
+}
+
+void ReleaseThreadScratch() {
+	std::vector<Decoder::Instruction>().swap(t_instructions);
+	Spirv::ReleaseThreadScratch();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

@@ -24,6 +24,9 @@
 #include <utility>
 #include <vector>
 
+#define VRAM_EMU_OWNER ::VramEmu::kFg
+#include "local/vram-emu.h" // (VRAM-EMU) sus asignaciones de VMA y CreateImage apuntadas con su dueno
+
 namespace Libs::Graphics::FrameGen {
 
 bool g_hudless = false;

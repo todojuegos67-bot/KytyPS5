@@ -108,6 +108,8 @@ public:
 	bool DrawIndex(DrawIndexArgs args);
 	// An indirect draw whose arguments the GPU wrote, drawn from them on the GPU.
 	[[nodiscard]] bool TryGpuIndirectDraw(uint64_t args, uint32_t count, uint32_t stride, bool indexed);
+	// (parpadeo2, KYTY_PARPADEO; local/parpadeo.h) An indexed indirect draw run about to be drawn. `path`: Parpadeo::Path.
+	void ParpadeoNoteDraws(std::span<const uint64_t> args, uint64_t index_bytes, uint32_t path);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	bool DrawIndexAuto(DrawAutoArgs args);
 	// Native XPR draws (kyty_local_native_xpr_mode): packets consumed, 0 = normal path.
@@ -196,6 +198,10 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
+	// (port2, KYTY_PORT2; local/port2.h) A marker of the emulator's Agc at `packet`: the dwords to pass over (the marker
+	// alone, or the marker and the span its flow was applied for). `can_apply`: outside speculation, state passes, chunks,
+	// stops and captures.
+	uint32_t Port2Marker(const uint32_t* packet, uint32_t remaining_dw, bool can_apply);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }

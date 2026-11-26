@@ -88,6 +88,7 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_BACKING_READ", &kyty_local_backing_read_mode},
 	    // The game's large memmoves write only the pages whose bytes differ (default on; 0 for an A/B).
 	    Switch {"KYTY_GUEST_MOVE_COMPARE", &kyty_local_move_compare},
+	    // (upstream1116) Copies that took an exception made again (common/hostException.h; default on, 0: once).
 	    Switch {"KYTY_STREAM_UPLOAD", &kyty_local_stream_upload_mode},
 	    Switch {"KYTY_FRAME_PIPELINE", &kyty_local_frame_pipeline_mode},
 	    Switch {"KYTY_WRITE_WINDOW_HANDOFF", &kyty_local_write_window_handoff_mode},
@@ -196,7 +197,7 @@ inline void InitializePerformanceSwitches() {
 	// measured best; a dedicated core made the whole process slower there.
 	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') {
 		LocalPlatform::PinThreadToCpuList(cpus);
-		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + cpus;
+		enabled += std::string(enabled.empty() ? "" : " ") + "KYTY_RENDER_CPUS=" + LocalPlatform::CpuListResolved(cpus);
 	}
 	// Above the game's threads (KYTY_RENDER_PRIORITY=0: normal). Walking into a new area, the game's threads
 	// streaming it in held the render CPUs for whole time slices: frames of 35-50 ms where the render thread
