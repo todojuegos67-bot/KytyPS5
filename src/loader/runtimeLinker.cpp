@@ -33,6 +33,7 @@
 #include "loader/demonsSoulsAllocClamp.h"
 #include "loader/demonsSoulsPortAlloc.h"
 #include "loader/demonsSoulsInventory.h"
+#include "loader/demonsSoulsInmortal.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1661,6 +1662,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsSkipIntro::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsCamera::InstallNoRamp(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsInventory::Install(m_programs.empty() ? nullptr : m_programs.front()); // (trucos3/4) F2 > Trucos: game-thread writes, inventory, names
+	DemonsSoulsInmortal::Install(m_programs.empty() ? nullptr : m_programs.front()); // (inmortal1) read-only: why a hit takes no HP
 	// (audit1) KYTY_DS_WRITE_AUDIT=1, off by default. Last: DemonsSoulsGpuPages (above) verifies whole functions this
 	// patches the entries of, and every patch above has checked the game's own bytes by now.
 	DemonsSoulsWriteAudit::Install(m_programs.empty() ? nullptr : m_programs.front());
