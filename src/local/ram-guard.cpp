@@ -1629,6 +1629,10 @@ void RamLineThread() {
 // page faults wait for: ~0.1-0.3 ms). With native guest memory a game page in the working set is the game's own RAM;
 // compressed or paged-out pages are not in it. `game_ram`: the sum (the labels below do not overlap: the ring and the
 // pool, inside cpupage / gpupage, are left out). False when the map has no snapshot.
+// (frio) The census' samples at the last census (page -> in the working set) and every sample page ever seen in it: the
+// "[-salio/+volvio, frio]" figures (only the census thread uses them).
+static std::unordered_map<uint64_t, bool> g_census_prev;
+static std::unordered_set<uint64_t>       g_census_ever;
 bool Ram16Census(char* out, size_t size, uint64_t* game_ram, double* ms, size_t* samples_out, uint64_t* stride_out) {
 	static const char* const labels[] = {"VirtualMemo", "cpuheap", "gpuheap", "cpupage", "gpupage", "cpubkt",
 	                                     "gpubkt",      "DefaultTagg", "RTSharedAll", "RTPersistAl"};
@@ -1664,7 +1668,9 @@ bool Ram16Census(char* out, size_t size, uint64_t* game_ram, double* ms, size_t*
 				samples.push_back({at & ~uint64_t {0xfff}, static_cast<uint32_t>(std::min(stride, end - at)), static_cast<uint16_t>(l)});
 	constexpr size_t                              Batch = 1024;
 	std::vector<PSAPI_WORKING_SET_EX_INFORMATION> entries(Batch);
-	uint64_t                                      in_ram[Labels] {};
+	uint64_t                                      in_ram[Labels] {}, went_out[Labels] {}, came_back[Labels] {}, out_after_in[Labels] {};
+	std::unordered_map<uint64_t, bool>            next_prev;
+	next_prev.reserve(samples.size());
 	for (size_t begin = 0; begin < samples.size(); begin += Batch) {
 		const size_t n = std::min(Batch, samples.size() - begin);
 		for (size_t i = 0; i < n; i++) {
@@ -1673,17 +1679,35 @@ bool Ram16Census(char* out, size_t size, uint64_t* game_ram, double* ms, size_t*
 		}
 		if (begin != 0) SwitchToThread();
 		if (K32QueryWorkingSetEx(GetCurrentProcess(), entries.data(), static_cast<DWORD>(n * sizeof(entries[0]))) == 0) return false;
-		for (size_t i = 0; i < n; i++)
-			if ((entries[i].VirtualAttributes.Flags & 1u) != 0) in_ram[samples[begin + i].label] += samples[begin + i].weight;
+		for (size_t i = 0; i < n; i++) {
+			const bool valid = (entries[i].VirtualAttributes.Flags & 1u) != 0;
+			const auto& s    = samples[begin + i];
+			if (valid) in_ram[s.label] += s.weight;
+			// (frio) The same sample at the census before: in RAM then and not now = Windows took it out of the working
+			// set (compression store or page file: bytes the game or the emulator wrote and nobody touched since); out then
+			// and in now = touched again. Only samples seen at both (a range new or gone counts in neither).
+			const auto it = g_census_prev.find(s.page);
+			if (it != g_census_prev.end()) {
+				if (it->second && !valid) went_out[s.label] += s.weight;
+				if (!it->second && valid) came_back[s.label] += s.weight;
+			}
+			next_prev[s.page] = valid;
+			if (valid) g_census_ever.insert(s.page);
+			else if (g_census_ever.count(s.page) != 0) out_after_in[s.label] += s.weight;
+		}
 	}
+	g_census_prev.swap(next_prev);
 	constexpr double GiBd = 1024.0 * 1024.0 * 1024.0;
 	size_t           used = 0;
 	uint64_t         sum  = 0;
 	out[0]                = '\0';
 	for (size_t l = 0; l < Labels; l++) {
 		sum += in_ram[l];
-		RamLineAdd(out, size, &used, "%s%s %.2f (%.2f)", l == 0 ? "" : ", ", labels[l], static_cast<double>(in_ram[l]) / GiBd,
-		           static_cast<double>(range_bytes[l]) / GiBd);
+		// "%s en RAM (rango) [-salio/+volvio desde el censo anterior, fuera tras haber estado en RAM]"
+		RamLineAdd(out, size, &used, "%s%s %.2f (%.2f) [-%.2f/+%.2f, frio %.2f]", l == 0 ? "" : ", ", labels[l],
+		           static_cast<double>(in_ram[l]) / GiBd, static_cast<double>(range_bytes[l]) / GiBd,
+		           static_cast<double>(went_out[l]) / GiBd, static_cast<double>(came_back[l]) / GiBd,
+		           static_cast<double>(out_after_in[l]) / GiBd);
 	}
 	*game_ram    = sum;
 	*ms          = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -2843,7 +2867,7 @@ void Ram16Thread() {
 		}
 		if (census_s > 0 && std::chrono::steady_clock::now() - census_at >= std::chrono::seconds(census_s)) {
 			census_at = std::chrono::steady_clock::now();
-			char     text[768];
+			char     text[1536];
 			uint64_t game = 0, stride = 0;
 			double   ms   = 0;
 			size_t   samples = 0;
@@ -2851,6 +2875,8 @@ void Ram16Thread() {
 				const uint64_t host = procs.ok && procs.own_private > game ? procs.own_private - game : 0;
 				std::printf("[ram16-censo] GB en RAM (rango) por asignador del juego: %s; juego %.2f, emulador fuera del juego "
 				            "%.2f (privado en RAM menos el juego: monton C++, Vulkan, JIT...; desglose en \"Private residency\"); "
+		            "[-salio/+volvio] = GB que salieron de RAM / volvieron desde el censo anterior, frio = fuera ahora tras "
+		            "haber estado en RAM (comprimido o paginado por Windows); "
 				            "%zu muestras cada %llu KiB, %.1f ms\n",
 				            text, static_cast<double>(game) / GiBd, static_cast<double>(host) / GiBd, samples,
 				            static_cast<unsigned long long>(stride >> 10u), ms);
