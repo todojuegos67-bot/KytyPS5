@@ -8089,6 +8089,7 @@ void TextureCache::EraseRetired() {
 void TextureCache::RetireStaleImages(uint64_t tick) {
 	constexpr uint64_t RetireTicks    = 1200;
 	constexpr size_t   MaxRetirements = 16;
+	constexpr uint64_t NativeKeepTicks = 18000; // (COV3)
 	if (const auto generation = SceneTags::Generation(); generation != m_scene_generation) {
 		m_scene_generation = generation;
 		m_scene_tick       = tick;
@@ -8104,6 +8105,11 @@ void TextureCache::RetireStaleImages(uint64_t tick) {
 		// (N2+N3) Fija: sus bytes "solo en la GPU" viven mientras el juego tenga el mip comprometido (como en la PS5).
 		// (N2+N3g) Aqui no hay presion de memoria: solo RunGarbageCollector / ReclaimImageMemory la expulsan.
 		if (TexNativa::AnyOwned(owner->info.data.address, owner->info.data.End())) return false;
+		// (COV3) Imagen nativa dispersa (creada al crear su CTexture, 0x8fe750): se queda hasta ~5 min sin uso. Log 205533:
+		// los trozos de 0x901330 llegan de media 25 s despues (log 200221: 103 s) y este retiro sin presion la borraba a los
+		// 1200 ticks (~20 s): 2078 / 9477 MB 'imagen ya creada (no encontrada o borrada)' a la RAM. Sin trozos no liga
+		// memoria; con presion de VRAM RunGarbageCollector la sigue expulsando como antes.
+		if (TexNativa::On() && IsNativeSparse(*owner) && m_lru_cache.TickOf(owner->lru_id) + NativeKeepTicks > tick) return false;
 		// (Left at its age: the collector's.)
 		if (keep_pools && owner->info.resources.levels == 1 && owner->info.resources.layers > 1 &&
 		    owner->info.data.size >= ChunkedUploadMin && GuestTexture(*owner) &&
