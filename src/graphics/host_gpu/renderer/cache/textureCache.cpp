@@ -7473,6 +7473,13 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 		regions.push_back(region);
 	}
 	if (tiles.empty()) return fallback();
+	// (NEGRAS) Un mip sin memoria ligada (por debajo de MinLevel, desligado o sin memoria): la subida se perderia y el
+	// rango quedaria "solo en la GPU" con su RAM soltada = negro para siempre. A la RAM como siempre.
+	for (const auto& region: regions)
+		if (!SparseLevelBound(image.backing, region.imageSubresource.mipLevel)) {
+			TexNativa::c_unbound_fallback.fetch_add(size, std::memory_order_relaxed);
+			return fallback();
+		}
 	if (m_native_ring == nullptr) return fallback();
 	// Los bytes ya estan en la memoria de subida (los copio el juego): destilado directo desde ahi.
 	m_native_ring->Flush(ring_offset, size);

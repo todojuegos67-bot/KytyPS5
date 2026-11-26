@@ -74,6 +74,7 @@ struct Coste {
 };
 
 struct Entry {
+	bool    min_set   = false; // (NEGRAS) min_level fijado por el primer descriptor: ya no cambia
 	uint8_t min_level = 0; // mips por debajo no se ligan (KYTY_TEXTURE_REDUCE: los que el emulador deja fuera)
 };
 inline std::mutex& Mutex() {
@@ -319,6 +320,7 @@ inline uint64_t ForgetReleased(uint64_t b, uint64_t e, bool rebacked) {
 	return n;
 }
 inline std::atomic<uint64_t> c_direct_bytes {0}, c_fallback_bytes {0}, c_lost_bytes {0}, c_restored_bytes {0};
+inline std::atomic<uint64_t> c_unbound_fallback {0}; // (NEGRAS) trozos a un mip sin ligar: a la RAM en vez de perderse
 // (11-25) Trozos de 0x901330 que llegan a NativeChunkCopy: todos / CTexture no registrada / sin imagen todavia.
 inline std::atomic<uint64_t> c_chunk_all_bytes {0}, c_chunk_nonative_bytes {0}, c_chunk_noimage_bytes {0};
 
@@ -511,10 +513,18 @@ inline bool IsNative(uint64_t base) {
 	return Table().count(base) != 0;
 }
 
-inline void SetMinLevel(uint64_t base, uint32_t level) {
+// (NEGRAS) El primer descriptor fija el nivel; despues no cambia (devuelve el fijado). Antes cambiaba con cada T#: el
+// `drop` de KYTY_TEXTURE_REDUCE depende de IsRegionGpuModified/HasGpuWrittenImageOverlap (cambian al reciclarse la
+// memoria), y una vista que pasaba a empezar en el mip 0 leia un mip que nunca se ligo (sparse sin ligar = negro).
+inline uint32_t SetMinLevel(uint64_t base, uint32_t level) {
 	std::lock_guard<std::mutex> lock(Mutex());
 	auto                        it = Table().find(base);
-	if (it != Table().end()) it->second.min_level = static_cast<uint8_t>(level);
+	if (it == Table().end()) return level;
+	if (!it->second.min_set) {
+		it->second.min_level = static_cast<uint8_t>(level);
+		it->second.min_set   = true;
+	}
+	return it->second.min_level;
 }
 
 inline uint32_t MinLevel(uint64_t base) {
@@ -530,11 +540,12 @@ inline void MaybeLog() {
 	int64_t       due = next.load(std::memory_order_relaxed);
 	if (now < due || !next.compare_exchange_strong(due, now + 30)) return;
 	std::printf("[tex-nativa] RAM emulada sin escribir (texturas solo en la GPU) %llu MB; a la RAM como siempre %llu MB; "
-	            "recuperadas de la VRAM antes de borrar %llu MB; perdidas %llu MB\n",
+	            "recuperadas de la VRAM antes de borrar %llu MB; perdidas %llu MB; a un mip sin ligar (a la RAM) %llu MB\n",
 	            static_cast<unsigned long long>(c_direct_bytes.load() >> 20u),
 	            static_cast<unsigned long long>(c_fallback_bytes.load() >> 20u),
 	            static_cast<unsigned long long>(c_restored_bytes.load() >> 20u),
-	            static_cast<unsigned long long>(c_lost_bytes.load() >> 20u));
+	            static_cast<unsigned long long>(c_lost_bytes.load() >> 20u),
+	            static_cast<unsigned long long>(c_unbound_fallback.load() >> 20u));
 	{
 		const uint64_t all = c_chunk_all_bytes.load(), dir = c_direct_bytes.load();
 		std::printf("[tex-nativa] cobertura directa a VRAM %.1f %% (%llu de %llu MB de trozos de 0x901459 sin pasar por la "

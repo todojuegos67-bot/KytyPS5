@@ -1432,6 +1432,13 @@ void SparseFlushPendingBinds(GraphicContext& graphics, CommandScheduler& schedul
 	mine.clear();
 }
 
+bool SparseLevelBound(const VulkanImage& image, uint32_t level) {
+	if (image.sparse == nullptr || !image.sparse->per_level) return true;
+	const auto& s = *image.sparse;
+	if (level >= s.tail_first_lod) return s.tail_bound;
+	return level < s.level_memory.size() && s.level_memory[level] != VK_NULL_HANDLE;
+}
+
 bool SparseIsPerLevel(const VulkanImage& image) {
 	return image.sparse != nullptr && image.sparse->per_level;
 }

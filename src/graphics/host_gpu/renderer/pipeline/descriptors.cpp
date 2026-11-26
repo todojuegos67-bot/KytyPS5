@@ -652,9 +652,11 @@ static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc
 	if (TexNativa::IsNative(full.data.address) && full.resources.layers == 1 && full.resources.levels > 1 &&
 	    full.type == Prospero::ImageType::kColor2D && !full.IsVolume() && !full.IsDepth() && !full.HasStencil() &&
 	    !full.HasMetadata() && full.samples == 1) {
-		TexNativa::SetMinLevel(full.data.address, drop);
-		desc.view_info.base_level  = first_held;
-		desc.view_info.level_count = last - first_held + 1u;
+		// (NEGRAS) El nivel fijado de la CTexture (no el `drop` de este T#): la vista nunca incluye un mip sin ligar.
+		const uint32_t held_min = TexNativa::SetMinLevel(full.data.address, drop);
+		const uint32_t fh       = std::min(std::max(static_cast<uint32_t>(base), held_min), full.resources.levels - 1u);
+		desc.view_info.base_level  = fh;
+		desc.view_info.level_count = std::max(static_cast<uint32_t>(last), fh) - fh + 1u;
 		TexNativa::c_views.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}

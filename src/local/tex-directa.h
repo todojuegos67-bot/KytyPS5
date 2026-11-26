@@ -345,6 +345,15 @@ inline bool NativeChunkCopy(void* dest, const void* src, size_t n) {
 		// (cov1) Una sola peticion por CTexture mientras siga pendiente (antes una por trozo: 11774 para 4273 CTexture).
 		if (!TexNativa::NoteNoImage(tl_chunk_tex, n)) PedirImagen(); // (11-25e) sin espera: este trozo a la RAM
 		TexNativa::c_chunk_noimage_bytes.fetch_add(n, std::memory_order_relaxed);
+		// (NEGRAS) El juego escribe este trozo en la RAM: si el rango seguia "solo en la GPU" (imagen borrada/aparcada a
+		// la espera de recuperarse), fuera ya, bajo PMutex como el anillo lleno; si no, la recuperacion posterior pisaria
+		// estos bytes nuevos con los viejos de la VRAM y el refresco nunca los leeria de la RAM.
+		if (TexNativa::AnyOwned(d, d + n)) {
+			std::lock_guard<std::mutex> lock(TexNativa::PMutex());
+			TexNativa::RemoveOwned(d, d + n);
+			TexNativa::PQueue().push_back({d, static_cast<uint64_t>(n), TexNativa::kRamWrite, 0, 0});
+			TexNativa::g_pending.store(true, std::memory_order_release);
+		}
 		return false;
 	}
 	TexNativa::NoteDirect(tl_chunk_tex, n); // (cov1) bytes directos gracias a una creacion urgente

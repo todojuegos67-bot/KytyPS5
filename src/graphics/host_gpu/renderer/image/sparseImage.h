@@ -41,6 +41,9 @@ void SparseUpdateLevels(GraphicContext& graphics, CommandScheduler& scheduler, V
 // entrega los espera. CommandScheduler::SubmitBuffers lo llama antes de cada entrega.
 void SparseFlushPendingBinds(GraphicContext& graphics, CommandScheduler& scheduler);
 
+// (NEGRAS) Si el mip `level` de una textura nativa tiene memoria ligada (true si no es nativa). Una subida a un mip sin
+// ligar se pierde (sparse: se lee como cero = textura negra).
+[[nodiscard]] bool SparseLevelBound(const VulkanImage& image, uint32_t level);
 // (N1) Whether `image` is a native texture (memory per level).
 [[nodiscard]] bool SparseIsPerLevel(const VulkanImage& image);
 
