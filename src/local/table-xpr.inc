@@ -314,6 +314,19 @@ struct RenderExecutor::TableXpr {
 	};
 	static constexpr size_t           RingCopies = 4096;
 	std::unique_ptr<RingCopy[]>       ring_copies = std::make_unique<RingCopy[]>(RingCopies);
+	// (bloques juntos, KYTY_BLOQUES_JUNTOS) Windows of whole 4 KiB pages copied once into the ring: a later range of
+	// the same submission and observation epoch inside one, with the window's tracker epoch unchanged, takes the
+	// window's copy at its offset (same capture point as RingCopy: translation). Also the census's recent copies.
+	struct RingWindow {
+		uint64_t          base = 0, size = 0, observation = 0, tick = 0, cpu_epoch = 0;
+		vk::DeviceAddress device = 0;
+		const uint8_t*    host   = nullptr;
+	};
+	static constexpr size_t RingWindows = 8;
+	std::array<RingWindow, RingWindows> ring_windows {};
+	uint32_t                            ring_window_next = 0;
+	std::array<RingWindow, RingWindows> censo_windows {};
+	uint32_t                            censo_next = 0;
 	uint32_t                          special_generation = 1; // moves with the image starts and the mappings
 	// Addresses no image starts at, each with the TextureCache::StartEpoch it was proven at (only an address gaining
 	// its first image moves that epoch): TableBlocks asks the texture cache (a lock and a map lookup) again only then.
@@ -1671,6 +1684,61 @@ void RenderExecutor::TableGather(const TablePair& pair, std::array<std::span<con
 // its bytes made on the GPU just before the dispatch is compared with them once it ran ("DEVICE MISMATCH": the buffer
 // held other bytes than the guest's). (The culling programs' plane loops run dword 2 times: a garbage count hung the
 // GPU, 10-13.)
+// (bloques juntos / censo bloques) Counters of KYTY_BLOQUES_JUNTOS (ring windows) and KYTY_CENSO_BLOQUES (ring copies
+// inside an earlier copy's window; the checks' and the copy's cycles), one '[censo-bloques]' line every 5 s.
+namespace BloquesJuntos {
+struct State {
+	std::atomic<uint64_t> copies {0}, inside {0}, bytes {0}, inside_bytes {0}, total_cycles {0}, copy_cycles {0};
+	std::atomic<uint64_t> taken {0}, windows {0}, window_bytes {0}, checked {0}, mismatches {0};
+	std::atomic<int64_t>  since_ns {0};
+	std::atomic<uint64_t> since_tsc {0};
+};
+inline State g;
+inline void NoteMismatch(uint64_t address, uint64_t size) {
+	if (g.mismatches.fetch_add(1, std::memory_order_relaxed) < 16)
+		std::printf("[censo-bloques] DIFERENCIA ventana vs copia en 0x%llx (%llu bytes)\n",
+		            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+}
+inline void MaybeReport() {
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch()).count();
+	int64_t since = g.since_ns.load(std::memory_order_relaxed);
+	if (since == 0) {
+		g.since_ns.store(now, std::memory_order_relaxed);
+		g.since_tsc.store(__rdtsc(), std::memory_order_relaxed);
+		return;
+	}
+	if (now - since < 5000000000ll || !g.since_ns.compare_exchange_strong(since, now)) return;
+	const uint64_t tsc  = __rdtsc();
+	const double   nspc = static_cast<double>(now - since) /
+	                    static_cast<double>(std::max<uint64_t>(1, tsc - g.since_tsc.exchange(tsc)));
+	const auto  take   = [](std::atomic<uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
+	const auto  copies = take(g.copies), inside = take(g.inside), bytes = take(g.bytes), ib = take(g.inside_bytes);
+	const auto  total = take(g.total_cycles), copy = take(g.copy_cycles);
+	const auto  taken = take(g.taken), windows = take(g.windows), wbytes = take(g.window_bytes), checked = take(g.checked);
+	const double n     = static_cast<double>(std::max<uint64_t>(1, copies));
+	std::printf("[censo-bloques] 5 s: copias %llu (%.1f MB) | dentro de ventana previa %.1f%% (%.1f%% bytes) | por copia: "
+	            "total %.0f ns = comprobaciones %.0f + Map/lectura/Commit %.0f | juntos: ventanas %llu (%.1f MB) tomadas %llu "
+	            "comprobadas %llu diferencias %llu\n",
+	            static_cast<unsigned long long>(copies), bytes / 1e6, 100.0 * inside / n,
+	            bytes == 0 ? 0.0 : 100.0 * ib / bytes, total * nspc / n, (total - std::min(total, copy)) * nspc / n,
+	            copy * nspc / n, static_cast<unsigned long long>(windows), wbytes / 1e6,
+	            static_cast<unsigned long long>(taken), static_cast<unsigned long long>(checked),
+	            static_cast<unsigned long long>(g.mismatches.load(std::memory_order_relaxed)));
+}
+inline void NoteCenso(bool inside, uint64_t size, uint64_t total, uint64_t copy) {
+	g.copies.fetch_add(1, std::memory_order_relaxed);
+	g.bytes.fetch_add(size, std::memory_order_relaxed);
+	if (inside) {
+		g.inside.fetch_add(1, std::memory_order_relaxed);
+		g.inside_bytes.fetch_add(size, std::memory_order_relaxed);
+	}
+	g.total_cycles.fetch_add(total, std::memory_order_relaxed);
+	g.copy_cycles.fetch_add(copy, std::memory_order_relaxed);
+	MaybeReport();
+}
+} // namespace BloquesJuntos
+
 namespace TableWatchState {
 struct Watch {
 	uint64_t hash;
@@ -2279,6 +2347,12 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 					// (A speculation's: the guest's writes, not those its commit makes current; with none of its own
 					// guest memory writes pending over the range, read as no GPU work wrote it.)
 					auto* const spec        = Spec::Current();
+					// (censo bloques, KYTY_CENSO_BLOQUES=1) The checks' and the copy's time per ring copy.
+					static const bool censo = [] {
+						const char* v = std::getenv("KYTY_CENSO_BLOQUES");
+						return v != nullptr && std::atoi(v) != 0;
+					}();
+					const uint64_t censo_start = censo ? __rdtsc() : 0;
 					const bool  cpu_written = buffer_cache.IsRegionCpuDirty(address, size) &&
 					                         !buffer_cache.IsRegionGpuModified(address, size);
 					if (cpu_written && size <= BufferCache::CACHING_PAGESIZE &&
@@ -2293,14 +2367,82 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						const auto tick        = m_context.GetCommandScheduler().CurrentTick();
 						const auto cpu         = buffer_cache.CpuModificationEpoch(address, size); // (before the copy)
 						vk::DeviceAddress device = 0;
+						// (bloques juntos) =1 windows, =2 windows checked against a plain copy; (censo bloques) =1.
+						static const int juntos = [] {
+							const char* v = std::getenv("KYTY_BLOQUES_JUNTOS");
+							return v == nullptr ? 0 : std::atoi(v);
+						}();
+						uint64_t censo_copy = 0;
+						bool     censo_copied = false;
+						vk::DeviceAddress window_device = 0;
+						if (juntos != 0 && shared != nullptr && cpu != 0) {
+							for (const auto& w: table.ring_windows)
+								if (w.device != 0 && w.tick == tick && w.observation == observation && address >= w.base &&
+								    address + size <= w.base + w.size &&
+								    buffer_cache.CpuModificationEpoch(w.base, w.size) == w.cpu_epoch) {
+									window_device = w.device + (address - w.base);
+									break;
+								}
+						}
 						if (shared != nullptr && cpu != 0 && shared->address == address && shared->size == size &&
 						    shared->observation == observation && shared->tick == tick && shared->cpu_epoch == cpu) {
 							device = shared->device;
 							LiveCounters::Add(LiveCounters::TableRingShared);
 							LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
-						} else if (auto [mapped, offset] = upload.Map(size, 16, false);
+						} else if (window_device != 0 && juntos != 2) {
+							device = window_device;
+							BloquesJuntos::g.taken.fetch_add(1, std::memory_order_relaxed);
+							BloquesJuntos::MaybeReport();
+							LiveCounters::Add(LiveCounters::TableRingShared);
+							LiveCounters::Add(LiveCounters::TableRingSharedBytes, size);
+						} else if (const bool windowed = juntos != 0 && shared != nullptr && cpu != 0 && window_device == 0;
+						           windowed && [&] {
+							           // A window of the whole pages around the range plus the next page.
+							           const uint64_t base = address & ~uint64_t {4095};
+							           const uint64_t end  = ((address + size + 4095) & ~uint64_t {4095}) + 4096;
+							           if (end - base > 16384) return false;
+							           const uint64_t wepoch = buffer_cache.CpuModificationEpoch(base, end - base);
+							           if (wepoch == 0) return false;
+							           const uint64_t t0 = censo ? __rdtsc() : 0;
+							           auto [wmapped, woffset] = upload.Map(end - base, 16, false);
+							           if (wmapped == nullptr ||
+							               !Libs::LibKernel::Memory::TryReadBackingToHost(base, wmapped, end - base))
+								           return false;
+							           upload.Commit();
+							           if (censo) censo_copy = __rdtsc() - t0;
+							           censo_copied = true;
+							           const auto wdev = upload.BufferDeviceAddress() + woffset;
+							           table.ring_windows[table.ring_window_next++ % TableXpr::RingWindows] = {
+							               .base = base, .size = end - base, .observation = observation, .tick = tick,
+							               .cpu_epoch = wepoch, .device = wdev,
+							               .host = reinterpret_cast<const uint8_t*>(wmapped)};
+							           device = wdev + (address - base);
+							           BloquesJuntos::g.windows.fetch_add(1, std::memory_order_relaxed);
+							           BloquesJuntos::g.window_bytes.fetch_add(end - base, std::memory_order_relaxed);
+							           return true;
+						           }()) {
+							LiveCounters::Add(LiveCounters::TableRingCopies);
+							LiveCounters::Add(LiveCounters::TableRingBytes, size);
+							if (shared != nullptr)
+								*shared = {.address = address, .size = size, .observation = observation, .tick = tick,
+								           .cpu_epoch = cpu, .device = device};
+						} else if (const uint64_t t0 = censo ? __rdtsc() : 0; true)
+						if (auto [mapped, offset] = upload.Map(size, 16, false);
 						           mapped != nullptr && Libs::LibKernel::Memory::TryReadBackingToHost(address, mapped, size)) {
 							upload.Commit();
+							if (censo) censo_copy = __rdtsc() - t0;
+							censo_copied = true;
+							if (juntos == 2 && window_device != 0) {
+								// (=2) The window's bytes at the range against the copy just made: reads the ring's mapping.
+								BloquesJuntos::g.checked.fetch_add(1, std::memory_order_relaxed);
+								for (const auto& w: table.ring_windows)
+									if (w.device != 0 && window_device >= w.device && window_device < w.device + w.size) {
+										if (w.host != nullptr &&
+										    std::memcmp(w.host + (window_device - w.device), mapped, size) != 0)
+											BloquesJuntos::NoteMismatch(address, size);
+										break;
+									}
+							}
 							if (spec != nullptr) spec->NoteCleanRead(address, size);
 							device = upload.BufferDeviceAddress() + offset;
 							LiveCounters::Add(LiveCounters::TableRingCopies);
@@ -2313,6 +2455,24 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								           .tick        = tick,
 								           .cpu_epoch   = cpu,
 								           .device      = device};
+						}
+						if (censo && censo_copied) {
+							// (censo bloques) Inside the 4 KiB page, or the next, of an earlier copy of this submission and
+							// observation epoch whose tracker epoch held?
+							bool inside = false;
+							for (const auto& w: table.censo_windows)
+								if (w.size != 0 && w.tick == tick && w.observation == observation && address >= w.base &&
+								    address + size <= w.base + w.size &&
+								    buffer_cache.CpuModificationEpoch(w.base, w.size) == w.cpu_epoch) {
+									inside = true;
+									break;
+								}
+							const uint64_t base = address & ~uint64_t {4095};
+							const uint64_t end  = ((address + size + 4095) & ~uint64_t {4095}) + 4096;
+							table.censo_windows[table.censo_next++ % TableXpr::RingWindows] = {
+							    .base = base, .size = end - base, .observation = observation, .tick = tick,
+							    .cpu_epoch = buffer_cache.CpuModificationEpoch(base, end - base)};
+							BloquesJuntos::NoteCenso(inside, size, __rdtsc() - censo_start, censo_copy);
 						}
 						// (The V#'s later uses take it from its held entry.)
 						if (device != 0 && shared != nullptr && cpu != 0)
