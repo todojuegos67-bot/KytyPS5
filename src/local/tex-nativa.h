@@ -98,8 +98,38 @@ inline std::map<uint64_t, uint64_t>& Owned() { // inicio -> fin, disjuntos
 	static std::map<uint64_t, uint64_t> m;
 	return m;
 }
+// (WB-EPOCA) Registro de cambios del registro "solo en la GPU": cada AddOwned/RemoveOwned (liberacion del juego por
+// unmap 0x7f9f70 op 2, free 0x802f90, aviso kRamWrite, trozo nuevo) apunta [b, e) con una epoca creciente. Una
+// descarga VRAM -> RAM (NativeRestoreBeforeDelete) toma la epoca al mirar sus rangos y, ANTES de escribir y bajo
+// OwnedMutex, descarta cualquier parte tocada despues: nunca escribe bytes viejos sobre memoria liberada o reutilizada
+// (crash 20261126-203637: write-back 22 ms despues de que el juego reutilizara 0x106c060000 -> vtable pisada).
+struct Cambio {
+	uint64_t b = 0, e = 0, epoca = 0;
+};
+constexpr size_t kCambiosN = 4096;
+inline Cambio    g_cambios[kCambiosN] {};
+inline uint64_t  g_epoca = 0; // bajo OwnedMutex
+inline std::atomic<uint64_t> c_wb_descartado_bytes {0}, c_wb_descartado_n {0};
+inline void ApuntarCambioLocked(uint64_t b, uint64_t e) {
+	const uint64_t ep        = ++g_epoca;
+	g_cambios[ep % kCambiosN] = Cambio {b, e, ep};
+}
+// Bajo OwnedMutex: [b, e) tocado despues de la epoca 'desde'? Sin historial suficiente: si (conservador).
+inline bool TocadoDesdeLocked(uint64_t b, uint64_t e, uint64_t desde) {
+	if (g_epoca - desde >= kCambiosN) return true;
+	for (uint64_t ep = desde + 1; ep <= g_epoca; ep++) {
+		const auto& c = g_cambios[ep % kCambiosN];
+		if (c.b < e && c.e > b) return true;
+	}
+	return false;
+}
+inline uint64_t EpocaActual() {
+	std::lock_guard<std::mutex> lock(OwnedMutex());
+	return g_epoca;
+}
 inline void AddOwned(uint64_t b, uint64_t e) {
 	std::lock_guard<std::mutex> lock(OwnedMutex());
+	ApuntarCambioLocked(b, e);
 	auto&                       m  = Owned();
 	auto                        it = m.upper_bound(b);
 	if (it != m.begin() && std::prev(it)->second >= b) --it;
@@ -117,6 +147,7 @@ inline uint64_t ForgetReleased(uint64_t b, uint64_t e, bool rebacked);
 inline void RemoveOwned(uint64_t b, uint64_t e) {
 	(void)ForgetReleased(b, e, false); // (N5) quien re-respalda llama antes ForgetReleased(b, e, true)
 	std::lock_guard<std::mutex> lock(OwnedMutex());
+	ApuntarCambioLocked(b, e);
 	auto&                       m  = Owned();
 	auto                        it = m.upper_bound(b);
 	if (it != m.begin() && std::prev(it)->second > b) --it;
@@ -132,10 +163,11 @@ inline void RemoveOwned(uint64_t b, uint64_t e) {
 	NativoCubierto::Descubrir(b, e - b, NativoCubierto::DTexturas);
 	for (const auto& k: keep) NativoCubierto::MarcarCubierto(k.first, k.second - k.first, NativoCubierto::DTexturas);
 }
-inline void OwnedIn(uint64_t b, uint64_t e, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+inline void OwnedIn(uint64_t b, uint64_t e, std::vector<std::pair<uint64_t, uint64_t>>& out, uint64_t* epoca = nullptr) {
 	Coste coste(kCQuery); // (N2+N3f)
 	out.clear();
 	std::lock_guard<std::mutex> lock(OwnedMutex());
+	if (epoca != nullptr) *epoca = g_epoca;
 	auto&                       m  = Owned();
 	auto                        it = m.upper_bound(b);
 	if (it != m.begin() && std::prev(it)->second > b) --it;
@@ -546,6 +578,9 @@ inline void MaybeLog() {
 	            static_cast<unsigned long long>(c_restored_bytes.load() >> 20u),
 	            static_cast<unsigned long long>(c_lost_bytes.load() >> 20u),
 	            static_cast<unsigned long long>(c_unbound_fallback.load() >> 20u));
+	std::printf("[tex-nativa] write-back descartado por liberacion %llu (%llu MB)\n",
+	            static_cast<unsigned long long>(c_wb_descartado_n.load()),
+	            static_cast<unsigned long long>(c_wb_descartado_bytes.load() >> 20u));
 	{
 		const uint64_t all = c_chunk_all_bytes.load(), dir = c_direct_bytes.load();
 		std::printf("[tex-nativa] cobertura directa a VRAM %.1f %% (%llu de %llu MB de trozos de 0x901459 sin pasar por la "

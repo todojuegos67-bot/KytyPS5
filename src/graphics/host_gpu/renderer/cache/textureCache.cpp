@@ -1200,8 +1200,10 @@ static std::unordered_map<uint64_t, std::vector<ImageId>>& NativeByBase() {
 // se puede descargar (grabador / operacion diferida): ya fuera del registro, su imagen de Vulkan sigue viva aqui hasta que
 // NativeRingCollect (hilo de render, antes de un draw) recupera sus bytes a la RAM y la retira. Antes se perdian
 // (RemoveOwned sin copia: textura vieja o corrupta al recrearla). Bajo m_lock.
-static std::vector<ImageId>& NativeRestoreLater() {
-	static std::vector<ImageId> v;
+// (WB-EPOCA) Con la epoca del registro al sacarla del registro: lo que cambie despues (liberado, reutilizado o de otra
+// textura nueva en la misma memoria) no se escribe con sus bytes viejos.
+static std::vector<std::pair<ImageId, uint64_t>>& NativeRestoreLater() {
+	static std::vector<std::pair<ImageId, uint64_t>> v;
 	return v;
 }
 static std::atomic<bool>     g_native_restore_later {false};
@@ -1314,7 +1316,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		if ((CommandScheduler::ThreadRecorder() != nullptr || CommandScheduler::InDeferredOperation()) && !image->depth_id &&
 		    TexNativa::AnyOwned(image->info.data.address, image->info.data.End())) {
 			if (DetachImage(id)) {
-				NativeRestoreLater().push_back(id);
+				NativeRestoreLater().emplace_back(id, TexNativa::EpocaActual());
 				TexNativa::c_later_n.fetch_add(1, std::memory_order_relaxed);
 				g_native_restore_later.store(true, std::memory_order_release);
 			}
@@ -2631,7 +2633,7 @@ void TextureCache::ParkImage(ImageId id, uint64_t keep) {
 	                                              TexNativa::AnyOwned(native->info.data.address, native->info.data.End())) {
 		if (!NativeRestoreBeforeDelete(*native, true)) {
 			if (DetachImage(id)) {
-				NativeRestoreLater().push_back(id);
+				NativeRestoreLater().emplace_back(id, TexNativa::EpocaActual());
 				TexNativa::c_later_n.fetch_add(1, std::memory_order_relaxed);
 				g_native_restore_later.store(true, std::memory_order_release);
 			}
@@ -7515,15 +7517,15 @@ void TextureCache::NativeRingCollect() {
 	    CommandScheduler::InDeferredOperation())
 		return;
 	std::scoped_lock lock {m_lock};
-	std::vector<ImageId> todo;
+	std::vector<std::pair<ImageId, uint64_t>> todo;
 	todo.swap(NativeRestoreLater());
 	g_native_restore_later.store(false, std::memory_order_release);
-	for (const auto id: todo) {
+	for (const auto& [id, desde]: todo) {
 		auto* image = m_slot_images.try_get(id);
 		if (image == nullptr || image->registered) continue; // (registrada otra vez: TakeParkedImage no la ve, no deberia)
 		const uint64_t base = image->info.data.address, size = image->info.data.size;
 		// Descarga de su imagen de Vulkan (viva: aun sin retirar). Sin keep_on_fail: si no se puede, se cuenta perdida.
-		if (NativeRestoreBeforeDelete(*image, false)) TexNativa::c_later_ok.fetch_add(1, std::memory_order_relaxed);
+		if (NativeRestoreBeforeDelete(*image, false, desde)) TexNativa::c_later_ok.fetch_add(1, std::memory_order_relaxed);
 		// Las imagenes registradas despues en esa memoria creian esos bytes ya en su textura: sucias, de la RAM ya buena.
 		for (const auto other: FindImagesInRegion(base, size, false)) {
 			auto* owner = m_slot_images.try_get(other);
@@ -7536,11 +7538,13 @@ void TextureCache::NativeRingCollect() {
 	}
 }
 
-bool TextureCache::NativeRestoreBeforeDelete(Image& image, bool keep_on_fail) {
+bool TextureCache::NativeRestoreBeforeDelete(Image& image, bool keep_on_fail, uint64_t desde) {
 	const uint64_t base = image.info.data.address, end = image.info.data.End();
 	std::vector<std::pair<uint64_t, uint64_t>> owned;
-	TexNativa::OwnedIn(base, end, owned);
+	uint64_t                                   epoca = 0; // (WB-EPOCA)
+	TexNativa::OwnedIn(base, end, owned, &epoca);
 	if (owned.empty()) return true;
+	if (desde < epoca) epoca = desde; // (WB-EPOCA) imagen sacada antes del registro: cuenta desde entonces
 	uint64_t bytes = 0;
 	for (const auto& [b, e]: owned) bytes += e - b;
 	const auto lost = [&]() {
@@ -7576,9 +7580,26 @@ bool TextureCache::NativeRestoreBeforeDelete(Image& image, bool keep_on_fail) {
 	m_scheduler.FlushAndWait();
 	download.Invalidate(offset, image.info.data.size);
 	// Solo los rangos "solo en la GPU" (el resto de la imagen ya estaba en la RAM).
-	for (const auto& [b, e]: owned) LibKernel::Memory::WriteBacking(b, mapped + (b - base), e - b, "tex-nativa");
-	(void)TexNativa::ForgetReleased(base, end, true); // (N5) bytes de la VRAM escritos: respaldo fisico otra vez
-	TexNativa::RemoveOwned(base, end);
+	// (WB-EPOCA) Bajo OwnedMutex (el free 0x802f90 y el unmap esperan): solo lo que nadie libero/reutilizo desde OwnedIn.
+	// Lo descartado es ya de quien lo libero o reutilizo: ni se escribe ni se quita del registro (una textura nueva en
+	// esa memoria conserva sus rangos "solo en la GPU").
+	std::vector<std::pair<uint64_t, uint64_t>> escritos;
+	{
+		std::lock_guard<std::mutex> olock(TexNativa::OwnedMutex());
+		for (const auto& [b, e]: owned) {
+			if (TexNativa::TocadoDesdeLocked(b, e, epoca)) {
+				TexNativa::c_wb_descartado_n.fetch_add(1, std::memory_order_relaxed);
+				TexNativa::c_wb_descartado_bytes.fetch_add(e - b, std::memory_order_relaxed);
+				continue;
+			}
+			LibKernel::Memory::WriteBacking(b, mapped + (b - base), e - b, "tex-nativa");
+			escritos.emplace_back(b, e);
+		}
+	}
+	for (const auto& [b, e]: escritos) {
+		(void)TexNativa::ForgetReleased(b, e, true); // (N5) bytes de la VRAM escritos: respaldo fisico otra vez
+		TexNativa::RemoveOwned(b, e);
+	}
 	TexNativa::c_restored_bytes.fetch_add(bytes, std::memory_order_relaxed);
 	return true;
 }

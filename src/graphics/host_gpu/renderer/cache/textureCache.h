@@ -385,7 +385,7 @@ private:
 	void               NativeGuardDirty(Image& image);
 	// (N2+N3c) Antes de borrar una imagen con bytes "solo en la GPU": se descargan y se escriben en la RAM emulada.
 	// (N2+N3g) keep_on_fail: si no se pueden recuperar los bytes "solo en la GPU", devuelve false y no los da por perdidos.
-	bool               NativeRestoreBeforeDelete(Image& image, bool keep_on_fail = false);
+	bool               NativeRestoreBeforeDelete(Image& image, bool keep_on_fail = false, uint64_t desde = ~uint64_t {0});
 	static constexpr size_t NativeEvictMax = 2; // (N2+N3g) expulsiones con descarga sincrona por pasada
 	// The dirty subresources over [window_begin, window_end) only (a whole one where it crosses an end).
 	[[nodiscard]] bool UploadImagePartial(Image& image, uint64_t window_begin = 0, uint64_t window_end = UINT64_MAX);
