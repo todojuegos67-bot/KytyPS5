@@ -228,19 +228,30 @@ inline Ring& TheRing() {
 	return r;
 }
 // Hilo del juego: hueco contiguo de n bytes (alineado a 256) o false. Bajo PMutex.
+inline std::atomic<uint64_t> c_ring_big_bytes {0}, c_ring_big_max {0}, c_ring_full_bytes {0}; // (COV4)
 inline bool RingAlloc(uint64_t n, uint64_t& offset, uint64_t& seq) {
 	auto& r = TheRing();
 	if (r.base.load(std::memory_order_acquire) == nullptr) return false;
 	n = (n + 255) & ~uint64_t {255};
-	if (n > r.size / 4) return false;
+	if (n > r.size / 4) {
+		c_ring_big_bytes.fetch_add(n, std::memory_order_relaxed); // (COV4) motivo de 'subida no posible'
+		if (n > c_ring_big_max.load(std::memory_order_relaxed)) c_ring_big_max.store(n, std::memory_order_relaxed);
+		return false;
+	}
 	if (r.spans.empty()) r.head = 0;
 	const uint64_t tail = r.spans.empty() ? 0 : r.spans.front().offset;
 	if (r.spans.empty() || r.head > tail || (r.head == tail && r.used == 0)) {
 		if (r.head + n <= r.size) offset = r.head;
 		else if (n <= tail) offset = 0;
-		else return false;
+		else {
+			c_ring_full_bytes.fetch_add(n, std::memory_order_relaxed);
+			return false;
+		}
 	} else {
-		if (r.head + n > tail) return false;
+		if (r.head + n > tail) {
+			c_ring_full_bytes.fetch_add(n, std::memory_order_relaxed);
+			return false;
+		}
 		offset = r.head;
 	}
 	seq = r.next_seq++;
@@ -352,6 +363,7 @@ inline uint64_t ForgetReleased(uint64_t b, uint64_t e, bool rebacked) {
 	return n;
 }
 inline std::atomic<uint64_t> c_direct_bytes {0}, c_fallback_bytes {0}, c_lost_bytes {0}, c_restored_bytes {0};
+inline std::atomic<uint64_t> c_unmap_kept {0}, c_unmap_del {0}; // (COV4) unmap op 2 sobre imagen nativa: parcial (se queda) / entera (borrada)
 inline std::atomic<uint64_t> c_unbound_fallback {0}; // (NEGRAS) trozos a un mip sin ligar: a la RAM en vez de perderse
 // (11-25) Trozos de 0x901330 que llegan a NativeChunkCopy: todos / CTexture no registrada / sin imagen todavia.
 inline std::atomic<uint64_t> c_chunk_all_bytes {0}, c_chunk_nonative_bytes {0}, c_chunk_noimage_bytes {0};
@@ -604,6 +616,12 @@ inline void MaybeLog() {
 	}
 	{
 		const uint64_t ln = c_create_lat_n.load(), nq = c_ni_queued_n.load(), nm = c_ni_made_n.load();
+		std::printf("[tex-nativa] (cov4) unmap sobre imagen nativa: parcial, imagen conservada %llu; entera, imagen borrada %llu; "
+		            "subida no posible por motivo: trozo mayor que 1/4 del anillo %llu MB (mayor %llu KB), anillo lleno %llu MB\n",
+		            static_cast<unsigned long long>(c_unmap_kept.load()), static_cast<unsigned long long>(c_unmap_del.load()),
+		            static_cast<unsigned long long>(c_ring_big_bytes.load() >> 20u),
+		            static_cast<unsigned long long>(c_ring_big_max.load() >> 10u),
+		            static_cast<unsigned long long>(c_ring_full_bytes.load() >> 20u));
 		std::printf("[tex-nativa] (cov1) por que llega sin imagen: aun en cola de creacion %llu trozos %llu MB, imagen ya creada "
 		            "(no encontrada o borrada) %llu trozos %llu MB, CTexture desconocida %llu MB; edad media del trozo desde "
 		            "0x8fe750 %.1f ms; latencia de creacion media %.2f ms (max %.1f ms, %llu)\n",

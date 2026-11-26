@@ -8107,6 +8107,18 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		// layer's memory at a time. The unmapped span becomes dirty (read back as it is when
 		// the image is next used) and stays unwatched until then; MapMemory marks it again
 		// when memory returns there.
+		// (COV4) Imagen nativa dispersa por mip (CTexture): el juego baja de trozo con op 2 (0x7f9f70) sobre los mips
+		// sobrantes y 0x901540 rehace el mip base del T#. SparseUpdate (arriba) ya desligo esos mips; la imagen se QUEDA.
+		// Antes caia en TryInvalidatePartial (falla: sus paginas no estan vigiladas, bytes solo en la GPU) y se borraba:
+		// log 20261126-211247: mips desligados 2713 ~ 2716 trozos 'imagen ya creada (no encontrada o borrada)' (2354 MB a
+		// la RAM) al volver a subir de trozo ~34 s despues. Sin marcar sucio: el rango ya no esta comprometido (nada que
+		// leer de la RAM) y el siguiente trozo de 0x901330 liga el mip y va directo.
+		if (TexNativa::On() && IsNativeSparse(*owner) && GuestGpu::IsGpuThread() &&
+		    (address > owner->info.data.address || address + size < owner->info.data.End())) {
+			TexNativa::c_unmap_kept.fetch_add(1, std::memory_order_relaxed);
+			++slow_partial;
+			continue;
+		}
 		if (address > owner->info.data.address || address + size < owner->info.data.End()) {
 			NoteDepthLayersDirtied(*owner, address & ~(TRACKER_PAGE_SIZE - 1), address + size, LayerDirtyByUnmap);
 			if (TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
@@ -8126,6 +8138,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner->IsGpuModified()) {
 			owner->ClearGpuModified();
 		}
+		if (TexNativa::On() && IsNativeSparse(*owner)) TexNativa::c_unmap_del.fetch_add(1, std::memory_order_relaxed); // (COV4)
 		DeleteImage(id);
 	}
 }
