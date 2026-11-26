@@ -7401,11 +7401,13 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 			UntrackImage(id, "tex-nativa");
 		}
 		TexNativa::c_fallback_bytes.fetch_add(size, std::memory_order_relaxed);
+		TexNativa::c_fallo[TexNativa::kFRamWrite].fetch_add(size, std::memory_order_relaxed); // (cov2)
 		return false;
 	}
 	const uint8_t*   data = TexNativa::TheRing().base.load(std::memory_order_acquire) + ring_offset;
 	// Sin subida directa posible: a la RAM emulada como siempre, y la imagen que haya ahi, sucia en ese rango.
-	const auto fallback = [&]() {
+	const auto fallback = [&](int why) {
+		TexNativa::c_fallo[why].fetch_add(size, std::memory_order_relaxed); // (cov2)
 		(void)TexNativa::ForgetReleased(address, end, true); // (N5)
 		TexNativa::RemoveOwned(address, end);
 		LibKernel::Memory::TryWriteBacking(address, data, size);
@@ -7420,7 +7422,7 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 		TexNativa::RingDone(seq, 0);
 		return false;
 	};
-	if (size == 0 || !GuestRange {address, size}.Valid()) return fallback();
+	if (size == 0 || !GuestRange {address, size}.Valid()) return fallback(TexNativa::kFRango);
 	Image* found = known;
 	// (11-25c) La imagen nativa de su CTexture, directa por la base del T# (sin FindImagesInRegion; y aunque otra imagen
 	// solape el rango, el trozo va a la de su CTexture).
@@ -7438,7 +7440,7 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 	}
 	if (found == nullptr) {
 		const auto images = FindImagesInRegion(address, size, false);
-		if (images.size() != 1) return fallback();
+		if (images.size() != 1) return fallback(TexNativa::kFSinImagen);
 		found = &m_slot_images[images.front()];
 	}
 	auto&       image = *found;
@@ -7446,17 +7448,17 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 	const auto  base  = info.data.address;
 	if (!SparseIsPerLevel(image.backing) || !image.registered || image.IsGpuModified() || image.IsBufferModified() ||
 	    image.IsStencilModified() || address < base || end > info.data.End() || info.IsVolume() || base % 256 != 0) {
-		return fallback();
+		return fallback(TexNativa::kFNoApta);
 	}
 	const auto binding = UploadBinding(image);
-	if (binding == BindingType::DepthTarget) return fallback();
+	if (binding == BindingType::DepthTarget) return fallback(TexNativa::kFProf);
 	auto& cached = m_partial_plans[image.serial];
 	if (cached.plan == nullptr || cached.binding != binding) {
 		cached.plan    = std::make_shared<TextureTransferPlan>(BuildTextureTransfer(image, binding, TransferDirection::Upload));
 		cached.binding = binding;
 	}
 	const auto& plan = *cached.plan;
-	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) return fallback();
+	if (!plan.valid || plan.swap_bgra16 || plan.tiles.empty() || plan.tiles.size() != plan.regions.size()) return fallback(TexNativa::kFPlan);
 	// Los subrecursos (tiles) dentro del trozo, enteros; su origen, los bytes del trozo.
 	std::vector<GpuTileInfo>         tiles;
 	std::vector<vk::BufferImageCopy> regions;
@@ -7466,7 +7468,7 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 		auto           region = plan.regions[index];
 		const uint64_t tb     = base + tile.tiled_offset, te = tb + tile.tiled_size;
 		if (te <= address || tb >= end) continue;
-		if (tb < address || te > end || region.bufferOffset < tile.linear_offset) return fallback(); // tile partido
+		if (tb < address || te > end || region.bufferOffset < tile.linear_offset) return fallback(TexNativa::kFPartido); // tile partido
 		const auto linear_offset = (linear_total + 255) & ~uint64_t {255};
 		region.bufferOffset      = linear_offset + (region.bufferOffset - tile.linear_offset);
 		tile.linear_offset       = linear_offset;
@@ -7475,15 +7477,15 @@ bool TextureCache::NativeUploadHostLocked(uint64_t address, uint64_t size, uint6
 		tiles.push_back(tile);
 		regions.push_back(region);
 	}
-	if (tiles.empty()) return fallback();
+	if (tiles.empty()) return fallback(TexNativa::kFSinTiles);
 	// (NEGRAS) Un mip sin memoria ligada (por debajo de MinLevel, desligado o sin memoria): la subida se perderia y el
 	// rango quedaria "solo en la GPU" con su RAM soltada = negro para siempre. A la RAM como siempre.
 	for (const auto& region: regions)
 		if (!SparseLevelBound(image.backing, region.imageSubresource.mipLevel)) {
 			TexNativa::c_unbound_fallback.fetch_add(size, std::memory_order_relaxed);
-			return fallback();
+			return fallback(TexNativa::kFSinLigar);
 		}
-	if (m_native_ring == nullptr) return fallback();
+	if (m_native_ring == nullptr) return fallback(TexNativa::kFSinAnillo);
 	// Los bytes ya estan en la memoria de subida (los copio el juego): destilado directo desde ahi.
 	m_native_ring->Flush(ring_offset, size);
 	const auto linear = m_tiler.Detile(m_native_ring->Handle(), ring_offset, size, linear_total, tiles, true);

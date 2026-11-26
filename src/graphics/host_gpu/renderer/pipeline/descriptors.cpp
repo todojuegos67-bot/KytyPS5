@@ -878,6 +878,56 @@ inline void PrePurge() {
 // un draw (ResolveTextureUncached con un recurso muestreado del tipo del T#), con <= 1,5 ms cada vez y una vez cada 4 ms
 // como mucho. La imagen queda creada y subida antes de su primer draw; nada mas cambia (la copia en RAM se mantiene).
 void RenderExecutor::TexAnticipadaDrain() {
+	// (cov2) Definidos al principio: el drenaje del anillo (abajo) tambien crea imagenes (trozos llegados sin ella).
+	// (11-25c, KYTY_TEX_NATIVA) T# de una CTexture -> su imagen, por el MISMO camino que un draw (misma clave). Devuelve la
+	// imagen o un id vacio.
+	const auto resolve_ctexture = [&](uint64_t tex, uint64_t* address_out, uint64_t* size_out) -> ImageId {
+		uint32_t dw[8];
+		if (!TexAnt::ReadTSharp(tex, dw)) return ImageId {};
+		ShaderRecompiler::IR::DescriptorValue value {};
+		for (int i = 0; i < 8; i++) value.dwords[static_cast<size_t>(i)] = dw[i];
+		value.dword_count     = 8;
+		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+		if (descriptor.IsNull()) return ImageId {};
+		ShaderRecompiler::IR::ImageResource resource {};
+		resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+		resource.numeric_class  = Prospero::SampledTextureNumericClass(descriptor.Format());
+		resource.read           = true;
+		using Dim               = ShaderRecompiler::Decoder::ImageDimension;
+		switch (descriptor.Type()) {
+			case Prospero::ImageType::kColor2D: resource.dimension = Dim::Dim2D; break;
+			case Prospero::ImageType::kColor2DArray: resource.dimension = Dim::Dim2DArray; break;
+			default: resource.dimension = Dim::Unknown; break; // las nativas son 2D de una capa (sparseImage.cpp)
+		}
+		if (resource.dimension == Dim::Unknown || resource.numeric_class == Prospero::TextureNumericClass::Unsupported)
+			return ImageId {};
+		TexAntRender::g_in_pre = true;
+		auto binding           = ResolveTextureUncached(resource, value);
+		TexAntRender::g_in_pre = false;
+		if (!binding.image_id || binding.desc.info.data.address == 0) return ImageId {};
+		*address_out = binding.desc.info.data.address;
+		*size_out    = binding.desc.info.data.size;
+		return binding.image_id;
+	};
+	// (11-25e) Presupuesto POR FOTOGRAMA (ventana de 16 ms) comun a la creacion urgente y a la anticipada. Antes cada una
+	// tenia 2 ms por LLAMADA y se llama antes de cada draw (~1700 por fotograma): en carga de zona sumaban decenas de ms en
+	// un fotograma (log 20261125-101818: render 2108 ms, max 35 ms una vuelta; SLOW Frame 51 -> 116 con queue_run/cpu
+	// ~22 ms). Ahora <= KYTY_TEX_NATIVA_PRE_US (por defecto 1500 us) por ventana; lo que no cabe sigue en su cola (los
+	// trozos que lleguen antes van por su camino normal: nada se pierde ni queda negro).
+	static const int64_t pre_budget_us = [] {
+		const char*     v = std::getenv("KYTY_TEX_NATIVA_PRE_US");
+		const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 1500;
+		return static_cast<int64_t>(n > 0 ? n : 1500);
+	}();
+	static int64_t pre_win_start = 0, pre_win_used = 0;
+	{
+		const int64_t now_w = TexAnt::NowUs();
+		if (now_w - pre_win_start >= 16000) {
+			pre_win_start = now_w;
+			pre_win_used  = 0;
+		}
+	}
+	const auto pre_left = [&]() -> int64_t { return pre_budget_us - pre_win_used; };
 	// (N2+N3, KYTY_TEX_NATIVA) Trozos que el juego copio a texturas nativas sin escribirlos en la RAM emulada: a su mip de
 	// la GPU (lo que queda, en la siguiente vuelta).
 	// (N2+N3c) Una vez cada 8 ms como mucho (esto corre antes de CADA draw: ~1700 por fotograma) y <= 1,5 ms cada vez.
@@ -902,7 +952,11 @@ void RenderExecutor::TexAnticipadaDrain() {
 			const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 500;
 			return static_cast<int64_t>(n > 0 ? n : 500);
 		}();
-		for (int k = 0; k < 64 && TexNativa::g_pending.load(std::memory_order_acquire) && TexAnt::NowUs() - t0 < native_budget_us; k++) {
+		// (cov2) El tiempo de crear imagenes no cuenta en el tope de subida: va al presupuesto comun de creacion (pre_left).
+		int64_t create_us = 0;
+		for (int k = 0; k < 64 && TexNativa::g_pending.load(std::memory_order_acquire) &&
+		                TexAnt::NowUs() - t0 - create_us < native_budget_us;
+		     k++) {
 			TexNativa::Pending p;
 			{
 				std::lock_guard<std::mutex> lock(TexNativa::PMutex());
@@ -912,6 +966,42 @@ void RenderExecutor::TexAnticipadaDrain() {
 					break;
 				}
 				p = q.front();
+			}
+			// (cov2) Trozo llegado sin imagen: la de su CTexture se crea AHORA (dispersa: sin memoria) y el trozo va directo.
+			// Sin presupuesto de creacion en esta ventana: se queda primero en la cola (el anillo lo guarda; si se llena,
+			// los trozos nuevos van a la RAM como siempre).
+			if (p.tex != 0 && !TexDirecta::HasImage(p.dest, p.size)) {
+				if (pre_left() <= 0) break;
+				const int64_t tc      = TexAnt::NowUs();
+				uint64_t      address = 0, isize = 0;
+				const auto    id      = resolve_ctexture(p.tex, &address, &isize);
+				bool          native  = false;
+				if (id) {
+					TexAntRender::PrePut(cache, address, id);
+					TexNativa::MarkMade(p.tex);
+					if (auto* image = cache.TryGetImage(id); image != nullptr && cache.IsNativeSparse(*image)) native = true;
+				}
+				if (native) {
+					TexNativa::c_dif_made.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					// No creable (o densa): los trozos siguientes de esa base, a la RAM ya en el memcpy (sin pasar por aqui).
+					TexNativa::c_dif_fail.fetch_add(1, std::memory_order_relaxed);
+					if (p.base != 0) TexNativa::MarkBadBase(p.base);
+				}
+				const int64_t dt = TexAnt::NowUs() - tc;
+				create_us += dt;
+				pre_win_used += dt;
+				TexNativa::c_dif_us.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+				if (static_cast<uint64_t>(dt) > TexNativa::c_dif_max_us.load(std::memory_order_relaxed))
+					TexNativa::c_dif_max_us.store(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+			}
+			{
+				// Crear la imagen puede haber sacado trozos de la cola (NativeApplyPending al expulsar otra): se saca
+				// solo si el primero sigue siendo este; si no, se vuelve a mirar.
+				std::lock_guard<std::mutex> lock(TexNativa::PMutex());
+				auto&                       q = TexNativa::PQueue();
+				if (q.empty() || q.front().seq != p.seq || q.front().dest != p.dest || q.front().ring_offset != p.ring_offset)
+					continue;
 				q.pop_front();
 			}
 			TexNativa::Coste coste_up(TexNativa::kCUpload); // (N2+N3f)
@@ -967,55 +1057,6 @@ void RenderExecutor::TexAnticipadaDrain() {
 	TexAnt::InstallOnce();
 	TexAnt::MaybeLog();
 	TexNativa::MaybeLog();
-	// (11-25c, KYTY_TEX_NATIVA) T# de una CTexture -> su imagen, por el MISMO camino que un draw (misma clave). Devuelve la
-	// imagen o un id vacio.
-	const auto resolve_ctexture = [&](uint64_t tex, uint64_t* address_out, uint64_t* size_out) -> ImageId {
-		uint32_t dw[8];
-		if (!TexAnt::ReadTSharp(tex, dw)) return ImageId {};
-		ShaderRecompiler::IR::DescriptorValue value {};
-		for (int i = 0; i < 8; i++) value.dwords[static_cast<size_t>(i)] = dw[i];
-		value.dword_count     = 8;
-		const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-		if (descriptor.IsNull()) return ImageId {};
-		ShaderRecompiler::IR::ImageResource resource {};
-		resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
-		resource.numeric_class  = Prospero::SampledTextureNumericClass(descriptor.Format());
-		resource.read           = true;
-		using Dim               = ShaderRecompiler::Decoder::ImageDimension;
-		switch (descriptor.Type()) {
-			case Prospero::ImageType::kColor2D: resource.dimension = Dim::Dim2D; break;
-			case Prospero::ImageType::kColor2DArray: resource.dimension = Dim::Dim2DArray; break;
-			default: resource.dimension = Dim::Unknown; break; // las nativas son 2D de una capa (sparseImage.cpp)
-		}
-		if (resource.dimension == Dim::Unknown || resource.numeric_class == Prospero::TextureNumericClass::Unsupported)
-			return ImageId {};
-		TexAntRender::g_in_pre = true;
-		auto binding           = ResolveTextureUncached(resource, value);
-		TexAntRender::g_in_pre = false;
-		if (!binding.image_id || binding.desc.info.data.address == 0) return ImageId {};
-		*address_out = binding.desc.info.data.address;
-		*size_out    = binding.desc.info.data.size;
-		return binding.image_id;
-	};
-	// (11-25e) Presupuesto POR FOTOGRAMA (ventana de 16 ms) comun a la creacion urgente y a la anticipada. Antes cada una
-	// tenia 2 ms por LLAMADA y se llama antes de cada draw (~1700 por fotograma): en carga de zona sumaban decenas de ms en
-	// un fotograma (log 20261125-101818: render 2108 ms, max 35 ms una vuelta; SLOW Frame 51 -> 116 con queue_run/cpu
-	// ~22 ms). Ahora <= KYTY_TEX_NATIVA_PRE_US (por defecto 1500 us) por ventana; lo que no cabe sigue en su cola (los
-	// trozos que lleguen antes van por su camino normal: nada se pierde ni queda negro).
-	static const int64_t pre_budget_us = [] {
-		const char*     v = std::getenv("KYTY_TEX_NATIVA_PRE_US");
-		const long long n = v != nullptr ? std::strtoll(v, nullptr, 10) : 1500;
-		return static_cast<int64_t>(n > 0 ? n : 1500);
-	}();
-	static int64_t pre_win_start = 0, pre_win_used = 0;
-	{
-		const int64_t now_w = TexAnt::NowUs();
-		if (now_w - pre_win_start >= 16000) {
-			pre_win_start = now_w;
-			pre_win_used  = 0;
-		}
-	}
-	const auto pre_left = [&]() -> int64_t { return pre_budget_us - pre_win_used; };
 	// (11-25d) Creacion URGENTE (tex-nativa.h, Urgente): un trozo de 0x901330 espera en el hilo del juego a la imagen de SU
 	// CTexture. Se atiende en cada llamada (antes de cada draw), sin puerta de tiempo ni tope: cada peticion es una CTexture
 	// con un trozo ya en camino, y el hilo del juego esta parado hasta la respuesta.
