@@ -188,17 +188,8 @@ public:
 				break;
 			}
 
-			// LibAtrac9's bit reader peeks a few bytes past the frame it decodes; on the last frame of a buffer
-			// that read ran off the end of the input (a heap vector or the game's buffer) into an unmapped page
-			// (crash 0xC0000005 in UnpackFrame). The frame is copied into a zero-padded buffer of our own.
-			const size_t frame_bytes = std::min<size_t>(remaining_input, m_superframe_bytes_remain);
-			if (m_frame_buffer.size() < frame_bytes + AT9_READ_PAD) {
-				m_frame_buffer.resize(frame_bytes + AT9_READ_PAD);
-			}
-			std::memcpy(m_frame_buffer.data(), input_bytes + input_offset, frame_bytes);
-			std::memset(m_frame_buffer.data() + frame_bytes, 0, AT9_READ_PAD);
 			int       bytes_used = 0;
-			const int ret        = DecodeFrame(m_frame_buffer.data(), &bytes_used);
+			const int ret        = DecodeFrame(input_bytes + input_offset, &bytes_used);
 			if (ret != 0) {
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				result.internal_result = ret;
@@ -644,8 +635,6 @@ private:
 	uint32_t             m_num_frames              = 0;
 	Atrac9CodecInfo      m_codec_info {};
 	std::vector<uint8_t> m_pcm_buffer;
-	static constexpr size_t AT9_READ_PAD = 64;
-	std::vector<uint8_t> m_frame_buffer;
 	// A multichannel stream (At9ParseMultiConfig): a mono decoder per channel, the bytes each channel used of the
 	// superframe so far and its share of it, and one channel's frame before it is interleaved.
 	std::vector<void*>    m_channel_handles;
