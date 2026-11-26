@@ -274,7 +274,9 @@ bool GraphicContext::CreateAllocator() {
 	{
 		// (vram-budget) 32 MiB on a small video memory heap too: "free inside VMA blocks" was 500-655 MiB at 64. VMA gives
 		// an allocation over half a block its own memory (dedicated), so images over 16 MiB still get theirs.
-		uint64_t block_mb = LocalPlatform::LowMemVram() || small_vram_heap ? 32 : 64;
+		// (VRAM-HUECO, 26/11) 32 MiB en todas las tarjetas: log 20261126-230735 (16 GB, bloques de 64) el hueco dentro de
+		// los bloques subia 95 -> 704 MiB en 11 min (132 -> 222 bloques) con lo usado plano. KYTY_VMA_BLOCK_MB=64 como antes.
+		uint64_t block_mb = 32;
 		if (const char* text = std::getenv("KYTY_VMA_BLOCK_MB"); text != nullptr && std::strtoull(text, nullptr, 10) > 0)
 			block_mb = std::strtoull(text, nullptr, 10);
 		info.preferredLargeHeapBlockSize = block_mb << 20u;
@@ -366,7 +368,9 @@ bool GraphicContext::CreateAllocator() {
 	// The game buffers' pool (graphicContext.h): VMA's device-local type for them, VMA's block sizes (dedicated memory
 	// for big ones, as in the default pools).
 	if (const char* defrag = std::getenv("KYTY_BUFFER_DEFRAG");
-	    defrag == nullptr ? small_video_memory : std::strcmp(defrag, "0") != 0) {
+	    defrag == nullptr || std::strcmp(defrag, "0") != 0) {
+		// (VRAM-HUECO, 26/11) En todas las tarjetas (antes solo < 12 GB): en 16 GB los ~2000-5000 bufferes del juego
+		// (1,2-1,7 GB) iban mezclados con las imagenes en los bloques comunes y dejaban huecos que nadie compactaba.
 		VkBufferCreateInfo buffer {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 		buffer.size  = uint64_t {64} << 10u;
 		buffer.usage = static_cast<VkBufferUsageFlags>(AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress);
