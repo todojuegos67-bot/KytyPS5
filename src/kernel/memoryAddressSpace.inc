@@ -5533,7 +5533,7 @@ private:
 #endif
 		}
 		// (TEX-GUARDA) Paginas "solo en la GPU" a las que esto dio escritura: sin ella otra vez (y si no, ya no son nuestras).
-		TexGuarda::AfterProtect(vaddr, size, (static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0,
+		::TexGuarda::AfterProtect(vaddr, size, (static_cast<uint32_t>(mode) & static_cast<uint32_t>(VirtualMemory::Mode::Write)) != 0,
 		                        VirtualMemory::IsExecute(mode));
 		return true;
 	}

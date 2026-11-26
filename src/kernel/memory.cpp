@@ -18,6 +18,7 @@
 #include "parpadeo6.h" // (SIN-VIGILAR-GANCHO: "asentados sin vigilante" en la linea [parpadeo6])
 #include "raiz-wb-guard.h" // (crash-ba2b1f: KYTY_RAIZ_WB_GUARD)
 #include "arena-dueno.h" // (ARENA-DUENO: KYTY_ARENA_DUENO=1, los [wb-guard] por instancia duena)
+#include "tex-guarda.h" // (TEX-GUARDA: incluido fuera del namespace; memoryAddressSpace.inc lo usa)
 
 #include "common/assert.h"
 #include "common/logging/log.h"
