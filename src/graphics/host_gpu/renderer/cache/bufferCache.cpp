@@ -5953,7 +5953,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr, value);
+	{
+		const Spec::ClearOriginScope origin(3); // (spec5)
+		(void)m_texture_cache.ClearMeta(vaddr, value);
+	}
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		Spec::NoteHostWrite(vaddr, size);

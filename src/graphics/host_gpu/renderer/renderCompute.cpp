@@ -738,6 +738,8 @@ void RenderExecutor::PredictDispatch(const HW::Shader& sh_ctx, uint32_t thread_g
 	const auto read = CatalogRead();
 	if (const auto found = learned.m_meta_clears.find(MetaClearKey(cs)); found != learned.m_meta_clears.end())
 		record.PredictClear(found->second);
+	else if (Spec::ClearGuess() && learned.m_meta_clear_shaders.contains(regs.data_addr))
+		record.PredictClear(0); // (spec5: any surface)
 }
 
 namespace {
@@ -1144,6 +1146,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			const auto read = CatalogRead();
 			if (const auto found = learned.m_meta_clears.find(MetaClearKey(sh_ctx.GetCs())); found != learned.m_meta_clears.end())
 				Spec::Current()->PredictClear(found->second);
+			else if (Spec::ClearGuess() && learned.m_meta_clear_shaders.contains(sh_ctx.GetCs().cs_regs.data_addr))
+				Spec::Current()->PredictClear(0); // (spec5: any surface)
 		}
 		return Spec::Refuse(m_dispatch_declined != nullptr ? m_dispatch_declined
 		                    : thread_dimensions            ? "dispatch (thread dimensions)"
@@ -1274,10 +1278,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (uint64_t cleared = 0; indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
-	                                                                          thread_group_y, thread_group_z, mode, cleared)) {
+	if (uint64_t cleared = 0; indirect_args == 0 && [&] {
+		    const Spec::ClearOriginScope origin(1); // (spec5)
+		    return TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y, thread_group_z, mode, cleared);
+	    }()) {
 		const auto write                            = CatalogWrite();
 		m_meta_clears[MetaClearKey(sh_ctx.GetCs())] = cleared;
+		m_meta_clear_shaders.insert(sh_ctx.GetCs().cs_regs.data_addr);
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "meta_clear";
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: meta clear", use_thread_dimensions);
 		ResetBindings();

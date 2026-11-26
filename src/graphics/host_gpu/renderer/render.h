@@ -524,6 +524,7 @@ private:
 	// speculation's hole of such a dispatch clears it (Spec::State::PredictClear). (Not the DCC fills
 	// TryConsumeComputeImageClear tracks: the normal path consumes those only where it can clear the image, 10-06.)
 	std::unordered_map<uint64_t, uint64_t> m_meta_clears;
+	std::unordered_set<uint64_t>           m_meta_clear_shaders; // (spec5: their shaders, Spec::ClearGuess)
 	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
 	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
 	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,

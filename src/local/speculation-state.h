@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <immintrin.h>
@@ -264,7 +265,8 @@ struct State {
 	[[nodiscard]] int KnownMeta(uint64_t address, uint32_t slice) noexcept {
 		MetaFact* latest = nullptr;
 		for (auto& fact: meta_facts)
-			if (fact.address == address && (fact.slice == slice || fact.slice == UINT32_MAX) && fact.first <= closed.size() &&
+			if ((fact.address == address || (fact.address == 0 && fact.cleared)) && (fact.slice == slice || fact.slice == UINT32_MAX) &&
+			    fact.first <= closed.size() &&
 			    (latest == nullptr || fact.first >= latest->first))
 				latest = &fact;
 		if (latest != nullptr) {
@@ -275,8 +277,8 @@ struct State {
 		for (const State* state = previous.load(); state != nullptr; state = state->previous.load()) {
 			const MetaFact* last = nullptr;
 			for (const auto& fact: state->meta_facts)
-				if (fact.address == address && (fact.slice == slice || fact.slice == UINT32_MAX) &&
-				    (last == nullptr || fact.first >= last->first))
+				if ((fact.address == address || (fact.address == 0 && fact.cleared)) &&
+				    (fact.slice == slice || fact.slice == UINT32_MAX) && (last == nullptr || fact.first >= last->first))
 					last = &fact;
 			if (last == nullptr) continue;
 			if (last->cleared) return 1;
@@ -463,6 +465,24 @@ inline thread_local State* t_state = nullptr;
 // memory writes of its processor (journaled, not made; one it cannot tell: written) and the surfaces its compute clears
 // clear (predicted). A speculation of a command buffer after it reads through it while it is not done.
 inline thread_local State* t_record = nullptr;
+// (spec5) Who clears surface metadata (TextureCache::ClearMeta notes it with the surface): 1 a compute meta clear, 2 a
+// draw's depth clear, 3 a CP fill; 0 other. The commit's "a surface cleared" stop names it.
+inline thread_local uint8_t t_clear_origin = 0;
+struct ClearOriginScope {
+	uint8_t saved;
+	explicit ClearOriginScope(uint8_t origin) noexcept: saved(t_clear_origin) { t_clear_origin = origin; }
+	~ClearOriginScope() { t_clear_origin = saved; }
+};
+// (spec5, KYTY_SPECULATE_CLEAR_GUESS=1, off by default) A dispatch hole of a shader that has cleared metadata before
+// with other user data (no entry of its key): every surface is taken as cleared from the next segment on (the draws
+// over metadata are holes that the normal path translates as it finds them), instead of the commit stopping.
+[[nodiscard]] inline bool ClearGuess() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_SPECULATE_CLEAR_GUESS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
 
 [[nodiscard]] inline State* Current() noexcept {
 	return t_state;

@@ -7957,6 +7957,12 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	return (found->second.clear_mask & (1u << slice)) != 0 || not_cleared();
 }
 
+uint8_t TextureCache::MetaClearOrigin(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	return found != m_surface_metas.end() ? found->second.clear_origin : 0;
+}
+
 bool TextureCache::ClearMeta(uint64_t address) {
 	if (!MetaFilterMayHold(address)) return false;
 	std::scoped_lock lock {m_lock};
@@ -7970,6 +7976,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	found->second.clear_mask        = UINT32_MAX;
 	found->second.fill_known        = false;
 	found->second.sample_depth_done = 0;
+	found->second.clear_origin      = static_cast<uint8_t>(Spec::t_clear_origin + (Spec::t_effect_source == Spec::EffectSource::Hole ? 4u : 0u));
 	m_meta_epoch.fetch_add(1, std::memory_order_release); // (a clear pending: cached answers ask again)
 	return true;
 }
@@ -7986,6 +7993,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	found->second.fill_value        = fill_value;
 	found->second.fill_known        = true;
 	found->second.sample_depth_done = 0;
+	found->second.clear_origin      = static_cast<uint8_t>(Spec::t_clear_origin + (Spec::t_effect_source == Spec::EffectSource::Hole ? 4u : 0u));
 	m_meta_epoch.fetch_add(1, std::memory_order_release);
 	return true;
 }

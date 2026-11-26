@@ -208,6 +208,7 @@ public:
 		return ImageStateEpoch() + m_resolution_epoch.load(std::memory_order_acquire) +
 		       m_meta_epoch.load(std::memory_order_acquire) + Image::CpuDirtyEpoch();
 	}
+	[[nodiscard]] uint8_t MetaClearOrigin(uint64_t address); // (spec5)
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr, bool* fill_known = nullptr);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
@@ -297,6 +298,7 @@ private:
 		// pending for the target bind's stencil (bit 0: one-layer surfaces only), and the clears applied (the line's count).
 		uint32_t sample_depth_done = 0;
 		uint64_t sample_clears     = 0;
+		uint8_t  clear_origin      = 0; // (spec5: Spec::t_clear_origin, +4 in a speculation's hole)
 	};
 
 	struct OverlapResult {

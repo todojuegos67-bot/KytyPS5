@@ -917,6 +917,16 @@ const char* Speculation::Changed(const Result& result, size_t index) const {
 	return nullptr;
 }
 
+// (spec5) The commit's "a surface cleared" stop by who cleared it (TextureCache::MetaClearOrigin).
+static const char* ClearedWhy(uint8_t origin) {
+	static constexpr const char* names[8] = {
+	    "commit: a surface cleared (other)",           "commit: a surface cleared (compute clear)",
+	    "commit: a surface cleared (depth clear draw)", "commit: a surface cleared (CP fill)",
+	    "commit: a surface cleared (other, in a hole)", "commit: a surface cleared (compute clear, in a hole)",
+	    "commit: a surface cleared (depth clear draw, in a hole)", "commit: a surface cleared (CP fill, in a hole)"};
+	return names[origin & 7u];
+}
+
 Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcessor& cp) {
 	auto&       scheduler = m_renderer.GetCommandScheduler();
 	const auto& state     = result.state;
@@ -947,7 +957,7 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		for (const auto& fact: state.meta_facts)
 			if (!fact.cleared && fact.first <= index && index <= fact.last &&
 			    m_renderer.GetTextureCache().IsMetaCleared(fact.address, fact.slice))
-				return ++m_stop_reasons["commit: a surface cleared"], Progress::Stopped;
+				return ++m_stop_reasons[ClearedWhy(m_renderer.GetTextureCache().MetaClearOrigin(fact.address))], Progress::Stopped;
 		{
 			const auto  from    = index == 0 ? Spec::Counts {} : state.closed[index - 1].end;
 			const auto& to      = state.closed[index].end;

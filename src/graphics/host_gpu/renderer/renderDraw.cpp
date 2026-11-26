@@ -838,6 +838,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		NativeRender::NoteTarget(depth.image_id.index, depth.image_id.generation, depth.desc.view_info.base_level,
 		                         depth.desc.view_info.base_layer, true); // (f5b: a verified pass's target)
 		const auto& metadata   = depth.desc.info.metadata;
+		const Spec::ClearOriginScope clear_origin(2); // (spec5)
 		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 		    !cache.ClearMeta(metadata.range.address)) {
 			EXIT("failed to acquire HTile metadata for a depth clear\n");
