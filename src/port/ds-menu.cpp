@@ -4430,35 +4430,52 @@ bool LButton(const char* text, ImVec2 at, ImVec2 size, bool primary, ImFont* fon
 
 // (11-13) Archivo de paginacion de hasta 100 GB en C: (PowerShell como administrador: Windows pide permiso). Evita que
 // un PC con poca RAM llegue al limite de memoria comprometida (un PC de 16 GB se reinicio ahi). Hace falta reiniciar.
-void SetBigPagefile() {
+void SetPagefile(int gb) {
 #if defined(_WIN32)
-	// A fixed 60 GB page file on C:, written where Windows keeps it (the PagingFiles registry value) with automatic
-	// management turned off; the window shows the value read back. Applied at the next restart.
-	static const char* script =
-	    "@echo off\r\n"
-	    "echo Archivo de paginacion fijo de 60 GB en C:\r\n"
-	    "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=False >nul 2>&1\r\n"
-	    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
-	    "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false} } catch {}\" >nul 2>&1\r\n"
-	    "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles "
-	    "/t REG_MULTI_SZ /d \"C:\\pagefile.sys 61440 61440\" /f\r\n"
-	    "echo.\r\n"
-	    "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles\r\n"
-	    "echo.\r\n"
-	    "echo Si arriba pone C:\\pagefile.sys 61440 61440 esta hecho. REINICIA EL PC para aplicarlo.\r\n"
-	    "pause\r\n";
+	// gb > 0: a fixed page file of that size on C:, written where Windows keeps it (the PagingFiles registry value)
+	// with automatic management off. gb == 0: back to Windows' default (system managed). Applied at the next restart.
+	std::string script = "@echo off\r\n";
+	if (gb > 0) {
+		const std::string mb = std::to_string(static_cast<long long>(gb) * 1024);
+		script += "echo Archivo de paginacion fijo de " + std::to_string(gb) + " GB en C:\r\n"
+		          "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=False >nul 2>&1\r\n"
+		          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
+		          "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false} } catch {}\" >nul 2>&1\r\n"
+		          "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles "
+		          "/t REG_MULTI_SZ /d \"C:\\pagefile.sys " + mb + " " + mb + "\" /f\r\n"
+		          "echo.\r\n"
+		          "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles\r\n"
+		          "echo.\r\n"
+		          "echo Si arriba pone C:\\pagefile.sys " + mb + " " + mb + " esta hecho. REINICIA EL PC para aplicarlo.\r\n";
+	} else {
+		script += "echo Archivo de paginacion: el de Windows por defecto (lo gestiona Windows)\r\n"
+		          "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=True >nul 2>&1\r\n"
+		          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
+		          "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$true} } catch {}\" >nul 2>&1\r\n"
+		          "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles "
+		          "/t REG_MULTI_SZ /d \"?:\\pagefile.sys\" /f\r\n"
+		          "echo.\r\n"
+		          "reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v PagingFiles\r\n"
+		          "echo.\r\n"
+		          "echo Si arriba pone ?:\\pagefile.sys esta hecho. REINICIA EL PC para aplicarlo.\r\n";
+	}
+	script += "pause\r\n";
 	char dir[MAX_PATH] = {};
 	if (GetTempPathA(MAX_PATH, dir) == 0) return;
-	const std::string path = std::string(dir) + "kyty-pagefile-60gb.cmd";
+	const std::string path = std::string(dir) + "kyty-pagefile.cmd";
 	if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
-		std::fwrite(script, 1, std::strlen(script), f);
+		std::fwrite(script.data(), 1, script.size(), f);
 		std::fclose(f);
 		// "runas": Windows asks for administrator permission (UAC) and runs the script elevated.
 		const std::string args = "/c \"" + path + "\"";
 		ShellExecuteA(nullptr, "runas", "cmd.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
 	}
+#else
+	(void)gb;
 #endif
 }
+
+void SetBigPagefile() { SetPagefile(60); }
 
 // Whether the 60 GB page file is already written in the registry (then only a restart is missing).
 static bool PagefileConfigured() {
@@ -4467,7 +4484,7 @@ static bool PagefileConfigured() {
 	DWORD size        = sizeof(value) - 2;
 	if (RegGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
 	                 "PagingFiles", RRF_RT_REG_MULTI_SZ, nullptr, value, &size) == ERROR_SUCCESS) {
-		return std::strstr(value, "61440") != nullptr;
+		return std::strstr(value, "C:\\pagefile.sys ") != nullptr && std::strstr(value, "C:\\pagefile.sys 0 0") == nullptr;
 	}
 #endif
 	return false;
@@ -4793,10 +4810,28 @@ void LauncherPerformance(Settings& s) {
 	BoxBegin("Rendimiento / PC");
 	{
 		const float y = RowY();
-		if (LButton("Archivo de paginación de 60 GB", {g_lbox.at.x + U(12), y}, {U(396), U(32)}, false, g_font_semi, U(15),
-		            "Pone en el disco C: un archivo de paginación de 16 a 60 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie al quedarse sin memoria en equipos con poca RAM. Solo ocupa espacio cuando hace falta. Reinicia el PC después."))
-			SetBigPagefile();
-		RowEnd(y, 36);
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(6)});
+		ImGui::TextColored(kGold, "Archivo de paginación de Windows");
+		RowEnd(y, 30);
+		const float y1 = RowY();
+		if (LButton("Optimizado (60 GB)", {g_lbox.at.x + U(12), y1}, {U(196), U(32)}, false, g_font_semi, U(15),
+		            "Pone en el disco C: un archivo de paginación fijo de 60 GB (Windows pedirá permiso de administrador). Evita que el PC se reinicie o el juego se cierre al quedarse sin memoria en equipos con poca RAM. Reinicia el PC después."))
+			SetPagefile(60);
+		if (LButton("Por defecto de Windows", {g_lbox.at.x + U(216), y1}, {U(196), U(32)}, false, g_font_semi, U(15),
+		            "Deja el archivo de paginación como viene en Windows (lo gestiona Windows solo). Windows pedirá permiso de administrador. Reinicia el PC después."))
+			SetPagefile(0);
+		RowEnd(y1, 36);
+		const float y2 = RowY();
+		static int custom_gb = 32;
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y2 + U(6)});
+		ImGui::TextUnformatted("El que quieras (GB):");
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(176), y2 + U(2)});
+		ImGui::SetNextItemWidth(U(110));
+		if (ImGui::InputInt("##pagefile_gb", &custom_gb, 4, 16)) custom_gb = std::clamp(custom_gb, 4, 256);
+		if (LButton("Aplicar", {g_lbox.at.x + U(296), y2}, {U(116), U(32)}, false, g_font_semi, U(15),
+		            "Pone en el disco C: un archivo de paginación fijo del tamaño elegido (4 a 256 GB). Windows pedirá permiso de administrador. Reinicia el PC después."))
+			SetPagefile(custom_gb);
+		RowEnd(y2, 36);
 		const uint64_t limit = CommitLimitGb();
 		if (limit != 0) {
 			const float ny = RowY();
@@ -4804,7 +4839,7 @@ void LauncherPerformance(Settings& s) {
 			const bool pending = limit < 64 && PagefileConfigured();
 			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, "Memoria total de Windows (RAM + paginación): %llu GB%s",
 			                   static_cast<unsigned long long>(limit),
-			                   limit >= 64 ? "" : pending ? "  -  hecho: REINICIA EL PC" : "  -  pulsa el botón y reinicia");
+			                   limit >= 64 ? "" : pending ? "  -  hecho: REINICIA EL PC" : "  -  elige una opción y reinicia");
 			RowEnd(ny, 24);
 		}
 	}
