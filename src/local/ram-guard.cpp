@@ -1775,6 +1775,12 @@ void Ram20Pass() {
 	static std::unordered_map<uint64_t, uint8_t> now_map, before_map;
 	static uint64_t                              have_pass = 0;
 	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> since;
+	// (ram20b) Blocks seen in the working set at some pass: only those are taken cold. A block never seen in RAM is
+	// (nearly always) committed and never written: reading it to the disk store faulted its demand-zero pages in, found
+	// them zero and reset them - no RAM won, and the 256 MiB budget of a pass spent on them (log 11-27 00:40: "en cero"
+	// +470 MiB every 10 s for minutes, "al disco" +0, with 7.6 GB of VirtualMemo committed). KYTY_RAM20_SOLO_VISTOS=0: as before.
+	static const bool                            seen_only = Env("KYTY_RAM20_SOLO_VISTOS") == nullptr || Env("KYTY_RAM20_SOLO_VISTOS")[0] != '0';
+	static std::unordered_set<uint64_t>          ever_in;
 	static std::vector<uint64_t>                 pairs(MaxPairs * 2);
 	static uint64_t                              cursor = 0;
 	const auto t0 = std::chrono::steady_clock::now();
@@ -1873,8 +1879,10 @@ void Ram20Pass() {
 		size_t in = 0;
 		for (size_t k = 0; k < PerBlock; k++) in += (entries[i * PerBlock + k].VirtualAttributes.Flags & 1u) != 0 ? 1 : 0;
 		const auto& c = cands[i];
+		if (in != 0 && seen_only) ever_in.insert(c.block);
 		if (in == 0) {
 			cold_out += Block;
+			if (seen_only && ever_in.count(c.block) == 0) continue; // (ram20b: never in RAM, nothing to win)
 			const auto found = since.find(c.block);
 			const auto first = found != since.end() ? found->second : now;
 			seen.emplace(c.block, first);
@@ -3418,8 +3426,15 @@ void Watch() {
 	            "of the GPU caches' images and buffers, read-only\n");
 	std::fflush(stdout);
 	auto& exchange = Get();
+	// (ram20b) Every 10 s with KYTY_RAM20 (a warm block needs two passes: taken from 20 s, not 60 s; the GPU thread's copy
+	// took 0.38-0.63 ms a pass, log 11-27 00:40); KYTY_GPU_RESIDENCY_S: another period.
+	static const int period_s = [] {
+		const char* v = std::getenv("KYTY_GPU_RESIDENCY_S");
+		if (v != nullptr && v[0] != '\0') return std::clamp(std::atoi(v), 2, 600);
+		return Ram20On() ? 10 : 30;
+	}();
 	for (uint64_t pass = 1;; pass++) {
-		std::this_thread::sleep_for(std::chrono::seconds(30));
+		std::this_thread::sleep_for(std::chrono::seconds(period_s));
 		std::vector<Range> ranges;
 		ranges.reserve(size_t {1} << 16u); // (here, not on the GPU thread)
 		std::vector<Range> stale;            // (a late answer to a pass not measured: freed outside the lock)

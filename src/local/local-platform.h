@@ -63,6 +63,10 @@ std::vector<std::pair<uint32_t, std::string>> ProcessThreads();
 uint64_t OpenKeptReadFile(const std::string& path, uint64_t* size);
 // Up to `size` bytes at `offset` of a kept file; the bytes read (0 at the end or on an error).
 uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t size);
+// (lectura-sin-cache, KYTY_LECTURA_SIN_CACHE=1) The smallest read call taken uncached (0: off), and ReadOpenFileAt
+// through an uncached twin of the kept file (no copy in the Windows file cache). 0: not read (read it the cached way).
+uint32_t UncachedReadMinBytes();
+uint32_t ReadOpenFileAtUncached(uint64_t file, uint64_t offset, void* buffer, uint32_t size);
 // A kept file read whole once, in the background (the first call for the path; Windows only): its later reads come from
 // the system file cache.
 void PrefetchKeptFile(const std::string& path);

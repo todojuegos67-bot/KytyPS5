@@ -1703,7 +1703,12 @@ static int ReadHostFileToGuestRaw(const std::string& host_path, uint64_t file_of
 		while (*bytes_read < readable) {
 			const auto request = static_cast<uint32_t>(std::min<uint64_t>(kept_buffer.size(), readable - *bytes_read));
 			const auto before  = Clock::now();
-			const auto read    = LocalPlatform::ReadOpenFileAt(kept, file_offset + *bytes_read, kept_buffer.data(), request);
+			// (lectura-sin-cache: a large read call through the uncached twin; 0 back: the cached way)
+			static const uint32_t uncached_min = LocalPlatform::UncachedReadMinBytes();
+			uint32_t              read         = 0;
+			if (uncached_min != 0 && readable >= uncached_min)
+				read = LocalPlatform::ReadOpenFileAtUncached(kept, file_offset + *bytes_read, kept_buffer.data(), request);
+			if (read == 0) read = LocalPlatform::ReadOpenFileAt(kept, file_offset + *bytes_read, kept_buffer.data(), request);
 			const auto after   = Clock::now();
 			reading += after - before;
 			if (read == 0) {

@@ -805,6 +805,101 @@ uint32_t ReadOpenFileAt(uint64_t file, uint64_t offset, void* buffer, uint32_t s
 	return got;
 }
 
+// (lectura-sin-cache) KYTY_LECTURA_SIN_CACHE=1 (off by default): the game's large reads (a call of at least
+// KYTY_LECTURA_SIN_CACHE_KB, default 1024: the level's banks and texture packs, read whole once into the game's own
+// memory - global_pages.ctxr 335 MB, player_foley.bnk 69 MB, obj_bg_general.bnk 49 MB, log 11-27 00:40 -) through a
+// second handle of the file with FILE_FLAG_NO_BUFFERING (ReOpenFile): no copy of them in the Windows file cache, which
+// held 1.7-2.1 GB in RAM all the run ("[ram+]" cache de archivos, ResidentSystemCachePage: system-wide, in use, not
+// standby) while the scratch files of the shaders were already uncached (KYTY_SPIRV_SIN_CACHE=1 ON in that log).
+// Sector-aligned reads into an aligned buffer of the thread's, then copied. The small pieces (audio streams, 16 KiB) keep
+// the cached handle and its read-ahead. Cost: a read of the same bytes again goes to the disk. 0 returned: the caller
+// reads through the cached handle as before.
+namespace {
+struct UncachedFiles {
+	std::mutex                             mutex;
+	std::unordered_map<uint64_t, HANDLE>   twin; // cached handle -> uncached handle (never closed, as the kept files)
+	std::atomic<uint64_t>                  bytes {0}, reads {0}, us {0}, failed {0}, printed {0};
+};
+UncachedFiles& Uncached() {
+	static auto* u = new UncachedFiles;
+	return *u;
+}
+} // namespace
+
+uint32_t UncachedReadMinBytes() {
+	static const uint32_t min = [] {
+		const char* on = std::getenv("KYTY_LECTURA_SIN_CACHE");
+		const bool  r  = on != nullptr && on[0] == '1';
+		uint32_t    kb = 1024;
+		if (const char* v = std::getenv("KYTY_LECTURA_SIN_CACHE_KB"); v != nullptr && v[0] != '\0')
+			kb = static_cast<uint32_t>(std::clamp<long>(std::strtol(v, nullptr, 10), 64, 1L << 20));
+		std::printf("[lectura-sin-cache] lecturas grandes del juego (>= %u KiB) sin cache de archivos de Windows: %s "
+		            "(KYTY_LECTURA_SIN_CACHE=1 lo enciende)\n",
+		            kb, r ? "ON" : "apagado");
+		std::fflush(stdout);
+		return r ? kb << 10u : 0u;
+	}();
+	return min;
+}
+
+uint32_t ReadOpenFileAtUncached(uint64_t file, uint64_t offset, void* buffer, uint32_t size) {
+	if (file == 0 || size == 0) return 0;
+	auto&  u    = Uncached();
+	HANDLE twin = INVALID_HANDLE_VALUE;
+	{
+		std::lock_guard lock(u.mutex);
+		auto found = u.twin.find(file);
+		if (found == u.twin.end()) {
+			HANDLE h = ReOpenFile(reinterpret_cast<HANDLE>(file), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+			                      FILE_FLAG_NO_BUFFERING);
+			found = u.twin.emplace(file, h).first; // (INVALID_HANDLE_VALUE kept too: not tried again)
+		}
+		twin = found->second;
+	}
+	if (twin == INVALID_HANDLE_VALUE) return 0;
+	constexpr uint64_t Sector = 4096, Bounce = (uint64_t {4} << 20u) + 2 * Sector;
+	thread_local uint8_t* bounce = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	if (bounce == nullptr) return 0;
+	const auto start = std::chrono::steady_clock::now();
+	GuestLazyCommit::Prefault(buffer, size);
+	uint32_t done = 0;
+	while (done < size) {
+		const uint64_t at    = offset + done;
+		const uint64_t begin = at & ~(Sector - 1);
+		const uint64_t want  = std::min<uint64_t>(size - done, Bounce - 2 * Sector);
+		const uint64_t end   = (at + want + Sector - 1) & ~(Sector - 1);
+		OVERLAPPED     o {};
+		o.Offset     = static_cast<DWORD>(begin);
+		o.OffsetHigh = static_cast<DWORD>(begin >> 32u);
+		DWORD got    = 0;
+		if (ReadFile(twin, bounce, static_cast<DWORD>(end - begin), &got, &o) == 0) {
+			if (GetLastError() != ERROR_HANDLE_EOF) u.failed.fetch_add(1, std::memory_order_relaxed);
+			break;
+		}
+		if (got <= at - begin) break; // (the end of the file)
+		const auto n = static_cast<uint32_t>(std::min<uint64_t>(want, got - (at - begin)));
+		std::memcpy(static_cast<uint8_t*>(buffer) + done, bounce + (at - begin), n);
+		done += n;
+		if (n < want) break; // (the end of the file)
+	}
+	const auto us = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	const auto total = u.bytes.fetch_add(done, std::memory_order_relaxed) + done;
+	const auto reads = u.reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto all   = u.us.fetch_add(us, std::memory_order_relaxed) + us;
+	// One line each 256 MiB read this way.
+	if (const auto step = total >> 28u; step > u.printed.load(std::memory_order_relaxed) &&
+	                                    u.printed.exchange(step, std::memory_order_relaxed) < step) {
+		std::printf("[lectura-sin-cache] %llu MiB leidos sin cache de Windows en %llu lecturas, %.1f ms en total (%.0f MB/s), "
+		            "fallidas %llu (leidas con cache)\n",
+		            static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(reads),
+		            static_cast<double>(all) / 1000.0, all == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(all),
+		            static_cast<unsigned long long>(u.failed.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+	return done;
+}
+
 void FollowKeptFiles(const std::string& recording, const std::string& root) {
 	static std::once_flag once;
 	std::call_once(once, [&] {
@@ -2914,6 +3009,14 @@ uint32_t ReadOpenFileAt(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/
 }
 
 void PrefetchKeptFile(const std::string& /*path*/) {}
+
+uint32_t UncachedReadMinBytes() {
+	return 0;
+}
+
+uint32_t ReadOpenFileAtUncached(uint64_t /*file*/, uint64_t /*offset*/, void* /*buffer*/, uint32_t /*size*/) {
+	return 0;
+}
 
 void FollowKeptFiles(const std::string& /*recording*/, const std::string& /*root*/) {}
 
