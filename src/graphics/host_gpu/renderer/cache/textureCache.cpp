@@ -8195,7 +8195,57 @@ void TextureCache::EraseRetired() {
 // ms frames, 2-3 times a map), where the image kept serves it or gives its layers on the GPU (HoldLayers). A kept
 // pool's watchers take a fault per MiB the game writes at most (partial dirty state). One last used before the game
 // entered its world (SceneTags) goes as before: the memory of the worlds left comes back.
+// (VRAM-FREE) Imagenes nativas de CTexture destruidas (ver TexNativa::OnEngineFree): fuera, con su VRAM al pool. La
+// CTexture ya no existe (el juego no la dibuja mas): nada que guardar, sus rangos "solo en la GPU" salen del registro
+// (no se escriben en la RAM: el juego ya puede usar esa memoria para otra cosa). Si una CTexture nueva se registro
+// despues en memoria que solapa, no se toca nada (sus bytes son de la nueva).
+void TextureCache::DropFreedNativeImages() {
+	if (!TexNativa::On() || !TexNativa::g_freed_pending.load(std::memory_order_acquire)) return;
+	std::vector<TexNativa::Liberado> q;
+	{
+		std::lock_guard<std::mutex> lock(TexNativa::FreedMutex());
+		q.swap(TexNativa::FreedQueue());
+		TexNativa::g_freed_pending.store(false, std::memory_order_release);
+	}
+	auto reg_seq = [](uint64_t base) {
+		std::lock_guard<std::mutex> lock(TexNativa::Mutex());
+		const auto it = TexNativa::RegSeq().find(base);
+		return it != TexNativa::RegSeq().end() ? it->second : uint64_t {0};
+	};
+	for (const auto& f: q) {
+		const auto images = FindImagesInRegion(f.ptr, 1, false);
+		for (const auto id: images) {
+			const auto* owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || !IsNativeSparse(*owner)) continue;
+			const uint64_t b = owner->info.data.address, e = owner->info.data.End();
+			if (reg_seq(b) > f.seq) {
+				TexNativa::c_freed_skip.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			bool newer = false;
+			for (const auto other: FindImagesInRegion(b, e - b, false)) {
+				const auto* o = m_slot_images.try_get(other);
+				if (other != id && o != nullptr && o->registered && IsNativeSparse(*o) && reg_seq(o->info.data.address) > f.seq) {
+					newer = true;
+					break;
+				}
+			}
+			if (newer) {
+				TexNativa::c_freed_skip.fetch_add(1, std::memory_order_relaxed);
+				continue;
+			}
+			const uint64_t bytes = e - b;
+			TexNativa::RemoveOwned(b, e);
+			if (owner->IsGpuModified()) m_slot_images[id].ClearGpuModified();
+			DeleteImage(id);
+			TexNativa::c_freed_imgs.fetch_add(1, std::memory_order_relaxed);
+			TexNativa::c_freed_mb.fetch_add(bytes >> 20u, std::memory_order_relaxed);
+		}
+	}
+}
+
 void TextureCache::RetireStaleImages(uint64_t tick) {
+	DropFreedNativeImages(); // (VRAM-FREE)
 	constexpr uint64_t RetireTicks    = 1200;
 	constexpr size_t   MaxRetirements = 16;
 	constexpr uint64_t NativeKeepTicks = 18000; // (COV3)
