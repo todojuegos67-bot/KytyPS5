@@ -445,9 +445,15 @@ inline void EraseLocked(Registry& r, std::map<uint64_t, Block>::iterator it) {
 		std::erase(o->second, it->first);
 		if (o->second.empty()) r.by_owner.erase(o);
 	}
+	const bool had_gpu = b.gpu != nullptr;
 	r.blocks.erase(it);
 	r.count.store(r.blocks.size(), std::memory_order_relaxed);
-	r.epoch.fetch_add(1, std::memory_order_release); // (MALLA-RAPIDA)
+	// (MALLA-TIRON, 11-26) Log 20261126-122830-166: 31992 mallas destruidas y solo 3569 con VkBuffer; cada baja movia
+	// `epoch` y vaciaba la cache del hilo de render (2.98 M usos + 3.6 M huecos por shared_mutex + mapa, compitiendo con
+	// el candado exclusivo de OnBuild/OnFree del hilo del juego: tiron1 carga/juego 17->29, otros 29->48). Un acierto
+	// cacheado solo apunta a bloques con VkBuffer, y una baja solo agranda huecos (los huecos cacheados siguen valiendo):
+	// sin VkBuffer no hay nada que invalidar.
+	if (had_gpu) r.epoch.fetch_add(1, std::memory_order_release); // (MALLA-RAPIDA)
 }
 
 // Restaura las paginas soltadas de un bloque desde su VkBuffer. Con ram_mutex tomado y SIN mutex (la escritura pasa por
@@ -897,7 +903,7 @@ inline void PrepareOne(uint64_t start, uint64_t gen) {
 			NativoCubierto::MarcarCubierto(start, end - start, NativoCubierto::DMallas);
 			BufMem::g_dedup_bytes.fetch_add(phi - plo, std::memory_order_relaxed);
 			BufMem::g_dedup_n.fetch_add(1, std::memory_order_relaxed);
-			r.epoch.fetch_add(1, std::memory_order_release);
+			// (MALLA-TIRON) Sin mover `epoch`: ningun acierto cacheado apunta a este bloque (aun sin VkBuffer).
 			return;
 		}
 	}
