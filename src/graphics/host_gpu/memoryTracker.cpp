@@ -557,6 +557,29 @@ void MemoryTracker::HotRedirty() noexcept {
 	                                  std::memory_order_relaxed);
 }
 
+// (PROT-MENOS7) See memoryTracker.h. One acquire load per listed region outside the range.
+void MemoryTracker::HotLazyListed(uint64_t vaddr, uint64_t size) noexcept {
+	if (!ProtMenos::V7() || !ProtMenos::LazyOn() || s_upload_owner != nullptr) return;
+	const size_t count = ProtMenos::g_region_count.load(std::memory_order_acquire);
+	if (count == 0) return;
+	ProtMenos::g_bda_lazy.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t gen = ProtMenos::g_submit_gen.load(std::memory_order_acquire);
+	for (size_t i = 0; i < count && i < ProtMenos::kMaxRegions; i++) {
+		auto* manager = static_cast<RegionManager*>(ProtMenos::g_regions[i].load(std::memory_order_acquire));
+		if (manager == nullptr || !manager->HasHot()) continue;
+		const uint64_t base = manager->GetCpuAddr();
+		if (size == 0) {
+			manager->HotLazy(gen);
+			continue;
+		}
+		const uint64_t end = vaddr + size;
+		if (end <= base || base + TRACKER_REGION_SIZE <= vaddr) continue;
+		const uint64_t from = vaddr > base ? vaddr - base : 0;
+		const uint64_t to   = end < base + TRACKER_REGION_SIZE ? end - base : TRACKER_REGION_SIZE;
+		manager->HotLazy(gen, from, to - from);
+	}
+}
+
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 void MemoryTracker::ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
                                           const char* operation) const noexcept {
@@ -637,7 +660,7 @@ static bool QueryRegion(RegionManager* manager, Query&& query) {
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		HotLazy(manager); // (PROT-MENOS6)
+		HotLazy(manager, offset, bytes); // (PROT-MENOS6/7)
 		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); });
 	});
 }
@@ -653,7 +676,7 @@ bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	// (Missing regions were never tracked: all CPU-dirty.)
 	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		HotLazy(manager); // (PROT-MENOS6)
+		HotLazy(manager, offset, bytes); // (PROT-MENOS6/7)
 		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu, true>(offset, bytes); });
 	});
 }

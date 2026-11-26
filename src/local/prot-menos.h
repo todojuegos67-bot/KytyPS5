@@ -40,6 +40,10 @@ uint64_t NativeTakeWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint6
 uint64_t NativePeekWritten(uint64_t vaddr, uint64_t size, uint64_t* pages, uint64_t max, bool* failed); // (PROT-MENOS4)
 } // namespace Libs::LibKernel::Memory
 
+namespace Loader::DemonsSoulsWriteAudit {
+[[nodiscard]] uint64_t StaleUsesTotal() noexcept; // (PROT-MENOS7: the stale check's total, KYTY_PROT_MENOS_V7=2)
+} // namespace Loader::DemonsSoulsWriteAudit
+
 namespace ProtMenos {
 
 constexpr uint64_t kWindowMs    = 500;
@@ -74,6 +78,43 @@ constexpr size_t   kMaxRegions  = 1u << 16u;
 	}();
 	return on;
 }
+
+// (PROT-MENOS7) KYTY_PROT_MENOS_V7 (default 0 = as PROT-MENOS6; =1 on). Log 20261127-002348-707 (KYTY_PROT_MENOS=1):
+// HotRedirty 3.5 ms/frame = full scans (8.8/frame x ~210 regions = ~1,560 peeks, ~1.4 ms) + lazy HotSteps (944/frame,
+// 2.07 ms, ~2.2 us each); 3,254 GetWriteWatch/frame (~1.06 us each); 16,384 hot pages (the cap) of which only ~1,230
+// written per frame (resubido 4.8 MiB/frame) and 129K clean-hot page looks/frame; promoted ~= demoted (thrash).
+// With it:
+//  1. Lazy check gated by the QUERY RANGE: a region's write watch is read for a submission only when the query's own
+//     pages hold clean hot pages (before: any query on the region). Exact: a query reads only its range.
+//  2. Lazy check on every thread (not only the GPU thread; never inside an upload callback) and before BDA reads
+//     (GpuResourceManager::PrepareBdaReadRanges / PrepareBda, MemoryTracker::HotLazyListed): every reader of tracker
+//     state is covered, so the full scan runs once per flip only (the burst of FUN_00a56270), not every 2 ms.
+//  3. Benefit-capped hot set: at each demotion pass (2 s) a region whose found writes x kFaultUs (fault + unprotect +
+//     reprotect spared) do not pay its write-watch calls x kCallUs goes back to the normal watch whole and is banned
+//     from promotion for kBanMs (no promote/demote thrash); otherwise only pages written in >= 2 of the 4 500 ms
+//     sub-windows (sustained writers) stay hot.
+constexpr uint64_t kSubMs   = 500;
+constexpr uint64_t kBanMs   = 10000;
+constexpr uint64_t kFaultUs = 5; // (fault round trip + VirtualProtect open + reprotect)
+constexpr uint64_t kCallUs  = 1; // (3.5 ms / 3,254 GetWriteWatch per frame, log 002348)
+[[nodiscard]] inline bool V7() noexcept {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_PROT_MENOS_V7");
+		const bool  y = On() && v != nullptr && (v[0] == '1' || v[0] == '2'); // (=2: + stale check)
+		if (On()) {
+			std::printf("[prot-menos] KYTY_PROT_MENOS_V7=%d: %s\n", y ? 1 : 0,
+			            y ? "lectura perezosa por rango, en todos los hilos y BDA; barrido completo 1 por frame; calientes por beneficio"
+			              : "como antes (PROT-MENOS6)");
+			std::fflush(stdout);
+		}
+		return y;
+	}();
+	return on;
+}
+inline std::atomic<uint64_t> g_gate_skip {0}; // (V7) lazy checks skipped: no clean hot page in the query range
+inline std::atomic<uint64_t> g_bda_lazy {0};  // (V7) BDA prepares that ran the lazy check
+inline std::atomic<uint64_t> g_banned {0};    // (V7) regions demoted whole for not paying
+inline std::atomic<uint64_t> g_other_thread {0}; // (V7) lazy HotSteps done off the GPU thread
 
 [[nodiscard]] inline uint64_t NowMs() noexcept {
 	return static_cast<uint64_t>(
@@ -154,7 +195,7 @@ inline thread_local bool     t_gpu_thread = false; // (set by HotRedirty: lazy c
 	static uint64_t last_us    = 0;
 	const uint64_t  frame      = g_frames.load(std::memory_order_relaxed);
 	const uint64_t  now        = NowUs();
-	if (frame == last_frame && now - last_us < GapUs()) return false;
+	if (frame == last_frame && (V7() || now - last_us < GapUs())) return false; // (PROT-MENOS7: once per flip)
 	last_frame = frame;
 	last_us    = now;
 	g_scans.fetch_add(1, std::memory_order_relaxed);
@@ -190,7 +231,7 @@ inline void Release(int64_t pages) noexcept { g_hot_pages.fetch_sub(pages, std::
 // (PROT-MENOS4) One thread (HotRedirty, GPU thread). Every 5 s, independent of the write audit.
 inline void Report() noexcept {
 	struct Snap {
-		uint64_t frames, calls, redirty_us, step_us, ww, peek, pages, cpu_writes, promoted, demoted, kept, late, failed, unchanged, scans, lazy, lazy_ns;
+		uint64_t frames, calls, redirty_us, step_us, ww, peek, pages, cpu_writes, promoted, demoted, kept, late, failed, unchanged, scans, lazy, lazy_ns, skip, other, bda, banned;
 	};
 	static uint64_t last_ms = 0;
 	static Snap     last {};
@@ -203,14 +244,15 @@ inline void Report() noexcept {
 	const auto ld = [](const std::atomic<uint64_t>& a) { return a.load(std::memory_order_relaxed); };
 	const Snap cur {ld(g_frames), ld(g_hot_calls), ld(g_redirty_us), ld(g_step_us), ld(g_ww_calls), ld(g_peek_calls),
 	                ld(g_redirty_pages), ld(g_cpu_writes), ld(g_promoted), ld(g_demoted), ld(g_kept), ld(g_ww_late),
-	                ld(g_ww_failed), ld(g_ww_unchanged), ld(g_scans), ld(g_lazy_calls), ld(g_lazy_ns)};
+	                ld(g_ww_failed), ld(g_ww_unchanged), ld(g_scans), ld(g_lazy_calls), ld(g_lazy_ns), ld(g_gate_skip),
+	                ld(g_other_thread), ld(g_bda_lazy), ld(g_banned)};
 	const double secs   = static_cast<double>(now - last_ms) / 1000.0;
 	const double frames = cur.frames > last.frames ? static_cast<double>(cur.frames - last.frames) : 1.0;
 	const auto   pf     = [&](uint64_t a, uint64_t b) { return static_cast<double>(a - b) / frames; };
 	std::printf("[prot-menos] %.1f s: %.0f frames, envios/frame %.1f, HotRedirty %.0f us/frame (HotStep %.0f), GetWriteWatch "
 	            "%.1f/frame (lecturas %.1f + reset %.1f, fallidas %llu), calientes %lld pag (%.1f MiB, %zu regiones), "
 	            "resubido %.2f MiB/frame, sin escribir %.0f pag/frame, fallos escritura CPU %.0f/s, promovidas %llu, "
-	            "degradadas %llu, mantenidas %llu, tardias %llu, ww=%d, lecturas completas/frame %.1f (gap %llu us), perezosas %.1f/frame %.0f us/frame (lazy=%d)\n",
+	            "degradadas %llu, mantenidas %llu, tardias %llu, ww=%d, lecturas completas/frame %.1f (gap %llu us), perezosas %.1f/frame %.0f us/frame (lazy=%d); v7=%d: saltadas por rango %.1f/frame, fuera del hilo GPU %.1f/frame, BDA %.1f/frame, regiones sin beneficio %llu\n",
 	            secs, frames, pf(cur.calls, last.calls), pf(cur.redirty_us, last.redirty_us), pf(cur.step_us, last.step_us),
 	            pf(cur.ww + cur.peek, last.ww + last.peek), pf(cur.peek, last.peek), pf(cur.ww, last.ww),
 	            static_cast<unsigned long long>(cur.failed - last.failed),
@@ -222,7 +264,12 @@ inline void Report() noexcept {
 	            static_cast<unsigned long long>(cur.demoted - last.demoted), static_cast<unsigned long long>(cur.kept - last.kept),
 	            static_cast<unsigned long long>(cur.late - last.late), WatchOn() ? 1 : 0,
 	            pf(cur.scans, last.scans), static_cast<unsigned long long>(GapUs()), pf(cur.lazy, last.lazy),
-	            pf(cur.lazy_ns, last.lazy_ns) / 1000.0, LazyOn() ? 1 : 0);
+	            pf(cur.lazy_ns, last.lazy_ns) / 1000.0, LazyOn() ? 1 : 0, V7() ? 1 : 0, pf(cur.skip, last.skip),
+	            pf(cur.other, last.other), pf(cur.bda, last.bda), static_cast<unsigned long long>(cur.banned - last.banned));
+	if (const char* v = std::getenv("KYTY_PROT_MENOS_V7"); v != nullptr && v[0] == '2')
+		std::printf("[prot-menos] COMPROBACION (V7=2): usos con datos viejos %llu desde el arranque (paginas sin vigilancia y "
+		            "calientes, muestreo 1/64; tiene que ser 0)\n",
+		            static_cast<unsigned long long>(::Loader::DemonsSoulsWriteAudit::StaleUsesTotal()));
 	std::fflush(stdout);
 	last    = cur;
 	last_ms = now;

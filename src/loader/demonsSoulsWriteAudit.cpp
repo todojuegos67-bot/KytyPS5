@@ -4551,6 +4551,17 @@ void Install(Program* program) {
 	g_start = std::chrono::steady_clock::now();
 	g_on.store(true, std::memory_order_release);
 	if (split != 0 && missing == 0) g_split.store(split, std::memory_order_release);
+	// (PROT-MENOS7) KYTY_PROT_MENOS=1 + KYTY_PROT_MENOS_V7=2: the stale check alone (no frame policy), for the hot pages.
+	if (const char* a = std::getenv("KYTY_PROT_MENOS"), *b = std::getenv("KYTY_PROT_MENOS_V7");
+	    a != nullptr && a[0] == '1' && b != nullptr && b[0] == '2' && g_clean == nullptr) {
+		try {
+			g_clean = new CleanPage[CleanSlots];
+		} catch (...) {
+		}
+		g_check_stale.store(g_clean != nullptr, std::memory_order_relaxed);
+		std::printf("[prot-menos] KYTY_PROT_MENOS_V7=2: COMPROBACION de datos viejos en paginas calientes (1 de cada 64; linea "
+		            "[nativo-check] / [write-frame]: usos viejos)\n");
+	}
 	// (policy6) The frame policy.
 	if (const int frame = FrameWanted(); frame != 0) {
 		if (!frame_ready) {

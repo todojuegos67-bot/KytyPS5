@@ -313,6 +313,11 @@ public:
 	// (MarkNoWatchDirty) or when it stops being no-watch (ClearNoWatch: a consumer asked for bytes of it no hook
 	// covers). GPU-dirty pages keep the usual rules. All of it under the region lock; HasNoWatch is a hint.
 	[[nodiscard]] bool HasNoWatch() const noexcept { return m_has_nowatch.load(std::memory_order_relaxed); }
+	// (PROT-MENOS7, region lock held or ReadShared) Some page of the range is hot.
+	[[nodiscard]] bool AnyHot(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return m_hot.AnyInRange(start, end);
+	}
 	// (Region lock held, or TrackingSpinLock::ReadShared.) Some page of the range is no-watch.
 	[[nodiscard]] bool AnyNoWatch(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -487,6 +492,7 @@ public:
 					const uint64_t        count  = ::Libs::LibKernel::Memory::NativePeekWritten(
                         m_cpu_addr + lo * TRACKER_PAGE_SIZE, (hi - lo) * TRACKER_PAGE_SIZE, peek, TRACKER_REGION_PAGES, &failed);
 					ProtMenos::g_peek_calls.fetch_add(1, std::memory_order_relaxed);
+					m_bn_calls++; // (PROT-MENOS7)
 					if (failed || count > TRACKER_REGION_PAGES) {
 						for (const auto [first, last]: runs) { // (as before: per run)
 							if (clean.AnyInRange(first, last)) TakeHotWritten(first, last, clean, add);
@@ -505,6 +511,13 @@ public:
 					RegionBits w = add & m_hot;
 					w &= ~m_hot_written;
 					m_hot_written ^= w; // (PROT-MENOS4: written in this demotion window; an OR)
+				}
+				if (ProtMenos::V7() && !add.None()) { // (PROT-MENOS7) benefit and sustained-writer bits
+					RegionBits w = add & m_hot;
+					m_bn_events += w.Count();
+					RegionBits& sub = HotSub(now_ms);
+					w &= ~sub;
+					sub ^= w; // (an OR)
 				}
 				RegionBits left = clean;
 				left &= ~add;
@@ -528,7 +541,36 @@ public:
 			RegionBits drop = m_hot & ~m_gpu_dirty; // (GPU-dirty ones stay hot: given back, they are writable)
 			// (PROT-MENOS4) With the write watch, the hot pages written in the last window stay hot (the per-frame
 			// ab46f0 fields): only the ones not written go back to the normal watch. Hot pages are only pages written.
-			if (watch) {
+			if (watch && ProtMenos::V7()) { // (PROT-MENOS7)
+				// Pays? Writes found (each a fault + unprotect + reprotect spared) against the write-watch calls made.
+				const bool pays = m_bn_events * ProtMenos::kFaultUs >= m_bn_calls * ProtMenos::kCallUs;
+				m_bn_events = m_bn_calls = 0;
+				if (!pays) {
+					m_hot_ban_until = now_ms + ProtMenos::kBanMs;
+					ProtMenos::g_banned.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					// Kept: written in >= 2 of the 4 sub-windows, or promoted in this pass (not seen long enough).
+					const uint64_t cur = now_ms / ProtMenos::kSubMs;
+					RegionBits     a[4];
+					for (int i = 0; i < 4; ++i)
+						if (m_hw_win[i] + 4 > cur) a[i] = m_hw[i];
+					RegionBits two;
+					for (int i = 0; i < 4; ++i)
+						for (int j = i + 1; j < 4; ++j) {
+							RegionBits t = a[i] & a[j];
+							t &= ~two;
+							two ^= t; // (an OR)
+						}
+					RegionBits n = m_hot_new & ~two;
+					two ^= n; // (an OR)
+					const RegionBits keep = drop & two;
+					if (!keep.None()) {
+						ProtMenos::g_kept.fetch_add(keep.Count(), std::memory_order_relaxed);
+						drop &= ~two;
+					}
+				}
+				m_hot_new.Clear();
+			} else if (watch) {
 				const RegionBits keep = drop & m_hot_written;
 				if (!keep.None()) {
 					ProtMenos::g_kept.fetch_add(keep.Count(), std::memory_order_relaxed);
@@ -550,13 +592,27 @@ public:
 	}
 	// (PROT-MENOS6, lock NOT held; GPU thread) Before a query of this submission reads the region's state: its clean hot
 	// pages' write watch read (HotStep) once per submission `gen`. Nothing to do (no hot page, none clean): two loads.
-	void HotLazy(uint64_t gen) {
+	// (PROT-MENOS7) `offset`/`bytes`: the query's range in the region; with V7 nothing is read unless that range holds
+	// a clean hot page (the query reads nothing else).
+	void HotLazy(uint64_t gen, uint64_t offset = 0, uint64_t bytes = TRACKER_REGION_SIZE) {
 		if (!m_has_hot.load(std::memory_order_acquire)) return;
 		if (!m_hot_clean.load(std::memory_order_acquire)) return; // (every hot page dirty already: uploaded as dirty)
 		if (m_hot_gen.load(std::memory_order_relaxed) == gen) return;
 		const auto       s0 = std::chrono::steady_clock::now();
 		std::scoped_lock guard(lock);
 		if (m_hot_gen.load(std::memory_order_relaxed) == gen) return;
+		if (ProtMenos::V7() && bytes != 0) {
+			const size_t first = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+			size_t       last  = static_cast<size_t>((offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE);
+			if (last > TRACKER_REGION_PAGES) last = TRACKER_REGION_PAGES;
+			RegionBits clean = m_hot & ~m_gpu_dirty;
+			clean &= ~m_cpu_dirty;
+			if (first >= last || !clean.AnyInRange(first, last)) {
+				ProtMenos::g_gate_skip.fetch_add(1, std::memory_order_relaxed);
+				return; // (gen left: another range of this region may still need it this submission)
+			}
+			if (!ProtMenos::t_gpu_thread) ProtMenos::g_other_thread.fetch_add(1, std::memory_order_relaxed);
+		}
 		m_hot_gen.store(gen, std::memory_order_relaxed);
 		const size_t pages = HotStep(ProtMenos::NowMs());
 		if (pages != 0) ProtMenos::g_redirty_pages.fetch_add(pages, std::memory_order_relaxed);
@@ -597,6 +653,7 @@ private:
 		const RegionBits promote = prot & m_seen;
 		m_seen ^= prot & ~m_seen; // (an OR)
 		if (promote.None()) return;
+		if (ProtMenos::V7() && now < m_hot_ban_until) return; // (PROT-MENOS7: did not pay; normal watch for kBanMs)
 		const auto want = static_cast<int64_t>(promote.Count());
 		if (!m_hot_listed) {
 			m_hot_listed = ProtMenos::ListRegion(this);
@@ -611,6 +668,7 @@ private:
 		if (!m_has_hot.load(std::memory_order_relaxed)) m_hot_since.store(now, std::memory_order_relaxed);
 		m_hot_written ^= promote & ~m_hot_written; // (PROT-MENOS4: just written; an OR)
 		m_hot ^= promote; // (disjoint: an OR)
+		m_hot_new ^= promote & ~m_hot_new; // (PROT-MENOS7; an OR)
 		m_has_hot.store(true, std::memory_order_release);
 		ProtMenos::g_promoted.fetch_add(static_cast<uint64_t>(want), std::memory_order_relaxed);
 	}
@@ -623,6 +681,7 @@ private:
 		const uint64_t        count  = ::Libs::LibKernel::Memory::NativeTakeWritten(
             m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE, found, TRACKER_REGION_PAGES, &failed);
 		ProtMenos::g_ww_calls.fetch_add(1, std::memory_order_relaxed);
+		m_bn_calls++; // (PROT-MENOS7)
 		if (failed || count > TRACKER_REGION_PAGES) {
 			ProtMenos::g_ww_failed.fetch_add(1, std::memory_order_relaxed);
 			RegionBits part(clean, first, last);
@@ -705,6 +764,15 @@ private:
 					runs++;
 				}
 				FrameNativo::NoteAvoided(m_cpu_addr + start * TRACKER_PAGE_SIZE, runs);
+				// (PROT-MENOS7, KYTY_PROT_MENOS_V7=2) The stale check (policy6) on hot pages too: hashed as they become clean.
+				if (::Loader::DemonsSoulsWriteAudit::CheckStaleOn()) {
+					for (const auto [first, last]: kept) {
+						for (size_t page = first; page < last; ++page) {
+							const uint64_t address = m_cpu_addr + page * TRACKER_PAGE_SIZE;
+							if (::Loader::DemonsSoulsWriteAudit::SampledPage(address)) ::Loader::DemonsSoulsWriteAudit::NoteNoWatchClean(address);
+						}
+					}
+				}
 				m_hot_clean.store(true, std::memory_order_release);
 				changed &= ~m_hot;
 			}
@@ -859,6 +927,20 @@ private:
 	RegionBits            m_hot;  // (never write-protected for the CPU; dirty again before each submission)
 	RegionBits            m_seen; // (write-protected pages written once in the window m_seen_window)
 	RegionBits            m_hot_written; // (PROT-MENOS4: hot pages found written since the last demotion pass)
+	// (PROT-MENOS7) Benefit of the region's hot pages since the last demotion pass, ban, sustained-writer bits.
+	uint64_t   m_bn_events = 0, m_bn_calls = 0, m_hot_ban_until = 0;
+	RegionBits m_hot_new; // (promoted since the last demotion pass)
+	RegionBits m_hw[4];   // (hot pages found written in the 500 ms sub-window m_hw_win[i], i = window % 4)
+	uint64_t   m_hw_win[4] {};
+	RegionBits& HotSub(uint64_t now_ms) {
+		const uint64_t w = now_ms / ProtMenos::kSubMs;
+		const auto     i = static_cast<size_t>(w % 4u);
+		if (m_hw_win[i] != w) {
+			m_hw[i].Clear();
+			m_hw_win[i] = w;
+		}
+		return m_hw[i];
+	}
 
 	void NoteVolatileClean() noexcept {
 		if (m_volatile.load(std::memory_order_relaxed)) m_volatile_clean.store(true, std::memory_order_release);

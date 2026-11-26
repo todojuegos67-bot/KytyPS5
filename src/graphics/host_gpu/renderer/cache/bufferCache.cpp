@@ -4906,7 +4906,9 @@ void BufferCache::PolicyCheckStale(uint64_t vaddr, uint64_t size, bool wide) con
 	uint64_t       pages   = 0;
 	for (uint64_t page = vaddr & ~(TRACKER_PAGE_SIZE - 1); page < end && pages < 16384; page += TRACKER_PAGE_SIZE, ++pages) {
 		if (!::Loader::DemonsSoulsWriteAudit::SampledPage(page) || !::Loader::DemonsSoulsWriteAudit::HasCleanHash(page)) continue;
-		const bool clean = tracker.AnyNoWatch(page, TRACKER_PAGE_SIZE) && !tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE);
+		// (PROT-MENOS7) Hot pages too (never write-protected: only the write watch read makes them dirty).
+		const bool clean = (tracker.AnyNoWatch(page, TRACKER_PAGE_SIZE) || tracker.AnyHot(page, TRACKER_PAGE_SIZE)) &&
+		                   !tracker.IsRegionCpuModified(page, TRACKER_PAGE_SIZE);
 		::Loader::DemonsSoulsWriteAudit::CheckNoWatchUse(page, clean, vaddr, end, wide || size > (uint64_t {1} << 20u));
 	}
 }

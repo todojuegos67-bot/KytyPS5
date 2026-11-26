@@ -1257,6 +1257,7 @@ bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges
 		return true;
 	}
 	Serie1NoteBda(m_scheduler, ranges.data(), ranges.size()); // (serie1)
+	for (const auto& range: ranges) MemoryTracker::HotLazyListed(range.address, range.size); // (PROT-MENOS7)
 	// (Before the lock: making buffers asks for it.)
 	m_buffer_cache.EnsureBdaReadable(ranges);
 	// (render3) KYTY_BDA_MEMO: the state the memo stands on, read after the buffers above were made (a buffer made
@@ -1393,6 +1394,7 @@ void GpuResourceManager::PrepareBda() {
 		return;
 	}
 	Serie1NoteBda(m_scheduler, nullptr, 0); // (serie1)
+	MemoryTracker::HotLazyListed(0, 0); // (PROT-MENOS7: every region with hot pages)
 	// Unknown shader addresses cannot prove disjointness from an in-flight readback.
 	LiveCounters::Add(LiveCounters::BdaFullSyncs);
 	m_buffer_cache.DrainGuestReadback();

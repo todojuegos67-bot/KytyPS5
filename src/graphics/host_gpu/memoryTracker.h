@@ -34,7 +34,7 @@ public:
 		if (!GuestRange{vaddr, size}.Valid() ||
 		    vaddr / TRACKER_REGION_SIZE != (vaddr + size - 1) / TRACKER_REGION_SIZE) return 0;
 		auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
-		if (manager != nullptr && s_upload_owner == nullptr) HotLazy(manager); // (PROT-MENOS6)
+		if (manager != nullptr && s_upload_owner == nullptr) HotLazy(manager, vaddr % TRACKER_REGION_SIZE, size); // (PROT-MENOS6/7)
 		return manager == nullptr ? 0 : manager->CpuModificationEpoch();
 	}
 	// (crash-ba2b1f) Crash reports: the trackers' bits of the page of `vaddr` (RegionManager::PeekPageUnlocked), no lock
@@ -152,7 +152,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
-		Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) { HotLazy(manager); }); // (PROT-MENOS6)
+		Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) { HotLazy(manager, offset, bytes); }); // (PROT-MENOS6/7)
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		// KYTY_ASYNC_REPROTECT: the pages this upload marks clean get their write protection
 		// from the upload worker, queued ahead of their copies (see TakeDeferredProtects).
@@ -220,6 +220,13 @@ public:
 		if (!GuestRange {vaddr, size}.Valid() || s_upload_owner == this) return false;
 		return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			return manager->HasNoWatch() && manager->lock.ReadShared([&] { return manager->AnyNoWatch(offset, bytes); });
+		});
+	}
+	// (PROT-MENOS7, KYTY_PROT_MENOS_V7=2 stale check) Some page of the range is hot.
+	[[nodiscard]] bool AnyHot(uint64_t vaddr, uint64_t size) {
+		if (!GuestRange {vaddr, size}.Valid() || s_upload_owner == this) return false;
+		return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			return manager->HasHot() && manager->lock.ReadShared([&] { return manager->AnyHot(offset, bytes); });
 		});
 	}
 	// The no-watch pages of the range CPU-dirty again (a hook announced a write); returns how many changed.
@@ -325,10 +332,21 @@ public:
 	static void HotRedirty() noexcept;
 	// (PROT-MENOS6) KYTY_PROT_MENOS lazy check: the region's clean hot pages read for this submission (RegionManager::
 	// HotLazy) before a GPU-thread query uses its state. No tracker lock may be held by the caller.
-	static void HotLazy(RegionManager* manager) noexcept {
-		if (!ProtMenos::t_gpu_thread || !ProtMenos::LazyOn()) return;
-		manager->HotLazy(ProtMenos::g_submit_gen.load(std::memory_order_acquire));
+	// (PROT-MENOS7) With V7: only when [offset, offset + bytes) of the region holds a clean hot page, and on every thread
+	// (never inside an upload callback: its region locks are held).
+	static void HotLazy(RegionManager* manager, uint64_t offset = 0, uint64_t bytes = TRACKER_REGION_SIZE) noexcept {
+		if (!ProtMenos::LazyOn()) return;
+		if (ProtMenos::V7()) {
+			if (s_upload_owner != nullptr) return;
+		} else if (!ProtMenos::t_gpu_thread) {
+			return;
+		}
+		manager->HotLazy(ProtMenos::g_submit_gen.load(std::memory_order_acquire), offset, bytes);
 	}
+	// (PROT-MENOS7) Before a BDA read of [vaddr, vaddr + size) (size 0: all guest memory): the lazy check over the
+	// regions with hot pages it touches (ProtMenos::g_regions), so their written hot pages are dirty (and their regions'
+	// BdaDirtyRegions bits set) before the BDA walk looks. Nothing without V7.
+	static void HotLazyListed(uint64_t vaddr, uint64_t size) noexcept;
 
 	struct DeferredProtect {
 		RegionManager* manager = nullptr;
