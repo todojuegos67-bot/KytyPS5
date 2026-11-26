@@ -92,6 +92,8 @@ public:
 	// (ram1b, KYTY_RAM_NATIVE_TEX) A sparse image (backing.sparse): its layers whose guest slices meet [begin, end) bound
 	// while committed, unbound when not; [gone_begin, gone_end) about to be unmapped (GPU thread; nothing for a dense one).
 	void SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin = 0, uint64_t gone_end = 0);
+	// (NEGRAS-LOG d) KYTY_TEX_NEGRAS_MAGENTA=1: patron visible en los mips nativos recien ligados.
+	void NegrasMagentaFill(uint32_t levels);
 	[[nodiscard]] bool IsSparse() const noexcept { return backing.sparse != nullptr; }
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] const Barriers& GetBarriers(vk::ImageLayout                      destination_layout,
@@ -421,6 +423,10 @@ public:
 	mutable std::atomic<bool> state_busy {false};
 	// RegisterImage calls on this object: a proof names one registration.
 	uint32_t         registrations      = 0;
+	// (NEGRAS-LOG) Origen de su creacion (TexNativa::t_neg_origen al registrarse por primera vez) y mips ya rellenados en
+	// magenta (KYTY_TEX_NEGRAS_MAGENTA).
+	uint8_t          neg_origen         = 0;
+	uint32_t         neg_magenta_levels = 0;
 	// TextureCache::ViewLevelBytes's last answer: the view's levels (base | count << 8; UINT32_MAX: none yet) and their
 	// bytes [level_begin, level_end) (level_end 0: the view needs the whole image).
 	mutable uint32_t level_view         = UINT32_MAX;

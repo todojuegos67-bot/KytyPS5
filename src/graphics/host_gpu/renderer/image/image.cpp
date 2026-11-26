@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/sparseImage.h" // (ram1b)
+#include "graphics/guest_gpu/graphicsRun.h" // (NEGRAS-LOG d: GuestGpu::IsGpuThread)
 #include "tex-nativa.h" // (N1, KYTY_TEX_NATIVA)
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex> // (RT-ALIAS-MEM)
 #include <set>   // (RT-ALIAS-MEM)
 #include <utility>
@@ -1398,10 +1400,55 @@ void Image::PrepareReuse(const ImageInfo& image_info) {
 	level_view          = UINT32_MAX;
 	level_begin         = 0;
 	level_end           = 0;
+	neg_magenta_levels  = 0; // (NEGRAS-LOG d)
 	++validity;
 	// (ram1b) A sparse image reused for another description (TakeParkedImage, the GPU thread): its layers bound as its
 	// new memory is committed.
 	if (IsSparse()) SparseUpdate(0, UINT64_MAX);
+}
+
+// (NEGRAS-LOG d, KYTY_TEX_NEGRAS_MAGENTA=1) Cada mip nativo que acaba de ligarse se rellena con un patron (magenta en
+// BC2/BC3, magenta y blanco en BC1; visible, no negro, en los demas BC). El ligado esta pendiente y la entrega que lleva esta copia lo espera
+// (SparseFlushPendingBinds). Lo que siga negro en pantalla no es "ligado sin datos": son ceros subidos o un mip sin ligar.
+void Image::NegrasMagentaFill(uint32_t levels) {
+	const uint32_t bpb = Prospero::BlockCompressedBytesPerBlock(info.guest_format);
+	if (bpb != 8 && bpb != 16) return;
+	if (!GuestGpu::IsGpuThread() || CommandScheduler::ThreadRecorder() != nullptr || CommandScheduler::InDeferredOperation())
+		return;
+	constexpr uint64_t kBytes = uint64_t {32} << 20u;
+	static Buffer*     pattern = nullptr; // (sin destruir: diagnostico)
+	if (pattern == nullptr) {
+		pattern = new Buffer(m_graphics, m_scheduler, MemoryUsage::Upload, 0, AllFlags, kBytes);
+		const auto map = pattern->Mapped();
+		if (map.size() < kBytes) return;
+		static const uint8_t b16[16] = {0xff, 0xff, 0, 0, 0, 0, 0, 0, 0x1f, 0xf8, 0x1f, 0xf8, 0, 0, 0, 0};
+		for (uint64_t at = 0; at < kBytes; at += 16) std::memcpy(map.data() + at, b16, 16);
+		pattern->Flush(0, kBytes);
+	}
+	if (pattern->Mapped().size() < kBytes) return;
+	std::vector<vk::BufferImageCopy> copies;
+	for (uint32_t level = 0; level < levels && level < 32; level++) {
+		const uint32_t bit   = 1u << level;
+		const bool     bound = SparseLevelBound(backing, level);
+		if (!bound) {
+			neg_magenta_levels &= ~bit;
+			continue;
+		}
+		if ((neg_magenta_levels & bit) != 0) continue;
+		const uint32_t w = std::max(info.extent.width >> level, 1u), h = std::max(info.extent.height >> level, 1u);
+		const uint64_t bytes = uint64_t {(w + 3u) / 4u} * ((h + 3u) / 4u) * bpb;
+		neg_magenta_levels |= bit;
+		if (bytes > kBytes) continue;
+		// (BC1, bloques de 8: el patron de 16 alterna bloques blancos y magenta; igual de visible.)
+		vk::BufferImageCopy c {};
+		c.bufferOffset      = 0;
+		c.bufferRowLength   = 0;
+		c.bufferImageHeight = 0;
+		c.imageSubresource  = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, level, 0, info.resources.layers};
+		c.imageExtent       = vk::Extent3D {w, h, 1};
+		copies.push_back(c);
+	}
+	if (!copies.empty()) Upload(copies, pattern->Handle(), 0, kBytes);
 }
 
 void Image::SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin, uint64_t gone_end) {
@@ -1416,6 +1463,7 @@ void Image::SparseUpdate(uint64_t begin, uint64_t end, uint64_t gone_begin, uint
 		}
 		SparseUpdateLevels(m_graphics, m_scheduler, backing, info.data.address, offsets, sizes, levels,
 		                   TexNativa::MinLevel(info.data.address), begin, end, gone_begin, gone_end);
+		if (TexNativa::NegrasMagenta()) NegrasMagentaFill(levels); // (NEGRAS-LOG d)
 		return;
 	}
 	const uint64_t stride = info.data.size / info.resources.layers;

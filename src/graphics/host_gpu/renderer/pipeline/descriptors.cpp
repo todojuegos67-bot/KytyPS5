@@ -1033,7 +1033,9 @@ void RenderExecutor::TexAnticipadaDrain() {
 		for (; done_u < urgent.size() && TexAnt::NowUs() - t0 < lim_u; done_u++) {
 			const auto& r       = urgent[done_u];
 			uint64_t    address = 0, size = 0;
+			TexNativa::t_neg_origen = 2; // (NEGRAS-LOG)
 			const auto  id      = resolve_ctexture(r->tex, &address, &size);
+			TexNativa::t_neg_origen = 0;
 			if (id) {
 				TexAntRender::PrePut(texture_cache, address, id);
 				TexNativa::c_pre_made.fetch_add(1, std::memory_order_relaxed);
@@ -1075,7 +1077,9 @@ void RenderExecutor::TexAnticipadaDrain() {
 			const int64_t lim_c = pre_left();
 			for (; done < todo.size() && TexAnt::NowUs() - t0 < lim_c; done++) {
 				uint64_t   address = 0, size = 0;
+				TexNativa::t_neg_origen = 1; // (NEGRAS-LOG)
 				const auto id      = resolve_ctexture(todo[done], &address, &size);
+				TexNativa::t_neg_origen = 0;
 				if (!id) {
 					TexNativa::c_pre_bad.fetch_add(1, std::memory_order_relaxed);
 					continue;

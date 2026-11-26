@@ -1236,8 +1236,28 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_start_epoch.store(epoch, std::memory_order_release);
 	}
 	TexDirecta::MarkImage(image.info.data.address, image.info.data.size, +1); // (etapa 2.1c) mapa sin bloqueo para el memcpy
-	if (TexNativa::On() && SparseIsPerLevel(image.backing) && TexNativa::IsNative(image.info.data.address))
-		NativeByBase()[image.info.data.address].push_back(id); // (11-25c) CTexture -> su imagen nativa
+	if (image.registrations == 0) image.neg_origen = TexNativa::t_neg_origen; // (NEGRAS-LOG)
+	if (TexNativa::On() && SparseIsPerLevel(image.backing) && TexNativa::IsNative(image.info.data.address)) {
+		auto& list = NativeByBase()[image.info.data.address];
+		list.push_back(id); // (11-25c) CTexture -> su imagen nativa
+		// (NEGRAS-LOG b) Dos imagenes nativas con la misma base: los trozos solo van a la mas reciente.
+		if (TexNativa::NegrasLog() && list.size() > 1 && TexNativa::NegrasLinea(1)) {
+			std::printf("[negra] doble-nativa base=0x%llx n=%zu:", static_cast<unsigned long long>(image.info.data.address),
+			            list.size());
+			for (const auto other: list) {
+				const auto* o = m_slot_images.try_get(other);
+				if (o == nullptr) continue;
+				std::printf(" {serial=%llu reg=%d origen=%s fmt=%u vk=%u %ux%u niveles=%u size=0x%llx}",
+				            static_cast<unsigned long long>(o->serial), (o->registered || other == id) ? 1 : 0,
+				            TexNativa::NegOrigen(other == id ? TexNativa::t_neg_origen : o->neg_origen),
+				            static_cast<uint32_t>(o->info.guest_format), static_cast<uint32_t>(o->info.pixel_format),
+				            o->info.extent.width, o->info.extent.height, o->info.resources.levels,
+				            static_cast<unsigned long long>(o->info.data.size));
+			}
+			std::printf("\n");
+			std::fflush(stdout);
+		}
+	}
 	image.registered = true;
 	++image.registrations;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -5406,6 +5426,24 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 		if (htile.slices != 0) ApplyHtileSampleClear(id, htile);
 	}
+	// (NEGRAS-LOG c) Vista del draw que incluye un mip nativo sin memoria ligada (se lee como cero = negro).
+	if (TexNativa::NegrasLog() && desc.type == BindingType::Texture && SparseIsPerLevel(image.backing)) {
+		const uint32_t first = desc.view_info.base_level;
+		const uint32_t last  = std::min(first + desc.view_info.level_count, image.info.resources.levels);
+		for (uint32_t level = first; level < last; level++) {
+			if (SparseLevelBound(image.backing, level)) continue;
+			static std::unordered_set<uint64_t> seen;
+			if (seen.size() < 100000 && seen.insert(image.serial << 5u | level).second && TexNativa::NegrasLinea(2)) {
+				std::printf("[negra] vista-sin-ligar base=0x%llx origen=%s fmt=%u %ux%u niveles=%u vista=%u+%u mip=%u "
+				            "nivel_fijado=%u\n",
+				            static_cast<unsigned long long>(image.info.data.address), TexNativa::NegOrigen(image.neg_origen),
+				            static_cast<uint32_t>(image.info.guest_format), image.info.extent.width,
+				            image.info.extent.height, image.info.resources.levels, first, desc.view_info.level_count, level,
+				            TexNativa::MinLevel(image.info.data.address));
+				std::fflush(stdout);
+			}
+		}
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -7243,6 +7281,36 @@ int TextureCache::DirectUploadRange(uint64_t address, uint64_t size, uint64_t /*
 
 void TextureCache::NativeGuardDirty(Image& image) {
 	NativeApplyPending(image); // (11-25) los trozos de su rango que aun esperan en el anillo, antes de usarla
+	// (NEGRAS-LOG a) Imagen no nativa sobre bytes "solo en la GPU": se sube de la RAM soltada (ceros).
+	if (TexNativa::NegrasLog() && TexNativa::On() && image.IsCpuDirty() && !SparseIsPerLevel(image.backing) &&
+	    TexNativa::AnyOwned(image.info.data.address, image.info.data.End())) {
+		static std::unordered_set<uint64_t> seen;
+		if (seen.size() < 100000 && seen.insert(image.serial).second && TexNativa::NegrasLinea(0)) {
+			std::vector<std::pair<uint64_t, uint64_t>> owned;
+			TexNativa::OwnedIn(image.info.data.address, image.info.data.End(), owned);
+			uint64_t ob = 0;
+			for (const auto& [b, e]: owned) ob += e - b;
+			std::printf("[negra] ajena addr=0x%llx size=0x%llx origen=%s fmt=%u vk=%u %ux%u niveles=%u capas=%u tile=%u "
+			            "disperso=%d buffer_mod=%d solo_gpu=%llu KB; nativas en su memoria:",
+			            static_cast<unsigned long long>(image.info.data.address),
+			            static_cast<unsigned long long>(image.info.data.size), TexNativa::NegOrigen(image.neg_origen),
+			            static_cast<uint32_t>(image.info.guest_format), static_cast<uint32_t>(image.info.pixel_format),
+			            image.info.extent.width, image.info.extent.height, image.info.resources.levels,
+			            image.info.resources.layers, static_cast<uint32_t>(image.info.tile_mode), image.IsSparse() ? 1 : 0,
+			            image.IsBufferModified() ? 1 : 0, static_cast<unsigned long long>(ob >> 10u));
+			for (const auto other: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+				const auto* o = m_slot_images.try_get(other);
+				if (o == nullptr || !SparseIsPerLevel(o->backing)) continue;
+				std::printf(" {base_ctexture=0x%llx origen=%s fmt=%u vk=%u %ux%u niveles=%u size=0x%llx}",
+				            static_cast<unsigned long long>(o->info.data.address), TexNativa::NegOrigen(o->neg_origen),
+				            static_cast<uint32_t>(o->info.guest_format), static_cast<uint32_t>(o->info.pixel_format),
+				            o->info.extent.width, o->info.extent.height, o->info.resources.levels,
+				            static_cast<unsigned long long>(o->info.data.size));
+			}
+			std::printf("\n");
+			std::fflush(stdout);
+		}
+	}
 	if (!TexNativa::On() || !image.IsCpuDirty() || image.IsBufferModified() || !SparseIsPerLevel(image.backing)) return;
 	const uint64_t base = image.info.data.address, end = image.info.data.End();
 	std::vector<std::pair<uint64_t, uint64_t>> owned;

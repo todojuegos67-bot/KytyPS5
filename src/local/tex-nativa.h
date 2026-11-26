@@ -673,4 +673,34 @@ inline void MaybeLog() {
 	std::fflush(stdout);
 }
 
+
+// (NEGRAS-LOG) Diagnostico de texturas negras, apagado por defecto (cero cambio de comportamiento):
+// KYTY_TEX_NEGRAS_LOG=1 escribe lineas "[negra] ..." (a) imagen no nativa sobre bytes "solo en la GPU", (b) dos imagenes
+// nativas con la misma base, (c) vista del draw que incluye un mip nativo sin memoria ligada. KYTY_TEX_NEGRAS_MAGENTA=1
+// rellena con un patron magenta cada mip nativo al ligarse (lo que se vea magenta = ligado sin datos; negro = ceros subidos).
+inline bool NegrasLog() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEX_NEGRAS_LOG");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+inline bool NegrasMagenta() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEX_NEGRAS_MAGENTA");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+// Origen de la creacion de la imagen en el hilo de render: 0 draw, 1 anticipada, 2 urgente.
+inline thread_local uint8_t t_neg_origen = 0;
+inline const char*          NegOrigen(uint8_t o) { return o == 1 ? "anticipada" : o == 2 ? "urgente" : "draw"; }
+// Tope de lineas por tipo (0 a, 1 b, 2 c, 3 d): true si se puede escribir otra.
+inline bool NegrasLinea(int kind) {
+	static std::atomic<uint32_t> n[4] {};
+	const uint32_t               k = n[kind].fetch_add(1, std::memory_order_relaxed);
+	if (k == 400) std::printf("[negra] tipo %d: mas de 400 lineas, el resto se omite\n", kind);
+	return k < 400;
+}
+
 } // namespace TexNativa
