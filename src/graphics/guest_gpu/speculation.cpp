@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "draw-state-observer.h"
@@ -319,7 +320,7 @@ bool Speculation::StatePass(const Job& job, uint64_t which) {
 	if (job.kind != Job::Kind::Graphics) return job.kind == Job::Kind::Flip; // (a flip preparation leaves the state as it is)
 	m_state->ResetDeCe();
 	m_state->SetFlip({});
-	m_state->SetChunking(ChunkWork);
+	m_state->SetChunking(ChunkWorkSize());
 	Pm4Execution execution;
 	for (;;) {
 		// A chunk from here: where it starts, and its record, which reads through the one before while that is not done.
@@ -937,7 +938,8 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (const char* why = Changed(result, index)) return ++m_stop_reasons[why], Progress::Stopped;
 		// (envio3) An image the work uses that a sweep found CPU-written since it was handed (logged as host writes by
 		// GpuResourceManager::InvalidateCpuWrittenPages): its upload is the GPU thread's; the rest the normal way.
-		if (DetachedOn() && Envio3::Mode() != 0 && !m_effects.host_writes.Empty())
+		// (spec5: and for the graphics speculation under KYTY_NATIVE_MEMORY, its sweeps logged the same way.)
+		if (((DetachedOn() && Envio3::Mode() != 0) || PageManager::NativeWriteWatch()) && !m_effects.host_writes.Empty())
 			for (const auto& use: state.closed[index].images)
 				if (m_effects.host_writes.Intersects(use.image->info.data.address, use.image->info.data.size))
 					return Envio2::Add(Envio3::g_totals.sweep_stops), ++m_stop_reasons["commit: CPU wrote an image (sweep)"],
@@ -986,7 +988,10 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 			}
 		}
 		const auto prepared = CurrentEpochs();
+		const auto prep_t0  = NowNs(); // (spec5: the report's main-thread split)
 		Before(result, index);
+		const auto prep_t1 = NowNs();
+		m_prepare_ns += prep_t1 - prep_t0;
 		// (Its preparation registers what the work did not find registered (BDA ranges): a buffer merged away under
 		// the recorded work leaves it reading a destroyed one. The work after it is translated in order.)
 		if (CurrentEpochs() != prepared && Changed(result, index) != nullptr)
@@ -995,7 +1000,11 @@ Speculation::Progress Speculation::CommitSegments(Result& result, CommandProcess
 		if (const auto tick = scheduler.SubmitRecorded(*result.recorder, segment.recorded - result.submitted); tick != 0)
 			result.last_tick = tick;
 		result.submitted = segment.recorded;
+		const auto after_t0 = NowNs();
+		m_submit_ns += after_t0 - prep_t1;
 		After(result, index);
+		m_after_ns += NowNs() - after_t0;
+		++m_chunks_committed;
 		result.next = index + 1;
 		if (index < result.holes.size()) {
 			const auto run = RunHole(result, cp, index);
@@ -1184,6 +1193,16 @@ void Speculation::Report() {
 	            static_cast<unsigned long long>(m_durations[2]), static_cast<unsigned long long>(m_durations[3]),
 	            static_cast<unsigned long long>(m_durations[4]), static_cast<unsigned long long>(m_durations[5]),
 	            static_cast<double>(m_longest_ns) / 1e6);
+	// (spec5) The GPU thread's time against the workers': what the speculation leaves on the main thread per frame
+	// (its queue time: commits - preparation, submission, after, holes -, waits, and the normal translation), and the
+	// segment count (per-segment delivery).
+	std::printf("%s: main thread %.2f ms/frame (prepare %.2f, submit %.2f, after %.2f, holes %.2f, waits %.2f, rest %.2f), "
+	            "workers %.2f ms/frame (kept %.2f, lost %.2f); %.1f segments/frame, chunk %u draws\n",
+	            m_name, ms(m_queue_ns), ms(m_prepare_ns), ms(m_submit_ns), ms(m_after_ns), ms(m_hole_ns), ms(m_wait_ns),
+	            ms(m_queue_ns > m_commit_ns + m_wait_ns ? m_queue_ns - m_commit_ns - m_wait_ns : 0),
+	            ms(m_kept_ns + m_lost_ns), ms(m_kept_ns), ms(m_lost_ns), static_cast<double>(m_chunks_committed) / frames,
+	            ChunkWorkSize());
+	m_prepare_ns = m_submit_ns = m_after_ns = m_chunks_committed = 0;
 	m_waits_for_ahead = m_ahead_misses = 0;
 	m_blind = m_stopped = m_blind_stopped = 0;
 	m_kept_ns = m_lost_ns = m_commit_ns = m_hole_ns = m_queue_ns = 0;

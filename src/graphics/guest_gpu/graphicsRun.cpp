@@ -1169,7 +1169,9 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 	// (p7, KYTY_P7: the live fixes on - C1, C2, C5, C6, C7 -, after every switch above; local/p7-compat.h.)
 	P7::ApplyAtGpuStart();
-	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4 && !PageManager::NativeWriteWatch()) {
+	// (spec5: with KYTY_NATIVE_MEMORY too - what each write-watch sweep finds CPU-written is logged for the speculation's
+	// commits, Spec::NoteHostWrite in GpuResourceManager::InvalidateCpuWrittenPages, and checked there.)
+	if (kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 	}
@@ -1178,7 +1180,7 @@ void GuestGpu::ThreadRun(void* data) {
 	// second Vulkan queue (its commits go to the one queue, lane 0).
 	if (Envio2::Mode() != 0) {
 		const bool lanes = gpu->m_renderer.GetCommandScheduler().GetMasterSemaphore().LanesOn();
-		const bool speculate = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !PageManager::NativeWriteWatch();
+		const bool speculate = kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
 		if (ParQueues::On() || speculate || lanes) {
 			std::printf("envio2: KYTY_ENVIO2 off: needs KYTY_PAR_QUEUES and KYTY_SPECULATE off and one Vulkan queue "
 			            "(par %d, speculate %u, lanes %d)\n",
@@ -1619,7 +1621,10 @@ bool GuestGpu::Process(Submission& submission) {
 	// write the game made before queueing it, PageManager::SweptSince; the queue was a few submissions deep.)
 	if (first_slice) {
 		// (envio3: what it finds CPU-written is logged for the compute submissions in flight, Speculation::Log.)
-		Spec::t_effects = Envio3::Mode() != 0 && m_acb_spec && m_acb_spec->Pending() ? &m_acb_spec->Log() : nullptr;
+		// (spec5: or for the graphics speculation's commits, with KYTY_SPECULATE under KYTY_NATIVE_MEMORY.)
+		Spec::t_effects = Envio3::Mode() != 0 && m_acb_spec && m_acb_spec->Pending() ? &m_acb_spec->Log()
+		                  : m_speculation                                            ? &m_speculation->Log()
+		                                                                             : nullptr;
 		const uint64_t censo_sweep_t0 = DsCensoDcb::On() ? DsCensoDcb::NowNs() : 0; // (w7)
 		CensoPm4::Mark(CensoPm4::KSweep); // (w18)
 		m_renderer.GetGpuResources().SweepCpuWrites((PageManager::SweptSince(submission.sweep_stamp) ||
@@ -1643,10 +1648,13 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	// The graphics queue's command buffers, speculation on: speculatively first (speculation.h).
-	// (Not with KYTY_NATIVE_MEMORY: a speculation translates on other threads, ahead of the sweeps of the write watch
-	// that tell the caches what the guest wrote, GpuResourceManager::SweepCpuWrites.)
+	// (spec5, KYTY_NATIVE_MEMORY: a speculation translates on other threads, ahead of the sweeps of the write watch that
+	// tell the caches what the guest wrote, GpuResourceManager::SweepCpuWrites. Every sweep logs what it found
+	// CPU-written in the speculation's effects log - the first slice's below, the waits' and flips' inside the
+	// EffectsScope -, and each commit checks its clean reads, its images and its buffers against it: a stop, translated
+	// the normal way, never stale data.)
 	const bool speculate = submission.type == SubmissionType::Graphics && submission.queue_id == 0 &&
-	                       kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 && !PageManager::NativeWriteWatch();
+	                       kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0;
 	if (speculate && !m_speculation) m_speculation = std::make_unique<Speculation>(m_renderer);
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {

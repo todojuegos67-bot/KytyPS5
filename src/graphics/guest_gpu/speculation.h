@@ -9,6 +9,7 @@
 #include "speculation-state.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
@@ -110,6 +111,16 @@ public:
 	[[nodiscard]] Outcome ResumeHanded(uint64_t serial, CommandProcessor& cp, Pm4Execution& execution);
 	void                  SetMaxInFlight(size_t count) noexcept { m_max_in_flight = std::max<size_t>(count, 1); }
 	static constexpr uint32_t ChunkWork = 128;
+	// (spec5) KYTY_SPECULATE_CHUNK=N (32-4096; default ChunkWork): draws/dispatches per chunk. Bigger chunks: fewer
+	// per-segment commits (prepare, submit, after) on the GPU thread, a longer wait for the first.
+	[[nodiscard]] static uint32_t ChunkWorkSize() noexcept {
+		static const uint32_t size = [] {
+			const char* value = std::getenv("KYTY_SPECULATE_CHUNK");
+			const long  n     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+			return n >= 32 && n <= 4096 ? static_cast<uint32_t>(n) : ChunkWork;
+		}();
+		return size;
+	}
 	// The graphics queue's time in a slice of a command buffer (the report's total).
 	void NoteQueueTime(uint64_t ns) noexcept { m_queue_ns += ns; }
 	// What the normal translation does while a speculation is not committed (Spec::t_effects of the thread that
@@ -270,6 +281,7 @@ private:
 	// Time (ns) translating the segments committed and the others, committing (holes apart), in holes, in the graphics
 	// queue; the frame of the last report.
 	uint64_t m_kept_ns = 0, m_lost_ns = 0, m_commit_ns = 0, m_hole_ns = 0, m_queue_ns = 0, m_report_frame = 0;
+	uint64_t m_prepare_ns = 0, m_submit_ns = 0, m_after_ns = 0, m_chunks_committed = 0; // (spec5: the report's split)
 	std::mutex m_mutex;
 	bool       m_quit  = false;
 	uint64_t   m_clock = 0; // (under m_mutex) orders translations beginning and results retired

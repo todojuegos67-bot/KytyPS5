@@ -43,6 +43,8 @@ extern "C" {
 // fault ended in, within 2 ms (a sequential stream of writes), takes the next 64 KiB at once. (1-1 route, 120 cap, A-B-A
 // over 29 points: window faults -13.6%, fps +0.7%, 1% low +3.8%, p99 -4.1%; uploads +9%, on the upload worker.)
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_window_stream_mode {1};
+// (performance-switches.h, KYTY_SPECULATE; spec5: the sweeps log for its commits.)
+extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
 }
 
 namespace Libs::Graphics {
@@ -957,7 +959,9 @@ void GpuResourceManager::InvalidateCpuWrittenPages(uint64_t vaddr, uint64_t size
 	// (envio3, KYTY_ENVIO3) A compute submission in flight on Kyty.Acb2 (Spec::t_effects set on the GPU thread) checks
 	// what was found CPU-written since it was handed: its commit stops at a clean read or image over it and re-uploads
 	// the buffers it reads there (Speculation::CommitSegments / Before). Off: nothing (t_effects is null).
-	if (Envio3::Mode() != 0) Spec::NoteHostWrite(vaddr, size);
+	// (spec5, KYTY_SPECULATE under KYTY_NATIVE_MEMORY: the same for the graphics speculation's commits; t_effects is its
+	// log at every sweep while it is on, GraphicsRun.)
+	if (Envio3::Mode() != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) Spec::NoteHostWrite(vaddr, size);
 	// (Fresh memory stands down with native memory - no backing view -: a first write is noted all the same. Unlike
 	// the fault, the page is invalidated in any case: another watcher may hold it, and an extra invalidation is safe.)
 	if (FreshMemory::Get() != nullptr)
