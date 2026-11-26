@@ -233,7 +233,7 @@ inline size_t EnvSize(const char* name, size_t fallback) {
 	return value != nullptr && *value != 0 ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : fallback;
 }
 inline size_t Sessions() {
-	static const size_t n = std::max<size_t>(1, std::min<size_t>(16, EnvSize("KYTY_TIRON6_USADOS_SESIONES", 3)));
+	static const size_t n = std::max<size_t>(1, std::min<size_t>(16, EnvSize("KYTY_TIRON6_USADOS_SESIONES", 1)));
 	return n;
 }
 inline size_t UsedSessionMin() {
