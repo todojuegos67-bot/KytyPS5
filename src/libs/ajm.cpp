@@ -681,6 +681,9 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 
 	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames, &state->gapless);
 	if (Libs::Audio::AudioInternal::StatsWanted()) AjmNoteDecode(instance, *state, input, input_size, output, result);
+	if ((result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL | AJM_RESULT_INVALID_DATA | AJM_RESULT_NOT_INITIALIZED |
+	                      AJM_RESULT_INVALID_PARAMETER)) != 0)
+		Libs::Audio::AudioInternal::NoteAjmError(static_cast<uint32_t>(result.result), instance, instance >> 14u);
 	return result;
 }
 

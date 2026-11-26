@@ -1092,6 +1092,15 @@ void WindowContext::ProcessEvent(double time_s) {
 			}
 			break;
 
+		case SDL_AUDIODEVICEADDED:
+		case SDL_AUDIODEVICEREMOVED:
+			// ([audiodev], always) A Windows output device added, lost or reset: a sound gap after the emulator.
+			std::printf("[audiodev] dispositivo de audio %s (salida %d, id %u) a los %.1f s\n",
+			            event->type == SDL_AUDIODEVICEADDED ? "anadido" : "perdido/quitado", event->adevice.iscapture ? 0 : 1,
+			            static_cast<unsigned>(event->adevice.which), static_cast<double>(SDL_GetTicks64()) / 1000.0);
+			std::fflush(stdout);
+			break;
+
 		case SDL_JOYDEVICEADDED:
 			GenericJoystickAdded(event->jdevice.which);
 			break;

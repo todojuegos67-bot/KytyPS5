@@ -135,6 +135,12 @@ private:
 		// (KYTY_AUDIO_ADAPT, default on: each 4 underruns of the port raise its blocking reserve by 20 ms, up to 100 ms.)
 		uint32_t underruns_total = 0;
 		uint32_t reserve_us      = 0;
+		// ([audiogap], always: a main port's run of blocks the game sent in silence, after sound.)
+		bool     gap_heard        = false; // (sound seen since the port opened)
+		uint32_t gap_blocks       = 0;     // (silent blocks in a row)
+		uint64_t gap_start        = 0;     // (process time of the run's first silent block, us)
+		uint32_t gap_underruns    = 0;     // (underruns since the run began)
+		uint32_t gap_low_grains   = UINT32_MAX;
 	};
 
 	struct PortIn {
@@ -163,6 +169,7 @@ private:
 	                                           std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, const float* gains, bool blocking);
 	void                   NoteOutputs(const OutputParam* params, uint32_t num);
+	void                   NoteSilenceGap(PortOut* port, const void* data);
 };
 
 static Audio* g_audio = nullptr;
@@ -208,6 +215,23 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 
 	return g_audio->AudioOutOutputs(output_params.data(),
 	                                static_cast<uint32_t>(output_params.size()), blocking);
+}
+
+// [ajm] decode failures (AJM's thread) for [audiogap] (the output thread).
+static std::atomic<uint32_t> g_ajm_errors {0};     // (since the last [audiogap] line)
+static std::atomic<uint32_t> g_ajm_last_code {0};
+static std::atomic<uint64_t> g_ajm_last_print_us {0};
+
+void NoteAjmError(uint32_t code, uint32_t instance, uint32_t codec) {
+	g_ajm_errors.fetch_add(1, std::memory_order_relaxed);
+	g_ajm_last_code.store(code, std::memory_order_relaxed);
+	const uint64_t now  = LibKernel::KernelGetProcessTime();
+	uint64_t       last = g_ajm_last_print_us.load(std::memory_order_relaxed);
+	if (last != 0 && now - last < 1000000) return;
+	if (!g_ajm_last_print_us.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+	std::printf("[ajm] error decodificando %s: codigo 0x%08x, instancia 0x%05x, a los %.1f s\n", codec == 1 ? "ATRAC9" : "AJM",
+	            code, instance, static_cast<double>(now) / 1e6);
+	std::fflush(stdout);
 }
 
 } // namespace AudioInternal
@@ -633,6 +657,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	if (port->last_output_time != 0 && queue_size != 0 && now - port->last_output_time < 200000) {
 		if (queued_bytes == 0) {
 			++port->stat_underruns;
+			++port->gap_underruns;
 			static const bool adapt = [] {
 				const char* value = std::getenv("KYTY_AUDIO_ADAPT");
 				return value == nullptr || std::string_view(value) != "0";
@@ -646,6 +671,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		}
 		const uint32_t grains = queued_bytes / queue_size;
 		port->stat_low_grains = std::min(port->stat_low_grains, grains);
+		port->gap_low_grains  = std::min(port->gap_low_grains, grains);
 	}
 	// (KYTY_AUDIO_LOG.) A main port's queue level before each output (ms), its lowest and highest every 2 s.
 	if (log_queue && port->type == 0 && queue_size != 0 && buffer_us != 0 && port->audio_device < 64) {
@@ -787,6 +813,8 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			port.freq             = freq;
 			port.format           = format;
 			port.last_output_time = 0;
+			port.gap_heard        = false;
+			port.gap_blocks       = 0;
 
 			switch (format) {
 				case Format::Signed16bitMono:
@@ -957,6 +985,50 @@ void Audio::NoteOutputs(const OutputParam* params, uint32_t num) {
 	}
 }
 
+// [audiogap] (always on): a main port's blocks that the game sent all silent (peak < 1e-4) for 150 ms and more after
+// sound: one line when sound comes back. The scan stops at the first loud sample, so normal play reads a few samples.
+// Tells a silence the game wrote (decode/mixer) from one after the emulator (underruns, device events: [audiodev]).
+void Audio::NoteSilenceGap(PortOut* port, const void* data) {
+	if (data == nullptr || port->channels_num <= 0 || port->freq == 0) return;
+	const size_t count  = static_cast<size_t>(port->samples_num) * static_cast<size_t>(port->channels_num);
+	bool         silent = true;
+	if (FormatIsFloat(port->format)) {
+		const auto* f = static_cast<const float*>(data);
+		for (size_t k = 0; k < count; k++)
+			if (std::fabs(f[k]) >= 1e-4f) { silent = false; break; }
+	} else {
+		const auto* v = static_cast<const int16_t*>(data);
+		for (size_t k = 0; k < count; k++)
+			if (v[k] > 3 || v[k] < -3) { silent = false; break; }
+	}
+	const uint64_t now = LibKernel::KernelGetProcessTime();
+	if (silent) {
+		if (!port->gap_heard) return;
+		if (port->gap_blocks++ == 0) {
+			port->gap_start      = now;
+			port->gap_underruns  = 0;
+			port->gap_low_grains = UINT32_MAX;
+		}
+		return;
+	}
+	if (port->gap_heard && port->gap_blocks != 0) {
+		const uint64_t ms = static_cast<uint64_t>(port->gap_blocks) * port->samples_num * 1000u / port->freq;
+		if (ms >= 150) {
+			const uint32_t errors = AudioInternal::g_ajm_errors.exchange(0, std::memory_order_relaxed);
+			const uint32_t code   = AudioInternal::g_ajm_last_code.load(std::memory_order_relaxed);
+			std::printf("[audiogap] port %d: silencio de %llu ms a los %.1f s (bloques del juego en cero; cola %d grains, underruns %u; "
+			            "errores AJM desde el anterior %u, ultimo codigo 0x%08x)\n",
+			            static_cast<int>(port - m_out_ports), static_cast<unsigned long long>(ms),
+			            static_cast<double>(port->gap_start) / 1e6,
+			            port->gap_low_grains == UINT32_MAX ? -1 : static_cast<int>(port->gap_low_grains), port->gap_underruns,
+			            errors, code);
+			std::fflush(stdout);
+		}
+	}
+	port->gap_heard  = true;
+	port->gap_blocks = 0;
+}
+
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
@@ -990,6 +1062,10 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	}
 
 	if (AudioInternal::StatsWanted()) NoteOutputs(params, num);
+	for (uint32_t i = 0; i < num; i++) {
+		auto& port = m_out_ports[params[i].handle.GetId()];
+		if (port.type == AUDIO_OUT_PORT_TYPE_MAIN && port.audio_device != 0) NoteSilenceGap(&port, params[i].data);
+	}
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];

@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -70,6 +71,10 @@ inline float PcmPeak(const void* data, size_t count, int encoding, size_t stride
 	}
 	return peak;
 }
+
+// (Always on, [audiogap]/[ajm]) An AJM decode that failed: counted for the next [audiogap] line, and one
+// "[ajm] error decodificando" line at most each second. Called only on a failure: no cost otherwise.
+void NoteAjmError(uint32_t code, uint32_t instance, uint32_t codec);
 
 } // namespace Libs::Audio::AudioInternal
 
