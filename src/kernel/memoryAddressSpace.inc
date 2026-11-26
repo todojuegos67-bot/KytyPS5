@@ -4075,7 +4075,7 @@ private:
 		void*       ptr     = nullptr;
 		// (commit-al-tocar, KYTY_COMMIT_AL_TOCAR=1: reserved only, committed at the first touch - NativeLazyCommit.)
 		const bool  lazy    = NativeLazyCommit::Start();
-		const DWORD commit  = lazy ? 0u : static_cast<DWORD>(MEM_COMMIT);
+		const DWORD commit  = lazy && NativeLazyCommit::LazyMapping() ? 0u : static_cast<DWORD>(MEM_COMMIT);
 		if (lazy) NativeLazyCommit::Register(vaddr, size);
 		{
 			LiveTrace::SlowOsCallScope slow(LiveTrace::OsMapView, vaddr, size);
@@ -5214,7 +5214,7 @@ public:
 		LiveTrace::SlowOsCallScope slow(LiveTrace::OsAlloc, vaddr, size);
 		// (commit-al-tocar, KYTY_COMMIT_AL_TOCAR=1: native guest memory reserved only, committed at the first touch.)
 		const bool  lazy        = m_backing->IsNative() && NativeLazyCommit::Start();
-		const DWORD lazy_commit = lazy ? 0u : static_cast<DWORD>(MEM_COMMIT);
+		const DWORD lazy_commit = lazy && NativeLazyCommit::LazyMapping() ? 0u : static_cast<DWORD>(MEM_COMMIT);
 		if (lazy) NativeLazyCommit::Register(vaddr, size);
 		// (Refused for lack of commit: a release pass and another try, MemGuard; the guard's releasers never take
 		// this lock.)
