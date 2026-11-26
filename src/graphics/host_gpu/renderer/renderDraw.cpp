@@ -2269,6 +2269,10 @@ bool RenderExecutor::TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	if (!m_context.GetGpuResources().IsMapped(run.indices.address, run.indices.size)) return false;
 	m_context.GetCommandScheduler().PopPendingOperations();
+	// (11-26 tex) Tambien aqui: casi todos los draws del juego van por esta ruta de tandas y no por DrawIndex; sin esto
+	// las colas de KYTY_TEX_NATIVA (creacion, urgente, trozos) no se vaciaban nunca (log 20261126-124455: encoladas 1715,
+	// resueltas 0; el log de tex-nativa salio una sola vez = una sola llamada).
+	TexAnticipadaDrain();
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },
 	                               LiveTrace::MarkDraw, buffer.GetShaders().GetPs().ps_regs.data_addr};
 	RenderLockGuard lock(m_context.GetMutex());
@@ -2757,6 +2761,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
+	TexAnticipadaDrain(); // (11-26 tex) como en DrawIndex y TryDrawIndexRun
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 	LiveTrace::MarkAfter gpu_mark {[&] { return m_context.GetCommandScheduler().Current().RawHandle(); },

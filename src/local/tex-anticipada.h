@@ -54,7 +54,10 @@ constexpr uint64_t kVmEnd      = 0x1400000000ull;
 inline bool On() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEX_ANTICIPADA");
-		return v != nullptr && v[0] == '1'; // (11-26 limpieza) apagado por defecto
+		// (11-26 limpieza) apagado por defecto. (11-26 tex) KYTY_TEX_NATIVA=1 lo enciende (necesita los ganchos de
+		// 0x8fe750/0x901330); KYTY_TEX_ANTICIPADA=0 explicito lo sigue apagando.
+		if (v != nullptr) return v[0] == '1';
+		return TexNativa::On();
 	}();
 	return on;
 }
