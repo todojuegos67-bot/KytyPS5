@@ -47,6 +47,7 @@
 #include "local/prot-menos.h"   // (PROT-MENOS) KYTY_PROT_MENOS: its counters in the [frame-nativo] line
 #include "local/copia1.h"       // (FRAME-NATIVO) the flips counted (Copia1::g_frames)
 #include "live-counters.h"      // (FRAME-NATIVO) UploadBytes
+#include "local/tex-nativa.h"   // (VRAM-FREE) free del motor sobre memoria de texturas
 #include "local/malla-nativa.h"  // (MALLA-NATIVA) KYTY_MALLA_NATIVA: lecturas de CPU de las mallas
 
 #include <algorithm>
@@ -1447,6 +1448,7 @@ void KYTY_SYSV_ABI OnDeferredFree(uint64_t /*backend*/, uint64_t pointer) {
 
 // (Every free of the game: the filter's one load unless the pointer may start a registered range.)
 void KYTY_SYSV_ABI OnHeapFree(uint64_t pointer) {
+	TexNativa::OnEngineFree(pointer); // (VRAM-FREE) CTexture destruida (DeletePendingItems 0x901f30)
 	auto* const registry = g_registry.load(std::memory_order_relaxed);
 	if (registry == nullptr || !registry->MayBeginAt(pointer) || pointer < 0x10000) return;
 	Freed(registry, pointer, CHeapFreeRemoved);

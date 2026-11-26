@@ -431,11 +431,47 @@ inline std::unordered_set<uint64_t>& BadBases() { // bases cuya imagen no se pud
 	return s;
 }
 // Salida de 0x8fe750 (tex-anticipada.h): la base del T# de la CTexture.
+inline std::atomic<uint64_t> g_reg_seq {0}; // (VRAM-FREE)
+inline std::unordered_map<uint64_t, uint64_t>& RegSeq();
 inline void Register(uint64_t base) {
 	if (!On() || base < kVmBegin || base >= kVmEnd) return;
 	std::lock_guard<std::mutex> lock(Mutex());
 	if (Table().emplace(base, Entry {}).second) c_registered.fetch_add(1, std::memory_order_relaxed);
 	BadBases().erase(base); // (11-25d) CTexture nueva en esa base: se vuelve a intentar
+	RegSeq()[base] = g_reg_seq.fetch_add(1, std::memory_order_relaxed) + 1; // (VRAM-FREE)
+}
+
+// (VRAM-FREE, 11-26) Ghidra 01.007.000: el destructor de CTexture (0x900bd0, vtable 0x25afc20) no libera su memoria:
+// mete sus 4 bloques (this+0x98..0xb0) en RenderDeferredMemoryDeleter (0x903460, DAT_02f65f58+0x928); FlushPendingFree
+// (0x901c40) -> DeletePendingItems (0x901f30) los suelta con el free del motor 0x7fa380 (asignador vtable+0xb0), que
+// los deja MAPEADOS en su cache de bloques (ReleasePages). Sin unmap, SparseUpdateLevels los veia "comprometidos" y la
+// imagen nativa de la CTexture destruida seguia viva y ligada para siempre (AnyOwned la salva del retiro): log
+// 20261126-223241, VRAM nativa 3.7 -> 6.5 GB al cambiar de zona. Aqui: el gancho de 0x7fa380 (write-audit) apunta el
+// puntero (zona de texturas) con la secuencia de registro; el hilo de la GPU borra las imagenes nativas que lo
+// contienen si su base no se volvio a registrar despues (CTexture nueva en la misma memoria).
+struct Liberado { uint64_t ptr, seq; };
+inline std::unordered_map<uint64_t, uint64_t>& RegSeq() { // base -> secuencia del ultimo Register. Bajo Mutex().
+	static std::unordered_map<uint64_t, uint64_t> m;
+	return m;
+}
+inline std::mutex& FreedMutex() {
+	static std::mutex m;
+	return m;
+}
+inline std::vector<Liberado>& FreedQueue() {
+	static std::vector<Liberado> v;
+	return v;
+}
+inline std::atomic<bool>     g_freed_pending {false};
+inline std::atomic<uint64_t> c_freed_ptrs {0}, c_freed_imgs {0}, c_freed_mb {0}, c_freed_skip {0};
+inline void OnEngineFree(uint64_t ptr) {
+	if (!On() || ptr < kVmBegin || ptr >= kVmEnd) return;
+	std::lock_guard<std::mutex> lock(FreedMutex());
+	auto& q = FreedQueue();
+	if (q.size() >= 65536) return;
+	q.push_back({ptr, g_reg_seq.load(std::memory_order_relaxed)});
+	c_freed_ptrs.fetch_add(1, std::memory_order_relaxed);
+	g_freed_pending.store(true, std::memory_order_release);
 }
 
 // (11-25c) Imagen nativa creada YA al crear la CTexture. Ghidra 01.007.000: CTexture::FTextureFactory (0x901240) llama
@@ -681,6 +717,9 @@ inline void MaybeLog() {
 	std::printf("[tex-nativa] gancho de free 0x802f90 %s: bloques solo-GPU liberados por el juego %llu (%llu MB, sacados del registro antes de que escriba)\n",
 	            g_free_hook_ok.load() ? "instalado" : "NO instalado", static_cast<unsigned long long>(c_free_hits.load()),
 	            static_cast<unsigned long long>(c_free_bytes.load() >> 20u));
+	std::printf("[tex-nativa] (vram-free) free 0x7fa380 en la zona de texturas %llu; imagenes nativas de CTexture destruidas borradas %llu (rango %llu MB, su VRAM vuelve al pool); saltadas por CTexture nueva en esa memoria %llu\n",
+	            static_cast<unsigned long long>(c_freed_ptrs.load()), static_cast<unsigned long long>(c_freed_imgs.load()),
+	            static_cast<unsigned long long>(c_freed_mb.load()), static_cast<unsigned long long>(c_freed_skip.load()));
 	std::printf("[tex-nativa] CTexture registradas %llu; imagenes nativas %llu (rechazadas %llu); vistas del draw %llu; mips "
 	            "ligados %llu, desligados %llu; VRAM ligada %llu MB, devuelta %llu MB; sin memoria %llu\n",
 	            static_cast<unsigned long long>(c_registered.load()), static_cast<unsigned long long>(c_images.load()),

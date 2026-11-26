@@ -254,6 +254,7 @@ public:
 	void LogPcMemory(uint64_t tick);
 	// The images no draw or dispatch used for a while go (RunGarbageCollector, once a flip).
 	void RetireStaleImages(uint64_t tick);
+	void DropFreedNativeImages(); // (VRAM-FREE)
 	// (M7) Gestor central de memoria: candidatas del gestor, copias RAM, linea [tex-dedup] (RunGarbageCollector, m_lock).
 	void GestorPass(uint64_t tick);
 	// (M7, TEX-DEDUP) Fuente con el mismo contenido para compartir su VkImage; alta tras InsertImage (m_lock).
