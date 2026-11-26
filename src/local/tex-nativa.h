@@ -41,7 +41,7 @@ constexpr uint64_t kVmEnd   = 0x1400000000ull;
 inline bool On() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEX_NATIVA");
-		const bool  r = v != nullptr && v[0] == '1';
+		const bool  r = v == nullptr || v[0] != '0'; // (por defecto ON desde 11-26 23:20; =0 lo apaga)
 		if (r) {
 			std::printf("[tex-nativa] KYTY_TEX_NATIVA=1: N1, una imagen Vulkan dispersa con todos sus mips por CTexture; "
 			            "memoria de video por mip segun lo que el juego compromete (0x901030/0x901110)\n");

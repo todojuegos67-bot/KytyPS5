@@ -220,7 +220,7 @@ inline uint32_t Threads(uint32_t cpus, uint64_t available_bytes) {
 inline bool SoloUsados() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_TIRON6_SOLO_USADOS");
-		const bool  set   = value != nullptr && value[0] == '1';
+		const bool  set   = value == nullptr || value[0] != '0'; // (por defecto ON desde 11-26 23:20; =0 lo apaga)
 		std::printf("[solo-usados] precarga solo de pipelines usados en las ultimas sesiones: %s\n",
 		            set ? "ON (KYTY_TIRON6_SOLO_USADOS=1)" : "off");
 		std::fflush(stdout);
