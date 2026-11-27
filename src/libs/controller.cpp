@@ -901,7 +901,36 @@ int GameController::StickDeadZone(int id, Controller::Axis axis, int value) {
 	if (mag > dz && mag > 0.0f) {
 		const float outer  = std::max(dz + 0.05f, info->outer);
 		const float scaled = std::min((mag - dz) / (outer - dz), 1.0f);
-		out                = ((a & 1) == 0 ? x : y) / mag * scaled;
+		// (pad-snap) An Xbox 360 stick pushed straight forward reads 10-20% sideways (its round gate, a worn stick): the
+		// radial dead zone kept that sideways part and the character went forward and to one side. Non-PlayStation
+		// pads: within KYTY_PAD_SNAP degrees (default 12, 0 off) of up/down/left/right the small axis is zeroed.
+		float nx = x, ny = y;
+		if (info->outer < 1.0f) {
+			static const float snap = [] {
+				const char* v = std::getenv("KYTY_PAD_SNAP");
+				const float d = v != nullptr && *v != '\0' ? std::clamp(static_cast<float>(std::atof(v)), 0.0f, 30.0f) : 12.0f;
+				return std::tan(d * 3.14159265f / 180.0f);
+			}();
+			if (std::abs(nx) <= std::abs(ny) * snap) nx = 0.0f;
+			else if (std::abs(ny) <= std::abs(nx) * snap) ny = 0.0f;
+		}
+		const float nmag = std::sqrt(nx * nx + ny * ny);
+		out              = nmag > 0.0f ? ((a & 1) == 0 ? nx : ny) / nmag * scaled : 0.0f;
+	}
+	// KYTY_PAD_LOG=1: each stick event, raw (0-255) and what the game gets, at most 10 lines a second.
+	static const bool pad_log = [] {
+		const char* v = std::getenv("KYTY_PAD_LOG");
+		return v != nullptr && *v == '1';
+	}();
+	if (pad_log && value >= 0) {
+		static uint64_t last_ms = 0;
+		if (const auto now = SDL_GetTicks64(); now - last_ms >= 100) {
+			last_ms = now;
+			std::printf("[pad-log] mando %d stick %s: crudo x=%d y=%d centro %.1f,%.1f -> eje %d = %.3f\n", id,
+			            stick == 0 ? "izq" : "der", info->raw[stick * 2], info->raw[stick * 2 + 1],
+			            info->center[stick * 2], info->center[stick * 2 + 1], a, out);
+			std::fflush(stdout);
+		}
 	}
 	const int v = out < 0.0f ? 128 + static_cast<int>(std::lround(out * 128.0f))
 	                         : 128 + static_cast<int>(std::lround(out * 127.0f));
