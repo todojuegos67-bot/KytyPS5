@@ -30,6 +30,8 @@
 
 #include <atomic>
 #include <cctype>
+#include <cwctype>
+#include <functional>
 #include <csignal>
 #include <cstdlib>
 #include <exception>
@@ -457,7 +459,7 @@ bool IsGame(const std::string& path) {
 	return p.extension() == L".zar" && fs::is_regular_file(p, ec);
 }
 
-std::string PickFolder() {
+std::string PickFolderOnly() {
 	std::string result;
 	IFileOpenDialog* dialog = nullptr;
 	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return result;
@@ -500,6 +502,343 @@ GameParam ReadParam(const std::string& game) {
 	} catch (...) {
 	}
 	return param;
+}
+
+// ---- (pkg1) The game from an archive: .zip / .7z / .rar extracted next to it (7-Zip if installed, else Windows' tar.exe),
+// then checked (eboot.bin, sce_sys/param.json PPSA01341 01.007.000) and used as the game folder. A PS5 .pkg holds an
+// encrypted PFS image (keys needed): not unpacked here, a clear message instead. ----
+
+std::wstring ArchiveTool(bool* seven) {
+	std::error_code ec;
+	for (const wchar_t* var : {L"ProgramW6432", L"ProgramFiles", L"ProgramFiles(x86)"}) {
+		wchar_t buf[MAX_PATH] = {};
+		if (GetEnvironmentVariableW(var, buf, MAX_PATH) == 0) continue;
+		const fs::path z = fs::path(buf) / L"7-Zip" / L"7z.exe";
+		if (fs::exists(z, ec)) {
+			*seven = true;
+			return z.wstring();
+		}
+	}
+	*seven = false;
+	wchar_t sys[MAX_PATH] = {};
+	GetSystemDirectoryW(sys, MAX_PATH);
+	const fs::path t = fs::path(sys) / L"tar.exe";
+	return fs::exists(t, ec) ? t.wstring() : std::wstring();
+}
+
+// Runs a command line hidden; its output in *out (when given). The exit code, or -1.
+int RunHidden(const std::wstring& cmd, std::string* out, const std::function<void()>& pump) {
+	SECURITY_ATTRIBUTES sa {sizeof(sa), nullptr, TRUE};
+	HANDLE rd = nullptr, wr = nullptr;
+	if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+	STARTUPINFOW si {};
+	si.cb         = sizeof(si);
+	si.dwFlags    = STARTF_USESTDHANDLES;
+	si.hStdOutput = wr;
+	si.hStdError  = wr;
+	si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+	PROCESS_INFORMATION pi {};
+	std::wstring line = cmd;
+	if (!CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+		CloseHandle(rd);
+		CloseHandle(wr);
+		return -1;
+	}
+	CloseHandle(wr);
+	std::thread reader([&] {
+		char  buf[4096];
+		DWORD n = 0;
+		while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0)
+			if (out != nullptr) out->append(buf, n);
+	});
+	while (WaitForSingleObject(pi.hProcess, 50) == WAIT_TIMEOUT)
+		if (pump) pump();
+	reader.join();
+	DWORD code = 0;
+	GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+	CloseHandle(rd);
+	return static_cast<int>(code);
+}
+
+// The uncompressed size from the tool's listing (7z l: the last summary line; tar -tv: the 5th column), 0 if unknown.
+uint64_t ListedSize(const std::string& listing, bool seven) {
+	uint64_t total = 0;
+	std::vector<std::string> lines;
+	size_t   start = 0;
+	for (size_t k = 0; k <= listing.size(); k++)
+		if (k == listing.size() || listing[k] == '\n') {
+			lines.push_back(listing.substr(start, k - start));
+			start = k + 1;
+		}
+	auto fields = [](const std::string& l) {
+		std::vector<std::string> f;
+		size_t                   k = 0;
+		while (k < l.size()) {
+			while (k < l.size() && std::isspace(static_cast<unsigned char>(l[k]))) k++;
+			size_t b = k;
+			while (k < l.size() && !std::isspace(static_cast<unsigned char>(l[k]))) k++;
+			if (k > b) f.push_back(l.substr(b, k - b));
+		}
+		return f;
+	};
+	auto num = [](const std::string& t, uint64_t* v) {
+		if (t.empty() || t.size() > 19) return false;
+		for (char c : t)
+			if (c < '0' || c > '9') return false;
+		*v = std::stoull(t);
+		return true;
+	};
+	if (seven) {
+		// The last line after the final "-----" separator: "<date> <time> <size> <packed> N files[, M folders]".
+		for (size_t k = lines.size(); k-- > 0;) {
+			if (lines[k].rfind("-----", 0) == 0 || lines[k].find("-------------------") != std::string::npos) {
+				for (size_t m = k + 1; m < lines.size(); m++) {
+					const auto f = fields(lines[m]);
+					for (const auto& t : f) {
+						uint64_t v = 0;
+						if (num(t, &v)) {
+							total = v;
+							break;
+						}
+					}
+					if (total != 0) break;
+				}
+				break;
+			}
+		}
+	} else {
+		for (const auto& l : lines) {
+			const auto f = fields(l);
+			uint64_t   v = 0;
+			if (f.size() >= 9 && !f[0].empty() && f[0][0] != 'd' && num(f[4], &v)) total += v;
+		}
+	}
+	return total;
+}
+
+uint64_t FolderBytes(const fs::path& dir) {
+	uint64_t        total = 0;
+	std::error_code ec;
+	for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+		if (it->is_regular_file(ec)) total += it->file_size(ec);
+	return total;
+}
+
+// A small progress window (GDI only), pumped while the tool runs.
+struct ExtractUi {
+	HWND        hwnd = nullptr;
+	std::wstring text;
+	float       frac = 0;
+};
+
+LRESULT CALLBACK ExtractUiProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+	auto* ui = reinterpret_cast<ExtractUi*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+	if (m == WM_PAINT && ui != nullptr) {
+		PAINTSTRUCT ps;
+		HDC         dc = BeginPaint(h, &ps);
+		RECT        rc;
+		GetClientRect(h, &rc);
+		FillRect(dc, &rc, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+		RECT tr {16, 12, rc.right - 16, 60};
+		SetBkMode(dc, TRANSPARENT);
+		DrawTextW(dc, ui->text.c_str(), -1, &tr, DT_LEFT | DT_WORDBREAK);
+		RECT bar {16, 70, rc.right - 16, 92};
+		FrameRect(dc, &bar, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+		RECT fill = bar;
+		InflateRect(&fill, -2, -2);
+		fill.right = fill.left + static_cast<LONG>((fill.right - fill.left) * std::clamp(ui->frac, 0.0f, 1.0f));
+		HBRUSH b   = CreateSolidBrush(RGB(176, 140, 60));
+		FillRect(dc, &fill, b);
+		DeleteObject(b);
+		EndPaint(h, &ps);
+		return 0;
+	}
+	if (m == WM_CLOSE) return 0; // (not closable while extracting)
+	return DefWindowProcW(h, m, w, l);
+}
+
+void ExtractUiOpen(ExtractUi* ui) {
+	static bool registered = false;
+	if (!registered) {
+		WNDCLASSW wc {};
+		wc.lpfnWndProc   = ExtractUiProc;
+		wc.hInstance     = GetModuleHandleW(nullptr);
+		wc.lpszClassName = L"DsExtractUi";
+		wc.hCursor       = LoadCursor(nullptr, IDC_WAIT);
+		RegisterClassW(&wc);
+		registered = true;
+	}
+	const int w = 520, h = 140;
+	ui->hwnd    = CreateWindowExW(WS_EX_TOPMOST, L"DsExtractUi", L"Demon's Souls: preparando el juego", WS_CAPTION | WS_POPUP | WS_VISIBLE,
+	                              (GetSystemMetrics(SM_CXSCREEN) - w) / 2, (GetSystemMetrics(SM_CYSCREEN) - h) / 2, w, h, nullptr, nullptr,
+	                              GetModuleHandleW(nullptr), nullptr);
+	if (ui->hwnd != nullptr) SetWindowLongPtrW(ui->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ui));
+}
+
+void ExtractUiPump(ExtractUi* ui) {
+	if (ui->hwnd != nullptr) InvalidateRect(ui->hwnd, nullptr, FALSE);
+	MSG msg;
+	while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+}
+
+// The folder holding eboot.bin at or under dir (3 levels at most: "PPSA01341-app0\" inside the archive).
+fs::path FindGameUnder(const fs::path& dir) {
+	std::error_code ec;
+	if (fs::exists(dir / L"eboot.bin", ec)) return dir;
+	for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+		if (it.depth() > 3) {
+			it.disable_recursion_pending();
+			continue;
+		}
+		if (it->is_directory(ec) && fs::exists(it->path() / L"eboot.bin", ec)) return it->path();
+	}
+	return {};
+}
+
+GameParam ReadParam(const std::string& game);
+
+// The checks for a game made from an archive: eboot.bin, sce_sys/param.json, PPSA01341 and (asked) 01.007.000.
+bool CheckExtractedGame(const fs::path& game) {
+	std::error_code ec;
+	if (!fs::exists(game / L"eboot.bin", ec) || !fs::exists(game / L"sce_sys" / L"param.json", ec)) {
+		Message("El archivo no contiene el juego volcado (falta eboot.bin o sce_sys\\param.json).");
+		return false;
+	}
+	const GameParam p = ReadParam(Utf8(game.wstring()));
+	if (p.title_id != "PPSA01341") {
+		Message("Ese juego no es Demon's Souls PPSA01341 (titleId: " + (p.title_id.empty() ? std::string("ninguno") : p.title_id) + ").");
+		return false;
+	}
+	if (p.version != "01.007.000")
+		return MessageBoxW(nullptr,
+		                   Wide("La version del juego es " + (p.version.empty() ? std::string("desconocida") : p.version) +
+		                        "; el port esta hecho para 01.007.000 (con otra puede fallar).\n\n¿Usarla igualmente?")
+		                       .c_str(),
+		                   L"Demon's Souls", MB_YESNO | MB_ICONWARNING) == IDYES;
+	return true;
+}
+
+// Extracts the archive into "<its folder>\<its name>\" and returns the game folder inside, or "" (a message shown).
+std::string GameFromArchive(const fs::path& archive) {
+	std::wstring ext = archive.extension().wstring();
+	for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+	if (ext == L".pkg") {
+		Message("Este .pkg esta cifrado (los .pkg de PS5 guardan el juego en una imagen PFS cifrada) y no se puede abrir aqui.\n\n"
+		        "Hace falta la carpeta app0 ya extraida (la que tiene eboot.bin y sce_sys): eligela con \"Carpeta\".");
+		return {};
+	}
+	bool               seven = false;
+	const std::wstring tool  = ArchiveTool(&seven);
+	if (tool.empty()) {
+		Message("No se encontro ni 7-Zip ni tar.exe de Windows para abrir el archivo. Instala 7-Zip o extraelo tu y elige la carpeta.");
+		return {};
+	}
+	const std::wstring q = L"\"" + archive.wstring() + L"\"";
+	std::string        listing;
+	const int          lc = RunHidden(seven ? L"\"" + tool + L"\" l " + q : L"\"" + tool + L"\" -tvf " + q, &listing, nullptr);
+	if (lc != 0) {
+		Message(seven ? "7-Zip no pudo leer el archivo (danado o con contrasena)."
+		              : "tar.exe de Windows no pudo leer el archivo (los .rar/.7z necesitan Windows 11 reciente). Instala 7-Zip y vuelve a elegirlo.");
+		return {};
+	}
+	std::error_code ec;
+	const uint64_t  need = ListedSize(listing, seven);
+	const fs::path  dest = archive.parent_path() / archive.stem();
+	if (fs::exists(dest, ec) && !fs::is_empty(dest, ec)) {
+		const fs::path found = FindGameUnder(dest);
+		if (!found.empty() &&
+		    MessageBoxW(nullptr, (L"Ya hay un juego extraido en:\n" + found.wstring() + L"\n\n\u00BFUsar ese (Si) o extraer de nuevo encima (No)?").c_str(),
+		                L"Demon's Souls", MB_YESNO | MB_ICONQUESTION) == IDYES)
+			return CheckExtractedGame(found) ? Utf8(found.wstring()) : std::string();
+	}
+	ULARGE_INTEGER free_bytes {};
+	if (GetDiskFreeSpaceExW(archive.parent_path().wstring().c_str(), &free_bytes, nullptr, nullptr)) {
+		const uint64_t want = (need != 0 ? need : fs::file_size(archive, ec)) + (512ull << 20);
+		if (free_bytes.QuadPart < want) {
+			Message("No hay espacio suficiente en el disco: hacen falta " + std::to_string(want >> 30) + " GB y quedan " +
+			        std::to_string(free_bytes.QuadPart >> 30) + " GB.");
+			return {};
+		}
+	}
+	fs::create_directories(dest, ec);
+	const uint64_t base = FolderBytes(dest);
+	ExtractUi      ui;
+	ui.text = L"Extrayendo el juego en:\n" + dest.wstring();
+	ExtractUiOpen(&ui);
+	auto last = std::chrono::steady_clock::now();
+	auto pump = [&] {
+		const auto now = std::chrono::steady_clock::now();
+		if (need != 0 && now - last > std::chrono::milliseconds(700)) {
+			last    = now;
+			ui.frac = static_cast<float>(static_cast<double>(FolderBytes(dest) - std::min(base, FolderBytes(dest))) / static_cast<double>(need));
+		}
+		ExtractUiPump(&ui);
+	};
+	const std::wstring qd = L"\"" + dest.wstring() + L"\"";
+	const int          xc = RunHidden(seven ? L"\"" + tool + L"\" x -y -o" + qd + L" " + q : L"\"" + tool + L"\" -xf " + q + L" -C " + qd, nullptr, pump);
+	if (ui.hwnd != nullptr) DestroyWindow(ui.hwnd);
+	ExtractUiPump(&ui);
+	if (xc != 0) {
+		Message("La extraccion fallo (codigo " + std::to_string(xc) + "). Revisa el archivo o el espacio libre.");
+		return {};
+	}
+	const fs::path found = FindGameUnder(dest);
+	if (found.empty()) {
+		Message("El archivo no contiene el juego volcado (no hay eboot.bin).");
+		return {};
+	}
+	return CheckExtractedGame(found) ? Utf8(found.wstring()) : std::string();
+}
+
+std::string PickArchive() {
+	std::string      result;
+	IFileOpenDialog* dialog = nullptr;
+	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return result;
+	const COMDLG_FILTERSPEC types[] = {{L"Juego (.zip .7z .rar .pkg .zar)", L"*.zip;*.7z;*.rar;*.pkg;*.zar"}, {L"Todos", L"*.*"}};
+	dialog->SetFileTypes(2, types);
+	DWORD options = 0;
+	dialog->GetOptions(&options);
+	dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+	dialog->SetTitle(L"Demon's Souls: elige el archivo del juego (.zip, .7z, .rar, .pkg o .zar)");
+	if (SUCCEEDED(dialog->Show(nullptr))) {
+		IShellItem* item = nullptr;
+		if (SUCCEEDED(dialog->GetResult(&item))) {
+			PWSTR path = nullptr;
+			if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+				result = Utf8(path);
+				CoTaskMemFree(path);
+			}
+			item->Release();
+		}
+	}
+	dialog->Release();
+	return result;
+}
+
+// The game picker: a folder (as before) or an archive, extracted and checked. "" = cancelled or failed (message shown).
+std::string PickFolder() {
+	const int choice = MessageBoxW(nullptr,
+	                               L"\u00BFComo tienes el juego?\n\nSi: una carpeta ya extraida (la que tiene eboot.bin y sce_sys).\n"
+	                               L"No: un archivo (.zip, .7z, .rar, .pkg o .zar); se extrae al lado y se usa esa carpeta.",
+	                               L"Demon's Souls: carpeta del juego", MB_YESNOCANCEL | MB_ICONQUESTION);
+	if (choice == IDYES) return PickFolderOnly();
+	if (choice != IDNO) return {};
+	const std::string picked = PickArchive();
+	if (picked.empty()) return {};
+	const fs::path p = fs::path(Wide(picked));
+	std::wstring   ext = p.extension().wstring();
+	for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
+	if (ext == L".zar") return picked; // (Kyty's own archive: the emulator opens it as it is)
+	std::printf("[port] game archive: %s\n", picked.c_str());
+	const std::string game = GameFromArchive(p);
+	std::printf("[port] game archive -> %s\n", game.empty() ? "(none)" : game.c_str());
+	return game;
 }
 
 // ---- The CPUs (run-windows.ps1): the largest L3 of a CPU with several, the performance cores of a hybrid one. ----
