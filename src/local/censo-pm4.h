@@ -51,7 +51,16 @@ constexpr uint32_t KAfter    = 323;       // tras el ejecutor, hasta el siguient
 constexpr uint32_t KSweep    = 324;       // SweepCpuWrites del primer trozo
 constexpr uint32_t KFlush    = 325;       // BufferFlush / BufferFlushDeferrable
 constexpr uint32_t KSlice    = 326;       // resto del trozo (Process fuera del bucle)
-constexpr uint32_t Keys      = 328;
+// (r0) Subdivisiones: el tramo abierto se reetiqueta (Retag) o se parte (Mark + vuelta) sin cambiar el total.
+constexpr uint32_t KNopCopy   = 328; // NOP R_ZERO = anuncio de copia lineal (DsLinearCopyHook): la copia en CPU entera
+constexpr uint32_t KNopHook   = 329; // NOP R_ZERO = otras marcas del emulador (port2, CENS, NATV, SSRClear)
+constexpr uint32_t KNopMarker = 330; // NOP R_ZERO = marcador 'hu' del juego (CpOpMarker)
+constexpr uint32_t KExecTable = 331; // ejecutor DispatchDirect: tomado por la tabla (TableDispatch)
+constexpr uint32_t KExecCopy  = 332; // ejecutor DispatchDirect: copia lineal por registros (CPU)
+constexpr uint32_t KEvBarrier = 333; // EVENT_WRITE que si grabo una barrera (EndRendering + pipelineBarrier2)
+constexpr uint32_t KProtSync  = 334; // FlushDeferredProtection antes de un paquete (cualquiera)
+constexpr uint32_t KProtAsync = 335; // FlushDeferredProtectionAsync antes de un paquete (cualquiera)
+constexpr uint32_t Keys      = 336;
 constexpr uint32_t Sites     = 8; // (7: techo, cualquier otro trozo: el recorrido PM4 entero queda repartido)
 
 constexpr uint64_t KickTag = 0xD0000000ull, AcbTag = 0xA0000000ull;
@@ -80,6 +89,17 @@ inline void Mark(uint32_t key) {
 	t_last = now;
 	t_key  = key;
 }
+// (r0) El tramo abierto pasa a ser de `key` (desde que se abrio); cuenta uno en `key`.
+inline void Retag(uint32_t key) {
+	if (t_site < 0) return;
+	t_key = key;
+	g_cells[t_site][key].n.fetch_add(1, std::memory_order_relaxed);
+}
+// (r0) Reetiqueta solo si el tramo abierto es de `from`.
+inline void RetagIf(uint32_t from, uint32_t key) {
+	if (t_site >= 0 && t_key == from) Retag(key);
+}
+[[nodiscard]] inline uint32_t Current() { return t_key; }
 // Un paquete de tipo `key` (cuenta y abre su tramo).
 inline void Packet(uint32_t key) {
 	if (t_site < 0) return;
@@ -123,6 +143,14 @@ struct SliceScope {
 		case KSweep: return "barrido SweepCpuWrites";
 		case KFlush: return "envio BufferFlush";
 		case KSlice: return "resto del trozo";
+		case KNopCopy: return "NOP copia lineal (anuncio)";
+		case KNopHook: return "NOP marcas emulador";
+		case KNopMarker: return "NOP marcador hu";
+		case KExecTable: return "ejecutor tabla";
+		case KExecCopy: return "ejecutor copia lineal";
+		case KEvBarrier: return "EVENT_WRITE con barrera";
+		case KProtSync: return "vaciar protecciones";
+		case KProtAsync: return "vaciar protecciones async";
 		case 0x11: return "SET_BASE";
 		case 0x15: return "DISPATCH_DIRECT";
 		case 0x16: return "DISPATCH_INDIRECT";
@@ -171,7 +199,7 @@ struct SliceScope {
 // (techo) Draw y dispatch: su paquete lleva el draw/dispatch entero (sus fases de tabla); lo demas es la fila "pm4" de techo.
 [[nodiscard]] inline bool IsWork(uint32_t k) {
 	switch (k) {
-		case 0x15: case 0x16: case 0x24: case 0x25: case 0x27: case 0x2C: case 0x2D: case 0x35: case 0x38: case KExec: case KAfter:
+		case 0x15: case 0x16: case 0x24: case 0x25: case 0x27: case 0x2C: case 0x2D: case 0x35: case 0x38: case KExec: case KAfter: case KExecTable: case KExecCopy:
 			return true;
 		default: return false;
 	}

@@ -1,3 +1,4 @@
+#include "local/censo-pm4.h" // (r0: the [techo] pm4 executor rows)
 #include "local/skip-shader.h"
 #include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
 #include "local/pathtrace.h" // (pt1, BB_PATHTRACING)
@@ -1053,6 +1054,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			m_dispatch_declined = nullptr;
 			if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, false)) {
 				vgeo_timer.count = &VgeoNativo::g_fast; vgeo_timer.ns = &VgeoNativo::g_fast_ns;
+				CensoPm4::RetagIf(CensoPm4::KExec, CensoPm4::KExecTable); // (r0)
 				return;
 			}
 			table_tried      = true; // (its refusal stands: the normal path below does not ask the table again)
@@ -1133,7 +1135,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (!thread_dimensions || indirect_args == 0) &&
 	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
 		LiveCensus::Scope census_table(LiveCensus::DispatchPhase, sh_ctx.GetCs().cs_regs.data_addr, 10);
-		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) return;
+		if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) {
+			CensoPm4::RetagIf(CensoPm4::KExec, CensoPm4::KExecTable); // (r0)
+			return;
+		}
 	}
 	// A direct dispatch of no thread groups (with thread dimensions: no threads) runs nothing: skipped before its
 	// program is prepared (about 60 a frame at 1-1, each evaluating its resource tables first).
@@ -1195,6 +1200,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                               thread_group_z, mode)) {
 			LiveCensus::SetDispatchShader(LiveCensus::LinearCopyShader); // (render4, KYTY_RENDER_STATS: the "cs" part)
 			TableDispatchSeen(sh_ctx.GetCs(), "dispatch: linear copy", thread_dimensions);
+			CensoPm4::RetagIf(CensoPm4::KExec, CensoPm4::KExecCopy); // (r0)
 			ResetBindings();
 			return;
 		}
@@ -1274,6 +1280,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                                     thread_group_x, thread_group_y,
 	                                                     thread_group_z, mode)) {
 		if (FrameCapture::Active()) FrameCapture::g_call.consumed = "linear_copy";
+		CensoPm4::RetagIf(CensoPm4::KExec, CensoPm4::KExecCopy); // (r0)
 		m_linear_copy_shader     = sh_ctx.GetCs().cs_regs.data_addr;
 		m_linear_copy_generation = shader_generation;
 		TableDispatchSeen(sh_ctx.GetCs(), "dispatch: linear copy", use_thread_dimensions);

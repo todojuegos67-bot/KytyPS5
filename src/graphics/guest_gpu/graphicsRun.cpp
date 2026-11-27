@@ -1,6 +1,7 @@
 #include "local/skip-shader.h"
 #include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
 #include "local/censo-pm4.h" // (w18, KYTY_CENSO_PM4: [censo-pm4])
+#include "local/r0-ab.h" // (r0, KYTY_R0_MARCAS / KYTY_R0_AB)
 #include "local/envio1.h"
 #include "local/envio2.h"
 #include "local/envio3.h"
@@ -2524,6 +2525,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// flow and its span passed over, the walk lands on the next draw; else (not sealed, a speculation, a state pass, a
 		// chunk, a stop, a capture, the record gone) a plain NOP: the span after it is walked as always.
 		if (packet_header == Port2::Header && Port2::Mode() != 0 && Port2::IsMarker(packet, remaining_dw)) {
+			CensoPm4::Retag(CensoPm4::KNopHook); // (r0)
 			const bool can_apply = spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 &&
 			                       g_gpu_state != nullptr && GuestGpu::IsGpuThread() &&
 			                       kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
@@ -2537,6 +2539,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2) The scene hook's CENS marks (6 dwords) around one pass call's draws: the
 		// translation time between them is the pass's cost ([censo-escena]). Passed over.
 		if (packet_header == DsCensoEscena::MarkHeader && DsCensoEscena::IsMark(packet, remaining_dw)) {
+			CensoPm4::Retag(CensoPm4::KNopHook); // (r0)
 			if (spec == nullptr && !m_state_only && GuestGpu::IsGpuThread()) DsCensoEscena::GpuMark(packet);
 			m_draw_run_skip = 0; // (como las marcas NATV)
 			cursor.offset_dw += DsCensoEscena::MarkDwords;
@@ -2547,6 +2550,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// (F5 pase 2, =3 / =1) The shadow hook's NATV marks (6 dwords) around one bucket's draws: the native cascade
 		// (renderer/dsSombrasNativas.inc). Passed over; in a speculation or a state pass, nothing else.
 		if (packet_header == DsNativoSombras::MarkHeader && DsNativoSombras::IsNatMark(packet, remaining_dw)) {
+			CensoPm4::Retag(CensoPm4::KNopHook); // (r0)
 			if (spec == nullptr && !m_state_only && GuestGpu::IsGpuThread() &&
 			    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3)) {
 				CheckBuffer();
@@ -2589,6 +2593,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// those packets run too (the emulated image is the one shown). Refused, unsealed, a speculation, a state pass or a
 		// chunked walk: the announcement alone is passed over and the game's packets run as always.
 		if (packet_header == DsNativoPase::Header && DsNativoPase::IsPacket(packet, remaining_dw)) {
+			CensoPm4::Retag(CensoPm4::KNopHook); // (r0)
 			uint32_t advance = DsNativoPase::PacketDwords;
 			if (spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 && g_gpu_state != nullptr &&
 			    GuestGpu::IsGpuThread() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
@@ -2619,6 +2624,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// boundary could lie within the packets passed over, nor with KYTY_SPECULATE at all (its state passes run the
 		// game's register packets, and a commit compares the processor's state with theirs).
 		if (packet_header == DsLinearCopyHook::Header && DsLinearCopyHook::IsPacket(packet, remaining_dw)) {
+			CensoPm4::Retag(CensoPm4::KNopCopy); // (r0)
 			uint32_t advance = DsLinearCopyHook::PacketDwords;
 			if (spec == nullptr && !m_state_only && m_stop_at == nullptr && m_chunk_every == 0 && g_gpu_state != nullptr &&
 			    GuestGpu::IsGpuThread() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
@@ -2695,17 +2701,34 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		// Only state, draws and dispatches keep the deferred read protections pending: before a label, a memory write,
 		// a wait or anything else the pages GPU work writes are protected (PageManager::DeferReadProtection).
-		if (!KeepsDeferredProtection(opcode)) {
+		// (r0, KYTY_R0_MARCAS; local/r0-ab.h) A NOP R_ZERO filler or a user-data marker of the game (CpOpMarker ids 0, 4,
+		// 0xd: the SGPR type only) writes no memory and waits for nothing: the deferred protections stay pending, as for
+		// state packets. The flip markers (0x777 / 0x778 / 0x781) and everything else as before.
+		bool r0_keeps = false;
+		if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO) {
+			const bool marker = remaining_dw >= 2 && (packet[1] & 0xffff0000u) == 0x68750000u;
+			const uint32_t id = marker ? packet[1] & 0xfffu : 0u;
+			if (marker) CensoPm4::Retag(CensoPm4::KNopMarker); // (r0: the census apart)
+			if ((!marker || id == 0x0u || id == 0x4u || id == 0xdu) && R0Ab::Marcas()) {
+				r0_keeps = true;
+				R0Ab::g_kept.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (!r0_keeps && !KeepsDeferredProtection(opcode)) {
+			const uint32_t censo_key = CensoPm4::Current(); // (r0: the flush's time apart, then the packet's again)
 			// (FLUSH-ASYNC, KYTY_FLUSH_ASYNC=1) Packets that write no memory, wait for nothing and signal nothing: the
 			// pending no-access ranges go to a worker (joined before the next flush or protection of this thread).
 			if (opcode == Pm4::IT_NOP || opcode == Pm4::IT_EVENT_WRITE || opcode == Pm4::IT_ACQUIRE_MEM ||
 			    opcode == Pm4::IT_INDIRECT_BUFFER || opcode == Pm4::IT_INDIRECT_BUFFER_CNST || opcode == Pm4::IT_CONTEXT_CONTROL ||
-			    opcode == Pm4::IT_CLEAR_STATE || opcode == Pm4::IT_PFP_SYNC_ME)
+			    opcode == Pm4::IT_CLEAR_STATE || opcode == Pm4::IT_PFP_SYNC_ME) {
+				CensoPm4::Mark(CensoPm4::KProtAsync); // (r0)
 				PageManager::FlushDeferredProtectionAsync();
-			else {
+			} else {
+				CensoPm4::Mark(CensoPm4::KProtSync); // (r0)
 				PageManager::SetLoteSite(0x100u + (opcode & 0xffu)); // (PROT-LOTE v2: which packet waited)
 				PageManager::FlushDeferredProtection();
 			}
+			CensoPm4::Mark(censo_key); // (r0)
 		}
 		// (f5p1 techo, KYTY_F5P1_TECHO=1; local/f5p1-techo.h) In an ON window, a draw of a verified pass 0/1 range of
 		// 0xad8bc0 is passed over (nothing translated, recorded or drawn); everything else runs as always.
@@ -4633,6 +4656,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	}
 #endif
 
+	CensoPm4::RetagIf(0x46u, CensoPm4::KEvBarrier); // (r0: an EVENT_WRITE that records a barrier, apart in the census)
 	RenderLockGuard lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
