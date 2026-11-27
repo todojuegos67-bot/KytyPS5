@@ -1433,9 +1433,14 @@ inline bool EnemyParts(const std::vector<Table>& t, std::vector<EnemyPart>* out)
 // Tipos que pueden ir a otros mundos: normales, de tamaño humano o menor, que andan (sin voladores, sin gigantes, sin
 // los que tienen ESD propia ni los fijos al suelo). c3110 (lagarto de cristal) queda fuera: suelta objetos.
 inline const std::vector<std::string>& CrossPool() {
-	static const std::vector<std::string> pool = {"c2000", "c2010", "c2020", "c2030", "c2070", "c2080", "c2100",
-	                                              "c2110", "c3010", "c3060", "c3070", "c3071", "c3120", "c3131",
-	                                              "c3133", "c4020", "c4021", "c4022", "c4030"};
+	// (rando29) + c2075 (Torre de Latria, m04_00/m04_01; 207500_battle.lua), c2101 (esqueleto grande de m05_01,
+	// 210100_battle.lua), c2130 (mujer sombra de m03_02, 213000_logic/battle.lua), c3130 / c3132 (bugbears de m06_01,
+	// 313000 / 313004_battle.lua). Fuera, comprobado en sus scripts: c3050 (gargola, "Gagoiru 305000", vuela y se activa
+	// por region), c3090 ("Ooka 309000", volador de 30 HP), c3040 (ESD propia en m04.chresdbnd), c3110 (suelta objetos).
+	static const std::vector<std::string> pool = {"c2000", "c2010", "c2020", "c2030", "c2070", "c2075", "c2080",
+	                                              "c2100", "c2101", "c2110", "c2130", "c3010", "c3060", "c3070",
+	                                              "c3071", "c3120", "c3130", "c3131", "c3132", "c3133", "c4020",
+	                                              "c4021", "c4022", "c4030"};
 	return pool;
 }
 
@@ -2213,7 +2218,13 @@ inline const std::vector<Inst>& Insts(const std::filesystem::path& app0) {
 				files.push_back(it->path());
 		}
 		std::sort(files.begin(), files.end());
-		std::set<std::string> pool(CrossPool().begin(), CrossPool().end());
+		std::set<std::string> pool;
+		// (rando29) Solo tipos con su modelo de Bluepoint (app0/characters/cXXXX_*); sin esa carpeta (pruebas fuera del
+		// juego) no se filtra.
+		const bool has_chars = std::filesystem::is_directory(app0 / "characters", ec);
+		for (const auto& m: CrossPool())
+			if (!has_chars || HasBluepointModel(app0, m)) pool.insert(m);
+			else std::printf("[rando] otros mundos: %s sin modelo de Bluepoint, no se usa\n", m.c_str());
 		for (const auto& f: files) {
 			std::vector<uint8_t>   d;
 			std::vector<Table>     t;
@@ -2937,7 +2948,28 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 		}
 		uint64_t xs = Fnv(map, Fnv("mundos", Fnv(seed)));
 		for (size_t i = types.size(); i > 1; i--) std::swap(types[i - 1], types[static_cast<size_t>(SplitMix(&xs) % i)]);
-		const size_t want = static_cast<size_t>(EnvInt("KYTY_DS_RANDOMIZER_CROSS_TYPES", 4, 1, 8));
+		// (rando29) Reparto por mundos: los tipos se toman por turnos de cada mundo de origen (m02..m06, en orden
+		// barajado), asi ningun mundo se queda fuera y el cupo no lo llena el mundo con mas tipos.
+		{
+			std::map<std::string, std::vector<std::string>> by_world;
+			for (const auto& ty: types)
+				for (const auto& in: insts)
+					if (in.model == ty && in.map.substr(0, 3) != world) {
+						by_world[in.map.substr(0, 3)].push_back(ty);
+						break;
+					}
+			std::vector<std::string> worlds;
+			for (const auto& [w, v]: by_world) worlds.push_back(w);
+			for (size_t i = worlds.size(); i > 1; i--) std::swap(worlds[i - 1], worlds[static_cast<size_t>(SplitMix(&xs) % i)]);
+			types.clear();
+			for (size_t r = 0;; r++) {
+				bool any = false;
+				for (const auto& w: worlds)
+					if (r < by_world[w].size()) types.push_back(by_world[w][r]), any = true;
+				if (!any) break;
+			}
+		}
+		const size_t want = static_cast<size_t>(EnvInt("KYTY_DS_RANDOMIZER_CROSS_TYPES", 8, 1, 16));
 		for (const auto& ty: types) {
 			if (xt.size() >= want) break;
 			std::vector<const Inst*> cand;
@@ -2960,33 +2992,69 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 		for (const auto& [ty, ds]: xt) names += (names.empty() ? "" : ", ") + ty + " (" + ds[0].in->map.substr(0, 3) + ")";
 		std::printf("[rando] mapa %s: otros mundos: %zu tipos: %s\n", map.c_str(), xt.size(), names.c_str());
 	}
-	// Cada sitio: un tipo distinto del suyo al azar entre los del mapa y los de otros mundos; perm >= sl.size() = otro mundo
-	// (perm - sl.size() = indice en xt).
-	std::vector<size_t>  perm(sl.size());
-	std::vector<XDonor>  xpick(sl.size());
-	uint64_t             fs = Fnv(map, Fnv("facil", Fnv(seed))); // (rando27) FACIL: ~30 % de los huecos
+	// (rando29) Cada sitio: un tipo distinto del suyo. Antes, uniforme entre tipos del mapa y de otros mundos (con pocos
+	// tipos de fuera salia casi todo de uno o dos). Ahora: un cupo fijo de sitios para otros mundos
+	// (KYTY_DS_RANDOMIZER_CROSS_PCT, por defecto 65 %, repartido al azar) y, dentro de cada grupo, siempre uno de los
+	// tipos menos usados hasta ahora en el mapa (empate al azar): todos los tipos salen casi las mismas veces.
+	// perm >= sl.size() = otro mundo (perm - sl.size() = indice en xt).
+	std::vector<size_t> perm(sl.size());
+	std::vector<XDonor> xpick(sl.size());
+	uint64_t            fs = Fnv(map, Fnv("facil", Fnv(seed))); // (rando27) FACIL: ~30 % de los huecos
+	std::vector<bool>   keep(sl.size(), false), foreign(sl.size(), false);
+	std::vector<size_t> active;
 	for (size_t k = 0; k < sl.size(); k++) {
-		if (Dificultad() == 1 && SplitMix(&fs) % 100 >= 30) {
+		if (Dificultad() == 1 && SplitMix(&fs) % 100 >= 30) keep[k] = true;
+		else active.push_back(k);
+	}
+	if (!xt.empty()) {
+		const size_t pct = static_cast<size_t>(EnvInt("KYTY_DS_RANDOMIZER_CROSS_PCT", 65, 0, 100));
+		std::vector<size_t> order = active;
+		for (size_t i = order.size(); i > 1; i--) std::swap(order[i - 1], order[static_cast<size_t>(SplitMix(&rs) % i)]);
+		const size_t nx = (order.size() * pct + 99) / 100;
+		for (size_t i = 0; i < nx && i < order.size(); i++) foreign[order[i]] = true;
+	}
+	std::map<std::string, size_t> used; // veces que sale cada tipo en este mapa
+	auto least = [&](const std::vector<std::string>& c) -> size_t { // indice en c de uno de los menos usados
+		size_t best = SIZE_MAX, n = 0, pick = 0;
+		for (size_t i = 0; i < c.size(); i++) {
+			const size_t u = used[c[i]];
+			if (u < best) best = u, n = 0;
+			if (u == best && SplitMix(&rs) % ++n == 0) pick = i;
+		}
+		return pick;
+	};
+	for (size_t k = 0; k < sl.size(); k++) {
+		if (keep[k]) {
 			perm[k] = k;
 			continue;
 		}
-		std::vector<const std::vector<size_t>*> other;
+		std::vector<std::string> own;
 		for (const auto& [m, v]: by_type)
-			if (m != sl[k].model) other.push_back(&v);
-		const size_t n = other.size() + xt.size();
-		if (n == 0) {
+			if (m != sl[k].model) own.push_back(m);
+		if (own.empty() && xt.empty()) {
 			perm[k] = k;
 			continue;
 		}
-		const size_t c = static_cast<size_t>(SplitMix(&rs) % n);
-		if (c < other.size()) {
-			const auto& v = *other[c];
-			perm[k]       = v[static_cast<size_t>(SplitMix(&rs) % v.size())];
-		} else {
-			const auto& ds = xt[c - other.size()].second;
-			perm[k]        = sl.size() + (c - other.size());
+		if ((foreign[k] || own.empty()) && !xt.empty()) {
+			std::vector<std::string> c;
+			for (const auto& [ty, ds]: xt) c.push_back(ty);
+			const size_t i  = least(c);
+			used[c[i]]++;
+			const auto& ds = xt[i].second;
+			perm[k]        = sl.size() + i;
 			xpick[k]       = ds[static_cast<size_t>(SplitMix(&rs) % ds.size())];
+		} else {
+			const size_t i = least(own);
+			used[own[i]]++;
+			const auto& v = by_type[own[i]];
+			perm[k]       = v[static_cast<size_t>(SplitMix(&rs) % v.size())];
 		}
+	}
+	if (!used.empty()) {
+		std::string mix;
+		for (const auto& [ty, n]: used)
+			if (n != 0) mix += (mix.empty() ? "" : ", ") + ty + " x" + std::to_string(n);
+		std::printf("[rando] mapa %s: mezcla por tipo: %s\n", map.c_str(), mix.c_str());
 	}
 	// Lo que viaja con el enemigo (del original): indice de modelo (+0x10) y typedata +0x00..+0x13 y +0x18.
 	struct Who {
