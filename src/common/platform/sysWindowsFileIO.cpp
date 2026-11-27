@@ -73,7 +73,7 @@ struct sys_file_t {
 static uint32_t CacheCeroMin() {
 	static const uint32_t min = [] {
 		const char* on = std::getenv("KYTY_CACHE_CERO");
-		if (on == nullptr || on[0] != '1') return 0u;
+		if (on != nullptr && on[0] == '0') return 0u; // (de serie: KYTY_CACHE_CERO=0 lo apaga)
 		long kb = 16;
 		if (const char* v = std::getenv("KYTY_CACHE_CERO_KB"); v != nullptr && v[0] != '\0') kb = std::strtol(v, nullptr, 10);
 		kb = kb < 4 ? 4 : (kb > 65536 ? 65536 : kb);

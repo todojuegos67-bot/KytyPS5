@@ -36,7 +36,7 @@ namespace Trad1 {
 [[nodiscard]] inline uint32_t Mode() {
 	static const uint32_t mode = [] {
 		const char* text = std::getenv("KYTY_TRAD1");
-		const auto  m    = text == nullptr || text[0] == '\0' ? 0u : static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+		const auto  m    = text == nullptr || text[0] == '\0' ? 1u : static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
 		if (m != 0) {
 			std::printf("[trad1] on (KYTY_TRAD1=%u): written V#s renoted per tick without a second ObtainBuffer%s; "
 			            "a [trad1] line every 5 s\n",

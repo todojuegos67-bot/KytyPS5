@@ -830,9 +830,9 @@ uint32_t UncachedReadMinBytes() {
 	static const uint32_t min = [] {
 		const char* on   = std::getenv("KYTY_LECTURA_SIN_CACHE");
 		const char* cero = std::getenv("KYTY_CACHE_CERO"); // (cache-cero: every read of KYTY_CACHE_CERO_KB, default 16)
-		const bool  r    = (on != nullptr && on[0] == '1') || (cero != nullptr && cero[0] == '1');
+		const bool  r    = (on != nullptr && on[0] == '1') || (cero == nullptr || cero[0] != '0');
 		uint32_t    kb   = 1024;
-		if (cero != nullptr && cero[0] == '1') {
+		if (cero == nullptr || cero[0] != '0') {
 			const char* v = std::getenv("KYTY_CACHE_CERO_KB");
 			kb = static_cast<uint32_t>(std::clamp<long>(v != nullptr && v[0] != '\0' ? std::strtol(v, nullptr, 10) : 16, 4, 1L << 16));
 			std::printf("[cache-cero] ON: lecturas >= %u KiB del juego, del nucleo y de los almacenes de pipelines sin cache de "
@@ -949,7 +949,7 @@ void FollowKeptFiles(const std::string& recording, const std::string& root) {
 
 void PrefetchKeptFile(const std::string& path) {
 	// (cache-cero) Reading whole files ahead fills the Windows file cache on purpose: off with KYTY_CACHE_CERO=1.
-	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v != nullptr && v[0] == '1'; }();
+	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v == nullptr || v[0] != '0'; }();
 	if (cero) return;
 	{
 		const std::lock_guard lock(g_kept_files_mutex);
@@ -1467,7 +1467,7 @@ uint64_t OpenFileForReading(const char* path) {
 	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
 	// (cache-cero) KYTY_CACHE_CERO=1: the pipeline stores (static binaries 6.2 GB, blobs) read without the Windows file
 	// cache (FILE_FLAG_RANDOM_ACCESS kept every view of them mapped in the system cache's working set).
-	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v != nullptr && v[0] == '1'; }();
+	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v == nullptr || v[0] != '0'; }();
 	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
 	                          cero ? FILE_FLAG_NO_BUFFERING : FILE_FLAG_RANDOM_ACCESS, nullptr);
 	if (file != INVALID_HANDLE_VALUE && cero) {
