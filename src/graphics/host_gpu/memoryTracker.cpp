@@ -1,3 +1,4 @@
+#include "local/faltas-reciclado.h" // (faltas3)
 #include "graphics/host_gpu/memoryTracker.h"
 #include "live-counters.h"
 
@@ -733,6 +734,7 @@ void MemoryTracker::NoteHostWrite(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	FaltasReciclado::GpuWrite(vaddr, size); // (faltas3, KYTY_FALTAS_RECICLADO; sin tabla: una carga)
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);

@@ -1,3 +1,4 @@
+#include "local/faltas-reciclado.h" // (faltas3, KYTY_FALTAS_RECICLADO)
 #include "local/envio3.h"
 #include "local/techo-faltas.h" // (techo-faltas, KYTY_TECHO: the handler's path)
 #include "local/sync-stats.h"
@@ -455,7 +456,27 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		}
 		const uint64_t tr2 = tramos ? __rdtsc() : 0;
 		if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// (faltas3, KYTY_FALTAS_RECICLADO; off: one relaxed load) A frame page whose every GPU-written byte the game's
+		// frame allocator has handed out again since: dead, dropped without the readback (local/faltas-reciclado.h).
+		const uint64_t page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		if (FaltasReciclado::Active() && !in_remap && FaltasReciclado::PageDead(page) && m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			if (FaltasReciclado::VerifyThis()) {
+				thread_local uint8_t before[TRACKER_PAGE_SIZE], after[TRACKER_PAGE_SIZE];
+				const bool b = LibKernel::Memory::NativeGuardedRead(before, reinterpret_cast<const void*>(page), TRACKER_PAGE_SIZE);
+				m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+				if (b && LibKernel::Memory::NativeGuardedRead(after, reinterpret_cast<const void*>(page), TRACKER_PAGE_SIZE)) {
+					uint64_t changed = 0;
+					for (size_t i = 0; i < TRACKER_PAGE_SIZE; ++i) changed += before[i] != after[i] ? 1u : 0u;
+					FaltasReciclado::g_verify_bytes.fetch_add(changed, std::memory_order_relaxed);
+				}
+				FaltasReciclado::g_verify.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				m_buffer_cache.InvalidateMemoryForWrite(page, TRACKER_PAGE_SIZE);
+				FaltasReciclado::g_skip.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else {
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
 		const uint64_t tr3 = tramos ? __rdtsc() : 0;
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (tramos) {

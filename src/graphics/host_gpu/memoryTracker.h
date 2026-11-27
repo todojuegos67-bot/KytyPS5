@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
+#include "local/faltas-reciclado.h" // (faltas3)
 #include "common/assert.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -184,6 +185,7 @@ public:
 		for (const auto& deferred: s_deferred) deferred.manager->ApplyDeferredProtection(deferred.address, deferred.size);
 		s_deferred.clear();
 		if (is_written) {
+			FaltasReciclado::GpuWrite(vaddr, size); // (faltas3, KYTY_FALTAS_RECICLADO)
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               manager->template ChangeState<DirtySource::Gpu, true>(

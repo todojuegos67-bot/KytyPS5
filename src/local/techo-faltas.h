@@ -12,6 +12,7 @@
 // Linea "[techo-faltas]" cada 5 s (desde Techo::Report, hilo de render).
 #include "local/techo.h"
 #include "local/frame-nativo.h"
+#include "local/faltas-reciclado.h"
 
 #include <atomic>
 #include <cstdint>
@@ -198,6 +199,19 @@ inline void Report(double frames, double ms_cyc) noexcept {
 		std::printf(" | A/B KYTY_FALTAS_TEX: esta ventana %s; media faltas A(antes) %.2f ms (%.0f v) B(nuevo) %.2f ms (%.0f v) -> %+.2f ms/fot",
 		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
 		g_tex_now.store(!was, std::memory_order_relaxed);
+	}
+	char rec[400];
+	FaltasReciclado::Report(rec, sizeof(rec));
+	std::printf("%s", rec);
+	if (FaltasReciclado::Mode() == 2) {
+		static double sum[2] {}, cnt[2] {};
+		const bool    was = FaltasReciclado::g_now.load(std::memory_order_relaxed);
+		sum[was ? 1 : 0] += hilo_ms[0] + hilo_ms[1];
+		cnt[was ? 1 : 0] += 1;
+		const double a = cnt[0] > 0 ? sum[0] / cnt[0] : 0, b = cnt[1] > 0 ? sum[1] / cnt[1] : 0;
+		std::printf(" | A/B KYTY_FALTAS_RECICLADO: esta ventana %s; media faltas A(antes) %.2f ms (%.0f v) B(nuevo) %.2f ms (%.0f v) -> %+.2f ms/fot",
+		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
+		FaltasReciclado::g_now.store(!was, std::memory_order_relaxed);
 	}
 	std::printf(" | perdidos %llu\n", static_cast<unsigned long long>(g_lost.exchange(0, std::memory_order_relaxed)));
 	std::fflush(stdout);

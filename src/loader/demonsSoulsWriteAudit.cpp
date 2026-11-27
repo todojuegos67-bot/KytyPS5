@@ -23,6 +23,7 @@
 //
 // Each hook compares the bytes around what it replaces with 01.007.000's before it patches; one that differs is left
 // out and said. The patches are written before any guest thread runs.
+#include "local/faltas-reciclado.h" // (faltas3)
 #include "loader/demonsSoulsWriteAudit.h"
 
 #include "common/abi.h"
@@ -2255,6 +2256,7 @@ uint64_t KYTY_SYSV_ABI OnFrameAllocAfter(uint64_t address) {
 		const uint64_t value = (g_fa_clock.fetch_add(1, std::memory_order_relaxed) + 1) << 8u | FaAllocatorIndex(slot.object);
 		const uint64_t first = address >> 12u, last = (address + slot.bytes - 1) >> 12u;
 		for (uint64_t page = first; page <= last; ++page) FaNotePage(page, value);
+		FaltasReciclado::Reserved(address, slot.bytes); // (faltas3, KYTY_FALTAS_RECICLADO: lo entregado esta muerto)
 		Count(FAllocs);
 		Count(FAllocPages, last - first + 1);
 		if (FrameOn()) {
