@@ -15,6 +15,8 @@
 //   4 DCB #1 de a150fa  idem, marcador "NASPSSCR"
 //   5 DCB #0 de a0ee77  sombras: SpotShadows (0xa10e20) + CascadedShadows (0xa11220, RenderShadowCascade 0..3)
 //   6 DCB #1 de a0ee77  idem
+#include "techo.h" // (techo: KYTY_TECHO=1 lo enciende en TODAS las DCB/ACB, bloque 7 "resto")
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -31,7 +33,7 @@ namespace CensoPm4 {
 [[nodiscard]] inline bool On() {
 	static const bool on = [] {
 		const char* t = std::getenv("KYTY_CENSO_PM4");
-		const bool  o = t != nullptr && t[0] == '1';
+		const bool  o = (t != nullptr && t[0] == '1') || Techo::On();
 		if (o) {
 			std::printf("[censo-pm4] KYTY_CENSO_PM4=1: tiempo por paquete PM4 en 7 bloques (necesita KYTY_CENSO_DCB=1)\n");
 			std::fflush(stdout);
@@ -50,17 +52,17 @@ constexpr uint32_t KSweep    = 324;       // SweepCpuWrites del primer trozo
 constexpr uint32_t KFlush    = 325;       // BufferFlush / BufferFlushDeferrable
 constexpr uint32_t KSlice    = 326;       // resto del trozo (Process fuera del bucle)
 constexpr uint32_t Keys      = 328;
-constexpr uint32_t Sites     = 7;
+constexpr uint32_t Sites     = 8; // (7: techo, cualquier otro trozo: el recorrido PM4 entero queda repartido)
 
 constexpr uint64_t KickTag = 0xD0000000ull, AcbTag = 0xA0000000ull;
-inline constexpr uint64_t kSiteKey[Sites] = {
+inline constexpr uint64_t kSiteKey[Sites - 1] = {
     0xa0ed3eull | ((AcbTag | 4ull) << 32u),  0xa09a7bull | ((KickTag | 0ull) << 32u), 0xa09a7bull | ((KickTag | 1ull) << 32u),
     0xa150faull | ((KickTag | 0ull) << 32u), 0xa150faull | ((KickTag | 1ull) << 32u), 0xa0ee77ull | ((KickTag | 0ull) << 32u),
     0xa0ee77ull | ((KickTag | 1ull) << 32u)};
 inline constexpr const char* kSiteName[Sites] = {
     "ACB #4 a0ed3e VirtualGeometry::PreRenderJob", "DCB #0 a09a7b RenderDepth2/GBuffer/Decal",
     "DCB #1 a09a7b RenderDepth2/GBuffer/Decal", "DCB #0 a150fa postproceso", "DCB #1 a150fa postproceso (NASPSSCR)",
-    "DCB #0 a0ee77 sombras Spot/Cascadas", "DCB #1 a0ee77 sombras Spot/Cascadas"};
+    "DCB #0 a0ee77 sombras Spot/Cascadas", "DCB #1 a0ee77 sombras Spot/Cascadas", "resto de DCB/ACB (techo)"};
 
 struct Cell { std::atomic<uint64_t> n {0}, cyc {0}; };
 inline Cell                  g_cells[Sites][Keys];
@@ -94,9 +96,9 @@ struct SliceScope {
 	int prev_site;
 	explicit SliceScope(uint64_t site_key): prev_site(t_site) {
 		t_site = -1;
-		if (site_key == 0 || !On()) return;
+		if (!On() || (site_key == 0 && !Techo::On())) return;
 		for (uint32_t i = 0; i < Sites; ++i)
-			if (kSiteKey[i] == site_key) {
+			if (i == Sites - 1 ? Techo::On() : kSiteKey[i] == site_key) {
 				t_site = static_cast<int>(i);
 				t_key  = KSlice;
 				t_last = __rdtsc();
@@ -166,6 +168,49 @@ struct SliceScope {
 	}
 }
 
+// (techo) Draw y dispatch: su paquete lleva el draw/dispatch entero (sus fases de tabla); lo demas es la fila "pm4" de techo.
+[[nodiscard]] inline bool IsWork(uint32_t k) {
+	switch (k) {
+		case 0x15: case 0x16: case 0x24: case 0x25: case 0x27: case 0x2C: case 0x2D: case 0x35: case 0x38: case KExec: case KAfter:
+			return true;
+		default: return false;
+	}
+}
+// (techo) Todas las DCB/ACB juntas: cada tipo de paquete y tramo, ms/fot, paquetes/fot, ns por paquete; y la suma de
+// lo que no es draw ni dispatch (lo que techo llama "PM4/registros fuera de draws y dispatches").
+inline void PrintAll(const uint64_t* n, const uint64_t* c, double f, double us_per_cycle) {
+	uint32_t order[Keys], m = 0;
+	uint64_t rest_c = 0, rest_n = 0, all_c = 0;
+	for (uint32_t k = 0; k < Keys; ++k) {
+		all_c += c[k];
+		if (c[k] == 0 && n[k] == 0) continue;
+		if (!IsWork(k)) {
+			rest_c += c[k];
+			rest_n += n[k];
+		}
+		order[m++] = k;
+	}
+	std::sort(order, order + m, [&](uint32_t a, uint32_t b) { return c[a] > c[b]; });
+	std::printf("[techo] pm4 %.0f fot: Process %.2f ms/fot; fuera de draws y dispatches %.2f ms/fot en %.0f paquetes/fot | top",
+	            f, static_cast<double>(all_c) * us_per_cycle / f / 1e3, static_cast<double>(rest_c) * us_per_cycle / f / 1e3,
+	            static_cast<double>(rest_n) / f);
+	for (uint32_t a = 0, shown = 0; a < m && shown < 24; ++a) {
+		const uint32_t k  = order[a];
+		const char*    nm = NameOf(k);
+		char           buf[24];
+		if (nm == nullptr) {
+			if (k >= KNop && k < KNop + 64) std::snprintf(buf, sizeof(buf), "NOP R_0x%02x", k - KNop);
+			else std::snprintf(buf, sizeof(buf), "op 0x%02x", k);
+			nm = buf;
+		}
+		const double us = static_cast<double>(c[k]) * us_per_cycle;
+		std::printf(" | %s%s %.3f ms %.0f/f", IsWork(k) ? "*" : "", nm, us / f / 1e3, static_cast<double>(n[k]) / f);
+		if (n[k] != 0) std::printf(" %.0f ns", us * 1e3 / static_cast<double>(n[k]));
+		++shown;
+	}
+	std::printf(" | (* = draw/dispatch, ya en sus filas)\n");
+}
+
 // Desde la frontera de frame (hilo GPU).
 inline void OnFrame() {
 	if (!On()) return;
@@ -178,6 +223,9 @@ inline void OnFrame() {
 	const double   ns    = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(clock - clock0).count());
 	const double   us_per_cycle = tsc > tsc0 ? ns / 1000.0 / static_cast<double>(tsc - tsc0) : 0.0;
 	const double   f            = frames;
+	static uint64_t agg_n[Keys], agg_c[Keys];
+	std::fill(std::begin(agg_n), std::end(agg_n), 0);
+	std::fill(std::begin(agg_c), std::end(agg_c), 0);
 	for (uint32_t s = 0; s < Sites; ++s) {
 		struct R { uint32_t k; uint64_t n, c; };
 		R        rows[Keys];
@@ -187,6 +235,8 @@ inline void OnFrame() {
 			const uint64_t n = g_cells[s][k].n.exchange(0, std::memory_order_relaxed);
 			const uint64_t c = g_cells[s][k].cyc.exchange(0, std::memory_order_relaxed);
 			if (n == 0 && c == 0) continue;
+			agg_n[k] += n;
+			agg_c[k] += c;
 			rows[m++] = {k, n, c};
 			total += c;
 		}
@@ -211,6 +261,7 @@ inline void OnFrame() {
 		}
 		std::printf("\n");
 	}
+	if (Techo::On()) PrintAll(agg_n, agg_c, f, us_per_cycle);
 	std::fflush(stdout);
 	frames = 0;
 	tsc0   = tsc;
