@@ -1260,6 +1260,30 @@ uint64_t NativoSombrasNatHook(uint64_t renderer, uint64_t list, uint64_t* ctx, i
 	// (SALTO) El estado final del cubo detras de sus paquetes; sin el, la GPU no puede saltarlo (va draw a draw).
 	uint64_t skip_word = 0;
 	uint32_t skip_dw   = 0;
+	// (TECHO, KYTY_NATIVO_SOMBRAS_TECHO=1, solo pruebas: las sombras salen mal) En el tramo "nativo" del A/B se salta en
+	// ProcessPm4 CADA cubo de las cascadas del sol (ni el juego ni el nativo lo dibujan), con la misma NOP + estado final
+	// del SALTO. El A/B interpolado da asi el maximo que podria ganar cualquier trabajo nativo de sombras.
+	static const bool techo = [] {
+		const char* t = std::getenv("KYTY_NATIVO_SOMBRAS_TECHO");
+		return t != nullptr && t[0] == '1' && t[1] == '\0';
+	}();
+	if (techo && reserve != nullptr && reserve + 1 == before && commands->bottom == bottom && after > before) {
+		static std::atomic<uint64_t> t_yes {0}, t_no {0};
+		const char* skip_why = nullptr;
+		const uint32_t dw    = static_cast<uint32_t>(after - before);
+		const bool ok = dw <= H::NatSkipMaxDw && *reserve == H::NatSkipFiller &&
+		                (NativoSombrasNatSummary(commands, before, after, &skip_why) != 0 || skip_why == nullptr);
+		if (ok) *reserve = H::NatSkipNop(dw + 1u);
+		const uint64_t n = (ok ? t_yes : t_no).fetch_add(1, std::memory_order_relaxed) + 1;
+		if (((t_yes.load(std::memory_order_relaxed) + t_no.load(std::memory_order_relaxed)) & 4095u) == 0)
+			std::printf("[nativo-sombras] TECHO cubos del sol saltados enteros=%llu no saltados=%llu (ultimo motivo: %s)\n",
+			            static_cast<unsigned long long>(t_yes.load()), static_cast<unsigned long long>(t_no.load()),
+			            ok ? "-" : (skip_why != nullptr ? skip_why : "demasiado grande o sin relleno"));
+		(void)n;
+		if (slot != nullptr) H::NatRelease(slot);
+		(void)NativoSombrasNatMark(commands, H::NatEnd, pass, seq);
+		return result;
+	}
 	if (why == nullptr && reserve != nullptr && reserve + 1 == before && commands->bottom == bottom) {
 		const char* skip_why = nullptr;
 		if (NativoSombrasNatSummary(commands, before, after, &skip_why) != 0 || skip_why == nullptr) {
