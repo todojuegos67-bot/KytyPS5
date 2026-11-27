@@ -3414,6 +3414,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// (raiz8, KYTY_RAIZ_ASYNC_RELEASE: the read releases the GPU thread left of this readback's pages applied
 			// here, by the thread that waited for them - the GPU thread goes on meanwhile -.)
 			const uint64_t r0 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)
+			// (sync6, KYTY_TECHO: measurement only) Of the window's pages put in here, how many RECICLADO knows dead
+			// (every GPU-written byte re-reserved since): what a "defer only dead pages" variant could leave.
+			if (FaltasReciclado::t_medir)
+				for (const auto& page: request->pages)
+					for (uint64_t at = page.address & ~uint64_t {0xfff}; at < page.address + page.size; at += 0x1000)
+						(FaltasReciclado::PageDead(at) ? FaltasReciclado::g_win_dead : FaltasReciclado::g_win_live)
+						    .fetch_add(1, std::memory_order_relaxed);
 			for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
 			if (r0 != 0) FaltasReciclado::g_rb_release.fetch_add(__rdtsc() - r0, std::memory_order_relaxed);
 		}

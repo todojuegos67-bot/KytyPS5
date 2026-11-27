@@ -222,6 +222,11 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	std::printf(" | lectura de vuelta en el hilo del juego (%.0f/fot): espera a la GPU %.2f ms, copia %.2f ms, put-in de guardados %.2f ms",
 	            static_cast<double>(rn - lrn) / frames, ms(rw - lrw), ms(rc - lrc), ms(rr - lrr));
 	lrw = rw, lrc = rc, lrr = rr, lrn = rn;
+	static uint64_t lwd = 0, lwl = 0;
+	const uint64_t  wd = FaltasReciclado::g_win_dead.load(), wl = FaltasReciclado::g_win_live.load();
+	std::printf(" (paginas de la ventana: muertas %.1f/fot, vivas %.1f/fot)", static_cast<double>(wd - lwd) / frames,
+	            static_cast<double>(wl - lwl) / frames);
+	lwd = wd, lwl = wl;
 	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
 	            ms(st - lst), ms(sr - lsr));
 	lst = st, lsr = sr, lsn = sn;

@@ -43,6 +43,8 @@ inline std::atomic<uint64_t> g_inv_lock {0}, g_inv_flush {0}, g_inv_regions {0};
 // semaforo maestro y operaciones prioritarias), copia a la memoria del juego (WriteBackGpuOwned), put-in de bytes
 // guardados (PageManager::ApplyDeferredReleases). Ciclos y lecturas de vuelta asincronas.
 inline std::atomic<uint64_t> g_rb_wait {0}, g_rb_copy {0}, g_rb_release {0}, g_rb_n {0};
+// (sync6) Paginas de la ventana de la lectura de vuelta de una falta: muertas segun la tabla / vivas. Solo mide.
+inline std::atomic<uint64_t> g_win_dead {0}, g_win_live {0};
 
 inline std::atomic<int>  g_mode {-1};
 inline std::atomic<bool> g_now {false}, g_off {false};
