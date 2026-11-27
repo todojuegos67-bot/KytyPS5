@@ -26,6 +26,9 @@ struct Row {
 // clang-format off
 const Row kRows[] = {
 	// Tabs and titles
+	{{"Traducir chat", "Translate chat", "Traduzir chat", "Traduire le chat", "Traduci chat", "Chat \xC3\xBC" "bersetzen"}},
+	{{"Traduce al idioma del men\xC3\xBA los mensajes que recibes (Google / MyMemory, gratis). Pasa el rat\xC3\xB3n por un mensaje para ver el original.", "Translates the messages you receive into the menu language (Google / MyMemory, free). Hover a message to see the original.", "Traduz para o idioma do menu as mensagens que voc\xC3\xAA recebe (Google / MyMemory, gr\xC3\xA1tis). Passe o mouse sobre uma mensagem para ver o original.", "Traduit dans la langue du menu les messages re\xC3\xA7us (Google / MyMemory, gratuit). Survolez un message pour voir l'original.", "Traduce nella lingua del men\xC3\xB9 i messaggi ricevuti (Google / MyMemory, gratis). Passa il mouse su un messaggio per vedere l'originale.", "\xC3\x9C" "bersetzt empfangene Nachrichten in die Men\xC3\xBCsprache (Google / MyMemory, kostenlos). Maus \xC3\xBC" "ber eine Nachricht: Original."}},
+	{{"Original: ", "Original: ", "Original: ", "Original : ", "Originale: ", "Original: "}},
 	{{"Imagen", "Image", "Imagem", "Image", "Immagine", "Bild"}},
 	{{"Frame generation", "Frame generation", "Gera\xC3\xA7\xC3\xA3o de quadros", "G\xC3\xA9n\xC3\xA9ration d'images", "Generazione di frame", "Frame-Generierung"}},
 	{{"Calidad grafica", "Graphics quality", "Qualidade gr\xC3\xA1" "fica", "Qualit\xC3\xA9 graphique", "Qualit\xC3\xA0 grafica", "Grafikqualit\xC3\xA4t"}},
@@ -815,6 +818,8 @@ void SetLanguage(const std::string& id) {
 	for (int i = 0; i < kMenuLanguageCount; i++)
 		if (id == kMenuLanguages[i]) g_lang = i;
 }
+
+const char* Language() { return kMenuLanguages[g_lang]; }
 
 const char* T(const char* es) {
 	if (g_lang == 0 || es == nullptr) return es;

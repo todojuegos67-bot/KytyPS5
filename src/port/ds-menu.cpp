@@ -10038,13 +10038,23 @@ void Draw(float unit, const std::vector<std::string>& fallback) {
 	g_unread[g_open_with] = 0;
 	ImGui::Spacing();
 	ImGui::TextColored(kGold, "%s", (std::string(I18n::T("Chat con ")) + g_open_with).c_str());
+	ImGui::SameLine(); // (chat-tr) Traducir chat: Sí/No, saved at once in settings.ini
+	if (bool tr = g_saved.chat_translate; ImGui::Checkbox(I18n::T("Traducir chat"), &tr)) {
+		Settings on_disk;
+		if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+		for (Settings* s: {&on_disk, &g_saved, &g_edit}) s->chat_translate = tr;
+		(void)SaveSettings(g_rt.ini_path, on_disk);
+	}
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", I18n::T("Traduce al idioma del menú los mensajes que recibes (Google / MyMemory, gratis). Pasa el ratón por un mensaje para ver el original."));
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.07f, 0.09f, 0.9f});
 	ImGui::BeginChild("##chatlog", {0, std::round(260 * unit)}, ImGuiChildFlags_Borders);
 	for (const auto& l: g_convo[g_open_with]) {
 		const ImVec4 col = l.mine ? ImVec4 {0.72f, 0.82f, 1.0f, 1.0f} : ImVec4 {0.93f, 0.91f, 0.88f, 1.0f};
 		ImGui::PushStyleColor(ImGuiCol_Text, col);
-		ImGui::TextWrapped("%s: %s", l.mine ? I18n::T("Tú") : l.from.c_str(), l.text.c_str());
+		const std::string tr = !l.mine && g_saved.chat_translate ? On::TranslatedText(l.text, I18n::Language()) : ""; // (chat-tr)
+		ImGui::TextWrapped("%s: %s", l.mine ? I18n::T("Tú") : l.from.c_str(), tr.empty() ? l.text.c_str() : tr.c_str());
 		ImGui::PopStyleColor();
+		if (!tr.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s%s", I18n::T("Original: "), l.text.c_str());
 	}
 	if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) ImGui::SetScrollHereY(1.0f);
 	ImGui::EndChild();

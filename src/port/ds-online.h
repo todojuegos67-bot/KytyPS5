@@ -47,4 +47,18 @@ struct ChatMessage {
 bool Chat(const std::string& host_port, const std::string& name, const std::string& password, const std::string& to, const std::string& text,
           std::vector<ChatMessage>* inbox, std::vector<std::string>* online, std::string* error);
 
+// (chat-tr) Automatic translation of the chat messages received, to the reader's menu language. Free, no key:
+// Google's public endpoint (translate.googleapis.com, client=gtx) first, MyMemory (api.mymemory.translated.net,
+// ~5000 chars/day per IP) if it fails. One worker thread, 3 s timeouts, a cache per text+language; never blocks.
+// TranslatedText: the translation when ready and different from `text`; empty while pending, if the message is
+// already in `lang` or if every service failed (then the original is shown; it is tried again after 2 minutes).
+std::string TranslatedText(const std::string& text, const std::string& lang);
+// Pure helpers (tested offline): percent-encoding of UTF-8, the request paths, and the answers' parsing.
+std::string UrlEncode(const std::string& s);
+std::string GoogleTranslatePath(const std::string& text, const std::string& lang);
+std::string MyMemoryPath(const std::string& text, const std::string& lang);
+// true: an answer was read (*out the translation, *src the detected language, e.g. "en").
+bool ParseGoogleTranslate(const std::string& json, std::string* out, std::string* src);
+bool ParseMyMemory(const std::string& json, std::string* out, std::string* src);
+
 } // namespace Port::Online

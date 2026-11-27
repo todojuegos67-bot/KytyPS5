@@ -16,6 +16,7 @@ extern const int         kMenuLanguageCount;
 void        SetLanguage(const std::string& id); // unknown: es
 const char* T(const char* es);              // the current language's text (the part from "##" on is kept)
 std::string DetectWindowsLanguage();        // the Windows UI language among kMenuLanguages, else en
+const char* Language();                     // (chat-tr) the current id: es, en, pt, fr, it, de
 int         GameLanguageFor(const std::string& id); // the PS5 console language (--console-language) for a menu language
 
 } // namespace Port::I18n

@@ -304,6 +304,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("multijugador_cuenta", s->online_name);
 	str("multijugador_clave", s->online_password);
 	str("multijugador_amigos", s->online_friends); // (chat1)
+	boo("chat_traducir", s->chat_translate); // (chat-tr)
 	boo("sin_trucos", s->no_cheats); // (stats1)
 	boo("randomizer", s->randomizer); // (rando1)
 	boo("randomizer_otros_mundos", s->randomizer_cross); // (rando20) enemigos de otros mundos (KYTY_DS_RANDOMIZER_CROSS)
@@ -641,6 +642,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "multijugador_clave=" << s.online_password << "\n"
 	  << "; Amigos del chat (nombres de cuenta separados por comas)\n"
 	  << "multijugador_amigos=" << s.online_friends << "\n"
+	  << "; Traducir chat: 1 los mensajes recibidos se ven en el idioma del menu (Google / MyMemory, gratis)\n"
+	  << "chat_traducir=" << b(s.chat_translate) << "\n"
 	  << "; Deshabilitar trucos y mejoras: 1 el menu F2 no ofrece trucos, armas, objetos, almas ni nivel, y todos quedan apagados\n"
 	  << "sin_trucos=" << b(s.no_cheats) << "\n"
 	  << "; Randomizer: 1 partida sin conexion con los Trofeos Randomizer (y los trucos apagados); semilla 0 = una nueva cada vez\n"

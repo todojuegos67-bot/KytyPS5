@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -627,6 +628,154 @@ bool Chat(const std::string& host_port, const std::string& name, const std::stri
 		if (const J* c = j.Get("conectados"))
 			for (const auto& e: c->a) online->push_back(e.AsStr());
 	return true;
+}
+
+// ---- (chat-tr) Automatic translation of the chat messages received (see ds-online.h).
+std::string UrlEncode(const std::string& s) {
+	static const char* hex = "0123456789ABCDEF";
+	std::string        out;
+	for (unsigned char c: s) {
+		if (std::isalnum(c) != 0 || c == '-' || c == '_' || c == '.' || c == '~') out += static_cast<char>(c);
+		else {
+			out += '%';
+			out += hex[c >> 4];
+			out += hex[c & 15];
+		}
+	}
+	return out;
+}
+std::string GoogleTranslatePath(const std::string& text, const std::string& lang) {
+	return "/translate_a/single?client=gtx&sl=auto&tl=" + UrlEncode(lang) + "&dt=t&ie=UTF-8&oe=UTF-8&q=" + UrlEncode(text);
+}
+std::string MyMemoryPath(const std::string& text, const std::string& lang) {
+	return "/get?q=" + UrlEncode(text) + "&langpair=" + UrlEncode("autodetect|" + lang);
+}
+static std::string BaseLang(std::string l) { // "en-GB" -> "en", "pt-BR" -> "pt"
+	if (auto d = l.find_first_of("-_"); d != std::string::npos) l.resize(d);
+	for (auto& c: l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	return l;
+}
+bool ParseGoogleTranslate(const std::string& json, std::string* out, std::string* src) {
+	using OnlineCore::J;
+	J j;
+	if (!OnlineCore::Parse(json, &j) || j.t != J::T::Arr || j.a.empty() || j.a[0].t != J::T::Arr) return false;
+	std::string t;
+	for (const auto& seg: j.a[0].a)
+		if (seg.t == J::T::Arr && !seg.a.empty() && seg.a[0].t == J::T::Str) t += seg.a[0].s;
+	if (t.empty()) return false;
+	if (out) *out = t;
+	if (src) *src = j.a.size() > 2 && j.a[2].t == J::T::Str ? BaseLang(j.a[2].s) : "";
+	return true;
+}
+bool ParseMyMemory(const std::string& json, std::string* out, std::string* src) {
+	using OnlineCore::J;
+	J j;
+	if (!OnlineCore::Parse(json, &j) || j.t != J::T::Obj) return false;
+	const J* st = j.Get("responseStatus");
+	const J* d  = j.Get("responseData");
+	if (st == nullptr || st->AsInt() != 200 || d == nullptr || d->t != J::T::Obj) return false;
+	const J* t = d->Get("translatedText");
+	if (t == nullptr || t->t != J::T::Str || t->s.empty() || t->s.rfind("MYMEMORY WARNING", 0) == 0) return false;
+	if (out) *out = t->s;
+	if (src) *src = d->Get("detectedLanguage") && d->Get("detectedLanguage")->t == J::T::Str ? BaseLang(d->Get("detectedLanguage")->s) : "";
+	return true;
+}
+#if defined(_WIN32)
+static bool HttpsGet(const wchar_t* host, const std::string& path, std::string* body) {
+	bool      ok = false;
+	HINTERNET s  = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (s == nullptr) return false;
+	WinHttpSetTimeouts(s, 3000, 3000, 3000, 3000);
+	const std::wstring wpath(path.begin(), path.end()); // (ASCII: the path is percent-encoded)
+	HINTERNET          c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+	HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", wpath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+	if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
+		DWORD code = 0, len = sizeof(code);
+		WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX);
+		char  buf[4096];
+		DWORD got = 0;
+		while (WinHttpReadData(r, buf, sizeof(buf), &got) && got > 0 && body->size() < (1u << 20)) body->append(buf, got);
+		ok = code == 200 && !body->empty();
+	}
+	if (r) WinHttpCloseHandle(r);
+	if (c) WinHttpCloseHandle(c);
+	WinHttpCloseHandle(s);
+	return ok;
+}
+#endif
+namespace {
+struct TrEntry {
+	int         state = 0; // 0 queued, 1 done, 2 failed
+	std::string text;      // the translation (empty: same language)
+	double      failed_at = 0;
+};
+std::mutex                        g_tr_m;
+std::condition_variable           g_tr_cv;
+std::map<std::string, TrEntry>    g_tr_cache; // lang + '\n' + text
+std::deque<std::string>           g_tr_queue;
+bool                              g_tr_started = false;
+double TrNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+// One translation: Google, then MyMemory. false: both failed.
+bool TranslateNow(const std::string& text, const std::string& lang, std::string* out) {
+#if defined(_WIN32)
+	std::string body, t, src;
+	if (HttpsGet(L"translate.googleapis.com", GoogleTranslatePath(text, lang), &body) && ParseGoogleTranslate(body, &t, &src)) {
+		*out = (src == lang || t == text) ? "" : t;
+		return true;
+	}
+	body.clear();
+	if (HttpsGet(L"api.mymemory.translated.net", MyMemoryPath(text, lang), &body) && ParseMyMemory(body, &t, &src)) {
+		*out = (src == lang || t == text) ? "" : t;
+		return true;
+	}
+	if (body.find("DISTINCT LANGUAGES") != std::string::npos) { // MyMemory: the text is already in `lang`
+		out->clear();
+		return true;
+	}
+#else
+	(void)text, (void)lang, (void)out;
+#endif
+	return false;
+}
+void TrWorker() {
+	for (;;) {
+		std::string key;
+		{
+			std::unique_lock lock(g_tr_m);
+			g_tr_cv.wait(lock, [] { return !g_tr_queue.empty(); });
+			key = g_tr_queue.front();
+			g_tr_queue.pop_front();
+		}
+		const auto        nl   = key.find('\n');
+		const std::string lang = key.substr(0, nl), text = key.substr(nl + 1);
+		std::string       out;
+		const bool        ok = TranslateNow(text, lang, &out);
+		std::lock_guard   lock(g_tr_m);
+		TrEntry&          e = g_tr_cache[key];
+		e.state             = ok ? 1 : 2;
+		e.text              = ok ? out : "";
+		e.failed_at         = ok ? 0 : TrNow();
+	}
+}
+} // namespace
+
+std::string TranslatedText(const std::string& text, const std::string& lang) {
+	if (text.empty() || lang.empty() || text.size() > 1000) return {};
+	const std::string key = lang + "\n" + text;
+	std::lock_guard   lock(g_tr_m);
+	auto              it = g_tr_cache.find(key);
+	if (it != g_tr_cache.end()) {
+		if (it->second.state == 1) return it->second.text;
+		if (it->second.state == 0 || TrNow() - it->second.failed_at < 120.0) return {};
+	}
+	g_tr_cache[key].state = 0;
+	g_tr_queue.push_back(key);
+	if (!g_tr_started) {
+		g_tr_started = true;
+		std::thread(TrWorker).detach();
+	}
+	g_tr_cv.notify_one();
+	return {};
 }
 
 } // namespace Port::Online

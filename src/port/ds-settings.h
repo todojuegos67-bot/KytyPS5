@@ -240,6 +240,7 @@ struct Settings {
 	std::string online_server = "127.0.0.1"; // the server's address (127.0.0.1: this PC is the host; friends: its public IP)
 	std::string online_name;                 // the account (F2 / launcher: "Crear cuenta")
 	std::string online_password;
+	bool        chat_translate = true; // (chat-tr) chat_traducir: the messages received, in the menu language
 	std::string online_friends; // (chat1) multijugador_amigos: account names, comma separated
 	// [Avanzado]
 	std::string extra; // KEY=VALUE;KEY=VALUE (run-windows -Set; KEY= removes it)
