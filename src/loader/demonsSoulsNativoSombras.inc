@@ -740,7 +740,21 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 					// tenia el registro: lo lee el hilo de la GPU (gs_user_sgpr) y la entrada solo se dibuja en nativo
 					// si (s10 & 0xffff) == 0, con la fila 0 que se copia aqui.)
 					const uint32_t reg = dcb_treg[k] + 2u;
-					if (dcb_treg[k] >= 0x3FEu || reg < 0x8Cu || reg - 0x8Cu >= 32u) return "skinning: s10 fuera de USER_DATA_GS";
+					if (dcb_treg[k] >= 0x3FEu || reg < 0x8Cu || reg - 0x8Cu >= 32u) {
+						// (DIAG 11-27, log 20261127-041016-200: 1,74 M entradas aqui) En que registro SH esta la tabla (s8) y que
+						// valores SH trae el estado en ese rango: con esto se sabe de donde leer el s10 (otra etapa o sin tabla).
+						static std::atomic<uint32_t> shown {0};
+						if (H::NatDiag() && shown.fetch_add(1, std::memory_order_relaxed) < 12) {
+							const uint32_t t = dcb_treg[k];
+							std::printf("[nativo-sombras] DIAG s10 fuera: reg tabla=0x%x es=%llx pase=%u", t, static_cast<unsigned long long>(dcb_es[k]), slot->pass);
+							if (t < 0x3F0u)
+								for (uint32_t r = t; r < t + 8u; ++r)
+									std::printf(sh_ok[r] != 0 ? " [0x%x]=%08x" : " [0x%x]=?", r, sh_val[r]);
+							std::printf("\n");
+							std::fflush(stdout);
+						}
+						return "skinning: s10 fuera de USER_DATA_GS";
+					}
 					if (!HostMemoryRangeIsReadable(obase, sizeof(d.obj))) return "objeto no legible";
 					d.s10_reg = reg;
 					d.vs      = 1;
