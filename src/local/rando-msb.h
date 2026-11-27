@@ -2377,9 +2377,12 @@ inline bool BuildCross3(const std::string& map, const std::filesystem::path& app
 // scripts/worlds/<mapa>/_cmn/<mapa>_everywhere.cgpr, p. ej. scn020000 de 1-1 cita c2000_0001..0004 y c2010_0001..0003).
 // La cinemática anima su aspecto en el sitio original mientras la lógica (MSB) ya está en el nuevo: cápsula sin cuerpo
 // visible = muro invisible. No se mueven (KYTY_DS_RANDOMIZER_MOVE_CINE=1 los vuelve a mover).
+// (rando21) Solo las escenas del propio mapa: scnWWAAxx para mWW_AA (scn020000 = 1-1, scn020100 = 1-2). Los nombres de
+// enemigo (c2010_0034...) se repiten en cada mapa del mundo; antes, las escenas de 1-2/1-3 del mXX_everywhere.cgpr
+// dejaban quietos en 1-1 a c2010_0005/0006/0034..0050 (soldados de lanza y escudo) sin salir en ninguna escena de 1-1.
 inline void CineScan(const Cg::File& f, const Cg::Rec& r, bool in_scn, const std::vector<std::string>& names,
-                     std::set<std::string>* out) {
-	const bool scn = in_scn || r.name.rfind("scn", 0) == 0 || r.name.rfind("cutscene", 0) == 0;
+                     std::set<std::string>* out, const std::string& pref) {
+	const bool scn = in_scn || r.name.rfind(pref, 0) == 0;
 	if (scn) {
 		for (const auto& [g, i]: r.ch) {
 			const Cg::Obj& ob = f.objs[i];
@@ -2397,7 +2400,7 @@ inline void CineScan(const Cg::File& f, const Cg::Rec& r, bool in_scn, const std
 			}
 		}
 	}
-	for (const auto& s: r.sub) CineScan(f, s, scn, names, out);
+	for (const auto& s: r.sub) CineScan(f, s, scn, names, out, pref);
 }
 inline std::set<std::string> CineNames(const std::string& map, const std::filesystem::path& app0,
                                        const std::vector<std::string>& names) {
@@ -2410,7 +2413,8 @@ inline std::set<std::string> CineNames(const std::string& map, const std::filesy
 	for (const auto& fp: files) {
 		Cg::File f;
 		if (!ReadWhole(fp, &f.d) || !Cg::Parse(&f)) continue;
-		for (const auto& t: f.tops) CineScan(f, t, false, names, &out);
+		const std::string pref = "scn" + map.substr(1, 2) + (map.size() >= 6 ? map.substr(4, 2) : std::string());
+		for (const auto& t: f.tops) CineScan(f, t, false, names, &out, pref);
 	}
 	return out;
 }
@@ -2496,6 +2500,12 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 		const std::string mname = ModelName(models[static_cast<size_t>(ps[i].model)]);
 		if (mname == "c3110") continue; // lagarto de cristal: suelta objetos
 		if (cine.count(ps[i].name) != 0) continue; // (rando19)
+		{ // (rando20) solo con colision valida (parte de tipo 5): el juego toma de ella los grupos del enemigo
+			const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
+			if (coll < 0 || static_cast<size_t>(coll) >= parts.size() || parts[static_cast<size_t>(coll)].size() < 0x10 ||
+			    BI32(parts[static_cast<size_t>(coll)], 0x8) != 5)
+				continue;
+		}
 		size_t         ti = 0;
 		{ // (rando20) solo con colisión válida (tipo 5): ver CollOk
 			const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
@@ -2539,9 +2549,15 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 		std::printf("[rando] mapa %s: fuertes al principio: menos de 2 enemigos movibles, se deja el original\n", map.c_str());
 		return false;
 	}
-	for (auto& c: cs) {
+	// (rando21) La semilla decide: fuerza con ruido (+-20) y distancia con factor 0,5..1,5. Antes era fijo (solo orden
+	// por fuerza y distancia): con cualquier semilla salían los mismos enemigos en los mismos sitios.
+	uint64_t rs = Fnv(map, Fnv(Seed()));
+	std::vector<float> dkey(cs.size());
+	for (size_t i = 0; i < cs.size(); i++) {
+		auto&     c = cs[i];
 		const int k = FuerzaTipo(c.model);
-		c.fuerza    = k >= 0 ? k : 50 - std::min(40, cuenta[c.model]);
+		c.fuerza    = (k >= 0 ? k : 50 - std::min(40, cuenta[c.model])) * 100 + static_cast<int>(SplitMix(&rs) % 4001) - 2000;
+		dkey[i]     = c.dist * (0.5f + static_cast<float>(SplitMix(&rs) % 1001) / 1000.0f);
 	}
 	// Enemigos: más fuertes primero (empate: nombre). Sitios: más cerca del inicio primero.
 	std::vector<size_t> by_f(cs.size()), by_d(cs.size());
@@ -2549,7 +2565,7 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 	std::stable_sort(by_f.begin(), by_f.end(), [&](size_t a, size_t b) {
 		return cs[a].fuerza != cs[b].fuerza ? cs[a].fuerza > cs[b].fuerza : cs[a].name < cs[b].name;
 	});
-	std::stable_sort(by_d.begin(), by_d.end(), [&](size_t a, size_t b) { return cs[a].dist < cs[b].dist; });
+	std::stable_sort(by_d.begin(), by_d.end(), [&](size_t a, size_t b) { return dkey[a] < dkey[b]; });
 
 	// Sitio (MSB) de cada candidato, del archivo original.
 	struct Spot {
