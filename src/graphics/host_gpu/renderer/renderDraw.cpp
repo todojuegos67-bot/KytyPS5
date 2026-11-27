@@ -1,3 +1,4 @@
+#include "local/bda-repite.h" // (bda-repite, KYTY_TECHO: solo mide; table-xpr.inc)
 #include "local/envio1.h" // (envio1: table-xpr.inc)
 #include "local/ds-nativo-sombras.h" // (F5 pase 2, =3/=1: el estado dinamico de los draws de la cascada marcada)
 #include "local/f0-measure.h" // (f0: table-xpr.inc, KYTY_F0)

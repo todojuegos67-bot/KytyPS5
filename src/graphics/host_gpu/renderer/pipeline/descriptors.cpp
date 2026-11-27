@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "slow-log.h"
+#include "local/bda-repite.h" // (bda-repite, KYTY_TECHO: solo mide)
 #include "local/ds-nativo-sombras.h" // (F5 pase 2, =2: quien lee la imagen de profundidad de las cascadas)
 
 #include "common/assert.h"
@@ -2109,13 +2110,25 @@ void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const Pre
 	thread_local std::vector<GuestRange> first_ranges, second_ranges;
 	first_ranges.clear();
 	second_ranges.clear();
+	BdaRepite::Scope repite; // (bda-repite, KYTY_TECHO: solo mide)
+	if (repite.on) {
+		if (first_dma)
+			BdaRepite::AddStage(repite.key, 0, first.runtime->program->bda_read_plan, first.runtime->resources.user_data,
+			                    first.runtime->resources.flattened_srt);
+		if (second_dma)
+			BdaRepite::AddStage(repite.key, 1, second->runtime->program->bda_read_plan, second->runtime->resources.user_data,
+			                    second->runtime->resources.flattened_srt);
+	}
 	const bool bounded = (!first_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
 	    first.runtime->program->bda_read_plan, first.runtime->resources, first_ranges)) &&
 	    (!second_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
 	    second->runtime->program->bda_read_plan, second->runtime->resources, second_ranges));
 	if (bounded) {
 		first_ranges.insert(first_ranges.end(), second_ranges.begin(), second_ranges.end());
+		repite.Eval(true, first_ranges);
 		if (m_context.GetGpuResources().PrepareBdaReadRanges(first_ranges)) return;
+	} else {
+		repite.Eval(false, {});
 	}
 	m_context.GetGpuResources().PrepareBda();
 }

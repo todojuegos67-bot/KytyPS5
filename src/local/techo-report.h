@@ -16,6 +16,8 @@
 
 #include <array>
 
+#include "local/bda-repite.h" // (bda-repite)
+
 namespace Techo {
 
 inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
@@ -52,6 +54,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		std::atexit([] { PrintTable("final"); });
 	}
 	++frames;
+	BdaRepite::Flip(flip_ns); // (bda-repite)
 	if (last.t != 0 && flip_ns - last.t < 5'000'000'000ll) return;
 	Snap now;
 	now.t             = flip_ns;

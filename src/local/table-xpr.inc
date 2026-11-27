@@ -2541,15 +2541,18 @@ void RenderExecutor::TablePrepareBda(const TablePair& pair, std::array<std::span
 	thread_local ShaderRecompiler::IR::ResourceSnapshot snapshot;
 	thread_local std::vector<GuestRange>                ranges, stage_ranges;
 	ranges.clear();
+	BdaRepite::Scope repite; // (bda-repite, KYTY_TECHO: solo mide)
 	bool bounded = true;
 	for (uint32_t st = 0; st < 2 && bounded; ++st) {
 		if (!global(st)) continue;
 		const auto& program = *pair.programs[st];
 		snapshot.user_data.assign(user_data[st].begin(), user_data[st].end());
 		snapshot.flattened_srt.assign(table.blocks[st].begin(), table.blocks[st].begin() + program.table_plan.slots.size());
+		if (repite.on) BdaRepite::AddStage(repite.key, st, program.bda_read_plan, snapshot.user_data, snapshot.flattened_srt);
 		bounded = ShaderRecompiler::IR::EvaluateBdaReadPlan(program.bda_read_plan, snapshot, stage_ranges);
 		ranges.insert(ranges.end(), stage_ranges.begin(), stage_ranges.end());
 	}
+	repite.Eval(bounded, ranges);
 	auto& resources = m_context.GetGpuResources();
 	if (!bounded || !resources.PrepareBdaReadRanges(ranges)) resources.PrepareBda();
 }
