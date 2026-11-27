@@ -60,8 +60,8 @@ inline bool Enabled() {
 		                     !(s != nullptr && std::strcmp(s, "0") == 0);
 		if (enabled) {
 			std::printf("[rando] barajado en el mismo mapa: activo (semilla %s)\n", Seed());
-			std::printf("[rando] enemigos de otros mundos: %s\n",
-			            (c != nullptr && std::strcmp(c, "1") == 0) ? "activo (KYTY_DS_RANDOMIZER_CROSS=1)" : "apagado");
+			(void)c;
+			std::printf("[rando] solo Boletaria (m02), mezcla dentro del mismo mapa; otros mundos: apagado\n");
 			std::fflush(stdout);
 		}
 		return enabled;
@@ -358,9 +358,14 @@ inline bool CrossWorldsOn() {
 	// (rando18) Apagado por defecto: el juego descarta en silencio a los enemigos de otros mundos (logs 111405 y 112432:
 	// lógica y aspecto coinciden y Bluepoint carga sus recursos, pero no aparecen ni atacan). KYTY_DS_RANDOMIZER_CROSS=1
 	// lo vuelve a encender para pruebas.
+	// (rando24) Por ahora solo el primer mundo (m02) y sin mezclar mundos: apagado siempre, se pida o no.
 	static const bool on = [] {
 		const char* c = std::getenv("KYTY_DS_RANDOMIZER_CROSS");
-		return Enabled() && c != nullptr && std::strcmp(c, "1") == 0;
+		if (Enabled() && c != nullptr && std::strcmp(c, "1") == 0) {
+			std::printf("[rando] enemigos de otros mundos: pedido pero apagado (por ahora solo Boletaria, mismo mapa)\n");
+			std::fflush(stdout);
+		}
+		return false;
 	}();
 	return on;
 }
@@ -402,6 +407,29 @@ inline bool MezclaOn() {
 // Copias del mapa redirigidas (MSB + legacy_instances): con otros mundos o con "fuertes al principio". Es lo que
 // consultan fileSystem.cpp y libAmpr.cpp antes de RedirectRead / RedirectedSize.
 inline bool CrossOn() { return DemonioOn() || CrossWorldsOn() || FuertesOn(); }
+
+// (rando24) Alcance: el randomizer solo toca los mapas del primer mundo (Boletaria, m02_xx); el resto, original.
+inline bool InScope(const std::string& map) { return map.size() >= 4 && (map.compare(0, 4, "m02_") == 0 || map.compare(0, 4, "M02_") == 0); }
+
+// (rando24) Hueco del demonio: el soldado c2000_0002 (20.5, 21.2, -123.0; colision 766, npc 200010) del primer patio.
+// Logs 20261127-040451-674 / 040741-877: c2000_0002 lo crea el juego (0x359990 llamada 2) y c2000_0000 no aparece
+// nunca en 0x359990 en ninguna prueba (tampoco con a2e3281). La mezcla deja ese sitio como esta.
+inline const char* DemonioTarget() { return "c2000_0002"; }
+
+// (rando24) KYTY_DS_RANDOMIZER_CGPR=0: la mezcla cambia SOLO el MSB (modelo + NpcParam/think); el legacy_instances.cgpr
+// va original (sin entidades trasplantadas). Prueba de muros invisibles: si con esto no salen, la causa es el trasplante.
+inline bool MezclaCgprOn() {
+	static const bool on = [] {
+		const char* c = std::getenv("KYTY_DS_RANDOMIZER_CGPR");
+		const bool  r = !(c != nullptr && std::strcmp(c, "0") == 0);
+		if (!r && FuertesOn()) {
+			std::printf("[rando] mezcla: solo MSB (KYTY_DS_RANDOMIZER_CGPR=0), legacy_instances original\n");
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	return on;
+}
 
 // (randomizer, fase 3) Bluepoint enlaza cada parte de enemigo del MSB con la entidad del MISMO NOMBRE de
 // scripts/worlds/<mapa>/_cmn/<mapa>_legacy_instances.cgpr (lista en cp11demonssouls/_cmn/cp11instances.crmp, clave
@@ -769,7 +797,7 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 	const std::string pname = GuestStr(reinterpret_cast<const char*>(name_p));
 	const std::string model = GuestStr(reinterpret_cast<const char*>(mname));
 	const int32_t     npc   = *reinterpret_cast<const int32_t*>(td + 0xC);
-	if (DemonioOn() && (pname == "c2000_0000" || call < 40)) { // (demonio) dato: partes que crea el juego (las primeras y el soldado)
+	if (DemonioOn() && (pname == DemonioTarget() || call < 40)) { // (demonio) dato: partes que crea el juego (las primeras y el soldado)
 		static std::atomic<int> dn {0};
 		if (dn.fetch_add(1) < 80) {
 			float pp[3];
@@ -2580,6 +2608,7 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	std::vector<Slot> sl;
 	for (size_t i = 0; i < ps.size(); i++) {
 		if (!ps[i].eligible || cine.count(ps[i].name) != 0) continue;
+		if (DemonioOn() && map == "m02_00_00_00" && ps[i].name == DemonioTarget()) continue; // (rando24) hueco del Vanguard
 		const std::string mname = ModelName(models[static_cast<size_t>(ps[i].model)]);
 		if (mname == "c3110") continue; // lagarto de cristal: suelta objetos
 		const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
@@ -2654,6 +2683,10 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	std::vector<uint8_t>   msb2 = BuildTables(t);
 	std::vector<Table>     check;
 	std::vector<EnemyPart> check_ps;
+	if (!MezclaCgprOn()) { // (rando24) solo MSB: cgpr original
+		swaps.clear();
+		new_objs = tf.objs.size();
+	}
 	if (!Cg::Transplant(tf, swaps, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) ||
 	    !EnemyParts(check, &check_ps) || check_ps.size() != ps.size()) {
 		std::printf("[rando] mapa %s: mezcla: el resultado no se relee bien, se deja el original\n", map.c_str());
@@ -2881,7 +2914,7 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 // donante + modelo y chrid) lo hace el gancho en memoria solo para la parte en ese sitio, igual que el resto del mapa.
 inline bool BuildDemonio(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_io,
                          std::vector<uint8_t>* cgpr_io) {
-	static const char* kTarget   = "c2000_0000";
+	static const char* kTarget   = DemonioTarget(); // (rando24) antes c2000_0000, que el juego no crea
 	static const char* kDonorMap = "m03_01_00_00";
 	static const char* kDonor    = "c1030_0000";
 	if (map != "m02_00_00_00") return false;
@@ -2976,10 +3009,10 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 		std::lock_guard<std::mutex> lock(HookMutex());
 		HookSwaps().push_back(h);
 	}
-	std::printf("[demonio] %s: hueco del soldado c2000_0000 (%.1f, %.1f, %.1f), colision %d: alli esta %s (%s, npc %d) -> tipo "
+	std::printf("[demonio] %s: hueco del soldado %s (%.1f, %.1f, %.1f), colision %d: alli esta %s (%s, npc %d) -> tipo "
 	            "Vanguard c1030 npc %d (entidad de %s %s); nada se mueve, MSB sin tocar (el tipo lo cambia el gancho); cgpr %zu -> %zu "
 	            "objetos\n",
-	            map.c_str(), static_cast<double>(slot[0]), static_cast<double>(slot[1]), static_cast<double>(slot[2]), BI32(pb, td + 0x1C),
+	            map.c_str(), kTarget, static_cast<double>(slot[0]), static_cast<double>(slot[1]), static_cast<double>(slot[2]), BI32(pb, td + 0x1C),
 	            sname.c_str(), smodel.c_str(), h.orig_npc, h.new_npc, kDonorMap, kDonor, tf.objs.size(), new_objs);
 	std::fflush(stdout);
 	msb_io->swap(msb2);
@@ -3034,8 +3067,9 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 	std::vector<uint8_t> msb, cg;
 	// (demonio) El Vanguard va ENCIMA de lo que haga el randomizer (antes lo sustituia: sin "[rando] mapa" en ningun mapa).
 	bool built = false;
-	if (FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
-	else if (CrossWorldsOn()) built = BuildCross3(map, app0, &msb, &cg);
+	const bool scope = InScope(map); // (rando24) solo Boletaria
+	if (scope && FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
+	else if (scope && CrossWorldsOn()) built = BuildCross3(map, app0, &msb, &cg);
 	if (built && !DynVisualOn() && !FuertesOn() && Enabled()) ShuffleBytes(map, msb); // barajado de la fase 1 en la copia
 	if (DemonioOn() && map == "m02_00_00_00") {
 		if (!built) { // sin copia del randomizer: los originales (modo barajar: barajados antes, como en memoria)
@@ -3107,6 +3141,7 @@ inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 
 // Fase 1 sobre lo leído en memoria. Si el mapa ya va por la copia (fase 2), la copia ya está barajada: no se toca.
 inline bool Shuffle(const std::string& path, std::vector<uint8_t>& bytes) {
+	if (!InScope(Detail::Lower(MapName(path)))) return false; // (rando24) solo Boletaria
 	if (FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
 	if ((CrossWorldsOn() || DemonioOn()) && !RedirectRead(path).empty()) return false; // la copia ya va barajada
 	return ShuffleBytes(MapName(path), bytes);

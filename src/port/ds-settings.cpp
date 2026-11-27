@@ -1407,6 +1407,12 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		std::printf("[port] randomizer: activo, semilla %lld%s, otros mundos %s (sin conexion, trucos apagados)\n", seed,
 		            s.randomizer_seed != 0 ? "" : " (aleatoria)", s.randomizer_cross ? "si" : "no");
 	}
+	else { // (rando24) Apagado: se quitan los del arranque anterior (el mismo lanzador los dejaba puestos y la mezcla
+	       // corria con el randomizer apagado: log 20261127-040741-877, misma semilla 748692 que la partida anterior).
+		env.Set("KYTY_DS_RANDOMIZER", "");
+		env.Set("KYTY_DS_RANDOMIZER_SEED", "");
+		env.Set("KYTY_DS_RANDOMIZER_CROSS", "");
+	}
 	// (11-21) The switches the test folder played with for days (native memory KYTY_RAIZ, the RAM savings RAM16 / RAM17 /
 	// RAM2 / RAM_NATIVE_TEX, the hitch fixes TIRON1-13...): on by default for everyone, first; settings.ini extra goes
 	// after them and can still change any (KEY=value, KEY= removes it). They were only in that folder's settings.ini.
