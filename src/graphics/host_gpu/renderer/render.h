@@ -18,6 +18,10 @@
 #include <unordered_set>
 #include <vector>
 
+namespace DsNativoSombras {
+struct NatSlot; // (ALFA-a: local/ds-nativo-sombras.h)
+} // namespace DsNativoSombras
+
 namespace Libs::Graphics {
 
 class Image;  // (render1 F2)
@@ -269,6 +273,7 @@ public:
 	// primero del cubo copia la capa emulada a la imagen propia; true (solo =1, cascada ya validada): no hacer el draw.
 	// El ejecutor de draws del hilo de la GPU.
 	void               DsNatMark(CommandBuffer& buffer, uint32_t kind_pass, uint32_t seq);
+	void DsNatAlfaProbe(CommandBuffer& buffer, const DsNativoSombras::NatSlot& slot); // (ALFA-a: resolver T#/S#, contar)
 	[[nodiscard]] bool DsNatBeforeDraw(CommandBuffer& buffer, uint64_t index_addr, uint32_t index_count);
 	[[nodiscard]] bool DsNatWants() const noexcept; // (un cubo de sombras marcado en curso: ProcessPm4 llama a DsNatBeforeDraw)
 	// (B1) La imagen de profundidad del ultimo draw (ResolveRenderDepthTarget: la misma busqueda del draw) y su direccion.

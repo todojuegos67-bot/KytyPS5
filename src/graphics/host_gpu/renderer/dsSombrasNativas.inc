@@ -1381,6 +1381,7 @@ void RenderExecutor::DsNatMark(CommandBuffer& buffer, uint32_t kind_pass, uint32
 		if (s.slot != nullptr && s.slot->pass == pass) s.entries_seen[pass] += s.slot->count;
 		if (s.slot == nullptr) return DsNatFail("sin datos del gancho (captura fallida: ver motivos)");
 		if (s.slot->pass != pass || s.slot->count == 0) return DsNatFail("ranura de otro cubo");
+		if (H::NatAlfaOn() && s.slot->alfa_n != 0) DsNatAlfaProbe(buffer, *s.slot); // (ALFA-a: solo cuenta)
 		// (11-27, log 20261127-045004-895: solo la cascada 0 (la cercana) da nativo_mas_cerca 0,048 %, err_max 0,14.) El cubo 3
 		// es kRS_Depth_Fadeout (0x25b3a10; 0xa13e60/0xa12de0 ponen ctx[0x27] = 0xc solo para el): objetos que se desvanecen
 		// con descarte en el PS, que el nativo (sin PS) dibuja enteros. Ese cubo lo dibuja el juego.
@@ -1793,6 +1794,76 @@ bool RenderExecutor::DsNatBeforeDraw(CommandBuffer& buffer, uint64_t index_addr,
 
 bool RenderExecutor::DsNatWants() const noexcept {
 	return g_ds_nat.phase != DsNatState::Idle;
+}
+
+// (ALFA-a, KYTY_NATIVO_SOMBRAS_ALFA=1) Las entradas F1 de recorte alfa que el gancho capturo en este cubo: su T# con
+// ResolveTexture (el mismo que usa RebindImages en los draws del emulador) y FindTexture (el de AcquireImages), y su S#
+// con la cache de samplers. Mismo marco que DsShadowCopyLayer: candado de render y fuera de cualquier pase de render
+// (FindTexture puede subir la imagen). Solo cuenta; nada se dibuja. 1 de cada 16 cubos con F1, para no pesar en el A/B.
+void RenderExecutor::DsNatAlfaProbe(CommandBuffer& buffer, const DsNativoSombras::NatSlot& slot) {
+	static uint32_t calls = 0;
+	static uint64_t c_try = 0, c_null = 0, c_noimg = 0, c_view = 0, c_noview = 0, c_sampler = 0, c_nosampler = 0;
+	static std::chrono::steady_clock::time_point next = std::chrono::steady_clock::now();
+	static bool logged = false;
+	if ((calls++ & 15u) != 0 || slot.alfa_n == 0) return;
+	if (buffer.IsInvalid() || Role() != 0 || Spec::Current() != nullptr || FrameCapture::Active() ||
+	    SkipShader::g_any.load(std::memory_order_relaxed))
+		return;
+	m_context.GetCommandScheduler().PopPendingOperations();
+	Envio1::NoteDispatch();
+	std::optional<Envio1::Scope> envio1_lock(std::in_place, Envio1::Lock);
+	RenderLockGuard              lock(m_context.GetMutex());
+	envio1_lock.reset();
+	buffer.EndRendering(); // (como DsShadowCopyLayer: el siguiente draw lo reabre)
+	buffer.InvalidateGraphicsState();
+	auto&                              cache = m_context.GetTextureCache();
+	ShaderRecompiler::IR::ImageResource res {};
+	res.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+	res.numeric_class  = Prospero::TextureNumericClass::Float;
+	res.dimension      = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+	res.read           = true;
+	res.source         = 0xA1FA0000u; // (clave propia en la cache de ResolveTexture)
+	for (uint32_t i = 0; i < slot.alfa_n && i < DsNativoSombras::NatAlfaMax; ++i) {
+		const auto& a = slot.alfa[i];
+		++c_try;
+		ShaderTextureResource t {};
+		std::memcpy(t.fields, a.tsharp, sizeof(t.fields));
+		if (t.IsNull()) { ++c_null; continue; }
+		ShaderRecompiler::IR::DescriptorValue v {};
+		for (uint32_t j = 0; j < 8; ++j) v.dwords[j] = a.tsharp[j];
+		v.dword_count = 8;
+		TextureBinding b = ResolveTexture(res, v);
+		if (!b.image_id || b.desc.info.data.address != t.Base40()) { ++c_noimg; continue; }
+		const vk::ImageView view = cache.FindTexture(b.image_id, b.desc);
+		if (view) ++c_view;
+		else ++c_noview;
+		ShaderSamplerResource smp {};
+		std::memcpy(smp.fields, a.ssharp, sizeof(smp.fields));
+		smp.fields[0] &= ~(0x7u << 12u); // (sin comparacion de profundidad, como NativeSampler)
+		const vk::Sampler sampler = m_context.GetSamplerCache().GetSampler(smp);
+		if (sampler) ++c_sampler;
+		else ++c_nosampler;
+		if (!logged && view) {
+			logged         = true;
+			const auto& im = cache.GetImage(b.image_id).info;
+			std::printf("[nativo-sombras-alfa] ALFA-a primera textura: T# %08x %08x %08x %08x %08x %08x %08x %08x -> %ux%u "
+			            "formato vk %d, niveles %u, capas %u | S# %08x %08x %08x %08x | umbral %g (entrada %u)\n",
+			            a.tsharp[0], a.tsharp[1], a.tsharp[2], a.tsharp[3], a.tsharp[4], a.tsharp[5], a.tsharp[6], a.tsharp[7],
+			            im.extent.width, im.extent.height, static_cast<int>(im.pixel_format), im.resources.levels,
+			            im.resources.layers, a.ssharp[0], a.ssharp[1], a.ssharp[2], a.ssharp[3], double(a.threshold), a.entry);
+			std::fflush(stdout);
+		}
+	}
+	if (const auto now = std::chrono::steady_clock::now(); now >= next) {
+		next = now + std::chrono::seconds(10);
+		std::printf("[nativo-sombras-alfa] ALFA-a (acumulado, 1 de cada 16 cubos con F1): entradas=%llu T# nulo=%llu sin imagen=%llu "
+		            "con vista=%llu sin vista=%llu sampler=%llu sin sampler=%llu\n",
+		            static_cast<unsigned long long>(c_try), static_cast<unsigned long long>(c_null),
+		            static_cast<unsigned long long>(c_noimg), static_cast<unsigned long long>(c_view),
+		            static_cast<unsigned long long>(c_noview), static_cast<unsigned long long>(c_sampler),
+		            static_cast<unsigned long long>(c_nosampler));
+		std::fflush(stdout);
+	}
 }
 
 } // namespace Libs::Graphics

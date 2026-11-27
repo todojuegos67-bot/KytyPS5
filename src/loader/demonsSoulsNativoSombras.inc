@@ -532,6 +532,69 @@ inline uint32_t NativoSombrasPsKind(uint64_t ps, uint32_t* flag_off) {
 	*flag_off = m.ps_off[i];
 	return m.ps_kind[i];
 }
+// (ALFA, T38 11-27; 9 de 35 PS de skinning, llvm-mc gfx1013) F1: fundido con bandera (cbuf+0x28; con 0 se salta) y
+// recorte alfa: s_load_dwordx2 s[16:17], s[0:1], 0x28 (tabla de samplers); s_load_dwordx4 s[8:11], s[16:17], 0x170
+// (S#); s_load_dwordx8 s[0:7], s[12:13], T (T# en el cbuf); image_sample v0, v[2:3] dmask 0x1 (canal r, UV =
+// param0.y.hi / param0.z.lo); s_load_dword vcc_lo, s[12:13], U (umbral); v_cmp_ge_f32 vcc_lo, vcc_lo, v0 -> descarta si
+// umbral >= r. Devuelve false si el codigo no es exactamente ese esquema.
+inline bool NativoSombrasPsF1(const uint32_t* w, uint32_t len, uint32_t* t_off, uint32_t* u_off) {
+	static constexpr uint32_t pre[] = {0xbfa00003u, 0xbefc0302u, 0xf4040300u, 0xfa000018u, 0xbf8cc07fu, 0xf4001a86u,
+	                                   0xfa000028u, 0xbe8e047eu, 0xbefe0a7eu, 0xbf8cc07fu, 0xbf076a80u};
+	constexpr uint32_t        npre  = sizeof(pre) / sizeof(pre[0]);
+	if (len < npre + 16u || std::memcmp(w, pre, sizeof(pre)) != 0) return false;
+	if (w[len - 1] != 0xbf810000u || w[len - 2] != 0u || w[len - 3] != 0xf8001890u || w[len - 4] != 0xbefe040eu) return false;
+	bool     samplers = false;
+	uint32_t found    = 0;
+	for (uint32_t i = npre; i + 1 < len; ++i) {
+		if (w[i] == 0xf4040400u && w[i + 1] == 0xfa000028u) samplers = true; // (s_load_dwordx2 s[16:17], s[0:1], 0x28)
+		if (w[i] != 0xf4080208u || w[i + 1] != 0xfa000170u) continue;       // (s_load_dwordx4 s[8:11], s[16:17], 0x170)
+		if (i + 12 >= len || w[i + 2] != 0xf40c0006u || (w[i + 3] & 0xFFF00000u) != 0xfa000000u) return false;
+		uint32_t j = i + 4;
+		while (j < i + 7 && w[j] == 0xbf8cc07fu) ++j; // (s_waitcnt)
+		if (w[j] != 0xf0800108u || w[j + 1] != 0x00400002u) return false; // (image_sample v0, v[2:3], s[0:7], s[8:11] dmask 1)
+		if (w[j + 2] != 0xf4001a86u || (w[j + 3] & 0xFFF00000u) != 0xfa000000u) return false;
+		uint32_t c = j + 4;
+		while (c < j + 7 && (w[c] & 0xFFFF0000u) == 0xbf8c0000u) ++c; // (s_waitcnt)
+		if (w[c] != 0x7c0c006au) return false;                       // (v_cmp_ge_f32 vcc_lo, vcc_lo, v0)
+		*t_off = w[i + 3] & 0xFFFFFu;
+		*u_off = w[j + 3] & 0xFFFFFu;
+		++found;
+	}
+	return samplers && found == 1;
+}
+// (ALFA-a) F1 recordado por direccion de PS (memo aparte de NativoSombrasPsKind): 0 no, 1 si con t/u.
+inline bool NativoSombrasPsF1At(uint64_t ps, uint32_t* t_off, uint32_t* u_off) {
+	struct Memo { uint64_t key[16] {}; uint32_t gen[16] {}; uint8_t ok[16] {}; uint32_t t[16] {}, u[16] {}; };
+	static thread_local Memo f;
+	auto&          m = NativoSombrasMemo();
+	const uint32_t i = static_cast<uint32_t>((ps >> 8u) * 0x9E3779B97F4A7C15ull >> 60u);
+	if (f.gen[i] != m.now || f.key[i] != ps) {
+		uint32_t len = 0;
+		while (len < 1024u && NativoSombrasReadable(ps + len * 4u, 4) && reinterpret_cast<const uint32_t*>(ps)[len] != 0xbf810000u) ++len;
+		uint32_t t = 0, u = 0;
+		const bool ok = len < 1024u && NativoSombrasReadable(ps + len * 4u, 4) &&
+		                NativoSombrasPsF1(reinterpret_cast<const uint32_t*>(ps), len + 1u, &t, &u);
+		f.key[i] = ps; f.gen[i] = m.now; f.ok[i] = ok ? 1 : 0; f.t[i] = t; f.u[i] = u;
+	}
+	*t_off = f.t[i];
+	*u_off = f.u[i];
+	return f.ok[i] != 0;
+}
+// (ALFA-a) Los datos de una entrada F1 con el fundido apagado (cbuf+0x28 == 0): T# (cbuf+T), S# (*(tabla+0x28)+0x170) y
+// umbral (cbuf+U). Falso: algo no legible, fundido encendido o T# nulo.
+inline bool NativoSombrasAlfaRead(uint64_t ps_table, uint32_t t_off, uint32_t u_off, DsNativoSombras::NatAlfa& out) {
+	if (ps_table < 0x100000ull || !NativoSombrasReadable(ps_table, 0x30)) return false;
+	const auto*    t  = reinterpret_cast<const uint64_t*>(ps_table);
+	const uint64_t cb = t[3] & 0xFFFFFFFFFFFFull, smp = t[5] & 0xFFFFFFFFFFFFull;
+	if (cb < 0x100000ull || smp < 0x100000ull || !NativoSombrasReadable(cb, 0x2c + 4) || !NativoSombrasReadable(cb + t_off, 32) ||
+	    !NativoSombrasReadable(cb + u_off, 4) || !NativoSombrasReadable(smp + 0x170, 16))
+		return false;
+	if (*reinterpret_cast<const uint32_t*>(cb + 0x28) != 0u) return false; // (fundido encendido)
+	std::memcpy(out.tsharp, reinterpret_cast<const void*>(cb + t_off), sizeof(out.tsharp));
+	std::memcpy(out.ssharp, reinterpret_cast<const void*>(smp + 0x170), sizeof(out.ssharp));
+	std::memcpy(&out.threshold, reinterpret_cast<const void*>(cb + u_off), 4);
+	return (out.tsharp[0] | (out.tsharp[1] & 0xFFu)) != 0;
+}
 // (tipo 2) La bandera que leera el PS: tabla = USER_DATA_PS s[0:1] (SH 0xC/0xD), cbuf = *(tabla+0x18), bandera =
 // *(cbuf+OFF). true: se pudo leer y vale 0 (el PS no descarta). Leida al grabar el draw (los cbuf de Agc no se
 // reescriben despues en el mismo fotograma); la comparacion con el juego lo vigila.
@@ -675,6 +738,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 	namespace H = DsNativoSombras;
 	const DsSombrasAb::Timer cost_fill(DsSombrasAb::CFill);
 	NativoSombrasMemoNew();
+	slot->alfa_n = 0;
 	const auto HostMemoryRangeIsReadable = [](uint64_t a, uint64_t size) { return NativoSombrasReadable(a, size); };
 	const uint64_t entries = (last - first) / 0x20;
 	const uint64_t cam     = ctx[0xb8 / 8] & 0xFFFFFFFFFFFFull;
@@ -902,6 +966,15 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 				info("VS de skinning con PS de fundido apagado (bandera 0: dibujada en nativo)");
 			else if (ps_kind == 2)
 				return "VS de skinning con PS de fundido encendido (la dibuja el juego)";
+			else if (uint32_t t_off = 0, u_off = 0; H::NatAlfaOn() && ps_kind == 0 && vs_kind == 1 && dcb_ps[k] != 0 &&
+			         dcb_ps[k] != ~uint64_t {0} && NativoSombrasPsF1At(dcb_ps[k], &t_off, &u_off)) {
+				// (ALFA-a) Se captura para que el hilo de la GPU resuelva textura y sampler; la entrada la sigue dibujando el juego.
+				if (slot->alfa_n < H::NatAlfaMax && NativoSombrasAlfaRead(dcb_psu[k], t_off, u_off, slot->alfa[slot->alfa_n])) {
+					slot->alfa[slot->alfa_n++].entry = static_cast<uint32_t>(k);
+					info("ALFA-a: F1 capturada (la dibuja el juego)");
+				}
+				return "VS de skinning con PS F1 de recorte alfa (ALFA-a: la dibuja el juego)";
+			}
 			else if (vs_kind == 1 && dcb_ps[k] != 0) {
 				if (H::NatDiag()) {
 					static std::atomic<uint32_t> shown {0};

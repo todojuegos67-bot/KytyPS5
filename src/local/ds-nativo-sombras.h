@@ -279,6 +279,23 @@ inline void GuestServeRequests() {
 // (KYTY_NATIVO_SOMBRAS_SKIN=1, apagado por defecto) Tambien las entradas con skinning: sus vertices son la salida del
 // compute de skinning (Ghidra 0xa92a94: dispatch 0x1d0a900 por objeto; 0x9f80a0 elige el bufer del fotograma por su
 // sello), que la GPU escribe; el hilo de render los obtiene con BufferCache::ObtainBuffer, como el draw emulado.
+// (ALFA-a, KYTY_NATIVO_SOMBRAS_ALFA=1, apagado) Recorte alfa F1 de los PS de skinning: el gancho guarda T#, S# y umbral
+// de hasta NatAlfaMax entradas por cubo; el hilo de la GPU (DsNatAlfaProbe) solo resuelve la textura y el sampler con la
+// cache del emulador y cuenta (nada se dibuja con ellos todavia).
+[[nodiscard]] inline bool NatAlfaOn() {
+	static const bool on = [] {
+		const char* text = std::getenv("KYTY_NATIVO_SOMBRAS_ALFA");
+		return text != nullptr && text[0] == '1' && text[1] == '\0';
+	}();
+	return on;
+}
+struct NatAlfa {
+	uint32_t entry = 0;     // (indice de la entrada en el cubo)
+	uint32_t tsharp[8] {};  // (T#: cbuf + T)
+	uint32_t ssharp[4] {};  // (S#: *(tabla USER_DATA_PS + 0x28) + 0x170)
+	float    threshold = 0; // (cbuf + U: descarta si umbral >= r)
+};
+constexpr uint32_t NatAlfaMax = 8;
 [[nodiscard]] inline bool NatSkinOn() {
 	static const bool on = [] {
 		const char* text = std::getenv("KYTY_NATIVO_SOMBRAS_SKIN");
@@ -319,6 +336,8 @@ struct NatSlot {
 	uint32_t              seq = 0, pass = 0, bucket = 0, count = 0, skipped = 0; // (skipped: entradas omitidas)
 	uint32_t              sh_full = 0; // (1: el gancho entendio todo el bloque hasta el cubo: s10 sin escribir de verdad)
 	uint64_t              block = 0; // (commands->bottom del bloque de la DCB del cubo: el s10 heredado es el mismo en un bloque)
+	uint32_t              alfa_n = 0; // (ALFA-a: entradas F1 capturadas en alfa[])
+	NatAlfa               alfa[NatAlfaMax] {};
 	uint64_t              bias = 0; // (ctx+0xa0, solo informativo: el sesgo se toma de los registros del emulador)
 	// (SALTO, =1) El dword reservado por el gancho justo despues de la marca de inicio (direccion en la DCB) y los dwords
 	// del juego que siguen (los paquetes del cubo). Si el dibujo nativo del cubo entero sale bien en la marca de inicio,
