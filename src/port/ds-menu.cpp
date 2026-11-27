@@ -5588,6 +5588,21 @@ const char* GradeName(int g) {
 }
 
 // The tab (always) and, open or closing, the panel above it. column_x: the left edge of the launcher's column.
+// (tiles-fit) The four bottom tiles (TROFEOS, ONLINE, SIN TRUCOS, RANDOMIZER) share the room left of the right-hand
+// column (JUGAR / Opciones): widths 400/300/300/300 with Px(14) gaps, shrunk evenly when they would reach the column.
+float g_tiles_limit = 0.0f; // the right column's left x (set by Draw each frame); 0 = no limit
+void TileRect(int i, float& tx, float& tw) {
+	const float gap = Px(14), x0 = Px(16);
+	const float base[4] = {Px(400), Px(300), Px(300), Px(300)};
+	const float need  = base[0] + base[1] + base[2] + base[3];
+	const float avail = (g_tiles_limit > 0.0f ? g_tiles_limit - gap : 1e9f) - x0 - gap * 3;
+	const float k     = avail < need ? std::max(avail, 0.0f) / need : 1.0f;
+	tx = x0;
+	for (int j = 0; j < i; j++) tx += std::floor(base[j] * k) + gap;
+	tx = std::round(tx);
+	tw = std::floor(base[i] * k);
+}
+
 void Draw(float width, float height, float column_x) {
 	if (!g_loaded) Reload();
 	auto&        io  = ImGui::GetIO();
@@ -5606,7 +5621,10 @@ void Draw(float width, float height, float column_x) {
 	ImFont*      serif  = g_font_serif != nullptr ? g_font_serif : ImGui::GetFont();
 	ImFont*      semi   = g_font_semi != nullptr ? g_font_semi : ImGui::GetFont();
 	const ImU32  gold   = IM_COL32(222, 196, 140, 255);
-	const float  tx = Px(16), tw = Px(400), th = Px(60);
+	g_tiles_limit = column_x;
+	float tx, tw;
+	TileRect(0, tx, tw);
+	const float th = Px(60);
 	const float  ty = std::round(height - U(34) - th);
 	const float  frac = static_cast<float>(g_pct) / 100.0f;
 
@@ -5961,8 +5979,9 @@ void Draw(float width, float height, float column_x) {
 bool g_online_open = false;
 void DrawOnline(float width, float height) {
 	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
-	const float th = Px(60), tw = Px(300);
-	const float tx = Px(16) + Px(400) + Px(14);
+	const float th = Px(60);
+	float tx, tw;
+	TileRect(1, tx, tw); // (tiles-fit)
 	const float ty = std::round(height - U(34) - th);
 	ImGui::SetNextWindowPos({tx, ty});
 	ImGui::SetNextWindowSize({tw, th});
@@ -6030,8 +6049,9 @@ void DrawOnline(float width, float height) {
 // forces them off at run time; this only moves the control out of the Conexión online panel onto the bottom bar.
 void DrawNoCheats(float width, float height) {
 	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
-	const float th = Px(60), tw = Px(300);
-	const float tx = (Px(16) + Px(400) + Px(14)) + Px(300) + Px(14); // ONLINE's tx + its width + the same Px(14) gap
+	const float th = Px(60);
+	float tx, tw;
+	TileRect(2, tx, tw); // (tiles-fit)
 	const float ty = std::round(height - U(34) - th);
 	ImGui::SetNextWindowPos({tx, ty});
 	ImGui::SetNextWindowSize({tw, th});
@@ -6089,8 +6109,9 @@ void DrawNoCheats(float width, float height) {
 // click draws a new seed. The seed is kept in settings.ini (randomizer_semilla): the same seed, the same draw.
 void DrawRandomizer(float width, float height) {
 	ImFont*     cinzel = g_font_display != nullptr ? g_font_display : ImGui::GetFont();
-	const float th = Px(60), tw = Px(300);
-	const float tx = (Px(16) + Px(400) + Px(14)) + Px(300) + Px(14) + Px(300) + Px(14); // SIN TRUCOS' tx + its width + the gap
+	const float th = Px(60);
+	float tx, tw;
+	TileRect(3, tx, tw); // (tiles-fit)
 	const float ty = std::round(height - U(34) - th);
 	ImGui::SetNextWindowPos({tx, ty});
 	ImGui::SetNextWindowSize({tw, th});
