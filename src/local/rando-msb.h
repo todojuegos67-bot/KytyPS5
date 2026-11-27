@@ -14,7 +14,8 @@
 // c5130), c7xxx (NPC). Modo seguro: ante cualquier dato fuera de rango no se cambia nada.
 //
 // Variables: KYTY_DS_RANDOMIZER=1 + KYTY_DS_RANDOMIZER_SEED (las pone el lanzador), KYTY_DS_RANDOMIZER_SHUFFLE=0 lo
-// apaga. (rando18) Por defecto: "fuertes al principio" (BuildFuertes, mismo mapa, lógica + aspecto juntos);
+// apaga. (rando23) Por defecto: "mezcla" (BuildMezcla: sitios fijos, cambia el enemigo de cada sitio); KYTY_DS_RANDOMIZER_MODE=fuertes
+// vuelve a "fuertes al principio" (BuildFuertes, mueve sitios: lógica + aspecto);
 // KYTY_DS_RANDOMIZER_MODE=barajar vuelve a esta fase 1; KYTY_DS_RANDOMIZER_CROSS=1 enciende la fase 2 (otros mundos).
 
 #include <algorithm>
@@ -374,11 +375,26 @@ inline bool FuertesOn() {
 		const bool  b = m != nullptr && std::strcmp(m, "barajar") == 0;
 		const bool  r = Enabled() && !CrossWorldsOn() && !b;
 		if (Enabled()) {
-			std::printf("[rando] modo: %s\n", r ? "fuertes al principio (mismo mapa, logica + aspecto)"
+			const bool fu = m != nullptr && std::strcmp(m, "fuertes") == 0;
+			std::printf("[rando] modo: %s\n", r ? (fu ? "fuertes al principio (mismo mapa, logica + aspecto)"
+			                                           : "mezcla (mismo mapa: cada sitio igual, cambia el enemigo que lo ocupa)")
 			                                    : (CrossWorldsOn() ? "otros mundos" : "barajar (solo MSB)"));
 			std::fflush(stdout);
 		}
 		return r;
+	}();
+	return on;
+}
+
+// (rando23) "Mezcla" (modo por defecto): ningun sitio se mueve. Posicion, rotacion, colision +0x1C, grupos +0x44,
+// patrulla y la matriz raiz de Bluepoint de cada sitio quedan como en el original; solo cambia QUE enemigo ocupa el
+// sitio (modelo, NpcParam/think/charaInit y su entidad visual de Bluepoint, anclada a la raiz del sitio). Motivo: con
+// sitios movidos salian muros invisibles solo con el randomizer; asi el mundo (colision, grupos, eventos) es identico al
+// original. KYTY_DS_RANDOMIZER_MODE=fuertes vuelve al modo anterior.
+inline bool MezclaOn() {
+	static const bool on = [] {
+		const char* m = std::getenv("KYTY_DS_RANDOMIZER_MODE");
+		return FuertesOn() && !(m != nullptr && std::strcmp(m, "fuertes") == 0);
 	}();
 	return on;
 }
@@ -2525,8 +2541,136 @@ inline int FuerzaTipo(const std::string& m) {
 	return it != k.end() ? it->second : -1;
 }
 
+// (rando23) Mezcla: ver MezclaOn. Es "meter una copia": cada sitio recibe una COPIA del enemigo donante; nada se
+// reubica. Sitios fijos; se permuta (con la semilla) el enemigo de cada sitio entre los enemigos
+// normales del mapa (los mismos elegibles que antes: sin entidad de evento, no citados por eventos, c2xxx/c3xxx, sin
+// cinematica, con colision valida). Un enemigo sin entidad no tiene estado de muerte guardado (los .lua solo usan
+// entidades), asi que no hereda ningun "muerto" de otro sitio.
+inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_out,
+                        std::vector<uint8_t>* cgpr_out) {
+	std::vector<uint8_t> msb;
+	Cg::File             tf;
+	if (!ReadWhole(MsbPathOf(app0, map), &msb) || !ReadWhole(CgprPathOf(app0, map), &tf.d)) return false;
+	if (!Cg::Parse(&tf)) {
+		std::printf("[rando] mapa %s: legacy_instances con formato no reconocido, se deja el original\n", map.c_str());
+		return false;
+	}
+	std::vector<Table> t;
+	if (!ParseTables(msb, &t) || BuildTables(t) != msb) return false;
+	std::vector<EnemyPart> ps;
+	if (!EnemyParts(t, &ps)) return false;
+	auto& models = t[0].blobs;
+	auto& parts  = t[3].blobs;
+	std::vector<uint32_t> refc(tf.objs.size(), 0);
+	for (const auto& r: tf.tops) {
+		std::vector<uint32_t> refs;
+		Cg::CollectRefs(r, &refs);
+		std::sort(refs.begin(), refs.end());
+		refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+		for (uint32_t o: refs) refc[o]++;
+	}
+	std::vector<std::string> enames;
+	for (const auto& e: ps)
+		if (e.eligible) enames.push_back(e.name);
+	const std::set<std::string> cine = CineNames(map, app0, enames);
+	struct Slot {
+		size_t      pi = 0, top = 0;
+		std::string model;
+	};
+	std::vector<Slot> sl;
+	for (size_t i = 0; i < ps.size(); i++) {
+		if (!ps[i].eligible || cine.count(ps[i].name) != 0) continue;
+		const std::string mname = ModelName(models[static_cast<size_t>(ps[i].model)]);
+		if (mname == "c3110") continue; // lagarto de cristal: suelta objetos
+		const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
+		if (coll < 0 || static_cast<size_t>(coll) >= parts.size() || BI32(parts[static_cast<size_t>(coll)], 0x8) != 5) continue;
+		size_t         ti = 0;
+		const Cg::Rec* r  = TopByName(tf, ps[i].name, &ti);
+		if (r == nullptr) continue;
+		const Cg::Root ri = Cg::RootInfo(tf, *r);
+		if (!ri.ok || ri.part != ps[i].index) continue;
+		std::vector<uint32_t> refs;
+		Cg::CollectRefs(*r, &refs);
+		bool shared = false; // como en fuertes: una matriz compartida con otra entidad no es solo de este enemigo
+		for (uint32_t o: refs) shared = shared || (tf.objs[o].hash == Cg::kTransform && refc[o] != 1);
+		if (shared) continue;
+		sl.push_back({i, ti, mname});
+	}
+	if (sl.size() < 2) {
+		std::printf("[rando] mapa %s: mezcla: menos de 2 enemigos, se deja el original\n", map.c_str());
+		return false;
+	}
+	std::vector<size_t> perm(sl.size());
+	for (size_t i = 0; i < perm.size(); i++) perm[i] = i;
+	uint64_t rs = Fnv(map, Fnv("mezcla", Fnv(Seed())));
+	for (size_t i = perm.size() - 1; i > 0; i--) std::swap(perm[i], perm[static_cast<size_t>(SplitMix(&rs) % (i + 1))]);
+	// Lo que viaja con el enemigo (del original): indice de modelo (+0x10) y typedata +0x00..+0x13 y +0x18.
+	struct Who {
+		int32_t model;
+		uint8_t head[0x14], init[4];
+	};
+	std::vector<Who> who(sl.size());
+	for (size_t k = 0; k < sl.size(); k++) {
+		const auto& e = ps[sl[k].pi];
+		const auto& p = parts[e.index];
+		who[k].model  = BI32(p, 0x10);
+		std::memcpy(who[k].head, p.data() + e.td, 0x14);
+		std::memcpy(who[k].init, p.data() + e.td + 0x18, 4);
+	}
+	std::vector<Cg::Swap> swaps;
+	size_t                changed = 0;
+	for (size_t k = 0; k < sl.size(); k++) { // sitio k recibe al enemigo perm[k]
+		const size_t e = perm[k];
+		if (sl[e].model == sl[k].model) continue; // mismo tipo: nada que cambiar
+		const auto& s  = ps[sl[k].pi];
+		auto&       p  = parts[s.index];
+		std::memcpy(p.data() + 0x10, &who[e].model, 4);
+		std::memcpy(p.data() + s.td, who[e].head, 0x14);
+		std::memcpy(p.data() + s.td + 0x18, who[e].init, 4);
+		p[s.td + 0x14] = 0; // agresivo: sin el estado pasivo (rando22)
+		// Copia de la entidad del donante (del archivo original), anclada a la raiz del sitio, con GUID nuevos: el
+		// donante sigue entero en su propio sitio (o recibe a su vez otra copia).
+		swaps.push_back({sl[k].top, &tf, sl[e].top, Fnv(s.name, Fnv("mezcla-guid", Fnv(Seed()))) | 1});
+		changed++;
+		std::printf("[rando] mezcla: %s sitio de %s (%s) -> %s (de %s)\n", map.c_str(), s.name.c_str(), sl[k].model.c_str(),
+		            sl[e].model.c_str(), ps[sl[e].pi].name.c_str());
+	}
+	if (changed == 0) return false;
+	{ // instancias por modelo (+0x18), como en otros mundos
+		std::vector<int32_t> count(models.size(), 0);
+		for (const auto& p: parts) {
+			const int32_t mi = BI32(p, 0x10);
+			if (mi >= 0 && static_cast<size_t>(mi) < count.size()) count[static_cast<size_t>(mi)]++;
+		}
+		for (size_t i = 0; i < models.size(); i++) std::memcpy(models[i].data() + 0x18, &count[i], 4);
+	}
+	std::vector<uint8_t> cg2;
+	size_t               new_objs = tf.objs.size();
+	for (const auto& sw: swaps) {
+		std::vector<uint32_t> refs;
+		Cg::CollectRefs(tf.tops[sw.donor_top], &refs);
+		new_objs += std::set<uint32_t>(refs.begin(), refs.end()).size();
+	}
+	std::vector<uint8_t>   msb2 = BuildTables(t);
+	std::vector<Table>     check;
+	std::vector<EnemyPart> check_ps;
+	if (!Cg::Transplant(tf, swaps, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) ||
+	    !EnemyParts(check, &check_ps) || check_ps.size() != ps.size()) {
+		std::printf("[rando] mapa %s: mezcla: el resultado no se relee bien, se deja el original\n", map.c_str());
+		std::fflush(stdout);
+		return false;
+	}
+	std::printf("[rando] mapa %s: mezcla: %zu sitios con otro enemigo de %zu (sitios, colision y grupos sin tocar)\n",
+	            map.c_str(), changed, sl.size());
+	std::fflush(stdout);
+	msb_out->swap(msb2);
+	cgpr_out->swap(cg2);
+	return true;
+}
+
 inline bool BuildFuertes(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_out,
                          std::vector<uint8_t>* cgpr_out) {
+	if (MezclaOn()) return BuildMezcla(map, app0, msb_out, cgpr_out); // (rando23)
 	std::vector<uint8_t> msb;
 	Cg::File             tf;
 	if (!ReadWhole(MsbPathOf(app0, map), &msb) || !ReadWhole(CgprPathOf(app0, map), &tf.d)) return false;
