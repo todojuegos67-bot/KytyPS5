@@ -77,10 +77,23 @@ inline bool Enabled() {
 // (FNV-1a en mayusculas); "$/cp11demonssouls/dvdroot/chr/c1030/c1030.model?chrid103001" esta. Trazas: creacion
 // (0x359990), modelo (0x1451700, la llama BPDsModel::TryInit 0x60a77b), FUN_01473fb0 (crear instancias del cgpr) y
 // FUN_01472490 (quitar una entidad de las listas del mundo). Apagado: ni una linea de esto se ejecuta.
+// (rando27) Dificultad del randomizer (lanzador, KYTY_DS_RANDOMIZER_DIFICULTAD): 1 facil (~30 % de los huecos con copia),
+// 2 intermedio (todos los huecos elegibles, como hasta ahora), 3 dificil (todos + el Vanguard del primer patio).
+inline int Dificultad() {
+	static const int d = [] {
+		const char* c = std::getenv("KYTY_DS_RANDOMIZER_DIFICULTAD");
+		const int   v = c != nullptr ? std::atoi(c) : 2;
+		return v >= 1 && v <= 3 ? v : 2;
+	}();
+	return d;
+}
 inline bool DemonioOn() {
 	static const bool on = [] {
 		const char* c = std::getenv("KYTY_DEMONIO_PATIO");
-		const bool  r = c != nullptr && std::strcmp(c, "1") == 0;
+		const char* r1 = std::getenv("KYTY_DS_RANDOMIZER");
+		// KYTY_DEMONIO_PATIO=1 sigue valiendo; con el randomizer en DIFICIL va siempre.
+		const bool  r = (c != nullptr && std::strcmp(c, "1") == 0) ||
+		               (r1 != nullptr && std::strcmp(r1, "1") == 0 && Dificultad() == 3 && !(c != nullptr && std::strcmp(c, "0") == 0));
 		if (r) {
 			std::printf("[demonio] KYTY_DEMONIO_PATIO=1: Vanguard (c1030) en el primer patio de Boletaria 1-1\n");
 			std::fflush(stdout);
@@ -758,6 +771,16 @@ constexpr uint64_t kEbootBase = 0x900000000ull;
 
 inline bool GuestPtrOk(uint64_t p) { return p >= 0x10000ull && p < 0x0000800000000000ull && (p & 7) == 0; }
 
+// (rando27) Ghidra: proxy:IsCompleteEvent (FUN_002455c0 la registra en 0x248fc1 con el objeto 0x27b3288 -> FUN_00213ab0)
+// lee, para ids < 20000, FUN_002a7550(*(eboot+0x27bf328), id): bit (id & 7) del byte [obj + id/8], ids hasta 0x467f.
+// 4096 = Falange derrotada (m02_00_00_00.lua).
+inline bool EventFlagOn(uint32_t id) {
+	if (id > 0x467f) return false;
+	const uint64_t obj = *reinterpret_cast<const uint64_t*>(kEbootBase + 0x27bf328);
+	if (!GuestPtrOk(obj)) return false;
+	return ((*reinterpret_cast<const uint8_t*>(obj + (id >> 3)) >> (id & 7)) & 1) != 0;
+}
+
 inline std::string GuestStr(const char* s) {
 	std::string r;
 	if (s == nullptr || !GuestPtrOk(reinterpret_cast<uint64_t>(s) & ~7ull)) return r;
@@ -1123,6 +1146,7 @@ inline void InstallModelProbe() {
 }
 #else
 inline void InstallModelProbe() {}
+inline bool EventFlagOn(uint32_t) { return false; }
 #endif
 
 namespace Detail {
@@ -2683,6 +2707,23 @@ inline int FuerzaTipo(const std::string& m) {
 // normales del mapa (los mismos elegibles que antes: sin entidad de evento, no citados por eventos, c2xxx/c3xxx, sin
 // cinematica, con colision valida). Un enemigo sin entidad no tiene estado de muerte guardado (los .lua solo usan
 // entidades), asi que no hereda ningun "muerto" de otro sitio.
+// (rando27) Mini-jefe de otro mundo en 1-1 tras derrotar a la Falange (flag 4096). Datos (NpcParam de gameparam.parambnd,
+// HP en +0x2C; partes normales elegibles de los MSB: sin entity id, no citadas por eventos, sin charaInit): los de mas
+// HP de otros mundos son c3130 (1290, gigante depravado de m06, demasiado grande para un hueco de soldado), c3131 (860,
+// m06), c2101 (632, esqueleto de m05_01, 7 ejemplares con IA propia 210100: ataca al ver al jugador, tamaño humano) y
+// c2080 (520). Se elige c2101 (m05_01 c2101_0003). Hueco: el arenero c2000_0006 (25.4, 30.2, -48.4; colision 765), el
+// enemigo normal mas cercano a la arena (17.5, 30.5, -3.2) a la misma altura: los hoplitas (860-897) y el nucleo (800)
+// no valen, el eventboss.lua los mata (ForceDead) con la Falange derrotada. No esta en la niebla ni en el camino del
+// ascensor/hoguera de 1-2; es un sitio de soldado de siempre. Antes de 4096 el hueco es el soldado normal.
+inline const char* MiniJefeMap() { return "m02_00_00_00"; }
+inline const char* MiniJefeSlot() { return "c2000_0006"; }
+inline bool FalangeMuerta() {
+	const char* c = std::getenv("KYTY_DS_MINIJEFE"); // 1 / 0: forzar (pruebas)
+	if (c != nullptr && c[0] == '1') return true;
+	if (c != nullptr && c[0] == '0') return false;
+	return EventFlagOn(4096);
+}
+
 // (rando26) Estado final de cada hueco de la mezcla (tipo que debe tener), para los ganchos de las cargas siguientes.
 struct SlotFinal {
 	std::string name, model;
@@ -2731,6 +2772,7 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	for (size_t i = 0; i < ps.size(); i++) {
 		if (!ps[i].eligible || cine.count(ps[i].name) != 0) continue;
 		if (DemonioOn() && map == "m02_00_00_00" && ps[i].name == DemonioTarget()) continue; // (rando24) hueco del Vanguard
+		if (map == MiniJefeMap() && ps[i].name == MiniJefeSlot()) continue; // (rando27) hueco del mini-jefe tras la Falange
 		const std::string mname = ModelName(models[static_cast<size_t>(ps[i].model)]);
 		if (mname == "c3110") continue; // lagarto de cristal: suelta objetos
 		const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
@@ -2810,7 +2852,12 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	// (perm - sl.size() = indice en xt).
 	std::vector<size_t>  perm(sl.size());
 	std::vector<XDonor>  xpick(sl.size());
+	uint64_t             fs = Fnv(map, Fnv("facil", Fnv(seed))); // (rando27) FACIL: ~30 % de los huecos
 	for (size_t k = 0; k < sl.size(); k++) {
+		if (Dificultad() == 1 && SplitMix(&fs) % 100 >= 30) {
+			perm[k] = k;
+			continue;
+		}
 		std::vector<const std::vector<size_t>*> other;
 		for (const auto& [m, v]: by_type)
 			if (m != sl[k].model) other.push_back(&v);
@@ -3244,6 +3291,67 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	return true;
 }
 
+// (rando27) Mini-jefe (ver MiniJefeSlot): copia de c2101_0003 de m05_01 en el hueco c2000_0006 de 1-1. Nada se mueve:
+// MSB sin tocar (tipo e IA por los ganchos 0xef430 / 0x359990 / 0x1451700 desde |finals|), cgpr con la entidad del
+// esqueleto anclada al hueco (colision del suelo y campos de sitio del hueco). |cg| sin relleno.
+inline bool BuildMiniJefe(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* cg,
+                          std::vector<SlotFinal>* finals) {
+	static const char* kDonorMap = "m05_01_00_00";
+	static const char* kDonor    = "c2101_0003";
+	auto fail = [&](const char* why) {
+		std::printf("[rando] mini-jefe: %s; no se pone\n", why);
+		std::fflush(stdout);
+		return false;
+	};
+	if (map != MiniJefeMap()) return false;
+	std::vector<uint8_t>   om, dm;
+	std::vector<Table>     ot, dt;
+	std::vector<EnemyPart> ops, dps;
+	if (!ReadWhole(MsbPathOf(app0, map), &om) || !ParseTables(om, &ot) || !EnemyParts(ot, &ops)) return fail("no se lee el MSB de 1-1");
+	if (!ReadWhole(MsbPathOf(app0, kDonorMap), &dm) || !ParseTables(dm, &dt) || !EnemyParts(dt, &dps)) return fail("no se lee el MSB de m05_01");
+	const EnemyPart* slot = nullptr;
+	for (const auto& e: ops)
+		if (e.name == MiniJefeSlot()) slot = &e;
+	const EnemyPart* don = nullptr;
+	for (const auto& e: dps)
+		if (e.name == kDonor && ModelName(dt[0].blobs[static_cast<size_t>(e.model)]) == "c2101") don = &e;
+	if (slot == nullptr || !slot->eligible) return fail("no esta el hueco c2000_0006");
+	if (don == nullptr || !don->eligible) return fail("no esta c2101_0003 en m05_01");
+	Cg::File tf;
+	tf.d = *cg;
+	if (!Cg::Parse(&tf)) return fail("cgpr no reconocido");
+	size_t         top = 0, dtop = 0;
+	const Cg::Rec* tr  = TopByName(tf, slot->name, &top);
+	if (tr == nullptr || !Cg::RootInfo(tf, *tr).ok || Cg::RootInfo(tf, *tr).part != slot->index) return fail("el hueco no tiene su entidad");
+	const Cg::File* df = DonorFile(app0, kDonorMap);
+	if (df == nullptr) return fail("no se lee m05_01_00_00_legacy_instances.cgpr");
+	const Cg::Rec* dr = TopByName(*df, kDonor, &dtop);
+	if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) return fail("c2101_0003 sin entidad");
+	std::vector<uint32_t> refs;
+	Cg::CollectRefs(df->tops[dtop], &refs);
+	std::vector<uint8_t> cg2;
+	if (!Cg::Transplant(tf, {Cg::Swap {top, df, dtop, Fnv("minijefe") | 1}}, &cg2) ||
+	    !Cg::Check(cg2, tf.objs.size() + std::set<uint32_t>(refs.begin(), refs.end()).size()))
+		return fail("el resultado no se relee bien");
+	SlotFinal f;
+	f.name = slot->name;
+	f.model = "c2101";
+	const auto& sp = ot[3].blobs[slot->index];
+	const auto& dp = dt[3].blobs[don->index];
+	std::memcpy(f.pos, sp.data() + 0x20, 12);
+	std::memcpy(f.td_head, dp.data() + don->td, 0x14);
+	std::memcpy(f.td_init, dp.data() + don->td + 0x18, 4);
+	finals->push_back(f);
+	int32_t npc = 0;
+	std::memcpy(&npc, f.td_head + 0xC, 4);
+	std::printf("[rando] mini-jefe: Falange derrotada (4096): %s (%.1f, %.1f, %.1f; colision %d) -> c2101 npc %d (de %s %s)\n",
+	            slot->name.c_str(), static_cast<double>(f.pos[0]), static_cast<double>(f.pos[1]), static_cast<double>(f.pos[2]),
+	            BI32(sp, slot->td + 0x1C), npc, kDonorMap, kDonor);
+	std::fflush(stdout);
+	cg->swap(cg2);
+	return true;
+}
+
 struct RedirectEntry {
 	bool                  done = false;
 	std::filesystem::path copy; // MSB; vacío: sin copia
@@ -3261,6 +3369,7 @@ struct RedirectEntry {
 	std::filesystem::path                          app0;
 	std::map<std::string, std::pair<std::string, int32_t>> base; // nombre@pos -> (modelo, npc) en el MSB servido
 	std::vector<uint8_t>                           msb0;            // MSB servido (para BuildDemonio en cada carga)
+	bool                                           minijefe = false; // (rando27) la copia servida lleva el mini-jefe
 };
 
 inline std::mutex& RedirectMutex() {
@@ -3432,7 +3541,8 @@ inline void NoteLoad(const std::string& map, RedirectEntry& e) {
 		return;
 	}
 	e.last = now;
-	if (e.load++ == 0) return;
+	const bool mj = map == MiniJefeMap() && FalangeMuerta(); // (rando27)
+	if (e.load++ == 0 && mj == e.minijefe) return;           // primera carga: la copia ya hecha (sin mini-jefe)
 	for (int attempt = 0; attempt < 4; attempt++) {
 		CurSeed() = std::string(Seed()) + "/c" + std::to_string(e.load) + (attempt > 0 ? "t" + std::to_string(attempt) : "");
 		std::vector<uint8_t>   msb, cg;
@@ -3444,6 +3554,7 @@ inline void NoteLoad(const std::string& map, RedirectEntry& e) {
 			std::vector<uint8_t> m0 = e.msb0; // el Vanguard: mismo hueco, sobre el MSB servido
 			BuildDemonio(map, e.app0, &m0, &cg);
 		}
+		const bool mj_ok = mj && BuildMiniJefe(map, e.app0, &cg, &finals);
 		if (!PadCgpr(&cg, e.cgpr_size)) {
 			std::printf("[rando] mapa %s: carga %d: el cgpr no cabe (%zu > %llu), otro intento\n", map.c_str(), e.load, cg.size(),
 			            static_cast<unsigned long long>(e.cgpr_size));
@@ -3454,7 +3565,8 @@ inline void NoteLoad(const std::string& map, RedirectEntry& e) {
 		if (dir.empty() || !WriteFile(cc, cg)) break;
 		std::error_code ec;
 		if (e.load >= 3) std::filesystem::remove(dir / Utf8Path(map + "_legacy_instances.c" + std::to_string(e.load - 2) + ".cgpr"), ec);
-		e.cgpr = cc;
+		e.cgpr     = cc;
+		e.minijefe = mj_ok;
 		SetHooks(map, e.load, finals, e);
 		std::printf("[rando] mapa %s: carga %d: mezcla nueva (semilla %s/c%d) en %s\n", map.c_str(), e.load, Seed(), e.load,
 		            PathUtf8(cc).c_str());

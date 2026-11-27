@@ -308,6 +308,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("randomizer", s->randomizer); // (rando1)
 	boo("randomizer_otros_mundos", s->randomizer_cross); // (rando20) enemigos de otros mundos (KYTY_DS_RANDOMIZER_CROSS)
 	num("randomizer_semilla", s->randomizer_seed);
+	num("randomizer_dificultad", s->randomizer_difficulty); // (rando27)
+	if (s->randomizer_difficulty < 1 || s->randomizer_difficulty > 3) s->randomizer_difficulty = 2;
 	boo("antilag", s->antilag);
 	// (before 10-27 "antilag" was a box, written 0 by default: the launcher's default, auto, either way)
 	str("antilag_modo", s->antilag_mode);
@@ -644,7 +646,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Randomizer: 1 partida sin conexion con los Trofeos Randomizer (y los trucos apagados); semilla 0 = una nueva cada vez\n"
 	  << "randomizer=" << b(s.randomizer) << "\n"
 	  << "randomizer_semilla=" << s.randomizer_seed << "\n"
-	  << "randomizer_otros_mundos=" << b(s.randomizer_cross) << "\n\n"
+	  << "randomizer_otros_mundos=" << b(s.randomizer_cross) << "\n"
+	  << "; Dificultad del randomizer: 1 facil (menos copias), 2 intermedio (todas), 3 dificil (todas + Vanguard en el primer patio)\n"
+	  << "randomizer_dificultad=" << s.randomizer_difficulty << "\n\n"
 	  << "[Avanzado]\n"
 	  << "; Interruptores del emulador: KYTY_X=1;KYTY_Y=2 (KYTY_X= lo quita). Solo para pruebas.\n"
 	  << "extra=" << s.extra << "\n";
@@ -1404,6 +1408,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		const long long seed = s.randomizer_seed != 0 ? s.randomizer_seed : static_cast<long long>(std::time(nullptr) % 1000000);
 		env.Set("KYTY_DS_RANDOMIZER_SEED", std::to_string(seed));
 		if (s.randomizer_cross) env.Set("KYTY_DS_RANDOMIZER_CROSS", "1"); // (rando20) enemigos de otros mundos
+		env.Set("KYTY_DS_RANDOMIZER_DIFICULTAD", std::to_string(s.randomizer_difficulty)); // (rando27)
 		std::printf("[port] randomizer: activo, semilla %lld%s, otros mundos %s (sin conexion, trucos apagados)\n", seed,
 		            s.randomizer_seed != 0 ? "" : " (aleatoria)", s.randomizer_cross ? "si" : "no");
 	}
@@ -1412,6 +1417,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		env.Set("KYTY_DS_RANDOMIZER", "");
 		env.Set("KYTY_DS_RANDOMIZER_SEED", "");
 		env.Set("KYTY_DS_RANDOMIZER_CROSS", "");
+		env.Set("KYTY_DS_RANDOMIZER_DIFICULTAD", "");
 	}
 	// (11-21) The switches the test folder played with for days (native memory KYTY_RAIZ, the RAM savings RAM16 / RAM17 /
 	// RAM2 / RAM_NATIVE_TEX, the hitch fixes TIRON1-13...): on by default for everyone, first; settings.ini extra goes

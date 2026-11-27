@@ -234,6 +234,7 @@ struct Settings {
 	bool        multiplayer = false;
 	bool        randomizer = false;    // (rando1) randomizer=1: offline, "Trofeos Randomizer" (KYTY_DS_RANDOMIZER)
 	bool        randomizer_cross = false; // (rando20) randomizer_otros_mundos=1: KYTY_DS_RANDOMIZER_CROSS=1
+	int         randomizer_difficulty = 2; // (rando27) randomizer_dificultad: 1 facil, 2 intermedio, 3 dificil (KYTY_DS_RANDOMIZER_DIFICULTAD)
 	int         randomizer_seed = 0;   // (rando1) randomizer_semilla: the same seed, the same draw (0: a new one each launch)
 	bool        no_cheats = false; // (stats1) sin_trucos=1: "Deshabilitar trucos y mejoras" (F2: no Trucos / Armas y objetos, every cheat forced off)
 	std::string online_server = "127.0.0.1"; // the server's address (127.0.0.1: this PC is the host; friends: its public IP)

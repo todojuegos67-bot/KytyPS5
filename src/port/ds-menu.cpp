@@ -6109,13 +6109,18 @@ void DrawRandomizer(float width, float height) {
 		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || on);
 		Tip("Randomizer: partida sin conexi\xC3\xB3n y sin trucos, con los Trofeos Randomizer al derrotar a cada archidemonio. "
 		    "Clic: activar / desactivar (semilla aleatoria en cada partida). Clic derecho: fijar una semilla nueva. "
-		    "Clic en \"MUNDOS\" (a la derecha, con el randomizer activo): enemigos de otros mundos s\xC3\xAD / no (experimental).");
+		    "Clic en \"MUNDOS\" (a la derecha, con el randomizer activo): enemigos de otros mundos s\xC3\xAD / no (experimental). "
+		    "Clic en \"NIVEL\": f\xC3\xA1" "cil (menos copias), intermedio (todas), dif\xC3\xAD" "cil (todas + el Vanguard en el primer patio).");
 		// (rando20) The right part of the tile (only while on) toggles the enemies from other worlds.
 		const bool cross_zone = clicked && !right && g_saved.randomizer && ImGui::GetIO().MousePos.x > tx + tw - Px(78);
+		// (rando27) Zona "NIVEL" (a la izquierda de MUNDOS): FACIL -> INTERMEDIO -> DIFICIL -> FACIL.
+		const float mx        = ImGui::GetIO().MousePos.x;
+		const bool  diff_zone = clicked && !right && !cross_zone && g_saved.randomizer && mx > tx + tw - Px(78 + 96);
 		if (clicked) {
 			Settings on_disk;
 			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
-			const bool now   = cross_zone ? true : (right ? true : !g_saved.randomizer);
+			const bool now   = (cross_zone || diff_zone) ? true : (right ? true : !g_saved.randomizer);
+			const int  diff  = diff_zone ? (g_saved.randomizer_difficulty % 3) + 1 : g_saved.randomizer_difficulty;
 			int        seed  = right ? 1 + static_cast<int>(static_cast<unsigned>(std::time(nullptr) * 2654435761u) % 999999u)
 			                         : (now ? g_saved.randomizer_seed : 0); // 0: a new random seed each launch
 			const bool cross = cross_zone ? !g_saved.randomizer_cross : (now ? g_saved.randomizer_cross : false);
@@ -6123,9 +6128,10 @@ void DrawRandomizer(float width, float height) {
 				s->randomizer       = now;
 				s->randomizer_seed  = seed;
 				s->randomizer_cross = cross;
+				s->randomizer_difficulty = diff;
 			}
 			(void)SaveSettings(g_rt.ini_path, on_disk);
-			std::printf("[port] randomizer=%d semilla=%d otros_mundos=%d\n", now ? 1 : 0, seed, cross ? 1 : 0);
+			std::printf("[port] randomizer=%d semilla=%d otros_mundos=%d dificultad=%d\n", now ? 1 : 0, seed, cross ? 1 : 0, diff);
 		}
 		auto*        dl = ImGui::GetWindowDrawList();
 		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
@@ -6159,10 +6165,19 @@ void DrawRandomizer(float width, float height) {
 		const float lx = mc.x + mr + Px(16);
 		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", U(2.5f));
 		char sub[64];
-		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 semilla %d", g_saved.randomizer_seed);
-		else if (on) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 aleatoria");
+		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "Semilla %d", g_saved.randomizer_seed);
+		else if (on) std::snprintf(sub, sizeof(sub), "Aleatoria");
 		else std::snprintf(sub, sizeof(sub), "Desactivado");
 		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(236, 214, 190, 230), sub, U(1));
+		if (on) { // (rando27) "NIVEL": dificultad del randomizer
+			const float dx = b.x - Px(78 + 96);
+			const int   d  = g_saved.randomizer_difficulty;
+			dl->AddLine({dx, a.y + Px(10)}, {dx, b.y - Px(10)}, Ca(204, 176, 122, 0.35f), 1.0f);
+			Spaced(dl, cinzel, Px(13), {dx + Px(10), a.y + Px(10)}, Ca(222, 196, 140, 0.9f), "NIVEL", U(1));
+			Spaced(dl, cinzel, Px(13), {dx + Px(10), a.y + Px(34)},
+			       d == 1 ? IM_COL32(170, 230, 160, 235) : (d == 3 ? IM_COL32(240, 120, 100, 240) : IM_COL32(235, 205, 140, 235)),
+			       d == 1 ? "F\xC3\x81" "CIL" : (d == 3 ? "DIF\xC3\x8D" "CIL" : "INTERM."), U(1));
+		}
 		if (on) { // (rando20) "MUNDOS" si / no: enemigos de otros mundos
 			const float  zx = b.x - Px(78);
 			dl->AddLine({zx, a.y + Px(10)}, {zx, b.y - Px(10)}, Ca(204, 176, 122, 0.35f), 1.0f);
