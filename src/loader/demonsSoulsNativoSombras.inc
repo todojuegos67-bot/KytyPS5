@@ -1357,8 +1357,10 @@ void InstallNativoSombrasHook(Program* program) {
 		Common::VirtualMemory::FlushInstructionCache(address, NativoSombrasMoved);
 		return refuse("its entry could not be flushed");
 	}
-	std::printf("[nativo-sombras] gancho instalado (KYTY_NATIVO_PASE_SOMBRAS=2: eboot+0xab57d0 cuenta la lista de sombras y "
-	            "sus draws en la DCB; solo mide) censo-escena=%u (KYTY_NATIVO_PASE_ESCENA)\n", DsCensoEscena::Mode());
+	std::printf("[nativo-sombras] gancho instalado (KYTY_NATIVO_PASE_SOMBRAS=%u: eboot+0xab57d0; %s) skinning=%u "
+	            "(KYTY_NATIVO_SOMBRAS_SKIN) censo-escena=%u (KYTY_NATIVO_PASE_ESCENA)\n", DsNativoSombras::Mode(),
+	            DsNativoSombras::Mode() == 2 ? "solo mide" : DsNativoSombras::Mode() == 3 ? "dibujo nativo aparte + comparacion" : "reemplaza las cascadas validadas",
+	            DsNativoSombras::NatSkinOn() ? 1u : 0u, DsCensoEscena::Mode());
 	std::fflush(stdout);
 #else
 	(void)program;

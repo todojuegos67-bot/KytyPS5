@@ -671,11 +671,13 @@ uint32_t DsNatLookups(BufferCache& buffers, const DsNativoSombras::NatSlot* slot
 		if (dr.skin != 0) {
 			// (Skinning: los indices son del CMesh (MALLA-NATIVA); los vertices, de la cache en la marca de fin.)
 			const auto [ibuf, ioff] = cached(dr.ibase, ibyte);
-			if (ibuf == nullptr || ioff % (dr.index32 != 0 ? 4u : 2u) != 0) {
-				H::NatCount(H::g_nat_entry_why, "skinning: indices sin VkBuffer de MALLA-NATIVA o sin alinear");
+			if (ibuf != nullptr && ioff % (dr.index32 != 0 ? 4u : 2u) != 0) {
+				H::NatCount(H::g_nat_entry_why, "skinning: indices sin alinear");
 				continue;
 			}
-			ib[k]     = {ibuf->Handle(), ioff};
+			// (11-27) Sin VkBuffer de MALLA-NATIVA (KYTY_MALLA_NATIVA=0 o aun sin preparar): el indice se toma con el candado
+			// de render de la cache de buferes del emulador (DsNatResolveCache), el mismo VkBuffer que usa el draw emulado.
+			ib[k]     = {ibuf != nullptr ? ibuf->Handle() : vk::Buffer {}, ibuf != nullptr ? ioff : 0};
 			native[k] = 1;
 			has_skin  = true;
 			++drawable;
@@ -684,16 +686,14 @@ uint32_t DsNatLookups(BufferCache& buffers, const DsNativoSombras::NatSlot* slot
 		// (Cache por llamada: la misma malla se repite en el cubo; un Lookup (candado de MALLA) por bloque distinto.)
 		const auto [vbuf, voff] = cached(dr.vbase, uint64_t {dr.vrecords} * dr.vstride);
 		const auto [ibuf, ioff] = cached(dr.ibase, ibyte);
-		if (vbuf == nullptr || ibuf == nullptr) {
-			H::NatCount(H::g_nat_entry_why, "sin VkBuffer de MALLA-NATIVA (aun)");
-			continue;
-		}
-		if (ioff % (dr.index32 != 0 ? 4u : 2u) != 0 || voff % 4u != 0) {
+		if ((ibuf != nullptr && ioff % (dr.index32 != 0 ? 4u : 2u) != 0) || (vbuf != nullptr && voff % 4u != 0)) {
 			H::NatCount(H::g_nat_entry_why, "indice o vertices sin alinear");
 			continue;
 		}
-		vb[k]     = {vbuf->Handle(), voff};
-		ib[k]     = {ibuf->Handle(), ioff};
+		// (11-27, log 20261127-033027-959: con KYTY_MALLA_NATIVA=0 ninguna entrada tenia VkBuffer -> 0 dibujados) Lo que
+		// MALLA-NATIVA no tenga se resuelve luego, con el candado de render, en la cache de buferes (DsNatResolveCache).
+		vb[k]     = {vbuf != nullptr ? vbuf->Handle() : vk::Buffer {}, vbuf != nullptr ? voff : 0};
+		ib[k]     = {ibuf != nullptr ? ibuf->Handle() : vk::Buffer {}, ibuf != nullptr ? ioff : 0};
 		native[k] = 1;
 		++drawable;
 	}
@@ -830,6 +830,45 @@ bool DsNatWork(RenderContext& context, CommandBuffer& buffer, int role, uint32_t
 	// (SKIN) Los vertices de skinning, ahora (con el candado de render, antes del de la cache): la cache de buferes
 	// del emulador, como el draw emulado de esa entrada (ObtainBuffer: su VkBuffer y sus esperas entre colas). Aqui
 	// y no al empezar el cubo: los draws emulados del cubo pueden rehacer ese bufer entre medias.
+	// (11-27) Vertices (sin skinning) e indices que MALLA-NATIVA no dio: la cache de buferes del emulador (ObtainBuffer,
+	// como el draw emulado de la entrada), aqui con el candado de render. Lo que no se obtenga lo dibuja el juego.
+	{
+		auto&      buffers  = context.GetBufferCache();
+		const auto resolve  = [&](const DsNativoSombras::NatSlot* sl, std::vector<std::pair<vk::Buffer, uint64_t>>& vbs,
+                                 std::vector<std::pair<vk::Buffer, uint64_t>>& ibs, std::vector<uint8_t>& nat) {
+			for (uint32_t k = 0; k < sl->count && k < nat.size(); ++k) {
+				if (nat[k] == 0) continue;
+				const auto& dr = sl->draws[k];
+				const uint32_t isz = dr.index32 != 0 ? 4u : 2u;
+				if (!ibs[k].first) {
+					vk::Buffer b {};
+					uint64_t   o = 0;
+					if (!obtain_skin(buffers, dr.ibase, (uint64_t {dr.istart} + dr.icount) * isz, b, o) || o % isz != 0) {
+						nat[k] = 0;
+						vbs[k] = {vk::Buffer {}, 0};
+						H::NatCount(H::g_nat_entry_why, "sin VkBuffer de indices en la cache (la dibuja el juego)");
+						continue;
+					}
+					ibs[k] = {b, o};
+					H::NatCount(H::g_nat_info_why, "indices de la cache de buferes (sin MALLA-NATIVA)");
+				}
+				if (dr.skin == 0 && !vbs[k].first) {
+					vk::Buffer b {};
+					uint64_t   o = 0;
+					if (!obtain_skin(buffers, dr.vbase, uint64_t {dr.vrecords} * dr.vstride, b, o)) {
+						nat[k] = 0;
+						vbs[k] = {vk::Buffer {}, 0};
+						H::NatCount(H::g_nat_entry_why, "sin VkBuffer de vertices en la cache (la dibuja el juego)");
+						continue;
+					}
+					vbs[k] = {b, o};
+					H::NatCount(H::g_nat_info_why, "vertices de la cache de buferes (sin MALLA-NATIVA)");
+				}
+			}
+		};
+		resolve(s.slot, s.vb, s.ib, s.native);
+		for (size_t c = 1; group_draw && c < s.group.size(); ++c) resolve(s.group[c].slot, s.group[c].vb, s.group[c].ib, s.group[c].native);
+	}
 	if (s.has_skin) {
 		auto& buffers = context.GetBufferCache();
 		for (uint32_t k = 0; k < s.slot->count; ++k) {
@@ -1017,7 +1056,7 @@ bool DsNatWork(RenderContext& context, CommandBuffer& buffer, int role, uint32_t
 	};
 	for (uint32_t k = 0; k < count; ++k) {
 		const auto& dr = s.slot->draws[k];
-		if (!s.vb[k].first) continue; // (omitida: la dibuja solo el juego)
+		if (!s.vb[k].first || !s.ib[k].first || s.native[k] == 0) continue; // (omitida: la dibuja solo el juego)
 		++drawn;
 		bind_vs(dr.vs);
 		command.bindVertexBuffers(0, 1, &s.vb[k].first, &s.vb[k].second);
@@ -1034,7 +1073,7 @@ bool DsNatWork(RenderContext& context, CommandBuffer& buffer, int role, uint32_t
 		auto& g = s.group[c];
 		for (uint32_t k = 0; k < g.slot->count; ++k) {
 			const auto& dr = g.slot->draws[k];
-			if (g.native[k] == 0 || !g.vb[k].first) {
+			if (g.native[k] == 0 || !g.vb[k].first || !g.ib[k].first) {
 				if (k < g.native.size()) g.native[k] = 0; // (no dibujada: su draw del juego se hace)
 				continue;
 			}
