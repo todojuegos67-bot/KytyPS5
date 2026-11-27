@@ -4147,6 +4147,11 @@ void Draw(ImDrawList* dl, float W, float H, float unit) {
 void Tip(const char* tip) {
 	if (tip == nullptr || *tip == '\0') return;
 	if (!ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) return;
+	{
+		// (tip-arriba) Always above the hovered control, centred on it, so it never covers the other buttons.
+		const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+		ImGui::SetNextWindowPos({(a.x + b.x) * 0.5f, a.y - U(8)}, ImGuiCond_Always, {0.5f, 1.0f});
+	}
 	if (ImGui::BeginTooltip()) {
 		ImGui::PushTextWrapPos(U(440));
 		ImGui::TextUnformatted(I18n::T(tip));
