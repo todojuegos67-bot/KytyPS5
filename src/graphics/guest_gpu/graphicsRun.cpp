@@ -54,7 +54,8 @@
 #include "trusted-depth.h" // (trust1)
 #include "ds-linear-copy-hook.h"
 #include "local/ds-nativo-pase.h" // (F5 pase 1, KYTY_NATIVO_PASE_SSRCLEAR)
-#include "local/ds-nativo-sombras.h" // (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=2: volcado del VS de sombras)
+#include "local/ds-nativo-sombras.h"
+#include "local/ds-sombras-ab.h" // (T43: tiempo de los cubos del sol) // (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=2: volcado del VS de sombras)
 #include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: [censo-dcb])
 #include "local/perfil.h"       // (KYTY_PERFIL)
 #include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
@@ -2553,7 +2554,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					DsNativoSombras::NatScanDcb(packet, remaining_dw, packet[4]); // (diagnostico)
 				if (DsNativoSombras::Mode() == 1 && DsNativoSombras::NatCascada() && (packet[3] & 0xFFu) == DsNativoSombras::NatBegin)
 					DsNativoSombras::NatScanGroup(packet, remaining_dw, (packet[3] >> 8u) & 0xFFu, packet[4]); // (=1 + CASCADA)
+				// (T43) Tiempo del hilo de render dentro de cada cubo del sol (de despues de la marca de inicio a antes de la de
+				// fin), en los dos tramos del A/B: con TECHO, lo que cuesta el salto (NOP + estado final); sin, los draws del juego.
+				static thread_local int64_t cubo_t0 = 0;
+				const bool begin = (packet[3] & 0xFFu) == DsNativoSombras::NatBegin;
+				if (!begin && cubo_t0 != 0 && DsSombrasAb::Seconds() != 0) {
+					DsSombrasAb::g_coste_ns[DsSombrasAb::CCubo].fetch_add(static_cast<uint64_t>(DsSombrasAb::NowNs() - cubo_t0), std::memory_order_relaxed);
+					DsSombrasAb::g_coste_n[DsSombrasAb::CCubo].fetch_add(1, std::memory_order_relaxed);
+				}
+				cubo_t0 = 0;
 				m_renderer.GetRenderExecutor().DsNatMark(CurrentBuffer(), packet[3], packet[4]);
+				if (begin && DsSombrasAb::Seconds() != 0) cubo_t0 = DsSombrasAb::NowNs();
 			}
 			m_draw_run_skip = 0;
 			cursor.offset_dw += DsNativoSombras::MarkDwords;

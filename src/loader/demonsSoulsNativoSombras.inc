@@ -1383,7 +1383,23 @@ KYTY_SYSV_ABI uint64_t NativoSombrasHook(uint64_t renderer, uint64_t list, uint6
 	// (T32 11-27: en el tramo "juego" del A/B el gancho seguia recorriendo la DCB y rellenando ranuras: el juego pagaba el
 	// coste del nativo y el A/B no valia. Ahora ese tramo es el juego tal cual. Seconds() y Juego(): lecturas de un static
 	// y de un atomico.)
-	if (DsSombrasAb::Seconds() != 0 && DsSombrasAb::Juego()) return g_nativo_sombras_original(renderer, list, ctx, bucket, pass);
+	if (DsSombrasAb::Seconds() != 0 && DsSombrasAb::Juego()) {
+		// (T43, con TECHO) Tambien en el tramo juego: solo las marcas de inicio y fin, para medir en el hilo de render lo
+		// que cuestan los draws del juego de cada cubo (CCubo). Sin ranura: DsNatMark no toma nada.
+		static const bool techo_t = [] {
+			const char* t = std::getenv("KYTY_NATIVO_SOMBRAS_TECHO");
+			return t != nullptr && t[0] == '1' && t[1] == '\0';
+		}();
+		auto* const cmds = techo_t && pass >= 0 && pass <= 3 && ctx != nullptr && ctx[0] != 0
+		                       ? reinterpret_cast<AgcCommandBuffer*>(*reinterpret_cast<uint64_t*>(ctx[0]))
+		                       : nullptr;
+		if (cmds == nullptr) return g_nativo_sombras_original(renderer, list, ctx, bucket, pass);
+		const uint32_t seq = DsNativoSombras::g_nat_seq.fetch_add(1, std::memory_order_relaxed) + 1u;
+		const bool     b   = NativoSombrasNatMark(cmds, DsNativoSombras::NatBegin, pass, seq);
+		const uint64_t r   = g_nativo_sombras_original(renderer, list, ctx, bucket, pass);
+		if (b) (void)NativoSombrasNatMark(cmds, DsNativoSombras::NatEnd, pass, seq);
+		return r;
+	}
 	if ((DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && pass >= 0 && list != 0 && ctx != nullptr &&
 	    bucket >= 0 && bucket <= 7)
 		return NativoSombrasNatHook(renderer, list, ctx, bucket, pass); // (=3 / =1: sin volcados)

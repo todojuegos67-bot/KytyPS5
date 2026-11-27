@@ -54,6 +54,7 @@ enum Coste : uint32_t {
 	CAntesDraw,   // DsNatBeforeDraw entero (hilo de render; incluye CStart y CWork)
 	CStart,       // DsNatStart (Lookups de MALLA-NATIVA, candados, IsMetaCleared)
 	CWork,        // DsNatWork (ObtainBuffer del skinning, EndRendering, barreras, dibujo)
+	CCubo,        // (T43) ProcessPm4 entre la marca de inicio y la de fin de cada cubo del sol (hilo de render, sin DsNatMark)
 	CCount
 };
 inline std::atomic<uint64_t> g_coste_ns[CCount] {};
@@ -170,7 +171,7 @@ inline void OnFlip(int64_t flip_ns, int64_t idle_ns, int64_t compile_ns) {
 	            cur.compile_ms / n, P99(cur.frame_ms));
 	{
 		static const char* const names[CCount] = {"gancho", "original del juego", "recorrido DCB", "DsNatMark", "DsNatBeforeDraw",
-		                                          "DsNatStart", "DsNatWork"};
+		                                          "DsNatStart", "DsNatWork", "cubos del sol en ProcessPm4"};
 		char   line[1024];
 		size_t at = 0;
 		for (uint32_t c = 0; c < CCount && at < sizeof(line); ++c) {
