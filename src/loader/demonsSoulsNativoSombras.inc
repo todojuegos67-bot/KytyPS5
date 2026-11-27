@@ -877,7 +877,16 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			if (d.skin != 0 && vs_kind != 1 && dcb_es[k] != 0 && H::NatDiag()) NativoSombrasDiagOtherVs(dcb_es[k], tables[k], sh_val, sh_ok, dcb_treg[k]);
 			if (d.skin != 0 && vs_kind != 1)
 				return dcb_es[k] == 0 ? "skinning: ES no esta en la DCB (la dibuja el juego)" : "skinning: otro VS (no 0x3866090d; la dibuja el juego)";
-			if (d.skin == 0 && vs_kind == 1) info("sin skinning con el VS 0x3866090d (se dibuja con el de skinning)");
+			// (T38 11-27, DIAG error: el "nativo mas cerca" con error real (|nativo-juego| hasta 0,66) esta en los cubos con
+			// entradas "vs_skin_sin_skin" (VS de skinning sin sello de animacion: 8 px err 0,55 con una sola de ellas; miles en
+			// las mezclas; los cubos solo con skinning, decenas). Esas tomaban los vertices como malla estatica, pero el VS lee
+			// el bufer de skinning (tabla[0]+0x10) que se reescribe cada fotograma. Ahora van como skinning: vertices de la
+			// cache en la marca de fin y la validacion propia del skinning.)
+			if (d.skin == 0 && vs_kind == 1) {
+				if (!H::NatSkinOn()) return "VS de skinning sin animacion (sin KYTY_NATIVO_SOMBRAS_SKIN: la dibuja el juego)";
+				d.skin = 1;
+				info("VS de skinning sin animacion: vertices del bufer de skinning");
+			}
 			// (11-27, log 20261127-060057-463, DIAG error: todo el error del nativo esta en el cubo 1 (kRS_Depth_Normal) y solo en
 			// cubos con el VS de skinning; los cubos solo estaticos, 0 px.) Los VS de skinning exportan param0 (UV), el estatico
 			// no: van con un PS que lee la UV (recorte alfa: pelo, tela, vegetacion) que el nativo (sin PS) no hace -> dibuja
