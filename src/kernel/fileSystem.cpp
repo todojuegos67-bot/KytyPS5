@@ -634,7 +634,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 				} else if (auto args = Loader::GameArgs::RedirectRead(file->real_name); !args.empty()) {
 					open_name = std::move(args);
 				} else if (RandoMsb::CrossOn()) { // (randomizer, fase 2: el MSB con enemigos de otros mundos)
-					if (auto cross = RandoMsb::RedirectRead(Common::PathToString(file->real_name)); !cross.empty()) {
+					if (auto cross = RandoMsb::RedirectRead(Common::PathToString(file->real_name), 0); !cross.empty()) {
 						open_name = std::move(cross);
 						RandoMsb::TraceRead(Common::PathToString(file->real_name), true);
 					}

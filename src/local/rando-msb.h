@@ -39,6 +39,7 @@
 #include <string>
 #include <utility>
 #include <map>
+#include <chrono>
 #include <vector>
 
 namespace RandoMsb {
@@ -60,8 +61,9 @@ inline bool Enabled() {
 		                     !(s != nullptr && std::strcmp(s, "0") == 0);
 		if (enabled) {
 			std::printf("[rando] barajado en el mismo mapa: activo (semilla %s)\n", Seed());
-			(void)c;
-			std::printf("[rando] solo Boletaria (m02), mezcla dentro del mismo mapa; otros mundos: apagado\n");
+			const bool mundos = c != nullptr && std::strcmp(c, "1") == 0;
+			std::printf("[rando] solo Boletaria (m02), mezcla en los mismos sitios; otros mundos: %s\n",
+			            mundos ? "SI (tipos de otros mundos como copias en huecos de Boletaria)" : "no");
 			std::fflush(stdout);
 		}
 		return enabled;
@@ -418,6 +420,31 @@ inline const char* DemonioTarget() { return "c2000_0002"; }
 
 // (rando24) KYTY_DS_RANDOMIZER_CGPR=0: la mezcla cambia SOLO el MSB (modelo + NpcParam/think); el legacy_instances.cgpr
 // va original (sin entidades trasplantadas). Prueba de muros invisibles: si con esto no salen, la causa es el trasplante.
+// (rando26) MUNDOS SI en el lanzador (KYTY_DS_RANDOMIZER_CROSS=1): la mezcla tambien usa como donantes enemigos normales
+// de OTROS mundos (lista blanca CrossPool, entidad de su legacy_instances.cgpr). Mismo metodo que el Vanguard de 1-1:
+// nada se mueve, el MSB del hueco no se toca, el tipo lo pone el gancho de creacion (0x359990 / 0x1451700) y el cgpr
+// lleva la entidad del donante anclada al hueco con la colision del suelo y los campos de sitio del hueco (rando25).
+inline bool MundosOn() {
+	static const bool on = [] {
+		const char* c = std::getenv("KYTY_DS_RANDOMIZER_CROSS");
+		return Enabled() && c != nullptr && std::strcmp(c, "1") == 0;
+	}();
+	return on;
+}
+
+// (rando26) Turnos: cada carga del mapa (muerte, hoguera, volver a la zona) es una mezcla nueva (semilla + numero de
+// carga). KYTY_DS_RANDOMIZER_ROTAR=0 vuelve a una sola mezcla por partida.
+inline bool RotarOn() {
+	static const bool on = [] {
+		const char* c = std::getenv("KYTY_DS_RANDOMIZER_ROTAR");
+		return !(c != nullptr && std::strcmp(c, "0") == 0);
+	}();
+	return on;
+}
+
+// (rando26) Huecos cambiados por gancho (otros mundos o turnos): hacen falta los ganchos 0x359990/0x1451700 y 0xef430.
+inline bool MezclaHooksOn() { return MezclaOn() && (MundosOn() || RotarOn()); }
+
 inline bool MezclaCgprOn() {
 	static const bool on = [] {
 		const char* c = std::getenv("KYTY_DS_RANDOMIZER_CGPR");
@@ -479,6 +506,8 @@ struct HookSwap {
 	int32_t     new_npc   = 0;
 	uint8_t     td_head[0x14] {};
 	uint8_t     td_init[4] {};
+	uint64_t    owner = 0;     // (rando26) mapa que la puso (Fnv del nombre); 0: sin dueño
+	bool        dead  = false; // (rando26) de una carga anterior del mapa: ya no vale (no se borra: Pending la apunta)
 };
 inline std::mutex& HookMutex() {
 	static std::mutex m;
@@ -829,15 +858,17 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 	} else {
 		std::lock_guard<std::mutex> lock(HookMutex());
 		for (const auto& h: HookSwaps())
-			if (h.name == pname && model == h.orig_model && (npc == h.orig_npc || npc == h.new_npc)) {
+			if (!h.dead && h.name == pname && model == h.orig_model && (npc == h.orig_npc || npc == h.new_npc)) {
 				if (h.has_pos) {
 					float pp[3];
 					std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
 					const float dx = pp[0] - h.pos[0], dy = pp[1] - h.pos[1], dz = pp[2] - h.pos[2];
 					const bool  ok = dx * dx + dy * dy + dz * dz < 1.0f;
-					std::printf("[demonio] crear parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f): %s\n", idx, pname.c_str(),
-					            model.c_str(), npc, static_cast<double>(pp[0]), static_cast<double>(pp[1]),
-					            static_cast<double>(pp[2]), ok ? "ES EL DEL PATIO, pasa a Vanguard" : "otro mapa, no se toca");
+					const bool vang = DemonioOn() && h.name == DemonioTarget() && std::strcmp(h.new_model, "c1030") == 0;
+					std::printf("[%s] crear parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f): %s%s\n", vang ? "demonio" : "rando", idx,
+					            pname.c_str(), model.c_str(), npc, static_cast<double>(pp[0]), static_cast<double>(pp[1]),
+					            static_cast<double>(pp[2]), ok ? (vang ? "ES EL DEL PATIO, pasa a Vanguard" : "es el hueco, pasa a ") : "otro mapa, no se toca",
+					            ok && !vang ? h.new_model : "");
 					std::fflush(stdout);
 					if (!ok) continue;
 				}
@@ -1049,7 +1080,7 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 			const int32_t npc = *reinterpret_cast<const int32_t*>(td + 0xC);
 			std::string   pname;
 			for (const auto& h: HookSwaps()) {
-				if (!h.has_pos || npc != h.orig_npc) continue;
+				if (h.dead || !h.has_pos || npc != h.orig_npc) continue;
 				if (pname.empty()) pname = GuestStr(reinterpret_cast<const char*>(name_p));
 				if (pname != h.name) continue;
 				float pp[3];
@@ -1058,9 +1089,13 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 				if (dx * dx + dy * dy + dz * dz >= 1.0f) continue;
 				std::memcpy(reinterpret_cast<void*>(td), h.td_head, sizeof(h.td_head));
 				std::memcpy(reinterpret_cast<void*>(td + 0x18), h.td_init, sizeof(h.td_init));
-				std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d antes de elegir los scripts; el juego "
-				            "cargara la IA del Vanguard (logica 10000, batalla 103001)\n",
-				            pname.c_str(), h.orig_npc, h.new_npc);
+				if (DemonioOn() && h.name == DemonioTarget())
+					std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d antes de elegir los scripts; el juego "
+					            "cargara la IA del Vanguard (logica 10000, batalla 103001)\n",
+					            pname.c_str(), h.orig_npc, h.new_npc);
+				else
+					std::printf("[rando] 0xef430 (IA): %s npc %d -> %d (%s) antes de elegir los scripts\n", pname.c_str(), h.orig_npc,
+					            h.new_npc, h.new_model);
 				std::fflush(stdout);
 				break;
 			}
@@ -1076,12 +1111,14 @@ inline void InstallModelProbe() {
 			std::printf("[rando-traza3] sonda del modelo instalada en eboot+0x1451700\n");
 			std::fflush(stdout);
 		}
-		if (b && (HookOn() || DemonioOn())) InstallStub(0x359990, reinterpret_cast<uint64_t>(&HookCreate), "gancho de creacion de enemigos");
+		const bool mezcla_hooks = MezclaHooksOn(); // (rando26) otros mundos / turnos: tipo por gancho + IA en 0xef430
+		if (b && (HookOn() || DemonioOn() || mezcla_hooks)) InstallStub(0x359990, reinterpret_cast<uint64_t>(&HookCreate), "gancho de creacion de enemigos");
 		if (b && DemonioOn()) {
 			InstallStub(0x1473fb0, reinterpret_cast<uint64_t>(&DemonioTraceCreate), "[demonio] traza FUN_01473fb0");
 			InstallStub(0x1472490, reinterpret_cast<uint64_t>(&DemonioTraceRemove), "[demonio] traza FUN_01472490");
-			InstallStub(0xef430, reinterpret_cast<uint64_t>(&DemonioPreAi), "[demonio] IA del Vanguard en FUN_000ef430");
 		}
+		if (b && (DemonioOn() || mezcla_hooks))
+			InstallStub(0xef430, reinterpret_cast<uint64_t>(&DemonioPreAi), "IA de los huecos cambiados en FUN_000ef430");
 	});
 }
 #else
@@ -2646,8 +2683,21 @@ inline int FuerzaTipo(const std::string& m) {
 // normales del mapa (los mismos elegibles que antes: sin entidad de evento, no citados por eventos, c2xxx/c3xxx, sin
 // cinematica, con colision valida). Un enemigo sin entidad no tiene estado de muerte guardado (los .lua solo usan
 // entidades), asi que no hereda ningun "muerto" de otro sitio.
+// (rando26) Estado final de cada hueco de la mezcla (tipo que debe tener), para los ganchos de las cargas siguientes.
+struct SlotFinal {
+	std::string name, model;
+	float       pos[3] {};
+	uint8_t     td_head[0x14] {}, td_init[4] {};
+};
+// (rando26) Semilla de la carga en curso ("<semilla>" en la primera, "<semilla>/cN" en la carga N); vacia: Seed().
+inline std::string& CurSeed() {
+	static std::string s;
+	return s;
+}
+
 inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_out,
-                        std::vector<uint8_t>* cgpr_out) {
+                        std::vector<uint8_t>* cgpr_out, std::vector<SlotFinal>* finals = nullptr) {
+	const std::string seed = CurSeed().empty() ? std::string(Seed()) : CurSeed();
 	std::vector<uint8_t> msb;
 	Cg::File             tf;
 	if (!ReadWhole(MsbPathOf(app0, map), &msb) || !ReadWhole(CgprPathOf(app0, map), &tf.d)) return false;
@@ -2707,18 +2757,77 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	// copia lleva GUID nuevos por sitio).
 	std::map<std::string, std::vector<size_t>> by_type;
 	for (size_t i = 0; i < sl.size(); i++) by_type[sl[i].model].push_back(i);
-	std::vector<size_t> perm(sl.size());
-	uint64_t            rs = Fnv(map, Fnv("mezcla2", Fnv(Seed())));
+	uint64_t rs = Fnv(map, Fnv("mezcla2", Fnv(seed)));
+	// (rando26) Otros mundos (MUNDOS SI): de 1 a 8 tipos de la lista blanca que no hay en este mapa (por defecto 4, otros
+	// en cada carga), cada uno con hasta 6 enemigos reales de otro mundo como donantes (su entidad del cgpr de su mapa).
+	struct XDonor {
+		const Inst*     in = nullptr;
+		const Cg::File* df = nullptr;
+		size_t          dtop = 0;
+	};
+	std::vector<std::pair<std::string, std::vector<XDonor>>> xt;
+	if (MundosOn()) {
+		std::set<std::string> present;
+		for (const auto& m: models)
+			if (BI32(m, 0x8) == 2) present.insert(ModelName(m));
+		const std::string        world = Lower(map).substr(0, 3);
+		const auto&              insts = Insts(app0);
+		std::vector<std::string> types;
+		for (const auto& m: CrossPool()) {
+			if (present.count(m) != 0) continue;
+			for (const auto& in: insts)
+				if (in.model == m && in.map.substr(0, 3) != world) {
+					types.push_back(m);
+					break;
+				}
+		}
+		uint64_t xs = Fnv(map, Fnv("mundos", Fnv(seed)));
+		for (size_t i = types.size(); i > 1; i--) std::swap(types[i - 1], types[static_cast<size_t>(SplitMix(&xs) % i)]);
+		const size_t want = static_cast<size_t>(EnvInt("KYTY_DS_RANDOMIZER_CROSS_TYPES", 4, 1, 8));
+		for (const auto& ty: types) {
+			if (xt.size() >= want) break;
+			std::vector<const Inst*> cand;
+			for (const auto& in: insts)
+				if (in.model == ty && in.map.substr(0, 3) != world) cand.push_back(&in);
+			for (size_t i = cand.size(); i > 1; i--) std::swap(cand[i - 1], cand[static_cast<size_t>(SplitMix(&xs) % i)]);
+			std::vector<XDonor> ds;
+			for (const Inst* in: cand) {
+				if (ds.size() >= 6) break;
+				const Cg::File* df = DonorFile(app0, in->map);
+				if (df == nullptr) continue;
+				size_t         dtop = 0;
+				const Cg::Rec* dr   = TopByName(*df, in->name, &dtop);
+				if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) continue;
+				ds.push_back({in, df, dtop});
+			}
+			if (!ds.empty()) xt.emplace_back(ty, std::move(ds));
+		}
+		std::string names;
+		for (const auto& [ty, ds]: xt) names += (names.empty() ? "" : ", ") + ty + " (" + ds[0].in->map.substr(0, 3) + ")";
+		std::printf("[rando] mapa %s: otros mundos: %zu tipos: %s\n", map.c_str(), xt.size(), names.c_str());
+	}
+	// Cada sitio: un tipo distinto del suyo al azar entre los del mapa y los de otros mundos; perm >= sl.size() = otro mundo
+	// (perm - sl.size() = indice en xt).
+	std::vector<size_t>  perm(sl.size());
+	std::vector<XDonor>  xpick(sl.size());
 	for (size_t k = 0; k < sl.size(); k++) {
 		std::vector<const std::vector<size_t>*> other;
 		for (const auto& [m, v]: by_type)
 			if (m != sl[k].model) other.push_back(&v);
-		if (other.empty()) {
+		const size_t n = other.size() + xt.size();
+		if (n == 0) {
 			perm[k] = k;
 			continue;
 		}
-		const auto& v = *other[static_cast<size_t>(SplitMix(&rs) % other.size())];
-		perm[k]       = v[static_cast<size_t>(SplitMix(&rs) % v.size())];
+		const size_t c = static_cast<size_t>(SplitMix(&rs) % n);
+		if (c < other.size()) {
+			const auto& v = *other[c];
+			perm[k]       = v[static_cast<size_t>(SplitMix(&rs) % v.size())];
+		} else {
+			const auto& ds = xt[c - other.size()].second;
+			perm[k]        = sl.size() + (c - other.size());
+			xpick[k]       = ds[static_cast<size_t>(SplitMix(&rs) % ds.size())];
+		}
 	}
 	// Lo que viaja con el enemigo (del original): indice de modelo (+0x10) y typedata +0x00..+0x13 y +0x18.
 	struct Who {
@@ -2734,19 +2843,46 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 		std::memcpy(who[k].init, p.data() + e.td + 0x18, 4);
 	}
 	std::vector<Cg::Swap> swaps;
-	size_t                changed = 0;
+	size_t                changed = 0, xchanged = 0;
 	for (size_t k = 0; k < sl.size(); k++) { // sitio k recibe al enemigo perm[k]
 		const size_t e = perm[k];
-		if (sl[e].model == sl[k].model) continue; // mismo tipo: nada que cambiar
-		const auto& s  = ps[sl[k].pi];
-		auto&       p  = parts[s.index];
+		const auto&  s = ps[sl[k].pi];
+		auto&        p = parts[s.index];
+		SlotFinal    f;
+		f.name = s.name;
+		std::memcpy(f.pos, p.data() + 0x20, 12);
+		if (e >= sl.size()) { // (rando26) de otro mundo: el MSB del hueco no cambia de tipo; tipo e IA por los ganchos
+			const XDonor& x = xpick[k];
+			p[s.td + 0x14]  = 0;
+			f.model         = x.in->model;
+			std::memcpy(f.td_head, x.in->td_head, 0x14);
+			std::memcpy(f.td_init, x.in->td_init, 4);
+			swaps.push_back({sl[k].top, x.df, x.dtop, Fnv(s.name, Fnv("mezcla-guid", Fnv(seed))) | 1});
+			changed++;
+			xchanged++;
+			std::printf("[rando] mezcla: %s sitio de %s (%s) -> %s (de otro mundo: %s %s)\n", map.c_str(), s.name.c_str(),
+			            sl[k].model.c_str(), x.in->model.c_str(), x.in->map.c_str(), x.in->name.c_str());
+			if (finals != nullptr) finals->push_back(f);
+			continue;
+		}
+		if (sl[e].model == sl[k].model) { // mismo tipo: nada que cambiar
+			f.model = sl[k].model;
+			std::memcpy(f.td_head, p.data() + s.td, 0x14);
+			std::memcpy(f.td_init, p.data() + s.td + 0x18, 4);
+			if (finals != nullptr) finals->push_back(f);
+			continue;
+		}
 		std::memcpy(p.data() + 0x10, &who[e].model, 4);
 		std::memcpy(p.data() + s.td, who[e].head, 0x14);
 		std::memcpy(p.data() + s.td + 0x18, who[e].init, 4);
 		p[s.td + 0x14] = 0; // agresivo: sin el estado pasivo (rando22)
+		f.model        = sl[e].model;
+		std::memcpy(f.td_head, who[e].head, 0x14);
+		std::memcpy(f.td_init, who[e].init, 4);
+		if (finals != nullptr) finals->push_back(f);
 		// Copia de la entidad del donante (del archivo original), anclada a la raiz del sitio, con GUID nuevos: el
 		// donante sigue entero en su propio sitio (o recibe a su vez otra copia).
-		swaps.push_back({sl[k].top, &tf, sl[e].top, Fnv(s.name, Fnv("mezcla-guid", Fnv(Seed()))) | 1});
+		swaps.push_back({sl[k].top, &tf, sl[e].top, Fnv(s.name, Fnv("mezcla-guid", Fnv(seed))) | 1});
 		changed++;
 		std::printf("[rando] mezcla: %s sitio de %s (%s) -> %s (de %s)\n", map.c_str(), s.name.c_str(), sl[k].model.c_str(),
 		            sl[e].model.c_str(), ps[sl[e].pi].name.c_str());
@@ -2764,7 +2900,7 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 	size_t               new_objs = tf.objs.size();
 	for (const auto& sw: swaps) {
 		std::vector<uint32_t> refs;
-		Cg::CollectRefs(tf.tops[sw.donor_top], &refs);
+		Cg::CollectRefs(sw.donor->tops[sw.donor_top], &refs);
 		new_objs += std::set<uint32_t>(refs.begin(), refs.end()).size();
 	}
 	std::vector<uint8_t>   msb2 = BuildTables(t);
@@ -2780,8 +2916,9 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 		std::fflush(stdout);
 		return false;
 	}
-	std::printf("[rando] mapa %s: mezcla: %zu sitios con otro enemigo de %zu (sitios, colision y grupos sin tocar)\n",
-	            map.c_str(), changed, sl.size());
+	std::printf("[rando] mapa %s: mezcla: %zu sitios con otro enemigo de %zu, %zu de otros mundos (sitios, colision y grupos "
+	            "sin tocar; semilla %s)\n",
+	            map.c_str(), changed, sl.size(), xchanged, seed.c_str());
 	std::fflush(stdout);
 	msb_out->swap(msb2);
 	cgpr_out->swap(cg2);
@@ -3113,6 +3250,17 @@ struct RedirectEntry {
 	uint64_t              size = 0;
 	std::filesystem::path cgpr; // legacy_instances.cgpr; vacío: sin copia
 	uint64_t              cgpr_size = 0;
+	// (rando26) Turnos. El juego resuelve el tamaño de cada archivo una vez al arrancar (libAmpr: ~250K rutas), así que
+	// cada carga sirve archivos del MISMO tamaño: el MSB es siempre el de la primera carga (la mezcla no cambia su
+	// tamaño y no se rehace: el tipo de cada hueco en las cargas siguientes lo ponen los ganchos 0xef430 / 0x359990 /
+	// 0x1451700 desde el tipo del MSB de la primera carga), y el cgpr va relleno con ceros hasta |cgpr_size| antes del
+	// pie (Ghidra FUN_00ba29b0: objetos y registros se leen por recuento, lo que sobra hasta el pie no se lee).
+	bool                                           rotate = false;
+	int                                            load = 0;        // cargas servidas (0: ninguna)
+	std::chrono::steady_clock::time_point          last {};         // última lectura del cgpr desde 0
+	std::filesystem::path                          app0;
+	std::map<std::string, std::pair<std::string, int32_t>> base; // nombre@pos -> (modelo, npc) en el MSB servido
+	std::vector<uint8_t>                           msb0;            // MSB servido (para BuildDemonio en cada carga)
 };
 
 inline std::mutex& RedirectMutex() {
@@ -3145,19 +3293,80 @@ inline bool WriteFile(const std::filesystem::path& p, const std::vector<uint8_t>
 	return ok;
 }
 
+// (rando26) Relleno del cgpr hasta |target| bytes: ceros entre el último registro y el pie "PRPG" (el pie apunta a su sitio).
+inline bool PadCgpr(std::vector<uint8_t>* cg, size_t target) {
+	if (cg->size() < 12 || target < cg->size() || target > 0xffffffffull) return false;
+	const size_t foot = cg->size() - 12;
+	if (std::memcmp(cg->data() + foot, "PRPG", 4) != 0) return false;
+	cg->insert(cg->begin() + static_cast<ptrdiff_t>(foot), target - cg->size(), 0);
+	const uint32_t nf = static_cast<uint32_t>(target - 12);
+	std::memcpy(cg->data() + nf + 8, &nf, 4);
+	return true;
+}
+
+inline std::string BaseKey(const std::string& name, const float* pos) {
+	char b[64];
+	std::snprintf(b, sizeof(b), "@%.0f,%.0f,%.0f", static_cast<double>(pos[0]), static_cast<double>(pos[1]), static_cast<double>(pos[2]));
+	return name + b;
+}
+
+// (rando26) Ganchos de una carga: cada hueco cuyo tipo final no es el del MSB servido. Las de la carga anterior del
+// mapa quedan muertas (no se borran: Pending las puede apuntar).
+inline void SetHooks(const std::string& map, int load, const std::vector<SlotFinal>& finals, const RedirectEntry& e) {
+	const uint64_t owner = Fnv(map, Fnv("rando26"));
+	std::lock_guard<std::mutex> lock(HookMutex());
+	for (auto& h: HookSwaps())
+		if (h.owner == owner) h.dead = true;
+	size_t n = 0;
+	for (const auto& f: finals) {
+		const auto it = e.base.find(BaseKey(f.name, f.pos));
+		if (it == e.base.end()) continue;
+		int32_t npc = 0;
+		std::memcpy(&npc, f.td_head + 0xC, 4);
+		if (it->second.first == f.model && it->second.second == npc) continue;
+		HookSwap h;
+		h.has_pos = true;
+		std::memcpy(h.pos, f.pos, 12);
+		h.name = f.name;
+		std::snprintf(h.orig_model, sizeof(h.orig_model), "%s", it->second.first.c_str());
+		h.orig_npc = it->second.second;
+		std::snprintf(h.new_model, sizeof(h.new_model), "%s", f.model.c_str());
+		h.new_npc = npc;
+		std::memcpy(h.td_head, f.td_head, sizeof(h.td_head));
+		std::memcpy(h.td_init, f.td_init, sizeof(h.td_init));
+		h.owner = owner;
+		HookSwaps().push_back(h);
+		n++;
+	}
+	std::printf("[rando] mapa %s: carga %d: %zu huecos con el tipo puesto por gancho (IA en 0xef430)\n", map.c_str(), load, n);
+}
+
+inline std::filesystem::path CopyDir() {
+	std::error_code ec;
+	const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" /
+	                 Utf8Path(DemonioOn() ? std::string("demonio-") + Seed() : std::string(Seed()));
+	if (!ec) std::filesystem::create_directories(dir, ec);
+	return ec ? std::filesystem::path() : dir;
+}
+
 // Copias del mapa (MSB + legacy_instances), una vez por mapa. |app0| sale de la ruta pedida.
-inline const RedirectEntry& EntryFor(const std::string& map, const std::filesystem::path& app0) {
-	for (const auto& [name, e]: RedirectTable())
+inline RedirectEntry& EntryFor(const std::string& map, const std::filesystem::path& app0) {
+	for (auto& [name, e]: RedirectTable())
 		if (name == map) return e;
 	RedirectEntry        e;
 	e.done = true;
+	e.app0 = app0;
 	std::vector<uint8_t> msb, cg;
+	std::vector<SlotFinal> finals;
 	// (demonio) El Vanguard va ENCIMA de lo que haga el randomizer (antes lo sustituia: sin "[rando] mapa" en ningun mapa).
 	bool built = false;
 	const bool scope = InScope(map); // (rando24) solo Boletaria
-	if (scope && FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
+	CurSeed().clear();
+	if (scope && MezclaOn()) built = BuildMezcla(map, app0, &msb, &cg, &finals);
+	else if (scope && FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
 	else if (scope && CrossWorldsOn()) built = BuildCross3(map, app0, &msb, &cg);
 	if (built && !DynVisualOn() && !FuertesOn() && Enabled()) ShuffleBytes(map, msb); // barajado de la fase 1 en la copia
+	const bool mezcla = built && MezclaOn();
 	if (DemonioOn() && map == "m02_00_00_00") {
 		if (!built) { // sin copia del randomizer: los originales (modo barajar: barajados antes, como en memoria)
 			msb.clear();
@@ -3171,37 +3380,99 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 		if (built) DynRegister(map, msb);
 		else if (ReadWhole(MsbPathOf(app0, map), &orig)) DynRegister(map, orig);
 	}
+	if (mezcla) { // (rando26) tipo de cada hueco en el MSB servido; ganchos de los de otros mundos
+		std::vector<Table>     t;
+		std::vector<EnemyPart> ps;
+		if (ParseTables(msb, &t) && EnemyParts(t, &ps))
+			for (const auto& pe: ps) {
+				const auto& p = t[3].blobs[pe.index];
+				float       pos[3];
+				std::memcpy(pos, p.data() + 0x20, 12);
+				e.base[BaseKey(pe.name, pos)] = {ModelName(t[0].blobs[static_cast<size_t>(pe.model)]), BI32(p, pe.td + 0xC)};
+			}
+		SetHooks(map, 1, finals, e);
+		e.rotate = RotarOn();
+		if (e.rotate) {
+			e.msb0 = msb;
+			// Hueco para las cargas siguientes: otros donantes, otras entidades. 25% (minimo 2 MB) sobre la primera.
+			const size_t cap = cg.size() + std::max<size_t>(cg.size() / 4, 2u << 20);
+			if (!PadCgpr(&cg, cap)) e.rotate = false;
+		}
+	}
 	if (built) {
 		// (rando16) Con entidad visual trasplantada no se baraja: la matriz de cada entidad de Bluepoint es la del sitio
 		// original de su parte; si la parte se mueve, aspecto y logica quedan en sitios distintos.
-		std::error_code ec;
-		const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" / Utf8Path(DemonioOn() ? std::string("demonio-") + Seed() : std::string(Seed()));
-		if (!ec) std::filesystem::create_directories(dir, ec);
-		const auto cm = dir / Utf8Path(map + ".msb");
-		const auto cc = dir / Utf8Path(map + "_legacy_instances.cgpr");
-		if (!ec && WriteFile(cm, msb) && WriteFile(cc, cg)) {
+		const auto dir = CopyDir();
+		const auto cm  = dir / Utf8Path(map + ".msb");
+		const auto cc  = dir / Utf8Path(map + "_legacy_instances.cgpr");
+		if (!dir.empty() && WriteFile(cm, msb) && WriteFile(cc, cg)) {
 			e.copy      = cm;
 			e.size      = msb.size();
 			e.cgpr      = cc;
 			e.cgpr_size = cg.size();
-			std::printf("[rando] mapa %s: copias %s (%zu bytes) y %s (%zu bytes)\n", map.c_str(), PathUtf8(cm).c_str(),
-			            msb.size(), PathUtf8(cc).c_str(), cg.size());
+			std::printf("[rando] mapa %s: copias %s (%zu bytes) y %s (%zu bytes)%s\n", map.c_str(), PathUtf8(cm).c_str(),
+			            msb.size(), PathUtf8(cc).c_str(), cg.size(), e.rotate ? "; turnos: otra mezcla en cada carga" : "");
 		} else {
+			e.rotate = false;
 			std::printf("[rando] mapa %s: no se pudieron escribir las copias, solo barajado\n", map.c_str());
 		}
 		std::fflush(stdout);
 	}
-	RedirectTable().emplace_back(map, e);
+	RedirectTable().emplace_back(map, std::move(e));
 	return RedirectTable().back().second;
+}
+
+// (rando26) Una lectura del cgpr del mapa desde el byte 0 = una carga del mapa (al arrancar, al morir, al descansar, al
+// volver). Desde la segunda (separada al menos 3 s de la anterior) se monta otra mezcla con la semilla "<semilla>/cN":
+// cgpr nuevo (mismo tamaño, relleno) en un archivo nuevo y ganchos nuevos; el MSB es el mismo.
+inline void NoteLoad(const std::string& map, RedirectEntry& e) {
+	const auto now = std::chrono::steady_clock::now();
+	if (e.load > 0 && now - e.last < std::chrono::seconds(3)) {
+		e.last = now;
+		return;
+	}
+	e.last = now;
+	if (e.load++ == 0) return;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		CurSeed() = std::string(Seed()) + "/c" + std::to_string(e.load) + (attempt > 0 ? "t" + std::to_string(attempt) : "");
+		std::vector<uint8_t>   msb, cg;
+		std::vector<SlotFinal> finals;
+		const bool             ok = BuildMezcla(map, e.app0, &msb, &cg, &finals);
+		CurSeed().clear();
+		if (!ok) continue;
+		if (DemonioOn() && map == "m02_00_00_00") {
+			std::vector<uint8_t> m0 = e.msb0; // el Vanguard: mismo hueco, sobre el MSB servido
+			BuildDemonio(map, e.app0, &m0, &cg);
+		}
+		if (!PadCgpr(&cg, e.cgpr_size)) {
+			std::printf("[rando] mapa %s: carga %d: el cgpr no cabe (%zu > %llu), otro intento\n", map.c_str(), e.load, cg.size(),
+			            static_cast<unsigned long long>(e.cgpr_size));
+			continue;
+		}
+		const auto dir = CopyDir();
+		const auto cc  = dir / Utf8Path(map + "_legacy_instances.c" + std::to_string(e.load) + ".cgpr");
+		if (dir.empty() || !WriteFile(cc, cg)) break;
+		std::error_code ec;
+		if (e.load >= 3) std::filesystem::remove(dir / Utf8Path(map + "_legacy_instances.c" + std::to_string(e.load - 2) + ".cgpr"), ec);
+		e.cgpr = cc;
+		SetHooks(map, e.load, finals, e);
+		std::printf("[rando] mapa %s: carga %d: mezcla nueva (semilla %s/c%d) en %s\n", map.c_str(), e.load, Seed(), e.load,
+		            PathUtf8(cc).c_str());
+		std::fflush(stdout);
+		return;
+	}
+	std::printf("[rando] mapa %s: carga %d: no se pudo montar otra mezcla, se repite la anterior\n", map.c_str(), e.load);
+	std::fflush(stdout);
 }
 
 } // namespace Detail
 
 // Copia del MSB o del legacy_instances.cgpr con enemigos de otros mundos, o vacío si no hay. Se crea una vez por mapa.
-inline std::filesystem::path RedirectRead(const std::string& path) {
+// |offset| = 0: lectura desde el principio (una carga, rando26); -1: solo tamaño / sin lectura.
+inline std::filesystem::path RedirectRead(const std::string& path, int64_t offset = -1) {
 	using namespace Detail;
 	if (!CrossOn()) return {};
-	if (DemonioOn()) InstallModelProbe(); // (demonio) ganchos y trazas antes de cargar ningun mapa
+	if (DemonioOn() || MezclaHooksOn()) InstallModelProbe(); // ganchos y trazas antes de cargar ningun mapa
 	const bool msb = IsMsbPath(path);
 	const bool cg  = !msb && IsCgprPath(path);
 	if (!msb && !cg) return {};
@@ -3211,7 +3482,8 @@ inline std::filesystem::path RedirectRead(const std::string& path) {
 	// app0/cp11demonssouls/dvdroot/map/mapstudio/X.msb y app0/scripts/worlds/X/_cmn/X_legacy_instances.cgpr
 	const auto app0 = real.parent_path().parent_path().parent_path().parent_path().parent_path();
 	std::lock_guard<std::mutex> lock(RedirectMutex());
-	const auto& e = EntryFor(map, app0);
+	auto& e = EntryFor(map, app0);
+	if (cg && offset == 0 && e.rotate) NoteLoad(map, e);
 	return msb ? e.copy : e.cgpr;
 }
 

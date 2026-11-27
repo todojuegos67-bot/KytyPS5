@@ -1781,7 +1781,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	// (randomizer, fase 2) Con enemigos de otros mundos el MSB se lee de su copia (ya barajada; local/rando-msb.h).
 	if (RandoMsb::CrossOn()) {
-		if (const auto cross = RandoMsb::RedirectRead(host_path); !cross.empty()) {
+		if (const auto cross = RandoMsb::RedirectRead(host_path, static_cast<int64_t>(file_offset)); !cross.empty()) {
 			RandoMsb::TraceRead(host_path, true);
 			const int r = ReadHostFileToGuestRaw(Common::PathToString(cross), file_offset, destination, size, bytes_read);
 			RandoMsb::TraceChunk(host_path, static_cast<int64_t>(file_offset), size, bytes_read != nullptr ? *bytes_read : 0, true);
