@@ -1405,10 +1405,21 @@ void RenderExecutor::DsNatMark(CommandBuffer& buffer, uint32_t kind_pass, uint32
 			const char* why  = nullptr;
 			if (regs.GetDepthRenderTarget().z_write_base_addr != s.addr || regs.GetDepthDepthView().slice_start != s.layer)
 				why = "registros de otra cascada en la marca (1er cubo: va por su 1er draw)";
-			else if (m_ds_last_depth_addr != s.addr || !m_ds_last_depth_id)
-				why = "la ultima profundidad resuelta no es la de la cascada";
-			else if (s.partial)
-				why = "cubo parcial";
+			else {
+				// (11-27, log 20261127-060057-463: cascada 3, 453 cubos sin salto por esto.) Los registros ya son los de la
+				// cascada (imagen y capa) pero aun no los resolvio ningun draw: se resuelve aqui, como el primer draw del cubo
+				// (ResolveRenderDepthTarget, con el candado de render, igual que renderDraw.cpp).
+				if (m_ds_last_depth_addr != s.addr || !m_ds_last_depth_id) {
+					RenderLockGuard resolve_lock(m_context.GetMutex());
+					RenderDepthInfo tmp {};
+					ResolveRenderDepthTarget(buffer, tmp);
+					H::NatCount(H::g_nat_info_why, "=1: profundidad de la cascada resuelta en la marca");
+				}
+				if (m_ds_last_depth_addr != s.addr || !m_ds_last_depth_id)
+					why = "la ultima profundidad resuelta no es la de la cascada";
+				else if (s.partial)
+					why = "cubo parcial";
+			}
 			if (why != nullptr) {
 				count_whole(0, false, why);
 				return;

@@ -797,6 +797,8 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 					if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
 						std::printf("[nativo-sombras] DIAG VS de skinning con PS @%llx ES @%llx: al juego\n",
 						            static_cast<unsigned long long>(dcb_ps[k]), static_cast<unsigned long long>(dcb_es[k]));
+					// (Su codigo al log, para separar los PS que descartan (recorte alfa) de los que no.)
+					if (dcb_ps[k] != ~uint64_t {0}) H::GpuCode("ps-skin", dcb_ps[k]);
 				}
 				return dcb_ps[k] == ~uint64_t {0} ? "VS de skinning con PS desconocido (la dibuja el juego)" : "VS de skinning con PS (recorte alfa: la dibuja el juego)";
 			}
