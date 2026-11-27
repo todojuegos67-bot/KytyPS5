@@ -62,6 +62,7 @@
 #include "local/perfil.h"       // (KYTY_PERFIL)
 #include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
 #include "render1.h" // (render1 F0+F1)
+#include "local/normal-why.h" // (vg1)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -2849,6 +2850,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				m_renderer.GetRenderExecutor().NativeXprForgetState();
 			if (packet_header == 0xc0032500u && !GraphicsRunDebugDumpEnabled()) {
 				G1::WalkMark(G1::WObserved); // (g1 NP1: the observer done, the try begins)
+				NormalWhy::t_why = NormalWhy::Table; // (vg1: lo cambia decal-safe)
 				const auto consumed =
 				    TryNativeXprDraws({packet, remaining_dw}, DrawStateObserver::g_shadow.last_clean);
 				G1::WalkMark(G1::WTried); // (g1 NP1: the try returned)
@@ -2875,6 +2877,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			} else if (packet_header == 0xc0083800u && !GraphicsRunDebugDumpEnabled()) {
 				// Several indexed indirect draws of consecutive arguments, as a run of DRAW_INDEX_INDIRECT.
 				G1::WalkMark(G1::WObserved); // (g1 NP1)
+				NormalWhy::t_why = NormalWhy::Table; // (vg1: lo cambia decal-safe)
 				const auto consumed = TryNativeMultiDraw({packet, remaining_dw});
 				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
@@ -2897,6 +2900,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			} else if (packet_header == 0xc0012d00u && !GraphicsRunDebugDumpEnabled()) {
 				// A draw of vertices as a table draw (the normal path stores the pair's state).
 				G1::WalkMark(G1::WObserved); // (g1 NP1)
+				NormalWhy::t_why = NormalWhy::Table; // (vg1: lo cambia decal-safe)
 				const auto consumed = TryNativeAutoDraw({packet, remaining_dw});
 				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
@@ -2910,6 +2914,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
 				G1::WalkMark(G1::WObserved); // (g1 NP1)
+				NormalWhy::t_why = NormalWhy::Table; // (vg1: lo cambia decal-safe)
 				const auto consumed = TryNativeDirectDraw({packet, remaining_dw});
 				G1::WalkMark(G1::WTried); // (g1 NP1)
 				if (consumed) {
@@ -2963,6 +2968,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (spec != nullptr && (opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_2 ||
 		                        opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO))
 			return refuse("draw"); // (no table draw took it)
+		if (spec == nullptr && NormalWhy::On() &&
+		    (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+		     opcode == Pm4::IT_DRAW_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_INDIRECT ||
+		     opcode == Pm4::IT_DRAW_INDIRECT_MULTI || opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI))
+			NormalWhy::Count(opcode, m_ucfg.GetPrimType() == Prospero::PrimitiveType::kTriList, m_index_type_and_size); // (vg1)
+		else
+			NormalWhy::t_why = NormalWhy::NoTry;
 		uint32_t packet_dw = 0;
 		if (spec == nullptr) {
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
@@ -3208,6 +3220,7 @@ static bool DecalLikeDraw(const HW::Context& ctx) {
 // The normal path takes the draw (KYTY_DECAL_SAFE): counted, the first ones and then every power of two printed.
 static bool DecalTakesNormalPath(const HW::Context& ctx) {
 	if (!DecalSafeOn() || !DecalLikeDraw(ctx)) return false;
+	NormalWhy::t_why = NormalWhy::Decal; // (vg1)
 	static std::atomic<uint64_t> routed {0};
 	const uint64_t               n = routed.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (n <= 2 || (n & (n - 1)) == 0) {

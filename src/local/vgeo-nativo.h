@@ -41,7 +41,8 @@ namespace VgeoNativo {
 		const char* v = std::getenv("KYTY_NATIVO_VGEO");
 		const int   m = v != nullptr ? std::atoi(v) : 0;
 		std::printf("[nativo-vgeo] KYTY_NATIVO_VGEO=%d (%s)\n", m,
-		            m == 1 ? "via corta" : m == 2 ? "via corta + validacion 1/8 frames por el camino normal" : "apagado");
+		            m == 1 ? "via corta" : m == 2 ? "via corta + validacion 1/8 frames por el camino normal"
+		            : m == 3 ? "A/B cada 5 s (con KYTY_TECHO): solo tabla primero, sin la via de argumentos" : "apagado");
 		std::fflush(stdout);
 		return m;
 	}();
@@ -51,6 +52,7 @@ namespace VgeoNativo {
 inline std::atomic<uint64_t> g_cs[3] {}; // direcciones de CS (formato cs_regs.data_addr)
 inline std::atomic<uint32_t> g_frame {0};
 inline std::atomic<bool>     g_normal_frame {false}; // (=2) este frame por el camino normal
+inline std::atomic<bool>     g_ab_on {false};        // (=3) esta ventana de 5 s con la tabla primero (B)
 
 // Contadores del intervalo (hilo GPU).
 inline std::atomic<uint64_t> g_fast {0}, g_fast_ns {0}, g_normal {0}, g_normal_ns {0}, g_val_normal {0},
@@ -152,11 +154,40 @@ struct TargetScope {
 }
 [[nodiscard]] inline bool ValidationFrame() { return Mode() == 2 && g_normal_frame.load(std::memory_order_relaxed); }
 // La via corta para este CS en este frame (argumentos indirectos en la GPU).
-[[nodiscard]] inline bool Fast(uint64_t cs) { return Mode() != 0 && Is(cs) && !ValidationFrame(); }
+[[nodiscard]] inline bool Fast(uint64_t cs) { return (Mode() == 1 || Mode() == 2) && Is(cs) && !ValidationFrame(); }
 // (w20) Camino de tabla PRIMERO para todo dispatch de compute (cualquier CS, cualquier cola): TableDispatch ya rechaza
 // por si mismo lo que no puede ir por tabla (no visto 2 veces, copia lineal / limpieza marcadas "special", TAA de frame
 // gen, HWRT, path tracing, SkipShader, captura). Sin aprendizaje ni lista de CS: no hay nada que vaciar.
-[[nodiscard]] inline bool TableFirst() { return Mode() != 0 && !ValidationFrame(); }
+// (vg1, =3) En la A/B solo esto cambia: el mismo TableDispatch con los mismos argumentos, antes o despues del prologo de
+// diagnostico del camino normal (trazas, censos, LiveTrace, Envio1, comprobaciones de CS nulo / SkipShader, que la tabla
+// ya excluye: CS visto 2 veces por el camino normal, sin SkipShader ni captura). Lo grabado en Vulkan es identico.
+[[nodiscard]] inline bool TableFirst() {
+	return Mode() == 3 ? g_ab_on.load(std::memory_order_relaxed) : Mode() != 0 && !ValidationFrame();
+}
+// (vg1) Ventana de 5 s de [techo] (hilo del informe): alterna A (prologo antes) / B (tabla primero) y compara el render
+// ocupado de cada ventana con la media de sus dos vecinas del otro modo (deriva de escena interpolada). Sin la 1a ventana.
+inline void AbWindow(double busy_ms, double fps, bool keep) {
+	if (Mode() != 3) return;
+	struct W { bool b; double busy; };
+	static W      w[4096];
+	static size_t n = 0;
+	const bool    was = g_ab_on.load(std::memory_order_relaxed);
+	if (keep && n < 4096) w[n++] = {was, busy_ms};
+	double sum[2] {}, cnt[2] {};
+	for (size_t i = 1; i + 1 < n; ++i)
+		if (w[i - 1].b != w[i].b && w[i + 1].b != w[i].b) {
+			const double d = w[i].busy - 0.5 * (w[i - 1].busy + w[i + 1].busy); // (este - vecinas)
+			sum[w[i].b ? 1 : 0] += d, cnt[w[i].b ? 1 : 0] += 1;
+		}
+	// B-A: las ventanas B dan (B - A) y las A dan (A - B): delta = (mB - mA) / 2 con signo.
+	const double db = cnt[1] > 0 ? sum[1] / cnt[1] : 0, da = cnt[0] > 0 ? sum[0] / cnt[0] : 0;
+	const double delta = (cnt[0] > 0 && cnt[1] > 0) ? 0.5 * (db - da) : cnt[1] > 0 ? db : -da;
+	std::printf("[nativo-vgeo] A/B tabla primero: esta ventana %s, render ocupado %.2f ms, %.1f fps | ventanas A %.0f B %.0f | "
+	            "delta interpolado B-A %+.3f ms/fot (negativo = B ahorra)\n",
+	            was ? "B (tabla primero)" : "A (como antes)", busy_ms, fps, cnt[0], cnt[1], delta);
+	std::fflush(stdout);
+	g_ab_on.store(!was, std::memory_order_relaxed);
+}
 
 [[nodiscard]] inline uint64_t Now() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
