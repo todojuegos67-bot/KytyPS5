@@ -458,6 +458,40 @@ inline bool NativoSombrasReadable(uint64_t a, uint64_t size) {
 	return true;
 }
 
+// (DIAG, ALFA) Los datos que lee un PS de recorte, una vez por direccion de PS.
+inline void NativoSombrasDiagPsData(uint64_t ps, uint64_t table) {
+	static std::atomic<uint64_t> seen[64] {};
+	if (ps == 0 || ps == ~uint64_t {0}) return;
+	bool claimed = false;
+	for (auto& k: seen) {
+		uint64_t expected = 0;
+		if (k.load(std::memory_order_relaxed) == ps) return;
+		if (k.compare_exchange_strong(expected, ps)) { claimed = true; break; }
+		if (expected == ps) return;
+	}
+	if (!claimed) return;
+	const auto dump = [&](const char* what, uint64_t a, uint32_t bytes) {
+		if (a < 0x100000ull || !NativoSombrasReadable(a, bytes)) {
+			std::printf("[nativo-sombras-alfa] PS @%llx %s @%llx: no legible\n", static_cast<unsigned long long>(ps), what,
+			            static_cast<unsigned long long>(a));
+			return;
+		}
+		const auto* w = reinterpret_cast<const uint32_t*>(a);
+		for (uint32_t i = 0; i < bytes / 4; i += 8) {
+			std::printf("[nativo-sombras-alfa] PS @%llx %s +%03x:", static_cast<unsigned long long>(ps), what, i * 4);
+			for (uint32_t j = i; j < i + 8 && j < bytes / 4; ++j) std::printf(" %08x", w[j]);
+			std::printf("\n");
+		}
+	};
+	dump("tabla", table, 0x40);
+	if (table >= 0x100000ull && NativoSombrasReadable(table, 0x30)) {
+		const auto* t = reinterpret_cast<const uint64_t*>(table);
+		dump("cbuf", t[3] & 0xFFFFFFFFFFFFull, 0x2a0);
+		dump("samplers", t[5] & 0xFFFFFFFFFFFFull, 0x180);
+	}
+	std::fflush(stdout);
+}
+
 // (hilo del juego) Que hace en profundidad el PS de un draw de skinning (T32/T34 11-27: 20 PS volcados, llvm-mc gfx1030):
 //  1: solo "exp null done vm; s_endpgm" (f8001890 00000000 bf810000): igual que sin PS.
 //  2: "fundido con bandera": s_load_dwordx2 s[12:13], s[0:1], 0x18; s_load_dword vcc_lo, s[12:13], OFF;
@@ -867,6 +901,12 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 						            static_cast<unsigned long long>(dcb_ps[k]), static_cast<unsigned long long>(dcb_es[k]));
 					// (Su codigo al log, para separar los PS que descartan (recorte alfa) de los que no.)
 					if (dcb_ps[k] != ~uint64_t {0}) H::GpuCode("ps-skin", dcb_ps[k]);
+					// (ALFA, T38) Para el recorte alfa nativo: el VS de skinning de este draw (de donde saca la UV de
+					// param0.z) y, una vez por PS, sus descriptores: tabla USER_DATA_PS s[0:1], cbuf (*(tabla+0x18), los
+					// T# en linea en cbuf+0x50/0x180/0x1c0/0x280 y umbrales 0x24/0x54/0x64) y la tabla de samplers
+					// (*(tabla+0x28), S# en +0xb0 y +0x170). Una sola vez cada uno (64 huecos).
+					H::GpuCode("es-skin", dcb_es[k]);
+					NativoSombrasDiagPsData(dcb_ps[k], dcb_psu[k]);
 				}
 				return dcb_ps[k] == ~uint64_t {0} ? "VS de skinning con PS desconocido (la dibuja el juego)" : "VS de skinning con PS (recorte alfa: la dibuja el juego)";
 			}
