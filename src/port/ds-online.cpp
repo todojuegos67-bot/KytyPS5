@@ -23,6 +23,7 @@
 #endif
 
 #include "port/ds-online.h"
+#include "port/ds-i18n.h"
 
 #include <algorithm>
 #include <atomic>
@@ -65,13 +66,13 @@ std::string MakeCode(const std::string& /*ip_port*/) { return {}; }
 std::string ReadCode(const std::string& /*text*/) { return {}; }
 std::string DataFolder() { return {}; }
 bool        CreateAccount(const std::string& /*host*/, const std::string& /*name*/, const std::string& /*password*/, std::string* error) {
-	if (error != nullptr) *error = "online no incluido en esta compilacion";
+	if (error != nullptr) *error = I18n::T("online no incluido en esta compilación");
 	return false;
 }
 std::string ServerState(const std::string& /*host_port*/) { return {}; }
 bool        Chat(const std::string& /*host_port*/, const std::string& /*name*/, const std::string& /*password*/, const std::string& /*to*/,
                  const std::string& /*text*/, std::vector<ChatMessage>* /*inbox*/, std::vector<std::string>* /*online*/, std::string* error) {
-	if (error != nullptr) *error = "online no incluido en esta compilacion";
+	if (error != nullptr) *error = I18n::T("online no incluido en esta compilación");
 	return false;
 }
 } // namespace Port::Online
@@ -284,15 +285,15 @@ bool Probe(const std::string& host_port, std::string* info) {
 	int         status = 0;
 	std::string reply;
 	if (!HttpPost(host_port, "/dsmaster/ss", "{\"cmd\":\"getServerState\"}", 3000, &status, &reply)) {
-		if (info) *info = "no responde (apagado, puerto cerrado o direccion mal escrita)";
+		if (info) *info = I18n::T("no responde (apagado, puerto cerrado o dirección mal escrita)");
 		return false;
 	}
 	OnlineCore::J j;
 	if (status != 200 || !OnlineCore::Parse(reply, &j) || j.Get("ServerState") == nullptr || j.Get("ServerState")->AsInt(-1) != 0) {
-		if (info) *info = "responde, pero no es un servidor de Demon's Souls (HTTP " + std::to_string(status) + ")";
+		if (info) *info = std::string(I18n::T("responde, pero no es un servidor de Demon's Souls (HTTP ")) + std::to_string(status) + ")";
 		return false;
 	}
-	if (info) *info = "conectado";
+	if (info) *info = I18n::T("conectado");
 	return true;
 }
 
@@ -576,12 +577,12 @@ bool CreateAccount(const std::string& host, const std::string& name, const std::
 	int         status = 0;
 	std::string reply;
 	if (!HttpPost(host + ":" + std::to_string(kAccountPort), "/cuenta/registro", OnlineCore::Dump(body), 4000, &status, &reply)) {
-		if (error) *error = "el servidor no responde (" + host + ":" + std::to_string(kAccountPort) + ")";
+		if (error) *error = std::string(I18n::T("el servidor no responde (")) + host + ":" + std::to_string(kAccountPort) + ")";
 		return false;
 	}
 	OnlineCore::J j;
 	if (!OnlineCore::Parse(reply, &j) || j.Get("ok") == nullptr || j.Get("ok")->t != OnlineCore::J::T::Bool || !j.Get("ok")->b) {
-		if (error) *error = (j.Get("error") ? j.Get("error")->AsStr() : "respuesta no valida");
+		if (error) *error = (j.Get("error") ? j.Get("error")->AsStr() : I18n::T("respuesta no válida"));
 		return false;
 	}
 	return true;
@@ -608,16 +609,16 @@ bool Chat(const std::string& host_port, const std::string& name, const std::stri
 	int         status = 0;
 	std::string reply;
 	if (!HttpPost(host_port, "/kyty/chat", OnlineCore::Dump(body), 4000, &status, &reply) || status == 0) {
-		if (error) *error = "el servidor no responde";
+		if (error) *error = I18n::T("el servidor no responde");
 		return false;
 	}
 	J j;
 	if (!OnlineCore::Parse(reply, &j) || j.t != J::T::Obj) {
-		if (error) *error = status == 404 ? "el servidor no tiene chat (actualizalo)" : "respuesta del servidor no valida";
+		if (error) *error = I18n::T(status == 404 ? "el servidor no tiene chat (actualízalo)" : "respuesta del servidor no válida");
 		return false;
 	}
 	if (const J* ok = j.Get("ok"); ok == nullptr || !ok->b) {
-		if (error) *error = j.Get("error") ? j.Get("error")->AsStr() : "error del servidor";
+		if (error) *error = j.Get("error") ? j.Get("error")->AsStr() : I18n::T("error del servidor");
 		return false;
 	}
 	if (inbox)

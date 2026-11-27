@@ -596,8 +596,8 @@ struct Presenter::Impl {
 		const bool es = PortLive::status_es.load(std::memory_order_relaxed); // (the PC port)
 		if (es && (progress.done < progress.total || progress.label != nullptr)) {
 			const bool pipelines = progress.label != nullptr && std::strstr(progress.label, "pipelines") != nullptr;
-			std::snprintf(line.data(), line.size(), "%s%s %zu/%zu  (%zu%%)", gate ? "Antes de jugar: " : "",
-			              pipelines ? "Preparando pipelines" : "Preparando shaders",
+			std::snprintf(line.data(), line.size(), "%s%s %zu/%zu  (%zu%%)", gate ? PortLive::status_before.load(std::memory_order_relaxed) : "",
+			              pipelines ? PortLive::status_pipelines.load(std::memory_order_relaxed) : PortLive::status_shaders.load(std::memory_order_relaxed),
 			              progress.done, progress.total, progress.done * 100 / progress.total);
 		} else if (progress.done < progress.total || progress.label != nullptr) {
 			std::snprintf(line.data(), line.size(), "%s %zu%%  (%zu / %zu)",

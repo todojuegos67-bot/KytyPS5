@@ -413,7 +413,7 @@ void Work() {
 			std::scoped_lock lock(g_mutex);
 			g_view.failed  = true;
 			g_view.running = false;
-			g_view.text    = "Primero elige la carpeta del juego (boton \"Elegir carpeta del juego...\") y vuelve a pulsar Preparar shaders.";
+			g_view.text    = I18n::T("Primero elige la carpeta del juego (botón \"Elegir carpeta del juego...\") y vuelve a pulsar Preparar shaders.");
 			return;
 		}
 	}
@@ -651,7 +651,7 @@ void Work() {
 	if (resumed) {
 		std::printf("[port] precompile: %d of %d shards done before: going on at %d %%\n", done, total, resumed_p);
 		std::fflush(stdout);
-		SetText("Preparando shaders: continuando (" + std::to_string(resumed_p) + " % ya hecho)..."); // (ds-pc-port51)
+		SetText(std::string(I18n::T("Preparando shaders: continuando (")) + std::to_string(resumed_p) + I18n::T(" % ya hecho)...")); // (ds-pc-port51)
 	}
 	{
 		std::scoped_lock lock(g_mutex);
@@ -712,7 +712,7 @@ void Work() {
 			                 true);
 			if (c.process == nullptr) {
 				kill_all();
-				return fail("No se pudo arrancar kyty_shader_precompile.exe.");
+				return fail(I18n::T("No se pudo arrancar kyty_shader_precompile.exe."));
 			}
 			running.push_back({item, c, name});
 		}
@@ -748,7 +748,7 @@ void Work() {
 				}
 				kill_all();
 				(void)run("merge-failed", L"--merge", false);
-				return fail("Fallo un trozo de la preparacion de shaders (" + r.name + "). Lo hecho se guarda. Mira logs\\*-precompile.");
+				return fail(std::string(I18n::T("Falló un trozo de la preparación de shaders (")) + r.name + I18n::T("). Lo hecho se guarda. Mira logs\\*-precompile."));
 			}
 			done++;
 			done_log << done_name(r.item) << "\n";
@@ -781,7 +781,7 @@ void Work() {
 	SetText("Preparando shaders: guardando la cache...");
 	// (Resumed: no --prune, which keeps only this run's pipelines: the earlier runs' shards were merged and are not made again.)
 	if (!run("merge", resumed ? L"--merge --stamp" : L"--merge --stamp --prune", false))
-		return fail("No se pudo guardar la cache de shaders (merge). Mira logs\\*-precompile.");
+		return fail(I18n::T("No se pudo guardar la caché de shaders (merge). Mira logs\\*-precompile."));
 	done_log.close();
 	fs::remove_all(resume_dir, ec);
 	fs::remove_all(g_nvidia, ec);

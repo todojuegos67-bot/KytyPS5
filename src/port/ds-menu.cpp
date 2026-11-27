@@ -1784,7 +1784,7 @@ float       g_unit = 1.0f;
 void Describe(const char* label, const char* tip) {
 	if (ImGui::IsItemFocused() || ImGui::IsItemHovered()) {
 		g_desc_title = I18n::T(label);
-		g_desc_text  = tip != nullptr ? tip : "";
+		g_desc_text  = tip != nullptr ? I18n::T(tip) : "";
 	}
 }
 
@@ -1925,7 +1925,7 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		// (10-28) Only the rows that truly need a restart; saved now, applied at the next start.
 		const ImVec2 ls = ImGui::CalcTextSize(text.c_str());
 		ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.68f);
-		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), "(requiere reinicio)");
+		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), I18n::T("(requiere reinicio)"));
 		ImGui::PopFont();
 	}
 	const char*  shown = I18n::T(value);
@@ -2733,17 +2733,17 @@ void CheckWork() {
 	// (10-28, the emulator launcher) Both versions shown; an installed version with the same or a newer date (the 8-digit
 	// YYYYMMDD in the tag) is never offered the published one (no downgrade).
 	const std::string cur  = Update::CurrentVersion();
-	const std::string both = "Version instalada: " + cur + "\nUltima version del port en GitHub: " + r.tag;
+	const std::string both = std::string(I18n::T("Versión instalada: ")) + cur + "\n" + I18n::T("Última versión del port en GitHub: ") + r.tag;
 	const std::string dc = Update::TagDate(cur), dr = Update::TagDate(r.tag);
 	// (11-23) A folder that knows its zip (version-zip.txt): up to date only with that very zip; a zip replaced in the same
 	// release (same tag, another zip name) is offered.
 	const std::string iz = Update::InstalledZip();
-	if (!iz.empty() && iz != r.asset) SetUpd(UpdateUi::Available, both + "\nNueva version " + r.asset + " \xE2\x80\x94 Cruz para actualizar");
-	else if (!iz.empty() || r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\nYa tienes la ultima version.");
-	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + "\nTu version es mas nueva. No hace falta actualizar.");
-	else SetUpd(UpdateUi::Available, both + "\nNueva version " + r.tag + " \xE2\x80\x94 Cruz para actualizar");
+	if (!iz.empty() && iz != r.asset) SetUpd(UpdateUi::Available, both + "\n" + I18n::T("Nueva versión ") + r.asset + " \xE2\x80\x94 " + I18n::T("Cruz para actualizar"));
+	else if (!iz.empty() || r.tag == cur) SetUpd(UpdateUi::UpToDate, both + "\n" + I18n::T("Ya tienes la última versión."));
+	else if ((!dc.empty() && !dr.empty() && dc > dr) || (r.published.size() >= 19 && r.published.substr(0, 19) <= Update::BuildIso())) SetUpd(UpdateUi::UpToDate, both + "\n" + I18n::T("Tu versión es más nueva. No hace falta actualizar."));
+	else SetUpd(UpdateUi::Available, both + "\n" + I18n::T("Nueva versión ") + r.tag + " \xE2\x80\x94 " + I18n::T("Cruz para actualizar"));
 #else
-	SetUpd(UpdateUi::Failed, "Solo en Windows.");
+	SetUpd(UpdateUi::Failed, I18n::T("Solo en Windows."));
 #endif
 }
 
@@ -2757,7 +2757,7 @@ void InstallWork() {
 	g_upd.cancel = false;
 	g_upd.done   = 0;
 	g_upd.total  = r.size;
-	SetUpd(UpdateUi::Working, "Descargando " + r.asset + "...");
+	SetUpd(UpdateUi::Working, std::string(I18n::T("Descargando ")) + r.asset + "...");
 	wchar_t temp[MAX_PATH + 1] = {};
 	GetTempPathW(MAX_PATH, temp);
 	std::string safe = r.tag;
@@ -2766,10 +2766,10 @@ void InstallWork() {
 	const std::filesystem::path zip = std::filesystem::path(temp) / std::filesystem::u8path("ds-update-" + safe + ".zip");
 	std::string                 error;
 	if (!Update::Download(r, zip, [](int64_t d, int64_t t) { g_upd.done = d; g_upd.total = t; Bump(); }, &g_upd.cancel, &error)) {
-		SetUpd(UpdateUi::Failed, error + ". No se ha cambiado nada.");
+		SetUpd(UpdateUi::Failed, error + I18n::T(". No se ha cambiado nada."));
 		return;
 	}
-	SetUpd(UpdateUi::Working, "Instalando (copia de seguridad y archivos nuevos)...");
+	SetUpd(UpdateUi::Working, I18n::T("Instalando (copia de seguridad y archivos nuevos)..."));
 	const auto     root = PortRoot();
 	Update::Result res;
 	if (Update::Writable(root)) res = Update::InstallZip(root, zip, r.tag, g_rt.game_rel);
@@ -2778,8 +2778,8 @@ void InstallWork() {
 	std::filesystem::remove(zip, ec);
 	// Restarted by itself (before, a line asked to close and open it again: missed, the update looked like it did nothing).
 	if (res.ok) {
-		SetUpd(UpdateUi::Done, "Actualizacion completada a la version " + r.tag +
-		                           ". Reiniciando con la nueva version... Tus shaders compilados y partidas guardadas se mantienen.");
+		SetUpd(UpdateUi::Done, std::string(I18n::T("Actualización completada a la versión ")) + r.tag +
+		                           I18n::T(". Reiniciando con la nueva versión... Tus shaders compilados y partidas guardadas se mantienen."));
 		std::this_thread::sleep_for(std::chrono::seconds(3));
 		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
@@ -2794,7 +2794,7 @@ void RestoreWork() {
 		if (g_upd.chosen < 0 || g_upd.chosen >= static_cast<int>(g_upd.backups.size())) return;
 		b = g_upd.backups[g_upd.chosen];
 	}
-	SetUpd(UpdateUi::Working, "Restaurando la version " + b.version + "...");
+	SetUpd(UpdateUi::Working, std::string(I18n::T("Restaurando la versión ")) + b.version + "...");
 	const auto     root = PortRoot();
 	Update::Result res;
 	if (Update::Writable(root)) {
@@ -2806,7 +2806,7 @@ void RestoreWork() {
 		                                          std::filesystem::u8path(Update::CurrentVersion()).wstring(), g_rt.game_rel.wstring()});
 	}
 	if (res.ok) {
-		SetUpd(UpdateUi::Done, "Restaurada la version " + b.version + ". Reiniciando...");
+		SetUpd(UpdateUi::Done, std::string(I18n::T("Restaurada la versión ")) + b.version + I18n::T(". Reiniciando..."));
 		std::this_thread::sleep_for(std::chrono::seconds(3));
 		RequestRestart(/*to_launcher=*/true); // (ds-pc-port38) the new version opens at the launcher
 	} else SetUpd(UpdateUi::Failed, res.error);
@@ -2818,12 +2818,12 @@ void OpenRestore() {
 	g_upd.backups = Update::ListBackups(PortRoot());
 	g_upd.chosen  = 0;
 	g_upd.state   = g_upd.backups.empty() ? UpdateUi::Failed : UpdateUi::Choosing;
-	g_upd.text    = g_upd.backups.empty() ? "No hay versiones anteriores guardadas" : "Elige la version a restaurar:";
+	g_upd.text    = I18n::T(g_upd.backups.empty() ? "No hay versiones anteriores guardadas" : "Elige la versión a restaurar:");
 	Bump();
 }
 
 void OpenCheck() {
-	SetUpd(UpdateUi::Checking, "Buscando la ultima version en GitHub...");
+	SetUpd(UpdateUi::Checking, I18n::T("Buscando la última versión en GitHub..."));
 	StartWorker(CheckWork);
 }
 
@@ -2898,7 +2898,7 @@ bool UpdateNotice(float width, float height) {
 		if (ImGui::Button(I18n::T("Sí"), {160 * g_unit, 40 * g_unit}) && !g_upd.busy.load()) {
 			g_notice_kind = NoticeNone;
 			g_tab_request = 4;
-			SetUpd(UpdateUi::Working, "Descargando...");
+			SetUpd(UpdateUi::Working, I18n::T("Descargando..."));
 			StartWorker(InstallWork);
 			started = true;
 		}
@@ -3002,7 +3002,7 @@ void DrawTrophyTab(float unit) {
 	}
 	Section("Trofeos");
 	if (rows.empty()) {
-		ImGui::TextWrapped("%s", "Aún no hay datos de trofeos: se cargan al iniciar el juego.");
+		ImGui::TextWrapped("%s", I18n::T("Aún no hay datos de trofeos: se cargan al iniciar el juego."));
 		return;
 	}
 	auto points = [](int g) { return g == 1 ? 300 : g == 2 ? 90 : g == 3 ? 30 : g == 4 ? 15 : 0; };
@@ -3016,12 +3016,12 @@ void DrawTrophyTab(float unit) {
 	}
 	const float frac = total > 0 ? static_cast<float>(have) / static_cast<float>(total) : 0.0f;
 	ImGui::PushFont(nullptr, 30.0f * unit);
-	ImGui::TextColored(kGold, "%d%% completado", static_cast<int>(frac * 100.0f));
+	ImGui::TextColored(kGold, I18n::T("%d%% completado"), static_cast<int>(frac * 100.0f));
 	ImGui::PopFont();
 	ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4 {0.80f, 0.63f, 0.30f, 1.0f});
 	ImGui::ProgressBar(frac, {-1.0f, 22.0f * unit}, "");
 	ImGui::PopStyleColor();
-	ImGui::Text("%d / %d trofeos", earned, static_cast<int>(rows.size()));
+	ImGui::Text(I18n::T("%d / %d trofeos"), earned, static_cast<int>(rows.size()));
 	ImGui::Separator();
 	static const ImVec4 grade_col[5] = {{0.6f, 0.6f, 0.6f, 1.0f}, {0.70f, 0.85f, 1.00f, 1.0f}, {1.00f, 0.82f, 0.30f, 1.0f},
 	                                    {0.78f, 0.80f, 0.84f, 1.0f}, {0.80f, 0.52f, 0.30f, 1.0f}};
@@ -3037,9 +3037,9 @@ void DrawTrophyTab(float unit) {
 		const float  h      = 64.0f * unit;
 		ImGui::Selectable("##t", false, ImGuiSelectableFlags_None, {w, h}); // focusable: D-pad / arrows scroll the list
 		if (ImGui::IsItemFocused() || ImGui::IsItemHovered()) {
-			g_desc_title = secret ? "Trofeo oculto" : r.name;
-			g_desc_text  = std::string(grade_txt[g]) + (r.earned ? " - obtenido" : " - sin obtener") + "\n\n" +
-			              (secret ? "Se revelar\xC3\xA1 al obtenerlo." : r.detail);
+			g_desc_title = secret ? std::string(I18n::T("Trofeo oculto")) : r.name;
+			g_desc_text  = std::string(I18n::T(grade_txt[g])) + I18n::T(r.earned ? " - obtenido" : " - sin obtener") + "\n\n" +
+			              (secret ? std::string(I18n::T("Se revelar\xC3\xA1 al obtenerlo.")) : r.detail);
 		}
 		ImDrawList* dl = ImGui::GetWindowDrawList();
 		const float r0 = 12.0f * unit;
@@ -3068,22 +3068,22 @@ void DrawPcTab(float unit) {
 	ImGui::TextColored(kGold, "%s", I18n::T("TU EQUIPO"));
 	ImGui::PopFont();
 	const auto& pc  = g_rt.pc;
-	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string("8 GB simulados") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
-	if (!pc.nvidia && !pc.gpu.empty()) gpu += "  (sin DLSS: solo NVIDIA)";
+	std::string gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
+	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string(I18n::T("8 GB simulados")) : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
+	if (!pc.nvidia && !pc.gpu.empty()) gpu += std::string("  (") + I18n::T("sin DLSS: solo NVIDIA") + ")";
 	InfoLine("Grafica", gpu, ink);
-	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string("16 GB RAM (simulados)") : std::to_string(pc.ram_gb) + " GB RAM"), ink);
+	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string(I18n::T("16 GB RAM (simulados)")) : std::to_string(pc.ram_gb) + " GB RAM"), ink);
 	if (!pc.recommended.empty()) {
-		InfoLine("Modo recomendado", pc.recommended, pc.unsupported ? red : kGold);
-		InfoLine("Esperado (estimacion)", pc.expected, pc.unsupported ? red : ink);
+		InfoLine("Modo recomendado", I18n::T(pc.recommended.c_str()), pc.unsupported ? red : kGold);
+		InfoLine("Esperado (estimacion)", I18n::T(pc.expected.c_str()), pc.unsupported ? red : ink);
 	} else {
-		InfoLine("Modo recomendado", "Grafica sin datos: empieza por el Modo Souls equilibrado y mira las metricas.", ink);
+		InfoLine("Modo recomendado", "Gráfica sin datos: empieza por el Modo Souls equilibrado y mira las métricas.", ink);
 	}
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
 	ImGui::Spacing();
-	ImGui::TextColored(kDim, "Version instalada: %s", Update::CurrentVersion());
+	ImGui::TextColored(kDim, I18n::T("Versión instalada: %s"), Update::CurrentVersion());
 
 	UpdateUi::State state;
 	std::string     text;
@@ -3098,7 +3098,7 @@ void DrawPcTab(float unit) {
 	// (10-28c) "Actualizar version" / "Volver a la version anterior" live only in the bottom bar (next to JUGAR / Salir);
 	// here only the confirmation once a newer port version was found.
 	if (state == UpdateUi::Available) {
-		if (ImGui::Button(("Actualizar a " + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
+		if (ImGui::Button((std::string(I18n::T("Actualizar a ")) + g_upd.release.tag).c_str(), {bw, bh})) StartWorker(InstallWork);
 	}
 	ImGui::EndDisabled();
 	// (10-27c) "Anadir a Steam": a non-Steam shortcut with its icon and artwork (ds-steam.cpp).
@@ -3107,11 +3107,11 @@ void DrawPcTab(float unit) {
 		static std::string steam_text;
 		static std::atomic<bool> steam_busy {false};
 		ImGui::BeginDisabled(steam_busy.load());
-		if (ImGui::Button("Añadir a Steam", {bw, bh})) {
+		if (ImGui::Button(I18n::T("Añadir a Steam"), {bw, bh})) {
 			steam_busy = true;
 			{
 				std::scoped_lock lock(steam_mutex);
-				steam_text = "Añadiendo a Steam...";
+				steam_text = I18n::T("Añadiendo a Steam...");
 			}
 			std::thread([] {
 				std::string report;
@@ -3123,13 +3123,13 @@ void DrawPcTab(float unit) {
 		}
 		ImGui::EndDisabled();
 		if (ImGui::IsItemHovered())
-			TipText("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
+			TipText("Añade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imágenes). Mejor con Steam cerrado; si está abierto, reinícialo para que aparezca.");
 		std::scoped_lock lock(steam_mutex);
 		if (!steam_text.empty()) ImGui::TextWrapped("%s", steam_text.c_str());
-		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso.");
+		else ImGui::TextColored(kDim, "%s", I18n::T("Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso."));
 	}
 	if (!text.empty()) ImGui::TextWrapped("%s", text.c_str());
-	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
+	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind(I18n::T("Descargando "), 0) == 0) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
@@ -3142,8 +3142,8 @@ void DrawPcTab(float unit) {
 			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i)) {
 				g_upd.chosen = i;
 				g_upd.state  = UpdateUi::Confirming;
-				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
-				             ". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.";
+				g_upd.text   = std::string(I18n::T("Se restaura la versión ")) + g_upd.backups[i].version +
+				             I18n::T(". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La caché de shaders, las partidas, los seeds y los ajustes no se tocan.");
 			}
 		}
 	}
@@ -3227,45 +3227,45 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	const auto&  pc = g_rt.pc;
 	if (!in_tab) {
 		ImGui::PushFont(nullptr, 34.0f * unit);
-		ImGui::TextColored(kGold, "%s", "Configurador");
+		ImGui::TextColored(kGold, "%s", I18n::T("Configurador"));
 		ImGui::PopFont();
 	}
 	ImGui::PushTextWrapPos(0.0f);
-	ImGui::TextColored(kDim, "%s", "Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales.");
+	ImGui::TextColored(kDim, "%s", I18n::T("Hemos detectado tu equipo. Puedes optimizar los gráficos para él o seguir con tus ajustes actuales."));
 	ImGui::PopTextWrapPos();
 	ImGui::Spacing();
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.12f, 0.10f, 0.08f, 0.85f});
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * unit);
 	ImGui::BeginChild("##hw", {0, 330 * unit}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding);
-	std::string gpu = pc.gpu.empty() ? std::string("no detectada") : pc.gpu;
-	if (pc.vram > 0) gpu += "  -  " + (g_rt.launched.simulate_vram8 ? std::string("8 GB de VRAM (simulados)") : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB de VRAM");
+	std::string gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
+	if (pc.vram > 0) gpu += "  -  " + (g_rt.launched.simulate_vram8 ? std::string(I18n::T("8 GB de VRAM (simulados)")) : std::to_string((pc.vram + (512ull << 20)) >> 30) + I18n::T(" GB de VRAM"));
 	InfoLine("Tarjeta gráfica", gpu, ink);
 	std::string cpu = pc.cpu.empty() ? std::string("?") : pc.cpu;
-	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + " núcleos / " + std::to_string(pc.cpu_threads) + " hilos";
+	if (pc.cpu_cores > 0) cpu += "  -  " + std::to_string(pc.cpu_cores) + I18n::T(" núcleos / ") + std::to_string(pc.cpu_threads) + I18n::T(" hilos");
 	InfoLine("Procesador", cpu, ink);
 	const bool low = g_rt.launched.simulate_ram16 || (pc.ram_gb > 0 && pc.ram_gb <= 20);
-	InfoLine("Memoria RAM", (g_rt.launched.simulate_ram16 ? std::string("16 GB (simulados)") : std::to_string(pc.ram_gb) + " GB") + (low ? "  (se activan las mejoras para equipos de 16 GB de RAM)" : ""), low ? kWarn : ink);
-	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + " a " + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
+	InfoLine("Memoria RAM", (g_rt.launched.simulate_ram16 ? std::string(I18n::T("16 GB (simulados)")) : std::to_string(pc.ram_gb) + " GB") + (low ? std::string("  (") + I18n::T("se activan las mejoras para equipos de 16 GB de RAM") + ")" : std::string()), low ? kWarn : ink);
+	InfoLine("Monitor", pc.screen_w > 0 ? std::to_string(pc.screen_w) + "x" + std::to_string(pc.screen_h) + I18n::T(" a ") + std::to_string(pc.refresh_hz) + " Hz" : std::string("?"), ink);
 	ImGui::EndChild();
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();
-	if (pc.unsupported) ImGui::TextColored(kWarn, "%s", pc.expected.c_str());
+	if (pc.unsupported) ImGui::TextColored(kWarn, "%s", I18n::T(pc.expected.c_str()));
 	ImGui::Spacing();
 	const float bw = 420 * unit, bh = 60 * unit;
-	if (ImGui::Button("Optimizar según tu equipo", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Optimizar según tu equipo"), {bw, bh})) {
 		g_cfg_why         = Optimize(pc, &g_edit);
 		g_edit.configured = true;
 		Save();
 		if (!g_config_mode && !g_start_mode) ApplyLive(g_edit);
 	}
 	if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-		g_desc_title = "Optimizar según tu equipo";
-		g_desc_text  = "Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.";
+		g_desc_title = I18n::T("Optimizar según tu equipo");
+		g_desc_text  = I18n::T("Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.");
 		if (!in_tab) TipText(g_desc_text.c_str());
 	}
 	if (!in_tab) {
 	ImGui::SameLine();
-	if (ImGui::Button("Continuar", {bw * 0.6f, bh})) {
+	if (ImGui::Button(I18n::T("Continuar"), {bw * 0.6f, bh})) {
 		if (!g_edit.configured) {
 			g_edit.configured = true;
 			Save();
@@ -3278,14 +3278,14 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	if (!g_cfg_why.empty()) {
 		ImGui::Spacing();
 		ImGui::PushFont(nullptr, 30.0f * unit);
-		ImGui::TextColored(kGold, "%s", "Hemos elegido:");
+		ImGui::TextColored(kGold, "%s", I18n::T("Hemos elegido:"));
 		ImGui::PopFont();
 		ImGui::PushTextWrapPos(0.0f);
 		for (const auto& line: g_cfg_why) ImGui::BulletText("%s", line.c_str());
 		ImGui::PopTextWrapPos();
-		ImGui::TextColored(kDim, "%s", g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F2."
+		ImGui::TextColored(kDim, "%s", I18n::T(g_start_mode ? "Guardado. Se aplica al pulsar JUGAR; en el juego puedes cambiarlo con F2."
 		                               : g_config_mode ? "Después puedes cambiar cualquier opción en el juego con F2."
-		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego.");
+		                                              : "Guardado. Lo marcado \"(requiere reinicio)\" se aplica la próxima vez que inicies el juego."));
 	}
 }
 
@@ -3363,7 +3363,7 @@ void Draw(float width, float height) {
 	}
 	ImGui::Begin("##PortMenu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::PushFont(font, 40.0f * unit);
-	ImGui::TextColored(kGold, "%s", g_start_mode ? "DEMON'S SOULS" : "AJUSTES");
+	ImGui::TextColored(kGold, "%s", I18n::T(g_start_mode ? "DEMON'S SOULS" : "AJUSTES"));
 	ImGui::PopFont();
 	ImGui::SameLine();
 	ImGui::SetCursorPosX(size.x - ImGui::CalcTextSize(g_rt.game_info.c_str()).x - 32 * unit);
@@ -3426,7 +3426,7 @@ void Draw(float width, float height) {
 			if (t == 5) DrawTrophyTab(unit);
 			else if (groups[t].empty()) {
 				Section("Sonido");
-				ImGui::TextWrapped("%s", "El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido.");
+				ImGui::TextWrapped( "%s", I18n::T("El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido."));
 			}
 			for (const int section: groups[t]) {
 			if (groups[t].size() > 1) Section(section_names[section]);
@@ -3465,7 +3465,7 @@ void Draw(float width, float height) {
 					ChoiceRow("Intensidad DLSS 5", s.dlss5_strength != g_rt.launched.dlss5_strength, kDlss5Strengths, kDlss5StrengthCount, s.dlss5_strength,
 					          kDlss5StrengthTip);
 					ImGui::EndDisabled();
-					if (!nvidia) ImGui::TextColored(kDim, "Sin DLSS: tu grafica no es NVIDIA.");
+					if (!nvidia) ImGui::TextColored(kDim, "%s", I18n::T("Sin DLSS: tu grafica no es NVIDIA."));
 					break;
 				}
 				case 1: { // Frame generation
@@ -3474,8 +3474,8 @@ void Draw(float width, float height) {
 					for (const char* id: {"sin-fg", "amd-x2", "amd-x3", "amd-x4", "amd-dinamico", "dlss-x2", "dlss-x3", "dlss-x4", "dlss-dinamico"})
 						if (nvidia || std::strncmp(id, "dlss", 4) != 0) modes.push_back({id, FrameGenLabel(id)});
 					if (fixed)
-						ImGui::TextColored(kWarn, "%s", s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
-						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla).");
+						ImGui::TextColored(kWarn, "%s", I18n::T(s.souls_mode == "equilibrado" ? "Modo Souls equilibrado: frame generation fija en AMD x2 (45 reales, 90 en pantalla)."
+						                                                              : s.souls_mode == "low" ? "Modo Souls low profile: frame generation fija en AMD x2 (30 reales, 60 en pantalla)." : s.souls_mode == "ligero-plus" ? "Modo Souls ligero +: frame generation fija en AMD x2 (40 reales, 80 en pantalla)." : "Modo Souls ligero: frame generation fija en AMD x2 (30 reales, 60 en pantalla)."));
 					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
 					ChoiceRow("Frame generation", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
@@ -3508,8 +3508,8 @@ void Draw(float width, float height) {
 							PortLive::fg_generate = g_fg_live;
 						}
 					}
-					ImGui::TextColored(kDim, "FPS desbloqueados siempre, salvo en los modos Souls de FPS fijos.");
-					ImGui::TextColored(kDim, "El menu se muestra sin frames generados (no se arrastra con la imagen).");
+					ImGui::TextColored(kDim, "%s", I18n::T("FPS desbloqueados siempre, salvo en los modos Souls de FPS fijos."));
+					ImGui::TextColored(kDim, "%s", I18n::T("El menu se muestra sin frames generados (no se arrastra con la imagen)."));
 					break;
 				}
 				case 2: { // Calidad grafica (the launcher's group, in its order)
@@ -3531,7 +3531,7 @@ void Draw(float width, float height) {
 					CheckRow("Viñeta", true, s.vignette, "Oscurecimiento de los bordes de la imagen (Sí = como en PS5).");
 					CheckRow("Bloom", true, s.bloom, "Resplandor alrededor de las luces fuertes (Sí = como en PS5).");
 					CheckRow("Adaptación de la vista", true, s.eye_adapt, "La exposición se adapta al pasar de zonas oscuras a claras, como el ojo (Sí = como en PS5).");
-					ImGui::TextColored(kDim, "%s", "Son ajustes internos del juego: los lee al arrancar.");
+					ImGui::TextColored(kDim, "%s", I18n::T("Son ajustes internos del juego: los lee al arrancar."));
 					break;
 				}
 				case 3: { // Ray tracing (ds-torch-1028's launcher rows, in its order; hardware RT only with the experimental switch)
@@ -3599,7 +3599,7 @@ void Draw(float width, float height) {
 					ImGui::Spacing();
 					ImGui::TextColored(kDim, "%s", I18n::T("Carpeta del juego:"));
 					ImGui::TextWrapped("%s", s.game.c_str());
-					ImGui::TextColored(kDim, "%s", g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego.");
+					ImGui::TextColored(kDim, "%s", I18n::T(g_start_mode ? "Se cambia abajo (Cambiar...)." : "Se cambia en el menu de inicio, antes del juego."));
 					break;
 				}
 				case 10: { // (ds-pc-port37) Ajustes del juego: the emulator launcher's window, as a section of its own
@@ -3629,13 +3629,13 @@ void Draw(float width, float height) {
 				case 6: { // Sistema
 					if (!g_start_mode) {
 					// (10-28) The Configurador again: the detected hardware and "Optimizar según tu equipo".
-					if (ImGui::Button("Configurador", {420 * unit, 56 * unit})) {
+					if (ImGui::Button(I18n::T("Configurador"), {420 * unit, 56 * unit})) {
 						g_cfg_open = true;
 						g_cfg_why.clear();
 					}
 					if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
-						g_desc_title = "Configurador";
-						g_desc_text  = "Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.";
+						g_desc_title = I18n::T("Configurador");
+						g_desc_text  = I18n::T("Muestra tu gráfica, procesador, RAM y monitor, y elige los ajustes con mejor rendimiento para tu equipo.");
 					}
 					ImGui::Spacing();
 					}
@@ -3680,7 +3680,7 @@ void Draw(float width, float height) {
 					         "Jugar con teclado y ratón: WASD para moverse, el ratón mueve la cámara, clic izquierdo R1, clic derecho L1, rueda o clic central fija objetivo. F7 suelta o captura el ratón. Con él activo la cámara gira sin la aceleración del juego, también con el stick derecho del mando: si juegas con mando, déjalo desactivado.");
 					ImGui::BeginDisabled(!s.kbm);
 					const auto restart_note = [&](bool changed) {
-						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", "   (requiere reinicio)");
+						if (changed && !g_start_mode) ImGui::TextColored(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}, "%s", I18n::T("   (requiere reinicio)"));
 					};
 					// (11-10) Sensitivity and anti-dead-zone apply live (with keyboard and mouse on since the start).
 					bool mouse_live = false;
@@ -3716,7 +3716,7 @@ void Draw(float width, float height) {
 					if (ImGui::CollapsingHeader(I18n::T("Mapear mando"))) (void)PadMap::Draw(s, unit); // (remap-f2: saved and live at once)
 					ImGui::TextColored(kDim, "%s", s.pad_map.empty() ? I18n::T("Mando: botones de serie.") : I18n::T("Mando: remapeado."));
 					// (10-28) The key bindings (the launcher's "Mapear mando" > Teclado y ratón), read only.
-					if (ImGui::CollapsingHeader("Teclas (teclado y ratón)")) {
+					if (ImGui::CollapsingHeader(I18n::T("Teclas (teclado y ratón)"))) {
 						static const char* kDefault =
 						    "LeftStickUp=W;LeftStickDown=S;LeftStickLeft=A;LeftStickRight=D;Walk=Left Ctrl;R1=Mouse:Left;L1=Mouse:Right;R2=Shift+Mouse:Left;L2=Shift+Mouse:Right;R3=Mouse:Middle;R3=Mouse:WheelUp;R3=Mouse:WheelDown;Circle=Space;Square=E;Cross=F;Triangle=G;Left=Q;Right=R;Up=1;Down=2;Left=3;Right=4;Options=Tab;TouchPad=Backspace";
 						static const std::pair<const char*, const char*> names[] = {
@@ -3746,9 +3746,9 @@ void Draw(float width, float height) {
 							}
 							ImGui::EndTable();
 						}
-						ImGui::TextColored(kDim, "%s", "Las teclas se cambian en mapa_teclado (settings.ini) o con \"Mapear mando\" del lanzador.");
+						ImGui::TextColored(kDim, "%s", I18n::T("Las teclas se cambian en mapa_teclado (settings.ini) o con \"Mapear mando\" del lanzador."));
 					}
-					ImGui::TextColored(kDim, "%s", "F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa.");
+					ImGui::TextColored(kDim, "%s", I18n::T("F7: soltar o capturar el ratón.  F8: métricas.  F11 / Alt+Intro: pantalla completa."));
 					break;
 				}
 				case 8: DrawPcTab(unit); break; // Tu equipo (Añadir a Steam)
@@ -3762,12 +3762,12 @@ void Draw(float width, float height) {
 			ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4 {0.06f, 0.055f, 0.05f, 0.75f});
 			ImGui::BeginChild("##desc", {0, page_h}, ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding); Anim::SmoothScroll();
 			ImGui::PushFont(nullptr, 30.0f * unit);
-			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? tabs[t] : g_desc_title.c_str());
+			ImGui::TextColored(kGold, "%s", g_desc_title.empty() ? I18n::T(tabs[t]) : g_desc_title.c_str());
 			ImGui::PopFont();
 			ImGui::Separator();
 			ImGui::PushTextWrapPos(0.0f);
-			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F2 abre estas mismas opciones."
-			                       : g_desc_text.empty() ? "Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento."
+			ImGui::TextUnformatted(g_desc_text.empty() && g_start_mode ? I18n::T("Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\n\nTodo se guarda en settings.ini y se aplica al pulsar JUGAR. Dentro del juego, F2 abre estas mismas opciones.")
+			                       : g_desc_text.empty() ? I18n::T("Flechas / cruceta: elegir y cambiar el valor.\nA / Intro: abrir la lista y elegir.\nLB / RB o Q / E (o el desplegable Sección): cambiar de sección.\nB / Esc: volver al juego.\n\n(requiere reinicio): se guarda ya y se aplica en el próximo inicio. El resto se aplica al momento.")
 			                                           : g_desc_text.c_str());
 			ImGui::PopTextWrapPos();
 			ImGui::EndChild();
@@ -3804,7 +3804,7 @@ void Draw(float width, float height) {
 			}
 		}
 		DrawShaderBlock(unit);
-		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F2 dentro del juego: opciones en vivo.") : g_status.c_str());
+		ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("Los cambios se aplican al pulsar JUGAR (sin reiniciar). F2 dentro del juego: opciones en vivo.") : I18n::T(g_status.c_str()));
 		const float bw = 300 * unit, bh = 60 * unit;
 		const auto  v  = Precompile::State();
 		if (ImGui::Button(I18n::T(v.running && !v.playable ? "JUGAR (sin esperar)" : "JUGAR"), {bw, bh})) {
@@ -3854,15 +3854,15 @@ void Draw(float width, float height) {
 		}
 	} else {
 	const bool needs = NeedsRestartLive(g_rt.launched, s);
-	if (needs) ImGui::TextColored(kWarn, "Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora).");
-	else ImGui::TextColored(kDim, "%s", g_status.empty() ? "B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas." : g_status.c_str());
+	if (needs) ImGui::TextColored(kWarn, "%s", I18n::T("Hay cambios \"(requiere reinicio)\": se aplican la próxima vez que inicies el juego (o pulsa Reiniciar ahora)."));
+	else ImGui::TextColored(kDim, "%s", g_status.empty() ? I18n::T("B / Círculo / Esc: volver al juego (sin aplicar).   LB / RB, Q / E: pestañas.") : I18n::T(g_status.c_str()));
 	const float bw = 220 * unit, bh = 52 * unit;
-	if (ImGui::Button("Aplicar", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Aplicar"), {bw, bh})) {
 		Save();
 		ApplyLive(s);
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Restablecer", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Restablecer"), {bw, bh})) {
 		// (The defaults, but the game folder and the languages stay.)
 		Settings d;
 		d.game              = s.game;
@@ -3874,7 +3874,7 @@ void Draw(float width, float height) {
 		g_status            = "Valores por defecto (pulsa Aplicar para guardarlos).";
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Volver", {bw, bh})) {
+	if (ImGui::Button(I18n::T("Volver"), {bw, bh})) {
 		Save();
 		ApplyLive(s);
 		SetOpen(false);
@@ -4397,6 +4397,10 @@ void DrawSoulsButton(ImDrawList* dl, ImVec2 a, ImVec2 b, ImFont* font, float fon
 	lozenge({a.x, mid.y}, lr, gold_o);
 	lozenge({b.x, mid.y}, lr, gold_o);
 	// The inscription: measured on whole pixels, flourishes out from it to the inner frame.
+	// (i18n-audit) The label fits the plate: a longer language (German, French) shrinks it, whole pixels, to at most 65 %.
+	for (const float room = (b.x - a.x) * 0.90f, min = std::round(font_size * 0.65f);
+	     font_size > min && font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, t).x > room;)
+		font_size -= 1.0f;
 	const ImVec2 ts  = font->CalcTextSizeA(font_size, FLT_MAX, 0.0f, t);
 	const float  sink = held ? px : 0.0f;
 	const ImVec2 p   = {std::floor(mid.x - ts.x * 0.5f), std::floor(mid.y - ts.y * 0.5f) + sink};
@@ -4846,7 +4850,7 @@ void LauncherPerformance(Settings& s) {
 	{
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(6)});
-		ImGui::TextColored(kGold, "Archivo de paginación de Windows");
+		ImGui::TextColored(kGold, "%s", I18n::T("Archivo de paginación de Windows"));
 		RowEnd(y, 30);
 		const float y1 = RowY();
 		if (LButton("Optimizado (60 GB)", {g_lbox.at.x + U(12), y1}, {U(196), U(32)}, false, g_font_semi, U(15),
@@ -4859,7 +4863,7 @@ void LauncherPerformance(Settings& s) {
 		const float y2 = RowY();
 		static int custom_gb = 32;
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y2 + U(6)});
-		ImGui::TextUnformatted("El que quieras (GB):");
+		ImGui::TextUnformatted( "%s", I18n::T("El que quieras (GB):"));
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(176), y2 + U(2)});
 		ImGui::SetNextItemWidth(U(110));
 		if (ImGui::InputInt("##pagefile_gb", &custom_gb, 4, 16)) custom_gb = std::clamp(custom_gb, 4, 256);
@@ -4872,9 +4876,9 @@ void LauncherPerformance(Settings& s) {
 			const float ny = RowY();
 			ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ny});
 			const bool pending = limit < 64 && PagefileConfigured();
-			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, "Memoria total de Windows (RAM + paginación): %llu GB%s",
+			ImGui::TextColored(limit >= 64 ? kGoldL : kGold, I18n::T("Memoria total de Windows (RAM + paginación): %llu GB%s"),
 			                   static_cast<unsigned long long>(limit),
-			                   limit >= 64 ? "" : pending ? "  -  hecho: REINICIA EL PC" : "  -  elige una opción y reinicia");
+			                   limit >= 64 ? "" : I18n::T(pending ? "  -  hecho: REINICIA EL PC" : "  -  elige una opción y reinicia"));
 			RowEnd(ny, 24);
 		}
 	}
@@ -5105,7 +5109,7 @@ void LauncherAjustes(Settings& s) {
 		}
 		ImGui::BeginDisabled(g_steam_busy.load());
 		if (LButton("Añadir a Steam", {g_lbox.at.x + U(214), by}, {U(194), U(32)}, false, g_font_semi, U(16),
-		            "Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.")) {
+		            "Añade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imágenes). Mejor con Steam cerrado; si está abierto, reinícialo para que aparezca.")) {
 			g_steam_busy = true;
 			{
 				std::scoped_lock lock(g_steam_mutex);
@@ -5192,7 +5196,7 @@ void LauncherUpdateBox() {
 		ImGui::EndDisabled();
 		ImGui::SameLine();
 	}
-	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind("Descargando", 0) == 0) {
+	if (state == UpdateUi::Working && g_upd.total.load() > 0 && text.rfind(I18n::T("Descargando "), 0) == 0) {
 		const float f = static_cast<float>(static_cast<double>(g_upd.done.load()) / static_cast<double>(g_upd.total.load()));
 		char        label[64];
 		std::snprintf(label, sizeof(label), "%.0f / %.0f MB", g_upd.done.load() / 1048576.0, g_upd.total.load() / 1048576.0);
@@ -5205,8 +5209,8 @@ void LauncherUpdateBox() {
 			if (ImGui::Selectable(g_upd.backups[i].version.c_str(), g_upd.chosen == i, ImGuiSelectableFlags_None, {U(396), 0})) {
 				g_upd.chosen = i;
 				g_upd.state  = UpdateUi::Confirming;
-				g_upd.text   = "Se restaura la version " + g_upd.backups[i].version +
-				             ". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.";
+				g_upd.text   = std::string(I18n::T("Se restaura la versión ")) + g_upd.backups[i].version +
+				             I18n::T(". Los archivos actuales del motor se guardan antes en _backup_update (se puede deshacer). La caché de shaders, las partidas, los seeds y los ajustes no se tocan.");
 			}
 		}
 	}
@@ -5633,6 +5637,14 @@ const char* GradeName(int g) {
 // (tiles-fit) The four bottom tiles (TROFEOS, ONLINE, SIN TRUCOS, RANDOMIZER) share the room left of the right-hand
 // column (JUGAR / Opciones): widths 400/300/300/300 with Px(14) gaps, shrunk evenly when they would reach the column.
 float g_tiles_limit = 0.0f; // the right column's left x (set by Draw each frame); 0 = no limit
+// (i18n-audit) A tile's line in its column: the size shrinks (whole pixels, down to 60 %) until it fits, so the longer
+// German or French words never run past the tile's edge.
+float FitTile(ImFont* f, const char* text, float size, float spacing, float max_w) {
+	const float min = std::round(size * 0.6f);
+	while (size > min && Spaced(nullptr, f, size, {0, 0}, 0, text, spacing) > max_w) size -= 1.0f;
+	return size;
+}
+
 void TileRect(int i, float& tx, float& tw) {
 	const float gap = Px(14), x0 = Px(16);
 	const float base[4] = {Px(400), Px(300), Px(300), Px(300)};
@@ -5714,7 +5726,8 @@ void Draw(float width, float height, float column_x) {
 		Libs::Trophy::DrawCup(dl, mc.x - cs * 0.5f, mc.y - cs * 0.48f, cs, Libs::Trophy::CupColor(g_earned > 0 ? 2 : 0));
 		// TROFEOS, then the counter and the percent.
 		const float lx = mc.x + mr + Px(16);
-		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), I18n::T("TROFEOS"), U(2.5f));
+		const float tts = FitTile(cinzel, I18n::T("TROFEOS"), Px(19), U(2.5f), b.x - Px(10) - lx);
+		Spaced(dl, cinzel, tts, {lx, std::round(a.y + Px(8) + (Px(19) - tts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), I18n::T("TROFEOS"), U(2.5f));
 		char count[64];
 		if (!g_rows.empty()) std::snprintf(count, sizeof(count), "%d / %d", g_earned, g_game_total);
 		else std::snprintf(count, sizeof(count), "-");
@@ -5897,7 +5910,7 @@ void Draw(float width, float height, float column_x) {
 			for (int k = g_rando_first; k < static_cast<int>(g_rows.size()); k++, all++)
 				if (g_rows[static_cast<size_t>(k)].t.earned) got++;
 			char         title[96];
-			std::snprintf(title, sizeof(title), "TROFEOS RANDOMIZER  %d / %d", got, all);
+			std::snprintf(title, sizeof(title), I18n::T("TROFEOS RANDOMIZER  %d / %d"), got, all);
 			const ImVec2 hp = ImGui::GetCursorScreenPos();
 			const float  hw = ImGui::GetContentRegionAvail().x;
 			ImGui::Dummy({hw, Px(48)});
@@ -6090,8 +6103,10 @@ void DrawOnline(float width, float height) {
 		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
 		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
 		const float lx = mc.x + mr + Px(16);
-		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "ONLINE", U(2.5f));
-		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), I18n::T("Cuenta y amigos"), U(1));
+		const char* title = I18n::T("ONLINE"), *sub = I18n::T("Cuenta y amigos");
+		const float ts = FitTile(cinzel, title, Px(19), U(2.5f), b.x - Px(10) - lx), ss = FitTile(cinzel, sub, Px(14), U(1), b.x - Px(10) - lx);
+		Spaced(dl, cinzel, ts, {lx, std::round(a.y + Px(8) + (Px(19) - ts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), title, U(2.5f));
+		Spaced(dl, cinzel, ss, {lx, std::round(a.y + Px(34) + (Px(14) - ss) * 0.5f)}, IM_COL32(200, 214, 236, 230), sub, U(1));
 	}
 	ImGui::End();
 	if (!g_online_open) return;
@@ -6170,8 +6185,10 @@ void DrawNoCheats(float width, float height) {
 		dl->AddCircle(mc, mr, Ca(222, 196, 140, 0.55f + 0.45f * hot), 32, std::max(1.0f, U(1.4f)));
 		Icons::Draw(dl, Icons::Soul, mc, mr * (1.25f + 0.06f * pl), Ca(190, 215, 255, 0.95f));
 		const float lx = mc.x + mr + Px(16);
-		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "SIN TRUCOS", U(2.5f));
-		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(200, 214, 236, 230), on ? "Activado" : "Desactivado", U(1));
+		const char* title = I18n::T("SIN TRUCOS"), *sub = I18n::T(on ? "Activado" : "Desactivado");
+		const float ts = FitTile(cinzel, title, Px(19), U(2.5f), b.x - Px(10) - lx), ss = FitTile(cinzel, sub, Px(14), U(1), b.x - Px(10) - lx);
+		Spaced(dl, cinzel, ts, {lx, std::round(a.y + Px(8) + (Px(19) - ts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), title, U(2.5f));
+		Spaced(dl, cinzel, ss, {lx, std::round(a.y + Px(34) + (Px(14) - ss) * 0.5f)}, IM_COL32(200, 214, 236, 230), sub, U(1));
 	}
 	ImGui::End();
 }
@@ -6207,14 +6224,15 @@ void DrawRandomizer(float width, float height) {
 		// (rando-ui3) Readable ON state: [medal | title + seed | NIVEL: x / MUNDOS: y stacked]. Labels and values share one
 		// size (>= the seed line, ~75 % of the title); the medal and its padding shrink instead. Hit-test: right block,
 		// top half = NIVEL (cycles), bottom half = MUNDOS (toggles); right-click anywhere = new seed.
-		const char* kDiff[3] = {"F\xC3\x81" "CIL", "INTERM.", "DIF\xC3\x8D" "CIL"};
+		const char* kDiff[3] = {I18n::T("F\xC3\x81" "CIL"), I18n::T("INTERM."), I18n::T("DIF\xC3\x8D" "CIL")};
+		const char* kLevel = I18n::T("NIVEL:"), *kWorlds = I18n::T("MUNDOS:"), *kYes = I18n::T("S\xC3\x8D"), *kNo = I18n::T("NO");
 		const float mr0  = std::round(th * (on ? 0.28f : 0.34f));
 		const float lx0  = tx + Px(on ? 8 : 12) + 2.0f * mr0 + Px(on ? 6 : 10); // the text after the medal
 		const float rx   = tx + tw - Px(8);
 		float       cfs  = Px(18), labw = 0, valw = 0; // (rando-ui4) bigger text; shrinks to fit as before
 		for (int it = 0; it < 8; it++) {
-			labw = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "NIVEL:", 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "MUNDOS:", 0.0f));
-			valw = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "S\xC3\x8D", 0.0f);
+			labw = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, kLevel, 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, kWorlds, 0.0f));
+			valw = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, kYes, 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, kNo, 0.0f));
 			for (const char* d: kDiff) valw = std::max(valw, Spaced(nullptr, cinzel, cfs, {0, 0}, 0, d, 0.0f));
 			if ((rx - labw - Px(5) - valw - Px(8)) - lx0 >= Px(80) || cfs <= Px(12)) break;
 			cfs -= Px(1) > 0 ? Px(1) : 1.0f;
@@ -6283,13 +6301,13 @@ void DrawRandomizer(float width, float height) {
 		const float ts  = fit("RANDOMIZER", Px(22), tsp);
 		Spaced(dl, cinzel, ts, {lx, std::round(a.y + Px(7) + (Px(22) - ts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", tsp);
 		char sub[64];
-		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "Semilla %d", g_saved.randomizer_seed);
-		else if (on) std::snprintf(sub, sizeof(sub), "Semilla aleatoria");
-		else std::snprintf(sub, sizeof(sub), "Desactivado");
+		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), I18n::T("Semilla %d"), g_saved.randomizer_seed);
+		else if (on) std::snprintf(sub, sizeof(sub), "%s", I18n::T("Semilla aleatoria"));
+		else std::snprintf(sub, sizeof(sub), "%s", I18n::T("Desactivado"));
 		float ss = fit(sub, Px(16), 0.0f);
 		if (on && ss < Px(11)) { // too small: the short form
 			if (g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "#%d", g_saved.randomizer_seed);
-			else std::snprintf(sub, sizeof(sub), "Aleatoria");
+			else std::snprintf(sub, sizeof(sub), "%s", I18n::T("Aleatoria"));
 			ss = fit(sub, Px(16), 0.0f);
 		}
 		Spaced(dl, cinzel, ss, {lx, a.y + Px(33)}, IM_COL32(236, 214, 190, 230), sub, 0.0f);
@@ -6302,9 +6320,9 @@ void DrawRandomizer(float width, float height) {
 				Spaced(dl, cinzel, cfs, {c1x + Px(8), std::round(y)}, IM_COL32(214, 204, 180, 240), label, 0.0f);
 				Spaced(dl, cinzel, cfs, {std::round(vx), std::round(y)}, vcol, value, 0.0f);
 			};
-			row(a.y + gap, "NIVEL:", kDiff[d - 1],
+			row(a.y + gap, kLevel, kDiff[d - 1],
 			    d == 1 ? IM_COL32(255, 222, 130, 255) : (d == 3 ? IM_COL32(255, 150, 120, 255) : IM_COL32(255, 240, 200, 255)));
-			row(b.y - gap - cfs, "MUNDOS:", g_saved.randomizer_cross ? "S\xC3\x8D" : "NO",
+			row(b.y - gap - cfs, kWorlds, g_saved.randomizer_cross ? kYes : kNo,
 			    g_saved.randomizer_cross ? IM_COL32(255, 222, 130, 255) : IM_COL32(245, 245, 245, 255));
 		}
 	}
@@ -6427,15 +6445,58 @@ void DrawLauncher(float width, float height) {
 		fg->AddText(f, size, {at.x + 1, at.y + 1}, IM_COL32(0, 0, 0, 170), text);
 		fg->AddText(f, size, {at.x + 1.5f, at.y + 1.5f}, IM_COL32(0, 0, 0, 90), text);
 		fg->AddText(f, size, at, IM_COL32(236, 226, 204, 200), text);
-		// (ds-pc-port52) The F2 hint just below it, same style, a little smaller: F2 switches the launcher between full
-		// screen borderless and a normal window (RunStartMenu).
-		const float  hsize = std::max(11.0f, std::round(U(12)));
-		const char*  hint  = I18n::T("F2 modo ventana");
-		const ImVec2 hs    = f->CalcTextSizeA(hsize, FLT_MAX, 0.0f, hint);
-		const ImVec2 hat   = {std::floor(width - margin - hs.x), std::floor(at.y + ts.y + U(2))};
-		fg->AddText(f, hsize, {hat.x + 1, hat.y + 1}, IM_COL32(0, 0, 0, 170), hint);
-		fg->AddText(f, hsize, {hat.x + 1.5f, hat.y + 1.5f}, IM_COL32(0, 0, 0, 90), hint);
-		fg->AddText(f, hsize, hat, IM_COL32(236, 226, 204, 200), hint);
+		// (ds-pc-port52, keyhint1) The keys under it, right-aligned, one per row: F1 opens the options inside the game
+		// (F1 or F2 open the in-game menu, OnEvent), F2 here switches the launcher between full screen borderless and a
+		// normal window (RunStartMenu). Each row: a key cap (dark plate, gold rim, the key in the gold serif of the tiles,
+		// a slow glow breathing around it) and its text in the display face, over a soft dark backing that fades out at
+		// its edges, so it reads over the art. Only the top-right corner: the launcher's column and tiles are at the
+		// bottom, the rows grow to the left for longer languages.
+		ImFont*      kf    = g_font_display != nullptr ? g_font_display : f;
+		const float  ksize = std::max(11.0f, std::round(U(13)));          // the key's letters
+		const float  tsize = std::max(11.0f, std::round(U(14)));          // the text
+		const float  kh    = std::round(ksize + U(9));                     // the cap's height
+		const float  gap   = std::round(U(9));                             // cap -> text
+		const float  t     = static_cast<float>(ImGui::GetTime());
+		float        y     = std::floor(at.y + ts.y + U(7));
+		const auto   key_row = [&](const char* key, const char* text, float phase) {
+			const ImVec2 kts = kf->CalcTextSizeA(ksize, FLT_MAX, 0.0f, key);
+			const ImVec2 tts = kf->CalcTextSizeA(tsize, FLT_MAX, 0.0f, text);
+			const float  kw  = std::round(std::max(kh * 1.25f, kts.x + U(14)));
+			const float  rx  = std::floor(width - margin);
+			const float  tx  = std::floor(rx - tts.x);
+			const ImVec2 k0 {std::floor(tx - gap - kw), y}, k1 {k0.x + kw, y + kh};
+			// The backing: a dark plate behind the cap and the text, feathered in three steps.
+			const ImVec2 b0 {k0.x - U(10), y - U(5)}, b1 {rx + U(6), y + kh + U(5)};
+			for (int i = 3; i >= 1; i--) {
+				const float g = static_cast<float>(i) * U(3);
+				fg->AddRectFilled({b0.x - g, b0.y - g}, {b1.x + g, b1.y + g}, IM_COL32(4, 5, 8, 34), U(10) + g);
+			}
+			fg->AddRectFilled(b0, b1, IM_COL32(4, 5, 8, 120), U(10));
+			// The glow: breathing slowly (about 3 s), a little out of step between the rows.
+			const float pulse = 0.5f + 0.5f * std::sin(t * 2.1f + phase);
+			for (int i = 3; i >= 1; i--) {
+				const float g = static_cast<float>(i) * U(1.6f);
+				fg->AddRect({k0.x - g, k0.y - g}, {k1.x + g, k1.y + g}, IM_COL32(230, 180, 90, static_cast<int>((14.0f + 26.0f * pulse) / i)), U(5) + g, 0,
+				            std::max(1.0f, U(1.6f)));
+			}
+			// The cap: dark plate, a lighter top (the key's bevel), the gold rim and a fine inner line.
+			fg->AddRectFilled(k0, k1, IM_COL32(16, 15, 19, 240), U(5));
+			fg->AddRectFilledMultiColor({k0.x + U(2), k0.y + U(2)}, {k1.x - U(2), k0.y + kh * 0.5f}, IM_COL32(90, 70, 40, 70), IM_COL32(90, 70, 40, 70),
+			                            IM_COL32(90, 70, 40, 0), IM_COL32(90, 70, 40, 0));
+			fg->AddRect(k0, k1, IM_COL32(204, 176, 122, static_cast<int>(190 + 50 * pulse)), U(5), 0, std::max(1.0f, U(1.3f)));
+			fg->AddRect({k0.x + U(2.5f), k0.y + U(2.5f)}, {k1.x - U(2.5f), k1.y - U(2.5f)}, IM_COL32(204, 176, 122, 40), U(3.5f), 0, 1.0f);
+			const ImVec2 kat {std::floor(k0.x + (kw - kts.x) * 0.5f), std::floor(k0.y + (kh - kts.y) * 0.5f)};
+			fg->AddText(kf, ksize, {kat.x + 1, kat.y + 1}, IM_COL32(0, 0, 0, 200), key);
+			fg->AddText(kf, ksize, kat, IM_COL32(236, 206, 140, 255), key);
+			// The text, with the fork line's soft shadow.
+			const ImVec2 tat {tx, std::floor(y + (kh - tts.y) * 0.5f)};
+			fg->AddText(kf, tsize, {tat.x + 1, tat.y + 1}, IM_COL32(0, 0, 0, 190), text);
+			fg->AddText(kf, tsize, {tat.x + 1.5f, tat.y + 1.5f}, IM_COL32(0, 0, 0, 90), text);
+			fg->AddText(kf, tsize, tat, IM_COL32(236, 226, 204, 235), text);
+			y += kh + std::round(U(9));
+		};
+		key_row("F1", I18n::T("Opciones dentro del juego"), 0.0f);
+		key_row("F2", I18n::T("Modo ventana"), 1.6f);
 	}
 
 	auto& io = ImGui::GetIO();
@@ -7627,17 +7688,17 @@ void Sample(LogState& L,
 	const Settings&  s = g_rt.launched;
 	// The launcher.ini values (StartMetricsWindow's): scalelabel, fglabel, antilagon, soulsmodo, dlsspreset.
 	const std::string souls = s.souls_mode;
-	const std::string modo  = souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
+	const std::string modo  = I18n::T(souls == "ligero" ? "Modo Souls ligero" : souls == "ligero-plus" ? "Modo Souls ligero +" : souls == "equilibrado" ? "Modo Souls equilibrado"
 	                        : souls == "ultra" ? "Modo Souls ultra" : souls == "extremo" ? "Modo Souls extremo"
-	                        : souls == "low" ? "Modo Souls PC low profile" : souls == "sin-tirones" ? "Optimizado 16 GB / 8 GB" : "Personalizado";
+	                        : souls == "low" ? "Modo Souls PC low profile" : souls == "sin-tirones" ? "Optimizado 16 GB / 8 GB" : "Personalizado");
 	const bool  fixed = FixedFg(s); // (11-22) the optimizado mode too
 	std::string fg_label = fixed ? modo : FrameGenLabel(s.framegen);
-	std::string al       = "No";
+	std::string al       = I18n::T("No");
 	if (fixed) al = "Ultra";
-	else if (s.framegen.rfind("dlss", 0) == 0) al = s.antilag_dlssg == "ultra" ? "Ultra (Reflex apagado)" : s.antilag_dlssg == "normal" ? "Normal (Reflex apagado)" : "Reflex (DLSS-G)";
+	else if (s.framegen.rfind("dlss", 0) == 0) al = I18n::T(s.antilag_dlssg == "ultra" ? "Ultra (Reflex apagado)" : s.antilag_dlssg == "normal" ? "Normal (Reflex apagado)" : "Reflex (DLSS-G)");
 	else if (s.framegen.rfind("amd", 0) == 0) {
 		const std::string m = s.antilag_mode.empty() || s.antilag_mode == "auto" ? (g_rt.pc.amd ? "amd2" : "normal") : s.antilag_mode;
-		al = m == "amd2" ? "Anti-Lag 2 (AMD)" : m == "ultra" ? "Ultra" : m == "no" ? "No" : "Normal";
+		al = I18n::T(m == "amd2" ? "Anti-Lag 2 (AMD)" : m == "ultra" ? "Ultra" : m == "no" ? "No" : "Normal");
 	}
 	std::string scale_label = kResModes[0].label;
 	for (int i = 0; i < kResModeCount; i++)
@@ -7834,7 +7895,7 @@ void Sample(LogState& L,
 			                                                    {"U.rendim.", "Ultra rendimiento"}, {"Rendim.", "Rendimiento"}};
 			for (const auto& [a, b]: reps)
 				if (const size_t at = m.find(a); at != std::string::npos) m.replace(at, std::strlen(a), b);
-			return m;
+			return std::string(I18n::T(m.c_str()));
 		};
 		if (!kind.empty()) {
 			rk = kind;
@@ -7850,19 +7911,19 @@ void Sample(LogState& L,
 				if (!L.dlss_ready && L.in_h == 0) model += " ...";
 			} else if (kind == "XeSS") model = L.xess_ver == "2.0.2" ? "XeSS 3.0.2" : !L.xess_ver.empty() ? "XeSS " + L.xess_ver : "XeSS";
 			else if (kind == "FSR") model = L.fsr_ver.empty() ? "FSR 3.1" : L.fsr_ver + " (AMD SDK 2.4)";
-		} else if (L.force4k) rk = "Nativo", res = "2160p (4K)";
-		else if (scale_label.find("juego") != std::string::npos) rk = "Juego", res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = "reescalado del juego";
-		else if (L.native != 0) rk = "Nativo", res = Fmt("%dp %s %dp", L.native, arrow, out_h);
+		} else if (L.force4k) rk = I18n::T("Nativo"), res = "2160p (4K)";
+		else if (scale_label.find("juego") != std::string::npos) rk = I18n::T("Juego"), res = Fmt("%sp %s %dp", scale_label.substr(0, scale_label.find('p')).c_str(), arrow, out_h), model = I18n::T("reescalado del juego");
+		else if (L.native != 0) rk = I18n::T("Nativo"), res = Fmt("%dp %s %dp", L.native, arrow, out_h);
 		else rk = scale_label;
-		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = "FSR 4 (IA, modelo v07)";
+		if (scale_label.rfind("FSR 4", 0) == 0 && rk == "FSR") rk = "FSR 4", mode = scale_label.substr(6), model = I18n::T("FSR 4 (IA, modelo v07)");
 		// (11-11) DLSS 5 in the Modelo row: the level it was launched with; "activo" once the log says it evaluates.
 		if (!g_rt.launched.dlss5.empty() && g_rt.launched.dlss5 != "0") {
 			std::string lvl = g_rt.launched.dlss5;
 			for (int i = 0; i < kDlss5LevelCount; i++)
 				if (g_rt.launched.dlss5 == kDlss5Levels[i].id) lvl = kDlss5Levels[i].label;
-			const std::string d5 = "DLSS 5 " + lvl + (L.dlss5_on ? " activo" : " ...");
+			const std::string d5 = "DLSS 5 " + lvl + (L.dlss5_on ? I18n::T(" activo") : " ...");
 			model = model.empty() ? d5 : model + " + " + d5;
-			if (rk.empty()) rk = "Nativo";
+			if (rk.empty()) rk = I18n::T("Nativo");
 		}
 		if (!rk.empty()) {
 			const ImU32 col = rk == "DLSS" ? kGreen : rk == "FSR" || rk == "FSR 4" ? kRed : rk == "XeSS" ? kBlue : kOrange;
@@ -7874,13 +7935,13 @@ void Sample(LogState& L,
 	const bool fg_nv = fg_label.find("DLSS") != std::string::npos || fg_label.find("Nvidia") != std::string::npos;
 	if (fg_on) {
 		const ImU32 fg_col = fg_nv ? kGreen : kRed;
-		if (fg_label.rfind("MODO ", 0) == 0 || fg_label.rfind("MODE ", 0) == 0) rows.push_back({"", fg_label, fg_col});
+		if (fixed) rows.push_back({"", fg_label, fg_col}); // (a Souls mode: its name alone)
 		else {
-			rows.push_back({"FG", fg_label + (fg_nv ? " (modelo C)" : ""), fg_col});
+			rows.push_back({"FG", fg_label + (fg_nv ? I18n::T(" (modelo C)") : ""), fg_col});
 			if (f.fg_mult > 0) rows.push_back({"FG ahora", Fmt("x%d", f.fg_mult), fg_col});
 		}
 	}
-	rows.push_back({"Anti-Lag", al, al == "No" ? kKhaki : kGreen});
+	rows.push_back({"Anti-Lag", al, al == I18n::T("No") ? kKhaki : kGreen});
 	rows.push_back({"", modo, kKhaki});
 	if (f.key >= 0 && L.last_key_at != std::chrono::steady_clock::time_point {} &&
 	    std::chrono::steady_clock::now() - L.last_key_at > std::chrono::seconds(3))
@@ -7888,7 +7949,7 @@ void Sample(LogState& L,
 	std::scoped_lock lock(g_mutex);
 	g_rows     = std::move(rows);
 	// (ds-pc-port42) The shown rate big, and with frame generation the real one beside it (the same [fsr3] / [dlssg] line).
-	g_fps_text = shown > 0 ? (fg_on && f.fg_real > 0 && f.fg_shown > 0 ? Fmt("FPS %.0f  (real %.0f)", shown, f.fg_real) : Fmt("FPS %.0f", shown)) : std::string();
+	g_fps_text = shown > 0 ? (fg_on && f.fg_real > 0 && f.fg_shown > 0 ? Fmt(I18n::T("FPS %.0f  (real %.0f)"), shown, f.fg_real) : Fmt("FPS %.0f", shown)) : std::string();
 	g_fps_color = fg_on ? (fg_nv ? kGreen : kRed) : kWhite;
 	g_ft = std::move(ft), g_ft_max = std::move(ftm);
 }
@@ -7946,14 +8007,14 @@ void Draw(float width, float height) {
 		std::scoped_lock lock(g_mutex);
 		rows = g_rows, fps = g_fps_text, fps_col = g_fps_color, ft = g_ft, ftm = g_ft_max;
 	}
-	if (rows.empty()) rows.push_back({"", "Cargando...", kOrange});
+	if (rows.empty()) rows.push_back({"", I18n::T("Cargando..."), kOrange});
 	const float row_px = std::round(15 * S), title_px = std::round(16 * S), fps_px = std::round(34 * S), small_px = std::round(10 * S);
 	const float pad = std::round(8 * S), row_h = std::ceil(row_px * 1.12f), title_h = std::ceil(title_px * 1.4f), fps_h = fps.empty() ? 0.0f : std::ceil(fps_px * 1.1f);
 	float name_w = std::round(90 * S), val_w = std::round(230 * S), wide_w = 0;
 	for (const auto& r: rows) {
 		const float w = f->CalcTextSizeA(row_px, FLT_MAX, 0, r.value.c_str()).x;
 		if (!r.name.empty()) {
-			name_w = std::max(name_w, f->CalcTextSizeA(row_px, FLT_MAX, 0, r.name.c_str()).x + std::round(10 * S));
+			name_w = std::max(name_w, f->CalcTextSizeA(row_px, FLT_MAX, 0, I18n::T(r.name.c_str())).x + std::round(10 * S));
 			val_w  = std::max(val_w, w);
 		} else wide_w = std::max(wide_w, w);
 	}
@@ -7968,7 +8029,7 @@ void Draw(float width, float height) {
 	const ImVec4 clip {x0, y0, x0 + W, y0 + 4000};
 	for (const auto& r: rows) {
 		if (!r.name.empty()) {
-			dl->AddText(f, row_px, {x0 + pad, y}, kName, r.name.c_str(), nullptr, 0, &clip);
+			dl->AddText(f, row_px, {x0 + pad, y}, kName, I18n::T(r.name.c_str()), nullptr, 0, &clip);
 			dl->AddText(f, row_px, {x0 + pad + name_w, y}, r.color, r.value.c_str(), nullptr, 0, &clip);
 		} else dl->AddText(f, row_px, {x0 + pad, y}, r.color, r.value.c_str(), nullptr, 0, &clip);
 		y += row_h;
@@ -7984,7 +8045,7 @@ void Draw(float width, float height) {
 		const float ly = gy + graph_h - ms / top * graph_h;
 		dl->AddLine({x0, ly}, {x0 + gw, ly}, IM_COL32(60, 60, 60, 255));
 	}
-	dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255), "frametime (ms)  40   verde media, naranja picos");
+	dl->AddText(f, small_px, {x0, gy}, IM_COL32(128, 128, 128, 255), I18n::T("frametime (ms)  40   verde media, naranja picos"));
 	dl->AddText(f, small_px, {x0, gy + graph_h - 16.7f / top * graph_h - small_px}, IM_COL32(128, 128, 128, 255), "16.7");
 	const auto line = [&](const std::vector<double>& list, ImU32 col) {
 		if (list.size() < 2) return;
@@ -10770,11 +10831,11 @@ void InstallMenu(const Runtime& runtime) {
 	const bool        fixed = FixedFg(runtime.launched);
 	const std::string fg    = fixed ? std::string("amd-x2") : runtime.launched.framegen;
 	if (fg != "sin-fg" && !fg.empty()) {
-		PortLive::fg_label  = fixed ? (runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO"
+		PortLive::fg_label  = fixed ? I18n::T(runtime.launched.souls_mode == "equilibrado" ? "MODO SOULS EQUILIBRADO"
 		                               : runtime.launched.souls_mode == "low"       ? "MODO SOULS PC LOW PROFILE"
 		                               : runtime.launched.souls_mode == "ligero-plus" ? "MODO SOULS LIGERO +"
 		                                                                            : "MODO SOULS LIGERO")
-		                            : FrameGenLabel(fg);
+		                            : I18n::T(FrameGenLabel(fg));
 		PortLive::fg_plain  = fixed;
 		PortLive::fg_vendor = fg.rfind("dlss", 0) == 0 ? 1 : 2;
 		PortLive::fg_now    = fg == "amd-x2" ? 2 : (fg == "amd-x3" || fg == "amd-120") ? 3 : fg == "amd-x4" ? 4 : 0;
@@ -10783,16 +10844,20 @@ void InstallMenu(const Runtime& runtime) {
 		static std::string gfx;
 		const auto         level = [](const Choice* items, int count, const std::string& id) {
             for (int i = 0; i < count; i++)
-                if (id == items[i].id) return items[i].label;
-            return items[0].label;
+                if (id == items[i].id) return I18n::T(items[i].label);
+            return I18n::T(items[0].label);
 		};
-		gfx = std::string("Texturas ") + level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce) +
-		      ", Distancia de dibujado " + level(kQualities, kQualityCount, runtime.launched.quality) + ", Sombras " +
-		      level(kShadows, kShadowCount, runtime.launched.shadows) + ", Detalle " + level(kDetails, kDetailCount, runtime.launched.detail);
+		gfx = std::string(I18n::T("Texturas")) + " " + level(kTextureReduce, kTextureReduceCount, runtime.launched.texture_reduce) + ", " +
+		      I18n::T("Distancia de dibujado") + " " + level(kQualities, kQualityCount, runtime.launched.quality) + ", " + I18n::T("Sombras") + " " +
+		      level(kShadows, kShadowCount, runtime.launched.shadows) + ", " + I18n::T("Detalle") + " " + level(kDetails, kDetailCount, runtime.launched.detail);
 		PortLive::gfx_line = gfx.c_str();
 	}
 	PortLive::g_hooks   = &kHooks;
-	PortLive::status_es = true; // (10-27b) "Preparando shaders X/Y" on screen
+	PortLive::status_es        = true; // (10-27b) "Preparando shaders X/Y" on screen, (i18n) in the menu language
+	PortLive::status_before    = I18n::T("Antes de jugar: ");
+	PortLive::status_shaders   = I18n::T("Preparando shaders");
+	PortLive::status_pipelines = I18n::T("Preparando pipelines");
+	PortLive::fg_now_word      = I18n::T("ahora");
 }
 
 void RequestQuit() {

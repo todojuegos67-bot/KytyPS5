@@ -17,7 +17,12 @@ inline std::atomic<float> sharpness {-1.0f};  // KYTY_UPSCALE_SHARPNESS; < 0: th
 // 4 Luz volumetrica, 8 Oclusion ambiental, 16 Luz de antorchas RT, 32 Destellos de lente, 64 Sombras RT); 0: as launched. Only an "off": a pass not launched cannot be turned on without a restart.
 inline std::atomic<int>   rt_off {0};
 inline std::atomic<int>   fg_generate {0};    // generated frames per real frame (fixed DLSS-G, FSR 3 MFG); 0: as launched
-inline std::atomic<bool>  status_es {false}; // (10-27b) the shader progress line in Spanish: "Preparando shaders X/Y"
+inline std::atomic<bool>  status_es {false}; // (10-27b) the shader progress line in the port's words (the texts below)
+// (i18n) Those words in the menu language (set by the port; I18n::T keeps the pointers alive).
+inline std::atomic<const char*> status_before {"Antes de jugar: "};
+inline std::atomic<const char*> status_shaders {"Preparando shaders"};
+inline std::atomic<const char*> status_pipelines {"Preparando pipelines"};
+inline std::atomic<const char*> fg_now_word {"ahora"}; // "FG x (ahora x3)"
 inline std::atomic<float> fps_cap {0.0f};     // KYTY_FPS_CAP (with KYTY_FLIP_WHEN_READY); 0: as launched
 inline std::atomic<int>   rumble {-1};        // KYTY_HAPTIC_RUMBLE; < 0: the environment's
 inline std::atomic<float> rumble_gain {0.0f}; // KYTY_HAPTIC_RUMBLE_GAIN; 0: the environment's

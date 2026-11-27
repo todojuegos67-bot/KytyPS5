@@ -1,6 +1,7 @@
 #include "port/ds-settings.h"
 
 #include "port/ds-tables.h"
+#include "port/ds-i18n.h"
 #include "port/ds-online.h"
 
 #include <algorithm>
@@ -2123,38 +2124,44 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 	s->godrays  = "0";
 	// (10-28, the emulator launcher's rule) The Configurador's tiers leave every RT effect at No: the user turns them on by hand.
 	(void)rtk;
+	// (i18n) The lines in the menu language: each template translated whole (I18n::T), then filled in.
 	const auto label = [](const Choice* items, int count, const std::string& id) {
 		for (int i = 0; i < count; i++)
-			if (id == items[i].id) return items[i].label;
-		return items[0].label;
+			if (id == items[i].id) return I18n::T(items[i].label);
+		return I18n::T(items[0].label);
 	};
-	why.push_back(std::string("Gráfica: ") + gpu_how + " (potencia " + std::to_string(gpu) + " de 100; RTX 5080 = 100). Procesador: " + cpu_how +
-	              " (" + std::to_string(cpu) + " de 100).");
-	why.push_back(std::string("Reescalado: ") + pick->label + " a " + std::to_string(out_w) + "x" + std::to_string(out_h) +
-	              " (el 3D a " + std::to_string(static_cast<int>(out_w / pick->value)) + "x" + std::to_string(static_cast<int>(out_h / pick->value)) + ").");
-	why.push_back(std::string("Detalle ") + label(kDetails, kDetailCount, s->detail) + ", texturas " + label(kTextureReduce, kTextureReduceCount, s->texture_reduce) +
-	              " (" + std::to_string(vram) + " GB de VRAM), sombras " + label(kShadows, kShadowCount, s->shadows) + ", distancia " +
-	              label(kQualities, kQualityCount, s->quality) + " (según el procesador), filtrado x16 " + (s->af16 ? "sí" : "no") + ".");
-	std::string rt = "Ray tracing: ";
+	const auto fmt = [](const char* es, auto... args) {
+		char buf[512];
+		std::snprintf(buf, sizeof(buf), I18n::T(es), args...);
+		return std::string(buf);
+	};
+	why.push_back(fmt("Gráfica: %s (potencia %d de 100; RTX 5080 = 100). Procesador: %s (%d de 100).", I18n::T(gpu_how.c_str()), gpu,
+	                  I18n::T(cpu_how.c_str()), cpu));
+	why.push_back(fmt("Reescalado: %s a %dx%d (el 3D a %dx%d).", I18n::T(pick->label), out_w, out_h, static_cast<int>(out_w / pick->value),
+	                  static_cast<int>(out_h / pick->value)));
+	why.push_back(fmt("Detalle %s, texturas %s (%d GB de VRAM), sombras %s, distancia %s (según el procesador), filtrado x16 %s.",
+	                  label(kDetails, kDetailCount, s->detail), label(kTextureReduce, kTextureReduceCount, s->texture_reduce), static_cast<int>(vram),
+	                  label(kShadows, kShadowCount, s->shadows), label(kQualities, kQualityCount, s->quality), I18n::T(s->af16 ? "sí" : "no")));
+	std::string rt = I18n::T("Ray tracing: ");
 	if (!s->rt_reflections && s->godrays == "0" && s->rt_lamps == "0" && s->rt_shadows == "0" && s->torch == "0" && !s->lens_flare &&
 	    s->rt_ss_refl == "0")
-		rt += "desactivado (no cabe a 60 FPS en este equipo).";
+		rt += I18n::T("desactivado (no cabe a 60 FPS en este equipo).");
 	else {
-		if (s->rt_ss_refl != "0") rt += "reflejos RT bajos; ";
-		if (s->rt_shadows != "0") rt += "sombras RT bajas; ";
-		if (s->rt_reflections) rt += "reflejos RT por hardware; ";
-		if (s->godrays != "0") rt += std::string("luz volumétrica ") + (s->godrays == "2" ? "media; " : "baja; ");
+		if (s->rt_ss_refl != "0") rt += std::string(I18n::T("reflejos RT bajos")) + "; ";
+		if (s->rt_shadows != "0") rt += std::string(I18n::T("sombras RT bajas")) + "; ";
+		if (s->rt_reflections) rt += std::string(I18n::T("reflejos RT por hardware")) + "; ";
+		if (s->godrays != "0") rt += std::string(I18n::T(s->godrays == "2" ? "luz volumétrica media" : "luz volumétrica baja")) + "; ";
 		rt.resize(rt.size() - 2);
 		rt += ".";
 	}
 	why.push_back(rt);
-	if (s->ram16_boost) why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: activadas las mejoras para equipos de 16 GB (perfil de memoria); texturas y distancia como mucho en Alto.");
-	else why.push_back("RAM " + std::to_string(pc.ram_gb) + " GB: no hacen falta las mejoras para equipos de 16 GB.");
+	if (s->ram16_boost) why.push_back(fmt("RAM %d GB: activadas las mejoras para equipos de 16 GB (perfil de memoria); texturas y distancia como mucho en Alto.", static_cast<int>(pc.ram_gb)));
+	else why.push_back(fmt("RAM %d GB: no hacen falta las mejoras para equipos de 16 GB.", static_cast<int>(pc.ram_gb)));
 	const double fps = 1000.0 / ms;
-	std::string  exp = std::string("Esperado: unos ") + F1(fps) + " FPS de media";
-	if (pc.refresh_hz >= 100 && fps < pc.refresh_hz * 0.9) exp += std::string(" (tu monitor va a ") + std::to_string(pc.refresh_hz) + " Hz: la frame generation de Gráficos puede llenarlo)";
-	if (base > target) exp += ". Tu procesador limita: por debajo de 60 FPS en las zonas pesadas aunque bajes gráficos";
-	why.push_back(exp + ". Es una estimación: puedes cambiar cualquier opción en F2.");
+	std::string  exp = fmt("Esperado: unos %s FPS de media", F1(fps));
+	if (pc.refresh_hz >= 100 && fps < pc.refresh_hz * 0.9) exp += fmt(" (tu monitor va a %d Hz: la frame generation de Gráficos puede llenarlo)", static_cast<int>(pc.refresh_hz));
+	if (base > target) exp += I18n::T(". Tu procesador limita: por debajo de 60 FPS en las zonas pesadas aunque bajes gráficos");
+	why.push_back(exp + I18n::T(". Es una estimación: puedes cambiar cualquier opción en F2."));
 	return why;
 }
 

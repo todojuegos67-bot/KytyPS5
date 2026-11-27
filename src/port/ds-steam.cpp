@@ -1,5 +1,6 @@
 // "Demon's Souls" PC port: "Anadir a Steam" (ds-steam.h).
 #include "port/ds-steam.h"
+#include "port/ds-i18n.h"
 
 #include "stb_image.h"
 
@@ -219,7 +220,7 @@ bool RunAddToSteamScript(const fs::path& exe, std::string* report) {
 	const fs::path  cmd    = folder / L"Anadir-a-Steam.cmd";
 	std::error_code ec;
 	if (!fs::exists(cmd, ec)) {
-		*report = "No esta Anadir-a-Steam.cmd junto al exe.";
+		*report = I18n::T("No está Anadir-a-Steam.cmd junto al exe.");
 		return false;
 	}
 	// Through cmd.exe /c, in a console of its own (the script ends with "pause": its result stays readable).
@@ -233,10 +234,10 @@ bool RunAddToSteamScript(const fs::path& exe, std::string* report) {
 	info.lpDirectory  = folder.c_str();
 	info.nShow        = SW_SHOWNORMAL;
 	if (!ShellExecuteExW(&info)) {
-		*report = "No se pudo abrir Anadir-a-Steam.cmd (error " + std::to_string(GetLastError()) + ").";
+		*report = std::string(I18n::T("No se pudo abrir Anadir-a-Steam.cmd (error ")) + std::to_string(GetLastError()) + ").";
 		return false;
 	}
-	*report = "Abierto Anadir-a-Steam.cmd: sigue lo que dice su ventana.";
+	*report = I18n::T("Abierto Anadir-a-Steam.cmd: sigue lo que dice su ventana.");
 	return true;
 }
 
@@ -246,7 +247,7 @@ bool AddToSteam(const fs::path& exe, std::string* report) {
 	const fs::path steam = SteamPath();
 	std::error_code ec;
 	if (steam.empty() || !fs::exists(steam / L"userdata", ec)) {
-		r = "No se encontro Steam (HKCU\\Software\\Valve\\Steam SteamPath, o no tiene userdata). Instala Steam e inicia sesion una vez.";
+		r = I18n::T("No se encontró Steam (HKCU\\Software\\Valve\\Steam SteamPath, o no tiene userdata). Instala Steam e inicia sesión una vez.");
 		return false;
 	}
 	const fs::path    folder  = exe.parent_path();
@@ -375,15 +376,16 @@ bool AddToSteam(const fs::path& exe, std::string* report) {
 	}
 	if (com) CoUninitialize();
 	if (added + present == 0) {
-		r = failed > 0 ? "No se pudo escribir shortcuts.vdf de Steam (archivo danado o sin permiso). Cierra Steam y prueba otra vez."
-		               : "Steam no tiene ningun usuario en userdata: inicia sesion en Steam una vez y prueba otra vez.";
+		r = I18n::T(failed > 0 ? "No se pudo escribir shortcuts.vdf de Steam (archivo dañado o sin permiso). Cierra Steam y prueba otra vez."
+		               : "Steam no tiene ningún usuario en userdata: inicia sesión en Steam una vez y prueba otra vez.");
 		return false;
 	}
-	r = "Anadido a Steam: " + std::to_string(added) + " usuario(s)";
-	if (present > 0) r += ", ya estaba en " + std::to_string(present);
-	if (failed > 0) r += ", fallo en " + std::to_string(failed);
-	r += art > 0 ? "; con sus imagenes." : "; sin imagenes (falta fondo-souls.jpg).";
-	r += " REINICIA STEAM (cierralo del todo y abrelo) para que aparezca \"Demon's Souls\" en la biblioteca.";
+	r = std::string(I18n::T("Añadido a Steam: ")) + std::to_string(added) + I18n::T(" usuario(s)");
+	if (present > 0) r += I18n::T(", ya estaba en ") + std::to_string(present);
+	if (failed > 0) r += I18n::T(", falló en ") + std::to_string(failed);
+	r += I18n::T(art > 0 ? "; con sus imágenes." : "; sin imágenes (falta fondo-souls.jpg).");
+	r += " ";
+	r += I18n::T("REINICIA STEAM (ciérralo del todo y ábrelo) para que aparezca \"Demon's Souls\" en la biblioteca.");
 	return true;
 }
 

@@ -181,34 +181,56 @@ struct Entry {
 struct RandoBoss {
 	const char* activity;
 	uint32_t    flag; // (rando-trofeos) the boss-defeated event flag (Ghidra: the game's activity table, see below)
-	const char* name_es;
-	const char* detail_es;
-	const char* name_en;
-	const char* detail_en;
+	const char* name[6];   // (i18n) es, en, pt, fr, it, de (the bosses with the game's own localized names)
+	const char* detail[6];
 };
 // (rando-trofeos) flag: the game's own activity table (eboot 01.007.000, built at 0x6561a0: records of 0x68 bytes at
 // 0x282b5a0.., activity name at +0, its length at +8, the event flag at +0x38), read with Ghidra. The lua of 1-x and 4-x
 // (m02/m03.luabnd: OnCharacterDead(4096, 800, ...), (4224, 801), (4360, 802), (4480, 821), (4756, 804), (4895, 805),
 // (4992, 822)) gives the same numbers. FUN_002a7550 reads them: bit (flag & 7) of byte flag >> 3, flag < 0x4680.
 const RandoBoss kRandoBosses[] = {
-	{"Phlx", 4096, "Muro de escudos roto", "Randomizer: derrota a la Falange.", "Shieldwall Broken", "Randomizer: defeat the Phalanx."},
-	{"ToKn", 4224, "La torre se inclina", "Randomizer: derrota al Caballero de la Torre.", "The Tower Kneels", "Randomizer: defeat the Tower Knight."},
-	{"Pent", 4360, "Acero contra acero", "Randomizer: derrota al Penetrador.", "Steel Against Steel", "Randomizer: defeat the Penetrator."},
-	{"FalK", 4480, "Corona de ceniza", "Randomizer: derrota al Falso Rey.", "Crown of Ash", "Randomizer: defeat the False King."},
-	{"ArmS", 6174, "Telar de fuego", "Randomizer: derrota a la Arañ" "a Acorazada.", "Loom of Fire", "Randomizer: defeat the Armor Spider."},
-	{"FlmL", 6272, "Brasa apagada", "Randomizer: derrota al Acechador de Fuego.", "Ember Quenched", "Randomizer: defeat the Flamelurker."},
-	{"DrgG", 6400, "El dios caí" "do", "Randomizer: derrota al Dios Dragón.", "The Fallen God", "Randomizer: defeat the Dragon God."},
-	{"Fool", 5123, "Reflejo quebrado", "Randomizer: derrota al Í" "dolo Necio.", "Broken Reflection", "Randomizer: defeat the Fool's Idol."},
-	{"ManE", 5251, "Alas en la niebla", "Randomizer: derrota al Devorahombres.", "Wings in the Mist", "Randomizer: defeat the Maneater."},
-	{"OldM", 5380, "Voz sin rostro", "Randomizer: derrota al Viejo Monje.", "Faceless Voice", "Randomizer: defeat the Old Monk."},
-	{"Adju", 4756, "Veredicto final", "Randomizer: derrota al Juez.", "Final Verdict", "Randomizer: defeat the Adjudicator."},
-	{"OldH", 4895, "Ojos cerrados", "Randomizer: derrota al Viejo Héroe.", "Eyes Shut", "Randomizer: defeat the Old Hero."},
-	{"StrK", 4992, "Fin de la tormenta", "Randomizer: derrota al Rey de las Tormentas.", "Storm's End", "Randomizer: defeat the Storm King."},
-	{"Lmon", 5650, "Sangre sin dueño", "Randomizer: derrota al Monstruo Sanguijuela.", "Ownerless Blood", "Randomizer: defeat the Leechmonger."},
-	{"DCol", 5770, "Enjambre disperso", "Randomizer: derrota al Coloso Sucio.", "Swarm Scattered", "Randomizer: defeat the Dirty Colossus."},
-	{"MAst", 5889, "Luto en el valle", "Randomizer: derrota a la Doncella Astraea.", "Mourning in the Valley", "Randomizer: defeat Maiden Astraea."},
-	{"Allant", 16952, "El rey verdadero", "Randomizer: derrota al Rey Allant.", "The True King", "Randomizer: defeat King Allant."},
+	{"Phlx", 4096, {"Muro de escudos roto", "Shieldwall Broken", "Muralha de escudos rompida", "Mur de boucliers brisé", "Muro di scudi infranto", "Schildwall gebrochen"},
+	 {"Randomizer: derrota a la Falange.", "Randomizer: defeat the Phalanx.", "Randomizer: derrote a Falange.", "Randomizer : vainquez la Phalange.", "Randomizer: sconfiggi la Falange.", "Randomizer: Besiege die Phalanx."}},
+	{"ToKn", 4224, {"La torre se inclina", "The Tower Kneels", "A torre se ajoelha", "La tour s'agenouille", "La torre si inginocchia", "Der Turm kniet nieder"},
+	 {"Randomizer: derrota al Caballero de la Torre.", "Randomizer: defeat the Tower Knight.", "Randomizer: derrote o Cavaleiro da Torre.", "Randomizer : vainquez le Chevalier de la tour.", "Randomizer: sconfiggi il Cavaliere della Torre.", "Randomizer: Besiege den Turmritter."}},
+	{"Pent", 4360, {"Acero contra acero", "Steel Against Steel", "Aço contra aço", "L'acier contre l'acier", "Acciaio contro acciaio", "Stahl gegen Stahl"},
+	 {"Randomizer: derrota al Penetrador.", "Randomizer: defeat the Penetrator.", "Randomizer: derrote o Penetrador.", "Randomizer : vainquez le Transperceur.", "Randomizer: sconfiggi il Penetratore.", "Randomizer: Besiege den Durchdringer."}},
+	{"FalK", 4480, {"Corona de ceniza", "Crown of Ash", "Coroa de cinzas", "Couronne de cendres", "Corona di cenere", "Krone aus Asche"},
+	 {"Randomizer: derrota al Falso Rey.", "Randomizer: defeat the False King.", "Randomizer: derrote o Falso Rei.", "Randomizer : vainquez le Roi illégitime.", "Randomizer: sconfiggi il Falso Re.", "Randomizer: Besiege den Falschen König."}},
+	{"ArmS", 6174, {"Telar de fuego", "Loom of Fire", "Tear de fogo", "Métier de feu", "Telaio di fuoco", "Webstuhl aus Feuer"},
+	 {"Randomizer: derrota a la Araña Acorazada.", "Randomizer: defeat the Armor Spider.", "Randomizer: derrote a Aranha Blindada.", "Randomizer : vainquez l'Araignée cuirassée.", "Randomizer: sconfiggi il Ragno Corazzato.", "Randomizer: Besiege die Panzerspinne."}},
+	{"FlmL", 6272, {"Brasa apagada", "Ember Quenched", "Brasa apagada", "Braise éteinte", "Brace spenta", "Erloschene Glut"},
+	 {"Randomizer: derrota al Acechador de Fuego.", "Randomizer: defeat the Flamelurker.", "Randomizer: derrote o Espreitador das Chamas.", "Randomizer : vainquez le Rôdeur enflammé.", "Randomizer: sconfiggi il Predatore delle Fiamme.", "Randomizer: Besiege den Flammenschleicher."}},
+	{"DrgG", 6400, {"El dios caído", "The Fallen God", "O deus caído", "Le dieu déchu", "Il dio caduto", "Der gefallene Gott"},
+	 {"Randomizer: derrota al Dios Dragón.", "Randomizer: defeat the Dragon God.", "Randomizer: derrote o Deus Dragão.", "Randomizer : vainquez le Dieu dragon.", "Randomizer: sconfiggi il Dio Drago.", "Randomizer: Besiege den Drachengott."}},
+	{"Fool", 5123, {"Reflejo quebrado", "Broken Reflection", "Reflexo partido", "Reflet brisé", "Riflesso infranto", "Zerbrochenes Spiegelbild"},
+	 {"Randomizer: derrota al Ídolo Necio.", "Randomizer: defeat the Fool's Idol.", "Randomizer: derrote o Ídolo do Tolo.", "Randomizer : vainquez l'Idole des fous.", "Randomizer: sconfiggi l'Idolo dello Stolto.", "Randomizer: Besiege das Götzenbild."}},
+	{"ManE", 5251, {"Alas en la niebla", "Wings in the Mist", "Asas na névoa", "Des ailes dans la brume", "Ali nella nebbia", "Flügel im Nebel"},
+	 {"Randomizer: derrota al Devorahombres.", "Randomizer: defeat the Maneater.", "Randomizer: derrote o Devorador de Homens.", "Randomizer : vainquez l'Anthropophage.", "Randomizer: sconfiggi il Mangiauomini.", "Randomizer: Besiege den Menschenfresser."}},
+	{"OldM", 5380, {"Voz sin rostro", "Faceless Voice", "Voz sem rosto", "Voix sans visage", "Voce senza volto", "Gesichtslose Stimme"},
+	 {"Randomizer: derrota al Viejo Monje.", "Randomizer: defeat the Old Monk.", "Randomizer: derrote o Velho Monge.", "Randomizer : vainquez le Moine sénile.", "Randomizer: sconfiggi il Vecchio Monaco.", "Randomizer: Besiege den Alten Mönch."}},
+	{"Adju", 4756, {"Veredicto final", "Final Verdict", "Veredito final", "Verdict final", "Verdetto finale", "Endgültiges Urteil"},
+	 {"Randomizer: derrota al Juez.", "Randomizer: defeat the Adjudicator.", "Randomizer: derrote o Juiz.", "Randomizer : vainquez le Juge.", "Randomizer: sconfiggi il Giudice.", "Randomizer: Besiege den Richter."}},
+	{"OldH", 4895, {"Ojos cerrados", "Eyes Shut", "Olhos fechados", "Yeux clos", "Occhi chiusi", "Geschlossene Augen"},
+	 {"Randomizer: derrota al Viejo Héroe.", "Randomizer: defeat the Old Hero.", "Randomizer: derrote o Velho Herói.", "Randomizer : vainquez le Vieux héros.", "Randomizer: sconfiggi il Vecchio Eroe.", "Randomizer: Besiege den Alten Helden."}},
+	{"StrK", 4992, {"Fin de la tormenta", "Storm's End", "Fim da tempestade", "Fin de la tempête", "Fine della tempesta", "Ende des Sturms"},
+	 {"Randomizer: derrota al Rey de las Tormentas.", "Randomizer: defeat the Storm King.", "Randomizer: derrote o Rei da Tempestade.", "Randomizer : vainquez le Roi de la tempête.", "Randomizer: sconfiggi il Re della Tempesta.", "Randomizer: Besiege den Sturmkönig."}},
+	{"Lmon", 5650, {"Sangre sin dueño", "Ownerless Blood", "Sangue sem dono", "Sang sans maître", "Sangue senza padrone", "Herrenloses Blut"},
+	 {"Randomizer: derrota al Monstruo Sanguijuela.", "Randomizer: defeat the Leechmonger.", "Randomizer: derrote o Mercador de Sanguessugas.", "Randomizer : vainquez le Seigneur des sangsues.", "Randomizer: sconfiggi il Mercante di Sanguisughe.", "Randomizer: Besiege den Blutsauger."}},
+	{"DCol", 5770, {"Enjambre disperso", "Swarm Scattered", "Enxame disperso", "Essaim dispersé", "Sciame disperso", "Zerstreuter Schwarm"},
+	 {"Randomizer: derrota al Coloso Sucio.", "Randomizer: defeat the Dirty Colossus.", "Randomizer: derrote o Colosso Imundo.", "Randomizer : vainquez le Colosse impur.", "Randomizer: sconfiggi il Colosso Sudicio.", "Randomizer: Besiege den Schmutzkoloss."}},
+	{"MAst", 5889, {"Luto en el valle", "Mourning in the Valley", "Luto no vale", "Deuil dans la vallée", "Lutto nella valle", "Trauer im Tal"},
+	 {"Randomizer: derrota a la Doncella Astraea.", "Randomizer: defeat Maiden Astraea.", "Randomizer: derrote a Donzela Astraea.", "Randomizer : vainquez Astrée.", "Randomizer: sconfiggi la Fanciulla Astrea.", "Randomizer: Besiege Jungfrau Astraea."}},
+	{"Allant", 16952, {"El rey verdadero", "The True King", "O verdadeiro rei", "Le vrai roi", "Il vero re", "Der wahre König"},
+	 {"Randomizer: derrota al Rey Allant.", "Randomizer: defeat King Allant.", "Randomizer: derrote o Rei Allant.", "Randomizer : vainquez le roi Allant.", "Randomizer: sconfiggi Re Allant.", "Randomizer: Besiege König Allant."}},
 };
+// (i18n) The randomizer's trophies in the game's language (its tag: es-ES, pt-BR, fr-FR...): es, en, pt, fr, it, de; else en.
+inline int RandoLang(const std::string& tag) {
+	static const char* const kTags[6] = {"es", "en", "pt", "fr", "it", "de"};
+	for (int i = 0; i < 6; i++)
+		if (tag.rfind(kTags[i], 0) == 0) return i;
+	return 1;
+}
 constexpr int kRandoBossCount = static_cast<int>(sizeof(kRandoBosses) / sizeof(kRandoBosses[0]));
 static_assert(kRandoFirst + kRandoBossCount == kRandoAll, "one trophy per boss, then the last one");
 
@@ -775,9 +797,12 @@ void Load(State& s) {
 		Entry e;
 		e.info.id    = kNexusTrophyId;
 		e.info.grade = 4;
-		const bool es = s.language.rfind("es", 0) == 0;
-		e.info.name   = es ? "Bienvenido al Nexo" : "Welcome to the Nexus";
-		e.info.detail = es ? "Llega al Nexo por primera vez." : "Reach the Nexus for the first time.";
+		static const char* const kName[6]   = {"Bienvenido al Nexo", "Welcome to the Nexus", "Bem-vindo ao Nexo", "Bienvenue au Nexus", "Benvenuto nel Nexus", "Willkommen im Nexus"};
+		static const char* const kDetail[6] = {"Llega al Nexo por primera vez.", "Reach the Nexus for the first time.", "Chegue ao Nexo pela primeira vez.",
+		                                       "Atteignez le Nexus pour la première fois.", "Raggiungi il Nexus per la prima volta.", "Erreiche zum ersten Mal den Nexus."};
+		const int k   = RandoLang(s.language);
+		e.info.name   = kName[k];
+		e.info.detail = kDetail[k];
 		if (const auto first = s.trophies.find(1); first != s.trophies.end()) {
 			e.icon_w = first->second.icon_w, e.icon_h = first->second.icon_h, e.icon = first->second.icon;
 		}
@@ -785,7 +810,7 @@ void Load(State& s) {
 	}
 	// (rando1) The randomizer trophies, with their own medal (outside the game's set: not for the platinum).
 	if (!s.trophies.empty() && s.trophies.count(kRandoFirst) == 0) {
-		const bool           es = s.language.rfind("es", 0) == 0;
+		const int            lang = RandoLang(s.language);
 		for (int i = 0; i <= kRandoBossCount; i++) {
 			// (rando3) Each trophy its own medal (its emblem; the last one on a gold coin).
 			std::vector<uint8_t> medal;
@@ -798,11 +823,15 @@ void Load(State& s) {
 			e.info.id    = kRandoFirst + i;
 			e.info.grade = i == kRandoBossCount ? 2 : 4;
 			if (i < kRandoBossCount) {
-				e.info.name   = es ? kRandoBosses[i].name_es : kRandoBosses[i].name_en;
-				e.info.detail = es ? kRandoBosses[i].detail_es : kRandoBosses[i].detail_en;
+				e.info.name   = kRandoBosses[i].name[lang];
+				e.info.detail = kRandoBosses[i].detail[lang];
 			} else {
-				e.info.name   = es ? "Señor del caos" : "Lord of Chaos";
-				e.info.detail = es ? "Randomizer: derrota a todos los archidemonios." : "Randomizer: defeat every archdemon.";
+				static const char* const kName[6]   = {"Señor del caos", "Lord of Chaos", "Senhor do caos", "Seigneur du chaos", "Signore del caos", "Herr des Chaos"};
+				static const char* const kDetail[6] = {"Randomizer: derrota a todos los archidemonios.", "Randomizer: defeat every archdemon.",
+				                                       "Randomizer: derrote todos os arquidemônios.", "Randomizer : vainquez tous les archidémons.",
+				                                       "Randomizer: sconfiggi tutti gli arcidemoni.", "Randomizer: Besiege alle Erzdämonen."};
+				e.info.name   = kName[lang];
+				e.info.detail = kDetail[lang];
 			}
 			e.icon_w = 128, e.icon_h = 128, e.icon = icon;
 			s.trophies[e.info.id] = std::move(e);

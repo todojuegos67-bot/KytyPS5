@@ -1,4 +1,5 @@
 #include "port/ds-update.h"
+#include "port/ds-i18n.h"
 
 #include <algorithm>
 #include <cctype>
@@ -334,7 +335,7 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 	Result          r;
 	std::error_code ec;
 	if (!fs::is_regular_file(src / P(kExeName), ec)) {
-		r.error = std::string("La version nueva no trae ") + kExeName + ". No se ha cambiado nada.";
+		r.error = std::string(I18n::T("La versión nueva no trae ")) + kExeName + I18n::T(". No se ha cambiado nada.");
 		return r;
 	}
 	// What the new version brings (not the user's).
@@ -349,7 +350,7 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 		files.push_back(rel);
 	}
 	if (ec) {
-		r.error = "No se pudo leer la version nueva (" + ec.message() + "). No se ha cambiado nada.";
+		r.error = std::string(I18n::T("No se pudo leer la versión nueva (")) + ec.message() + I18n::T("). No se ha cambiado nada.");
 		return r;
 	}
 	std::sort(files.begin(), files.end());
@@ -376,10 +377,10 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 		}
 		for (const auto& rel: files)
 			if (fs::is_regular_file(root / rel)) save(rel);
-		if (!WriteFile(bdir / ".version", old_version)) throw std::runtime_error("no se pudo escribir la copia de seguridad");
+		if (!WriteFile(bdir / ".version", old_version)) throw std::runtime_error(I18n::T("no se pudo escribir la copia de seguridad"));
 	} catch (const std::exception& e) {
 		fs::remove_all(bdir, ec);
-		r.error = std::string("No se pudo hacer la copia de seguridad en ") + kBackupDir + " (" + e.what() + "). No se ha cambiado nada.";
+		r.error = std::string(I18n::T("No se pudo hacer la copia de seguridad en ")) + kBackupDir + " (" + e.what() + I18n::T("). No se ha cambiado nada.");
 		return r;
 	}
 
@@ -417,7 +418,7 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 			const std::string shipped = ReadFile(src / "settings.ini");
 			const std::string merged  = had_ini ? MergeIni(user_ini, shipped) : shipped;
 			if (!had_ini || merged != user_ini) {
-				if (!WriteFile(ini, merged)) throw std::runtime_error("no se pudo escribir settings.ini");
+				if (!WriteFile(ini, merged)) throw std::runtime_error(I18n::T("no se pudo escribir settings.ini"));
 				ini_written = true;
 			}
 		}
@@ -441,9 +442,9 @@ Result DoInstall(const fs::path& root, const fs::path& src, const std::string& o
 		}
 		if (errors == 0) {
 			fs::remove_all(bdir, ec);
-			r.error = std::string("No se pudo actualizar (") + e.what() + "). Se ha deshecho todo: la carpeta sigue como estaba.";
+			r.error = std::string(I18n::T("No se pudo actualizar (")) + e.what() + I18n::T("). Se ha deshecho todo: la carpeta sigue como estaba.");
 		} else {
-			r.error = std::string("No se pudo actualizar (") + e.what() + ") y no se pudo deshacer todo: la version anterior esta en " +
+			r.error = std::string(I18n::T("No se pudo actualizar (")) + e.what() + I18n::T(") y no se pudo deshacer todo: la versión anterior está en ") +
 			          kBackupDir + "\\" + name + ".";
 		}
 		return r;
@@ -468,7 +469,7 @@ Result Install(const fs::path& root, const fs::path& src, const std::string& old
 		return DoInstall(root, src, old_version, new_version, options, {});
 	} catch (const std::exception& e) {
 		Result r;
-		r.error = std::string("No se pudo actualizar: ") + e.what();
+		r.error = std::string(I18n::T("No se pudo actualizar: ")) + e.what();
 		return r;
 	}
 }
@@ -476,13 +477,13 @@ Result Install(const fs::path& root, const fs::path& src, const std::string& old
 Result Restore(const fs::path& root, const std::string& name, const std::string& current_version, const Options& options) {
 	Result r;
 	if (name.empty() || name.find_first_of("\\/") != std::string::npos || name == "." || name == "..") {
-		r.error = "Copia no valida.";
+		r.error = I18n::T("Copia no válida.");
 		return r;
 	}
 	const fs::path src = root / kBackupDir / P(name);
 	std::error_code ec;
 	if (!fs::is_regular_file(src / P(kExeName), ec)) {
-		r.error = std::string("La copia ") + name + " no tiene " + kExeName + ".";
+		r.error = std::string(I18n::T("La copia ")) + name + I18n::T(" no tiene ") + kExeName + ".";
 		return r;
 	}
 	std::string version = Trim(ReadFile(src / ".version"));
@@ -491,9 +492,9 @@ Result Restore(const fs::path& root, const std::string& name, const std::string&
 		r = DoInstall(root, src, current_version, version, options, name);
 	} catch (const std::exception& e) {
 		r.ok    = false;
-		r.error = std::string("No se pudo restaurar: ") + e.what();
+		r.error = std::string(I18n::T("No se pudo restaurar: ")) + e.what();
 	}
-	if (!r.ok && r.error.rfind("No se pudo actualizar", 0) == 0) r.error.replace(0, 21, "No se pudo restaurar");
+	if (const std::string upd = I18n::T("No se pudo actualizar"); !r.ok && r.error.rfind(upd, 0) == 0) r.error.replace(0, upd.size(), I18n::T("No se pudo restaurar"));
 	return r;
 }
 
@@ -569,13 +570,13 @@ bool HttpGet(const std::string& url, const std::function<bool(const char*, DWORD
 	parts.lpszExtraInfo     = extra;
 	parts.dwExtraInfoLength = 4096;
 	if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS) {
-		*error = "direccion no valida";
+		*error = I18n::T("dirección no válida");
 		return false;
 	}
 	Handle session(WinHttpOpen(L"DemonsSoulsPC-Update", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
 	if (session.h == nullptr) session.h = WinHttpOpen(L"DemonsSoulsPC-Update", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (session.h == nullptr) {
-		*error = "sin conexion (WinHTTP)";
+		*error = I18n::T("sin conexión (WinHTTP)");
 		return false;
 	}
 	WinHttpSetTimeouts(session.h, 15000, 15000, 30000, 60000);
@@ -585,20 +586,20 @@ bool HttpGet(const std::string& url, const std::function<bool(const char*, DWORD
 	                                                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
 	                                    : nullptr);
 	if (request.h == nullptr) {
-		*error = "no se pudo conectar con " + N(host);
+		*error = std::string(I18n::T("no se pudo conectar con ")) + N(host);
 		return false;
 	}
 	const wchar_t* headers = L"Accept: application/vnd.github+json, application/octet-stream\r\n";
 	if (!WinHttpSendRequest(request.h, headers, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
 	    !WinHttpReceiveResponse(request.h, nullptr)) {
-		*error = "no se pudo conectar con " + N(host) + " (error " + std::to_string(GetLastError()) + ")";
+		*error = std::string(I18n::T("no se pudo conectar con ")) + N(host) + " (error " + std::to_string(GetLastError()) + ")";
 		return false;
 	}
 	DWORD status = 0, size = sizeof(status);
 	WinHttpQueryHeaders(request.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
 	                    WINHTTP_NO_HEADER_INDEX);
 	if (status != 200) {
-		*error = "respuesta " + std::to_string(status) + " de " + N(host);
+		*error = std::string(I18n::T("respuesta ")) + std::to_string(status) + I18n::T(" de ") + N(host);
 		return false;
 	}
 	wchar_t length_text[32] = {};
@@ -611,7 +612,7 @@ bool HttpGet(const std::string& url, const std::function<bool(const char*, DWORD
 	for (;;) {
 		DWORD read = 0;
 		if (!WinHttpReadData(request.h, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
-			*error = "la descarga se corto (error " + std::to_string(GetLastError()) + ")";
+			*error = std::string(I18n::T("la descarga se cortó (error ")) + std::to_string(GetLastError()) + ")";
 			return false;
 		}
 		if (read == 0) break;
@@ -644,7 +645,7 @@ Result ReadResult() {
 	std::getline(in, backup);
 	r.ok = Trim(state) == "ok";
 	if (r.ok) r.version = Trim(text);
-	else r.error = text.empty() ? "El actualizador no termino." : Trim(text);
+	else r.error = text.empty() ? I18n::T("El actualizador no terminó.") : Trim(text);
 	r.backup = Trim(backup);
 	return r;
 }
@@ -664,7 +665,7 @@ bool CheckLatest(Release* release, std::string* error) {
 		             },
 		             error)) {
 			if (page > 1) break; // (what came already is used)
-			*error = "No se pudo consultar GitHub: " + *error;
+			*error = std::string(I18n::T("No se pudo consultar GitHub: ")) + *error;
 			return false;
 		}
 		nlohmann::json part;
@@ -672,12 +673,12 @@ bool CheckLatest(Release* release, std::string* error) {
 			part = nlohmann::json::parse(body);
 		} catch (...) {
 			if (page > 1) break;
-			*error = "Respuesta de GitHub no valida.";
+			*error = I18n::T("Respuesta de GitHub no válida.");
 			return false;
 		}
 		if (!part.is_array()) {
 			if (page > 1) break;
-			*error = "Respuesta de GitHub no valida.";
+			*error = I18n::T("Respuesta de GitHub no válida.");
 			return false;
 		}
 		for (auto& item: part) list.push_back(std::move(item));
@@ -717,10 +718,10 @@ bool CheckLatest(Release* release, std::string* error) {
 		}
 		if (!release->url.empty()) return true;
 		}
-		*error = "No hay ninguna version del port (DemonsSoulsPC-*) publicada en GitHub.";
+		*error = I18n::T("No hay ninguna versión del port (DemonsSoulsPC-*) publicada en GitHub.");
 		return false;
 	} catch (...) {
-		*error = "Respuesta de GitHub no valida.";
+		*error = I18n::T("Respuesta de GitHub no válida.");
 		return false;
 	}
 	return true;
@@ -730,7 +731,7 @@ bool Download(const Release& release, const fs::path& file, const std::function<
               std::string* error) {
 	std::ofstream out(file, std::ios::binary | std::ios::trunc);
 	if (!out) {
-		*error = "No se pudo crear " + U8(file);
+		*error = std::string(I18n::T("No se pudo crear ")) + U8(file);
 		return false;
 	}
 	int64_t    done = 0;
@@ -744,13 +745,13 @@ bool Download(const Release& release, const fs::path& file, const std::function<
 	                          error);
 	out.close();
 	if (ok && release.size > 0 && done != release.size) {
-		*error = "la descarga esta incompleta";
+		*error = I18n::T("la descarga está incompleta");
 		std::error_code ec;
 		fs::remove(file, ec);
 		return false;
 	}
 	if (!ok) {
-		*error = "No se pudo descargar " + release.asset + ": " + *error;
+		*error = std::string(I18n::T("No se pudo descargar ")) + release.asset + ": " + *error;
 		std::error_code ec;
 		fs::remove(file, ec);
 	}
@@ -765,7 +766,7 @@ bool Extract(const fs::path& zip, const fs::path& dir, std::string* error) {
 	GetSystemDirectoryW(system, MAX_PATH);
 	const fs::path tar = fs::path(system) / L"tar.exe";
 	if (!fs::exists(tar, ec)) {
-		*error = "Windows no tiene tar.exe (hace falta Windows 10 1803 o mas nuevo).";
+		*error = I18n::T("Windows no tiene tar.exe (hace falta Windows 10 1803 o más nuevo).");
 		return false;
 	}
 	std::wstring        command = L"\"" + tar.wstring() + L"\" -xf \"" + zip.wstring() + L"\" -C \"" + dir.wstring() + L"\"";
@@ -773,7 +774,7 @@ bool Extract(const fs::path& zip, const fs::path& dir, std::string* error) {
 	PROCESS_INFORMATION pi {};
 	si.cb = sizeof(si);
 	if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi)) {
-		*error = "No se pudo descomprimir (tar.exe no arranca).";
+		*error = I18n::T("No se pudo descomprimir (tar.exe no arranca).");
 		return false;
 	}
 	WaitForSingleObject(pi.hProcess, INFINITE);
@@ -782,7 +783,7 @@ bool Extract(const fs::path& zip, const fs::path& dir, std::string* error) {
 	CloseHandle(pi.hThread);
 	CloseHandle(pi.hProcess);
 	if (code != 0) {
-		*error = "No se pudo descomprimir el zip (codigo " + std::to_string(code) + ").";
+		*error = std::string(I18n::T("No se pudo descomprimir el zip (código ")) + std::to_string(code) + ").";
 		return false;
 	}
 	return true;
@@ -803,9 +804,9 @@ Result InstallZip(const fs::path& root, const fs::path& zip, const std::string& 
 	const fs::path dir = fs::path(temp) / (L"ds-update-" + std::to_wstring(GetTickCount64()));
 	std::string    error;
 	if (!Extract(zip, dir, &error)) {
-		r.error = error + " No se ha cambiado nada.";
+		r.error = error + " " + I18n::T("No se ha cambiado nada.");
 	} else if (const fs::path src = FindReleaseRoot(dir); src.empty()) {
-		r.error = std::string("El zip descargado no trae ") + kExeName + ". No se ha cambiado nada.";
+		r.error = std::string(I18n::T("El zip descargado no trae ")) + kExeName + I18n::T(". No se ha cambiado nada.");
 	} else {
 		Options options;
 		options.game_rel = game_rel;
@@ -836,7 +837,7 @@ Result RunElevated(const fs::path& exe, const std::vector<std::wstring>& args) {
 	info.lpParameters = params.c_str();
 	info.nShow        = SW_HIDE;
 	if (!ShellExecuteExW(&info) || info.hProcess == nullptr) {
-		r.error = "Sin permiso de administrador no se puede escribir en esta carpeta. No se ha cambiado nada.";
+		r.error = I18n::T("Sin permiso de administrador no se puede escribir en esta carpeta. No se ha cambiado nada.");
 		return r;
 	}
 	WaitForSingleObject(info.hProcess, INFINITE);

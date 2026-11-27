@@ -1186,7 +1186,7 @@ inline bool Listen(Server* srv, std::atomic<bool>* stop, std::string* error, int
 	addr.sin_port        = htons(static_cast<uint16_t>(port));
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(s, 64) != 0) {
-		*error = "el puerto " + std::to_string(port) + " ya esta en uso";
+		*error = std::string(I18n::T("el puerto ")) + std::to_string(port) + I18n::T(" ya está en uso");
 		CloseSock(s);
 		return false;
 	}
@@ -1223,7 +1223,7 @@ inline bool Relay(Server* srv, std::atomic<bool>* stop, std::string* error, int 
 	addr.sin_family      = AF_INET;
 	addr.sin_port        = htons(static_cast<uint16_t>(port));
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) { *error = "el puerto UDP " + std::to_string(port) + " ya esta en uso"; CloseSock(s); return false; }
+	if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) { *error = std::string(I18n::T("el puerto UDP ")) + std::to_string(port) + I18n::T(" ya está en uso"); CloseSock(s); return false; }
 	std::map<uint64_t, sockaddr_in> where;   // account -> endpoint
 	std::map<uint64_t, uint64_t>    who;     // endpoint key -> account
 	const auto key = [](const sockaddr_in& a) { return (static_cast<uint64_t>(a.sin_addr.s_addr) << 16) | a.sin_port; };

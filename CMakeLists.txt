@@ -1238,7 +1238,8 @@ target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
 add_executable(port_update_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PortUpdateTests.cpp"
 	"${KYTY_SOURCE_DIR}/port/ds-update.cpp"
-	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp")
+	"${KYTY_SOURCE_DIR}/port/ds-settings.cpp"
+	"${KYTY_SOURCE_DIR}/port/ds-i18n.cpp")
 target_include_directories(port_update_tests PRIVATE ${inc_headers})
 
 add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
