@@ -1524,11 +1524,9 @@ bool DsNatStart(RenderContext& context, CommandBuffer& buffer, int role, uint64_
 	if (static_ok && !skin_ready && (s.sample[s.pass]++ % every) != 0) {
 		proven    = true;
 		drop_skin = true;
-	} else if (!proven && !static_ok && H::g_nat_proven[s.pass].load(std::memory_order_relaxed) &&
-	           (s.sample[s.pass]++ % every) != 0) {
-		// (T32 11-27: sin validar, 1 de cada 16 daba 37 parciales comparados en toda la partida (< 50): nunca se
-		// validaba ninguna cascada y no se dibujo nada en nativo. Sin validar se compara cada cubo capturado; el
-		// muestreo 1 de cada N solo cuando ya esta validada.)
+	} else if (!proven && !static_ok && (s.sample[s.pass]++ % every) != 0) {
+		// (T34 11-27: comparar cada cubo sin validar (bc3999ba) costaba copias y lecturas en cada cubo de las cascadas 0 y 3,
+		// que no se validan nunca (c0 skinning nativo_mas_cerca 4,49 %): nativo 56,3 fps vs juego 65,6. Vuelve 1 de cada N.)
 		++s.sampled_out[s.pass];
 		return DsNatQuiet(), false;
 	}
