@@ -68,7 +68,9 @@ inline std::atomic<bool> g_turno_now {false};
 	int m = g_turno_mode.load(std::memory_order_relaxed);
 	if (m >= 0) return m;
 	const char* v = std::getenv("KYTY_SYNC_TURNO");
-	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
+	// (sync3) Encendido por defecto: con comandos en cola el preambulo corre, lo mismo que sin OTROS2 (comportamiento de
+	// antes en esos pasos); T54 A/B -0.29 ms/fot. =0 lo apaga, =2 A/B.
+	m             = (v != nullptr && v[0] == '0') ? 0 : (v != nullptr && v[0] == '2') ? 2 : 1;
 	g_turno_now.store(m == 1, std::memory_order_relaxed);
 	g_turno_mode.store(m, std::memory_order_relaxed);
 	std::printf("[techo-faltas] KYTY_SYNC_TURNO=%d: %s\n", m, m == 1 ? "encendido" : m == 2 ? "A/B cada 5 s" : "apagado (como antes)");
@@ -214,6 +216,12 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	std::printf(" | buffers por dentro: cerrojo de region %.2f ms (%.0f/fot), lectura/descarte %.2f ms, resto = buffers - ambos",
 	            ms(il - lil), static_cast<double>(ir - lir) / frames, ms(ifl - lif));
 	lil = il, lif = ifl, lir = ir;
+	static uint64_t lrw = 0, lrc = 0, lrr = 0, lrn = 0;
+	const uint64_t  rw = FaltasReciclado::g_rb_wait.load(), rc = FaltasReciclado::g_rb_copy.load(),
+	               rr = FaltasReciclado::g_rb_release.load(), rn = FaltasReciclado::g_rb_n.load();
+	std::printf(" | lectura de vuelta en el hilo del juego (%.0f/fot): espera a la GPU %.2f ms, copia %.2f ms, put-in de guardados %.2f ms",
+	            static_cast<double>(rn - lrn) / frames, ms(rw - lrw), ms(rc - lrc), ms(rr - lrr));
+	lrw = rw, lrc = rc, lrr = rr, lrn = rn;
 	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
 	            ms(st - lst), ms(sr - lsr));
 	lst = st, lsr = sr, lsn = sn;

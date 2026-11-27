@@ -1,3 +1,4 @@
+#include "local/faltas-reciclado.h" // (sync3)
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "local/envio1.h"
 #include "gpu-residency.h"
@@ -755,6 +756,19 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 		while (!request->copied.load(std::memory_order_acquire)) request->copied.wait(false);
 		return;
 	}
+	const bool     medir = FaltasReciclado::t_medir; // (sync3, KYTY_TECHO: the fault's wait vs copy)
+	const uint64_t w0    = medir ? __rdtsc() : 0;
+	struct CopyClock {
+		bool     on;
+		uint64_t w0, c0 = 0;
+		~CopyClock() {
+			if (!on) return;
+			const uint64_t end = __rdtsc();
+			FaltasReciclado::g_rb_wait.fetch_add((c0 != 0 ? c0 : end) - w0, std::memory_order_relaxed);
+			if (c0 != 0) FaltasReciclado::g_rb_copy.fetch_add(end - c0, std::memory_order_relaxed);
+			FaltasReciclado::g_rb_n.fetch_add(1, std::memory_order_relaxed);
+		}
+	} copy_clock {medir, w0};
 	if (request->queue_value != 0) {
 		m_readback_queue->Wait(request->queue_value);
 		m_scheduler.WaitPriorityOperations(request->producer_tick);
@@ -767,6 +781,7 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 		m_scheduler.WaitPriorityOperations(request->tick);
 	}
 	uint32_t pending = GuestReadback::Pending;
+	if (medir) copy_clock.c0 = __rdtsc();
 	if (request->state.compare_exchange_strong(pending, GuestReadback::Copying, std::memory_order_acq_rel)) {
 		request->download->Invalidate(0, request->packed_size);
 		if (request->verify != nullptr) {
@@ -3398,9 +3413,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			});
 			// (raiz8, KYTY_RAIZ_ASYNC_RELEASE: the read releases the GPU thread left of this readback's pages applied
 			// here, by the thread that waited for them - the GPU thread goes on meanwhile -.)
+			const uint64_t r0 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)
 			for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
+			if (r0 != 0) FaltasReciclado::g_rb_release.fetch_add(__rdtsc() - r0, std::memory_order_relaxed);
 		}
+		const uint64_t r1 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)
 		PageManager::ApplyDeferredReleases(vaddr, size); // (raiz8: the bytes this read is for, whatever path released them)
+		if (r1 != 0) FaltasReciclado::g_rb_release.fetch_add(__rdtsc() - r1, std::memory_order_relaxed);
 		return;
 	}
 	LiveCounters::Add(GuestGpu::IsGpuThread() ? LiveCounters::SyncReadsRender : LiveCounters::SyncReadsGuest);
