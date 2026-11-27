@@ -1,5 +1,5 @@
 #pragma once
-// (faltas3) KYTY_FALTAS_RECICLADO (sin variable o 0: apagado; 1 encendido; 2 A/B dentro de la partida, cambia cada
+// (faltas3) KYTY_FALTAS_RECICLADO (sin variable o 1: encendido desde faltas3b; 0 apagado; 2 A/B dentro de la partida, cambia cada
 // ventana de 5 s de KYTY_TECHO). Log T50 20261127-111950-777: la falta de escritura normal en DefaultTagg cuesta
 // ~430 us en el hilo de envio, casi todo BufferCache::InvalidateMemory -> ReadMemory: lee de vuelta lo que la GPU
 // escribio en la pagina para no perderlo, antes de que la CPU escriba (10.9 ms/fot en 25 faltas).
@@ -35,7 +35,10 @@ inline std::atomic<bool> g_now {false}, g_off {false};
 	int m = g_mode.load(std::memory_order_relaxed);
 	if (m >= 0) return m;
 	const char* v = std::getenv("KYTY_FALTAS_RECICLADO");
-	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
+	// (faltas3b) Encendido por defecto: T52 (log 20261127-120905-287, Boletaria hasta el pabellon) A/B en la misma
+	// partida 10.93 -> 9.40 ms/fot de faltas en el hilo de envio (-1.53), 13094 faltas sin lectura de vuelta, 0 fallos de
+	// seguridad. =0 lo apaga; =2 A/B.
+	m             = (v != nullptr && v[0] == '0') ? 0 : (v != nullptr && v[0] == '2') ? 2 : 1;
 	g_now.store(m == 1, std::memory_order_relaxed);
 	g_mode.store(m, std::memory_order_relaxed);
 	std::printf("[faltas-reciclado] KYTY_FALTAS_RECICLADO=%d: %s\n", m,
