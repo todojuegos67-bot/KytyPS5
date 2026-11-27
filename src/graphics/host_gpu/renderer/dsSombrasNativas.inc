@@ -38,6 +38,11 @@ struct DsNatPending {
 	bool     busy = false, full = false; // (full: el cubo entero en nativo, sin entradas omitidas)
 	bool     cleared = false; // (la capa tenia un clear HTILE pendiente al empezar: A = valor de clear)
 	bool     skin = false;    // (con entradas de skinning dibujadas en nativo)
+	// (DIAG cascada 0, 11-27) De que esta hecho el cubo: cubo del juego (0 Occluders, 1 Normal, 3 Fadeout), mezcla de VS
+	// (bit0 estatico, bit1 VS de skinning con skinning, bit2 VS de skinning sin skinning), entradas por tipo, las de s10
+	// heredado y hasta 4 ES distintos.
+	uint32_t bucket = 0, mix = 0, n_static = 0, n_skin = 0, n_skinvs_static = 0, n_s10 = 0;
+	uint64_t es[4] {};
 };
 
 struct DsNatState {
@@ -402,6 +407,24 @@ void DsNatCopyLayer(vk::CommandBuffer command, Image* image, uint32_t layer, DsN
 	if (previous.layout != vk::ImageLayout::eUndefined) image->Transit(previous.layout, previous.access_mask, range, command);
 }
 
+// (DIAG) [cascada][cubo][mezcla de VS] = {pixeles nativo mas cerca, cubos con error, cubos sin error}.
+uint64_t g_ds_nat_err[4][4][8][3] {};
+void DsNatErrReport() {
+	struct Row { uint64_t px, bad, good; uint32_t c, b, m; };
+	Row rows[128];
+	uint32_t n = 0;
+	for (uint32_t c = 0; c < 4; ++c)
+		for (uint32_t b = 0; b < 4; ++b)
+			for (uint32_t m = 0; m < 8; ++m)
+				if (g_ds_nat_err[c][b][m][1] + g_ds_nat_err[c][b][m][2] != 0)
+					rows[n++] = {g_ds_nat_err[c][b][m][0], g_ds_nat_err[c][b][m][1], g_ds_nat_err[c][b][m][2], c, b, m};
+	std::sort(rows, rows + n, [](const Row& x, const Row& y) { return x.px > y.px; });
+	for (uint32_t i = 0; i < n && i < 10; ++i)
+		std::printf("[nativo-sombras] DIAG error top%u: cascada %u cubo %u mezcla %s%s%s: nativo_mas_cerca=%llu px en %llu cubos (sin error %llu)\n",
+		            i + 1, rows[i].c, rows[i].b, (rows[i].m & 1u) ? "estatico " : "", (rows[i].m & 2u) ? "skin " : "",
+		            (rows[i].m & 4u) ? "vs_skin_sin_skin" : "", static_cast<unsigned long long>(rows[i].px),
+		            static_cast<unsigned long long>(rows[i].bad), static_cast<unsigned long long>(rows[i].good));
+}
 // Los resultados de las comparaciones cuyo tick ya termino la GPU; cada 10 s, la linea por cascada.
 void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 	namespace H = DsNativoSombras;
@@ -420,6 +443,22 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 			s.drawn[c] += p.drawn;
 			++s.compared[c];
 			if (r[1] > s.max_err[c]) s.max_err[c] = r[1];
+			if (r[2] != 0 && H::NatDiag()) {
+				// (DIAG) Cubos con pixeles donde el nativo queda MAS CERCA que el juego (= error del nativo): agregado por
+				// cascada x cubo x mezcla de VS (linea cada 10 s, 10 mas grandes) y los 30 primeros cubos con su detalle.
+				g_ds_nat_err[c & 3u][p.bucket & 3u][p.mix & 7u][0] += r[2];
+				g_ds_nat_err[c & 3u][p.bucket & 3u][p.mix & 7u][1] += 1;
+				static uint32_t shown = 0;
+				if (shown < 30) {
+					++shown;
+					std::printf("[nativo-sombras] DIAG error cascada %u cubo %u: nativo_mas_cerca=%u px err_max=%g | entradas: estaticas=%u "
+					            "skinning=%u vs_skin_sin_skin=%u s10_heredado=%u completo=%u | ES %llx %llx %llx %llx\n",
+					            c, p.bucket, r[2], [&] { float f = 0; std::memcpy(&f, &r[1], 4); return double(f); }(), p.n_static, p.n_skin, p.n_skinvs_static, p.n_s10,
+					            p.full ? 1u : 0u, static_cast<unsigned long long>(p.es[0]), static_cast<unsigned long long>(p.es[1]),
+					            static_cast<unsigned long long>(p.es[2]), static_cast<unsigned long long>(p.es[3]));
+				}
+			}
+			if (r[2] == 0 && H::NatDiag()) g_ds_nat_err[c & 3u][p.bucket & 3u][p.mix & 7u][2] += 1;
 			if (p.skin) {
 				++s.skin_cubes[c];
 				s.skin_eq[c] += r[0];
@@ -450,6 +489,7 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 	const auto now = std::chrono::steady_clock::now();
 	if (now - s.last_report < std::chrono::seconds(10)) return;
 	s.last_report = now;
+	if (H::NatDiag()) DsNatErrReport();
 	const auto pc = [](uint64_t a, uint64_t b) { return b != 0 ? 100.0 * double(a) / double(b) : 0.0; };
 	const auto fl = [](uint32_t bits) {
 		float f = 0;
@@ -1171,6 +1211,21 @@ bool DsNatWork(RenderContext& context, CommandBuffer& buffer, int role, uint32_t
 		p.full   = !s.partial;
 		p.cleared = s.cleared;
 		p.skin    = s.has_skin;
+		p.bucket  = s.slot->bucket;
+		p.mix = p.n_static = p.n_skin = p.n_skinvs_static = p.n_s10 = 0;
+		for (auto& e: p.es) e = 0;
+		for (uint32_t k = 0; k < s.slot->count && k < s.native.size(); ++k) {
+			const auto& dr = s.slot->draws[k];
+			if (s.native[k] == 0) continue;
+			if (dr.vs == 0) ++p.n_static, p.mix |= 1u;
+			else if (dr.skin != 0) ++p.n_skin, p.mix |= 2u;
+			else ++p.n_skinvs_static, p.mix |= 4u;
+			if (dr.s10_reg != 0) ++p.n_s10;
+			for (auto& e: p.es) {
+				if (e == dr.es) break;
+				if (e == 0) { e = dr.es; break; }
+			}
+		}
 		p.pixels = uint64_t {s.extent.width} * s.extent.height;
 		p.busy   = true;
 		++s.next;
