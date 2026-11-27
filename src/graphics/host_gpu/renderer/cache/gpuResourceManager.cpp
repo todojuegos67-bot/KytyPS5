@@ -1,4 +1,5 @@
 #include "local/envio3.h"
+#include "local/techo-faltas.h" // (techo-faltas, KYTY_TECHO: the handler's path)
 #include "local/sync-stats.h"
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "live-census.h"
@@ -389,6 +390,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// protection, the kept bytes in) and the access retried. A page watched again by then faults again, on the paths
 	// below. First: the paths below read the page's state, which already says released.
 	if (m_page_manager.ApplyDeferredReleaseAt(fault_vaddr)) {
+		TechoFaltas::SetVia(TechoFaltas::VDiferida);
 		return true;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -398,6 +400,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			if (!m_page_manager.WatchedSpan(fault_vaddr & ~(TRACKER_PAGE_SIZE - 1), TRACKER_PAGE_SIZE, &first, &end)) {
 				// (audit1, KYTY_DS_WRITE_AUDIT: measurement only, here and below.)
 				if (::Loader::DemonsSoulsWriteAudit::On()) ::Loader::DemonsSoulsWriteAudit::NoteWriteFault(fault_vaddr, 2);
+				TechoFaltas::SetVia(TechoFaltas::VPrimera);
 				return true;
 			}
 		}
@@ -421,6 +424,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 				if (::Loader::DemonsSoulsWriteAudit::On()) ::Loader::DemonsSoulsWriteAudit::NoteWriteFault(fault_vaddr, 1);
 				LiveCounters::Add(LiveCounters::WriteFault);
 				if (FaultStatsOn()) NoteFault(fault_vaddr, 1);
+				TechoFaltas::SetVia(TechoFaltas::VSinVigilar);
 				return true;
 			}
 		}
@@ -432,15 +436,18 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			if (FaultStatsOn()) NoteFault(fault_vaddr, 0);
 			if (::Loader::DemonsSoulsWriteAudit::On()) ::Loader::DemonsSoulsWriteAudit::NoteWriteFault(fault_vaddr, 0);
 			if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
+			TechoFaltas::SetVia(TechoFaltas::VVentana);
 			return true;
 		}
 		LiveCounters::Add(LiveCounters::WriteFault);
+		TechoFaltas::SetVia(TechoFaltas::VEscritura);
 		if (FaultStatsOn()) NoteFault(fault_vaddr, 1);
 		if (::Loader::DemonsSoulsWriteAudit::On()) ::Loader::DemonsSoulsWriteAudit::NoteWriteFault(fault_vaddr, 1);
 		// No watcher holds the page, so no cache expects this fault: the protection outlived its
 		// watchers and would fault forever. It gets the guest's own protection back.
 		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::StaleProtectRepairs);
+			TechoFaltas::SetVia(TechoFaltas::VRestaurada);
 			return true;
 		}
 		if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
@@ -448,6 +455,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
+		TechoFaltas::SetVia(TechoFaltas::VLectura);
 		Raiz::NoteGameReadFault(fault_vaddr); // (raiz2: the windows' exposure estimate)
 		if (FaultStatsOn()) NoteFault(fault_vaddr, 2);
 		// (policy1, KYTY_DS_WRITE_AUDIT: the "[read-audit]" lines. Measurement only.)

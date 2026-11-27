@@ -5,6 +5,7 @@
 // tambien salen de GBuffer 0xa05430, DepthPrePass 0xa0a370, Debug 0xa07e80, 0xa12860, 0xa12de0: por eso "fuera de
 // marcas" se da por grupo (sombras / resto), no se inventa un reparto por via.
 #include "local/techo.h"
+#include "local/techo-faltas.h"
 #include "local/ds-censo-dcb.h"
 #include "local/ds-censo-escena.h"
 #include "local/live-census.h"
@@ -206,6 +207,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		            static_cast<double>(now.waits[3] - last.waits[3]) / 1e6 / n, static_cast<double>(now.waits[4] - last.waits[4]) / 1e6 / n,
 		            keep ? "" : " (arranque: fuera de la tabla)");
 		std::fflush(stdout);
+		TechoFaltas::Report(n, ms_cyc); // (techo-faltas: the game threads' faults, a line beside this one)
 		if (keep && flip_ns - last_table >= 30'000'000'000ll) {
 			last_table = flip_ns;
 			PrintTable("acumulada");

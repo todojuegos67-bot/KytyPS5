@@ -1,0 +1,150 @@
+#pragma once
+// (techo-faltas) Con KYTY_TECHO=1 (solo mide; apagado = una lectura de un static por falta): censo de las faltas de
+// pagina de la vigilancia (GpuResourceManager::HandleFault) en los hilos del juego, para saber QUE memoria escribe el
+// juego y QUIEN (log 20261127-101545-220, Boletaria 1-1: 7.04 ms/fot y ~236 faltas/fot en hilos del juego, ~30 us cada
+// una; la vigilancia de cpuheap/DefaultTagg/otros/cpubkt 36/27/21/16 % de los cambios de proteccion).
+// Cada falta: zona de la memoria (FrameNativo::Classify: DefaultTagg, cpuheap, cpubkt, ring, ctx, gpupage, otros), via
+// del manejador (ventana, primera escritura, sin-vigilancia, escritura normal, lectura de la GPU, aplicada diferida...),
+// ciclos dentro del manejador, hilo (el de envio = el que llama a sceAgcSuspendPoint, o los demas) y, 1 de cada 4, la
+// instruccion que escribe (offset en el eboot; codigo del emulador -> la direccion de vuelta de la pila si es del eboot).
+// Camino critico: el tiempo que el hilo de envio espera dentro de sceAgcSuspendPoint (GuestGpu::Done: espera al
+// emulador). Si esa espera es mayor que sus faltas, las faltas del juego NO retrasan el envio del fotograma.
+// Linea "[techo-faltas]" cada 5 s (desde Techo::Report, hilo de render).
+#include "local/techo.h"
+#include "local/frame-nativo.h"
+
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+
+namespace TechoFaltas {
+
+// Via del manejador (la pone HandleFault en el hilo que falla).
+enum Via : uint8_t { VDiferida = 0, VPrimera, VSinVigilar, VVentana, VRestaurada, VEscritura, VLectura, VNoMapeada, Vias };
+inline const char* const kVias[Vias] = {"diferida", "primera", "sin-vigilar", "ventana", "restaurada", "escritura", "lectura", "no-mapeada"};
+inline thread_local uint8_t t_via      = VNoMapeada;
+inline thread_local bool    t_envio    = false; // este hilo llama a sceAgcSuspendPoint
+inline void                 SetVia(Via v) noexcept { t_via = v; }
+
+constexpr uint32_t Zonas = FrameNativo::CCount;
+// [hilo 0 otros / 1 envio][zona][via]: ciclos y llamadas.
+inline std::atomic<uint64_t> g_cyc[2][Zonas][Vias] {};
+inline std::atomic<uint64_t> g_n[2][Zonas][Vias] {};
+inline std::atomic<uint64_t> g_wait_cyc {0}, g_wait_n {0}; // espera del hilo de envio en sceAgcSuspendPoint
+
+// Sitios: clave = offset en el eboot (+1; bit 40: via codigo del emulador) | zona << 48. Tabla abierta, muestreada.
+constexpr size_t Slots = 2048;
+struct Slot {
+	std::atomic<uint64_t> key {0}, cyc {0}, n {0}, envio {0};
+};
+inline Slot                  g_sites[Slots];
+inline std::atomic<uint64_t> g_lost {0};
+inline std::atomic<uint64_t> g_sample {0};
+
+[[nodiscard]] inline bool SampleSite() noexcept {
+	return (g_sample.fetch_add(1, std::memory_order_relaxed) & 3u) == 0;
+}
+
+// `site`: offset en el eboot + 1 (0: desconocido), con el bit 40 si la instruccion era del emulador (memcpy del runtime).
+inline void Note(uint64_t vaddr, uint64_t cycles, uint64_t site, bool sampled) noexcept {
+	const uint32_t z = FrameNativo::Classify(vaddr);
+	const uint32_t v = t_via < Vias ? t_via : VNoMapeada;
+	const uint32_t h = t_envio ? 1 : 0;
+	g_cyc[h][z][v].fetch_add(cycles, std::memory_order_relaxed);
+	g_n[h][z][v].fetch_add(1, std::memory_order_relaxed);
+	if (!sampled) return;
+	const uint64_t key = (site | (uint64_t {z} << 48u) | (uint64_t {v} << 52u)) + 1u;
+	size_t         i   = static_cast<size_t>((key * 0x9E3779B97F4A7C15ull) >> 53u) % Slots;
+	for (size_t p = 0; p < 32; ++p, i = (i + 1) % Slots) {
+		uint64_t cur = g_sites[i].key.load(std::memory_order_relaxed);
+		if (cur == 0 && g_sites[i].key.compare_exchange_strong(cur, key, std::memory_order_relaxed)) cur = key;
+		if (cur != key) continue;
+		g_sites[i].cyc.fetch_add(cycles, std::memory_order_relaxed);
+		g_sites[i].n.fetch_add(1, std::memory_order_relaxed);
+		if (h != 0) g_sites[i].envio.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	g_lost.fetch_add(1, std::memory_order_relaxed);
+}
+
+// sceAgcSuspendPoint: marca el hilo de envio y mide su espera al emulador.
+struct EnvioScope {
+	uint64_t t0;
+	EnvioScope(): t0(Techo::On() ? __rdtsc() : 0) {
+		if (t0 != 0) t_envio = true;
+	}
+	~EnvioScope() {
+		if (t0 == 0) return;
+		g_wait_cyc.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+		g_wait_n.fetch_add(1, std::memory_order_relaxed);
+	}
+	EnvioScope(const EnvioScope&)            = delete;
+	EnvioScope& operator=(const EnvioScope&) = delete;
+};
+
+// Desde Techo::Report (cada 5 s): `frames` fotogramas, `ms_cyc` ms por ciclo TSC.
+inline void Report(double frames, double ms_cyc) noexcept {
+	if (frames <= 0) return;
+	static uint64_t last_cyc[2][Zonas][Vias] {}, last_n[2][Zonas][Vias] {}, last_wait = 0, last_wait_n = 0;
+	const auto      ms = [&](uint64_t c) { return static_cast<double>(c) * ms_cyc / frames; };
+	double          zona_ms[Zonas] {}, zona_n[Zonas] {}, via_ms[Vias] {}, via_n[Vias] {}, hilo_ms[2] {}, hilo_n[2] {};
+	for (uint32_t h = 0; h < 2; ++h)
+		for (uint32_t z = 0; z < Zonas; ++z)
+			for (uint32_t v = 0; v < Vias; ++v) {
+				const uint64_t c = g_cyc[h][z][v].load(std::memory_order_relaxed), n = g_n[h][z][v].load(std::memory_order_relaxed);
+				const double   dm = ms(c - last_cyc[h][z][v]), dn = static_cast<double>(n - last_n[h][z][v]) / frames;
+				last_cyc[h][z][v] = c, last_n[h][z][v] = n;
+				zona_ms[z] += dm, zona_n[z] += dn, via_ms[v] += dm, via_n[v] += dn, hilo_ms[h] += dm, hilo_n[h] += dn;
+			}
+	const uint64_t w = g_wait_cyc.load(std::memory_order_relaxed), wn = g_wait_n.load(std::memory_order_relaxed);
+	const double   wait_ms = ms(w - last_wait), wait_n = static_cast<double>(wn - last_wait_n) / frames;
+	last_wait = w, last_wait_n = wn;
+	std::printf("[techo-faltas] 5 s: faltas %.2f ms/fot (%.0f/fot), hilo de envio %.2f ms (%.0f) + otros %.2f ms (%.0f); "
+	            "espera del hilo de envio en sceAgcSuspendPoint %.2f ms/fot (%.1f/fot: %s) | por zona:",
+	            hilo_ms[0] + hilo_ms[1], hilo_n[0] + hilo_n[1], hilo_ms[1], hilo_n[1], hilo_ms[0], hilo_n[0], wait_ms, wait_n,
+	            wait_ms > hilo_ms[1] ? "espera mas que sus faltas: las faltas no retrasan el envio" : "sus faltas pueden retrasar el envio");
+	for (uint32_t z = 0; z < Zonas; ++z)
+		if (zona_n[z] >= 0.05) std::printf(" %s %.2f (%.0f)", FrameNativo::kNames[z], zona_ms[z], zona_n[z]);
+	std::printf(" | por via:");
+	for (uint32_t v = 0; v < Vias; ++v)
+		if (via_n[v] >= 0.05) std::printf(" %s %.2f (%.0f)", kVias[v], via_ms[v], via_n[v]);
+	// Sitios (muestreo 1/4, se escala x4): los 16 mas caros de la ventana.
+	struct Row {
+		uint64_t key, cyc, n, envio;
+	};
+	Row    top[16] {};
+	size_t used = 0;
+	for (auto& s: g_sites) {
+		const uint64_t key = s.key.load(std::memory_order_relaxed);
+		if (key == 0) continue;
+		const Row r {key - 1u, s.cyc.exchange(0, std::memory_order_relaxed), s.n.exchange(0, std::memory_order_relaxed),
+		             s.envio.exchange(0, std::memory_order_relaxed)};
+		if (r.n == 0) continue;
+		size_t k = used < 16 ? used++ : 16;
+		if (k == 16) {
+			if (r.cyc <= top[15].cyc) continue;
+			k = 15;
+		}
+		while (k > 0 && top[k - 1].cyc < r.cyc) {
+			top[k] = top[k - 1];
+			--k;
+		}
+		top[k] = r;
+	}
+	std::printf(" | sitios (eboot+off zona via ms/fot faltas/fot, x4; 'emu<-' = memcpy del emulador llamado desde ahi):");
+	for (size_t k = 0; k < used; ++k) {
+		const uint64_t key  = top[k].key;
+		const uint64_t site = key & ((uint64_t {1} << 40u) - 1u);
+		const bool     emu  = ((key >> 40u) & 1u) != 0;
+		const uint32_t z = static_cast<uint32_t>((key >> 48u) & 0xfu), v = static_cast<uint32_t>((key >> 52u) & 0xfu);
+		if (site == 0) std::printf(" ?");
+		else std::printf(" %s%llx", emu ? "emu<-" : "", static_cast<unsigned long long>(site - 1u));
+		std::printf(" %s %s %.2f %.1f%s", z < Zonas ? FrameNativo::kNames[z] : "?", v < Vias ? kVias[v] : "?", ms(top[k].cyc) * 4.0,
+		            static_cast<double>(top[k].n) * 4.0 / frames, top[k].envio != 0 ? " (envio)" : "");
+		std::printf(k + 1 < used ? "," : "");
+	}
+	std::printf(" | perdidos %llu\n", static_cast<unsigned long long>(g_lost.exchange(0, std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+
+} // namespace TechoFaltas

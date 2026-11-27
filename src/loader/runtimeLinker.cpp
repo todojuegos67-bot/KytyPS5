@@ -43,6 +43,8 @@
 #include "live-trace.h"
 #include "local/juego3.h" // (juego3, KYTY_JUEGO3)
 #include "local/f0-measure.h" // (esperas2: the game thread's time in the fault handler, KYTY_ESPERAS)
+#include "local/live-census.h"
+#include "local/techo-faltas.h" // (techo-faltas, KYTY_TECHO: census of the game threads' faults)
 #include "native/g1-probe.h" // (g1)
 
 #include <algorithm>
@@ -886,7 +888,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// (policy1: and the reader of a read fault, for the "[read-audit]" table.)
 		if (DemonsSoulsWriteAudit::On())
 			DemonsSoulsWriteAudit::NoteFaultSite(info->exception_address, info->rsp);
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		// (techo-faltas, KYTY_TECHO: measurement only) the game threads' faults by zone, handler path, thread and writer.
+		const bool     faltas_on = Techo::On() && !LiveCensus::g_render;
+		const uint64_t faltas_t0 = faltas_on ? __rdtsc() : 0;
+		if (faltas_on) TechoFaltas::SetVia(TechoFaltas::VNoMapeada);
+		const bool gpu_fault_handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+		if (faltas_on && gpu_fault_handled) {
+			const uint64_t cycles  = __rdtsc() - faltas_t0;
+			const bool     sampled = TechoFaltas::SampleSite();
+			uint64_t       site    = 0;
+			if (sampled && g_faulting_linker != nullptr) {
+				const uint64_t rip = info->exception_address;
+				if (const auto* p = g_faulting_linker->FindProgramByAddr(rip); p != nullptr) {
+					site = rip - p->base_vaddr + 1u;
+				} else if (info->rsp != 0) {
+					// Emulator code (a runtime memcpy for the guest): the return address on top of its stack, if the eboot's.
+					const uint64_t ret = *reinterpret_cast<const uint64_t*>(info->rsp);
+					if (const auto* q = g_faulting_linker->FindProgramByAddr(ret); q != nullptr)
+						site = (ret - q->base_vaddr + 1u) | (uint64_t {1} << 40u);
+				}
+			}
+			TechoFaltas::Note(info->access_violation_vaddr, cycles, site, sampled);
+		}
+		if (gpu_fault_handled) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			// (g1, KYTY_G1_PROBE: the CPU's reads of GPU-written pages by call site; one relaxed load when off)
 			G1::NoteGpuFault(access == GpuAccess::Read, info->exception_address, info->rsp, info->access_violation_vaddr);

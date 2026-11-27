@@ -28,6 +28,7 @@
 #include "local/port1.h" // (port1, KYTY_PORT1)
 #include "local/port2.h" // (port2, KYTY_PORT2)
 #include "local/f0-measure.h" // (f0, KYTY_F0)
+#include "local/techo-faltas.h" // (techo-faltas, KYTY_TECHO)
 #include "local/juego3.h" // (juego3, KYTY_JUEGO3)
 #include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: censo por DCB y sitio del juego)
 #include "native/native-render.h" // (f5, KYTY_NATIVE_RENDER)
@@ -1577,7 +1578,10 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	EXIT_IF(g_renderer == nullptr);
 	F0Measure::GameSuspend(true); // (f0: the game's frame ends; what follows is its wait for the emulator)
 	Juego3::GameSuspend(true);    // (juego3, KYTY_JUEGO3: the game thread's frame and its time off the CPU)
-	g_renderer->GetGpu().Done();
+	{
+		const TechoFaltas::EnvioScope techo_envio; // (techo-faltas, KYTY_TECHO: this is the submit thread; its wait)
+		g_renderer->GetGpu().Done();
+	}
 	Juego3::GameSuspend(false);    // (juego3)
 	F0Measure::GameSuspend(false); // (f0)
 
