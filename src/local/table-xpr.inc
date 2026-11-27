@@ -2629,6 +2629,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       std::span<const uint64_t> commands, uint64_t index_base,
                                                       uint64_t index_bytes, vk::IndexType index_type,
                                                       const NativeXprDirectDraw* direct) {
+	// (ti1, KYTY_TABLA_INDIRECTO) Un draw de argumentos en la GPU: no con lo que el camino normal hace aparte para ellos
+	// (malla: su rejilla sale de las cuentas; las particulas de la generacion de frames, la verificacion de port-r).
+	if (direct != nullptr && direct->indirect_args != 0 &&
+	    (pair.programs[0] == nullptr || pair.programs[0]->stage == ShaderType::Mesh || PortR::Verifying() ||
+	     FrameGen::ParticleNativeWanted()))
+		return TableResult::Native;
 	auto&       table  = OwnTable();
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
@@ -3208,6 +3214,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
 	std::array<uint32_t, 64>                     group_sizes;
 	uint32_t                                     groups = 0;
+	std::pair<Buffer*, uint64_t> indirect_args {}; // (ti1)
+	if (direct != nullptr && direct->indirect_args != 0) {
+		indirect_args = obtain(table.args, direct->indirect_args, sizeof(vk::DrawIndirectCommand), [] {});
+		if (indirect_args.first == nullptr) return TableResult::Native;
+	}
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
 		while (first + count < commands.size() && commands[first + count] == commands[first] + count * stride) ++count;
@@ -3445,6 +3456,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (indexed)
 			vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset),
 			                      first_instance);
+		else if (direct->indirect_args != 0) // (ti1: cuentas, primer vertice y primera instancia de la GPU)
+			vk_buffer.drawIndirect(indirect_args.first->Handle(), indirect_args.second, 1,
+			                       static_cast<uint32_t>(sizeof(vk::DrawIndirectCommand)));
 		else
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}
