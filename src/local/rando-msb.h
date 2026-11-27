@@ -711,44 +711,54 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 		}
 	}
 	Pending().sw = nullptr;
-	if (!GuestPtrOk(obj)) return;
-	if (*reinterpret_cast<const uint8_t*>(obj + 0x14) == 1) return; // jugador
+	// (demonio) dato: cuantas veces entra el juego aqui y por donde sale (Ghidra: 0x359990 es la entrada +0x28 de la
+	// vtable 0x2581ee8 del cargador 0x359800 que crea 0x3233d0 para cada ChrIns de FUN_003effe0/0x34ae50).
+	static std::atomic<int> calls {0};
+	const int               call = calls.fetch_add(1);
+	auto                    out  = [&](const char* why) {
+                if (DemonioOn() && call < 40) {
+                        std::printf("[demonio] 0x359990 llamada %d: sale sin mirar (%s)\n", call + 1, why);
+                        std::fflush(stdout);
+                }
+	};
+	if (!GuestPtrOk(obj)) return out("obj no valido");
+	if (*reinterpret_cast<const uint8_t*>(obj + 0x14) == 1) return out("jugador / c0000"); // jugador
 	const uint64_t map = *reinterpret_cast<const uint64_t*>(obj + 0x8);
 	const int32_t  idx = *reinterpret_cast<const int32_t*>(obj + 0x10);
-	if (!GuestPtrOk(map) || idx < 0 || idx > 100000) return;
+	if (!GuestPtrOk(map) || idx < 0 || idx > 100000) return out("puntero de mapa, parte o modelo no valido");
 	uint64_t part = 0, mrec = 0;
 	if (*reinterpret_cast<const uint8_t*>(map + 0x22c) == 1) {
 		const uint64_t parts = *reinterpret_cast<const uint64_t*>(map + 0x928);
 		const uint64_t mods  = *reinterpret_cast<const uint64_t*>(map + 0x860);
-		if (!GuestPtrOk(parts) || !GuestPtrOk(mods)) return;
+		if (!GuestPtrOk(parts) || !GuestPtrOk(mods)) return out("puntero de mapa, parte o modelo no valido");
 		part = parts + static_cast<uint64_t>(idx) * 0x80;
 		const int32_t mi = *reinterpret_cast<const int32_t*>(part + 0x10);
-		if (mi < 0 || mi > 100000) return;
+		if (mi < 0 || mi > 100000) return out("puntero de mapa, parte o modelo no valido");
 		mrec = mods + static_cast<uint64_t>(mi) * 0x20;
 	} else {
 		const uint64_t plist = *reinterpret_cast<const uint64_t*>(map + 0x48);
 		const uint64_t mlist = *reinterpret_cast<const uint64_t*>(map + 0x30);
-		if (!GuestPtrOk(plist) || !GuestPtrOk(mlist)) return;
+		if (!GuestPtrOk(plist) || !GuestPtrOk(mlist)) return out("puntero de mapa, parte o modelo no valido");
 		part = *reinterpret_cast<const uint64_t*>(plist + 0x18 + static_cast<uint64_t>(idx) * 8);
-		if (!GuestPtrOk(part)) return;
+		if (!GuestPtrOk(part)) return out("puntero de mapa, parte o modelo no valido");
 		const int32_t mi = *reinterpret_cast<const int32_t*>(part + 0x10);
-		if (mi < 0 || mi > 100000) return;
+		if (mi < 0 || mi > 100000) return out("puntero de mapa, parte o modelo no valido");
 		mrec = *reinterpret_cast<const uint64_t*>(mlist + 0x18 + static_cast<uint64_t>(mi) * 8);
 	}
-	if (!GuestPtrOk(part) || !GuestPtrOk(mrec)) return;
+	if (!GuestPtrOk(part) || !GuestPtrOk(mrec)) return out("puntero de mapa, parte o modelo no valido");
 	const uint64_t name_p = *reinterpret_cast<const uint64_t*>(part);
 	const uint64_t mname  = *reinterpret_cast<const uint64_t*>(mrec);
 	const uint64_t td     = *reinterpret_cast<const uint64_t*>(part + 0x70);
-	if (!GuestPtrOk(name_p & ~7ull) || !GuestPtrOk(mname & ~7ull) || !GuestPtrOk(td & ~3ull)) return;
+	if (!GuestPtrOk(name_p & ~7ull) || !GuestPtrOk(mname & ~7ull) || !GuestPtrOk(td & ~3ull)) return out("puntero de mapa, parte o modelo no valido");
 	const std::string pname = GuestStr(reinterpret_cast<const char*>(name_p));
 	const std::string model = GuestStr(reinterpret_cast<const char*>(mname));
 	const int32_t     npc   = *reinterpret_cast<const int32_t*>(td + 0xC);
-	if (DemonioOn() && pname == "c2000_0000") { // (demonio) dato: el juego llega a crear la parte (sea cual sea el sitio)
+	if (DemonioOn() && (pname == "c2000_0000" || call < 40)) { // (demonio) dato: partes que crea el juego (las primeras y el soldado)
 		static std::atomic<int> dn {0};
-		if (dn.fetch_add(1) < 20) {
+		if (dn.fetch_add(1) < 80) {
 			float pp[3];
 			std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
-			std::printf("[demonio] 0x359990: parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f)\n", idx, pname.c_str(), model.c_str(), npc,
+			std::printf("[demonio] 0x359990 llamada %d: parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f)\n", call + 1, idx, pname.c_str(), model.c_str(), npc,
 			            static_cast<double>(pp[0]), static_cast<double>(pp[1]), static_cast<double>(pp[2]));
 			std::fflush(stdout);
 		}
@@ -856,6 +866,13 @@ __attribute__((sysv_abi, noinline)) inline void ProbeModel(uint64_t /*self*/, co
 		std::fflush(stdout);
 		model = sw->new_model;
 		id    = sw->new_npc;
+	}
+	if (DemonioOn()) { // (demonio) dato: el juego pide modelos (las primeras peticiones, de cualquier enemigo)
+		static std::atomic<int> any {0};
+		if (any.fetch_add(1) < 30) {
+			std::printf("[demonio] 0x1451700: modelo %s chrid %d desde eboot+0x%llx\n", model.c_str(), id, static_cast<unsigned long long>(from));
+			std::fflush(stdout);
+		}
 	}
 	if (DemonioOn() && (model == "c1030" || id == 103001)) {
 		static std::atomic<int> dl {0};
@@ -2707,9 +2724,9 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 }
 
 // (demonio) Una sola parte: el soldado c2000_0000 de m02_00_00_00 pasa a ser el Vanguard de m03_01_00_00 (c1030_0000)
-// y se pone en la arena de la Falange, entre el centro (c5001_0000, 17.5 30.5 -3.2) y la archipiedra de 1-2
-// (o0300_0001 / punto del jugador c0000_0006, 17.5 30.5 5.9): sitio (17.5, 30.5, -1.0), colision y grupos +0x44 de
-// c5001_0000 (colision 820), sin patrulla, sin estado pasivo. Va ENCIMA de lo que haya hecho el randomizer (fuertes /
+// y se pone en el centro del primer patio tras la archipiedra (14.8, 21.2, -124.5; colision 766 y grupos del soldado
+// en el MSB original). Antes: arena de la Falange (colision 820): log 20261127-034836-921 sin ninguna linea de 0x359990.
+// Sin patrulla, sin estado pasivo. Va ENCIMA de lo que haya hecho el randomizer (fuertes /
 // barajado): |msb| y |cg| entran ya construidos (vacios: los originales).
 // Log 20261127-032608-861: con el modelo c1030 METIDO en la tabla de modelos del MSB (indices de modelo corridos) no
 // hubo ni una peticion de c1030 (0x1451700) ni la linea del gancho 0x359990 (comparaba el modelo con "c2000" y el MSB
@@ -2723,8 +2740,7 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	static const char* kTarget   = "c2000_0000";
 	static const char* kDonorMap = "m03_01_00_00";
 	static const char* kDonor    = "c1030_0000";
-	static const char* kArena    = "c5001_0000"; // Falange
-	static const float kSpot[3]  = {17.5f, 30.5f, -1.0f};
+	static const float kSpot[3]  = {14.8f, 21.2f, -124.5f}; // centro del primer patio (entre c2000_0000 y c2000_0002)
 	if (map != "m02_00_00_00") return false;
 	auto fail = [&](const char* why) {
 		std::printf("[demonio] %s: %s; el Vanguard no se pone\n", map.c_str(), why);
@@ -2746,13 +2762,19 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	auto& models = t[0].blobs;
 	auto& parts  = t[3].blobs;
 
-	size_t pi = ps.size(), ai = ps.size();
-	for (size_t i = 0; i < ps.size(); i++) {
+	size_t pi = ps.size();
+	for (size_t i = 0; i < ps.size(); i++)
 		if (ps[i].name == kTarget && ModelName(models[static_cast<size_t>(ps[i].model)]) == "c2000") pi = i;
-		if (ps[i].name == kArena) ai = i;
-	}
 	if (pi == ps.size()) return fail("no esta el soldado c2000_0000");
-	if (ai == ps.size()) return fail("no esta la Falange c5001_0000");
+	// Colision, grupos +0x44 y giro del sitio: los del soldado en el MSB ORIGINAL (el randomizer puede haberlo movido).
+	std::vector<uint8_t>   omsb;
+	std::vector<Table>     ot;
+	std::vector<EnemyPart> ops;
+	if (!ReadWhole(MsbPathOf(app0, map), &omsb) || !ParseTables(omsb, &ot) || !EnemyParts(ot, &ops)) return fail("no se lee el MSB original");
+	size_t oi = ops.size();
+	for (size_t i = 0; i < ops.size(); i++)
+		if (ops[i].name == kTarget) oi = i;
+	if (oi == ops.size()) return fail("no esta el soldado en el MSB original");
 	size_t         top = 0;
 	const Cg::Rec* tr  = TopByName(tf, kTarget, &top);
 	if (tr == nullptr || !Cg::RootInfo(tf, *tr).ok || Cg::RootInfo(tf, *tr).part != ps[pi].index)
@@ -2774,13 +2796,13 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	for (const auto& m: models)
 		if (BI32(m, 0x8) == 2 && ModelName(m) == "c1030") return fail("c1030 ya esta en el mapa");
 
-	// Sitio: arena de la Falange (lógica en el MSB).
-	const auto&  ap  = parts[ps[ai].index];
-	const size_t atd = ps[ai].td;
+	// Sitio: centro del primer patio (lógica en el MSB), colision 766 del soldado original.
+	const auto&  ap  = ot[3].blobs[ops[oi].index];
+	const size_t atd = ops[oi].td;
 	auto&        pb  = parts[ps[pi].index];
 	const size_t td  = ps[pi].td;
-	const float  rot[3] {0.0f, 0.0f, 0.0f}; // mirando a la archipiedra (+Z)
 	std::memcpy(pb.data() + 0x20, kSpot, 12);
+	const float rot[3] {0.0f, 0.0f, 0.0f}; // mismo giro que la matriz del cgpr (identidad)
 	std::memcpy(pb.data() + 0x2C, rot, 12);
 	std::memcpy(pb.data() + 0x44, ap.data() + 0x44, 32);
 	std::memcpy(pb.data() + td + 0x1C, ap.data() + atd + 0x1C, 4);
@@ -2818,7 +2840,7 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 		std::lock_guard<std::mutex> lock(HookMutex());
 		HookSwaps().push_back(h);
 	}
-	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en la arena de la Falange "
+	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en el centro del primer patio "
 	            "(%.1f, %.1f, %.1f), colision %d; MSB sin cambio de modelo (lo cambia el gancho); cgpr %zu -> %zu objetos\n",
 	            map.c_str(), kTarget, h.orig_npc, h.new_npc, kDonorMap, kDonor, static_cast<double>(kSpot[0]),
 	            static_cast<double>(kSpot[1]), static_cast<double>(kSpot[2]), BI32(pb, td + 0x1C), tf.objs.size(), new_objs);
