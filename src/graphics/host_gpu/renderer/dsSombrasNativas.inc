@@ -87,7 +87,7 @@ struct DsNatState {
 	uint32_t                  diag_info[8][3] {};
 	uint64_t                  inpass_yes[4] {}, inpass_no[4] {}; // (b: dibujos dentro del render pass del emulador / no) // (parciales seguidos con nativo_mas_cerca = 0, entre ventanas)
 	uint64_t                  dcb_direct[4] {}, dcb_ib[4] {}, dcb_noend[4] {}, seen_all[4] {};
-	uint64_t                  entries_seen[4] {}, game_draws[4] {}, game_skipped[4] {}, doubled[4] {}, quiet_clear[4] {}, quiet_order[4] {};
+	uint64_t                  entries_seen[4] {}, game_draws[4] {}, game_skipped[4] {}, doubled[4] {}, quiet_clear[4] {}, quiet_order[4] {}, quiet_min[4] {};
 	uint32_t                  sample[4] {}; // (=3: se compara 1 de cada N cubos)
 	uint32_t                  cam_next = 0;
 	uint64_t                  cam_tick[DsNatCamRing] {};
@@ -575,14 +575,14 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 		// se saltaron (los hace el nativo), y cuantas entradas nativas se dibujaron dos veces.)
 		std::printf("[nativo-sombras] =%u cascada %u: draws del juego saltados %.1f%% (%llu de %llu entradas con datos; en cubos "
 		            "reemplazados %llu de %llu draws) | dibujados dos veces=%llu | cubos reemplazados con clear HTILE (1er draw "
-		            "del juego conservado)=%llu | no reemplazados por test no min/max=%llu | DCB entre marcas: draws directos=%llu "
+		            "del juego conservado)=%llu | no reemplazados por test no min/max=%llu por MINPARCIAL=%llu | DCB entre marcas: draws directos=%llu "
 		            "INDIRECT_BUFFER=%llu sin marca de fin en el bufer=%llu; vistos por DsNatBeforeDraw=%llu | cubos =1 sin dibujo "
 		            "nativo (un solo draw del juego o fallo antes de saltar)=%llu | dentro del render pass del emulador=%llu, "
 		            "no posible=%llu | CASCADA: pases=%llu cubos=%llu no agrupados (ranura/camara/fallo)=%llu con clear a mitad=%llu\n",
 		            H::Mode(), c, pc(s.game_skipped[c], s.entries_seen[c]), static_cast<unsigned long long>(s.game_skipped[c]),
 		            static_cast<unsigned long long>(s.entries_seen[c]), static_cast<unsigned long long>(s.game_skipped[c]),
 		            static_cast<unsigned long long>(s.game_draws[c]), static_cast<unsigned long long>(s.doubled[c]),
-		            static_cast<unsigned long long>(s.quiet_clear[c]), static_cast<unsigned long long>(s.quiet_order[c]),
+		            static_cast<unsigned long long>(s.quiet_clear[c]), static_cast<unsigned long long>(s.quiet_order[c]), static_cast<unsigned long long>(s.quiet_min[c]),
 		            static_cast<unsigned long long>(s.dcb_direct[c]), static_cast<unsigned long long>(s.dcb_ib[c]),
 		            static_cast<unsigned long long>(s.dcb_noend[c]), static_cast<unsigned long long>(s.seen_all[c]),
 		            static_cast<unsigned long long>(s.replace_undone[c]), static_cast<unsigned long long>(s.inpass_yes[c]),
@@ -599,7 +599,7 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 		s.replace_undone[c] = s.inpass_yes[c] = s.inpass_no[c] = 0;
 		s.groups[c] = s.group_cubes[c] = s.group_abort[c] = s.group_clear[c] = 0;
 		s.dcb_direct[c] = s.dcb_ib[c] = s.dcb_noend[c] = s.seen_all[c] = 0;
-		s.game_draws[c] = s.game_skipped[c] = s.doubled[c] = s.quiet_clear[c] = s.quiet_order[c] = s.entries_seen[c] = 0;
+		s.game_draws[c] = s.game_skipped[c] = s.doubled[c] = s.quiet_clear[c] = s.quiet_order[c] = s.quiet_min[c] = s.entries_seen[c] = 0;
 		s.eq[c] = s.total[c] = s.drawn[c] = s.events[c] = s.compared[c] = s.fails[c] = s.replaced[c] = 0;
 		s.full_cubes[c] = s.full_eq[c] = s.full_total[c] = 0;
 		if (H::NatSkinOn())
@@ -1620,6 +1620,18 @@ bool DsNatStart(RenderContext& context, CommandBuffer& buffer, int role, uint64_
 		// (Log 20261125-023042-999: las cascadas 0, 1 y 3 tenian clear HTILE pendiente en todos sus cubos y se quedaban
 		// emuladas. Con clear pendiente se deja hacer el PRIMER draw del juego del cubo: aplica el clear (loadOp clear) antes
 		// que todo lo demas; el resto se salta como siempre y el nativo dibuja al final, despues de ese clear.)
+		// (T40 11-27: con el skinning validado la cascada 0 reemplaza ~950 cubos parciales saltando solo el 15,8 % de sus
+		// draws; cada uno paga un pase nativo propio y el juego sigue con el resto.) KYTY_NATIVO_SOMBRAS_MINPARCIAL=n (0-100,
+		// 0 = como antes): un cubo parcial con menos del n % de entradas en nativo se queda entero al juego.
+		static const uint32_t min_partial = [] {
+			const char* text = std::getenv("KYTY_NATIVO_SOMBRAS_MINPARCIAL");
+			const long  n    = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+			return n >= 0 && n <= 100 ? static_cast<uint32_t>(n) : 0u;
+		}();
+		if (s.partial && min_partial != 0 && uint64_t {drawable} * 100u < uint64_t {min_partial} * (count - empty)) {
+			++s.quiet_min[s.pass];
+			return DsNatQuiet(), false;
+		}
 		if (s.partial && !order_free) {
 			++s.quiet_order[s.pass];
 			return DsNatQuiet(), false;

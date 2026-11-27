@@ -83,6 +83,10 @@ struct Modo {
 };
 inline Modo g_total[2]; // [0 nativo, 1 juego], sin el primer tramo
 inline uint32_t g_tramos[2] {};
+// (T40 11-27: los fps subieron de 56 a 101 durante la partida; la media de cada modo no vale.) Cada tramo (sin el 1o):
+// modo, fps y render ocupado por fotograma. El RESUMEN compara cada tramo con la media de sus dos vecinos (del otro modo).
+struct Tramo { uint32_t modo; double fps, busy; };
+inline std::vector<Tramo> g_serie;
 
 [[nodiscard]] inline double P99(std::vector<float> v) {
 	if (v.empty()) return 0.0;
@@ -113,6 +117,23 @@ inline void Resumen(const char* cuando) {
 	            static_cast<unsigned long long>(j.frames), fps(j), fj, bj, comp(j), pj, fn - fj, fj > 0 ? (fn - fj) * 100.0 / fj : 0.0,
 	            fps(n) - fps(j), fps(j) > 0 ? (fps(n) - fps(j)) * 100.0 / fps(j) : 0.0, bn - bj, bj > 0 ? (bn - bj) * 100.0 / bj : 0.0,
 	            pn - pj, pj > 0 ? (pn - pj) * 100.0 / pj : 0.0);
+	// Interpolado entre vecinos: tramo i con i-1 e i+1 del otro modo. nativo - juego (%), media de todos los tramos validos.
+	double   sf = 0, sb = 0;
+	uint32_t k  = 0;
+	for (size_t i = 1; i + 1 < g_serie.size(); ++i) {
+		const Tramo &a = g_serie[i - 1], &c = g_serie[i], &b = g_serie[i + 1];
+		if (a.modo == c.modo || b.modo == c.modo) continue;
+		const double vf = (a.fps + b.fps) * 0.5, vb = (a.busy + b.busy) * 0.5;
+		if (vf <= 0 || vb <= 0 || c.fps <= 0 || c.busy <= 0) continue;
+		const double df = (c.fps - vf) * 100.0 / vf, db = (c.busy - vb) * 100.0 / vb;
+		sf += c.modo == 0 ? df : -df;
+		sb += c.modo == 0 ? db : -db;
+		++k;
+	}
+	if (k != 0)
+		std::printf("[sombras-ab] RESUMEN interpolado (%s; cada tramo frente a la media de sus 2 vecinos del otro modo, %u tramos): "
+		            "nativo - juego: fps %+.1f%%, render ocupado %+.1f%%\n",
+		            cuando, k, sf / k, sb / k);
 	std::fflush(stdout);
 }
 
@@ -171,6 +192,7 @@ inline void OnFlip(int64_t flip_ns, int64_t idle_ns, int64_t compile_ns) {
 		t.frames += cur.frames, t.wall_ms += cur.wall_ms, t.busy_ms += cur.busy_ms, t.compile_ms += cur.compile_ms;
 		t.frame_ms.insert(t.frame_ms.end(), cur.frame_ms.begin(), cur.frame_ms.end());
 		g_tramos[modo]++;
+		g_serie.push_back({modo, n * 1e3 / cur.wall_ms, cur.busy_ms / n});
 		Resumen("parcial");
 	} else {
 		std::fflush(stdout);
