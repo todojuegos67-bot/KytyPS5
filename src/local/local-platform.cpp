@@ -2634,7 +2634,6 @@ void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t fram
 	if (low_mb == 0 || full_mb == 0 || low_mb >= full_mb) return;
 	static uint64_t generation = ~0ull, settled_for = ~0ull;
 	static int64_t  same_for   = 0;
-	static bool     lowered    = false;
 	if (scene_generation != generation) {
 		generation = scene_generation;
 		same_for   = 0;
@@ -2642,63 +2641,87 @@ void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t fram
 		same_for++;
 	}
 	const bool settled = frame_kind == 1 && frame_seconds >= 30 && same_for >= 30;
-	const auto set_min = [](uint64_t mb) {
-		static std::atomic<uint64_t> t_min {0};
-		t_min.store(mb << 20u, std::memory_order_relaxed);
-		RunTrimQuiet([] {
-			const auto minimum = static_cast<SIZE_T>(t_min.load(std::memory_order_relaxed));
-			(void)SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, minimum + (SIZE_T {512} << 20u),
-			                                 QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-		});
-	};
-	if (!settled) {
-		if (frame_kind != 1) settled_for = ~0ull; // (a loading screen on the same map, e.g. a death: lowered again after it)
-		if (lowered && (frame_kind != 1 || same_for == 0)) {
-			lowered = false;
-			g_resident_low.store(false, std::memory_order_release);
-			set_min(full_mb);
-			std::printf("[ram-carga] carga (mapa nuevo o sin vista 3D): minimo en RAM %llu MiB otra vez; working set %llu MiB\n",
-			            static_cast<unsigned long long>(full_mb),
-			            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u));
+	static std::atomic<uint64_t> t_run {0};
+	static std::atomic<uint64_t> t_busy {0}; // (the run of the glide going on; 0: none)
+	// (ram-carga3, logs 20261127-102325 and 20261127-101545) Lowering the hard minimum 8192 -> 5120 in one call let
+	// Windows, short of RAM (0.6-0.8 GB available), take 3.4 GB at once (ws 8.9 -> 5.5 GB in 1 s; the stepped trim then
+	// found nothing: "0 pasos") and the pages faulted back as 252-437 ms frames. Now the minimum glides with the working
+	// set: each step the cap is ws - 64 MiB and the hard minimum 64 MiB under it, so Windows can never take more than a
+	// step (the pages it picks are the ones not accessed lately: its own aging; the hot set stays). Two causes start it:
+	// the load ended (3D and map 30 s; down to n + 512 MiB), or RAM short while in 3D (available < 1 GiB, any time: until
+	// 1.5 GiB available or n + 512 MiB). A load (new map or no 3D) brings the full minimum back and stops it.
+	const auto glide = [](const char* why, bool pressure, uint64_t step_mb, int sleep_ms) {
+		if (t_busy.load(std::memory_order_acquire) != 0) return;
+		g_resident_low.store(true, std::memory_order_release);
+		const uint64_t run = t_run.fetch_add(1, std::memory_order_acq_rel) + 1;
+		t_busy.store(run, std::memory_order_release);
+		std::thread([run, why, pressure, step_mb, sleep_ms] {
+			SetThreadDescription(GetCurrentThread(), L"Kyty.RamCarga");
+			const auto t0 = std::chrono::steady_clock::now();
+			const auto faults = [] {
+				PROCESS_MEMORY_COUNTERS pmc {};
+				pmc.cb = sizeof(pmc);
+				return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)) != 0 ? uint64_t {pmc.PageFaultCount} : 0ull;
+			};
+			const uint64_t before       = ProcessMemory().working_set;
+			const uint64_t avail_before = AvailablePhysicalMemory();
+			const uint64_t goal         = (low_mb + 512) << 20u;
+			const uint64_t step         = step_mb << 20u;
+			int            steps        = 0;
+			uint64_t       last_min     = 0;
+			for (uint64_t ws = before; ws > goal && steps < 200; ++steps) {
+				if (t_run.load(std::memory_order_acquire) != run || !g_resident_low.load(std::memory_order_acquire)) break;
+				if (pressure && AvailablePhysicalMemory() >= (1536ull << 20u)) break;
+				const uint64_t target  = ws > goal + step ? ws - step : goal;
+				const uint64_t minimum = target - step > (low_mb << 20u) ? target - step : (low_mb << 20u);
+				if (!TrimWorkingSetTo(target, minimum)) break;
+				last_min = minimum;
+				std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+				const uint64_t now = ProcessMemory().working_set;
+				ws = now < ws ? now : target; // (the game grows meanwhile: go on from the target)
+			}
+			const uint64_t after       = ProcessMemory().working_set;
+			const uint64_t avail_after = AvailablePhysicalMemory();
+			const double   ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			const uint64_t f0 = faults();
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+			const uint64_t refaults = faults() - f0;
+			std::printf("[ram-carga] %s: minimo en RAM -> %llu MiB; working set %llu -> %llu MiB (%llu MiB recortados) en %d pasos "
+			            "de %llu MiB; disponible %llu -> %llu MiB; %.0f ms; faltas de pagina 1 s despues %llu\n",
+			            why, static_cast<unsigned long long>(last_min >> 20u), static_cast<unsigned long long>(before >> 20u),
+			            static_cast<unsigned long long>(after >> 20u),
+			            static_cast<unsigned long long>(before > after ? (before - after) >> 20u : 0ull), steps,
+			            static_cast<unsigned long long>(step_mb),
+			            static_cast<unsigned long long>(avail_before >> 20u), static_cast<unsigned long long>(avail_after >> 20u),
+			            ms, static_cast<unsigned long long>(refaults));
 			std::fflush(stdout);
+			uint64_t mine = run;
+			t_busy.compare_exchange_strong(mine, 0, std::memory_order_acq_rel);
+		}).detach();
+	};
+	// (ram-carga4, idea del usuario 11-27) While the load screen / fog is up (no 3D view for 1 s or more) a hitch is not
+	// seen: the RAM goes back there, in 256 MiB steps 20 ms apart, down to n + 512 MiB (the 8 GB minimum is no longer put
+	// back on a load). In 3D only the 64 MiB steps when RAM is short.
+	if (!settled) {
+		if (frame_kind != 1) settled_for = ~0ull; // (a loading screen on the same map, e.g. a death: settled again after it)
+		if (frame_kind == 2 && frame_seconds >= 1) {
+			if (ProcessMemory().working_set > ((low_mb + 512 + 256) << 20u)) glide("carga/niebla (sin vista 3D)", false, 256, 20);
+			return;
 		}
+		if (frame_kind == 1 && AvailablePhysicalMemory() < (1024ull << 20u) &&
+		    ProcessMemory().working_set > ((low_mb + 512) << 20u))
+			glide("poca RAM libre en 3D", true, 64, 100);
 		return;
 	}
-	if (lowered || settled_for == generation) return;
+	if (settled_for == generation) {
+		if (AvailablePhysicalMemory() < (1024ull << 20u) && ProcessMemory().working_set > ((low_mb + 512) << 20u))
+			glide("poca RAM libre en 3D", true, 64, 100);
+		return;
+	}
 	settled_for = generation;
-	lowered     = true;
-	g_resident_low.store(true, std::memory_order_release);
-	set_min(low_mb);
-	// (ram-carga2, log 20261127-070611) Trimmed in one call it took 208 ms inside the quiet window: a 224 ms frame each
-	// map. Now in 64 MiB steps (~5 ms of quiet window each) 100 ms apart on a thread of its own; it stops if a load
-	// brings the full minimum back meanwhile.
-	static std::atomic<uint64_t> t_run {0};
-	const uint64_t               run = t_run.fetch_add(1, std::memory_order_acq_rel) + 1;
-	std::thread([run, full_mb] {
-		SetThreadDescription(GetCurrentThread(), L"Kyty.RamCarga");
-		const auto     t0           = std::chrono::steady_clock::now();
-		const uint64_t before       = ProcessMemory().working_set;
-		const uint64_t avail_before = AvailablePhysicalMemory();
-		const uint64_t goal         = (low_mb + 512) << 20u;
-		int            steps        = 0;
-		for (uint64_t ws = before; ws > goal && steps < 200; ++steps) {
-			if (t_run.load(std::memory_order_acquire) != run || !g_resident_low.load(std::memory_order_acquire)) break;
-			const uint64_t target = ws > goal + (64ull << 20u) ? ws - (64ull << 20u) : goal;
-			if (!TrimWorkingSetTo(target, low_mb << 20u)) break;
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			const uint64_t now = ProcessMemory().working_set;
-			ws = now < ws ? now : target; // (the game grows meanwhile: go on from the target)
-		}
-		std::printf("[ram-carga] carga terminada (3D y mapa 30 s): minimo en RAM %llu -> %llu MiB; working set %llu -> %llu MiB "
-		            "en %d pasos de 64 MiB; disponible %llu -> %llu MiB; %.0f ms\n",
-		            static_cast<unsigned long long>(full_mb), static_cast<unsigned long long>(low_mb),
-		            static_cast<unsigned long long>(before >> 20u),
-		            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u), steps,
-		            static_cast<unsigned long long>(avail_before >> 20u),
-		            static_cast<unsigned long long>(AvailablePhysicalMemory() >> 20u),
-		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-		std::fflush(stdout);
-	}).detach();
+	t_run.fetch_add(1, std::memory_order_acq_rel); // (a pressure glide hands over: the settled one goes to the goal)
+	t_busy.store(0, std::memory_order_release);
+	glide("carga terminada (3D y mapa 30 s)", false, 64, 100);
 }
 
 bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
