@@ -1012,6 +1012,62 @@ __attribute__((sysv_abi, noinline)) inline void DemonioTraceRemove(uint64_t a, u
 	std::fflush(stdout);
 }
 
+// (demonio) Ghidra: FUN_000ef430 (llamada desde FUN_000f13a0 al cargar el bloque) recorre las partes de enemigo de cada
+// mapa (lista rdx: +0x10 cuantos, +0x18 punteros; mapa +0x252==1: tabla +0x928 de 0x80 desde +0x2e4, cuantas +0x2b4;
+// si no, +0x190 / +0x188), lee el typedata (+0x70): si charaInit (+0x18) < 1, NpcParam (+0xC) -> aiThinkId
+// (NpcParam +4) -> NpcThinkParam logicId/battleGoalID, y SOLO carga "ai:/out/%06d_logic.lua" / "_battle.lua" de esos
+// ids (FUN_000ef990 / FUN_000efad0). El Vanguard cambiaba de tipo despues (0x359990): el mapa seguia diciendo soldado
+// 200010 (think 200000) y 103001_battle.lua no se cargaba (en m02_00 solo 200000, 201000...): aparecia sin IA, quieto.
+// Aqui, a la entrada de 0xef430, la parte del patio recibe ya el typedata del Vanguard (NpcParam 103001, think 103001:
+// logica 10000, batalla 103001), asi el juego carga su script de combate como el de cualquier enemigo del mapa.
+__attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t, uint64_t list, uint64_t, uint64_t) {
+	if (!GuestPtrOk(list)) return;
+	const int32_t nmaps = *reinterpret_cast<const int32_t*>(list + 0x10);
+	if (nmaps <= 0 || nmaps > 64) return;
+	std::lock_guard<std::mutex> lock(HookMutex());
+	for (int32_t m = 0; m < nmaps; m++) {
+		const uint64_t map = *reinterpret_cast<const uint64_t*>(list + 0x18 + static_cast<uint64_t>(m) * 8);
+		if (!GuestPtrOk(map)) continue;
+		const bool    flat = *reinterpret_cast<const uint8_t*>(map + 0x252) != 0;
+		const int32_t n    = *reinterpret_cast<const int32_t*>(map + (flat ? 0x2b4 : 0x188));
+		if (n <= 0 || n > 100000) continue;
+		for (int32_t i = 0; i < n; i++) {
+			uint64_t part = 0;
+			if (flat) {
+				const uint64_t tab = *reinterpret_cast<const uint64_t*>(map + 0x928);
+				if (!GuestPtrOk(tab)) break;
+				part = tab + static_cast<uint64_t>(*reinterpret_cast<const int32_t*>(map + 0x2e4) + i) * 0x80;
+			} else {
+				const uint64_t lst = *reinterpret_cast<const uint64_t*>(map + 0x190);
+				if (!GuestPtrOk(lst)) break;
+				part = *reinterpret_cast<const uint64_t*>(lst + static_cast<uint64_t>(i) * 8);
+			}
+			if (!GuestPtrOk(part)) continue;
+			const uint64_t td     = *reinterpret_cast<const uint64_t*>(part + 0x70);
+			const uint64_t name_p = *reinterpret_cast<const uint64_t*>(part);
+			if (!GuestPtrOk(td & ~3ull) || !GuestPtrOk(name_p & ~7ull)) continue;
+			const int32_t npc = *reinterpret_cast<const int32_t*>(td + 0xC);
+			std::string   pname;
+			for (const auto& h: HookSwaps()) {
+				if (!h.has_pos || npc != h.orig_npc) continue;
+				if (pname.empty()) pname = GuestStr(reinterpret_cast<const char*>(name_p));
+				if (pname != h.name) continue;
+				float pp[3];
+				std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
+				const float dx = pp[0] - h.pos[0], dy = pp[1] - h.pos[1], dz = pp[2] - h.pos[2];
+				if (dx * dx + dy * dy + dz * dz >= 1.0f) continue;
+				std::memcpy(reinterpret_cast<void*>(td), h.td_head, sizeof(h.td_head));
+				std::memcpy(reinterpret_cast<void*>(td + 0x18), h.td_init, sizeof(h.td_init));
+				std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d antes de elegir los scripts; el juego "
+				            "cargara la IA del Vanguard (logica 10000, batalla 103001)\n",
+				            pname.c_str(), h.orig_npc, h.new_npc);
+				std::fflush(stdout);
+				break;
+			}
+		}
+	}
+}
+
 inline void InstallModelProbe() {
 	static std::once_flag once;
 	std::call_once(once, [] {
@@ -1024,6 +1080,7 @@ inline void InstallModelProbe() {
 		if (b && DemonioOn()) {
 			InstallStub(0x1473fb0, reinterpret_cast<uint64_t>(&DemonioTraceCreate), "[demonio] traza FUN_01473fb0");
 			InstallStub(0x1472490, reinterpret_cast<uint64_t>(&DemonioTraceRemove), "[demonio] traza FUN_01472490");
+			InstallStub(0xef430, reinterpret_cast<uint64_t>(&DemonioPreAi), "[demonio] IA del Vanguard en FUN_000ef430");
 		}
 	});
 }
