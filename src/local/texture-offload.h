@@ -2380,10 +2380,31 @@ inline std::vector<std::pair<uint64_t, uint64_t>> Ram18TakeQueued() {
 		state.cold_drop.push_back(begin);
 		added.emplace_back(begin, size);
 	};
-	for (const auto& [begin, size]: state.cold_queue) take(begin, size, 0);
-	for (const auto& [begin, size, r20]: state.r20_queue) take(begin, size, r20 <= State::R20Kinds ? r20 : 0);
-	state.cold_queue.clear();
-	state.r20_queue.clear();
+	// (picos-r20) At most KYTY_RAM18_TOMA_MB (default 32, ~4 ms) a call: the caller is the render thread (OffloadScan, every 120
+	// frames), which puts a read watcher on each range taken (a drain and a VirtualProtect a 256 KiB block); a RAM20 pass of
+	// 512 MiB was 2048 of them in one frame (log 11-27 01:31: frames of 60-80 ms, cpu= high, queue_run low, right after the
+	// passes). The rest stays queued for the next scans (a new pass replaces the queue).
+	static const uint64_t take_max = [] {
+		const char* value = std::getenv("KYTY_RAM18_TOMA_MB");
+		const uint64_t mb = value != nullptr && value[0] != '\0' ? std::strtoull(value, nullptr, 10) : uint64_t {32};
+		return std::clamp<uint64_t>(mb, 1, 1024) << 20u;
+	}();
+	uint64_t taken_bytes = 0;
+	size_t   cold_used = 0, r20_used = 0;
+	for (; cold_used < state.cold_queue.size() && taken_bytes < take_max; cold_used++) {
+		const auto& [begin, size] = state.cold_queue[cold_used];
+		const size_t before = added.size();
+		take(begin, size, 0);
+		if (added.size() != before) taken_bytes += size;
+	}
+	for (; r20_used < state.r20_queue.size() && taken_bytes < take_max; r20_used++) {
+		const auto& [begin, size, r20] = state.r20_queue[r20_used];
+		const size_t before = added.size();
+		take(begin, size, r20 <= State::R20Kinds ? r20 : 0);
+		if (added.size() != before) taken_bytes += size;
+	}
+	state.cold_queue.erase(state.cold_queue.begin(), state.cold_queue.begin() + static_cast<std::ptrdiff_t>(cold_used));
+	state.r20_queue.erase(state.r20_queue.begin(), state.r20_queue.begin() + static_cast<std::ptrdiff_t>(r20_used));
 	return added;
 }
 

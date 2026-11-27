@@ -289,7 +289,7 @@ void ApplyLowRamDefaults() {
 				            "KYTY_RAM20_WARM_BUF=1); up to %s MiB a pass (KYTY_RAM20_MB); \"[ram20]\" line every %s s "
 				            "(KYTY_RAM20_LINE_S)\n",
 				            ram20_set.empty() ? "" : ", ", ram20_set.c_str(),
-				            Env("KYTY_RAM20_COLD_S") != nullptr ? Env("KYTY_RAM20_COLD_S") : "10",
+				            Env("KYTY_RAM20_COLD_S") != nullptr ? Env("KYTY_RAM20_COLD_S") : "120",
 				            Env("KYTY_RAM20_MB") != nullptr ? Env("KYTY_RAM20_MB") : "256",
 				            Env("KYTY_RAM20_LINE_S") != nullptr ? Env("KYTY_RAM20_LINE_S") : "10");
 				StartRam18();
@@ -1760,7 +1760,7 @@ void Ram20Pass() {
 	using namespace GpuResidency;
 	static const int      cold_s = [] {
         const char* v = Env("KYTY_RAM20_COLD_S");
-        return v == nullptr ? 10 : std::clamp(std::atoi(v), 1, 3600);
+        return v == nullptr ? 120 : std::clamp(std::atoi(v), 1, 3600); // (picos-r20: 120 s, was 10: a block back in use soon after was a touch-back - a disk read in the fault, up to 5 ms - and a page-file read to write it)
 	}();
 	static const bool     warm_on  = Env("KYTY_RAM20_WARM") == nullptr || Env("KYTY_RAM20_WARM")[0] != '0';
 	static const bool     warm_buf = Env("KYTY_RAM20_WARM_BUF") != nullptr && Env("KYTY_RAM20_WARM_BUF")[0] == '1';
@@ -1872,7 +1872,8 @@ void Ram20Pass() {
 	};
 	constexpr uint8_t ImageMask = (1u << Texture) | (1u << Target) | (1u << Storage);
 	const auto        now       = std::chrono::steady_clock::now();
-	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> seen;
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> seen, warm_seen;
+	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> warm_since;
 	std::vector<uint8_t> take(cands.size(), 0);
 	uint64_t             warm = 0, cold_out = 0, ready_cold = 0, ready_warm = 0;
 	for (size_t i = 0; i < cands.size(); i++) {
@@ -1895,11 +1896,20 @@ void Ram20Pass() {
 		warm += in * Granule;
 		const uint8_t allowed = warm_buf ? static_cast<uint8_t>(ImageMask | (1u << GpuBuffer) | (1u << GpuWrittenBuffer)) : ImageMask;
 		if (warm_on && warm_label[c.label] && c.stable && (c.mask & ~allowed) == 0) {
-			take[i] = 1;
-			ready_warm += Block;
+			// (picos-r20) Only after KYTY_RAM20_COLD_S (120 s) of passes in a row that found it so: taken two passes (10 s)
+			// in, the textures the game came back to were read back from the disk in a fault (log 11-27 01:31: +134
+			// touch-backs, 98 MiB of textures, 227 ms, in the first minute of RAM20).
+			const auto found = warm_since.find(c.block);
+			const auto first = found != warm_since.end() ? found->second : now;
+			warm_seen.emplace(c.block, first);
+			if (now - first >= std::chrono::seconds(cold_s)) {
+				take[i] = 1;
+				ready_warm += Block;
+			}
 		}
 	}
 	since.swap(seen);
+	warm_since.swap(warm_seen);
 	// Merged by kind within 1 MiB windows (a range starts at the same place from pass to pass: its serial too), up to the
 	// budget from where the last pass stopped.
 	std::vector<std::tuple<uint64_t, uint64_t, uint8_t>> ranges;

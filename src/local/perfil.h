@@ -324,6 +324,9 @@ inline void Start() {
 	}
 	uint64_t low = 0, high = 0;
 	if (!LocalPlatform::CurrentThreadStack(&low, &high)) low = high = 0;
+	std::printf("[perfil] ON: hilo de render %u muestreado cada %llu us -> %s (cada 30 s y al salir)\n", LocalPlatform::ThreadId(),
+	            static_cast<unsigned long long>(g_period_us), g_path.c_str());
+	std::fflush(stdout);
 	std::atexit(AtExit);
 	std::thread(Run, LocalPlatform::ThreadId(), low, high).detach();
 #endif
