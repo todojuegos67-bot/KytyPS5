@@ -202,6 +202,9 @@ void      RunTrimQuiet(void (*call)());
 // change runs; they go to the standby list / page file and fault back in on use), keeping a hard minimum of min_bytes
 // (0: none). False where refused, min_bytes >= target_bytes, or on other systems.
 bool      TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes);
+// (ram-carga) KYTY_RESIDENT_TRAS_CARGA_MB: KYTY_RESIDENT_MB's hard minimum lowered (and the working set trimmed once) when the
+// 3D view and the map have held 30 s; the full minimum again at a new map or loading screen. Once a second (black box).
+void      ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t frame_seconds);
 // The physical memory the system can still give without paging (free and standby; Linux: MemAvailable). 0: unknown.
 uint64_t AvailablePhysicalMemory();
 // Diagnostics: the process's address space in [begin, end) to stdout, labelled: each allocation of 16 MiB and more (its

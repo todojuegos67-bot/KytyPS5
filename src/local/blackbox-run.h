@@ -392,6 +392,8 @@ inline void WatchLoop(std::string path) {
 		else
 			Append(line, sizeof(line), used, " scene=-");
 		const uint32_t frame_kind = g_scene_frame.load(std::memory_order_relaxed);
+		LocalPlatform::ResidentSettle(SceneTags::Generation(), frame_kind,
+		                              AgeMs(now, g_scene_frame_since.load(std::memory_order_relaxed)) / 1000);
 		Append(line, sizeof(line), used, " fr=%s/%llds", frame_kind == 1 ? "3d" : frame_kind == 2 ? "no3d" : "-",
 		       static_cast<long long>(AgeMs(now, g_scene_frame_since.load(std::memory_order_relaxed)) / 1000));
 		char file[FileWords * 8 + 1] {};

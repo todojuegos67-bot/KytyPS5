@@ -2585,6 +2585,7 @@ void StartMemoryBreakdown() {
 }
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
+static std::atomic<uint64_t>              g_resident_kept_mb {0}; // KYTY_RESIDENT_MB's hard minimum as Windows took it
 
 void KeepResident() {
 	static std::once_flag once;
@@ -2604,6 +2605,7 @@ void KeepResident() {
 			                                QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
 			if (ok) break;
 		}
+		if (ok) g_resident_kept_mb.store(kept, std::memory_order_relaxed);
 		std::printf("Memory: %llu MiB kept in RAM (KYTY_RESIDENT_MB=%llu)%s\n", ok ? kept : 0ull, static_cast<unsigned long long>(mb),
 		            ok ? "" : ": refused by Windows");
 		std::fflush(stdout);
@@ -2612,6 +2614,73 @@ void KeepResident() {
 static SIZE_T g_ws_min = 0, g_ws_max = 0; // the working set sizes the process started with
 static std::atomic<uint64_t> g_cap_max {0}, g_cap_min {0};
 static std::atomic<bool>     g_cap_ok {false};
+bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes);
+
+// (ram-carga, 11-27) KYTY_RESIDENT_TRAS_CARGA_MB=<n>: KYTY_RESIDENT_MB's hard minimum (8192 on 16 GB PCs) holds the working
+// set at ~8.2 GB for as long as the game runs (log 20261127-064914: ws 8191-8412 MiB for 290 s, 0.5-0.8 GB available;
+// at 292 s it fell to 4.8 GB in 2 s with frames as before, 25-34 ms longest a second, and rose only to 5.4 GB in 20 s:
+// the game's hot set is ~5 GB). Called once a second by the black box: while loading (no 3D view, or a new map, for
+// less than 30 s) the full minimum; once the 3D view and the map have held 30 s, the minimum lowered to n MiB and the
+// working set trimmed once to n + 512 MiB inside the guest memory's quiet window (cold pages to the standby list: no
+// data lost, they fault back from RAM while the standby list keeps them). A new map or a loading screen: the full
+// minimum again. 0 or unset: off.
+void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t frame_seconds) {
+	static const uint64_t low_mb = [] {
+		const char* text = std::getenv("KYTY_RESIDENT_TRAS_CARGA_MB");
+		return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+	}();
+	const uint64_t full_mb = g_resident_kept_mb.load(std::memory_order_relaxed);
+	if (low_mb == 0 || full_mb == 0 || low_mb >= full_mb) return;
+	static uint64_t generation = ~0ull, settled_for = ~0ull;
+	static int64_t  same_for   = 0;
+	static bool     lowered    = false;
+	if (scene_generation != generation) {
+		generation = scene_generation;
+		same_for   = 0;
+	} else {
+		same_for++;
+	}
+	const bool settled = frame_kind == 1 && frame_seconds >= 30 && same_for >= 30;
+	const auto set_min = [](uint64_t mb) {
+		static std::atomic<uint64_t> t_min {0};
+		t_min.store(mb << 20u, std::memory_order_relaxed);
+		RunTrimQuiet([] {
+			const auto minimum = static_cast<SIZE_T>(t_min.load(std::memory_order_relaxed));
+			(void)SetProcessWorkingSetSizeEx(GetCurrentProcess(), minimum, minimum + (SIZE_T {512} << 20u),
+			                                 QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+		});
+	};
+	if (!settled) {
+		if (frame_kind != 1) settled_for = ~0ull; // (a loading screen on the same map, e.g. a death: lowered again after it)
+		if (lowered && (frame_kind != 1 || same_for == 0)) {
+			lowered = false;
+			set_min(full_mb);
+			std::printf("[ram-carga] carga (mapa nuevo o sin vista 3D): minimo en RAM %llu MiB otra vez; working set %llu MiB\n",
+			            static_cast<unsigned long long>(full_mb),
+			            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u));
+			std::fflush(stdout);
+		}
+		return;
+	}
+	if (lowered || settled_for == generation) return;
+	settled_for                  = generation;
+	lowered                      = true;
+	const auto     t0            = std::chrono::steady_clock::now();
+	const uint64_t before        = ProcessMemory().working_set;
+	const uint64_t avail_before  = AvailablePhysicalMemory();
+	set_min(low_mb);
+	const bool     trimmed       = before > ((low_mb + 512) << 20u) && TrimWorkingSetTo((low_mb + 512) << 20u, low_mb << 20u);
+	const uint64_t after         = ProcessMemory().working_set;
+	std::printf("[ram-carga] carga terminada (3D y mapa 30 s): minimo en RAM %llu -> %llu MiB; working set %llu -> %llu MiB "
+	            "(%s); disponible %llu -> %llu MiB; %.1f ms\n",
+	            static_cast<unsigned long long>(full_mb), static_cast<unsigned long long>(low_mb),
+	            static_cast<unsigned long long>(before >> 20u), static_cast<unsigned long long>(after >> 20u),
+	            trimmed ? "recortado una vez" : "sin recorte", static_cast<unsigned long long>(avail_before >> 20u),
+	            static_cast<unsigned long long>(AvailablePhysicalMemory() >> 20u),
+	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+	std::fflush(stdout);
+}
+
 bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
 	if (target_bytes == 0 || min_bytes >= target_bytes) return false;
 	g_cap_max.store(target_bytes, std::memory_order_relaxed);
@@ -3261,6 +3330,7 @@ MemoryUse ProcessMemory() {
 void StartWorkingSetTrim() {}
 void KeepResident() {}
 bool TrimWorkingSetTo(uint64_t, uint64_t) { return false; }
+void ResidentSettle(uint64_t, uint32_t, int64_t) {}
 void StartMemoryBreakdown() {}
 void SetSimulationBallast(uint64_t) {}
 uint64_t SimulationBallast() { return 0; }
