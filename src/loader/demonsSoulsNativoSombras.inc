@@ -905,6 +905,14 @@ uint32_t NativoSombrasNatSummary(AgcCommandBuffer* commands, const uint32_t* beg
 			}
 			case 0x26: if (len > 4) return *why = "salto: INDEX_BASE raro", 0u; last_pkt[0] = p; break;
 			case 0x2a: if (len > 4) return *why = "salto: INDEX_TYPE raro", 0u; last_pkt[1] = p; break;
+			// (11-27, log 20261127-053203-329: "paquete no admitido 0x7A" = 67023 cubos sin salto: casi todos.) 0x7A =
+			// SET_UCONFIG_REG_INDEX que escribe Agc (AgcDcbSetIndexSize, agc.cpp): solo VGT_INDEX_TYPE (0x243 con los bits de
+			// indice 0x20000000). Es el tipo de indice: el ultimo de los dos (0x2A o este) gana, asi que comparte su hueco y
+			// se repite tal cual.
+			case 0x7a:
+				if (len != 3 || (p[1] & 0x0fffffffu) != 0x243u) return *why = "salto: SET_UCONFIG_REG_INDEX no VGT_INDEX_TYPE", 0u;
+				last_pkt[1] = p;
+				break;
 			case 0x2f: if (len > 4) return *why = "salto: NUM_INSTANCES raro", 0u; last_pkt[2] = p; break;
 			case 0x13: if (len > 4) return *why = "salto: INDEX_BUFFER_SIZE raro", 0u; last_pkt[3] = p; break;
 			case 0x63: case 0x64: case 0x9f: {
