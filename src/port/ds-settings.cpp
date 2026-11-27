@@ -369,8 +369,17 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("ahorro_memoria_v3", s->ram16_boost); // (port28) new key: the old one was on by default
 	s->ram16_boost = false; // (11-13) options removed: Ahorro de memoria RAM and Modo seguro
 	s->safe_gpu    = false;
-	boo("rend_ayuda_subidas", s->perf_upload_help);
-	boo("rend_espera_hilos", s->perf_spin_gate);
+	{
+		// (cpu-pocos-hilos) CPUs de 12 hilos o menos (i5/i3, portatiles): por defecto el render ayuda con las subidas
+		// y los hilos de ayuda no giran en vacio. Claves nuevas (_v2): las viejas se guardaban a 0 para todos; quien
+		// lo cambie en el lanzador conserva su eleccion.
+		const unsigned hw = std::thread::hardware_concurrency();
+		const bool     pocos = hw != 0 && hw <= 12;
+		s->perf_upload_help = pocos;
+		s->perf_spin_gate   = pocos;
+	}
+	boo("rend_ayuda_subidas_v2", s->perf_upload_help);
+	boo("rend_espera_hilos_v2", s->perf_spin_gate);
 	// (11-22) rend_registros_pm4, rend_subidas_dos_hilos_v2, rend_feedback_anticipado and rend_feedback_agrupado: always on
 	// in code (no boxes); an old value in settings.ini is not read.
 	s->perf_pm4_regfile = s->perf_upload_lanes = s->perf_eager_feedback = s->perf_feedback_batch = true;
@@ -617,9 +626,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "; Opciones de rendimiento (0 = como siempre; 1 = la mejora experimental de KytyPS5 upstream)\n"
 	  << "; Siempre activas (sin opción): registros PM4 directos, subidas en dos hilos, copias de la GPU anticipadas y agrupadas\n"
 	  << "; El hilo de render ayuda con las subidas si la CPU va cargada (KYTY_UPLOAD_HELP=2)\n"
-	  << "rend_ayuda_subidas=" << b(s.perf_upload_help) << "\n"
+	  << "rend_ayuda_subidas_v2=" << b(s.perf_upload_help) << "\n"
 	  << "; Los hilos de ayuda dejan de esperar activos si la CPU va cargada (KYTY_SPIN_GATE=1)\n"
-	  << "rend_espera_hilos=" << b(s.perf_spin_gate) << "\n"
+	  << "rend_espera_hilos_v2=" << b(s.perf_spin_gate) << "\n"
 	  << "; Shaders lane-local ampliados (KYTY_LANE_LOCAL_WIDE; recompila parte de los shaders)\n"
 	  << "rend_shaders_lane_local=" << b(s.perf_lane_wide) << "\n\n"
 	  << "[Interfaz]\n"
