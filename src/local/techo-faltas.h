@@ -222,6 +222,20 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	std::printf(" | lectura de vuelta en el hilo del juego (%.0f/fot): espera a la GPU %.2f ms, copia %.2f ms, put-in de guardados %.2f ms",
 	            static_cast<double>(rn - lrn) / frames, ms(rw - lrw), ms(rc - lrc), ms(rr - lrr));
 	lrw = rw, lrc = rc, lrr = rr, lrn = rn;
+	static uint64_t lps = 0;
+	const uint64_t  ps = FaltasReciclado::g_putin_skipped.load();
+	std::printf(" (paginas de la ventana dejadas al hilo de liberaciones %.0f/fot)", static_cast<double>(ps - lps) / frames);
+	lps = ps;
+	if (FaltasReciclado::PutinMode() == 2) {
+		static double sum[2] {}, cnt[2] {};
+		const bool    was = FaltasReciclado::g_putin_now.load(std::memory_order_relaxed);
+		sum[was ? 1 : 0] += hilo_ms[0] + hilo_ms[1];
+		cnt[was ? 1 : 0] += 1;
+		const double a = cnt[0] > 0 ? sum[0] / cnt[0] : 0, b = cnt[1] > 0 ? sum[1] / cnt[1] : 0;
+		std::printf(" | A/B KYTY_PUTIN_SOLO_PAGINA: esta ventana %s; media faltas A %.2f ms (%.0f v) B %.2f ms (%.0f v) -> %+.2f ms/fot",
+		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
+		FaltasReciclado::g_putin_now.store(!was, std::memory_order_relaxed);
+	}
 	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
 	            ms(st - lst), ms(sr - lsr));
 	lst = st, lsr = sr, lsn = sn;

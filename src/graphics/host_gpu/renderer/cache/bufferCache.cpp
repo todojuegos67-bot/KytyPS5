@@ -3414,7 +3414,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// (raiz8, KYTY_RAIZ_ASYNC_RELEASE: the read releases the GPU thread left of this readback's pages applied
 			// here, by the thread that waited for them - the GPU thread goes on meanwhile -.)
 			const uint64_t r0 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)
-			for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
+			// (sync4, KYTY_PUTIN_SOLO_PAGINA) A write fault's readback: only its own range below; the window's other pages
+			// are left to the release thread or their own fault (local/faltas-reciclado.h).
+			if (FaltasReciclado::PutinSoloPagina()) FaltasReciclado::g_putin_skipped.fetch_add(request->pages.size(), std::memory_order_relaxed);
+			else
+				for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
 			if (r0 != 0) FaltasReciclado::g_rb_release.fetch_add(__rdtsc() - r0, std::memory_order_relaxed);
 		}
 		const uint64_t r1 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)
