@@ -180,29 +180,34 @@ struct Entry {
 // = the archdemon defeated, as Tut2Van for the Vanguard) and its trophy, in the game's order (1-1 .. 5-3, then the Old One).
 struct RandoBoss {
 	const char* activity;
+	uint32_t    flag; // (rando-trofeos) the boss-defeated event flag (Ghidra: the game's activity table, see below)
 	const char* name_es;
 	const char* detail_es;
 	const char* name_en;
 	const char* detail_en;
 };
+// (rando-trofeos) flag: the game's own activity table (eboot 01.007.000, built at 0x6561a0: records of 0x68 bytes at
+// 0x282b5a0.., activity name at +0, its length at +8, the event flag at +0x38), read with Ghidra. The lua of 1-x and 4-x
+// (m02/m03.luabnd: OnCharacterDead(4096, 800, ...), (4224, 801), (4360, 802), (4480, 821), (4756, 804), (4895, 805),
+// (4992, 822)) gives the same numbers. FUN_002a7550 reads them: bit (flag & 7) of byte flag >> 3, flag < 0x4680.
 const RandoBoss kRandoBosses[] = {
-	{"Phlx", "Muro de escudos roto", "Randomizer: derrota a la Falange.", "Shieldwall Broken", "Randomizer: defeat the Phalanx."},
-	{"ToKn", "La torre se inclina", "Randomizer: derrota al Caballero de la Torre.", "The Tower Kneels", "Randomizer: defeat the Tower Knight."},
-	{"Pent", "Acero contra acero", "Randomizer: derrota al Penetrador.", "Steel Against Steel", "Randomizer: defeat the Penetrator."},
-	{"FalK", "Corona de ceniza", "Randomizer: derrota al Falso Rey.", "Crown of Ash", "Randomizer: defeat the False King."},
-	{"ArmS", "Telar de fuego", "Randomizer: derrota a la Arañ" "a Acorazada.", "Loom of Fire", "Randomizer: defeat the Armor Spider."},
-	{"FlmL", "Brasa apagada", "Randomizer: derrota al Acechador de Fuego.", "Ember Quenched", "Randomizer: defeat the Flamelurker."},
-	{"DrgG", "El dios caí" "do", "Randomizer: derrota al Dios Dragón.", "The Fallen God", "Randomizer: defeat the Dragon God."},
-	{"Fool", "Reflejo quebrado", "Randomizer: derrota al Í" "dolo Necio.", "Broken Reflection", "Randomizer: defeat the Fool's Idol."},
-	{"ManE", "Alas en la niebla", "Randomizer: derrota al Devorahombres.", "Wings in the Mist", "Randomizer: defeat the Maneater."},
-	{"OldM", "Voz sin rostro", "Randomizer: derrota al Viejo Monje.", "Faceless Voice", "Randomizer: defeat the Old Monk."},
-	{"Adju", "Veredicto final", "Randomizer: derrota al Juez.", "Final Verdict", "Randomizer: defeat the Adjudicator."},
-	{"OldH", "Ojos cerrados", "Randomizer: derrota al Viejo Héroe.", "Eyes Shut", "Randomizer: defeat the Old Hero."},
-	{"StrK", "Fin de la tormenta", "Randomizer: derrota al Rey de las Tormentas.", "Storm's End", "Randomizer: defeat the Storm King."},
-	{"Lmon", "Sangre sin dueño", "Randomizer: derrota al Monstruo Sanguijuela.", "Ownerless Blood", "Randomizer: defeat the Leechmonger."},
-	{"DCol", "Enjambre disperso", "Randomizer: derrota al Coloso Sucio.", "Swarm Scattered", "Randomizer: defeat the Dirty Colossus."},
-	{"MAst", "Luto en el valle", "Randomizer: derrota a la Doncella Astraea.", "Mourning in the Valley", "Randomizer: defeat Maiden Astraea."},
-	{"Allant", "El rey verdadero", "Randomizer: derrota al Rey Allant.", "The True King", "Randomizer: defeat King Allant."},
+	{"Phlx", 4096, "Muro de escudos roto", "Randomizer: derrota a la Falange.", "Shieldwall Broken", "Randomizer: defeat the Phalanx."},
+	{"ToKn", 4224, "La torre se inclina", "Randomizer: derrota al Caballero de la Torre.", "The Tower Kneels", "Randomizer: defeat the Tower Knight."},
+	{"Pent", 4360, "Acero contra acero", "Randomizer: derrota al Penetrador.", "Steel Against Steel", "Randomizer: defeat the Penetrator."},
+	{"FalK", 4480, "Corona de ceniza", "Randomizer: derrota al Falso Rey.", "Crown of Ash", "Randomizer: defeat the False King."},
+	{"ArmS", 6174, "Telar de fuego", "Randomizer: derrota a la Arañ" "a Acorazada.", "Loom of Fire", "Randomizer: defeat the Armor Spider."},
+	{"FlmL", 6272, "Brasa apagada", "Randomizer: derrota al Acechador de Fuego.", "Ember Quenched", "Randomizer: defeat the Flamelurker."},
+	{"DrgG", 6400, "El dios caí" "do", "Randomizer: derrota al Dios Dragón.", "The Fallen God", "Randomizer: defeat the Dragon God."},
+	{"Fool", 5123, "Reflejo quebrado", "Randomizer: derrota al Í" "dolo Necio.", "Broken Reflection", "Randomizer: defeat the Fool's Idol."},
+	{"ManE", 5251, "Alas en la niebla", "Randomizer: derrota al Devorahombres.", "Wings in the Mist", "Randomizer: defeat the Maneater."},
+	{"OldM", 5380, "Voz sin rostro", "Randomizer: derrota al Viejo Monje.", "Faceless Voice", "Randomizer: defeat the Old Monk."},
+	{"Adju", 4756, "Veredicto final", "Randomizer: derrota al Juez.", "Final Verdict", "Randomizer: defeat the Adjudicator."},
+	{"OldH", 4895, "Ojos cerrados", "Randomizer: derrota al Viejo Héroe.", "Eyes Shut", "Randomizer: defeat the Old Hero."},
+	{"StrK", 4992, "Fin de la tormenta", "Randomizer: derrota al Rey de las Tormentas.", "Storm's End", "Randomizer: defeat the Storm King."},
+	{"Lmon", 5650, "Sangre sin dueño", "Randomizer: derrota al Monstruo Sanguijuela.", "Ownerless Blood", "Randomizer: defeat the Leechmonger."},
+	{"DCol", 5770, "Enjambre disperso", "Randomizer: derrota al Coloso Sucio.", "Swarm Scattered", "Randomizer: defeat the Dirty Colossus."},
+	{"MAst", 5889, "Luto en el valle", "Randomizer: derrota a la Doncella Astraea.", "Mourning in the Valley", "Randomizer: defeat Maiden Astraea."},
+	{"Allant", 16952, "El rey verdadero", "Randomizer: derrota al Rey Allant.", "The True King", "Randomizer: defeat King Allant."},
 };
 constexpr int kRandoBossCount = static_cast<int>(sizeof(kRandoBosses) / sizeof(kRandoBosses[0]));
 static_assert(kRandoFirst + kRandoBossCount == kRandoAll, "one trophy per boss, then the last one");
@@ -575,24 +580,38 @@ void LoadIcon(const std::map<std::string, Bytes>& files, int id, Entry& e) {
 	}
 }
 
+// (rando-trofeos) The randomizer's unlocks (200 .. 217) live in their own file, next to trophies.json and never in it:
+// the game's trophies and saves are not touched by the randomizer.
+std::filesystem::path RandoStore(const State& s) { return s.store.parent_path() / kRandoStoreName; }
+
+void WriteJson(const std::filesystem::path& file, const nlohmann::json& j);
+
 void SaveStore(State& s) {
-	nlohmann::json j;
+	nlohmann::json j, r;
 	j["title_id"] = s.title_id;
+	r["title_id"] = s.title_id;
 	auto& u       = j["unlocked"];
 	u             = nlohmann::json::object();
-	for (const auto& [id, t]: s.unlocked) u[std::to_string(id)] = t;
+	auto& ru      = r["unlocked"];
+	ru            = nlohmann::json::object();
+	for (const auto& [id, t]: s.unlocked) (IsRando(id) ? ru : u)[std::to_string(id)] = t;
+	WriteJson(s.store, j);
+	if (!ru.empty() || std::filesystem::exists(RandoStore(s))) WriteJson(RandoStore(s), r);
+}
+
+void WriteJson(const std::filesystem::path& file, const nlohmann::json& j) {
 	std::error_code ec;
-	std::filesystem::create_directories(s.store.parent_path(), ec);
-	const auto tmp = s.store.string() + ".tmp";
+	std::filesystem::create_directories(file.parent_path(), ec);
+	const auto tmp = file.string() + ".tmp";
 	{
 		std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
 		if (!f) return;
 		f << j.dump(1, '\t');
 	}
-	std::filesystem::rename(tmp, s.store, ec);
+	std::filesystem::rename(tmp, file, ec);
 	if (ec) {
-		std::filesystem::remove(s.store, ec);
-		std::filesystem::rename(tmp, s.store, ec);
+		std::filesystem::remove(file, ec);
+		std::filesystem::rename(tmp, file, ec);
 	}
 }
 
@@ -655,14 +674,17 @@ void Load(State& s) {
 	s.words             = LabelFor(Primary(lang));
 	if (!Loader::SystemContentParamSfoGetString("TITLE", &s.title)) s.title.clear();
 
-	// The unlocks so far.
-	if (std::ifstream f(s.store, std::ios::binary); f) {
-		const auto j = nlohmann::json::parse(f, nullptr, false);
-		if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object()) {
-			for (const auto& [k, v]: j["unlocked"].items()) {
-				char* end = nullptr;
-				const long id = std::strtol(k.c_str(), &end, 10);
-				if (end != k.c_str()) s.unlocked[static_cast<int>(id)] = v.is_number() ? v.get<int64_t>() : 0;
+	// The unlocks so far: the game's (trophies.json) and the randomizer's (rando-trofeos: their own file; any randomizer
+	// id an older build left in trophies.json is kept and moves to the randomizer file at the next save).
+	for (const auto& file: {s.store, RandoStore(s)}) {
+		if (std::ifstream f(file, std::ios::binary); f) {
+			const auto j = nlohmann::json::parse(f, nullptr, false);
+			if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object()) {
+				for (const auto& [k, v]: j["unlocked"].items()) {
+					char* end = nullptr;
+					const long id = std::strtol(k.c_str(), &end, 10);
+					if (end != k.c_str()) s.unlocked[static_cast<int>(id)] = v.is_number() ? v.get<int64_t>() : 0;
+				}
 			}
 		}
 	}
@@ -1276,6 +1298,12 @@ int RandoTrophyForActivity(const std::string& activity) {
 	for (int i = 0; i < kRandoBossCount; i++)
 		if (activity == kRandoBosses[i].activity) return kRandoFirst + i;
 	return -1;
+}
+
+uint32_t RandoFlagForActivity(const std::string& activity) {
+	for (int i = 0; i < kRandoBossCount; i++)
+		if (activity == kRandoBosses[i].activity) return kRandoBosses[i].flag;
+	return 0;
 }
 
 bool RandoAllBosses() {

@@ -22,6 +22,10 @@ constexpr int kRandoAll   = 217;
 inline bool   IsRando(int id) { return id >= kRandoFirst && id <= kRandoAll; }
 // The randomizer trophy of a boss fight (the game's UDS activity id: "Phlx", "ToKn"...), -1 for any other activity.
 int RandoTrophyForActivity(const std::string& activity);
+// (rando-trofeos) That boss's "defeated" event flag (FUN_002a7550's numbering), 0 for any other activity.
+uint32_t RandoFlagForActivity(const std::string& activity);
+// (rando-trofeos) The randomizer's unlocks: _SaveData/<title>/<this>, never trophies.json.
+constexpr const char* kRandoStoreName = "trophies-randomizer.json";
 // Every boss trophy (200 .. 216) unlocked: the last one (217) is due.
 bool RandoAllBosses();
 // The randomizer medal (original art drawn in code), RGBA8 bytes, size x size.

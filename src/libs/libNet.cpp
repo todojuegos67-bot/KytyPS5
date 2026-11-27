@@ -9,6 +9,7 @@
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "libs/trophy.h"
+#include "local/rando-trofeos.h"
 #include "libs/addcont.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -3020,6 +3021,77 @@ static std::string UdsDump(const NpUniversalDataSystemEventPropertyObject& o) {
 	return r + "}";
 }
 
+#if defined(_WIN32) && (defined(__clang__) || defined(__GNUC__))
+extern "C" __declspec(dllimport) int __stdcall IsBadReadPtr(const void*, unsigned long long);
+#define KYTY_RANDO_TROFEOS_READ 1
+#else
+#define KYTY_RANDO_TROFEOS_READ 0
+#endif
+
+// (rando-trofeos) The randomizer is on (the launcher's KYTY_DS_RANDOMIZER=1): nothing below runs otherwise.
+static bool RandoOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_DS_RANDOMIZER");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+// (rando-trofeos) The game's event flag, as FUN_002a7550 reads it (rando-trofeos.h); -1 when not readable.
+static int RandoReadFlag(uint32_t flag, uint64_t* ptr) {
+	*ptr = 0;
+#if KYTY_RANDO_TROFEOS_READ
+	const auto* pp = reinterpret_cast<const uint64_t*>(RandoTrofeos::kFlagsPtr);
+	if (IsBadReadPtr(pp, sizeof(uint64_t)) != 0) return -1;
+	const uint64_t bits = *pp;
+	if (bits == 0 || IsBadReadPtr(reinterpret_cast<const void*>(bits), RandoTrofeos::kFlagLimit / 8) != 0) return -1;
+	*ptr = bits;
+	return RandoTrofeos::FlagBit(reinterpret_cast<const uint8_t*>(bits), flag);
+#else
+	(void)flag;
+	return -1;
+#endif
+}
+
+static void RandoAward(const std::string& activity, const char* how) {
+	const int id = Libs::Trophy::RandoTrophyForActivity(activity);
+	if (id < 0) return;
+	int  plat = -1;
+	bool ok   = Libs::Trophy::Unlock(id, &plat);
+	std::printf("UDS: randomizer boss %s defeated (%s) -> trophy %d %s\n", activity.c_str(), how, id, ok ? "new" : "already");
+	if (Libs::Trophy::RandoAllBosses() && Libs::Trophy::Unlock(Libs::Trophy::kRandoAll, &plat))
+		std::printf("UDS: randomizer: every archdemon -> trophy %d\n", Libs::Trophy::kRandoAll);
+}
+
+// (rando-trofeos) A boss fight starts: armed while its flag is 0; a thread looks at the flag twice a second.
+static void RandoArm(const std::string& activity) {
+	static std::mutex            m;
+	static RandoTrofeos::Watch   watch;
+	static bool                  running = false;
+	const uint32_t               flag    = Libs::Trophy::RandoFlagForActivity(activity);
+	if (flag == 0) return;
+	std::lock_guard lock(m);
+	const bool      armed = watch.Arm(activity, flag, RandoReadFlag);
+	std::printf("UDS: randomizer boss %s fight (flag %u) -> %s\n", activity.c_str(), flag, armed ? "armed" : "not armed (already dead or no flags)");
+	if (!armed || running) return;
+	running = true;
+	std::thread([] {
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(500));
+			std::vector<std::string> dead;
+			{
+				std::lock_guard lock(m);
+				dead = watch.Poll(RandoReadFlag);
+				if (dead.empty() && watch.Empty()) {
+					running = false;
+					return;
+				}
+			}
+			for (const auto& a: dead) RandoAward(a, "flag");
+		}
+	}).detach();
+}
+
 static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 	auto        name = UdsLower(e.name);
 	std::string dump = UdsDump(e.props);
@@ -3040,23 +3112,15 @@ static void UdsHandleEvent(const NpUniversalDataSystemEvent& e) {
 	}
 	// (rando1) "Trofeos Randomizer": an archdemon's fight completed (DsActivityEnd outcome "completed" of a boss activity)
 	// while the launcher's randomizer is on (KYTY_DS_RANDOMIZER=1); the last one when all are held.
-	if (e.name == "DsActivityEnd") {
-		static const bool rando = [] {
-			const char* v = std::getenv("KYTY_DS_RANDOMIZER");
-			return v != nullptr && v[0] == '1';
-		}();
+	if (e.name == "DsActivityEnd" && RandoOn()) {
 		const auto a = e.props.strings.find("activityId");
 		const auto o = e.props.strings.find("outcome");
-		if (rando && a != e.props.strings.end() && o != e.props.strings.end() && o->second == "completed") {
-			const int id = Libs::Trophy::RandoTrophyForActivity(a->second);
-			if (id >= 0) {
-				int  plat = -1;
-				bool ok   = Libs::Trophy::Unlock(id, &plat);
-				std::printf("UDS: randomizer boss %s defeated -> trophy %d %s\n", a->second.c_str(), id, ok ? "new" : "already");
-				if (Libs::Trophy::RandoAllBosses() && Libs::Trophy::Unlock(Libs::Trophy::kRandoAll, &plat))
-					std::printf("UDS: randomizer: every archdemon -> trophy %d\n", Libs::Trophy::kRandoAll);
-			}
-		}
+		if (a != e.props.strings.end() && o != e.props.strings.end() && o->second == "completed") RandoAward(a->second, "completed");
+	}
+	// (rando-trofeos) The fight of a boss begins: watch its "defeated" flag (the trophy pops when it goes to 1).
+	if (e.name == "DsActivityStart" && RandoOn()) {
+		const auto a = e.props.strings.find("activityId");
+		if (a != e.props.strings.end()) RandoArm(a->second);
 	}
 	if (e.name == "DsActivityStart") {
 		const auto a = e.props.strings.find("activityId");

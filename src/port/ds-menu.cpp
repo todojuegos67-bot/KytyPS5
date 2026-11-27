@@ -2964,10 +2964,12 @@ std::vector<TrophyRow> LoadTrophyRows() {
 	}
 	if (list.empty()) return rows;
 	std::set<int> got;
-	if (std::ifstream f(list.parent_path() / "trophies.json", std::ios::binary); f) {
-		const auto j = nlohmann::json::parse(f, nullptr, false);
-		if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
-			for (const auto& [k, v]: j["unlocked"].items()) got.insert(std::atoi(k.c_str()));
+	for (const char* name: {"trophies.json", Libs::Trophy::kRandoStoreName}) { // (rando-trofeos) + the randomizer's file
+		if (std::ifstream f(list.parent_path() / name, std::ios::binary); f) {
+			const auto j = nlohmann::json::parse(f, nullptr, false);
+			if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
+				for (const auto& [k, v]: j["unlocked"].items()) got.insert(std::atoi(k.c_str()));
+		}
 	}
 	if (std::ifstream f(list, std::ios::binary); f) {
 		const auto j = nlohmann::json::parse(f, nullptr, false);
