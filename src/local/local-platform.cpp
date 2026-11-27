@@ -828,11 +828,18 @@ UncachedFiles& Uncached() {
 
 uint32_t UncachedReadMinBytes() {
 	static const uint32_t min = [] {
-		const char* on = std::getenv("KYTY_LECTURA_SIN_CACHE");
-		const bool  r  = on != nullptr && on[0] == '1';
-		uint32_t    kb = 1024;
-		if (const char* v = std::getenv("KYTY_LECTURA_SIN_CACHE_KB"); v != nullptr && v[0] != '\0')
+		const char* on   = std::getenv("KYTY_LECTURA_SIN_CACHE");
+		const char* cero = std::getenv("KYTY_CACHE_CERO"); // (cache-cero: every read of KYTY_CACHE_CERO_KB, default 16)
+		const bool  r    = (on != nullptr && on[0] == '1') || (cero != nullptr && cero[0] == '1');
+		uint32_t    kb   = 1024;
+		if (cero != nullptr && cero[0] == '1') {
+			const char* v = std::getenv("KYTY_CACHE_CERO_KB");
+			kb = static_cast<uint32_t>(std::clamp<long>(v != nullptr && v[0] != '\0' ? std::strtol(v, nullptr, 10) : 16, 4, 1L << 16));
+			std::printf("[cache-cero] ON: lecturas >= %u KiB del juego, del nucleo y de los almacenes de pipelines sin cache de "
+			            "Windows; sin lectura adelantada de ficheros enteros\n", kb);
+		} else if (const char* v = std::getenv("KYTY_LECTURA_SIN_CACHE_KB"); v != nullptr && v[0] != '\0') {
 			kb = static_cast<uint32_t>(std::clamp<long>(std::strtol(v, nullptr, 10), 64, 1L << 20));
+		}
 		std::printf("[lectura-sin-cache] lecturas grandes del juego (>= %u KiB) sin cache de archivos de Windows: %s "
 		            "(KYTY_LECTURA_SIN_CACHE=1 lo enciende)\n",
 		            kb, r ? "ON" : "apagado");
@@ -941,6 +948,9 @@ void FollowKeptFiles(const std::string& recording, const std::string& root) {
 }
 
 void PrefetchKeptFile(const std::string& path) {
+	// (cache-cero) Reading whole files ahead fills the Windows file cache on purpose: off with KYTY_CACHE_CERO=1.
+	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v != nullptr && v[0] == '1'; }();
+	if (cero) return;
 	{
 		const std::lock_guard lock(g_kept_files_mutex);
 		const auto            found = g_kept_files.find(path);
@@ -1301,8 +1311,9 @@ ScratchNoCacheSet& ScratchNoCache() {
 	return *set;
 }
 
+std::atomic<bool> g_scratch_nocache_any {false};
 bool IsScratchNoCache(uint64_t file) {
-	if (!ScratchNoCacheRequested()) return false;
+	if (!g_scratch_nocache_any.load(std::memory_order_relaxed)) return false;
 	std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
 	return ScratchNoCache().files.count(file) != 0;
 }
@@ -1411,6 +1422,7 @@ uint64_t OpenScratchFile() {
 	if (no_cache) {
 		std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
 		ScratchNoCache().files.insert(reinterpret_cast<uint64_t>(file));
+		g_scratch_nocache_any.store(true, std::memory_order_relaxed);
 	}
 	return reinterpret_cast<uint64_t>(file);
 }
@@ -1443,7 +1455,7 @@ bool ReadScratchFile(uint64_t file, uint64_t offset, void* data, size_t size) {
 }
 
 void CloseScratchFile(uint64_t file) {
-	if (file != 0 && ScratchNoCacheRequested()) {
+	if (file != 0 && g_scratch_nocache_any.load(std::memory_order_relaxed)) {
 		std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
 		ScratchNoCache().files.erase(file);
 	}
@@ -1453,8 +1465,16 @@ void CloseScratchFile(uint64_t file) {
 uint64_t OpenFileForReading(const char* path) {
 	wchar_t wide[MAX_PATH * 2] {};
 	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
+	// (cache-cero) KYTY_CACHE_CERO=1: the pipeline stores (static binaries 6.2 GB, blobs) read without the Windows file
+	// cache (FILE_FLAG_RANDOM_ACCESS kept every view of them mapped in the system cache's working set).
+	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v != nullptr && v[0] == '1'; }();
 	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-	                          FILE_FLAG_RANDOM_ACCESS, nullptr);
+	                          cero ? FILE_FLAG_NO_BUFFERING : FILE_FLAG_RANDOM_ACCESS, nullptr);
+	if (file != INVALID_HANDLE_VALUE && cero) {
+		std::lock_guard<std::mutex> lock(ScratchNoCache().mutex);
+		ScratchNoCache().files.insert(reinterpret_cast<uint64_t>(file));
+		g_scratch_nocache_any.store(true, std::memory_order_relaxed);
+	}
 	return file == INVALID_HANDLE_VALUE ? 0 : reinterpret_cast<uint64_t>(file);
 }
 

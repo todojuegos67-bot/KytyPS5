@@ -13,6 +13,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -59,7 +60,83 @@ struct sys_file_t {
 		HANDLE              handle;
 		sys_file_mem_buf_t* buf;
 	};
+	HANDLE nocache  = nullptr; // (cache-cero: the uncached twin of a read-only file, opened at its first read)
+	bool   readonly = false;   // (SysFileOpenR)
 };
+
+// (cache-cero) KYTY_CACHE_CERO=1 (off by default): every read of KYTY_CACHE_CERO_KB (default 16) or more through a
+// read-only file (the game's sceKernelRead/pread, the emulator's own loads) goes through a FILE_FLAG_NO_BUFFERING twin:
+// its bytes never enter the Windows file cache. Log 11-27 01:15: with the large APR reads and the shader scratch files
+// already uncached, "[ram+]" cache de archivos still rose 304 -> 1897 MiB in the first minute and stayed ~2 GB; the
+// kernel read path (Common::File) was never covered. Sector-aligned reads into a thread's bounce, the position moved
+// after. Smaller reads (headers, 16 KiB audio pieces below the threshold) keep the cache.
+static uint32_t CacheCeroMin() {
+	static const uint32_t min = [] {
+		const char* on = std::getenv("KYTY_CACHE_CERO");
+		if (on == nullptr || on[0] != '1') return 0u;
+		long kb = 16;
+		if (const char* v = std::getenv("KYTY_CACHE_CERO_KB"); v != nullptr && v[0] != '\0') kb = std::strtol(v, nullptr, 10);
+		kb = kb < 4 ? 4 : (kb > 65536 ? 65536 : kb);
+		return static_cast<uint32_t>(kb) << 10u;
+	}();
+	return min;
+}
+static std::atomic<uint64_t> g_cero_bytes {0}, g_cero_reads {0}, g_cero_failed {0}, g_cero_printed {0};
+
+// true: done (bytes in *got); false: the cached way.
+static bool CacheCeroRead(void* data, uint32_t size, sys_file_t& f, DWORD* got) {
+	if (f.nocache == nullptr) {
+		HANDLE h  = ReOpenFile(f.handle, GENERIC_READ, FILE_SHARE_POSIX, FILE_FLAG_NO_BUFFERING);
+		f.nocache = h; // (INVALID_HANDLE_VALUE kept: not tried again)
+	}
+	if (f.nocache == INVALID_HANDLE_VALUE) return false;
+	LARGE_INTEGER zero {}, pos {};
+	if (SetFilePointerEx(f.handle, zero, &pos, FILE_CURRENT) == 0) return false;
+	constexpr uint64_t Sector = 4096, Piece = uint64_t {4} << 20u, Bounce = Piece + 2 * Sector;
+	thread_local auto* bounce = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	if (bounce == nullptr) return false;
+	GuestLazyCommit::Prefault(data, size);
+	const auto offset = static_cast<uint64_t>(pos.QuadPart);
+	uint32_t   done   = 0;
+	while (done < size) {
+		const uint64_t at    = offset + done;
+		const uint64_t begin = at & ~(Sector - 1);
+		const uint64_t want  = std::min<uint64_t>(size - done, Piece);
+		const uint64_t end   = (at + want + Sector - 1) & ~(Sector - 1);
+		OVERLAPPED     o {};
+		o.Offset     = static_cast<DWORD>(begin);
+		o.OffsetHigh = static_cast<DWORD>(begin >> 32u);
+		DWORD n      = 0;
+		if (ReadFile(f.nocache, bounce, static_cast<DWORD>(end - begin), &n, &o) == 0) {
+			if (GetLastError() != ERROR_HANDLE_EOF) {
+				if (done == 0) {
+					g_cero_failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+			}
+			break;
+		}
+		if (n <= at - begin) break;
+		const auto c = static_cast<uint32_t>(std::min<uint64_t>(want, n - (at - begin)));
+		std::memcpy(static_cast<uint8_t*>(data) + done, bounce + (at - begin), c);
+		done += c;
+		if (c < want) break;
+	}
+	LARGE_INTEGER next {};
+	next.QuadPart = static_cast<LONGLONG>(offset + done);
+	(void)SetFilePointerEx(f.handle, next, nullptr, FILE_BEGIN);
+	*got             = done;
+	const auto total = g_cero_bytes.fetch_add(done, std::memory_order_relaxed) + done;
+	const auto reads = g_cero_reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (const auto step = total >> 28u; step > g_cero_printed.load(std::memory_order_relaxed) &&
+	                                    g_cero_printed.exchange(step, std::memory_order_relaxed) < step) {
+		std::printf("[cache-cero] %llu MiB leidos sin cache de Windows por el nucleo en %llu lecturas (fallidas %llu)\n",
+		            static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(reads),
+		            static_cast<unsigned long long>(g_cero_failed.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+	return true;
+}
 
 // IWYU pragma: no_include <fileapi.h>
 // IWYU pragma: no_include <handleapi.h>
@@ -86,6 +163,11 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
+		static const uint32_t cero = CacheCeroMin();
+		if (cero != 0 && f.readonly && size >= cero && CacheCeroRead(data, size, f, &w)) {
+			if (bytes_read != nullptr) *bytes_read = w;
+			return;
+		}
 		GuestLazyCommit::Prefault(data, size); // (a kernel-mode write into a reserved guest page fails, not faults)
 		if (ReadFile(f.handle, data, size, &w, nullptr) == 0) {
 			// Shown: a failed read used to pass as a short one.
@@ -197,7 +279,8 @@ sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_
 	if (h_file == INVALID_HANDLE_VALUE) {
 		ret->type = SYS_FILE_ERROR;
 	} else {
-		ret->type = SYS_FILE_FILE;
+		ret->type     = SYS_FILE_FILE;
+		ret->readonly = true;
 	}
 
 	ret->handle = h_file;
@@ -276,6 +359,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
 
 void SysFileClose(sys_file_t* f) {
 	if (f->type == SYS_FILE_FILE) {
+		if (f->nocache != nullptr && f->nocache != INVALID_HANDLE_VALUE) CloseHandle(f->nocache);
 		CloseHandle(f->handle);
 	} else if (f->type == SYS_FILE_MEMORY_STAT) {
 		delete f->buf;
