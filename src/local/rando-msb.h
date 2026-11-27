@@ -1588,6 +1588,9 @@ constexpr uint8_t  kMatrix[5] = {0xbb, 0xab, 0x82, 0xad, 0x30};
 constexpr uint8_t  kPartIdx[5] = {0x91, 0xc5, 0x7f, 0x57, 0x04};
 constexpr uint8_t  kEventId[5] = {0x52, 0x4b, 0x77, 0x16, 0x04};
 constexpr uint8_t  kGroup[5]   = {0x22, 0x3a, 0x03, 0xf4, 0x04};
+constexpr uint8_t  kCollPart[5] = {0x64, 0x10, 0xa6, 0x9e, 0x04}; // (rando25) colision del suelo del sitio
+constexpr uint8_t  kSiteA[5]    = {0x2e, 0xa8, 0x67, 0xe9, 0x04};
+constexpr uint8_t  kSiteB[5]    = {0xc1, 0xa9, 0x67, 0xea, 0x04};
 
 inline size_t Find(const std::vector<uint8_t>& d, size_t a, size_t b, const uint8_t* pat, size_t n) {
 	for (size_t i = a; i + n <= b; i++)
@@ -1805,6 +1808,18 @@ inline bool Transplant(const File& t, const std::vector<Swap>& swaps, std::vecto
 					const size_t c = Find(o, pay, pay + ob.len, kGroup, 5);
 					if (b != std::string::npos) std::memcpy(o.data() + b + 5, &rt.event, 4);
 					if (c != std::string::npos) std::memcpy(o.data() + c + 5, &rt.group, 4);
+					// (rando25) Campos del SITIO que el juego lee de este objeto (no del MSB): colision del suelo
+					// (0x9ea61064 = typedata +0x1C del MSB: 766 en c2000_0000, 788 en c2010_0029, 513 en c1030_0000 de
+					// m03_01) y 0xe967a82e / 0xea67a9c1 (cambian de sitio a sitio dentro del mismo tipo). Se quedaban los
+					// del donante: el enemigo colgaba de la colision de OTRO sitio (o de otro mapa, el Vanguard) y el juego
+					// no lo creaba (0x359990) estando ahi su cuerpo: c2000_0000 nunca creado con trasplante, si sin el
+					// (log 20261127-042910-357, llamada 1). Ahora van los del sitio original.
+					const Obj& to = t.objs[rt.legacy_obj];
+					for (const uint8_t* key: {kCollPart, kSiteA, kSiteB}) {
+						const size_t dp = Find(o, pay, pay + ob.len, key, 5);
+						const size_t sp = Find(t.d, to.pay, to.pay + to.len, key, 5);
+						if (dp != std::string::npos && sp != std::string::npos) std::memcpy(o.data() + dp + 5, t.d.data() + sp + 5, 4);
+					}
 				}
 			}
 		}
@@ -2629,10 +2644,25 @@ inline bool BuildMezcla(const std::string& map, const std::filesystem::path& app
 		std::printf("[rando] mapa %s: mezcla: menos de 2 enemigos, se deja el original\n", map.c_str());
 		return false;
 	}
+	// (rando25) Log 20261127-042910-357: con la permutacion casi todo era soldado <-> soldado (c2000 34, c2010 44 de 102)
+	// y no se notaba. Ahora cada sitio elige primero un TIPO distinto del suyo, al azar entre todos los tipos normales del
+	// mapa (los raros salen tanto como los comunes), y luego un ejemplar de ese tipo como donante (puede repetirse: cada
+	// copia lleva GUID nuevos por sitio).
+	std::map<std::string, std::vector<size_t>> by_type;
+	for (size_t i = 0; i < sl.size(); i++) by_type[sl[i].model].push_back(i);
 	std::vector<size_t> perm(sl.size());
-	for (size_t i = 0; i < perm.size(); i++) perm[i] = i;
-	uint64_t rs = Fnv(map, Fnv("mezcla", Fnv(Seed())));
-	for (size_t i = perm.size() - 1; i > 0; i--) std::swap(perm[i], perm[static_cast<size_t>(SplitMix(&rs) % (i + 1))]);
+	uint64_t            rs = Fnv(map, Fnv("mezcla2", Fnv(Seed())));
+	for (size_t k = 0; k < sl.size(); k++) {
+		std::vector<const std::vector<size_t>*> other;
+		for (const auto& [m, v]: by_type)
+			if (m != sl[k].model) other.push_back(&v);
+		if (other.empty()) {
+			perm[k] = k;
+			continue;
+		}
+		const auto& v = *other[static_cast<size_t>(SplitMix(&rs) % other.size())];
+		perm[k]       = v[static_cast<size_t>(SplitMix(&rs) % v.size())];
+	}
 	// Lo que viaja con el enemigo (del original): indice de modelo (+0x10) y typedata +0x00..+0x13 y +0x18.
 	struct Who {
 		int32_t model;
