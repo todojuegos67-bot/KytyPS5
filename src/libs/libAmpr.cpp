@@ -1788,7 +1788,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 			return r;
 		}
 	}
-	if (RandoMsb::Enabled()) RandoMsb::TraceRead(host_path, false); // (randomizer: traza de personajes y MSB)
+	if (RandoMsb::Traced()) RandoMsb::TraceRead(host_path, false); // (randomizer: traza de personajes y MSB)
 	const int result = ReadHostFileToGuestRaw(host_path, file_offset, destination, size, bytes_read);
 	RandoMsb::TraceChunk(host_path, static_cast<int64_t>(file_offset), size, bytes_read != nullptr ? *bytes_read : 0, false);
 	if (result == OK && file_offset == 0 && bytes_read != nullptr && *bytes_read >= 0x40 && RandoMsb::Enabled() &&

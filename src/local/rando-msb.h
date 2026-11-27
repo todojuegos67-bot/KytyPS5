@@ -68,6 +68,26 @@ inline bool Enabled() {
 	return on;
 }
 
+// (demonio) Experimento KYTY_DEMONIO_PATIO=1 (apagado por defecto): el Vanguard (c1030, NpcParam 103001, su entidad de
+// m03_01_00_00 c1030_0000) en el primer patio de 1-1 (m02_00_00_00), en el sitio del soldado c2000_0000 (9.1, 21.2,
+// -126.0; colision 766, sus grupos +0x44 se quedan). Ghidra: los modelos de cp11models.crmp se buscan en FUN_008b68a0
+// (FNV-1a en mayusculas); "$/cp11demonssouls/dvdroot/chr/c1030/c1030.model?chrid103001" esta. Trazas: creacion
+// (0x359990), modelo (0x1451700, la llama BPDsModel::TryInit 0x60a77b), FUN_01473fb0 (crear instancias del cgpr) y
+// FUN_01472490 (quitar una entidad de las listas del mundo). Apagado: ni una linea de esto se ejecuta.
+inline bool DemonioOn() {
+	static const bool on = [] {
+		const char* c = std::getenv("KYTY_DEMONIO_PATIO");
+		const bool  r = c != nullptr && std::strcmp(c, "1") == 0;
+		if (r) {
+			std::printf("[demonio] KYTY_DEMONIO_PATIO=1: Vanguard (c1030) en el primer patio de Boletaria 1-1\n");
+			std::fflush(stdout);
+		}
+		return r;
+	}();
+	return on;
+}
+inline bool Traced() { return Enabled() || DemonioOn(); }
+
 inline std::string MapName(const std::string& path) {
 	const auto slash = path.find_last_of("/\\!");
 	std::string name = path.substr(slash == std::string::npos ? 0 : slash + 1);
@@ -365,7 +385,7 @@ inline bool FuertesOn() {
 
 // Copias del mapa redirigidas (MSB + legacy_instances): con otros mundos o con "fuertes al principio". Es lo que
 // consultan fileSystem.cpp y libAmpr.cpp antes de RedirectRead / RedirectedSize.
-inline bool CrossOn() { return CrossWorldsOn() || FuertesOn(); }
+inline bool CrossOn() { return DemonioOn() || CrossWorldsOn() || FuertesOn(); }
 
 // (randomizer, fase 3) Bluepoint enlaza cada parte de enemigo del MSB con la entidad del MISMO NOMBRE de
 // scripts/worlds/<mapa>/_cmn/<mapa>_legacy_instances.cgpr (lista en cp11demonssouls/_cmn/cp11instances.crmp, clave
@@ -406,6 +426,8 @@ inline void InstallModelProbe(); // (rando8) mas abajo
 // si viene de eboot+0x366294 con ese modelo original, cambia rsi por el modelo del donante y edx por su chrid.
 // KYTY_DS_RANDOMIZER_HOOK=0 lo apaga.
 struct HookSwap {
+	bool        has_pos = false; // (demonio) ademas, la parte debe estar en |pos| (+0x20), a menos de 1 m
+	float       pos[3] {};
 	std::string name;           // parte (c2000_0035)
 	char        orig_model[16] {};
 	int32_t     orig_npc  = 0;
@@ -557,7 +579,7 @@ inline const DynType* DynChoose(const std::string& pname, const std::string& mod
 
 inline int TraceLevel() {
 	static const int level = [] {
-		if (!Enabled()) return 0;
+		if (!Enabled() && !DemonioOn()) return 0;
 		const char* c = std::getenv("KYTY_DS_RANDOMIZER_TRACE");
 		if (c == nullptr || *c == '\0') return 1;
 		return std::atoi(c) <= 0 ? 0 : (std::atoi(c) >= 2 ? 2 : 1);
@@ -591,7 +613,7 @@ inline const char* TraceTail(const std::string& low) {
 // vez cada uno y como mucho 20000 lineas.
 inline void TraceRead(const std::string& path, bool from_copy) {
 	const int level = TraceLevel();
-	if (level >= 2 || HookOn()) InstallModelProbe(); // (rando8/10) sonda y gancho del modelo, antes de cargar ningun mapa
+	if (level >= 2 || HookOn() || DemonioOn()) InstallModelProbe(); // (rando8/10) sonda y gancho del modelo, antes de cargar ningun mapa
 	if (level == 0) return;
 	const std::string low = TraceLow(path);
 	if (level < 2 && low.find("/chr/c") == std::string::npos && low.find("scripts/cp11/characters/") == std::string::npos &&
@@ -744,6 +766,17 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 		std::lock_guard<std::mutex> lock(HookMutex());
 		for (const auto& h: HookSwaps())
 			if (h.name == pname && model == h.orig_model && (npc == h.orig_npc || npc == h.new_npc)) {
+				if (h.has_pos) {
+					float pp[3];
+					std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
+					const float dx = pp[0] - h.pos[0], dy = pp[1] - h.pos[1], dz = pp[2] - h.pos[2];
+					const bool  ok = dx * dx + dy * dy + dz * dz < 1.0f;
+					std::printf("[demonio] crear parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f): %s\n", idx, pname.c_str(),
+					            model.c_str(), npc, static_cast<double>(pp[0]), static_cast<double>(pp[1]),
+					            static_cast<double>(pp[2]), ok ? "ES EL DEL PATIO, pasa a Vanguard" : "otro mapa, no se toca");
+					std::fflush(stdout);
+					if (!ok) continue;
+				}
 				hit = &h;
 				break;
 			}
@@ -814,6 +847,14 @@ __attribute__((sysv_abi, noinline)) inline void ProbeModel(uint64_t /*self*/, co
 		model = sw->new_model;
 		id    = sw->new_npc;
 	}
+	if (DemonioOn() && (model == "c1030" || id == 103001)) {
+		static std::atomic<int> dl {0};
+		if (dl.fetch_add(1) < 50) {
+			std::printf("[demonio] modelo %s chrid %d pedido desde eboot+0x%llx (0x60a780 = BPDsModel::TryInit)\n", model.c_str(), id,
+			            static_cast<unsigned long long>(from));
+			std::fflush(stdout);
+		}
+	}
 	if (TraceLevel() < 2) return;
 	static std::mutex                                 m;
 	static std::set<std::pair<std::string, int32_t>> seen;
@@ -880,6 +921,26 @@ inline bool InstallStub(uint64_t rva, uint64_t fn, const char* what) {
 	return true;
 }
 
+// (demonio) Trazas de entrada (sin cambiar nada): FUN_01473fb0(rdi, rsi, rdx...) crea las instancias de un recurso del
+// cgpr; FUN_01472490(mundo, entidad, char) quita la entidad de las listas del mundo (+0x48 / +0x58). Cada llamada con su
+// retorno, como mucho 400 lineas cada una; si el Vanguard se descarta, sale aqui justo despues de crearlo.
+__attribute__((sysv_abi, noinline)) inline void DemonioTraceCreate(uint64_t a, uint64_t b, uint64_t c, uint64_t ret, uint64_t) {
+	static std::atomic<int> n {0};
+	if (n.fetch_add(1) >= 400) return;
+	std::printf("[demonio] FUN_01473fb0(%llx, %llx, %llx) desde eboot+0x%llx\n", static_cast<unsigned long long>(a),
+	            static_cast<unsigned long long>(b), static_cast<unsigned long long>(c),
+	            static_cast<unsigned long long>(ret >= kEbootBase ? ret - kEbootBase : ret));
+	std::fflush(stdout);
+}
+__attribute__((sysv_abi, noinline)) inline void DemonioTraceRemove(uint64_t a, uint64_t b, uint64_t c, uint64_t ret, uint64_t) {
+	static std::atomic<int> n {0};
+	if (n.fetch_add(1) >= 400) return;
+	std::printf("[demonio] FUN_01472490 quitar entidad %llx del mundo %llx (%d) desde eboot+0x%llx\n",
+	            static_cast<unsigned long long>(b), static_cast<unsigned long long>(a), static_cast<int>(c & 0xff),
+	            static_cast<unsigned long long>(ret >= kEbootBase ? ret - kEbootBase : ret));
+	std::fflush(stdout);
+}
+
 inline void InstallModelProbe() {
 	static std::once_flag once;
 	std::call_once(once, [] {
@@ -888,7 +949,11 @@ inline void InstallModelProbe() {
 			std::printf("[rando-traza3] sonda del modelo instalada en eboot+0x1451700\n");
 			std::fflush(stdout);
 		}
-		if (b && HookOn()) InstallStub(0x359990, reinterpret_cast<uint64_t>(&HookCreate), "gancho de creacion de enemigos");
+		if (b && (HookOn() || DemonioOn())) InstallStub(0x359990, reinterpret_cast<uint64_t>(&HookCreate), "gancho de creacion de enemigos");
+		if (b && DemonioOn()) {
+			InstallStub(0x1473fb0, reinterpret_cast<uint64_t>(&DemonioTraceCreate), "[demonio] traza FUN_01473fb0");
+			InstallStub(0x1472490, reinterpret_cast<uint64_t>(&DemonioTraceRemove), "[demonio] traza FUN_01472490");
+		}
 	});
 }
 #else
@@ -2629,6 +2694,131 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 	return true;
 }
 
+// (demonio) Una sola parte: el soldado c2000_0000 del primer patio de m02_00_00_00 pasa a ser el Vanguard de
+// m03_01_00_00 (c1030_0000): MSB (modelo c1030 añadido al grupo de enemigos, typedata del donante, sin patrulla; colision
+// 766 y grupos +0x44 del sitio) + entidad de Bluepoint trasplantada entera (cmdl, caws, ragdoll, sonido) con la matriz y
+// el enlace al MSB del soldado + gancho en memoria (0x359990/0x1451700) solo para la parte en esa posicion.
+inline bool BuildDemonio(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_out,
+                         std::vector<uint8_t>* cgpr_out) {
+	static const char* kTarget = "c2000_0000";
+	static const char* kDonorMap = "m03_01_00_00";
+	static const char* kDonor = "c1030_0000";
+	if (map != "m02_00_00_00") return false;
+	auto fail = [&](const char* why) {
+		std::printf("[demonio] %s: %s; se deja el mapa original\n", map.c_str(), why);
+		std::fflush(stdout);
+		return false;
+	};
+	std::vector<uint8_t> msb, dmsb;
+	Cg::File             tf;
+	if (!ReadWhole(MsbPathOf(app0, map), &msb) || !ReadWhole(CgprPathOf(app0, map), &tf.d)) return fail("no se leen el MSB o el cgpr");
+	if (!Cg::Parse(&tf)) return fail("legacy_instances con formato no reconocido");
+	std::vector<Table> t, dt;
+	if (!ParseTables(msb, &t) || BuildTables(t) != msb) return fail("MSB no reconocido");
+	std::vector<EnemyPart> ps, dps;
+	if (!EnemyParts(t, &ps)) return fail("partes del MSB no reconocidas");
+	if (!ReadWhole(MsbPathOf(app0, kDonorMap), &dmsb) || !ParseTables(dmsb, &dt) || !EnemyParts(dt, &dps))
+		return fail("no se lee el MSB de m03_01_00_00");
+	auto& models = t[0].blobs;
+	auto& parts  = t[3].blobs;
+
+	size_t pi = ps.size();
+	for (size_t i = 0; i < ps.size(); i++)
+		if (ps[i].name == kTarget && ModelName(models[static_cast<size_t>(ps[i].model)]) == "c2000") pi = i;
+	if (pi == ps.size()) return fail("no esta el soldado c2000_0000");
+	size_t         top = 0;
+	const Cg::Rec* tr  = TopByName(tf, kTarget, &top);
+	if (tr == nullptr || !Cg::RootInfo(tf, *tr).ok || Cg::RootInfo(tf, *tr).part != ps[pi].index)
+		return fail("el soldado no tiene su entidad en el cgpr");
+
+	size_t dpi = dps.size();
+	for (size_t i = 0; i < dps.size(); i++)
+		if (dps[i].name == kDonor && ModelName(dt[0].blobs[static_cast<size_t>(dps[i].model)]) == "c1030") dpi = i;
+	if (dpi == dps.size()) return fail("no esta el Vanguard c1030_0000 en m03_01_00_00");
+	const auto&          dmodel = dt[0].blobs[static_cast<size_t>(dps[dpi].model)];
+	const auto&          dpart  = dt[3].blobs[dps[dpi].index];
+	uint8_t              td_head[0x14], td_init[4];
+	std::memcpy(td_head, dpart.data() + dps[dpi].td, 0x14);
+	std::memcpy(td_init, dpart.data() + dps[dpi].td + 0x18, 4);
+	const Cg::File* df = DonorFile(app0, kDonorMap);
+	if (df == nullptr) return fail("no se lee m03_01_00_00_legacy_instances.cgpr");
+	size_t         dtop = 0;
+	const Cg::Rec* dr   = TopByName(*df, kDonor, &dtop);
+	if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) return fail("el Vanguard no tiene entidad en el cgpr de m03_01");
+
+	size_t  last_enemy = models.size();
+	int32_t type_idx   = 0;
+	for (size_t i = 0; i < models.size(); i++)
+		if (BI32(models[i], 0x8) == 2) {
+			if (ModelName(models[i]) == "c1030") return fail("c1030 ya esta en el mapa");
+			last_enemy = i;
+			type_idx++;
+		}
+	if (last_enemy == models.size()) return fail("sin modelos de enemigo");
+	std::vector<uint8_t> blob = dmodel;
+	std::memcpy(blob.data() + 0xC, &type_idx, 4);
+	const size_t insert_at = last_enemy + 1;
+	models.insert(models.begin() + static_cast<ptrdiff_t>(insert_at), blob);
+	for (auto& p: parts) {
+		int32_t mi = BI32(p, 0x10);
+		if (mi >= static_cast<int32_t>(insert_at)) {
+			mi++;
+			std::memcpy(p.data() + 0x10, &mi, 4);
+		}
+	}
+	const auto& e  = ps[pi];
+	auto&       pb = parts[e.index];
+	HookSwap    h;
+	h.has_pos = true;
+	std::memcpy(h.pos, pb.data() + 0x20, 12);
+	h.name = kTarget;
+	std::snprintf(h.orig_model, sizeof(h.orig_model), "c2000");
+	h.orig_npc = BI32(pb, e.td + 0xC);
+	std::snprintf(h.new_model, sizeof(h.new_model), "c1030");
+	std::memcpy(&h.new_npc, td_head + 0xC, 4);
+	std::memcpy(h.td_head, td_head, sizeof(h.td_head));
+	std::memcpy(h.td_init, td_init, sizeof(h.td_init));
+	const int32_t mi = static_cast<int32_t>(insert_at);
+	std::memcpy(pb.data() + 0x10, &mi, 4);
+	std::memcpy(pb.data() + e.td, td_head, 0x14);
+	std::memcpy(pb.data() + e.td + 0x18, td_init, 4);
+	std::memset(pb.data() + e.td + 0x20, 0xFF, 24); // sin patrulla
+	std::vector<int32_t> count(models.size(), 0);
+	for (const auto& p: parts) {
+		const int32_t m = BI32(p, 0x10);
+		if (m >= 0 && static_cast<size_t>(m) < count.size()) count[static_cast<size_t>(m)]++;
+	}
+	for (size_t i = 0; i < models.size(); i++) std::memcpy(models[i].data() + 0x18, &count[i], 4);
+	std::vector<uint8_t> msb2 = BuildTables(t);
+
+	std::vector<Cg::Swap> swaps;
+	swaps.push_back({top, df, dtop});
+	std::vector<uint32_t> refs;
+	Cg::CollectRefs(df->tops[dtop], &refs);
+	const size_t           new_objs = tf.objs.size() + std::set<uint32_t>(refs.begin(), refs.end()).size();
+	std::vector<uint8_t>   cg2;
+	std::vector<Table>     check;
+	std::vector<EnemyPart> check_ps;
+	if (!Cg::Transplant(tf, swaps, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) || !EnemyParts(check, &check_ps) ||
+	    check_ps.size() != ps.size())
+		return fail("el resultado no se relee bien");
+	{
+		std::lock_guard<std::mutex> lock(HookMutex());
+		HookSwaps().push_back(std::move(h));
+	}
+	float pos[3];
+	std::memcpy(pos, pb.data() + 0x20, 12);
+	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en (%.1f, %.1f, %.1f), colision %d; "
+	            "cgpr %zu -> %zu objetos\n",
+	            map.c_str(), kTarget, HookSwaps().back().orig_npc, HookSwaps().back().new_npc, kDonorMap, kDonor,
+	            static_cast<double>(pos[0]), static_cast<double>(pos[1]), static_cast<double>(pos[2]), BI32(pb, e.td + 0x1C),
+	            tf.objs.size(), new_objs);
+	std::fflush(stdout);
+	msb_out->swap(msb2);
+	cgpr_out->swap(cg2);
+	return true;
+}
+
 struct RedirectEntry {
 	bool                  done = false;
 	std::filesystem::path copy; // MSB; vacío: sin copia
@@ -2674,8 +2864,9 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 	RedirectEntry        e;
 	e.done = true;
 	std::vector<uint8_t> msb, cg;
-	const bool built = FuertesOn() ? BuildFuertes(map, app0, &msb, &cg) : BuildCross3(map, app0, &msb, &cg);
-	if (DynVisualOn()) { // (rando16) indice de partes de TODOS los mapas, tal como los lee el juego
+	const bool built = DemonioOn() ? BuildDemonio(map, app0, &msb, &cg)
+	                               : (FuertesOn() ? BuildFuertes(map, app0, &msb, &cg) : BuildCross3(map, app0, &msb, &cg));
+	if (!DemonioOn() && DynVisualOn()) { // (rando16) indice de partes de TODOS los mapas, tal como los lee el juego
 		std::vector<uint8_t> orig;
 		if (built) DynRegister(map, msb);
 		else if (ReadWhole(MsbPathOf(app0, map), &orig)) DynRegister(map, orig);
@@ -2683,9 +2874,9 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 	if (built) {
 		// (rando16) Con entidad visual trasplantada no se baraja: la matriz de cada entidad de Bluepoint es la del sitio
 		// original de su parte; si la parte se mueve, aspecto y logica quedan en sitios distintos.
-		if (!DynVisualOn() && !FuertesOn()) ShuffleBytes(map, msb);
+		if (!DemonioOn() && !DynVisualOn() && !FuertesOn()) ShuffleBytes(map, msb);
 		std::error_code ec;
-		const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" / Utf8Path(Seed());
+		const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" / Utf8Path(DemonioOn() ? "demonio-patio" : Seed());
 		if (!ec) std::filesystem::create_directories(dir, ec);
 		const auto cm = dir / Utf8Path(map + ".msb");
 		const auto cc = dir / Utf8Path(map + "_legacy_instances.cgpr");
@@ -2711,6 +2902,7 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 inline std::filesystem::path RedirectRead(const std::string& path) {
 	using namespace Detail;
 	if (!CrossOn()) return {};
+	if (DemonioOn()) InstallModelProbe(); // (demonio) ganchos y trazas antes de cargar ningun mapa
 	const bool msb = IsMsbPath(path);
 	const bool cg  = !msb && IsCgprPath(path);
 	if (!msb && !cg) return {};
@@ -2737,7 +2929,7 @@ inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 
 // Fase 1 sobre lo leído en memoria. Si el mapa ya va por la copia (fase 2), la copia ya está barajada: no se toca.
 inline bool Shuffle(const std::string& path, std::vector<uint8_t>& bytes) {
-	if (FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
+	if (DemonioOn() || FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
 	if (CrossWorldsOn() && !RedirectRead(path).empty()) return false;
 	return ShuffleBytes(MapName(path), bytes);
 }

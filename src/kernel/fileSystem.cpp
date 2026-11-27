@@ -639,7 +639,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 						RandoMsb::TraceRead(Common::PathToString(file->real_name), true);
 					}
 				}
-				if (RandoMsb::Enabled() && open_name == file->real_name) { // (randomizer: traza)
+				if (RandoMsb::Traced() && open_name == file->real_name) { // (randomizer: traza)
 					RandoMsb::TraceRead(Common::PathToString(file->real_name), false);
 				}
 			}
