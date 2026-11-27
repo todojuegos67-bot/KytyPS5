@@ -1295,6 +1295,15 @@ void RenderExecutor::DsNatMark(CommandBuffer& buffer, uint32_t kind_pass, uint32
 		if (s.slot != nullptr && s.slot->pass == pass) s.entries_seen[pass] += s.slot->count;
 		if (s.slot == nullptr) return DsNatFail("sin datos del gancho (captura fallida: ver motivos)");
 		if (s.slot->pass != pass || s.slot->count == 0) return DsNatFail("ranura de otro cubo");
+		// (11-27, log 20261127-045004-895: solo la cascada 0 (la cercana) da nativo_mas_cerca 0,048 %, err_max 0,14.) El cubo 3
+		// es kRS_Depth_Fadeout (0x25b3a10; 0xa13e60/0xa12de0 ponen ctx[0x27] = 0xc solo para el): objetos que se desvanecen
+		// con descarte en el PS, que el nativo (sin PS) dibuja enteros. Ese cubo lo dibuja el juego.
+		// KYTY_NATIVO_SOMBRAS_FADEOUT=1: dibujarlo tambien en nativo (como antes).
+		static const bool fade_on = [] {
+			const char* t = std::getenv("KYTY_NATIVO_SOMBRAS_FADEOUT");
+			return t != nullptr && t[0] == '1' && t[1] == '\0';
+		}();
+		if (s.slot->bucket == 3u && !fade_on) return DsNatFail("cubo Fadeout (descarte en el PS: lo dibuja el juego)");
 		s.depth_seq = m_ds_last_depth_seq; // (=1: el dibujo exige una resolucion de profundidad posterior, de este cubo)
 		// (CASCADA) Primer cubo de una cascada validada: se toman ya las ranuras de los demas cubos de la cascada (las marcas
 		// que siguen en este bufer). Si alguna no esta lista, es de otra cascada o tiene otra camara, no se agrupa (este cubo
