@@ -62,8 +62,8 @@ inline bool Enabled() {
 		if (enabled) {
 			std::printf("[rando] barajado en el mismo mapa: activo (semilla %s)\n", Seed());
 			const bool mundos = c != nullptr && std::strcmp(c, "1") == 0;
-			std::printf("[rando] solo Boletaria (m02), mezcla en los mismos sitios; otros mundos: %s\n",
-			            mundos ? "SI (tipos de otros mundos como copias en huecos de Boletaria)" : "no");
+			std::printf("[rando] mundos 1-5 (m02..m06; Nexo y tutorial originales), mezcla en los mismos sitios; otros mundos: %s\n",
+			            mundos ? "SI (tipos de otros mundos como copias en los huecos de cada mundo)" : "no");
 			std::fflush(stdout);
 		}
 		return enabled;
@@ -424,7 +424,12 @@ inline bool MezclaOn() {
 inline bool CrossOn() { return DemonioOn() || CrossWorldsOn() || FuertesOn(); }
 
 // (rando24) Alcance: el randomizer solo toca los mapas del primer mundo (Boletaria, m02_xx); el resto, original.
-inline bool InScope(const std::string& map) { return map.size() >= 4 && (map.compare(0, 4, "m02_") == 0 || map.compare(0, 4, "M02_") == 0); }
+// (rando28) Todos los mundos: Boletaria (m02), Stonefang (m03), Latria (m04), Santuario (m05) y Valle (m06). El Nexo
+// (m01) y el tutorial (m08) quedan originales: el MSB del Nexo solo tiene NPC (c0000 x14, c7080, c7130, c7150) y c4000_0015,
+// todos con entity id de evento: ningun hueco de enemigo normal.
+inline bool InScope(const std::string& map) {
+	return map.size() >= 4 && (map[0] == 'm' || map[0] == 'M') && map[1] == '0' && map[2] >= '2' && map[2] <= '6' && map[3] == '_';
+}
 
 // (rando24) Hueco del demonio: el soldado c2000_0002 (20.5, 21.2, -123.0; colision 766, npc 200010) del primer patio.
 // Logs 20261127-040451-674 / 040741-877: c2000_0002 lo crea el juego (0x359990 llamada 2) y c2000_0000 no aparece
@@ -3479,7 +3484,7 @@ inline RedirectEntry& EntryFor(const std::string& map, const std::filesystem::pa
 	std::vector<SlotFinal> finals;
 	// (demonio) El Vanguard va ENCIMA de lo que haga el randomizer (antes lo sustituia: sin "[rando] mapa" en ningun mapa).
 	bool built = false;
-	const bool scope = InScope(map); // (rando24) solo Boletaria
+	const bool scope = InScope(map); // (rando28) mundos 1-5
 	CurSeed().clear();
 	if (scope && MezclaOn()) built = BuildMezcla(map, app0, &msb, &cg, &finals);
 	else if (scope && FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
@@ -3654,20 +3659,21 @@ struct LuabndCopy {
 	std::filesystem::path copy;
 	uint64_t              size = 0;
 };
-inline LuabndCopy& M02Luabnd() {
-	static LuabndCopy c;
-	return c;
+// (rando28) Una copia por area (m02..m06): "m02".."m06".
+inline LuabndCopy& AreaLuabnd(const std::string& area) {
+	static std::map<std::string, LuabndCopy> t;
+	return t[area];
 }
 
 // |real| = .../dvdroot/script/m02.luabnd. Copia hecha una vez (bajo RedirectMutex).
-inline const LuabndCopy& LuabndFor(const std::filesystem::path& real) {
-	auto& c = M02Luabnd();
+inline const LuabndCopy& LuabndFor(const std::filesystem::path& real, const std::string& self) {
+	auto& c = AreaLuabnd(self);
 	if (c.done) return c;
 	c.done = true;
 	std::vector<uint8_t> orig;
 	std::vector<BndFile> fs;
 	if (!ReadWhole(real, &orig) || !ParseBnd3(orig, &fs)) {
-		std::printf("[rando] m02.luabnd: no se lee o formato no reconocido; scripts de IA originales\n");
+		std::printf("[rando] %s.luabnd: no se lee o formato no reconocido; scripts de IA originales\n", self.c_str());
 		std::fflush(stdout);
 		return c;
 	}
@@ -3679,7 +3685,8 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real) {
 	}
 	const size_t n0 = fs.size();
 	bool         vang = false;
-	for (const char* area: {"m03", "m01", "m04", "m05", "m06", "m08"}) {
+	for (const char* area: {"m03", "m02", "m01", "m04", "m05", "m06", "m08"}) {
+		if (self == area) continue;
 		std::vector<uint8_t> d;
 		std::vector<BndFile> dfs;
 		if (!ReadWhole(real.parent_path() / (std::string(area) + ".luabnd"), &d) || !ParseBnd3(d, &dfs)) continue;
@@ -3694,28 +3701,33 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real) {
 	const auto bytes = BuildBnd3(orig, fs);
 	std::vector<BndFile> check;
 	const auto dir = CopyDir();
-	const auto cp  = dir / "m02.luabnd";
+	const auto cp  = dir / Utf8Path(self + ".luabnd");
 	if (!ParseBnd3(bytes, &check) || check.size() != fs.size() || dir.empty() || !WriteFile(cp, bytes)) {
-		std::printf("[rando] m02.luabnd: la copia no se pudo hacer; scripts de IA originales\n");
+		std::printf("[rando] %s.luabnd: la copia no se pudo hacer; scripts de IA originales\n", self.c_str());
 		std::fflush(stdout);
 		return c;
 	}
 	c.copy = cp;
 	c.size = bytes.size();
-	std::printf("[rando] m02.luabnd: copia con %zu scripts de IA de otras areas (%zu -> %zu archivos, %zu -> %zu bytes)%s\n",
-	            fs.size() - n0, n0, fs.size(), orig.size(), bytes.size(),
+	std::printf("[rando] %s.luabnd: copia con %zu scripts de IA de otras areas (%zu -> %zu archivos, %zu -> %zu bytes)%s\n",
+	            self.c_str(), fs.size() - n0, n0, fs.size(), orig.size(), bytes.size(),
 	            vang ? "; incluye 103001_battle.lua (combate del Vanguard, de m03.luabnd)" : "");
 	std::fflush(stdout);
 	return c;
 }
 
-inline bool IsM02LuabndPath(const std::string& path) {
+// (rando28) ".../script/mXX.luabnd" de un mundo del randomizer (m02..m06) -> "mXX"; si no, "".
+inline std::string AreaLuabndOf(const std::string& path) {
 	std::string low = Lower(path);
 	for (auto& ch: low)
 		if (ch == '\\') ch = '/';
-	return low.size() > 18 && low.compare(low.size() - 18, 18, "/script/m02.luabnd") == 0;
+	if (low.size() < 18 || low.compare(low.size() - 18, 8, "/script/") != 0 || low.compare(low.size() - 7, 7, ".luabnd") != 0)
+		return {};
+	const std::string area = low.substr(low.size() - 10, 3);
+	return InScope(area + "_") ? area : std::string();
 }
-inline bool LuabndOn() { return DemonioOn() || MundosOn(); }
+// Vanguard (solo m02) o MUNDOS SI (cualquier mundo con donantes de otros mundos).
+inline bool LuabndOn(const std::string& area) { return MundosOn() || (DemonioOn() && area == "m02"); }
 
 } // namespace Detail
 
@@ -3725,10 +3737,10 @@ inline std::filesystem::path RedirectRead(const std::string& path, int64_t offse
 	using namespace Detail;
 	if (!CrossOn()) return {};
 	if (DemonioOn() || MezclaHooksOn()) InstallModelProbe(); // ganchos y trazas antes de cargar ningun mapa
-	if (IsM02LuabndPath(path)) { // scripts de IA que le faltan a Boletaria (Vanguard, otros mundos)
-		if (!LuabndOn()) return {};
+	if (const std::string area = AreaLuabndOf(path); !area.empty()) { // scripts de IA que le faltan al mundo
+		if (!LuabndOn(area)) return {};
 		std::lock_guard<std::mutex> lock(RedirectMutex());
-		return LuabndFor(Utf8Path(path)).copy;
+		return LuabndFor(Utf8Path(path), area).copy;
 	}
 	const bool msb = IsMsbPath(path);
 	const bool cg  = !msb && IsCgprPath(path);
@@ -3746,9 +3758,9 @@ inline std::filesystem::path RedirectRead(const std::string& path, int64_t offse
 
 inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 	if (RedirectRead(path).empty()) return std::nullopt;
-	if (Detail::IsM02LuabndPath(path)) {
+	if (const std::string area = Detail::AreaLuabndOf(path); !area.empty()) {
 		std::lock_guard<std::mutex> lock(Detail::RedirectMutex());
-		return Detail::M02Luabnd().size;
+		return Detail::AreaLuabnd(area).size;
 	}
 	const bool  msb = IsMsbPath(path);
 	std::string map = Detail::Lower(MapName(path));
@@ -3761,7 +3773,7 @@ inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 
 // Fase 1 sobre lo leído en memoria. Si el mapa ya va por la copia (fase 2), la copia ya está barajada: no se toca.
 inline bool Shuffle(const std::string& path, std::vector<uint8_t>& bytes) {
-	if (!InScope(Detail::Lower(MapName(path)))) return false; // (rando24) solo Boletaria
+	if (!InScope(Detail::Lower(MapName(path)))) return false; // (rando28) mundos 1-5
 	if (FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
 	if ((CrossWorldsOn() || DemonioOn()) && !RedirectRead(path).empty()) return false; // la copia ya va barajada
 	return ShuffleBytes(MapName(path), bytes);
