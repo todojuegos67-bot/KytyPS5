@@ -46,49 +46,6 @@ inline std::atomic<uint64_t> g_rb_wait {0}, g_rb_copy {0}, g_rb_release {0}, g_r
 // (sync6) Paginas de la ventana de la lectura de vuelta de una falta: muertas segun la tabla / vivas. Solo mide.
 inline std::atomic<uint64_t> g_win_dead {0}, g_win_live {0};
 
-// (sync7) KYTY_PUTIN_MUERTAS (sin variable o 0: como antes; 1 encendido; 2 A/B cada 5 s con KYTY_TECHO). En la lectura
-// de vuelta de una falta de escritura, las paginas de la ventana (no la de la falta) cuyo contenido de la GPU esta
-// entero en granulos muertos (PageDead: todo lo que la GPU escribio alli lo ha vuelto a entregar el asignador de frame
-// despues) no ponen sus bytes guardados en el hilo del juego: se quedan a su falta o al hilo de liberaciones (raiz8).
-// Las vivas, igual que siempre. T57: 470 muertas / 325 vivas por fotograma.
-// Seguridad: esos bytes guardados son de la GPU y estan en granulos muertos; quien los lea antes del put-in (una ventana
-// del emulador sobre la pagina sin acceso, o un memcpy del runtime) ve los bytes anteriores de memoria que ningun dueno
-// vivo tiene escrita (si el dueno nuevo la hubiera escrito, su escritura habria fallado y aplicado el put-in antes). El
-// cierre de sync4 (puntero = -1.0f) necesitaba datos VIVOS viejos: aqui no hay. Verificacion: 1 de cada 16 muertas se
-// pone igual en el hilo del juego (contada), y se cuentan las que luego aplica una falta del juego sobre ellas.
-inline thread_local bool t_falta_escritura = false;
-inline std::atomic<int>  g_pm_mode {-1};
-inline std::atomic<bool> g_pm_now {false};
-inline std::atomic<uint64_t> g_pm_deferred {0}, g_pm_verified {0}, g_pm_fault_applied {0}, g_pm_sample {0};
-[[nodiscard]] inline int PmMode() noexcept {
-	int m = g_pm_mode.load(std::memory_order_relaxed);
-	if (m >= 0) return m;
-	const char* v = std::getenv("KYTY_PUTIN_MUERTAS");
-	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
-	g_pm_now.store(m == 1, std::memory_order_relaxed);
-	g_pm_mode.store(m, std::memory_order_relaxed);
-	std::printf("[faltas-reciclado] KYTY_PUTIN_MUERTAS=%d: %s\n", m,
-	            m == 1 ? "encendido (paginas muertas de la ventana sin put-in en el hilo del juego)" : m == 2 ? "A/B cada 5 s" : "apagado (como antes)");
-	std::fflush(stdout);
-	return m;
-}
-[[nodiscard]] inline bool PmActive() noexcept {
-	return t_falta_escritura && PmMode() != 0 && g_pm_now.load(std::memory_order_relaxed);
-}
-// Paginas aplazadas (una tabla pequena con perdida: solo para contar las que luego aplica una falta).
-constexpr size_t PmSlots = 8192;
-inline std::atomic<uint64_t> g_pm_pages[PmSlots] {};
-inline void PmNote(uint64_t page) noexcept {
-	g_pm_pages[static_cast<size_t>(((page >> 12u) * 0x9E3779B97F4A7C15ull) >> 51u) % PmSlots].store(page + 1, std::memory_order_relaxed);
-}
-inline void PmFaultApplied(uint64_t vaddr) noexcept {
-	const uint64_t page = vaddr & ~uint64_t {0xfff};
-	auto&          slot = g_pm_pages[static_cast<size_t>(((page >> 12u) * 0x9E3779B97F4A7C15ull) >> 51u) % PmSlots];
-	uint64_t       want = page + 1;
-	if (slot.load(std::memory_order_relaxed) == want && slot.compare_exchange_strong(want, 0, std::memory_order_relaxed))
-		g_pm_fault_applied.fetch_add(1, std::memory_order_relaxed);
-}
-
 inline std::atomic<int>  g_mode {-1};
 inline std::atomic<bool> g_now {false}, g_off {false};
 [[nodiscard]] inline int Mode() noexcept {

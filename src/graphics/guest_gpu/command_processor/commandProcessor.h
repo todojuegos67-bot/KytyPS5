@@ -118,7 +118,6 @@ public:
 	[[nodiscard]] uint32_t TryNativeDirectDraw(std::span<const uint32_t> packet);
 	// A DRAW_INDEX_AUTO of a triangle list or strip as a table draw: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeAutoDraw(std::span<const uint32_t> packet);
-	[[nodiscard]] uint32_t TryNativeIndirectDraw(std::span<const uint32_t> packet); // (ti1, KYTY_TABLA_INDIRECTO)
 	// A DRAW_INDEX_INDIRECT_MULTI of a count it holds, as that many DRAW_INDEX_INDIRECT: the packet's dwords, or 0.
 	[[nodiscard]] uint32_t TryNativeMultiDraw(std::span<const uint32_t> packet);
 	uint32_t TryDrawIndirectRun(std::span<const uint32_t> packets);

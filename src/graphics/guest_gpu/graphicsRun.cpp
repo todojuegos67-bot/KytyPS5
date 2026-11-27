@@ -63,7 +63,6 @@
 #include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
 #include "render1.h" // (render1 F0+F1)
 #include "local/normal-why.h" // (vg1)
-#include "local/tabla-indirecto.h" // (ti1)
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
@@ -2925,23 +2924,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					continue;
 				}
 				if (spec != nullptr) return refuse("draw");
-			} else if (packet_header == 0xc0032400u && spec == nullptr && TablaIndirecto::Try() &&
-			           !GraphicsRunDebugDumpEnabled()) {
-				// (ti1, KYTY_TABLA_INDIRECTO) Un DRAW_INDIRECT no indexado por la tabla (el normal guarda el par).
-				G1::WalkMark(G1::WObserved);
-				NormalWhy::t_why = NormalWhy::Table;
-				const uint64_t ti_t0    = TablaIndirecto::Now();
-				const auto     consumed = TryNativeIndirectDraw({packet, remaining_dw});
-				G1::WalkMark(G1::WTried);
-				if (consumed) {
-					TablaIndirecto::g_table.fetch_add(1, std::memory_order_relaxed);
-					TablaIndirecto::g_table_ns.fetch_add(TablaIndirecto::Now() - ti_t0, std::memory_order_relaxed);
-					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
-					execution.m_made_progress = true;
-					GetScheduler().CompleteDraws(1);
-					continue;
-				}
-				TablaIndirecto::g_refused.fetch_add(1, std::memory_order_relaxed);
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
@@ -3009,12 +2991,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			NormalWhy::t_why = NormalWhy::NoTry;
 		uint32_t packet_dw = 0;
 		if (spec == nullptr) {
-			const uint64_t ti_t0 = opcode == Pm4::IT_DRAW_INDIRECT && TablaIndirecto::Mode() != 0 ? TablaIndirecto::Now() : 0; // (ti1)
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-			if (ti_t0 != 0) {
-				TablaIndirecto::g_normal.fetch_add(1, std::memory_order_relaxed);
-				TablaIndirecto::g_normal_ns.fetch_add(TablaIndirecto::Now() - ti_t0, std::memory_order_relaxed);
-			}
 		} else {
 			// What would submit or wait for the GPU refuses the packet.
 			try {
@@ -3691,55 +3668,6 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 #endif
 }
 
-// (ti1, KYTY_TABLA_INDIRECTO; local/tabla-indirecto.h) DRAW_INDIRECT no indexado por la tabla: lo que acepta
-// CpOpDrawIndirect y TryGpuIndirectDraw dibuja en la GPU (argumentos alineados, mapeados, no de una imagen), de un tipo
-// que la tabla dibuja tal cual (lista / tira de triangulos, como TryNativeAutoDraw). La tabla emite drawIndirect sobre el
-// bufer de los argumentos: cuentas, primer vertice y primera instancia los pone la GPU, como en el camino normal.
-uint32_t CommandProcessor::TryNativeIndirectDraw(std::span<const uint32_t> packet) {
-	LiveCensus::Scope census(LiveCensus::NativeXpr, 2);
-	TrustedDepth::ClassClock class_clock(2);
-#ifdef KYTY_LOCAL_VULKAN_RECORDING
-	using Prospero::PrimitiveType;
-	const auto primitive = m_ucfg.GetPrimType();
-	if (packet.size() < 5 || packet[0] != 0xc0032400u || (packet[4] & ~0x20u) != 2u || m_draw_indirect_args_base_addr == 0 ||
-	    (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() ||
-	    Render1::On() ||
-	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip))
-		return 0;
-	const uint64_t args = m_draw_indirect_args_base_addr + packet[1];
-	auto&          resources = GetGpuResources();
-	if ((args & 3u) != 0 || !resources.IsMapped(args, sizeof(DrawIndirectArgs)) ||
-	    resources.GetTextureCache().IsRegionGpuModified(args, sizeof(DrawIndirectArgs)))
-		return 0;
-	if (DecalTakesNormalPath(m_ctx)) {
-		m_renderer.GetRenderExecutor().NativeXprForgetState();
-		return 0;
-	}
-	CheckBuffer();
-	// KYTY_RENDER_ASPECT: como DrawIndexAuto con los argumentos en la GPU (cuenta 1); varias areas van por el normal.
-	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), 1));
-	if (hud.Several()) return 0u;
-	std::optional<HudAnchor::Scope>        anchor;
-	std::optional<HudAnchor::StretchScope> widen;
-	if (hud.Single()) {
-		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
-	} else if (hud.marker) {
-		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), HudAnchor::MarkerArea, false);
-	} else {
-		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
-		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
-	}
-	RenderExecutor::NativeXprDirectDraw draw {0, 1, 1, false};
-	draw.indirect_args = args;
-	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
-	           ? 5u
-	           : 0u;
-#else
-	(void)packet;
-	return 0;
-#endif
-}
-
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
 	constexpr uint32_t max_draws = 64;
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) return 0; // one record per draw while a frame is recorded
@@ -4280,7 +4208,6 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		CheckBuffer();
 		frame_num = m_renderer.GetGpu().GetFrameNum();
 		VgeoNativo::OnFrame(frame_num); // (w11)
-		TablaIndirecto::OnFrame(frame_num); // (ti1)
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.load(std::memory_order_relaxed) < 1024 && log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
