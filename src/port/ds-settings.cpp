@@ -1553,6 +1553,13 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		std::string pool_mb = env.Get("KYTY_DS_TEXTURE_POOL_MB");
 		const int   vram_gb = s.simulate_vram8 ? 8 : static_cast<int>((pc.vram + (512ull << 20)) >> 30);
 		if (false && pool_mb.empty() && vram_gb > 0) pool_mb = vram_gb <= 8 ? "3072" : "4096";
+		// (SPILL2, 11-27) Con KYTY_VRAM_RAM_SPILL=1 en tarjetas de 8 GB o menos: pool del juego 2560 MiB. Ghidra 0xac9d80
+		// (releido 11-27): presupuesto = pool<<20 - fijo (mgr+0x286048), min con lo libre de su monton (0x80d540); si no cabe,
+		// pasada 1 (orden 0xacc070 modo 3) baja SOLO las texturas con mas mip del pedido (FUN_00901200 tamano actual vs
+		// FUN_009015e0 tamano al mip deseado) y para en cuanto cabe; la pasada 2 (todo a mip 0) solo si aun falta. Log
+		// 20261127-102325 (pool 8192): nativas 2130 MiB (pico 2418), VRAM 6365-6764 sobre el tope 6451 -> el recolector
+		// expulsaba y resubia 228-1928 MiB cada 5 s. Asi es el juego quien deja de subir mips lejanos, como un juego de PC.
+		if (pool_mb.empty() && vram_gb > 0 && vram_gb <= 8 && env.Get("KYTY_VRAM_RAM_SPILL") == "1") pool_mb = "2560";
 		if (!pool_mb.empty() && pool_mb != "0") {
 			env.AppendConvars("texturePoolSizeMiBs=" + pool_mb);
 			std::printf("[texpool] pool de texturas del juego %s MiB (texturePoolSizeMiBs, de fabrica 8192) para %d GB de VRAM\n", pool_mb.c_str(), vram_gb);

@@ -7647,11 +7647,21 @@ void TextureCache::NativeRingCollect() {
 // en la VRAM tal cual. Cualquier perdida de bytes con el modo encendido (c_lost_bytes sube) sale como VIOLACION en el log.
 // RAM: no se baja nada con la RAM disponible < SpillRamMinMiB (el juego ya degrada con sus mips; nunca al disco).
 namespace RamSpill {
-constexpr uint64_t SpillTicks      = 600;  // ~10 s sin usarse
-constexpr uint64_t StartPerFlipMiB = 48;   // como mucho por fotograma (copia GPU, sin espera)
+// (SPILL2, 11-27, log 20261127-102325) Las 146 bajadas (465 MiB) coincidieron con los tirones de 237-437 ms (s 52-54):
+// escribir 320 MiB en la RAM en un fotograma + resubidas inmediatas. Ahora: solo lo frio de verdad (30 s), como mucho
+// 24 MiB escritos por fotograma, nada que se resubio hace < 60 s ni que ya se bajo hace < 180 s (sin ping-pong), suelo de
+// RAM 1536 MiB (la reserva del sistema; 2560 bloqueo casi todo en un PC de 16 GB) y RAM sin presion de ram-guard.
+constexpr uint64_t SpillTicks      = 1800; // ~30 s sin usarse
+constexpr uint64_t WritePerFlipMiB = 24;
+constexpr uint64_t RedemoteMs      = 180000;
+constexpr uint64_t StartPerFlipMiB = 24;   // como mucho por fotograma (copia GPU, sin espera)
 constexpr uint64_t InFlightMaxMiB  = 192;  // descargas en vuelo
 constexpr uint64_t MaxImageMiB     = 64;
-constexpr uint64_t SpillRamMinMiB  = 2560; // RAM disponible minima para bajar (RamReservaMiB 1536 + margen)
+constexpr uint64_t SpillRamMinMiB  = 1536; // RAM disponible minima para bajar (RamReservaMiB)
+static std::unordered_map<uint64_t, uint64_t> bajada_ms; // direccion -> ms de su ultima bajada (hilo de render)
+// (SPILL-AB) KYTY_VRAM_RAM_SPILL_AB=1: cada 10 s encendido/apagado; por modo fotogramas, peor, > 50 y > 100 ms.
+struct AbModo { uint64_t n = 0, sum_us = 0, peor_us = 0, s50 = 0, s100 = 0; };
+static AbModo ab[2];
 constexpr int      OnPct = 97, GoalPct = 92;
 struct Job {
 	ImageId                 id;
@@ -7683,12 +7693,46 @@ void TextureCache::RamSpillPass(uint64_t tick) {
 	using namespace RamSpill;
 	if (!RamSpill::On(m_graphics)) return;
 	if (CommandScheduler::ThreadRecorder() != nullptr || CommandScheduler::InDeferredOperation()) return;
+	static const bool ab_on = [] {
+		const char* v = std::getenv("KYTY_VRAM_RAM_SPILL_AB");
+		return v != nullptr && v[0] == '1';
+	}();
+	const uint64_t ahora_ms = VramReparto::NowMs();
+	if (ab_on) {
+		static uint64_t prev_us = 0, t0_ms = ahora_ms, fase_vista = 0;
+		const uint64_t  now_us  = ahora_ms * 1000; // (resolucion de ms basta para > 50 ms)
+		const uint64_t  fase    = (ahora_ms - t0_ms) / 10000;
+		const int       modo    = static_cast<int>(fase & 1u) == 0 ? 1 : 0; // fase par: encendido
+		if (prev_us != 0 && fase == fase_vista) {
+			const uint64_t d = now_us - prev_us;
+			auto&          m = ab[modo];
+			m.n++, m.sum_us += d, m.peor_us = std::max(m.peor_us, d);
+			if (d > 50000) m.s50++;
+			if (d > 100000) m.s100++;
+		}
+		prev_us = now_us;
+		if (fase != fase_vista) {
+			fase_vista = fase;
+			const auto& on = ab[1];
+			const auto& of = ab[0];
+			std::printf("[vram-ram-ab] ahora %s | ENCENDIDO: %llu fot, media %.1f ms, peor %llu ms, >50 ms %llu, >100 ms %llu | "
+			            "APAGADO: %llu fot, media %.1f ms, peor %llu ms, >50 ms %llu, >100 ms %llu\n",
+			            (fase & 1u) == 0 ? "ENCENDIDO" : "APAGADO", static_cast<unsigned long long>(on.n),
+			            on.n ? on.sum_us / 1000.0 / on.n : 0.0, static_cast<unsigned long long>(on.peor_us / 1000),
+			            static_cast<unsigned long long>(on.s50), static_cast<unsigned long long>(on.s100),
+			            static_cast<unsigned long long>(of.n), of.n ? of.sum_us / 1000.0 / of.n : 0.0,
+			            static_cast<unsigned long long>(of.peor_us / 1000), static_cast<unsigned long long>(of.s50),
+			            static_cast<unsigned long long>(of.s100));
+			std::fflush(stdout);
+		}
+		if (modo == 0) return; // apagado: ni bajadas nuevas ni escrituras (lo en vuelo espera, sus comprobaciones siguen)
+	}
 	constexpr uint64_t MiBv = uint64_t {1} << 20u;
 	static uint64_t    lost0 = TexNativa::c_lost_bytes.load(std::memory_order_relaxed);
 	// 1) Terminar las descargas que la GPU ya acabo (sin esperar nunca).
-	uint64_t inflight = 0;
+	uint64_t inflight = 0, escrito = 0;
 	for (auto it = jobs.begin(); it != jobs.end();) {
-		if (!m_scheduler.IsFree(it->tick)) {
+		if (!m_scheduler.IsFree(it->tick) || escrito >= WritePerFlipMiB * MiBv) {
 			inflight += it->buf->Size();
 			++it;
 			continue;
@@ -7717,6 +7761,8 @@ void TextureCache::RamSpillPass(uint64_t tick) {
 			}
 		}
 		if (!ok) continue; // INVARIANTE: la imagen sigue en la VRAM, intacta
+		escrito += j.buf->Size();
+		bajada_ms[base] = ahora_ms;
 		uint64_t bytes = 0;
 		for (const auto& [b, e]: owned) {
 			(void)TexNativa::ForgetReleased(b, e, true);
@@ -7739,7 +7785,8 @@ void TextureCache::RamSpillPass(uint64_t tick) {
 	static bool activo = false;
 	if (uso * 100 >= tope * OnPct) activo = true;
 	if (uso * 100 < tope * GoalPct) activo = false;
-	const bool ram_ok = RamGuard::AvailablePhysical() == 0 || (RamGuard::AvailablePhysical() >> 20u) >= SpillRamMinMiB;
+	const bool ram_ok = RamGuard::PressureLevel() == RamGuard::None &&
+	                    (RamGuard::AvailablePhysical() == 0 || (RamGuard::AvailablePhysical() >> 20u) >= SpillRamMinMiB);
 	if (activo && ram_ok && tick > SpillTicks && inflight < InFlightMaxMiB * MiBv) {
 		uint64_t           started = 0;
 		const uint64_t     goal    = uso > tope * GoalPct / 100 ? uso - tope * GoalPct / 100 : 0;
@@ -7752,6 +7799,9 @@ void TextureCache::RamSpillPass(uint64_t tick) {
 				return false;
 			for (const auto& j: jobs)
 				if (j.id == id) return false;
+			if (VramReparto::ReupReciente(im->info.data.address, ahora_ms)) return false; // (SPILL2) volvio hace < 60 s
+			if (const auto b = bajada_ms.find(im->info.data.address); b != bajada_ms.end() && ahora_ms - b->second < RedemoteMs)
+				return false; // (SPILL2) sin ping-pong
 			pick.push_back(id);
 			started += SparseBoundBytes(im->backing);
 			return started >= std::min(goal, StartPerFlipMiB * MiBv);
@@ -7821,6 +7871,7 @@ void TextureCache::RamSpillPass(uint64_t tick) {
 		            static_cast<unsigned long long>(c_violacion), lost > lost0 ? " (bytes perdidos: c_lost_bytes subio)" : "");
 		std::fflush(stdout);
 		lost0 = lost;
+		std::erase_if(bajada_ms, [&](const auto& kv) { return ahora_ms - kv.second >= RedemoteMs; });
 		l_n = c_dem_n, l_b = c_dem_bytes, l_ru = ru, l_rub = rub;
 	}
 }
