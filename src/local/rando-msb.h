@@ -2868,8 +2868,8 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 }
 
 // (demonio) Una sola parte: el soldado c2000_0000 de m02_00_00_00 pasa a ser el Vanguard de m03_01_00_00 (c1030_0000)
-// y se pone en el centro del primer patio tras la archipiedra (14.8, 21.2, -124.5; colision 766 y grupos del soldado
-// en el MSB original). Antes: arena de la Falange (colision 820): log 20261127-034836-921 sin ninguna linea de 0x359990.
+// como COPIA de tipo en el hueco del soldado (9.1, 21.2, -126.0, colision 766, primer patio): regla del usuario, nunca se
+// mueve nada (moverlo rompe el juego). Antes: centro del patio / arena de la Falange movidos.
 // Sin patrulla, sin estado pasivo. Va ENCIMA de lo que haya hecho el randomizer (fuertes /
 // barajado): |msb| y |cg| entran ya construidos (vacios: los originales).
 // Log 20261127-032608-861: con el modelo c1030 METIDO en la tabla de modelos del MSB (indices de modelo corridos) no
@@ -2884,7 +2884,6 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	static const char* kTarget   = "c2000_0000";
 	static const char* kDonorMap = "m03_01_00_00";
 	static const char* kDonor    = "c1030_0000";
-	static const float kSpot[3]  = {14.8f, 21.2f, -124.5f}; // centro del primer patio (entre c2000_0000 y c2000_0002)
 	if (map != "m02_00_00_00") return false;
 	auto fail = [&](const char* why) {
 		std::printf("[demonio] %s: %s; el Vanguard no se pone\n", map.c_str(), why);
@@ -2906,11 +2905,10 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	auto& models = t[0].blobs;
 	auto& parts  = t[3].blobs;
 
-	size_t pi = ps.size();
-	for (size_t i = 0; i < ps.size(); i++)
-		if (ps[i].name == kTarget && ModelName(models[static_cast<size_t>(ps[i].model)]) == "c2000") pi = i;
-	if (pi == ps.size()) return fail("no esta el soldado c2000_0000");
-	// Colision, grupos +0x44 y giro del sitio: los del soldado en el MSB ORIGINAL (el randomizer puede haberlo movido).
+	// Hueco: el sitio del soldado c2000_0000 en el MSB ORIGINAL (9.1, 21.2, -126.0; primer patio). No se mueve nada:
+	// la parte que el randomizer haya dejado en ese sitio (o el propio soldado) conserva sitio, colision, grupos, patrulla
+	// y matriz del cgpr; solo cambia su TIPO (modelo c1030 / NpcParam 103001 / typedata en el gancho, recursos de
+	// personaje del cgpr del Vanguard).
 	std::vector<uint8_t>   omsb;
 	std::vector<Table>     ot;
 	std::vector<EnemyPart> ops;
@@ -2919,10 +2917,22 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	for (size_t i = 0; i < ops.size(); i++)
 		if (ops[i].name == kTarget) oi = i;
 	if (oi == ops.size()) return fail("no esta el soldado en el MSB original");
+	float slot[3];
+	std::memcpy(slot, ot[3].blobs[ops[oi].index].data() + 0x20, 12);
+	size_t pi = ps.size();
+	for (size_t i = 0; i < ps.size(); i++) {
+		float q[3];
+		std::memcpy(q, parts[ps[i].index].data() + 0x20, 12);
+		const float dx = q[0] - slot[0], dy = q[1] - slot[1], dz = q[2] - slot[2];
+		if (dx * dx + dy * dy + dz * dz < 0.25f) pi = i;
+	}
+	if (pi == ps.size()) return fail("no hay ninguna parte en el sitio del soldado");
+	const std::string sname = ps[pi].name;
+	const std::string smodel = ModelName(models[static_cast<size_t>(ps[pi].model)]);
 	size_t         top = 0;
-	const Cg::Rec* tr  = TopByName(tf, kTarget, &top);
+	const Cg::Rec* tr  = TopByName(tf, sname, &top);
 	if (tr == nullptr || !Cg::RootInfo(tf, *tr).ok || Cg::RootInfo(tf, *tr).part != ps[pi].index)
-		return fail("el soldado no tiene su entidad en el cgpr");
+		return fail("la parte del sitio no tiene su entidad en el cgpr");
 
 	size_t dpi = dps.size();
 	for (size_t i = 0; i < dps.size(); i++)
@@ -2940,41 +2950,23 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	for (const auto& m: models)
 		if (BI32(m, 0x8) == 2 && ModelName(m) == "c1030") return fail("c1030 ya esta en el mapa");
 
-	// Sitio: centro del primer patio (lógica en el MSB), colision 766 del soldado original.
-	const auto&  ap  = ot[3].blobs[ops[oi].index];
-	const size_t atd = ops[oi].td;
 	auto&        pb  = parts[ps[pi].index];
 	const size_t td  = ps[pi].td;
-	std::memcpy(pb.data() + 0x20, kSpot, 12);
-	const float rot[3] {0.0f, 0.0f, 0.0f}; // mismo giro que la matriz del cgpr (identidad)
-	std::memcpy(pb.data() + 0x2C, rot, 12);
-	std::memcpy(pb.data() + 0x44, ap.data() + 0x44, 32);
-	std::memcpy(pb.data() + td + 0x1C, ap.data() + atd + 0x1C, 4);
-	std::memset(pb.data() + td + 0x20, 0xFF, 24); // sin patrulla
-	pb[td + 0x14] = 0;                            // sin estado pasivo
-	std::vector<uint8_t> msb2 = BuildTables(t);
+	std::vector<uint8_t> msb2 = msb; // MSB sin tocar
 
-	// Aspecto: entidad entera del Vanguard, con la matriz en el sitio nuevo y el enlace al MSB del soldado.
+	// Aspecto: entidad entera del Vanguard con la matriz y el enlace al MSB de la parte del sitio (sin mover).
 	Cg::Swap sw {top, df, dtop};
-	sw.has_dest = true;
-	std::memset(sw.dest, 0, sizeof(sw.dest));
-	sw.dest[0] = sw.dest[4] = sw.dest[8] = 1.0f;
-	std::memcpy(sw.dest + 9, kSpot, 12);
 	std::vector<uint32_t> refs;
 	Cg::CollectRefs(df->tops[dtop], &refs);
-	const size_t           new_objs = tf.objs.size() + std::set<uint32_t>(refs.begin(), refs.end()).size();
-	std::vector<uint8_t>   cg2;
-	std::vector<Table>     check;
-	std::vector<EnemyPart> check_ps;
-	if (!Cg::Transplant(tf, {sw}, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) || !EnemyParts(check, &check_ps) ||
-	    check_ps.size() != ps.size())
-		return fail("el resultado no se relee bien");
+	const size_t         new_objs = tf.objs.size() + std::set<uint32_t>(refs.begin(), refs.end()).size();
+	std::vector<uint8_t> cg2;
+	if (!Cg::Transplant(tf, {sw}, &cg2) || !Cg::Check(cg2, new_objs)) return fail("el resultado no se relee bien");
 
 	HookSwap h;
 	h.has_pos = true;
-	std::memcpy(h.pos, kSpot, 12);
-	h.name = kTarget;
-	std::snprintf(h.orig_model, sizeof(h.orig_model), "c2000");
+	std::memcpy(h.pos, slot, 12);
+	h.name = sname;
+	std::snprintf(h.orig_model, sizeof(h.orig_model), "%s", smodel.c_str());
 	h.orig_npc = BI32(pb, td + 0xC);
 	std::snprintf(h.new_model, sizeof(h.new_model), "c1030");
 	std::memcpy(&h.new_npc, td_head + 0xC, 4);
@@ -2984,10 +2976,11 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 		std::lock_guard<std::mutex> lock(HookMutex());
 		HookSwaps().push_back(h);
 	}
-	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en el centro del primer patio "
-	            "(%.1f, %.1f, %.1f), colision %d; MSB sin cambio de modelo (lo cambia el gancho); cgpr %zu -> %zu objetos\n",
-	            map.c_str(), kTarget, h.orig_npc, h.new_npc, kDonorMap, kDonor, static_cast<double>(kSpot[0]),
-	            static_cast<double>(kSpot[1]), static_cast<double>(kSpot[2]), BI32(pb, td + 0x1C), tf.objs.size(), new_objs);
+	std::printf("[demonio] %s: hueco del soldado c2000_0000 (%.1f, %.1f, %.1f), colision %d: alli esta %s (%s, npc %d) -> tipo "
+	            "Vanguard c1030 npc %d (entidad de %s %s); nada se mueve, MSB sin tocar (el tipo lo cambia el gancho); cgpr %zu -> %zu "
+	            "objetos\n",
+	            map.c_str(), static_cast<double>(slot[0]), static_cast<double>(slot[1]), static_cast<double>(slot[2]), BI32(pb, td + 0x1C),
+	            sname.c_str(), smodel.c_str(), h.orig_npc, h.new_npc, kDonorMap, kDonor, tf.objs.size(), new_objs);
 	std::fflush(stdout);
 	msb_io->swap(msb2);
 	cgpr_io->swap(cg2);
