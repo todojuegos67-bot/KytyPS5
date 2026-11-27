@@ -1077,6 +1077,13 @@ __attribute__((sysv_abi, noinline)) inline void DemonioTraceRemove(uint64_t a, u
 __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t, uint64_t list, uint64_t, uint64_t) {
 	if (!GuestPtrOk(list)) return;
 	const int32_t nmaps = *reinterpret_cast<const int32_t*>(list + 0x10);
+	{
+		static std::atomic<int> calls {0};
+		if (calls.fetch_add(1) < 20) {
+			std::printf("[rando] 0xef430 (scripts de IA): %d mapas\n", nmaps);
+			std::fflush(stdout);
+		}
+	}
 	if (nmaps <= 0 || nmaps > 64) return;
 	std::lock_guard<std::mutex> lock(HookMutex());
 	for (int32_t m = 0; m < nmaps; m++) {
@@ -1103,7 +1110,7 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 			const int32_t npc = *reinterpret_cast<const int32_t*>(td + 0xC);
 			std::string   pname;
 			for (const auto& h: HookSwaps()) {
-				if (h.dead || !h.has_pos || npc != h.orig_npc) continue;
+				if (h.dead || !h.has_pos || (npc != h.orig_npc && npc != h.new_npc)) continue;
 				if (pname.empty()) pname = GuestStr(reinterpret_cast<const char*>(name_p));
 				if (pname != h.name) continue;
 				float pp[3];
@@ -1112,7 +1119,10 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 				if (dx * dx + dy * dy + dz * dz >= 1.0f) continue;
 				std::memcpy(reinterpret_cast<void*>(td), h.td_head, sizeof(h.td_head));
 				std::memcpy(reinterpret_cast<void*>(td + 0x18), h.td_init, sizeof(h.td_init));
-				if (DemonioOn() && h.name == DemonioTarget())
+				if (npc == h.new_npc) { // ya llevaba el tipo nuevo (log 060503: sin linea de 0xef430 y c1030 al crear)
+					std::printf("[%s] 0xef430 (IA): %s ya lleva npc %d (%s) al elegir los scripts\n",
+					            DemonioOn() && h.name == DemonioTarget() ? "demonio" : "rando", pname.c_str(), npc, h.new_model);
+				} else if (DemonioOn() && h.name == DemonioTarget())
 					std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d antes de elegir los scripts; el juego "
 					            "cargara la IA del Vanguard (logica 10000, batalla 103001)\n",
 					            pname.c_str(), h.orig_npc, h.new_npc);
@@ -3577,6 +3587,136 @@ inline void NoteLoad(const std::string& map, RedirectEntry& e) {
 	std::fflush(stdout);
 }
 
+// (demonio/mundos) Ghidra: FUN_000ef430 (desde FUN_000f13a0, "ai:/ai_script.loadlist") carga por cada parte del mapa
+// "ai:/out/%06d_logic.lua" / "_battle.lua" (FUN_000ef990 / FUN_000efad0) del archivo del area ("script:/m%02d.luabnd").
+// m02.luabnd (Boletaria, BND3 sin comprimir, 66 archivos) NO trae 103001_battle.lua (el Vanguard, solo en m03.luabnd):
+// con el tipo bien puesto el juego no encuentra su script de combate y el Vanguard se queda quieto. Lo mismo para los
+// enemigos de otros mundos (MUNDOS SI). Se sirve una copia de m02.luabnd con los ai\out\*.lua que le faltan, sacados
+// de los luabnd de las otras areas (el primero que lo tenga); lo demas, byte a byte igual.
+struct BndFile {
+	uint32_t             flags = 0;
+	int32_t              id    = 0;
+	std::string          name;
+	std::vector<uint8_t> data;
+};
+
+inline bool ParseBnd3(const std::vector<uint8_t>& b, std::vector<BndFile>* out) {
+	if (b.size() < 0x20 || std::memcmp(b.data(), "BND3", 4) != 0 || b[0xC] != 0x74 || b[0xD] != 0 || b[0xE] != 0) return false;
+	uint32_t n = 0;
+	std::memcpy(&n, b.data() + 0x10, 4);
+	if (n == 0 || n > 100000 || 0x20 + static_cast<uint64_t>(n) * 0x18 > b.size()) return false;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t v[6];
+		std::memcpy(v, b.data() + 0x20 + i * 0x18, sizeof(v)); // flags, tamano, offset, id, nombre, tamano sin comprimir
+		if (v[1] != v[5] || static_cast<uint64_t>(v[2]) + v[1] > b.size() || v[4] >= b.size()) return false;
+		BndFile f;
+		f.flags = v[0];
+		std::memcpy(&f.id, &v[3], 4);
+		for (size_t k = v[4]; k < b.size() && b[k] != 0; k++) f.name.push_back(static_cast<char>(b[k]));
+		f.data.assign(b.begin() + v[2], b.begin() + v[2] + v[1]);
+		out->push_back(std::move(f));
+	}
+	return true;
+}
+
+inline std::vector<uint8_t> BuildBnd3(const std::vector<uint8_t>& orig, const std::vector<BndFile>& fs) {
+	std::vector<uint8_t> b(orig.begin(), orig.begin() + 0x20); // cabecera original (version, formato)
+	const uint32_t       n = static_cast<uint32_t>(fs.size());
+	std::memcpy(b.data() + 0x10, &n, 4);
+	b.resize(0x20 + static_cast<size_t>(n) * 0x18, 0);
+	std::vector<uint32_t> noff(n);
+	for (uint32_t i = 0; i < n; i++) {
+		noff[i] = static_cast<uint32_t>(b.size());
+		b.insert(b.end(), fs[i].name.begin(), fs[i].name.end());
+		b.push_back(0);
+	}
+	const uint32_t hend = static_cast<uint32_t>(b.size());
+	std::memcpy(b.data() + 0x14, &hend, 4);
+	for (uint32_t i = 0; i < n; i++) {
+		b.resize((b.size() + 15) & ~static_cast<size_t>(15), 0);
+		const uint32_t v[6] {fs[i].flags, static_cast<uint32_t>(fs[i].data.size()), static_cast<uint32_t>(b.size()),
+		                     static_cast<uint32_t>(fs[i].id), noff[i], static_cast<uint32_t>(fs[i].data.size())};
+		std::memcpy(b.data() + 0x20 + i * 0x18, v, sizeof(v));
+		b.insert(b.end(), fs[i].data.begin(), fs[i].data.end());
+	}
+	return b;
+}
+
+inline bool IsAiScript(const std::string& name) {
+	std::string low = Lower(name);
+	for (auto& ch: low)
+		if (ch == '/') ch = '\\';
+	return low.find("\\ai\\out\\") != std::string::npos && low.size() > 4 && low.compare(low.size() - 4, 4, ".lua") == 0;
+}
+
+struct LuabndCopy {
+	bool                  done = false;
+	std::filesystem::path copy;
+	uint64_t              size = 0;
+};
+inline LuabndCopy& M02Luabnd() {
+	static LuabndCopy c;
+	return c;
+}
+
+// |real| = .../dvdroot/script/m02.luabnd. Copia hecha una vez (bajo RedirectMutex).
+inline const LuabndCopy& LuabndFor(const std::filesystem::path& real) {
+	auto& c = M02Luabnd();
+	if (c.done) return c;
+	c.done = true;
+	std::vector<uint8_t> orig;
+	std::vector<BndFile> fs;
+	if (!ReadWhole(real, &orig) || !ParseBnd3(orig, &fs)) {
+		std::printf("[rando] m02.luabnd: no se lee o formato no reconocido; scripts de IA originales\n");
+		std::fflush(stdout);
+		return c;
+	}
+	std::set<std::string> have;
+	int32_t               next_id = 0;
+	for (const auto& f: fs) {
+		have.insert(Lower(f.name));
+		next_id = std::max(next_id, f.id + 1);
+	}
+	const size_t n0 = fs.size();
+	bool         vang = false;
+	for (const char* area: {"m03", "m01", "m04", "m05", "m06", "m08"}) {
+		std::vector<uint8_t> d;
+		std::vector<BndFile> dfs;
+		if (!ReadWhole(real.parent_path() / (std::string(area) + ".luabnd"), &d) || !ParseBnd3(d, &dfs)) continue;
+		for (auto& f: dfs) {
+			if (!IsAiScript(f.name) || !have.insert(Lower(f.name)).second) continue;
+			if (Lower(f.name).find("103001_battle.lua") != std::string::npos) vang = true;
+			f.id = next_id++;
+			fs.push_back(std::move(f));
+		}
+	}
+	if (fs.size() == n0) return c;
+	const auto bytes = BuildBnd3(orig, fs);
+	std::vector<BndFile> check;
+	const auto dir = CopyDir();
+	const auto cp  = dir / "m02.luabnd";
+	if (!ParseBnd3(bytes, &check) || check.size() != fs.size() || dir.empty() || !WriteFile(cp, bytes)) {
+		std::printf("[rando] m02.luabnd: la copia no se pudo hacer; scripts de IA originales\n");
+		std::fflush(stdout);
+		return c;
+	}
+	c.copy = cp;
+	c.size = bytes.size();
+	std::printf("[rando] m02.luabnd: copia con %zu scripts de IA de otras areas (%zu -> %zu archivos, %zu -> %zu bytes)%s\n",
+	            fs.size() - n0, n0, fs.size(), orig.size(), bytes.size(),
+	            vang ? "; incluye 103001_battle.lua (combate del Vanguard, de m03.luabnd)" : "");
+	std::fflush(stdout);
+	return c;
+}
+
+inline bool IsM02LuabndPath(const std::string& path) {
+	std::string low = Lower(path);
+	for (auto& ch: low)
+		if (ch == '\\') ch = '/';
+	return low.size() > 18 && low.compare(low.size() - 18, 18, "/script/m02.luabnd") == 0;
+}
+inline bool LuabndOn() { return DemonioOn() || MundosOn(); }
+
 } // namespace Detail
 
 // Copia del MSB o del legacy_instances.cgpr con enemigos de otros mundos, o vacío si no hay. Se crea una vez por mapa.
@@ -3585,6 +3725,11 @@ inline std::filesystem::path RedirectRead(const std::string& path, int64_t offse
 	using namespace Detail;
 	if (!CrossOn()) return {};
 	if (DemonioOn() || MezclaHooksOn()) InstallModelProbe(); // ganchos y trazas antes de cargar ningun mapa
+	if (IsM02LuabndPath(path)) { // scripts de IA que le faltan a Boletaria (Vanguard, otros mundos)
+		if (!LuabndOn()) return {};
+		std::lock_guard<std::mutex> lock(RedirectMutex());
+		return LuabndFor(Utf8Path(path)).copy;
+	}
 	const bool msb = IsMsbPath(path);
 	const bool cg  = !msb && IsCgprPath(path);
 	if (!msb && !cg) return {};
@@ -3601,6 +3746,10 @@ inline std::filesystem::path RedirectRead(const std::string& path, int64_t offse
 
 inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 	if (RedirectRead(path).empty()) return std::nullopt;
+	if (Detail::IsM02LuabndPath(path)) {
+		std::lock_guard<std::mutex> lock(Detail::RedirectMutex());
+		return Detail::M02Luabnd().size;
+	}
 	const bool  msb = IsMsbPath(path);
 	std::string map = Detail::Lower(MapName(path));
 	if (!msb) map = map.substr(0, map.size() - std::string("_legacy_instances").size());
