@@ -19,19 +19,32 @@ from collections import Counter, defaultdict
 HEX = re.compile(r"^\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+(\d+)\s+(.*)$")
 
 
-def load_map(path):
+def load_map(path, base=0x140000000):
+    """lld-link /lldmap: 'Address Size Align Out In Symbol'. Addresses are RVAs (not VAs, unlike MSVC .map);
+    section lines have the name in the Out column, object lines 'obj:(.text)', symbol lines only the symbol.
+    Only symbols inside the .text output section are kept (data symbols such as $R00000A in .rsrc used to swallow
+    every exe sample). Returned addresses are VAs (base + RVA)."""
     syms = []
+    sec = None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = HEX.match(line)
             if not m:
                 continue
             rest = m.group(4).strip()
-            if not rest or rest.startswith(".") or ":(" in rest or rest.endswith(".obj") or rest.endswith(".lib"):
+            if not rest:
                 continue
             addr = int(m.group(1), 16)
-            if addr == 0:
+            # section line: name in the Out column (col 24); obj/symbol lines start further right. Symbol names
+            # may start with '.' too ('..@941.end' in nasm objects), so go by column, not by the leading dot.
+            col = line.index(rest)
+            if col < 30:
+                sec = rest
                 continue
+            if sec != ".text" or ":(" in rest or rest.endswith(".obj") or rest.endswith(".lib") or addr == 0:
+                continue
+            if addr < base:
+                addr += base
             syms.append((addr, int(m.group(2), 16), rest))
     syms.sort()
     return syms
@@ -104,7 +117,7 @@ def main():
     total, data = parse(a.perfil)
     if total == 0:
         sys.exit("sin muestras")
-    sym = Symbolizer(load_map(a.map), int(a.base, 16))
+    sym = Symbolizer(load_map(a.map, int(a.base, 16)), int(a.base, 16))
 
     self_f = Counter()
     for c, tok in data.get("raw self", []):
