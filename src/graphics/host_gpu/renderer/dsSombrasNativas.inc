@@ -536,7 +536,19 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 		// entradas.) Validacion propia: >= 20 cubos con skinning comparados seguidos, cada ventana >= 99,9 % iguales y
 		// "nativo mas cerca" = 0; una ventana peor la retira. Sin ella no se reemplaza nada en la cascada (sigue comparando).
 		if (s.skin_cubes[c] != 0) {
-			const bool skin_ok = pc(s.skin_eq[c], s.skin_total[c]) >= 99.9 && s.skin_native_near[c] == 0;
+			// (T39 11-27: tras d6591e84 el "nativo mas cerca" del skinning es 0,004-0,006 % de los pixeles con err_max
+			// 0,0006-0,0019 en cubos completos (T38, con el error de los vertices: 0,3-0,66). Con "= 0" no se validaba nunca y
+			// las cascadas 1 y 2 (todos sus cubos con skinning) dejaron de reemplazar. Ahora tambien vale: <= 0,01 % de pixeles
+			// con el nativo mas cerca y el mayor |nativo-juego| de esos <= 0,004 (KYTY_NATIVO_SOMBRAS_SKIN_ERR; 0 = como antes).)
+			static const float skin_err = [] {
+				const char* text = std::getenv("KYTY_NATIVO_SOMBRAS_SKIN_ERR");
+				const float v    = text != nullptr ? std::strtof(text, nullptr) : 0.004f;
+				return v >= 0.0f && v < 0.05f ? v : 0.004f;
+			}();
+			float nat_max = 0;
+			std::memcpy(&nat_max, &s.nat_max[c], 4);
+			const bool near_small = skin_err > 0.0f && pc(s.skin_native_near[c], s.skin_total[c]) <= 0.01 && nat_max <= skin_err;
+			const bool skin_ok    = pc(s.skin_eq[c], s.skin_total[c]) >= 99.9 && (s.skin_native_near[c] == 0 || near_small);
 			if (skin_ok) s.skin_ok_run[c] += s.skin_cubes[c];
 			else {
 				s.skin_ok_run[c] = 0;
