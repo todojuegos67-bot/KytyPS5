@@ -929,7 +929,7 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 					std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
 					const float dx = pp[0] - h.pos[0], dy = pp[1] - h.pos[1], dz = pp[2] - h.pos[2];
 					const bool  ok = dx * dx + dy * dy + dz * dz < 1.0f;
-					const bool vang = DemonioOn() && h.name == DemonioTarget() && h.owner == Fnv("demonio-jefe");
+					const bool vang = DemonioOn() && h.name == DemonioTarget() && h.owner == Detail::Fnv("demonio-jefe");
 					std::printf("[%s] crear parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f): %s%s\n", vang ? "demonio" : "rando", idx,
 					            pname.c_str(), model.c_str(), npc, static_cast<double>(pp[0]), static_cast<double>(pp[1]),
 					            static_cast<double>(pp[2]), ok ? (vang ? "ES EL DEL PATIO, pasa al jefe " : "es el hueco, pasa a ") : "otro mapa, no se toca",
