@@ -9059,6 +9059,12 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	RamSpillPass(tick); // (VRAM-RAM-SPILL)
+	if (tick == 0) { // (POOL8) que pool del juego se aplico (lo pone el lanzador: texturePoolSizeMiBs)
+		const char* pool = std::getenv("KYTY_DS_TEXTURE_POOL_MB");
+		std::printf("[texpool] pool de texturas del juego: %s MiB (texturePoolSizeMiBs; sin poner = 8192 de fabrica)\n",
+		            pool != nullptr && *pool != 0 ? pool : "8192");
+		std::fflush(stdout);
+	}
 	// Parked images not taken back since the flip before: the game left that use of the memory.
 	std::erase_if(m_parked, [&](auto& item) {
 		// (W10) La gemela de un pool de sombras (keep == CubeTwinKeep) ya no caduca por flips: solo se va con su memoria
@@ -9275,8 +9281,23 @@ void TextureCache::RunGarbageCollector() {
 		const uint64_t ut     = m_graphics.GetDeviceMemoryUsage();
 		// (VRAM-TOPE) Con el tope unico, el nivel 3 (expulsion) empieza al 98 % del tope efectivo y sigue hasta el 93 %.
 		const uint64_t tope_b = VramTope::On() ? VramTope::g_tope_bytes.load(std::memory_order_relaxed) : 0;
-		const uint64_t alto   = tope_b != 0 ? tope_b / 100 * VramTope::N3Pct : bt / 100 * VramDrv::TechoPct;
-		const uint64_t bajo   = tope_b != 0 ? tope_b / 100 * VramTope::N3LowPct : bt / 100 * VramDrv::TechoBajoPct;
+		uint64_t alto   = tope_b != 0 ? tope_b / 100 * VramTope::N3Pct : bt / 100 * VramDrv::TechoPct;
+		uint64_t bajo   = tope_b != 0 ? tope_b / 100 * VramTope::N3LowPct : bt / 100 * VramDrv::TechoBajoPct;
+		// (TECHO8, 11-27; KYTY_VRAM8_TECHO_TABLA=0 lo apaga) En tarjetas de <= 8 GB el techo es el tope de la tabla del usuario
+		// (8 GB -> 6,3 GB de uso del proceso; min con el presupuesto del driver - 128 MiB), con histeresis hasta el 95 %. Log
+		// 20261127-104731 (pool 2560): uso 6101-6235 MiB, [vram] 6838 -> techo 92 % = 6291 / 85 % = 5812: el recolector
+		// quedaba ACTIVO toda la partida (1498 expulsadas, 554 re-subidas, 1573 MiB) con el uso por debajo del tope 6451.
+		static const bool techo_tabla = [] {
+			const char* v = std::getenv("KYTY_VRAM8_TECHO_TABLA");
+			return !(v != nullptr && v[0] == '0');
+		}();
+		if (tope_b == 0 && techo_tabla && (VramCardBytes() >> 20u) != 0 && (VramCardBytes() >> 20u) <= 8704) {
+			uint64_t cap = GestorMem::TablaVramMiB(VramCardBytes() >> 20u) << 20u;
+			if (const uint64_t drv = VramDrv::g_drv_budget_bytes.load(std::memory_order_relaxed); drv > (uint64_t {128} << 20u))
+				cap = std::min(cap, drv - (uint64_t {128} << 20u));
+			alto = cap;
+			bajo = cap / 100 * 95;
+		}
 		bool           activo = VramDrv::g_activo.load(std::memory_order_relaxed);
 		if (!activo && ut > alto) {
 			activo = true;
