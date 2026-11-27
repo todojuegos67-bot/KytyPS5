@@ -41,6 +41,7 @@
 #include <map>
 #include <chrono>
 #include <vector>
+#include "rando-lua-region.h"
 
 namespace RandoMsb {
 
@@ -3705,33 +3706,21 @@ inline bool IsAiScript(const std::string& name) {
 	return low.find("\\ai\\out\\") != std::string::npos && low.size() > 4 && low.compare(low.size() - 4, 4, ".lua") == 0;
 }
 
-// (jefe) Ghidra: la funcion Lua IsInsideTargetRegion es FUN_000f6490 (registrada en 0x104973/0x104a01 como
-// "IsInsideTargetRegion") -> FUN_00201f90: busca la region por su id de entidad en el MSB cargado (FUN_0020d6d0) y si no
-// existe devuelve 0 (falso). 103001_battle.lua (Vanguard de m03_01) solo ataca si el jugador esta en las regiones 2275 /
-// 2276 del MSB de m03_01_00_00 ("debu103001Battle_IsEnableAttack") y solo persigue si esta en 2270 y el Vanguard fuera
-// de 2271. Ninguna existe en m02_00_00_00 (POINT_PARAM_ST de ambos MSB): en el patio la copia siempre "espera 1 s
-// mirando al objetivo" (GOAL_COMMON_Wait) y nunca pega. En la copia del script que va a otras areas esas pruebas de
-// region pasan a pruebas de distancia (persigue si esta a mas de 6 m, ataca siempre que el reparto por distancia lo
-// elija, vuelve a su sitio solo si se aleja mas de 15 m); los ataques (3000..3301) y sus repartos, sin tocar.
-inline bool SinRegionesVanguard(std::vector<uint8_t>* d) {
-	std::string t(d->begin(), d->end());
-	const std::pair<const char*, const char*> rep[] = {
-	    {"if ( ai:IsInsideTargetRegion(TARGET_ENE_0, 2270) ) then", "if ( true ) then"},
-	    {"if ( not(ai:IsInsideTargetRegion(TARGET_SELF, 2271)) ) then", "if ( 6 < ai:GetDist(TARGET_ENE_0) ) then"},
-	    {"if ( ai:IsInsideTargetRegion(TARGET_ENE_0, 2275) ) then return true; end", "if ( true ) then return true; end"},
-	    {"if ( ai:IsInsideTargetRegion(TARGET_ENE_0, 2276) ) then return true; end", ""},
-	    {"ai:AddObserveRegion( 0, TARGET_SELF, 2271 );", ""},
-	    {"TARGET_ENE_0, APPROACH_DIST, AI_DIR_TYPE_CENTER", "TARGET_ENE_0, 6, AI_DIR_TYPE_CENTER"},
-	    {"\tlocal BACKHOME_DIST = 3;", "\tlocal BACKHOME_DIST = 15;"},
-	};
-	for (const auto& r: rep) {
-		const size_t at = t.find(r.first);
-		if (at == std::string::npos || t.find(r.first, at + 1) != std::string::npos) return false;
-		t.replace(at, std::strlen(r.first), r.second);
-	}
-	if (t.find("IsInsideTargetRegion") != std::string::npos || t.find("ObserveRegion( 0") != std::string::npos) return false;
-	d->assign(t.begin(), t.end());
-	return true;
+// (rando-regiones) Pruebas de region de los scripts de IA: ver rando-lua-region.h (Ghidra, reglas). Sustituye a
+// SinRegionesVanguard (754ca7eb), que solo cubria 103001_battle.lua con su texto exacto.
+inline bool SinRegiones(BndFile* f, const std::string& self, const char* why) {
+	std::string           t(f->data.begin(), f->data.end());
+	Rando::Lua::RegionStats st;
+	const bool            ch = Rando::Lua::RewriteRegionCalls(&t, &st);
+	if (!ch && st.unknown == 0) return false;
+	std::string n = f->name;
+	if (const size_t k = n.find_last_of("\\/"); k != std::string::npos) n = n.substr(k + 1);
+	std::printf("[regiones] %s.luabnd: %s (%s): %d de region -> distancia (%d IsInsideTargetRegion, %d IsInsideObserveRegion, "
+	            "%d vuelta a casa a 15 m)%s%s\n",
+	            self.c_str(), n.c_str(), why, st.Total(), st.target, st.observe, st.home,
+	            st.unknown ? "; sin tocar (forma desconocida): " : "", st.unknown ? st.unknown_text.c_str() : "");
+	if (ch) f->data.assign(t.begin(), t.end());
+	return ch;
 }
 
 struct LuabndCopy {
@@ -3765,6 +3754,12 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real, const std:
 	}
 	const size_t n0 = fs.size();
 	bool         vang = false;
+	// (rando-regiones) Los enemigos normales (c2xxx / c3xxx) que la mezcla pone en otro hueco del mismo mapa siguen con
+	// su script y sus regiones existen, pero quedan lejos: misma reescritura para sus scripts 2xxxxx / 3xxxxx.
+	size_t own = 0;
+	if (MezclaOn() || MundosOn())
+		for (auto& f: fs)
+			if (IsAiScript(f.name) && Rando::Lua::MovedInOwnWorld(Lower(f.name)) && SinRegiones(&f, self, "mismo mundo, otro hueco")) own++;
 	for (const char* area: {"m03", "m02", "m01", "m04", "m05", "m06", "m08"}) {
 		if (self == area) continue;
 		std::vector<uint8_t> d;
@@ -3775,16 +3770,11 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real, const std:
 			for (const auto& j: Jefes())
 				if (Lower(f.name).find(std::to_string(j.battle) + "_battle.lua") != std::string::npos) vang = true;
 			f.id = next_id++;
-			if (self != "m03" && Lower(f.name).find("103001_battle.lua") != std::string::npos) {
-				const bool ok = SinRegionesVanguard(&f.data);
-				std::printf("[jefe] %s.luabnd: 103001_battle.lua: %s\n", self.c_str(),
-				            ok ? "pruebas de region de m03_01 (2270/2271/2275/2276) cambiadas por distancia: persigue y ataca"
-				               : "texto no reconocido, se deja el original (sin ataques fuera de m03_01)");
-			}
+			SinRegiones(&f, self, area); // fuera de su mundo ninguna de sus regiones existe
 			fs.push_back(std::move(f));
 		}
 	}
-	if (fs.size() == n0) return c;
+	if (fs.size() == n0 && own == 0) return c;
 	const auto bytes = BuildBnd3(orig, fs);
 	std::vector<BndFile> check;
 	const auto dir = CopyDir();
@@ -3820,7 +3810,7 @@ inline std::string AreaLuabndOf(const std::string& path) {
 	return InScope(area + "_") ? area : std::string();
 }
 // Vanguard (solo m02) o MUNDOS SI (cualquier mundo con donantes de otros mundos).
-inline bool LuabndOn(const std::string& area) { return MundosOn() || (DemonioOn() && area == "m02"); }
+inline bool LuabndOn(const std::string& area) { return MundosOn() || MezclaOn() || (DemonioOn() && area == "m02"); }
 
 } // namespace Detail
 
