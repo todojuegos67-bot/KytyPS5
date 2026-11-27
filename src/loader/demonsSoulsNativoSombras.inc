@@ -1068,8 +1068,10 @@ uint32_t NativoSombrasNatSummary(AgcCommandBuffer* commands, const uint32_t* beg
 	// repiten tal cual (5 dwords, en su orden; la GPU lee la misma tabla) ANTES del estado directo: exacto salvo si un
 	// registro directo es anterior a un indirecto que lo vuelve a poner (entonces el directo ganaria): se comprueba con
 	// los desplazamientos de la tabla y, si pasa, sin salto.
-	constexpr uint32_t           MaxInd      = 32;
-	const uint32_t*              ind[MaxInd];
+	// (T42 11-27: con 32, TECHO salto 2757 cubos y 5435 no por "demasiados paquetes indirectos".) Los paquetes se siguen
+	// repitiendo tal cual (la GPU lee la tabla cuando toca: puede escribirla la GPU, SyncCommandMemory); solo sube el tope.
+	constexpr uint32_t           MaxInd      = 2048;
+	static thread_local const uint32_t* ind[MaxInd];
 	uint32_t                     ind_n       = 0;
 	*why                                     = nullptr;
 	NativoSombrasMemoNew();
@@ -1161,7 +1163,7 @@ uint32_t NativoSombrasNatSummary(AgcCommandBuffer* commands, const uint32_t* beg
 	need += uc_n * 3;
 	// (Un indirecto identico a otro posterior sobra: el posterior deja los mismos valores encima.)
 	const auto ind_dup = [&](uint32_t i) {
-		for (uint32_t j = i + 1; j < ind_n; ++j)
+		for (uint32_t j = i + 1; j < ind_n && j < i + 65u; ++j) // (los 64 siguientes: O(n) con miles de indirectos)
 			if (std::memcmp(ind[i], ind[j], 5 * sizeof(uint32_t)) == 0) return true;
 		return false;
 	};
@@ -1274,6 +1276,7 @@ uint64_t NativoSombrasNatHook(uint64_t renderer, uint64_t list, uint64_t* ctx, i
 		const bool ok = dw <= H::NatSkipMaxDw && *reserve == H::NatSkipFiller &&
 		                (NativoSombrasNatSummary(commands, before, after, &skip_why) != 0 || skip_why == nullptr);
 		if (ok) *reserve = H::NatSkipNop(dw + 1u);
+		else H::NatCount(H::g_nat_info_why, skip_why != nullptr ? skip_why : "TECHO: cubo de mas de 0x4000 dwords o sin relleno");
 		const uint64_t n = (ok ? t_yes : t_no).fetch_add(1, std::memory_order_relaxed) + 1;
 		if (((t_yes.load(std::memory_order_relaxed) + t_no.load(std::memory_order_relaxed)) & 4095u) == 0)
 			std::printf("[nativo-sombras] TECHO cubos del sol saltados enteros=%llu no saltados=%llu (ultimo motivo: %s)\n",
