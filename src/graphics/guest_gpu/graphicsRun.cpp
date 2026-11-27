@@ -64,6 +64,7 @@
 #include "render1.h" // (render1 F0+F1)
 #include "local/normal-why.h" // (vg1)
 #include "local/tabla-indirecto.h" // (ti1)
+#include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -1601,6 +1602,10 @@ bool GuestGpu::Process(Submission& submission) {
 	const VgeoNativo::TargetScope vgeo_target(censo_dcb ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed) : 0);
 	// (w18) [censo-pm4]: tiempo por paquete PM4 y por fase en los bloques caros del censo.
 	const CensoPm4::SliceScope censo_pm4(censo_dcb ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed) : 0);
+	// (techo-escena, KYTY_TECHO_ESCENA=1/2, solo prueba) los draws de las DCB del pase de escena, saltados.
+	const TechoEscena::Scope techo_escena(censo_dcb && TechoEscena::Mode() != 0
+	                                          ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed)
+	                                          : 0);
 	// (envio1, KYTY_ENVIO1=1: a compute queue's submission, measured.)
 	const Envio1::AcbScope envio1_acb(submission.queue_id != 0);
 	const Envio2::GpuScope envio2_gpu(submission.queue_id != 0 && m_acb_spec != nullptr); // (envio2)
@@ -2323,6 +2328,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
+		// (techo-escena, solo prueba) un draw del pase de escena: ni traducido ni grabado.
+		if (TechoEscena::t_skip && spec == nullptr && !m_state_only && Pm4ClassOf(opcode) == LiveCensus::Pm4Draw &&
+		    (packet_header >> 30u) == 3u && KYTY_PM4_LEN(packet_header) <= remaining_dw) {
+			TechoEscena::g_skipped.fetch_add(1, std::memory_order_relaxed);
+			m_draw_run_skip = 0;
+			cursor.offset_dw += KYTY_PM4_LEN(packet_header);
 			execution.m_made_progress = true;
 			continue;
 		}

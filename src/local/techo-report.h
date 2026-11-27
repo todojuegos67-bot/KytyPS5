@@ -7,6 +7,7 @@
 #include "local/techo.h"
 #include "local/techo-faltas.h"
 #include "local/tabla-indirecto.h"
+#include "local/techo-escena.h"
 #include "local/normal-why.h"
 #include "local/ds-censo-dcb.h"
 #include "local/ds-censo-escena.h"
@@ -210,6 +211,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		            keep ? "" : " (arranque: fuera de la tabla)");
 		std::fflush(stdout);
 		TablaIndirecto::Window(busy, n * 1e3 / wall_ms, n, keep); // (ti1, KYTY_TABLA_INDIRECTO)
+		TechoEscena::Window(busy, n * 1e3 / wall_ms, n, keep);    // (techo-escena, solo prueba)
 		NormalWhy::Report(n);                                // (vg1, porque los draws van al camino normal)
 		TechoFaltas::Report(n, ms_cyc); // (techo-faltas: the game threads' faults, a line beside this one)
 		if (keep && flip_ns - last_table >= 30'000'000'000ll) {
