@@ -4972,6 +4972,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		const Techo::CohScope techo_scope(Techo::CProtect, LiveCensus::g_render); // (techo, KYTY_TECHO)
 		LiveCounters::Add(LiveCounters::ProtectCalls);
 		if (LiveCensus::g_render) {
 			LiveCounters::Add(LiveCounters::ProtectCallsRender);

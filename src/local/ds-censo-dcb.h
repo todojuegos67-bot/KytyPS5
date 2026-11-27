@@ -36,12 +36,14 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "local/techo.h" // (techo: KYTY_TECHO lo enciende)
+
 namespace DsCensoDcb {
 
 [[nodiscard]] inline bool On() {
 	static const bool on = [] {
 		const char* t = std::getenv("KYTY_CENSO_DCB");
-		return t != nullptr && t[0] == '1' && t[1] == '\0';
+		return Techo::On() || (t != nullptr && t[0] == '1' && t[1] == '\0');
 	}();
 	return on;
 }

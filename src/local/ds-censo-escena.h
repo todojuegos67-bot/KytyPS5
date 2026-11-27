@@ -35,6 +35,7 @@ namespace DsCensoEscena {
 [[nodiscard]] inline uint32_t Mode() {
 	static const uint32_t mode = [] {
 		const char* t = std::getenv("KYTY_NATIVO_PASE_ESCENA");
+		if (Techo::On() && (t == nullptr || t[0] == '\0' || t[0] == '0')) return 2u; // (techo)
 		if (t == nullptr || t[0] == '\0' || t[1] != '\0') return 0u;
 		return (t[0] == '1' || t[0] == '2' || t[0] == '3') ? 2u : 0u; // (solo mide por ahora)
 	}();

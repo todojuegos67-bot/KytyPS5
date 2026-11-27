@@ -13,6 +13,7 @@
 #include <x86intrin.h>
 
 #include "blackbox.h"
+#include "techo.h" // (techo: KYTY_TECHO enciende estos scopes)
 #include "otros1.h"
 #include "render5.h"
 #include "sync-stats.h"
@@ -69,7 +70,7 @@ inline constexpr const char* KindNames[Kinds] = {"dispatch", "draw", "xpr", "dis
 [[nodiscard]] inline bool RenderStatsOn() {
 	static const bool on = [] {
 		const char* text = std::getenv("KYTY_RENDER_STATS");
-		return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
+		return Techo::On() || (text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0'));
 	}();
 	return on;
 }

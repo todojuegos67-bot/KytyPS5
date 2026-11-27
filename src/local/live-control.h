@@ -46,6 +46,7 @@
 #include "perf-overlay.h"
 #include "slow-log.h"
 #include "time-census.h"
+#include "techo-report.h" // (techo, KYTY_TECHO)
 #include "ds-sombras-ab.h" // (sombras-ab, KYTY_NATIVO_SOMBRAS_AB)
 #include "trusted-depth.h" // (trust1)
 #include "native/g1-probe.h" // (g1, KYTY_G1_PROBE / KYTY_G1_STATE)
@@ -550,6 +551,7 @@ inline void Flip() {
 	LiveCensus::Par2::Flipped(); // (trust1: the two-thread what-if's frame ends at this flip)
 	TrustedDepth::OnFlip(flip_ns); // (trust1: the [trust1] line, KYTY_RENDER_STATS / KYTY_DS_TRUSTED_DEPTH)
 	Render5Report(flip_ns); // (render5)
+	Techo::Report(flip_ns, g_render_idle_ns); // (techo; nada si apagado)
 	DsSombrasAb::OnFlip(flip_ns, g_render_idle_ns, LiveCensus::g_waits_ns[LiveCensus::WaitCompile]); // (sombras-ab; nada si apagado)
 	Copia1::NoteFrame();    // (copia1: the [copia1] line's frames)
 	if (SlowLog::HitchThreshold() > 0.0) {
