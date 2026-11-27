@@ -56,6 +56,9 @@ inline std::atomic<bool> g_tex_now {false};
 inline std::atomic<uint64_t> g_tramo[4] {};
 inline std::atomic<uint64_t> g_tramo_n {0}, g_tex_skipped {0};
 inline std::atomic<uint64_t> g_lect_cyc {0}; // lectura: BufferCache::ReadMemory
+// (sync1) SendCommandSync de hilos que no son el de la GPU: espera hasta que el hilo de la GPU lo empieza (su turno) y
+// lo que dura el comando (DiscardGpuWrites, ReadMemory...). Ciclos y llamadas.
+inline std::atomic<uint64_t> g_sync_turn {0}, g_sync_run {0}, g_sync_n {0};
 
 
 constexpr uint32_t Zonas = FrameNativo::CCount;
@@ -186,6 +189,12 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	               lc = g_lect_cyc.load(std::memory_order_relaxed);
 	const double esc_n = static_cast<double>(tn - ltn) / frames, sk_n = static_cast<double>(sk - lsk) / frames, lect = ms(lc - llc);
 	ltn = tn, lsk = sk, llc = lc;
+	static uint64_t lst = 0, lsr = 0, lsn = 0;
+	const uint64_t  st = g_sync_turn.load(std::memory_order_relaxed), sr = g_sync_run.load(std::memory_order_relaxed),
+	               sn = g_sync_n.load(std::memory_order_relaxed);
+	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
+	            ms(st - lst), ms(sr - lsr));
+	lst = st, lsr = sr, lsn = sn;
 	std::printf(" | escritura por tramo (%.0f/fot): ventana %.2f restaurar %.2f buffers %.2f texturas %.2f ms (sin cerrojo %.0f/fot);"
 	            " lectura ReadMemory %.2f ms",
 	            esc_n, tr[0], tr[1], tr[2], tr[3], sk_n, lect);

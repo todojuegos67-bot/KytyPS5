@@ -1,3 +1,4 @@
+#include "local/techo-faltas.h" // (sync1, KYTY_TECHO)
 #include "local/skip-shader.h"
 #include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
 #include "local/censo-pm4.h" // (w18, KYTY_CENSO_PM4: [censo-pm4])
@@ -390,8 +391,17 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 	// thread 16.66 -> 16.38 ms a frame). 0 waiting, 1 done, 2 the caller sleeps.
 	constexpr uint32_t    Spins = 500;
 	std::atomic<uint32_t> state {0};
-	SendCommand([operation = std::move(command), &state]() mutable {
+	// (sync1, KYTY_TECHO: measurement only) the caller's wait for its turn vs the command's own run, game threads.
+	const uint64_t sync_t0 = Techo::On() ? __rdtsc() : 0;
+	SendCommand([operation = std::move(command), &state, sync_t0]() mutable {
+		const uint64_t run0 = sync_t0 != 0 ? __rdtsc() : 0;
 		operation();
+		if (sync_t0 != 0) {
+			const uint64_t run1 = __rdtsc();
+			TechoFaltas::g_sync_turn.fetch_add(run0 - sync_t0, std::memory_order_relaxed);
+			TechoFaltas::g_sync_run.fetch_add(run1 - run0, std::memory_order_relaxed);
+			TechoFaltas::g_sync_n.fetch_add(1, std::memory_order_relaxed);
+		}
 		if (state.exchange(1, std::memory_order_acq_rel) == 2) state.notify_one();
 	});
 	for (uint32_t spin = 0; spin < Spins; ++spin) {
