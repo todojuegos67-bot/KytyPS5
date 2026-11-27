@@ -1405,6 +1405,9 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	// -Ram16 (10-24): "Optimizacion equipos 16 GB RAM" on a PC of 20 GB of RAM or less (or simulated) only.
 	if (low_ram) { // (10-27b) on low-RAM PCs only, whatever the old box says
 		env.Default("KYTY_RESIDENT_MB", "8192"); // (picos5) 8 GB: with 7 the ~200 MB buffer uploads read paged-out guest memory (backing_read 60-120 ms every few s); (picos4) 7 GB, was 6: the game holds ~8 GB while playing; Windows paged the rest out
+		// (ram-carga, 11-27, log 20261127-070611) Once the load ends (3D view and map held 30 s) the 8 GB minimum lowered to
+		// 5 GB and the working set trimmed in small steps: 8153 -> 5632 MiB, available 0.2 -> 1.7-2.9 GB, frames as before.
+		env.Default("KYTY_RESIDENT_TRAS_CARGA_MB", "5120");
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
 		// (ram16-t6, 11-23) Start-up compute warm: only the pipelines the game used in earlier sessions. Log 20261123-082215:
 		// all 4722 recipes cost +3.9 GB resident (emulator 8.2 GB), the 16 GB PC then played with 150-440 MiB available and

@@ -2586,6 +2586,7 @@ void StartMemoryBreakdown() {
 
 static std::atomic<void (*)(void (*)())> g_trim_runner {nullptr};
 static std::atomic<uint64_t>              g_resident_kept_mb {0}; // KYTY_RESIDENT_MB's hard minimum as Windows took it
+static std::atomic<bool>                  g_resident_low {false}; // (ram-carga) the lowered minimum in force
 
 void KeepResident() {
 	static std::once_flag once;
@@ -2654,6 +2655,7 @@ void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t fram
 		if (frame_kind != 1) settled_for = ~0ull; // (a loading screen on the same map, e.g. a death: lowered again after it)
 		if (lowered && (frame_kind != 1 || same_for == 0)) {
 			lowered = false;
+			g_resident_low.store(false, std::memory_order_release);
 			set_min(full_mb);
 			std::printf("[ram-carga] carga (mapa nuevo o sin vista 3D): minimo en RAM %llu MiB otra vez; working set %llu MiB\n",
 			            static_cast<unsigned long long>(full_mb),
@@ -2663,22 +2665,40 @@ void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t fram
 		return;
 	}
 	if (lowered || settled_for == generation) return;
-	settled_for                  = generation;
-	lowered                      = true;
-	const auto     t0            = std::chrono::steady_clock::now();
-	const uint64_t before        = ProcessMemory().working_set;
-	const uint64_t avail_before  = AvailablePhysicalMemory();
+	settled_for = generation;
+	lowered     = true;
+	g_resident_low.store(true, std::memory_order_release);
 	set_min(low_mb);
-	const bool     trimmed       = before > ((low_mb + 512) << 20u) && TrimWorkingSetTo((low_mb + 512) << 20u, low_mb << 20u);
-	const uint64_t after         = ProcessMemory().working_set;
-	std::printf("[ram-carga] carga terminada (3D y mapa 30 s): minimo en RAM %llu -> %llu MiB; working set %llu -> %llu MiB "
-	            "(%s); disponible %llu -> %llu MiB; %.1f ms\n",
-	            static_cast<unsigned long long>(full_mb), static_cast<unsigned long long>(low_mb),
-	            static_cast<unsigned long long>(before >> 20u), static_cast<unsigned long long>(after >> 20u),
-	            trimmed ? "recortado una vez" : "sin recorte", static_cast<unsigned long long>(avail_before >> 20u),
-	            static_cast<unsigned long long>(AvailablePhysicalMemory() >> 20u),
-	            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-	std::fflush(stdout);
+	// (ram-carga2, log 20261127-070611) Trimmed in one call it took 208 ms inside the quiet window: a 224 ms frame each
+	// map. Now in 64 MiB steps (~5 ms of quiet window each) 100 ms apart on a thread of its own; it stops if a load
+	// brings the full minimum back meanwhile.
+	static std::atomic<uint64_t> t_run {0};
+	const uint64_t               run = t_run.fetch_add(1, std::memory_order_acq_rel) + 1;
+	std::thread([run, low_mb, full_mb] {
+		SetThreadDescription(GetCurrentThread(), L"Kyty.RamCarga");
+		const auto     t0           = std::chrono::steady_clock::now();
+		const uint64_t before       = ProcessMemory().working_set;
+		const uint64_t avail_before = AvailablePhysicalMemory();
+		const uint64_t goal         = (low_mb + 512) << 20u;
+		int            steps        = 0;
+		for (uint64_t ws = before; ws > goal && steps < 200; ++steps) {
+			if (t_run.load(std::memory_order_acquire) != run || !g_resident_low.load(std::memory_order_acquire)) break;
+			const uint64_t target = ws > goal + (64ull << 20u) ? ws - (64ull << 20u) : goal;
+			if (!TrimWorkingSetTo(target, low_mb << 20u)) break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			const uint64_t now = ProcessMemory().working_set;
+			ws = now < ws ? now : target; // (the game grows meanwhile: go on from the target)
+		}
+		std::printf("[ram-carga] carga terminada (3D y mapa 30 s): minimo en RAM %llu -> %llu MiB; working set %llu -> %llu MiB "
+		            "en %d pasos de 64 MiB; disponible %llu -> %llu MiB; %.0f ms\n",
+		            static_cast<unsigned long long>(full_mb), static_cast<unsigned long long>(low_mb),
+		            static_cast<unsigned long long>(before >> 20u),
+		            static_cast<unsigned long long>(ProcessMemory().working_set >> 20u), steps,
+		            static_cast<unsigned long long>(avail_before >> 20u),
+		            static_cast<unsigned long long>(AvailablePhysicalMemory() >> 20u),
+		            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+		std::fflush(stdout);
+	}).detach();
 }
 
 bool TrimWorkingSetTo(uint64_t target_bytes, uint64_t min_bytes) {
