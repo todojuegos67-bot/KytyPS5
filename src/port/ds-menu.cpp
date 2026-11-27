@@ -5739,7 +5739,7 @@ void Draw(float width, float height, float column_x) {
 		dl->AddText(serif, Px(15), {hx, a.y + Px(58)}, IM_COL32(206, 196, 176, 230), line);
 	}
 	{
-		const float by = std::round(a.y + Px(86)), bh = Px(8);
+		const float by = std::round(a.y + Px(78)), bh = Px(8);
 		const float fill = frac * Anim::EaseOut(static_cast<float>((now - g_opened_at - 0.15) / 0.9));
 		dl->AddRectFilled({hx, by}, {hx + hw, by + bh}, IM_COL32(255, 255, 255, 18), bh * 0.5f);
 		dl->AddRect({hx, by}, {hx + hw, by + bh}, IM_COL32(204, 176, 122, 70), bh * 0.5f, 0, 1.0f);
@@ -6108,19 +6108,24 @@ void DrawRandomizer(float width, float height) {
 		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || on);
 		Tip("Randomizer: partida sin conexi\xC3\xB3n y sin trucos, con los Trofeos Randomizer al derrotar a cada archidemonio. "
-		    "Clic derecho: semilla nueva.");
+		    "Clic: activar / desactivar (semilla aleatoria en cada partida). Clic derecho: fijar una semilla nueva. "
+		    "Clic en \"MUNDOS\" (a la derecha, con el randomizer activo): enemigos de otros mundos s\xC3\xAD / no (experimental).");
+		// (rando20) The right part of the tile (only while on) toggles the enemies from other worlds.
+		const bool cross_zone = clicked && !right && g_saved.randomizer && ImGui::GetIO().MousePos.x > tx + tw - Px(78);
 		if (clicked) {
 			Settings on_disk;
 			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
-			const bool now  = right ? true : !g_saved.randomizer;
-			int        seed = g_saved.randomizer_seed;
-			if (right || (now && seed == 0)) seed = 1 + static_cast<int>(static_cast<unsigned>(std::time(nullptr) * 2654435761u) % 999999u);
+			const bool now   = cross_zone ? true : (right ? true : !g_saved.randomizer);
+			int        seed  = right ? 1 + static_cast<int>(static_cast<unsigned>(std::time(nullptr) * 2654435761u) % 999999u)
+			                         : (now ? g_saved.randomizer_seed : 0); // 0: a new random seed each launch
+			const bool cross = cross_zone ? !g_saved.randomizer_cross : (now ? g_saved.randomizer_cross : false);
 			for (Settings* s: {&on_disk, &g_saved, &g_edit}) {
-				s->randomizer      = now;
-				s->randomizer_seed = seed;
+				s->randomizer       = now;
+				s->randomizer_seed  = seed;
+				s->randomizer_cross = cross;
 			}
 			(void)SaveSettings(g_rt.ini_path, on_disk);
-			std::printf("[port] randomizer=%d semilla=%d\n", now ? 1 : 0, seed);
+			std::printf("[port] randomizer=%d semilla=%d otros_mundos=%d\n", now ? 1 : 0, seed, cross ? 1 : 0);
 		}
 		auto*        dl = ImGui::GetWindowDrawList();
 		const ImVec2 a {tx, ty}, b {tx + tw, ty + th};
@@ -6154,9 +6159,18 @@ void DrawRandomizer(float width, float height) {
 		const float lx = mc.x + mr + Px(16);
 		Spaced(dl, cinzel, Px(19), {lx, a.y + Px(8)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", U(2.5f));
 		char sub[64];
-		if (on) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 semilla %d", g_saved.randomizer_seed);
+		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 semilla %d", g_saved.randomizer_seed);
+		else if (on) std::snprintf(sub, sizeof(sub), "Activado \xC2\xB7 aleatoria");
 		else std::snprintf(sub, sizeof(sub), "Desactivado");
 		Spaced(dl, cinzel, Px(14), {lx, a.y + Px(34)}, IM_COL32(236, 214, 190, 230), sub, U(1));
+		if (on) { // (rando20) "MUNDOS" si / no: enemigos de otros mundos
+			const float  zx = b.x - Px(78);
+			dl->AddLine({zx, a.y + Px(10)}, {zx, b.y - Px(10)}, Ca(204, 176, 122, 0.35f), 1.0f);
+			Spaced(dl, cinzel, Px(13), {zx + Px(10), a.y + Px(10)}, Ca(222, 196, 140, 0.9f), "MUNDOS", U(1));
+			Spaced(dl, cinzel, Px(14), {zx + Px(10), a.y + Px(34)},
+			       g_saved.randomizer_cross ? IM_COL32(170, 230, 160, 235) : IM_COL32(200, 200, 200, 200),
+			       g_saved.randomizer_cross ? "S\xC3\x8D" : "NO", U(1));
+		}
 	}
 	ImGui::End();
 }
@@ -6658,7 +6672,7 @@ void DrawLauncher(float width, float height) {
 	LauncherTrophy::Draw(width, height, px);
 	LauncherTrophy::DrawOnline(width, height); // (online12) ONLINE beside TROFEOS
 	LauncherTrophy::DrawNoCheats(width, height); // (cleanbtn) SIN TRUCOS beside ONLINE: toggles g_saved.no_cheats
-	// (rando-oculto 11-23) RANDOMIZER hidden from the launcher until it works: LauncherTrophy::DrawRandomizer(width, height);
+	LauncherTrophy::DrawRandomizer(width, height); // (rando20) back in the launcher, off by default
 
 	// (ds-pc-port17) The installed version, always visible (bottom left), and the startup update notice.
 	{

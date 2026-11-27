@@ -180,6 +180,14 @@ struct Enemy {
 
 } // namespace Detail
 
+// (rando20) Índice de colisión (typedata +0x1C) válido: una parte de colisión (tipo 5) del mismo MSB.
+// Ghidra FUN_006c0df0 (0x6c1d1c..0x6c1db3): al cargar el mapa, cada enemigo toma los DrawGroups (+0x44, 16 bytes) de la
+// parte que cita su +0x1C; si el índice es -1 o se sale, se queda con los suyos.
+inline bool CollOk(Detail::Reader& r, const std::vector<uint64_t>& parts, int32_t coll) {
+	if (coll < 0 || static_cast<size_t>(coll) >= parts.size()) return false;
+	return r.I32(parts[static_cast<size_t>(coll)] + 0x8) == 5 && r.ok;
+}
+
 // Baraja el MSB leído en |bytes| (el archivo entero, desde el offset 0). Devuelve true si cambió algo.
 inline bool ShuffleBytes(const std::string& map, std::vector<uint8_t>& bytes) {
 	using namespace Detail;
@@ -233,6 +241,10 @@ inline bool ShuffleBytes(const std::string& map, std::vector<uint8_t>& bytes) {
 		bool finite = true;
 		for (int f = 0; f < 6; f++) finite = finite && std::isfinite(r.F32(p + 0x20 + f * 4));
 		if (!finite) continue;
+		// (rando20) Solo sitios con colisión válida: el juego copia a la parte los grupos de dibujo de su colisión
+		// (eboot 0x6c1d1c..0x6c1db3); con -1 o un índice malo el enemigo queda con grupos de otra zona: inactivo e
+		// invisible, pero su cápsula sigue ahí = muro invisible.
+		if (!CollOk(r, parts, r.I32(td + 0x1C))) continue;
 		enemies.push_back({p, td, r.CStr(p + static_cast<uint64_t>(name_off)), mname});
 	}
 	if (!r.ok) return false;
@@ -244,12 +256,14 @@ inline bool ShuffleBytes(const std::string& map, std::vector<uint8_t>& bytes) {
 	// Sitio = pos+rot (24 bytes), colisión (4), patrulla (24).
 	struct Spot {
 		uint8_t place[24];
+		uint8_t groups[32]; // (rando20) DrawGroups + DispGroups del sitio (parte +0x44, 2 x 16 bytes)
 		uint8_t coll[4];
 		uint8_t patrol[24];
 	};
 	std::vector<Spot> spots(enemies.size());
 	for (size_t i = 0; i < enemies.size(); i++) {
 		std::memcpy(spots[i].place, bytes.data() + enemies[i].part + 0x20, 24);
+		std::memcpy(spots[i].groups, bytes.data() + enemies[i].part + 0x44, 32);
 		std::memcpy(spots[i].coll, bytes.data() + enemies[i].td + 0x1C, 4);
 		std::memcpy(spots[i].patrol, bytes.data() + enemies[i].td + 0x20, 24);
 	}
@@ -273,6 +287,7 @@ inline bool ShuffleBytes(const std::string& map, std::vector<uint8_t>& bytes) {
 		const size_t s = perm[i];
 		if (s == i) continue;
 		std::memcpy(bytes.data() + enemies[i].part + 0x20, spots[s].place, 24);
+		std::memcpy(bytes.data() + enemies[i].part + 0x44, spots[s].groups, 32);
 		std::memcpy(bytes.data() + enemies[i].td + 0x1C, spots[s].coll, 4);
 		std::memcpy(bytes.data() + enemies[i].td + 0x20, spots[s].patrol, 24);
 		changed++;
@@ -2482,6 +2497,14 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 		if (mname == "c3110") continue; // lagarto de cristal: suelta objetos
 		if (cine.count(ps[i].name) != 0) continue; // (rando19)
 		size_t         ti = 0;
+		{ // (rando20) solo con colisión válida (tipo 5): ver CollOk
+			const int32_t coll = BI32(parts[ps[i].index], ps[i].td + 0x1C);
+			if (coll < 0 || static_cast<size_t>(coll) >= parts.size() || parts[static_cast<size_t>(coll)].size() < 0x10 ||
+			    BI32(parts[static_cast<size_t>(coll)], 0x8) != 5) {
+				std::printf("[rando] mapa %s: %s sin colision valida, se queda en su sitio\n", map.c_str(), ps[i].name.c_str());
+				continue;
+			}
+		}
 		const Cg::Rec* r  = TopByName(tf, ps[i].name, &ti);
 		if (r == nullptr) continue;
 		const Cg::Root ri = Cg::RootInfo(tf, *r);
@@ -2530,13 +2553,14 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 
 	// Sitio (MSB) de cada candidato, del archivo original.
 	struct Spot {
-		uint8_t place[24], coll[4], patrol[24];
+		uint8_t place[24], groups[32], coll[4], patrol[24];
 	};
 	std::vector<Spot> sp(cs.size());
 	for (size_t i = 0; i < cs.size(); i++) {
 		const auto& p  = parts[ps[cs[i].pi].index];
 		const size_t td = ps[cs[i].pi].td;
 		std::memcpy(sp[i].place, p.data() + 0x20, 24);
+		std::memcpy(sp[i].groups, p.data() + 0x44, 32);
 		std::memcpy(sp[i].coll, p.data() + td + 0x1C, 4);
 		std::memcpy(sp[i].patrol, p.data() + td + 0x20, 24);
 	}
@@ -2563,6 +2587,7 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 		auto&        p  = parts[ps[cs[e].pi].index];
 		const size_t td = ps[cs[e].pi].td;
 		std::memcpy(p.data() + 0x20, sp[s].place, 24);
+		std::memcpy(p.data() + 0x44, sp[s].groups, 32); // (rando20) grupos del sitio, no los de la zona de origen
 		if (move_coll) std::memcpy(p.data() + td + 0x1C, sp[s].coll, 4);
 		if (move_patrol) std::memcpy(p.data() + td + 0x20, sp[s].patrol, 24);
 		else std::memset(p.data() + td + 0x20, 0xFF, 24); // sin patrulla: no vuelve andando al sitio viejo

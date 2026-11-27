@@ -306,7 +306,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	str("multijugador_amigos", s->online_friends); // (chat1)
 	boo("sin_trucos", s->no_cheats); // (stats1)
 	boo("randomizer", s->randomizer); // (rando1)
-	s->randomizer = false; // (rando-oculto 11-23) off and hidden from the launcher until it works
+	boo("randomizer_otros_mundos", s->randomizer_cross); // (rando20) enemigos de otros mundos (KYTY_DS_RANDOMIZER_CROSS)
 	num("randomizer_semilla", s->randomizer_seed);
 	boo("antilag", s->antilag);
 	// (before 10-27 "antilag" was a box, written 0 by default: the launcher's default, auto, either way)
@@ -643,7 +643,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "sin_trucos=" << b(s.no_cheats) << "\n"
 	  << "; Randomizer: 1 partida sin conexion con los Trofeos Randomizer (y los trucos apagados); semilla 0 = una nueva cada vez\n"
 	  << "randomizer=" << b(s.randomizer) << "\n"
-	  << "randomizer_semilla=" << s.randomizer_seed << "\n\n"
+	  << "randomizer_semilla=" << s.randomizer_seed << "\n"
+	  << "randomizer_otros_mundos=" << b(s.randomizer_cross) << "\n\n"
 	  << "[Avanzado]\n"
 	  << "; Interruptores del emulador: KYTY_X=1;KYTY_Y=2 (KYTY_X= lo quita). Solo para pruebas.\n"
 	  << "extra=" << s.extra << "\n";
@@ -1402,7 +1403,9 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		env.Set("KYTY_DS_RANDOMIZER", "1");
 		const long long seed = s.randomizer_seed != 0 ? s.randomizer_seed : static_cast<long long>(std::time(nullptr) % 1000000);
 		env.Set("KYTY_DS_RANDOMIZER_SEED", std::to_string(seed));
-		std::printf("[port] randomizer: activo, semilla %lld (sin conexion, trucos apagados)\n", seed);
+		if (s.randomizer_cross) env.Set("KYTY_DS_RANDOMIZER_CROSS", "1"); // (rando20) enemigos de otros mundos
+		std::printf("[port] randomizer: activo, semilla %lld%s, otros mundos %s (sin conexion, trucos apagados)\n", seed,
+		            s.randomizer_seed != 0 ? "" : " (aleatoria)", s.randomizer_cross ? "si" : "no");
 	}
 	// (11-21) The switches the test folder played with for days (native memory KYTY_RAIZ, the RAM savings RAM16 / RAM17 /
 	// RAM2 / RAM_NATIVE_TEX, the hitch fixes TIRON1-13...): on by default for everyone, first; settings.ini extra goes
