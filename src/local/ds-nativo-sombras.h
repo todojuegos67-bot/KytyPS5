@@ -107,13 +107,18 @@ inline std::atomic<uint64_t> g_gpu_pending_index {0}; // (indice del primer draw
 
 // El codigo de un shader en hexadecimal, hasta s_endpgm (0xbf810000) o 4 KiB, para desensamblarlo fuera (llvm-mc amdgcn).
 inline void GpuCode(const char* stage, uint64_t addr) {
-	static std::atomic<uint64_t> seen[8] {};
+	// (Log T32 11-27: con 8 huecos y 20 PS distintos, al llenarse se volcaba en CADA llamada: 522 MB de log y 2-3 ms por
+	// llamada del gancho en los hilos del juego. Ahora cada shader una sola vez; con la tabla llena, nada.)
+	static std::atomic<uint64_t> seen[64] {};
 	if (addr == 0) return;
+	bool claimed = false;
 	for (auto& k: seen) {
 		uint64_t expected = 0;
 		if (k.load(std::memory_order_relaxed) == addr) return;
-		if (k.compare_exchange_strong(expected, addr)) break;
+		if (k.compare_exchange_strong(expected, addr)) { claimed = true; break; }
+		if (expected == addr) return;
 	}
+	if (!claimed) return;
 	uint64_t dwords = 0;
 	while (dwords < 1024 && Libs::Graphics::HostMemoryRangeIsReadable(addr + dwords * 4, 4)) {
 		const uint32_t w = reinterpret_cast<const uint32_t*>(addr)[dwords++];

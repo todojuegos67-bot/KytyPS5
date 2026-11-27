@@ -424,6 +424,9 @@ struct NativoSombrasPageMemo {
 	uint64_t es_key[16] {};
 	uint32_t es_gen[16] {};
 	uint8_t  es_kind[16] {};
+	uint64_t ps_key[16] {};
+	uint32_t ps_gen[16] {};
+	uint8_t  ps_kind[16] {};
 };
 inline NativoSombrasPageMemo& NativoSombrasMemo() {
 	static thread_local NativoSombrasPageMemo m;
@@ -435,6 +438,7 @@ inline void NativoSombrasMemoNew() {
 	if (++m.now == 0) {
 		std::memset(m.gen, 0, sizeof(m.gen));
 		std::memset(m.es_gen, 0, sizeof(m.es_gen));
+		std::memset(m.ps_gen, 0, sizeof(m.ps_gen));
 		m.now = 1;
 	}
 }
@@ -451,6 +455,23 @@ inline bool NativoSombrasReadable(uint64_t a, uint64_t size) {
 		if (m.ok[i] == 0) return false;
 	}
 	return true;
+}
+
+// (hilo del juego) PS sin efecto en profundidad: exactamente "exp null off,off,off,off done vm" + s_endpgm
+// (f8001890 00000000 bf810000). Recordado por direccion y generacion de la memo (el codigo puede recargarse).
+inline bool NativoSombrasPsTrivial(uint64_t ps) {
+	auto&          m = NativoSombrasMemo();
+	const uint32_t i = static_cast<uint32_t>((ps >> 8u) * 0x9E3779B97F4A7C15ull >> 60u); // (0..15)
+	if (m.ps_gen[i] == m.now && m.ps_key[i] == ps) return m.ps_kind[i] != 0;
+	bool r = false;
+	if (NativoSombrasReadable(ps, 12)) {
+		const auto* w = reinterpret_cast<const uint32_t*>(ps);
+		r             = w[0] == 0xf8001890u && w[1] == 0u && w[2] == 0xbf810000u;
+	}
+	m.ps_key[i]  = ps;
+	m.ps_gen[i]  = m.now;
+	m.ps_kind[i] = r ? 1 : 0;
+	return r;
 }
 
 // (0x63 / 0x64 / 0x9F) SET_SH/UCONFIG/CONTEXT_REG_INDIRECT, como CpOpIndirect*Regs (pm4Handlers.cpp): 5 dwords;
@@ -791,7 +812,12 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			// cubos con el VS de skinning; los cubos solo estaticos, 0 px.) Los VS de skinning exportan param0 (UV), el estatico
 			// no: van con un PS que lee la UV (recorte alfa: pelo, tela, vegetacion) que el nativo (sin PS) no hace -> dibuja
 			// de mas, "nativo mas cerca". Con el VS de skinning y un PS puesto (o sin saber cual), la dibuja el juego.
-			if (vs_kind == 1 && dcb_ps[k] != 0) {
+			// (T32 11-27, 20 PS distintos volcados y desensamblados (llvm-mc gfx1030): 16 hacen image_sample + v_cmp +
+			// s_andn2 de la mascara viva = recorte alfa; 4 son solo "exp null done vm; s_endpgm" (3 dwords), iguales a no
+			// tener PS: esas entradas van en nativo.)
+			if (vs_kind == 1 && dcb_ps[k] != 0 && dcb_ps[k] != ~uint64_t {0} && NativoSombrasPsTrivial(dcb_ps[k]))
+				info("VS de skinning con PS solo exp null (dibujada en nativo)");
+			else if (vs_kind == 1 && dcb_ps[k] != 0) {
 				if (H::NatDiag()) {
 					static std::atomic<uint32_t> shown {0};
 					if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
@@ -1163,6 +1189,10 @@ KYTY_SYSV_ABI uint64_t NativoSombrasHook(uint64_t renderer, uint64_t list, uint6
 	if (DsCensoEscena::Mode() != 0 && (pass < 0 || DsNativoSombras::Mode() == 0)) // (w8: tambien las sombras)
 		return NativoEscenaCensus(reinterpret_cast<uint64_t>(__builtin_return_address(0)), renderer, list, ctx, bucket, pass);
 	if (DsNativoSombras::Mode() == 0) return g_nativo_sombras_original(renderer, list, ctx, bucket, pass); // (solo censo)
+	// (T32 11-27: en el tramo "juego" del A/B el gancho seguia recorriendo la DCB y rellenando ranuras: el juego pagaba el
+	// coste del nativo y el A/B no valia. Ahora ese tramo es el juego tal cual. Seconds() y Juego(): lecturas de un static
+	// y de un atomico.)
+	if (DsSombrasAb::Seconds() != 0 && DsSombrasAb::Juego()) return g_nativo_sombras_original(renderer, list, ctx, bucket, pass);
 	if ((DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && pass >= 0 && list != 0 && ctx != nullptr &&
 	    bucket >= 0 && bucket <= 7)
 		return NativoSombrasNatHook(renderer, list, ctx, bucket, pass); // (=3 / =1: sin volcados)

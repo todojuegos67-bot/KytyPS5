@@ -1524,7 +1524,11 @@ bool DsNatStart(RenderContext& context, CommandBuffer& buffer, int role, uint64_
 	if (static_ok && !skin_ready && (s.sample[s.pass]++ % every) != 0) {
 		proven    = true;
 		drop_skin = true;
-	} else if (!proven && !static_ok && (s.sample[s.pass]++ % every) != 0) {
+	} else if (!proven && !static_ok && H::g_nat_proven[s.pass].load(std::memory_order_relaxed) &&
+	           (s.sample[s.pass]++ % every) != 0) {
+		// (T32 11-27: sin validar, 1 de cada 16 daba 37 parciales comparados en toda la partida (< 50): nunca se
+		// validaba ninguna cascada y no se dibujo nada en nativo. Sin validar se compara cada cubo capturado; el
+		// muestreo 1 de cada N solo cuando ya esta validada.)
 		++s.sampled_out[s.pass];
 		return DsNatQuiet(), false;
 	}
