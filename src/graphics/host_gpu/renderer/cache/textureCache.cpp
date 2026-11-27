@@ -56,6 +56,7 @@ std::atomic<uint64_t>& H1TexVmBytes() { // (H1, KYTY_H1_TEX_VM) bytes tomados po
 #include "subida-rep.h" // (SUBIDA-REP: KYTY_SUBIDA_REPARTO)
 #include "vram-drv.h" // (VRAM-DRV: desglose medido y techo propio del recolector)
 #include "vram-juego.h" // (VRAM-JUEGO: KYTY_VRAM_JUEGO, pool de streaming del juego)
+#include "async-mundo.h" // (ASYNC-MUNDO: enableAsyncCompute=false solo en Latria)
 #include "vram-tope.h" // (VRAM-TOPE: tope unico por tarjeta, calidad proporcional, cambio de mundo)
 #include "tex-stream.h" // (TEX-STREAM: KYTY_TEX_STREAM, mips bajo demanda con el juego)
 #include "gestor-memoria.h" // (M7) gestor central de memoria: registro, uso y expulsion por prioridad
@@ -9104,6 +9105,13 @@ void TextureCache::RunGarbageCollector() {
 		if (const auto now = std::chrono::steady_clock::now(); now - last_vj >= std::chrono::seconds(2)) {
 			last_vj = now;
 			VramJuego::Tick(m_graphics.GetDeviceMemoryUsage(), m_graphics.GetTotalMemoryBudget(false));
+		}
+	}
+	if (AsyncMundo::On()) { // (ASYNC-MUNDO) cada ~1 s
+		static auto last_am = std::chrono::steady_clock::now();
+		if (const auto now = std::chrono::steady_clock::now(); now - last_am >= std::chrono::seconds(1)) {
+			last_am = now;
+			AsyncMundo::Tick();
 		}
 	}
 	// (VRAM-TECHO) KYTY_VRAM_TECHO=1 (por defecto): cada ~1 s; por encima del 90 % del presupuesto el propio juego baja la
