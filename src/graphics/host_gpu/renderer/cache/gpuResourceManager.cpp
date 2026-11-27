@@ -459,6 +459,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		// (faltas3, KYTY_FALTAS_RECICLADO; off: one relaxed load) A frame page whose every GPU-written byte the game's
 		// frame allocator has handed out again since: dead, dropped without the readback (local/faltas-reciclado.h).
 		const uint64_t page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		FaltasReciclado::t_medir = tramos; // (sync2: the buffers part's split, KYTY_TECHO)
 		if (FaltasReciclado::Active() && !in_remap && FaltasReciclado::PageDead(page) && m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
 			if (FaltasReciclado::VerifyThis()) {
 				thread_local uint8_t before[TRACKER_PAGE_SIZE], after[TRACKER_PAGE_SIZE];
@@ -477,6 +478,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		} else {
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
+		FaltasReciclado::t_medir = false;
 		const uint64_t tr3 = tramos ? __rdtsc() : 0;
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (tramos) {

@@ -23,11 +23,22 @@
 #include <algorithm>
 #include <atomic>
 #include <new>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 namespace FaltasReciclado {
+
+// (sync2, KYTY_TECHO) Reparto del tramo "buffers" de la falta de escritura: la falta pone t_medir y
+// MemoryTracker::InvalidateRegion suma la espera de los cerrojos de region y el on_flush (lectura de vuelta /
+// descarte, con su SendCommandSync); el resto es trabajo propio. Ciclos.
+inline thread_local bool     t_medir = false;
+inline std::atomic<uint64_t> g_inv_lock {0}, g_inv_flush {0}, g_inv_regions {0};
 
 inline std::atomic<int>  g_mode {-1};
 inline std::atomic<bool> g_now {false}, g_off {false};

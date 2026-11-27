@@ -2270,7 +2270,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				                   LiveCounters::Value(C::EagerRefused);
 				if (after != before) ++Otros2::g_pre_would_postpone;
 				++Otros2::g_pre_skipped;
-			} else if (can_wait) {
+			} else if (can_wait && !(TechoFaltas::TurnoMode() != 0 && TechoFaltas::g_turno_now.load(std::memory_order_relaxed) &&
+			                           g_gpu_state->HasPendingCommands())) {
+				// (sync2, KYTY_SYNC_TURNO: with a guest command queued the preamble runs, as without OTROS2.)
 				++pre_skips;
 				++Otros2::g_pre_skipped;
 			} else {

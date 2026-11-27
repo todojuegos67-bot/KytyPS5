@@ -81,11 +81,17 @@ public:
 		CheckNotInUploadCallback();
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool     medir = FaltasReciclado::t_medir;
+			const uint64_t l0    = medir ? __rdtsc() : 0;
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
 				std::scoped_lock lock(manager->lock);
+				if (medir) {
+					FaltasReciclado::g_inv_lock.fetch_add(__rdtsc() - l0, std::memory_order_relaxed);
+					FaltasReciclado::g_inv_regions.fetch_add(1, std::memory_order_relaxed);
+				}
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
@@ -93,7 +99,9 @@ public:
 				return false;
 			}();
 			if (should_flush) {
+				const uint64_t f0 = medir ? __rdtsc() : 0;
 				on_flush();
+				if (medir) FaltasReciclado::g_inv_flush.fetch_add(__rdtsc() - f0, std::memory_order_relaxed);
 			}
 		});
 	}

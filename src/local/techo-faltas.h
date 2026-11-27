@@ -59,6 +59,22 @@ inline std::atomic<uint64_t> g_lect_cyc {0}; // lectura: BufferCache::ReadMemory
 // (sync1) SendCommandSync de hilos que no son el de la GPU: espera hasta que el hilo de la GPU lo empieza (su turno) y
 // lo que dura el comando (DiscardGpuWrites, ReadMemory...). Ciclos y llamadas.
 inline std::atomic<uint64_t> g_sync_turn {0}, g_sync_run {0}, g_sync_n {0};
+// (sync2) KYTY_SYNC_TURNO: con OTROS2 el preambulo de ProcessPm4 se salta pasos "que no lo necesitan" aunque haya
+// comandos de la CPU en cola (SendCommandSync): esperan al siguiente paso no saltado. =1: con comandos en cola el
+// preambulo corre (lo mismo que sin OTROS2); =2 A/B cada 5 s (KYTY_TECHO); sin variable o 0 como antes.
+inline std::atomic<int>  g_turno_mode {-1};
+inline std::atomic<bool> g_turno_now {false};
+[[nodiscard]] inline int TurnoMode() noexcept {
+	int m = g_turno_mode.load(std::memory_order_relaxed);
+	if (m >= 0) return m;
+	const char* v = std::getenv("KYTY_SYNC_TURNO");
+	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
+	g_turno_now.store(m == 1, std::memory_order_relaxed);
+	g_turno_mode.store(m, std::memory_order_relaxed);
+	std::printf("[techo-faltas] KYTY_SYNC_TURNO=%d: %s\n", m, m == 1 ? "encendido" : m == 2 ? "A/B cada 5 s" : "apagado (como antes)");
+	std::fflush(stdout);
+	return m;
+}
 
 
 constexpr uint32_t Zonas = FrameNativo::CCount;
@@ -192,6 +208,12 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	static uint64_t lst = 0, lsr = 0, lsn = 0;
 	const uint64_t  st = g_sync_turn.load(std::memory_order_relaxed), sr = g_sync_run.load(std::memory_order_relaxed),
 	               sn = g_sync_n.load(std::memory_order_relaxed);
+	static uint64_t lil = 0, lif = 0, lir = 0;
+	const uint64_t  il = FaltasReciclado::g_inv_lock.load(), ifl = FaltasReciclado::g_inv_flush.load(),
+	               ir = FaltasReciclado::g_inv_regions.load();
+	std::printf(" | buffers por dentro: cerrojo de region %.2f ms (%.0f/fot), lectura/descarte %.2f ms, resto = buffers - ambos",
+	            ms(il - lil), static_cast<double>(ir - lir) / frames, ms(ifl - lif));
+	lil = il, lif = ifl, lir = ir;
 	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
 	            ms(st - lst), ms(sr - lsr));
 	lst = st, lsr = sr, lsn = sn;
@@ -208,6 +230,16 @@ inline void Report(double frames, double ms_cyc) noexcept {
 		std::printf(" | A/B KYTY_FALTAS_TEX: esta ventana %s; media faltas A(antes) %.2f ms (%.0f v) B(nuevo) %.2f ms (%.0f v) -> %+.2f ms/fot",
 		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
 		g_tex_now.store(!was, std::memory_order_relaxed);
+	}
+	if (TurnoMode() == 2) {
+		static double sum[2] {}, cnt[2] {};
+		const bool    was = g_turno_now.load(std::memory_order_relaxed);
+		sum[was ? 1 : 0] += hilo_ms[0] + hilo_ms[1];
+		cnt[was ? 1 : 0] += 1;
+		const double a = cnt[0] > 0 ? sum[0] / cnt[0] : 0, b = cnt[1] > 0 ? sum[1] / cnt[1] : 0;
+		std::printf(" | A/B KYTY_SYNC_TURNO: esta ventana %s; media faltas A %.2f ms (%.0f v) B %.2f ms (%.0f v) -> %+.2f ms/fot",
+		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
+		g_turno_now.store(!was, std::memory_order_relaxed);
 	}
 	char rec[400];
 	FaltasReciclado::Report(rec, sizeof(rec));
