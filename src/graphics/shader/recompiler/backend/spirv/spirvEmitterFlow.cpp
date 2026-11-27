@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdlib>
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 
 #include <algorithm>
 #include <atomic>
@@ -313,6 +314,11 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || !input->per_vertex) {
+		// (pascal-compat) Without fragmentShaderBarycentric (IR::DeviceFragmentBarycentric) P10 / P20 are 0 and P0 the
+		// interpolated value: P0 + I*P10 + J*P20 stays that value. With the feature this path takes only flat P0.
+		if (mode < 2u && !IR::DeviceFragmentBarycentric()) {
+			return ConstantU32(state, 0);
+		}
 		return EmitAttribute(ctx, attr, chan);
 	}
 	const auto load_vertex = [&](uint32_t vertex) {

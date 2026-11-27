@@ -173,6 +173,11 @@ Port::PcInfo DetectPc() {
 	std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 	pc.nvidia = pc.gpu.empty() || up.find("NVIDIA") != std::string::npos || up.find("GEFORCE") != std::string::npos ||
 	            up.find("RTX") != std::string::npos || up.find("GTX") != std::string::npos || up.find("QUADRO") != std::string::npos;
+	// (pascal-compat) DLSS needs tensor cores (RTX): a GeForce GTX / MX or a Quadro without RTX gets FSR instead
+	// (ds-settings.cpp BuildLaunch's DLSS -> FSR fallback). Any name with RTX keeps DLSS as before.
+	if (pc.nvidia && !pc.gpu.empty() && up.find("RTX") == std::string::npos &&
+	    (up.find("GTX") != std::string::npos || up.find(" MX") != std::string::npos || up.find("QUADRO") != std::string::npos))
+		pc.nvidia = false;
 	pc.amd = up.find("AMD") != std::string::npos || up.find("RADEON") != std::string::npos;
 	HKEY key = nullptr;
 	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &key) == ERROR_SUCCESS) {

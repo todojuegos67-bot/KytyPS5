@@ -28,6 +28,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h" // (up1118: StaticStoreFeatures)
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h" // (pascal-compat)
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1021,7 +1022,55 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		std::printf("WARNING: this GPU has no fragmentShaderBarycentric (GTX 10xx, RDNA 1): a few effects may be "
 		            "missing or wrong.\n");
 	}
+	// (pascal-compat) Pixel shaders without per-vertex inputs or gl_BaryCoord when the device lacks them (no
+	// SPV_KHR_fragment_shader_barycentric in a module the device cannot run); with the feature nothing changes.
+	ShaderRecompiler::IR::SetDeviceFragmentBarycentric(barycentric_supported);
+#else
+	[[maybe_unused]] const bool barycentric_supported = true;
 #endif
+	{
+		// (pascal-compat) One line: the optional features this GPU lacks and what the emulator does instead.
+		const auto available = EnumerateVulkan<vk::ExtensionProperties>(
+		    "vkEnumerateDeviceExtensionProperties", [&](uint32_t* count, vk::ExtensionProperties* values) {
+			    return physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
+		    });
+		vk::PhysicalDeviceProperties  props {};
+		physical_device.getProperties(&props);
+		vk::PhysicalDeviceMemoryProperties memory {};
+		physical_device.getMemoryProperties(&memory);
+		uint64_t local_heap = 0;
+		for (uint32_t i = 0; i < memory.memoryHeapCount; i++)
+			if (memory.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)
+				local_heap = std::max<uint64_t>(local_heap, memory.memoryHeaps[i].size);
+		std::string missing;
+		std::string fallback;
+		const auto  add = [&](bool lacks, const char* what, const char* instead) {
+			if (!lacks) return;
+			missing += missing.empty() ? what : std::string(", ") + what;
+			fallback += fallback.empty() ? instead : std::string("; ") + instead;
+		};
+		add(!barycentric_supported, "fragmentShaderBarycentric", "interpolacion normal (P10/P20 = 0)");
+		add(!HasExtension(available, VK_EXT_MESH_SHADER_EXTENSION_NAME), "VK_EXT_mesh_shader", "vertex shaders");
+		add(!HasExtension(available, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME), "VK_NV_copy_memory_indirect", "copias normales");
+		add(!HasExtension(available, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME), "VK_KHR_pipeline_binary", "cache de pipelines del driver");
+		add(!HasExtension(available, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME), "VK_EXT_memory_priority", "sin prioridades de VRAM");
+		add(!HasExtension(available, VK_NV_LOW_LATENCY_2_EXTENSION_NAME), "VK_NV_low_latency2", "sin Reflex (limitador propio)");
+		add(!HasExtension(available, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME), "VK_EXT_memory_budget", "VRAM estimada por el heap");
+		const bool small_heap = local_heap != 0 && local_heap <= (85ull << 30) / 10;
+		if (small_heap) {
+			missing += missing.empty() ? "VRAM <= 8,5 GB" : ", VRAM <= 8,5 GB";
+			fallback += fallback.empty() ? "modo VRAM 8 GB" : "; modo VRAM 8 GB";
+		}
+		if (missing.empty()) {
+			LOGF("[compat] GPU %s: completa (nada que suplir)\n", props.deviceName.data());
+			std::printf("[compat] GPU %s: completa (nada que suplir)\n", props.deviceName.data());
+		} else {
+			LOGF("[compat] GPU %s (%llu MiB): faltan %s -> respaldo %s\n", props.deviceName.data(),
+			     static_cast<unsigned long long>(local_heap >> 20), missing.c_str(), fallback.c_str());
+			std::printf("[compat] GPU %s (%llu MiB): faltan %s -> respaldo %s\n", props.deviceName.data(),
+			            static_cast<unsigned long long>(local_heap >> 20), missing.c_str(), fallback.c_str());
+		}
+	}
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;

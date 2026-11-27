@@ -781,7 +781,10 @@ void RecommendFor(PcInfo* pc) {
 		const char*              expected;
 	};
 	static const Row rows[] = {
-	    {{"GTX 9", "GTX 10", "GTX TITAN", "RX 4", "RX 5", "VEGA", "RADEON VII"}, "NO COMPATIBLE",
+	    // (pascal-compat) GTX 9xx / 10xx: no fragmentShaderBarycentric, the emulator's fallback (normal interpolation); no DLSS.
+	    {{"GTX 9", "GTX 10", "GTX TITAN"}, "Modo Souls PC low profile",
+	     "EXPERIMENTAL: sin fragmentShaderBarycentric (respaldo del emulador) ni DLSS (FSR). 900p: ~30 FPS; puede no ir fluido"},
+	    {{"RX 4", "RX 5", "VEGA", "RADEON VII"}, "NO COMPATIBLE",
 	     "tu grafica no tiene fragmentShaderBarycentric (hace falta NVIDIA RTX 20 / GTX 16 o AMD RX 6000 o mas nuevas)"},
 	    {{"RTX 509", "RTX 508", "RTX 409", "RTX 408", "RX 7900 XTX"}, "Modo Souls extremo",
 	     "4K cine: ~40-50 FPS reales (150-224 en pantalla con FG). 1440p: 60-75 reales"},

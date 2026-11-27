@@ -4,9 +4,21 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+static std::atomic<bool> g_device_fragment_barycentric {true};
+
+void SetDeviceFragmentBarycentric(bool supported) {
+	g_device_fragment_barycentric.store(supported, std::memory_order_relaxed);
+}
+
+bool DeviceFragmentBarycentric() {
+	return g_device_fragment_barycentric.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 [[noreturn]] void Fail(std::string_view message) {
@@ -210,8 +222,8 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 				const auto input = inst.Arg(0).U32();
 				const auto mode  = inst.Arg(2).U32();
 				referenced[input] = true;
-				per_vertex[input] =
-				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
+				per_vertex[input] = DeviceFragmentBarycentric() &&
+				                    (per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input));
 			}
 		}
 	}
@@ -240,7 +252,7 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 		const bool shared_disagree =
 		    ShaderPixelParameterIsFlat(*pixel, input) != ShaderPixelParameterIsFlat(*pixel, target);
 		AddInput(info, StageInputKind::Parameter, target, 4, fmt::format("in_param_{}", target),
-		         per_vertex[input] || shared_disagree);
+		         DeviceFragmentBarycentric() && (per_vertex[input] || shared_disagree));
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		if (!interpolated[input] || ShaderPixelParameterIsFlat(*pixel, input)) {
@@ -300,10 +312,10 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::Layer: AddInput(info, kind, 0, 1, "gl_Layer"); break;
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
+					if (DeviceFragmentBarycentric()) AddInput(info, kind, 0, 3, "gl_BaryCoordKHR");
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					if (DeviceFragmentBarycentric()) AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
 					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");
