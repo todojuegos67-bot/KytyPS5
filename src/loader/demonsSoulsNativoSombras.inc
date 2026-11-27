@@ -427,6 +427,7 @@ struct NativoSombrasPageMemo {
 	uint64_t ps_key[16] {};
 	uint32_t ps_gen[16] {};
 	uint8_t  ps_kind[16] {};
+	uint16_t ps_off[16] {};
 };
 inline NativoSombrasPageMemo& NativoSombrasMemo() {
 	static thread_local NativoSombrasPageMemo m;
@@ -457,21 +458,54 @@ inline bool NativoSombrasReadable(uint64_t a, uint64_t size) {
 	return true;
 }
 
-// (hilo del juego) PS sin efecto en profundidad: exactamente "exp null off,off,off,off done vm" + s_endpgm
-// (f8001890 00000000 bf810000). Recordado por direccion y generacion de la memo (el codigo puede recargarse).
-inline bool NativoSombrasPsTrivial(uint64_t ps) {
+// (hilo del juego) Que hace en profundidad el PS de un draw de skinning (T32/T34 11-27: 20 PS volcados, llvm-mc gfx1030):
+//  1: solo "exp null done vm; s_endpgm" (f8001890 00000000 bf810000): igual que sin PS.
+//  2: "fundido con bandera": s_load_dwordx2 s[12:13], s[0:1], 0x18; s_load_dword vcc_lo, s[12:13], OFF;
+//     s_cmp_lg_u32 0, vcc_lo; s_cbranch_scc0 -> justo a la cola "s_mov exec, s[14:15]; exp null; s_endpgm". Con la
+//     bandera (cbuf+OFF) a 0 el PS no descarta nada (8 de los 20: 26c978200, 26c994500, 26a7e2a00, ... con OFF 0x28 o
+//     0x2c). Con bandera distinta de 0 descarta por una textura de ruido y la distancia (fundido): al juego.
+//  0: otro (recorte alfa de verdad, varias texturas o desconocido): al juego.
+// Recordado por direccion y generacion de la memo.
+inline uint32_t NativoSombrasPsKind(uint64_t ps, uint32_t* flag_off) {
 	auto&          m = NativoSombrasMemo();
 	const uint32_t i = static_cast<uint32_t>((ps >> 8u) * 0x9E3779B97F4A7C15ull >> 60u); // (0..15)
-	if (m.ps_gen[i] == m.now && m.ps_key[i] == ps) return m.ps_kind[i] != 0;
-	bool r = false;
-	if (NativoSombrasReadable(ps, 12)) {
-		const auto* w = reinterpret_cast<const uint32_t*>(ps);
-		r             = w[0] == 0xf8001890u && w[1] == 0u && w[2] == 0xbf810000u;
+	if (m.ps_gen[i] != m.now || m.ps_key[i] != ps) {
+		uint32_t kind = 0, off = 0;
+		if (NativoSombrasReadable(ps, 12)) {
+			const auto* w = reinterpret_cast<const uint32_t*>(ps);
+			if (w[0] == 0xf8001890u && w[1] == 0u && w[2] == 0xbf810000u) kind = 1;
+		}
+		if (kind == 0 && NativoSombrasReadable(ps, 11 * 4)) {
+			const auto*    w      = reinterpret_cast<const uint32_t*>(ps);
+			const uint32_t pre[]  = {0xbfa00003u, 0xf4040300u, 0xfa000018u, 0xbf8cc07fu, 0xf4001a86u};
+			const uint32_t pre2[] = {0xbe8e047eu, 0xbefe0a7eu, 0xbf8cc07fu, 0xbf076a80u};
+			bool           ok     = std::memcmp(w, pre, sizeof(pre)) == 0 && (w[5] & 0xFFFFF000u) == 0xfa000000u &&
+			              std::memcmp(w + 6, pre2, sizeof(pre2)) == 0 && (w[10] & 0xFFFF0000u) == 0xbf840000u;
+			if (ok) {
+				const uint32_t target = 11u + (w[10] & 0xFFFFu); // (s_cbranch_scc0: PC + 4 + simm16 * 4)
+				uint32_t       len    = 0;                       // (hasta el primer s_endpgm)
+				while (len < 1024u && NativoSombrasReadable(ps + len * 4u, 4) && w[len] != 0xbf810000u) ++len;
+				ok = len < 1024u && w[len] == 0xbf810000u && target + 3u == len && w[target] == 0xbefe040eu &&
+				     w[target + 1] == 0xf8001890u && w[target + 2] == 0u;
+				if (ok) { kind = 2; off = w[5] & 0xFFFu; }
+			}
+		}
+		m.ps_key[i]  = ps;
+		m.ps_gen[i]  = m.now;
+		m.ps_kind[i] = static_cast<uint8_t>(kind);
+		m.ps_off[i]  = static_cast<uint16_t>(off);
 	}
-	m.ps_key[i]  = ps;
-	m.ps_gen[i]  = m.now;
-	m.ps_kind[i] = r ? 1 : 0;
-	return r;
+	*flag_off = m.ps_off[i];
+	return m.ps_kind[i];
+}
+// (tipo 2) La bandera que leera el PS: tabla = USER_DATA_PS s[0:1] (SH 0xC/0xD), cbuf = *(tabla+0x18), bandera =
+// *(cbuf+OFF). true: se pudo leer y vale 0 (el PS no descarta). Leida al grabar el draw (los cbuf de Agc no se
+// reescriben despues en el mismo fotograma); la comparacion con el juego lo vigila.
+inline bool NativoSombrasPsFlagOff(uint64_t ps_table, uint32_t off) {
+	if (ps_table < 0x100000ull || !NativoSombrasReadable(ps_table + 0x18, 8)) return false;
+	const uint64_t cb = *reinterpret_cast<const uint64_t*>(ps_table + 0x18) & 0xFFFFFFFFFFFFull;
+	if (cb < 0x100000ull || !NativoSombrasReadable(cb + off, 4)) return false;
+	return *reinterpret_cast<const uint32_t*>(cb + off) == 0u;
 }
 
 // (0x63 / 0x64 / 0x9F) SET_SH/UCONFIG/CONTEXT_REG_INDIRECT, como CpOpIndirect*Regs (pm4Handlers.cpp): 5 dwords;
@@ -625,6 +659,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 	// aparece) y USER_DATA s10 = el registro de la tabla (s8) + 2 (el VS de skinning indexa las filas del objeto con
 	// s10 & 0xffff + instance_id). Registros SH vistos en esta DCB (desplazamiento < 0x400).
 	static thread_local uint64_t dcb_es[H::NatMaxDraws];
+	static thread_local uint64_t dcb_psu[H::NatMaxDraws]; // (USER_DATA_PS s[0:1], SH 0xC/0xD: tabla del PS; 0 si no)
 	static thread_local uint64_t dcb_ps[H::NatMaxDraws]; // (SPI_SHADER_PGM_LO/HI_PS 0x8/0x9 de ese draw; ~0: no se sabe)
 	static thread_local uint32_t dcb_s10[H::NatMaxDraws];
 	static thread_local uint8_t  dcb_s10_ok[H::NatMaxDraws];
@@ -682,6 +717,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			dcb_count[draws] = op == 0x35 && len >= 4 ? p[3] : op == 0x27 && len >= 5 ? p[4] : 0;
 			dcb_start[draws] = op == 0x35 && len >= 4 ? p[2] : 0;
 			dcb_ps[draws]    = sh_ok[0x8] != 0 && sh_ok[0x9] != 0 ? (uint64_t {sh_val[0x8]} << 8u) | (uint64_t {sh_val[0x9] & 0xFFu} << 40u) : ~uint64_t {0};
+			dcb_psu[draws]   = sh_ok[0xC] != 0 && sh_ok[0xD] != 0 ? (uint64_t {sh_val[0xC]} | (uint64_t {sh_val[0xD] & 0xFFFFu} << 32u)) : 0;
 			dcb_es[draws]    = sh_ok[0xC8] != 0 && sh_ok[0xC9] != 0
 			                       ? (uint64_t {sh_val[0xC8]} << 8u) | (uint64_t {sh_val[0xC9] & 0xFFu} << 40u)
 			                       : 0;
@@ -815,8 +851,14 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			// (T32 11-27, 20 PS distintos volcados y desensamblados (llvm-mc gfx1030): 16 hacen image_sample + v_cmp +
 			// s_andn2 de la mascara viva = recorte alfa; 4 son solo "exp null done vm; s_endpgm" (3 dwords), iguales a no
 			// tener PS: esas entradas van en nativo.)
-			if (vs_kind == 1 && dcb_ps[k] != 0 && dcb_ps[k] != ~uint64_t {0} && NativoSombrasPsTrivial(dcb_ps[k]))
+			uint32_t       ps_off  = 0;
+			const uint32_t ps_kind = vs_kind == 1 && dcb_ps[k] != 0 && dcb_ps[k] != ~uint64_t {0} ? NativoSombrasPsKind(dcb_ps[k], &ps_off) : 0u;
+			if (ps_kind == 1)
 				info("VS de skinning con PS solo exp null (dibujada en nativo)");
+			else if (ps_kind == 2 && NativoSombrasPsFlagOff(dcb_psu[k], ps_off))
+				info("VS de skinning con PS de fundido apagado (bandera 0: dibujada en nativo)");
+			else if (ps_kind == 2)
+				return "VS de skinning con PS de fundido encendido (la dibuja el juego)";
 			else if (vs_kind == 1 && dcb_ps[k] != 0) {
 				if (H::NatDiag()) {
 					static std::atomic<uint32_t> shown {0};
@@ -828,7 +870,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 				}
 				return dcb_ps[k] == ~uint64_t {0} ? "VS de skinning con PS desconocido (la dibuja el juego)" : "VS de skinning con PS (recorte alfa: la dibuja el juego)";
 			}
-			if (vs_kind == 1) info("VS de skinning sin PS (dibujada en nativo)");
+			if (vs_kind == 1 && dcb_ps[k] == 0) info("VS de skinning sin PS (dibujada en nativo)");
 			if (vs_kind == 1) {
 				if (dcb_s10_ok[k] == 0 && d.skin == 0) {
 					// (Sin skinning y sin s10 en la DCB: como antes, VS estatico con la fila 0; validado en cascadas 2-3.)
