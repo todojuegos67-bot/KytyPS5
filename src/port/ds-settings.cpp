@@ -1412,6 +1412,19 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		// (ram-carga, 11-27, log 20261127-070611) Once the load ends (3D view and map held 30 s) the 8 GB minimum lowered to
 		// 5 GB and the working set trimmed in small steps: 8153 -> 5632 MiB, available 0.2 -> 1.7-2.9 GB, frames as before.
 		env.Default("KYTY_RESIDENT_TRAS_CARGA_MB", "5120");
+		// (ram-pico, 11-27) The RAM peak during the load comes from the game's texture streaming keeping every mip it has
+		// streamed while its pool (texturePoolSizeMiBs, 8192 MiB) has room: log 20261127-102325, [mem-directa] mapped 5.5 ->
+		// 11.2 GB in the first 50 s, ws 9.7 GB with 0.4 GB free. Ghidra FUN_00ac9d80 (texture pool update): bVar2 =
+		// cacheUnusedTextures (*0x2f695b8, convar registered in FUN_00ad3070 at 0xad46a2, default 1). With 1 the pass that
+		// lowers mips (sort 0xacc070 mode 3, then for each texture FUN_00901200 current size vs FUN_009015e0 size at the
+		// wanted mip) runs only when the pool is over budget (lVar91 > 0) and stops as soon as it fits; with 0 it runs every
+		// update and drops every mip above the one the view wants. Same textures on screen (the wanted mip is kept); what
+		// goes is the cache of zones already passed. On PCs of 20 GB or less, unless the user chose it in the launcher
+		// (gs_texcache Si/No): cacheUnusedTextures=false.
+		if (demons && GameSettingLevel(s, "gs_texcache") == 0) {
+			env.AppendConvars("cacheUnusedTextures=false");
+			std::printf("[ram-pico] cacheUnusedTextures=false (PC de %d GB de RAM: el juego suelta los mips que no se ven)\n", static_cast<int>(pc.ram_gb));
+		}
 		env.Default("KYTY_PREFETCH_MIN_AVAIL_MB", "1536");
 		// (ram16-t6, 11-23) Start-up compute warm: only the pipelines the game used in earlier sessions. Log 20261123-082215:
 		// all 4722 recipes cost +3.9 GB resident (emulator 8.2 GB), the 16 GB PC then played with 150-440 MiB available and
