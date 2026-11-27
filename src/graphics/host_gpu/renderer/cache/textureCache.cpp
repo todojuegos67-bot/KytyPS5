@@ -7632,6 +7632,199 @@ void TextureCache::NativeRingCollect() {
 	}
 }
 
+// (VRAM-RAM-SPILL, 11-27) KYTY_VRAM_RAM_SPILL=1 (APAGADO por defecto hasta validarlo), solo tarjetas de <= 8 GB (o
+// simular_vram_8gb). Causa: las texturas nativas (bytes "solo en la GPU") nunca se expulsan (NativeEvictCap = 0 desde el
+// cuelgue 051042) y, si se expulsaran, NativeRestoreBeforeDelete descarga con FlushAndWait (parada del hilo de render).
+// En 8 GB no caben: el driver (WDDM) pagina la VRAM a la RAM por su cuenta -> tirones.
+// Aqui, sobre el tope de la tabla (8 GB -> 6,3 GB, min con presupuesto del driver - 128 MiB), las nativas frias (sin
+// usarse >= SpillTicks fotogramas, LRU) bajan a la RAM del juego SIN esperar a la GPU: copia GPU -> bufer de descarga en
+// este fotograma; en un fotograma posterior, ya terminada (IsFree), se escriben sus rangos "solo en la GPU" en la RAM
+// con las MISMAS comprobaciones que la AGUA de las tarjetas grandes (epoca + TEX-GUARDA) y se borra la imagen: una sola
+// copia (la RAM). Al volver a usarse, la imagen se crea por el camino de siempre (InitializeImage -> NativeGuardDirty ->
+// subida desde la RAM, antes del draw): mismo codigo que en 10/12/16 GB, ningun camino nuevo de texturas.
+// INVARIANTE (nunca negra/vacia): la imagen solo se borra si TODOS sus rangos "solo en la GPU" se escribieron en la RAM;
+// si cualquiera cambio (trozo nuevo, free, escritura de la CPU) o no esta protegido, se aborta entera y la imagen sigue
+// en la VRAM tal cual. Cualquier perdida de bytes con el modo encendido (c_lost_bytes sube) sale como VIOLACION en el log.
+// RAM: no se baja nada con la RAM disponible < SpillRamMinMiB (el juego ya degrada con sus mips; nunca al disco).
+namespace RamSpill {
+constexpr uint64_t SpillTicks      = 600;  // ~10 s sin usarse
+constexpr uint64_t StartPerFlipMiB = 48;   // como mucho por fotograma (copia GPU, sin espera)
+constexpr uint64_t InFlightMaxMiB  = 192;  // descargas en vuelo
+constexpr uint64_t MaxImageMiB     = 64;
+constexpr uint64_t SpillRamMinMiB  = 2560; // RAM disponible minima para bajar (RamReservaMiB 1536 + margen)
+constexpr int      OnPct = 97, GoalPct = 92;
+struct Job {
+	ImageId                 id;
+	uint64_t                serial = 0, tick = 0, start_lru = 0, epoca = 0, vram = 0;
+	std::unique_ptr<Buffer> buf;
+};
+static std::vector<Job> jobs; // bajo m_lock (hilo de render)
+static uint64_t c_dem_n = 0, c_dem_bytes = 0, c_dem_vram = 0, c_abort_cambio = 0, c_abort_uso = 0, c_abort_guarda = 0,
+                c_abort_ram = 0, c_violacion = 0, c_esperas = 0;
+static bool On(const GraphicContext& g) {
+	static const bool pedido = [] {
+		const char* v = std::getenv("KYTY_VRAM_RAM_SPILL");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!pedido || !TexNativa::On() || !g.CanReportMemoryUsage()) return false;
+	static const bool chica = [] {
+		const uint64_t card = VramCardBytes() >> 20u;
+		const bool     r    = card != 0 && card <= 8704;
+		std::printf("[vram-ram] KYTY_VRAM_RAM_SPILL=1: tarjeta %llu MiB -> %s\n", static_cast<unsigned long long>(card),
+		            r ? "ACTIVO (texturas nativas frias a la RAM, una sola copia)" : "inactivo (solo <= 8 GB)");
+		std::fflush(stdout);
+		return r;
+	}();
+	return chica;
+}
+} // namespace RamSpill
+
+void TextureCache::RamSpillPass(uint64_t tick) {
+	using namespace RamSpill;
+	if (!RamSpill::On(m_graphics)) return;
+	if (CommandScheduler::ThreadRecorder() != nullptr || CommandScheduler::InDeferredOperation()) return;
+	constexpr uint64_t MiBv = uint64_t {1} << 20u;
+	static uint64_t    lost0 = TexNativa::c_lost_bytes.load(std::memory_order_relaxed);
+	// 1) Terminar las descargas que la GPU ya acabo (sin esperar nunca).
+	uint64_t inflight = 0;
+	for (auto it = jobs.begin(); it != jobs.end();) {
+		if (!m_scheduler.IsFree(it->tick)) {
+			inflight += it->buf->Size();
+			++it;
+			continue;
+		}
+		Job   j     = std::move(*it);
+		it          = jobs.erase(it);
+		auto* image = m_slot_images.try_get(j.id);
+		if (image == nullptr || !image->registered || image->serial != j.serial) continue; // ya no existe: nada que hacer
+		if (m_lru_cache.TickOf(image->lru_id) != j.start_lru) { c_abort_uso++; continue; } // se volvio a usar: se queda
+		const uint64_t base = image->info.data.address, end = image->info.data.End();
+		std::vector<std::pair<uint64_t, uint64_t>> owned;
+		TexNativa::OwnedIn(base, end, owned);
+		if (RamGuard::AvailablePhysical() != 0 && (RamGuard::AvailablePhysical() >> 20u) < SpillRamMinMiB) { c_abort_ram++; continue; }
+		j.buf->Invalidate(0, j.buf->Size());
+		const uint8_t* mapped = j.buf->Mapped().data();
+		bool           ok     = true;
+		{ // todo o nada, bajo OwnedMutex (free 0x802f90 / unmap / fault de escritura esperan)
+			std::lock_guard<std::mutex> olock(TexNativa::OwnedMutex());
+			for (const auto& [b, e]: owned) {
+				if (TexNativa::TocadoDesdeLocked(b, e, j.epoca)) { ok = false; c_abort_cambio++; break; }
+				if (!TexGuarda::Intact(b, e)) { ok = false; c_abort_guarda++; break; }
+			}
+			if (ok) {
+				TexGuarda::EmulatorWrite emulator_write;
+				for (const auto& [b, e]: owned) LibKernel::Memory::WriteBacking(b, mapped + (b - base), e - b, "vram-ram");
+			}
+		}
+		if (!ok) continue; // INVARIANTE: la imagen sigue en la VRAM, intacta
+		uint64_t bytes = 0;
+		for (const auto& [b, e]: owned) {
+			(void)TexNativa::ForgetReleased(b, e, true);
+			TexNativa::RemoveOwned(b, e);
+			bytes += e - b;
+		}
+		if (TexNativa::AnyOwned(base, end)) { c_violacion++; continue; } // no deberia pasar: se queda
+		VramReparto::Evicted(base, image->info.data.size); // la vuelta cuenta como re-subida (VramDrv::g_reup_*)
+		c_dem_n++;
+		c_dem_bytes += bytes;
+		c_dem_vram += j.vram;
+		DeleteImage(j.id);
+	}
+	// 2) Presion: uso real del proceso contra el tope.
+	const uint64_t uso  = m_graphics.GetDeviceMemoryUsage();
+	const uint64_t card = VramCardBytes() >> 20u;
+	const uint64_t drv  = VramDrv::g_drv_budget_bytes.load(std::memory_order_relaxed);
+	uint64_t       tope = GestorMem::TablaVramMiB(card) * MiBv;
+	if (drv > 128 * MiBv) tope = std::min(tope, drv - 128 * MiBv);
+	static bool activo = false;
+	if (uso * 100 >= tope * OnPct) activo = true;
+	if (uso * 100 < tope * GoalPct) activo = false;
+	const bool ram_ok = RamGuard::AvailablePhysical() == 0 || (RamGuard::AvailablePhysical() >> 20u) >= SpillRamMinMiB;
+	if (activo && ram_ok && tick > SpillTicks && inflight < InFlightMaxMiB * MiBv) {
+		uint64_t           started = 0;
+		const uint64_t     goal    = uso > tope * GoalPct / 100 ? uso - tope * GoalPct / 100 : 0;
+		std::vector<ImageId> pick;
+		m_lru_cache.ForEachItemBelow(tick - SpillTicks, [&](ImageId id) {
+			const auto* im = m_slot_images.try_get(id);
+			if (im == nullptr || !im->registered || !im->IsSparse() || !SparseIsPerLevel(im->backing) || im->depth_id ||
+			    im->IsGpuModified() || im->info.data.size > MaxImageMiB * MiBv ||
+			    !TexNativa::AnyOwned(im->info.data.address, im->info.data.End()))
+				return false;
+			for (const auto& j: jobs)
+				if (j.id == id) return false;
+			pick.push_back(id);
+			started += SparseBoundBytes(im->backing);
+			return started >= std::min(goal, StartPerFlipMiB * MiBv);
+		});
+		for (const auto id: pick) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr) continue;
+			NativeApplyPending(*image); // trozos del anillo antes de copiar (como NativeRestoreBeforeDelete)
+			image = m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered) continue;
+			auto plan = BuildDownload(*image);
+			if (!plan.valid) continue;
+			Job j;
+			j.id        = id;
+			j.serial    = image->serial;
+			j.start_lru = m_lru_cache.TickOf(image->lru_id);
+			j.epoca     = TexNativa::EpocaActual();
+			j.vram      = SparseBoundBytes(image->backing);
+			j.buf       = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                       vk::BufferUsageFlagBits::eTransferDst, image->info.data.size);
+			m_scheduler.EndRendering();
+			DownloadImageData(*image, *j.buf, 0, image->info.data.size, std::move(plan));
+			vk::BufferMemoryBarrier barrier {};
+			barrier.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer              = j.buf->Handle();
+			barrier.offset              = 0;
+			barrier.size                = VK_WHOLE_SIZE;
+			m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+			                                               nullptr);
+			j.tick = m_scheduler.CurrentTick();
+			jobs.push_back(std::move(j));
+		}
+	} else if (activo && !ram_ok) {
+		c_esperas++; // RAM corta: no se baja; el juego degrada con sus mips (VRAM_TECHO), nunca al disco
+	}
+	// 3) Linea cada 5 s.
+	static auto     last = std::chrono::steady_clock::now();
+	static uint64_t l_n = 0, l_b = 0, l_ru = 0, l_rub = 0;
+	if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(5)) {
+		last              = now;
+		uint64_t hot_n = 0, hot_b = 0;
+		m_slot_images.ForEach([&](ImageId, const Image& im) {
+			if (im.registered && im.IsSparse() && SparseIsPerLevel(im.backing)) {
+				hot_n++;
+				hot_b += SparseBoundBytes(im.backing);
+			}
+		});
+		const uint64_t lost = TexNativa::c_lost_bytes.load(std::memory_order_relaxed);
+		if (lost > lost0) c_violacion++;
+		const uint64_t ru = VramDrv::g_reup_n.load(std::memory_order_relaxed), rub = VramDrv::g_reup_bytes.load(std::memory_order_relaxed);
+		std::printf("[vram-ram] VRAM %llu/%llu MiB (%s) | nativas en VRAM %llu (%llu MiB) | a la RAM 5 s %llu (%llu MiB), "
+		            "total %llu (%llu MiB de VRAM) | vueltas (resubidas) 5 s %llu (%llu MiB) | en vuelo %zu | abortadas uso %llu "
+		            "cambio %llu guarda %llu ram %llu | RAM libre %llu MiB, sin bajar por RAM %llu | esperas GPU 0 | "
+		            "VIOLACIONES %llu%s\n",
+		            static_cast<unsigned long long>(uso >> 20u), static_cast<unsigned long long>(tope >> 20u),
+		            activo ? "bajando" : "ok", static_cast<unsigned long long>(hot_n), static_cast<unsigned long long>(hot_b >> 20u),
+		            static_cast<unsigned long long>(c_dem_n - l_n), static_cast<unsigned long long>((c_dem_bytes - l_b) >> 20u),
+		            static_cast<unsigned long long>(c_dem_n), static_cast<unsigned long long>(c_dem_vram >> 20u),
+		            static_cast<unsigned long long>(ru - l_ru), static_cast<unsigned long long>((rub - l_rub) >> 20u), jobs.size(),
+		            static_cast<unsigned long long>(c_abort_uso), static_cast<unsigned long long>(c_abort_cambio),
+		            static_cast<unsigned long long>(c_abort_guarda), static_cast<unsigned long long>(c_abort_ram),
+		            static_cast<unsigned long long>(RamGuard::AvailablePhysical() >> 20u), static_cast<unsigned long long>(c_esperas),
+		            static_cast<unsigned long long>(c_violacion), lost > lost0 ? " (bytes perdidos: c_lost_bytes subio)" : "");
+		std::fflush(stdout);
+		lost0 = lost;
+		l_n = c_dem_n, l_b = c_dem_bytes, l_ru = ru, l_rub = rub;
+	}
+}
+
 bool TextureCache::NativeRestoreBeforeDelete(Image& image, bool keep_on_fail, uint64_t desde) {
 	const uint64_t base = image.info.data.address, end = image.info.data.End();
 	std::vector<std::pair<uint64_t, uint64_t>> owned;
@@ -8814,6 +9007,7 @@ void TextureCache::RunGarbageCollector() {
 	EraseRetired();
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	RamSpillPass(tick); // (VRAM-RAM-SPILL)
 	// Parked images not taken back since the flip before: the game left that use of the memory.
 	std::erase_if(m_parked, [&](auto& item) {
 		// (W10) La gemela de un pool de sombras (keep == CubeTwinKeep) ya no caduca por flips: solo se va con su memoria
