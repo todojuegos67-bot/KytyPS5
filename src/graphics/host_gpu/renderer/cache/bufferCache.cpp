@@ -3421,7 +3421,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					for (uint64_t at = page.address & ~uint64_t {0xfff}; at < page.address + page.size; at += 0x1000)
 						(FaltasReciclado::PageDead(at) ? FaltasReciclado::g_win_dead : FaltasReciclado::g_win_live)
 						    .fetch_add(1, std::memory_order_relaxed);
-			for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
+			if (FaltasReciclado::PmActive() && !FaltasReciclado::g_off.load(std::memory_order_relaxed)) {
+				// (sync7, KYTY_PUTIN_MUERTAS) Dead pages (not the fault's own: applied below) left; live ones in runs, as before.
+				const uint64_t own = vaddr & ~uint64_t {0xfff};
+				for (const auto& page: request->pages) {
+					uint64_t run = 0, run_end = 0;
+					const uint64_t end = page.address + page.size;
+					for (uint64_t at = page.address & ~uint64_t {0xfff}; at < end; at += 0x1000) {
+						bool defer = at != own && FaltasReciclado::PageDead(at);
+						if (defer && (FaltasReciclado::g_pm_sample.fetch_add(1, std::memory_order_relaxed) & 15u) == 0) {
+							defer = false;
+							FaltasReciclado::g_pm_verified.fetch_add(1, std::memory_order_relaxed);
+						}
+						if (defer) {
+							if (run_end > run) PageManager::ApplyDeferredReleases(run, run_end - run);
+							run = run_end = 0;
+							FaltasReciclado::PmNote(at);
+							FaltasReciclado::g_pm_deferred.fetch_add(1, std::memory_order_relaxed);
+							continue;
+						}
+						const uint64_t from = std::max(at, page.address), to = std::min(at + 0x1000, end);
+						if (run_end == from) run_end = to;
+						else {
+							if (run_end > run) PageManager::ApplyDeferredReleases(run, run_end - run);
+							run = from, run_end = to;
+						}
+					}
+					if (run_end > run) PageManager::ApplyDeferredReleases(run, run_end - run);
+				}
+			} else
+				for (const auto& page: request->pages) PageManager::ApplyDeferredReleases(page.address, page.size);
 			if (r0 != 0) FaltasReciclado::g_rb_release.fetch_add(__rdtsc() - r0, std::memory_order_relaxed);
 		}
 		const uint64_t r1 = FaltasReciclado::t_medir ? __rdtsc() : 0; // (sync3)

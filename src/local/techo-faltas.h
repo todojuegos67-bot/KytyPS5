@@ -227,6 +227,22 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	std::printf(" (paginas de la ventana: muertas %.1f/fot, vivas %.1f/fot)", static_cast<double>(wd - lwd) / frames,
 	            static_cast<double>(wl - lwl) / frames);
 	lwd = wd, lwl = wl;
+	static uint64_t lpd = 0, lpv = 0, lpf = 0;
+	const uint64_t  pd = FaltasReciclado::g_pm_deferred.load(), pv = FaltasReciclado::g_pm_verified.load(),
+	               pf = FaltasReciclado::g_pm_fault_applied.load();
+	std::printf(" | putin-muertas: aplazadas %.1f/fot, verificadas (puestas igual) %.1f/fot, luego aplicadas por falta %.1f/fot",
+	            static_cast<double>(pd - lpd) / frames, static_cast<double>(pv - lpv) / frames, static_cast<double>(pf - lpf) / frames);
+	lpd = pd, lpv = pv, lpf = pf;
+	if (FaltasReciclado::PmMode() == 2) {
+		static double sum[2] {}, cnt[2] {};
+		const bool    was = FaltasReciclado::g_pm_now.load(std::memory_order_relaxed);
+		sum[was ? 1 : 0] += hilo_ms[0] + hilo_ms[1];
+		cnt[was ? 1 : 0] += 1;
+		const double a = cnt[0] > 0 ? sum[0] / cnt[0] : 0, b = cnt[1] > 0 ? sum[1] / cnt[1] : 0;
+		std::printf(" | A/B KYTY_PUTIN_MUERTAS: esta ventana %s; media faltas A %.2f ms (%.0f v) B %.2f ms (%.0f v) -> %+.2f ms/fot",
+		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
+		FaltasReciclado::g_pm_now.store(!was, std::memory_order_relaxed);
+	}
 	std::printf(" | SendCommandSync (%.0f/fot): espera de turno %.2f ms, comando %.2f ms", static_cast<double>(sn - lsn) / frames,
 	            ms(st - lst), ms(sr - lsr));
 	lst = st, lsr = sr, lsn = sn;

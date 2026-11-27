@@ -392,6 +392,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// below. First: the paths below read the page's state, which already says released.
 	if (m_page_manager.ApplyDeferredReleaseAt(fault_vaddr)) {
 		TechoFaltas::SetVia(TechoFaltas::VDiferida);
+		if (FaltasReciclado::PmMode() != 0) FaltasReciclado::PmFaultApplied(fault_vaddr); // (sync7: counted)
 		return true;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -460,6 +461,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		// frame allocator has handed out again since: dead, dropped without the readback (local/faltas-reciclado.h).
 		const uint64_t page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
 		FaltasReciclado::t_medir = tramos; // (sync2: the buffers part's split, KYTY_TECHO)
+		FaltasReciclado::t_falta_escritura = true; // (sync7, KYTY_PUTIN_MUERTAS)
 		if (FaltasReciclado::Active() && !in_remap && FaltasReciclado::PageDead(page) && m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
 			if (FaltasReciclado::VerifyThis()) {
 				thread_local uint8_t before[TRACKER_PAGE_SIZE], after[TRACKER_PAGE_SIZE];
@@ -479,6 +481,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
 		FaltasReciclado::t_medir = false;
+		FaltasReciclado::t_falta_escritura = false;
 		const uint64_t tr3 = tramos ? __rdtsc() : 0;
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		if (tramos) {
