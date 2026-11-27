@@ -87,15 +87,52 @@ inline int Dificultad() {
 	}();
 	return d;
 }
+// (jefes) Candidatos "de calibre Vanguard" para el hueco del patio (datos: NpcParam HP +0x2C, think NpcParam +4 ->
+// NpcThinkParam logica/batalla; partes de los MSB sin entity id de jefe, sin charaInit, con entidad en el cgpr de su
+// mapa). Jefes de arena (c5xxx, c4050 Flamelurker, c6020 Old Hero, c6050 Dragon God, c3040 Maneater, c7230 Allant,
+// c5120/c5130 dragones) fuera: niebla, eventboss.lua, cinematicas. KYTY_DS_JEFE=<chr> fuerza uno (pruebas);
+// KYTY_DEMONIO_PATIO=1 = Vanguard fijo; DIFICIL: uno al azar por carga (semilla + numero de carga).
+struct JefeDef {
+	const char* model;
+	const char* map;   // mapa donante (MSB + legacy_instances.cgpr)
+	const char* donor; // parte donante
+	const char* name;
+	int32_t     hp, battle;
+};
+inline const std::vector<JefeDef>& Jefes() {
+	static const std::vector<JefeDef> j = {
+	    {"c1030", "m03_01_00_00", "c1030_0000", "Vanguard (c1030_vanguard)", 1800, 103001},
+	    {"c3130", "m06_01_00_00", "c3130_0007", "Gran bugbear (c3130_largebugbear)", 1290, 313000},
+	    {"c3131", "m06_01_00_00", "c3131_0000", "Bugbear (c3131_bugbear)", 860, 313000},
+	};
+	return j;
+}
+inline const char* JefeForzado() { // "" = ninguno
+	static const std::string f = [] {
+		const char* c = std::getenv("KYTY_DS_JEFE");
+		if (c != nullptr && c[0] != '\0') {
+			std::string v(c);
+			for (const auto& d: Jefes())
+				if (v == d.model) return v;
+			std::printf("[jefe] KYTY_DS_JEFE=%s no esta en la lista (c1030, c3130, c3131); se ignora\n", c);
+			std::fflush(stdout);
+		}
+		const char* p = std::getenv("KYTY_DEMONIO_PATIO");
+		if (p != nullptr && std::strcmp(p, "1") == 0) return std::string("c1030");
+		return std::string();
+	}();
+	return f.c_str();
+}
 inline bool DemonioOn() {
 	static const bool on = [] {
 		const char* c = std::getenv("KYTY_DEMONIO_PATIO");
 		const char* r1 = std::getenv("KYTY_DS_RANDOMIZER");
-		// KYTY_DEMONIO_PATIO=1 sigue valiendo; con el randomizer en DIFICIL va siempre.
-		const bool  r = (c != nullptr && std::strcmp(c, "1") == 0) ||
+		// KYTY_DEMONIO_PATIO=1 (Vanguard fijo) o KYTY_DS_JEFE=<chr> siguen valiendo; con el randomizer en DIFICIL va siempre.
+		const bool  r = JefeForzado()[0] != '\0' ||
 		               (r1 != nullptr && std::strcmp(r1, "1") == 0 && Dificultad() == 3 && !(c != nullptr && std::strcmp(c, "0") == 0));
 		if (r) {
-			std::printf("[demonio] KYTY_DEMONIO_PATIO=1: Vanguard (c1030) en el primer patio de Boletaria 1-1\n");
+			std::printf("[demonio] jefe en el primer patio de Boletaria 1-1: %s\n",
+			            JefeForzado()[0] != '\0' ? JefeForzado() : "al azar en cada carga (DIFICIL)");
 			std::fflush(stdout);
 		}
 		return r;
@@ -892,11 +929,11 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 					std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
 					const float dx = pp[0] - h.pos[0], dy = pp[1] - h.pos[1], dz = pp[2] - h.pos[2];
 					const bool  ok = dx * dx + dy * dy + dz * dz < 1.0f;
-					const bool vang = DemonioOn() && h.name == DemonioTarget() && std::strcmp(h.new_model, "c1030") == 0;
+					const bool vang = DemonioOn() && h.name == DemonioTarget() && h.owner == Fnv("demonio-jefe");
 					std::printf("[%s] crear parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f): %s%s\n", vang ? "demonio" : "rando", idx,
 					            pname.c_str(), model.c_str(), npc, static_cast<double>(pp[0]), static_cast<double>(pp[1]),
-					            static_cast<double>(pp[2]), ok ? (vang ? "ES EL DEL PATIO, pasa a Vanguard" : "es el hueco, pasa a ") : "otro mapa, no se toca",
-					            ok && !vang ? h.new_model : "");
+					            static_cast<double>(pp[2]), ok ? (vang ? "ES EL DEL PATIO, pasa al jefe " : "es el hueco, pasa a ") : "otro mapa, no se toca",
+					            ok ? h.new_model : "");
 					std::fflush(stdout);
 					if (!ok) continue;
 				}
@@ -977,7 +1014,7 @@ __attribute__((sysv_abi, noinline)) inline void ProbeModel(uint64_t /*self*/, co
 			std::fflush(stdout);
 		}
 	}
-	if (DemonioOn() && (model == "c1030" || id == 103001)) {
+	if (DemonioOn() && (model == "c1030" || model == "c3130" || model == "c3131")) {
 		static std::atomic<int> dl {0};
 		if (dl.fetch_add(1) < 50) {
 			std::printf("[demonio] modelo %s chrid %d pedido desde eboot+0x%llx (0x60a780 = BPDsModel::TryInit)\n", model.c_str(), id,
@@ -1128,9 +1165,9 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 					std::printf("[%s] 0xef430 (IA): %s ya lleva npc %d (%s) al elegir los scripts\n",
 					            DemonioOn() && h.name == DemonioTarget() ? "demonio" : "rando", pname.c_str(), npc, h.new_model);
 				} else if (DemonioOn() && h.name == DemonioTarget())
-					std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d antes de elegir los scripts; el juego "
-					            "cargara la IA del Vanguard (logica 10000, batalla 103001)\n",
-					            pname.c_str(), h.orig_npc, h.new_npc);
+					std::printf("[demonio] 0xef430 (scripts de IA del mapa): %s npc %d -> %d (%s) antes de elegir los scripts; el juego "
+					            "cargara su IA (ai:/out/<think>_battle.lua del luabnd)\n",
+					            pname.c_str(), h.orig_npc, h.new_npc, h.new_model);
 				else
 					std::printf("[rando] 0xef430 (IA): %s npc %d -> %d (%s) antes de elegir los scripts\n", pname.c_str(), h.orig_npc,
 					            h.new_npc, h.new_model);
@@ -3198,14 +3235,25 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 // (map+0x928 / +0x860, hechas del MSB por FUN_006c2e90) y llama 0x367030 -> 0x366130 -> 0x1451700. Ahora el MSB NO
 // cambia de modelo ni de tabla de modelos (soldado c2000, su NpcParam): el cambio a c1030 / 103001 (typedata del
 // donante + modelo y chrid) lo hace el gancho en memoria solo para la parte en ese sitio, igual que el resto del mapa.
+// Jefe de la carga |load| (0 = primera): el forzado, o uno de Jefes() por la semilla (cambia al morir / recargar).
+inline const JefeDef& JefeDe(int load) {
+	const auto& j = Jefes();
+	const char* f = JefeForzado();
+	for (const auto& d: j)
+		if (f[0] != '\0' && std::strcmp(f, d.model) == 0) return d;
+	const uint64_t h = Fnv(std::string(Seed()) + "/jefe/" + std::to_string(load));
+	return j[static_cast<size_t>(h % j.size())];
+}
 inline bool BuildDemonio(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_io,
-                         std::vector<uint8_t>* cgpr_io) {
+                         std::vector<uint8_t>* cgpr_io, int load = 0) {
 	static const char* kTarget   = DemonioTarget(); // (rando24) antes c2000_0000, que el juego no crea
-	static const char* kDonorMap = "m03_01_00_00";
-	static const char* kDonor    = "c1030_0000";
+	const JefeDef&     jefe      = JefeDe(load);
+	const char*        kDonorMap = jefe.map;
+	const char*        kDonor    = jefe.donor;
+	const std::string  kModel    = jefe.model;
 	if (map != "m02_00_00_00") return false;
 	auto fail = [&](const char* why) {
-		std::printf("[demonio] %s: %s; el Vanguard no se pone\n", map.c_str(), why);
+		std::printf("[demonio] %s: %s; el jefe %s no se pone\n", map.c_str(), why, jefe.model);
 		std::fflush(stdout);
 		return false;
 	};
@@ -3220,7 +3268,7 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	std::vector<EnemyPart> ps, dps;
 	if (!EnemyParts(t, &ps)) return fail("partes del MSB no reconocidas");
 	if (!ReadWhole(MsbPathOf(app0, kDonorMap), &dmsb) || !ParseTables(dmsb, &dt) || !EnemyParts(dt, &dps))
-		return fail("no se lee el MSB de m03_01_00_00");
+		return fail("no se lee el MSB del mapa donante");
 	auto& models = t[0].blobs;
 	auto& parts  = t[3].blobs;
 
@@ -3255,19 +3303,19 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 
 	size_t dpi = dps.size();
 	for (size_t i = 0; i < dps.size(); i++)
-		if (dps[i].name == kDonor && ModelName(dt[0].blobs[static_cast<size_t>(dps[i].model)]) == "c1030") dpi = i;
-	if (dpi == dps.size()) return fail("no esta el Vanguard c1030_0000 en m03_01_00_00");
+		if (dps[i].name == kDonor && ModelName(dt[0].blobs[static_cast<size_t>(dps[i].model)]) == kModel) dpi = i;
+	if (dpi == dps.size()) return fail("no esta la parte donante en su mapa");
 	const auto& dpart = dt[3].blobs[dps[dpi].index];
 	uint8_t     td_head[0x14], td_init[4];
 	std::memcpy(td_head, dpart.data() + dps[dpi].td, 0x14);
 	std::memcpy(td_init, dpart.data() + dps[dpi].td + 0x18, 4);
 	const Cg::File* df = DonorFile(app0, kDonorMap);
-	if (df == nullptr) return fail("no se lee m03_01_00_00_legacy_instances.cgpr");
+	if (df == nullptr) return fail("no se lee el legacy_instances.cgpr del mapa donante");
 	size_t         dtop = 0;
 	const Cg::Rec* dr   = TopByName(*df, kDonor, &dtop);
-	if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) return fail("el Vanguard no tiene entidad en el cgpr de m03_01");
+	if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) return fail("la parte donante no tiene entidad en el cgpr de su mapa");
 	for (const auto& m: models)
-		if (BI32(m, 0x8) == 2 && ModelName(m) == "c1030") return fail("c1030 ya esta en el mapa");
+		if (BI32(m, 0x8) == 2 && ModelName(m) == kModel) return fail("el modelo ya esta en el mapa");
 
 	auto&        pb  = parts[ps[pi].index];
 	const size_t td  = ps[pi].td;
@@ -3287,19 +3335,22 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	h.name = sname;
 	std::snprintf(h.orig_model, sizeof(h.orig_model), "%s", smodel.c_str());
 	h.orig_npc = BI32(pb, td + 0xC);
-	std::snprintf(h.new_model, sizeof(h.new_model), "c1030");
+	std::snprintf(h.new_model, sizeof(h.new_model), "%s", jefe.model);
 	std::memcpy(&h.new_npc, td_head + 0xC, 4);
 	std::memcpy(h.td_head, td_head, sizeof(h.td_head));
 	std::memcpy(h.td_init, td_init, sizeof(h.td_init));
+	h.owner = Fnv("demonio-jefe");
 	{
 		std::lock_guard<std::mutex> lock(HookMutex());
+		for (auto& o: HookSwaps()) // el jefe de la carga anterior ya no vale (otro tipo en el mismo hueco)
+			if (o.owner == h.owner) o.dead = true;
 		HookSwaps().push_back(h);
 	}
 	std::printf("[demonio] %s: hueco del soldado %s (%.1f, %.1f, %.1f), colision %d: alli esta %s (%s, npc %d) -> tipo "
-	            "Vanguard c1030 npc %d (entidad de %s %s); nada se mueve, MSB sin tocar (el tipo lo cambia el gancho); cgpr %zu -> %zu "
+	            "%s npc %d, HP %d, batalla %06d_battle.lua (entidad de %s %s; carga %d); nada se mueve, MSB sin tocar (el tipo lo cambia el gancho); cgpr %zu -> %zu "
 	            "objetos\n",
 	            map.c_str(), kTarget, static_cast<double>(slot[0]), static_cast<double>(slot[1]), static_cast<double>(slot[2]), BI32(pb, td + 0x1C),
-	            sname.c_str(), smodel.c_str(), h.orig_npc, h.new_npc, kDonorMap, kDonor, tf.objs.size(), new_objs);
+	            sname.c_str(), smodel.c_str(), h.orig_npc, jefe.name, h.new_npc, jefe.hp, jefe.battle, kDonorMap, kDonor, load, tf.objs.size(), new_objs);
 	std::fflush(stdout);
 	msb_io->swap(msb2);
 	cgpr_io->swap(cg2);
@@ -3567,7 +3618,7 @@ inline void NoteLoad(const std::string& map, RedirectEntry& e) {
 		if (!ok) continue;
 		if (DemonioOn() && map == "m02_00_00_00") {
 			std::vector<uint8_t> m0 = e.msb0; // el Vanguard: mismo hueco, sobre el MSB servido
-			BuildDemonio(map, e.app0, &m0, &cg);
+			BuildDemonio(map, e.app0, &m0, &cg, e.load);
 		}
 		const bool mj_ok = mj && BuildMiniJefe(map, e.app0, &cg, &finals);
 		if (!PadCgpr(&cg, e.cgpr_size)) {
@@ -3692,7 +3743,8 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real, const std:
 		if (!ReadWhole(real.parent_path() / (std::string(area) + ".luabnd"), &d) || !ParseBnd3(d, &dfs)) continue;
 		for (auto& f: dfs) {
 			if (!IsAiScript(f.name) || !have.insert(Lower(f.name)).second) continue;
-			if (Lower(f.name).find("103001_battle.lua") != std::string::npos) vang = true;
+			for (const auto& j: Jefes())
+				if (Lower(f.name).find(std::to_string(j.battle) + "_battle.lua") != std::string::npos) vang = true;
 			f.id = next_id++;
 			fs.push_back(std::move(f));
 		}
@@ -3711,7 +3763,13 @@ inline const LuabndCopy& LuabndFor(const std::filesystem::path& real, const std:
 	c.size = bytes.size();
 	std::printf("[rando] %s.luabnd: copia con %zu scripts de IA de otras areas (%zu -> %zu archivos, %zu -> %zu bytes)%s\n",
 	            self.c_str(), fs.size() - n0, n0, fs.size(), orig.size(), bytes.size(),
-	            vang ? "; incluye 103001_battle.lua (combate del Vanguard, de m03.luabnd)" : "");
+	            vang ? "; incluye scripts de combate de los jefes del patio" : "");
+	if (DemonioOn() && self == "m02")
+		for (const auto& j: Jefes()) {
+			bool has = false;
+			for (const auto& f: fs) has = has || Lower(f.name).find(std::to_string(j.battle) + "_battle.lua") != std::string::npos;
+			std::printf("[jefe] m02.luabnd: %06d_battle.lua (%s): %s\n", j.battle, j.model, has ? "esta" : "NO ESTA (sin IA)");
+		}
 	std::fflush(stdout);
 	return c;
 }
