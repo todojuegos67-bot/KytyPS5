@@ -836,6 +836,53 @@ void MarkCheatsUsed(const char* what) {
 }
 bool CheatsUsed() { return g_cheats_used.load(); }
 
+// (rando-online) See ds-settings.h.
+namespace {
+constexpr const char* kSalaAbc = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford base32
+uint32_t SalaFnv(const std::string& t) {
+	uint32_t h = 2166136261u;
+	for (unsigned char c: t) h = (h ^ c) * 16777619u;
+	return h;
+}
+uint32_t SalaPayload(int seed, int difficulty, bool cross) {
+	return (static_cast<uint32_t>(seed) & 0xFFFFFu) | (static_cast<uint32_t>(difficulty & 3) << 20) | ((cross ? 1u : 0u) << 22) | (1u << 23);
+}
+uint32_t SalaSum(uint32_t payload) { return SalaFnv("sala1|" + std::to_string(payload)) & 0xFFFFu; }
+} // namespace
+std::string RandoSalaCode(int seed, int difficulty, bool cross) {
+	const uint32_t p = SalaPayload(seed, difficulty, cross);
+	const uint64_t v = (static_cast<uint64_t>(p) << 16) | SalaSum(p);
+	std::string    c(8, '0');
+	for (int i = 0; i < 8; i++) c[7 - i] = kSalaAbc[(v >> (5 * i)) & 31u];
+	return c;
+}
+bool RandoSalaDecode(const std::string& code, int* seed, int* difficulty, bool* cross) {
+	uint64_t v = 0;
+	int      n = 0;
+	for (char ch: code) {
+		char u = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+		if (u == ' ' || u == '-') continue;
+		if (u == 'O') u = '0';
+		if (u == 'I' || u == 'L') u = '1';
+		const char* f = std::strchr(kSalaAbc, u);
+		if (u == 0 || f == nullptr) return false;
+		v = (v << 5) | static_cast<uint64_t>(f - kSalaAbc);
+		if (++n > 8) return false;
+	}
+	if (n != 8) return false;
+	const uint32_t p = static_cast<uint32_t>(v >> 16);
+	if ((v & 0xFFFFu) != SalaSum(p) || (p >> 23) != 1u) return false;
+	const int s = static_cast<int>(p & 0xFFFFFu), d = static_cast<int>((p >> 20) & 3u);
+	if (s < 1 || s > 999999 || d < 1 || d > 3) return false;
+	if (seed != nullptr) *seed = s;
+	if (difficulty != nullptr) *difficulty = d;
+	if (cross != nullptr) *cross = ((p >> 22) & 1u) != 0;
+	return true;
+}
+uint32_t RandoSalaKey(int seed, int difficulty, bool cross) {
+	return SalaFnv("rnet1|" + std::to_string(seed) + "|" + std::to_string(difficulty) + "|" + (cross ? "1" : "0") + "|rotar0") | 0x80000000u;
+}
+
 LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const PcInfo& pc) {
 	Settings retired = s_in;
 	RetireOldRt(&retired); // (rtq2) a preset applied in this session may have set an old RT option
@@ -1395,10 +1442,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	if (s.multiplayer && CheatsUsed()) {
 		std::printf("[port] online: desactivado porque hay trucos activos\n");
 		std::fflush(stdout);
-	} else if (s.multiplayer && s.randomizer) { // (rando1) the randomizer is offline, as the cheats
-		std::printf("[port] online: desactivado porque el randomizer esta activo\n");
-		std::fflush(stdout);
-	} else if (s.multiplayer) {
+	} else if (s.multiplayer) { // (rando-online) also with the randomizer: its own "sala" (below), never mixed with others
 		const std::string host = Port::Online::ServerHost(); // (online10) one server for everyone (DuckDNS; 127.0.0.1 on the owner's PC)
 		env.Set("KYTY_ONLINE", "1");
 		env.Set("KYTY_ONLINE_SERVER", host + ":31415");
@@ -1412,7 +1456,22 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		env.Set("KYTY_DS_RANDOMIZER_SEED", std::to_string(seed));
 		if (s.randomizer_cross) env.Set("KYTY_DS_RANDOMIZER_CROSS", "1"); // (rando20) enemigos de otros mundos
 		env.Set("KYTY_DS_RANDOMIZER_DIFICULTAD", std::to_string(s.randomizer_difficulty)); // (rando27)
-		std::printf("[port] randomizer: activo, semilla %lld%s, otros mundos %s (sin conexion, trucos apagados)\n", seed,
+		// (rando-online) Online: the world must be the same for everyone of the sala. The per-load rotation (seed + this
+		// PC's own load counter) differs between players (a phantom loads the host's world at another count), and nothing
+		// shared counts loads without touching the server: online it is off (one mix per seed, the same on every PC).
+		// KYTY_DS_SALA: the key that keeps this configuration apart on the server (libs/network.cpp).
+		if (s.multiplayer && !CheatsUsed()) {
+			char key[16];
+			std::snprintf(key, sizeof(key), "%08X", RandoSalaKey(static_cast<int>(seed), s.randomizer_difficulty, s.randomizer_cross));
+			env.Set("KYTY_DS_RANDOMIZER_ROTAR", "0");
+			env.Set("KYTY_DS_SALA", key);
+			std::printf("[port] randomizer online: sala %s (codigo %s), rotacion por muerte apagada\n", key,
+			            RandoSalaCode(static_cast<int>(seed), s.randomizer_difficulty, s.randomizer_cross).c_str());
+		} else {
+			env.Set("KYTY_DS_RANDOMIZER_ROTAR", "");
+			env.Set("KYTY_DS_SALA", "");
+		}
+		std::printf("[port] randomizer: activo, semilla %lld%s, otros mundos %s (trucos apagados)\n", seed,
 		            s.randomizer_seed != 0 ? "" : " (aleatoria)", s.randomizer_cross ? "si" : "no");
 	}
 	else { // (rando24) Apagado: se quitan los del arranque anterior (el mismo lanzador los dejaba puestos y la mezcla
@@ -1421,6 +1480,8 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		env.Set("KYTY_DS_RANDOMIZER_SEED", "");
 		env.Set("KYTY_DS_RANDOMIZER_CROSS", "");
 		env.Set("KYTY_DS_RANDOMIZER_DIFICULTAD", "");
+		env.Set("KYTY_DS_RANDOMIZER_ROTAR", ""); // (rando-online)
+		env.Set("KYTY_DS_SALA", "");
 	}
 	// (11-21) The switches the test folder played with for days (native memory KYTY_RAIZ, the RAM savings RAM16 / RAM17 /
 	// RAM2 / RAM_NATIVE_TEX, the hitch fixes TIRON1-13...): on by default for everyone, first; settings.ini extra goes

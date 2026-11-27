@@ -6128,7 +6128,7 @@ void DrawRandomizer(float width, float height) {
 		const bool hov     = ImGui::IsItemHovered();
 		if (hov) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
 		const float hot = Anim::Hot(ImGui::GetItemID(), hov || ImGui::IsItemFocused() || on);
-		Tip("Randomizer: partida sin conexi\xC3\xB3n y sin trucos, con los Trofeos Randomizer al derrotar a cada archidemonio. "
+		Tip("Randomizer: partida sin trucos (online: en Conexi\xC3\xB3n online, Sala), con los Trofeos Randomizer al derrotar a cada archidemonio. "
 		    "Clic: activar / desactivar (semilla aleatoria en cada partida). Clic derecho: fijar una semilla nueva. "
 		    "Clic en \"MUNDOS\" (a la derecha, con el randomizer activo): enemigos de otros mundos s\xC3\xAD / no (experimental). "
 		    "Clic en \"NIVEL\": f\xC3\xA1" "cil (menos copias), intermedio (todas), dif\xC3\xAD" "cil (todas + el Vanguard en el primer patio).");
@@ -10099,6 +10099,57 @@ long long Number(const std::string& json, const std::string& key) {
 	return a == std::string::npos ? -1 : std::atoll(json.c_str() + a + key.size() + 3);
 }
 
+// (rando-online) Randomizer online "Sala": with the randomizer on, the code of this world (seed + NIVEL + MUNDOS, 8
+// letters) to pass to the others, and a field to type a friend's code (sets the same seed / NIVEL / MUNDOS). Online only
+// players with exactly the same code meet (signs, co-op, invasions, messages); the rotation per death is off online.
+char g_sala[16] = {};
+void SalaApply(int seed, int diff, bool cross) {
+	Settings on_disk;
+	if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
+	for (Settings* s: {&on_disk, &g_saved, &g_edit}) {
+		s->randomizer            = true;
+		s->randomizer_seed       = seed;
+		s->randomizer_difficulty = diff;
+		s->randomizer_cross      = cross;
+	}
+	(void)SaveSettings(g_rt.ini_path, on_disk);
+	std::printf("[port] sala: semilla=%d dificultad=%d otros_mundos=%d codigo %s\n", seed, diff, cross ? 1 : 0,
+	            Port::RandoSalaCode(seed, diff, cross).c_str());
+}
+void SalaBlock(float unit) {
+	if (!g_saved.randomizer) return;
+	ImGui::Spacing();
+	ImGui::TextColored(kGold, "%s", I18n::T("Sala del Randomizer (todos con el mismo mundo)"));
+	if (g_saved.randomizer_seed == 0) {
+		ImGui::TextColored(kDim, "%s", I18n::T("Semilla aleatoria: crea una sala para fijarla y pasar el c\xC3\xB3" "digo."));
+		if (Anim::Button(I18n::T("Crear sala"), {std::round(300 * unit), std::round(50 * unit)}, unit)) {
+			const int seed = 1 + static_cast<int>(static_cast<unsigned>(std::time(nullptr) * 2654435761u) % 999999u);
+			SalaApply(seed, std::clamp(g_saved.randomizer_difficulty, 1, 3), g_saved.randomizer_cross);
+			Note(I18n::T("Sala creada. Pasa el c\xC3\xB3" "digo a los dem\xC3\xA1s. Se aplica al reiniciar el juego."));
+		}
+	} else {
+		const std::string code = Port::RandoSalaCode(g_saved.randomizer_seed, std::clamp(g_saved.randomizer_difficulty, 1, 3), g_saved.randomizer_cross);
+		const std::string line = std::string(I18n::T("C\xC3\xB3" "digo de tu sala: ")) + code.substr(0, 4) + "-" + code.substr(4);
+		ImGui::TextColored(kGold, "%s", line.c_str());
+		ImGui::SameLine();
+		if (ImGui::SmallButton(I18n::T("Copiar"))) ImGui::SetClipboardText(code.c_str());
+	}
+	ImGui::SetNextItemWidth(std::round(260 * unit));
+	ImGui::InputTextWithHint(I18n::T("C\xC3\xB3" "digo de sala"), "XXXX-XXXX", g_sala, sizeof(g_sala), ImGuiInputTextFlags_CharsUppercase);
+	ImGui::SameLine();
+	if (ImGui::SmallButton(I18n::T("Unirse"))) {
+		int  seed = 0, diff = 2;
+		bool cross = false;
+		if (Port::RandoSalaDecode(g_sala, &seed, &diff, &cross)) {
+			SalaApply(seed, diff, cross);
+			Note(I18n::T("Sala puesta: mismo mundo que quien te pas\xC3\xB3 el c\xC3\xB3" "digo. Se aplica al reiniciar el juego."));
+		} else {
+			Note(I18n::T("C\xC3\xB3" "digo de sala no v\xC3\xA1lido."));
+		}
+	}
+	ImGui::TextColored(kDim, "%s", I18n::T("Online solo coincides con jugadores de tu mismo c\xC3\xB3" "digo. Sin trucos. Sin rotaci\xC3\xB3n por muerte."));
+}
+
 // The settings rows (the launcher's Configurador and the F2 page).
 void SettingsBlock(float unit) {
 	if (!g_inited) {
@@ -10119,12 +10170,10 @@ void SettingsBlock(float unit) {
 	}
 	const ImVec2 bs {std::round(300 * unit), std::round(50 * unit)};
 	// (trucos-online) Cheats in use: the box shows off and cannot be turned on (online and cheats never together).
-	const bool   cheats = CheatsInUse() || g_saved.randomizer; // (rando1) the randomizer plays offline too
+	const bool   cheats = CheatsInUse(); // (rando-online) the randomizer plays online now, in its own sala (below)
 	bool         on     = g_saved.multiplayer && !cheats;
 	if (ImGui::Checkbox(I18n::T("Conexión online"), &on)) {
-		if (on && g_saved.randomizer) {
-			Note(I18n::T("Desactiva el Randomizer para jugar online."));
-		} else if (on && cheats) {
+		if (on && cheats) {
 			Note(I18n::T("Desactiva los trucos (o reinicia sin usarlos) para jugar online."));
 			std::printf("[port] online: no se puede activar, hay trucos en uso\n");
 		} else {
@@ -10134,6 +10183,7 @@ void SettingsBlock(float unit) {
 	}
 	Anim::Highlight(unit);
 	if (cheats) ImGui::TextColored(kGold, "%s", I18n::T("Desactiva los trucos (o reinicia sin usarlos) para jugar online."));
+	SalaBlock(unit); // (rando-online)
 	ImGui::TextColored(kDim, "%s", (std::string(I18n::T("Servidor: ")) + On::kPublicServer + I18n::T(" (todos los jugadores al mismo)")).c_str()); // (online10)
 	ImGui::SetNextItemWidth(std::round(420 * unit));
 	ImGui::InputTextWithHint(I18n::T("Cuenta"), I18n::T("nombre (letras y números)"), g_name, sizeof(g_name));

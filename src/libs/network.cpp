@@ -44,6 +44,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <cctype>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -3701,11 +3702,121 @@ static bool online_restart_local_server() {
 #endif
 }
 
-// (online7) one retry after 300 ms (a server just started, a busy accept queue); a failure logs its last step.
+// (rando-online) Randomizer online (KYTY_DS_SALA = 8 hex digits, puesto por el lanzador solo con randomizer + online;
+// sin ella no se toca ni un byte). Todo el emparejamiento de nuestro servidor (mensajes, manchas de sangre, fantasmas,
+// replays y senales de invocacion -> sesiones de cooperativo) va por bloque (blockId / block_id / blockID, u32; el eboot
+// lo pone en addSummonSign @0x663680 junto a version, AccountId, password...) y el de PSN por rulesetName (POST
+// /v1/tickets). Aqui, sin tocar el servidor: el bloque que sale va XOR K (K = hash de semilla+nivel+mundos, bit 31
+// puesto) y vuelve con XOR K; el ruleset sale con "~R<K>" y vuelve sin el. Asi solo coinciden jugadores con la misma
+// configuracion exacta; los demas (sin randomizer u otra semilla) caen en bloques distintos. 0 y 0xFFFFFFFF (sin
+// bloque) no se tocan.
+namespace {
+uint32_t SalaKey() {
+	static const uint32_t k = [] {
+		const char* v = std::getenv("KYTY_DS_SALA");
+		const uint32_t x = (v != nullptr && *v != 0) ? static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) : 0u;
+		if (x != 0) {
+			std::printf("Online: randomizer en sala %08X (solo jugadores con el mismo mundo)\n", x);
+			std::fflush(stdout);
+		}
+		return x;
+	}();
+	return k;
+}
+uint32_t SalaMap(uint32_t b, uint32_t k) { return (b == 0u || b == 0xFFFFFFFFu) ? b : (b ^ k); }
+// Every "<key>": <integer> (optionally quoted) for the block keys, mapped with SalaMap.
+std::string SalaBlocks(const std::string& in, uint32_t k) {
+	std::string out;
+	out.reserve(in.size() + 32);
+	size_t i = 0;
+	while (i < in.size()) {
+		size_t best = std::string::npos, klen = 0;
+		for (const char* key: {"\"blockId\"", "\"block_id\"", "\"blockID\""}) {
+			const size_t f = in.find(key, i);
+			if (f < best) { best = f; klen = std::strlen(key); }
+		}
+		if (best == std::string::npos) { out.append(in, i, std::string::npos); break; }
+		size_t j = best + klen;
+		while (j < in.size() && (in[j] == ' ' || in[j] == '\t')) j++;
+		if (j >= in.size() || in[j] != ':') { out.append(in, i, j - i); i = j; continue; }
+		j++;
+		while (j < in.size() && (in[j] == ' ' || in[j] == '\t')) j++;
+		const bool q = j < in.size() && in[j] == '"';
+		size_t     n = j + (q ? 1 : 0);
+		const size_t n0 = n;
+		if (n < in.size() && in[n] == '-') n++;
+		while (n < in.size() && in[n] >= '0' && in[n] <= '9') n++;
+		if (n == n0 || (n == n0 + 1 && in[n0] == '-')) { out.append(in, i, n - i); i = n; continue; }
+		const uint32_t v = static_cast<uint32_t>(std::strtoll(in.c_str() + n0, nullptr, 10));
+		const uint32_t m = SalaMap(v, k);
+		if (m == v) { out.append(in, i, n - i); i = n; continue; } // no block (0 / -1): the very same text
+		out.append(in, i, n0 - i);
+		out += std::to_string(m);
+		i = n;
+	}
+	return out;
+}
+std::string SalaTag(uint32_t k) {
+	char t[16];
+	std::snprintf(t, sizeof(t), "~R%08X", k);
+	return t;
+}
+std::string SalaOut(const std::string& url, const std::string& body, uint32_t k) {
+	std::string b = SalaBlocks(body, k);
+	if (url.find("/tickets") != std::string::npos) {
+		const auto r = b.find("\"rulesetName\"");
+		if (r != std::string::npos) {
+			const auto a = b.find('"', b.find(':', r + 13) + 1);
+			const auto z = a == std::string::npos ? std::string::npos : b.find('"', a + 1);
+			if (z != std::string::npos) b.insert(z, SalaTag(k));
+		}
+	}
+	return b;
+}
+std::string SalaIn(const std::string& body, uint32_t k) {
+	std::string b = SalaBlocks(body, k);
+	const std::string tag = SalaTag(k);
+	for (size_t f = b.find(tag); f != std::string::npos; f = b.find(tag, f)) b.erase(f, tag.size());
+	return b;
+}
+void SalaFixLength(std::string* headers, size_t n) {
+	if (headers == nullptr) return;
+	std::string low = *headers;
+	for (auto& c: low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	const auto f = low.find("content-length:");
+	if (f == std::string::npos) return;
+	size_t a = f + 15, e = a;
+	while (e < headers->size() && (*headers)[e] != '\r' && (*headers)[e] != '\n') e++;
+	headers->replace(a, e - a, " " + std::to_string(n));
+}
+} // namespace
+
+static bool HttpExchangeTwice(const std::string& method, const std::string& url,
+                              const std::vector<std::pair<std::string, std::string>>& headers,
+                              const std::string& body, int* status, std::string* resp_headers,
+                              std::string* resp_body);
+
+// (rando-online) KYTY_DS_SALA unset: exactly the previous exchange.
 bool HttpExchange(const std::string& method, const std::string& url,
                   const std::vector<std::pair<std::string, std::string>>& headers,
                   const std::string& body, int* status, std::string* resp_headers,
                   std::string* resp_body) {
+	const uint32_t k = SalaKey();
+	if (k == 0) return HttpExchangeTwice(method, url, headers, body, status, resp_headers, resp_body);
+	const bool ok = HttpExchangeTwice(method, url, headers, SalaOut(url, body, k), status, resp_headers, resp_body);
+	if (ok && resp_body != nullptr) {
+		const size_t before = resp_body->size();
+		*resp_body = SalaIn(*resp_body, k);
+		if (resp_body->size() != before) SalaFixLength(resp_headers, resp_body->size());
+	}
+	return ok;
+}
+
+// (online7) one retry after 300 ms (a server just started, a busy accept queue); a failure logs its last step.
+static bool HttpExchangeTwice(const std::string& method, const std::string& url,
+                              const std::vector<std::pair<std::string, std::string>>& headers,
+                              const std::string& body, int* status, std::string* resp_headers,
+                              std::string* resp_body) {
 	for (int attempt = 1; attempt <= 2; attempt++) {
 		if (HttpExchangeOnce(method, url, headers, body, status, resp_headers, resp_body)) {
 			if (attempt > 1) {

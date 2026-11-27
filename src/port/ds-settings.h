@@ -332,6 +332,14 @@ bool FixedFg(const Settings& settings);
 void MarkCheatsUsed(const char* what);
 bool CheatsUsed();
 
+// (rando-online) Randomizer online por salas. Codigo de sala (8 letras, base32 sin I/L/O/U): semilla (20 bits), nivel
+// (2), mundos (1), version 1 (rotacion por muerte apagada online) y una suma de 16 bits; lo crea uno y lo escriben los
+// demas, asi todos cargan el mismo mundo. RandoSalaKey: la clave que separa en el servidor a los jugadores de esta
+// configuracion (KYTY_DS_SALA, libs/network.cpp); nunca 0, bit 31 puesto.
+std::string RandoSalaCode(int seed, int difficulty, bool cross);
+bool        RandoSalaDecode(const std::string& code, int* seed, int* difficulty, bool* cross);
+uint32_t    RandoSalaKey(int seed, int difficulty, bool cross);
+
 } // namespace Port
 
 #endif // EMULATOR_SRC_PORT_DS_SETTINGS_H_

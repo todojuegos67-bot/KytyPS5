@@ -1573,7 +1573,7 @@ int main(int argc, char* argv[]) {
 	runtime.game_info  = (param.name.empty() ? std::string("Demon's Souls") : param.name) +
 	                    (param.title_id.empty() ? std::string() : "  " + version);
 	runtime.launched   = settings;
-	if (settings.randomizer) runtime.launched.multiplayer = false; // (rando1) the randomizer plays offline (ds-settings BuildLaunch)
+	// (rando-online) the randomizer plays online too, in its own sala (ds-settings BuildLaunch); cheats stay off (CheatsBlocked)
 	if (Port::CheatsUsed()) runtime.launched.multiplayer = false; // (trucos-online) launched offline: cheats were used
 	runtime.notes      = plan.notes;
 	runtime.pc         = pc;
