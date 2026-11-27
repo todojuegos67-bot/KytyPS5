@@ -86,7 +86,7 @@ static std::atomic<uint64_t> g_cero_bytes {0}, g_cero_reads {0}, g_cero_failed {
 // true: done (bytes in *got); false: the cached way.
 static bool CacheCeroRead(void* data, uint32_t size, sys_file_t& f, DWORD* got) {
 	if (f.nocache == nullptr) {
-		HANDLE h  = ReOpenFile(f.handle, GENERIC_READ, FILE_SHARE_POSIX, FILE_FLAG_NO_BUFFERING);
+		HANDLE h  = ReOpenFile(f.handle, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_NO_BUFFERING);
 		f.nocache = h; // (INVALID_HANDLE_VALUE kept: not tried again)
 	}
 	if (f.nocache == INVALID_HANDLE_VALUE) return false;
