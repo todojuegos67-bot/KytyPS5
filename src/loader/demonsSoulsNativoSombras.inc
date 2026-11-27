@@ -604,6 +604,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 	// aparece) y USER_DATA s10 = el registro de la tabla (s8) + 2 (el VS de skinning indexa las filas del objeto con
 	// s10 & 0xffff + instance_id). Registros SH vistos en esta DCB (desplazamiento < 0x400).
 	static thread_local uint64_t dcb_es[H::NatMaxDraws];
+	static thread_local uint64_t dcb_ps[H::NatMaxDraws]; // (SPI_SHADER_PGM_LO/HI_PS 0x8/0x9 de ese draw; ~0: no se sabe)
 	static thread_local uint32_t dcb_s10[H::NatMaxDraws];
 	static thread_local uint8_t  dcb_s10_ok[H::NatMaxDraws];
 	static thread_local uint32_t dcb_treg[H::NatMaxDraws]; // (registro SH del puntero de la tabla (s8) de ese draw)
@@ -659,6 +660,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			dcb_op[draws]    = op;
 			dcb_count[draws] = op == 0x35 && len >= 4 ? p[3] : op == 0x27 && len >= 5 ? p[4] : 0;
 			dcb_start[draws] = op == 0x35 && len >= 4 ? p[2] : 0;
+			dcb_ps[draws]    = sh_ok[0x8] != 0 && sh_ok[0x9] != 0 ? (uint64_t {sh_val[0x8]} << 8u) | (uint64_t {sh_val[0x9] & 0xFFu} << 40u) : ~uint64_t {0};
 			dcb_es[draws]    = sh_ok[0xC8] != 0 && sh_ok[0xC9] != 0
 			                       ? (uint64_t {sh_val[0xC8]} << 8u) | (uint64_t {sh_val[0xC9] & 0xFFu} << 40u)
 			                       : 0;
@@ -785,6 +787,20 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			if (d.skin != 0 && vs_kind != 1)
 				return dcb_es[k] == 0 ? "skinning: ES no esta en la DCB (la dibuja el juego)" : "skinning: otro VS (no 0x3866090d; la dibuja el juego)";
 			if (d.skin == 0 && vs_kind == 1) info("sin skinning con el VS 0x3866090d (se dibuja con el de skinning)");
+			// (11-27, log 20261127-060057-463, DIAG error: todo el error del nativo esta en el cubo 1 (kRS_Depth_Normal) y solo en
+			// cubos con el VS de skinning; los cubos solo estaticos, 0 px.) Los VS de skinning exportan param0 (UV), el estatico
+			// no: van con un PS que lee la UV (recorte alfa: pelo, tela, vegetacion) que el nativo (sin PS) no hace -> dibuja
+			// de mas, "nativo mas cerca". Con el VS de skinning y un PS puesto (o sin saber cual), la dibuja el juego.
+			if (vs_kind == 1 && dcb_ps[k] != 0) {
+				if (H::NatDiag()) {
+					static std::atomic<uint32_t> shown {0};
+					if (shown.fetch_add(1, std::memory_order_relaxed) < 8)
+						std::printf("[nativo-sombras] DIAG VS de skinning con PS @%llx ES @%llx: al juego\n",
+						            static_cast<unsigned long long>(dcb_ps[k]), static_cast<unsigned long long>(dcb_es[k]));
+				}
+				return dcb_ps[k] == ~uint64_t {0} ? "VS de skinning con PS desconocido (la dibuja el juego)" : "VS de skinning con PS (recorte alfa: la dibuja el juego)";
+			}
+			if (vs_kind == 1) info("VS de skinning sin PS (dibujada en nativo)");
 			if (vs_kind == 1) {
 				if (dcb_s10_ok[k] == 0 && d.skin == 0) {
 					// (Sin skinning y sin s10 en la DCB: como antes, VS estatico con la fila 0; validado en cascadas 2-3.)
