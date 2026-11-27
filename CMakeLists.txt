@@ -189,7 +189,12 @@ if(KYTY_CLANG_CL)
 	option(KYTY_NATIVE_OPT "Release: -O3 -march=KYTY_MARCH" ON)
 	# A build for other PCs: x86-64-v3 (AVX2, FMA, BMI2). native also takes this CPU's newer
 	# extensions (GFNI, AVX-VNNI), which crash CPUs without them at the first use.
-	set(KYTY_MARCH "x86-64-v3" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)" FORCE) # (11-23) always AVX2: native put AVX-512 in the exe and it died at start (0xc000001d) on CPUs without it (Intel Core Ultra / Arrow Lake, most Intel desktops)
+	set(KYTY_MARCH "x86-64-v3" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)") # (11-23) AVX2: native put AVX-512 in the exe and it died at start (0xc000001d) on CPUs without it (Intel Core Ultra / Arrow Lake, most Intel desktops)
+	# (11-27) Only x86-64-v3 (the main exe) or x86-64-v2 ("Demon's Souls-compat.exe", CPUs without AVX2): native/v4 are refused.
+	if(NOT KYTY_MARCH MATCHES "^x86-64(-v2|-v3)?$")
+		message(WARNING "KYTY_MARCH=${KYTY_MARCH} not allowed: x86-64-v3 used")
+		set(KYTY_MARCH "x86-64-v3" CACHE STRING "Release: the -march of KYTY_NATIVE_OPT (x86-64-v3 for other PCs)" FORCE)
+	endif()
 	option(KYTY_THIN_LTO "Release: ThinLTO" ON)
 	option(KYTY_PGO_GENERATE "Instrumented build; the live command `pgo <file>` writes the profile" OFF)
 	set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (empty: none)")
@@ -1546,7 +1551,15 @@ if (KYTY_DS_PORT AND WIN32)
 		"${KYTY_SOURCE_DIR}/port/ds-port.h"
 		"${KYTY_SOURCE_DIR}/port/ds-settings.h"
 		"${KYTY_SOURCE_DIR}/port/ds-tables.h"
+		"${KYTY_SOURCE_DIR}/port/ds-cpu-guard.cpp"
 		"${KYTY_SOURCE_DIR}/port/ds-port.rc")
+	if (KYTY_CLANG_CL AND KYTY_NATIVE_OPT AND KYTY_MARCH STREQUAL "x86-64-v3")
+		# (11-27) The v3 exe: its first TLS callback, built at plain x86-64 without LTO, starts "Demon's Souls-compat.exe"
+		# (the -DKYTY_MARCH=x86-64-v2 build) on CPUs without AVX2. The compat build leaves it out (no redirect).
+		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-cpu-guard.cpp" PROPERTIES
+			COMPILE_DEFINITIONS "KYTY_DS_CPU_GUARD=1"
+			COMPILE_OPTIONS "/clang:-march=x86-64;-fno-lto")
+	endif()
 	if (KYTY_CLANG_CL)
 		set_source_files_properties("${KYTY_SOURCE_DIR}/port/ds-main.cpp" "${KYTY_SOURCE_DIR}/port/ds-menu.cpp"
 			"${KYTY_SOURCE_DIR}/port/ds-settings.cpp" "${KYTY_SOURCE_DIR}/port/ds-update.cpp" "${KYTY_SOURCE_DIR}/port/ds-precompile.cpp" "${KYTY_SOURCE_DIR}/port/ds-steam.cpp" "${KYTY_SOURCE_DIR}/port/ds-i18n.cpp" "${KYTY_SOURCE_DIR}/port/ds-resume.cpp" "${KYTY_SOURCE_DIR}/port/ds-online.cpp" PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
@@ -1570,7 +1583,7 @@ if (KYTY_DS_PORT AND WIN32)
 		# (hp, 11-25) No linker-made manifest: ds-port.rc embeds ds-port.manifest (asInvoker + SegmentHeap) as RT_MANIFEST 1.
 		target_link_options(kyty_emulator PRIVATE "/MANIFEST:NO")
 	endif()
-	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 winhttp dxgi advapi32 windowscodecs)
+	target_link_libraries(kyty_emulator ole32 oleaut32 shell32 uuid gdi32 user32 winhttp dxgi advapi32 windowscodecs)
 	# (10-27) The version stamp the in-game update compares with releases/latest (the CI passes its package name, the tag).
 	set(KYTY_DS_PORT_VERSION "" CACHE STRING "Demon's Souls PC port version (its release tag)")
 	if (KYTY_DS_PORT_VERSION)

@@ -238,6 +238,12 @@ jobs:
           call build-windows.cmd kyty_shader_precompile >> build.log 2>&1 || (type build.log & exit /b 1)
           rem (10-23) zarchive.exe: packs the game folder into one .zar the emulator reads directly.
           call build-windows.cmd zarchive_tool >> build.log 2>&1 || (type build.log & exit /b 1)
+          rem (11-27) The DS port: "Demon's Souls-compat.exe" at x86-64-v2 for CPUs without AVX2 (the v3 exe starts it there).
+          echo %KYTY_CMAKE_ARGS% | findstr /c:"KYTY_DS_PORT=ON" >nul && (
+            set "KYTY_BUILD_DIR=%CD%\_Build\windows-compat"
+            set "KYTY_CMAKE_ARGS=%KYTY_CMAKE_ARGS:x86-64-v3=x86-64-v2%"
+            call build-windows.cmd kyty_emulator >> build.log 2>&1 || (type build.log & exit /b 1)
+          )
           type build.log
 
       - name: Build errors
@@ -264,6 +270,7 @@ jobs:
             $out = "_Build\package\$env:FOLDER"
             New-Item -ItemType Directory -Force $out, "$out\_PipelineCache", "$out\LICENSES" | Out-Null
             Copy-Item "$build\kyty_emulator.exe" "$out\Demon's Souls.exe"
+            Copy-Item "_Build\windows-compat\kyty_emulator.exe" "$out\Demon's Souls-compat.exe"
             # (The shader preparation before the game: kyty_shader_precompile --make-seeds / --static-inputs.)
             Copy-Item "$build\kyty_shader_precompile.exe", "$build\libwinpthread-1.dll", fondo-souls.jpg $out
             # (ds-pc-port8) The launcher's background (the key art with the logo). (ds-pc-port9: no TU EQUIPO card, no knight.)
