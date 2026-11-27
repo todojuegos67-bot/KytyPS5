@@ -2377,6 +2377,7 @@ void Medallion(ImDrawList* dl, ImVec2 c, float r, float v, float alpha, bool dan
 
 // (perfopts-1107) The selection highlight that glides between the F2 menu's entries: each frame the focused (else
 // hovered) entry gives its rectangle; the highlight eases towards it and is drawn under the entries (DrawInGameMenu).
+void TipText(const char* text); // (tip-dentro) below: a tooltip kept inside the screen
 namespace Glide {
 ImVec2 g_a {0, 0}, g_b {0, 0}, g_ta {0, 0}, g_tb {0, 0};
 bool   g_have = false, g_shown = false, g_focused = false, g_danger = false;
@@ -3122,7 +3123,7 @@ void DrawPcTab(float unit) {
 		}
 		ImGui::EndDisabled();
 		if (ImGui::IsItemHovered())
-			ImGui::SetTooltip("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
+			TipText("Anade \"Demon's Souls\" a la biblioteca de Steam como juego externo (con icono e imagenes). Mejor con Steam cerrado; si esta abierto, reinicialo para que aparezca.");
 		std::scoped_lock lock(steam_mutex);
 		if (!steam_text.empty()) ImGui::TextWrapped("%s", steam_text.c_str());
 		else ImGui::TextColored(kDim, "%s", "Steam debe cerrarse antes o reiniciarse después para que aparezca el acceso.");
@@ -3260,7 +3261,7 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 	if (ImGui::IsItemHovered() || ImGui::IsItemFocused()) {
 		g_desc_title = "Optimizar según tu equipo";
 		g_desc_text  = "Elige los ajustes con mejor rendimiento para tu gráfica, procesador, RAM y monitor (objetivo: 60 FPS o más) y los guarda en settings.ini. Cambia gráficos, ray tracing y la opción de 16 GB de RAM; revisa las otras pestañas para ver el resultado.";
-		if (!in_tab) ImGui::SetTooltip("%s", g_desc_text.c_str());
+		if (!in_tab) TipText(g_desc_text.c_str());
 	}
 	if (!in_tab) {
 	ImGui::SameLine();
@@ -3272,7 +3273,7 @@ void DrawConfigurator(float unit, bool in_tab = false) {
 		g_cfg_open = false;
 		if (g_config_mode) g_start_result = 1;
 	}
-	if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_cfg_why.empty() ? "Sigue con tus ajustes actuales." : "Sigue con los ajustes elegidos.");
+	if (ImGui::IsItemHovered()) TipText(g_cfg_why.empty() ? "Sigue con tus ajustes actuales." : "Sigue con los ajustes elegidos.");
 	}
 	if (!g_cfg_why.empty()) {
 		ImGui::Spacing();
@@ -3824,7 +3825,7 @@ void Draw(float width, float height) {
 			}
 		}
 		if (v.running && ImGui::IsItemHovered())
-			ImGui::SetTooltip("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
+			TipText("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
 		ImGui::SameLine();
 		ImGui::BeginDisabled(g_upd.busy.load());
 		if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
@@ -3849,7 +3850,7 @@ void Draw(float width, float height) {
 				Save();
 			}
 			if (ImGui::IsItemHovered())
-				ImGui::SetTooltip("%s", "El juego arrancará directo. Para volver a verlo: F2 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
+				TipText("El juego arrancará directo. Para volver a verlo: F2 > Sistema > Mostrar el lanzador al iniciar, o \"Demon's Souls.exe\" --lanzador.");
 		}
 	} else {
 	const bool needs = NeedsRestartLive(g_rt.launched, s);
@@ -4145,14 +4146,41 @@ void Draw(ImDrawList* dl, float W, float H, float unit) {
 } // namespace Ambience
 #include "port/ds-fog.inc"
 
+// (tip-dentro) Places the next tooltip above [a, b], centred on it, clamped inside the display (margin U(8)); below
+// the item only when there is no room above. Width as the tooltip wraps it: text up to U(440) plus the window padding.
+void TipPlace(ImVec2 a, ImVec2 b, const char* text) {
+	const ImGuiStyle& st = ImGui::GetStyle();
+	const ImVec2      ds = ImGui::GetIO().DisplaySize;
+	const ImVec2      ts = ImGui::CalcTextSize(text, nullptr, false, U(440) - st.WindowPadding.x);
+	const float       w  = ts.x + st.WindowPadding.x * 2.0f, h = ts.y + st.WindowPadding.y * 2.0f;
+	const float       m  = U(8);
+	float             x  = (a.x + b.x) * 0.5f - w * 0.5f;
+	x                    = std::max(m, std::min(x, ds.x - m - w));
+	float y              = a.y - m - h;
+	if (y < m) y = std::min(b.y + m, ds.y - m - h);
+	ImGui::SetNextWindowPos({std::round(x), std::round(std::max(m, y))}, ImGuiCond_Always, {0.0f, 0.0f});
+}
+
+// A plain-text tooltip of the last item, placed as Tip (for the launcher's SetTooltip calls).
+void TipText(const char* text) {
+	TipPlace(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), text);
+	if (ImGui::BeginTooltip()) {
+		ImGui::PushTextWrapPos(U(440));
+		ImGui::TextUnformatted(text);
+		ImGui::PopTextWrapPos();
+		ImGui::EndTooltip();
+	}
+}
+
 // The tooltip of the last item (the launcher's ToolTip: on hover, after a short pause; also on disabled rows).
 void Tip(const char* tip) {
 	if (tip == nullptr || *tip == '\0') return;
 	if (!ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) return;
 	{
 		// (tip-arriba) Always above the hovered control, centred on it, so it never covers the other buttons.
+		// (tip-dentro) Its width measured first, so it stays whole inside the screen (the TROFEOS tile, far left, was cut).
 		const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-		ImGui::SetNextWindowPos({(a.x + b.x) * 0.5f, a.y - U(8)}, ImGuiCond_Always, {0.5f, 1.0f});
+		TipPlace(a, b, I18n::T(tip));
 	}
 	if (ImGui::BeginTooltip()) {
 		ImGui::PushTextWrapPos(U(440));
@@ -5231,6 +5259,7 @@ struct IconJob {
 std::vector<Row>         g_rows;
 int                      g_earned = 0, g_pct = 0;
 int                      g_game_total = 0;    // (rando1) the game's trophies only (the "X / 38"): the randomizer's apart
+int                      g_rando_have = 0, g_rando_all = 0; // (rando-trofeos) the "Trofeos Randomizer" earned / all
 int                      g_rando_first = -1;  // (rando1) index of the first "Trofeos Randomizer" row (they go last), -1 none
 int                      g_grade_have[5] = {}, g_grade_all[5] = {};
 bool                     g_loaded = false;
@@ -5271,17 +5300,18 @@ void Reload() {
 	g_dir    = FindDir();
 	std::map<int, int64_t> times;
 	if (!g_dir.empty()) {
-		if (std::ifstream f(g_dir / "trophies.json", std::ios::binary); f) {
-			const auto j = nlohmann::json::parse(f, nullptr, false);
-			if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
-				for (const auto& [k, v]: j["unlocked"].items()) times[std::atoi(k.c_str())] = v.is_number() ? v.get<int64_t>() : 0;
+		for (const char* name: {"trophies.json", Libs::Trophy::kRandoStoreName}) { // (rando-trofeos) + the randomizer's file
+			if (std::ifstream f(g_dir / name, std::ios::binary); f) {
+				const auto j = nlohmann::json::parse(f, nullptr, false);
+				if (j.is_object() && j.contains("unlocked") && j["unlocked"].is_object())
+					for (const auto& [k, v]: j["unlocked"].items()) times[std::atoi(k.c_str())] = v.is_number() ? v.get<int64_t>() : 0;
+			}
 		}
 	}
 	auto rows = LoadTrophyRows();
 	g_rows.clear();
 	g_rows.reserve(rows.size());
 	for (auto& r: rows) {
-		if (Libs::Trophy::IsRando(r.id)) continue; // (rando-oculto 11-23) the randomizer's trophies hidden from the launcher
 		Row x;
 		if (r.earned)
 			if (auto it = times.find(r.id); it != times.end()) x.when = it->second;
@@ -5308,8 +5338,13 @@ void Reload() {
 			g_rando_first = i;
 			break;
 		}
+	g_rando_have = g_rando_all = 0;
 	for (const auto& r: g_rows) {
-		if (Libs::Trophy::IsRando(r.t.id)) continue; // (rando1) not in the game's count nor percent
+		if (Libs::Trophy::IsRando(r.t.id)) { // (rando1) not in the game's count nor percent
+			g_rando_all++;
+			if (r.t.earned) g_rando_have++;
+			continue;
+		}
 		g_game_total++;
 		const int g = r.t.grade >= 1 && r.t.grade <= 4 ? r.t.grade : 0;
 		total += points(g);
@@ -5608,6 +5643,8 @@ void TileRect(int i, float& tx, float& tw) {
 	for (int j = 0; j < i; j++) tx += std::floor(base[j] * k) + gap;
 	tx = std::round(tx);
 	tw = std::floor(base[i] * k);
+	// (rando-ui4) RANDOMIZER, the last one, takes the free room up to the column (gap kept), at most Px(480).
+	if (i == 3 && k >= 1.0f && g_tiles_limit > 0.0f) tw = std::max(tw, std::floor(std::min(Px(480), g_tiles_limit - gap - tx)));
 }
 
 void Draw(float width, float height, float column_x) {
@@ -5686,7 +5723,34 @@ void Draw(float width, float height, float column_x) {
 			char pct[16];
 			std::snprintf(pct, sizeof(pct), "%d%%", g_pct);
 			Lozenge(dl, {std::round(lx + cw + Px(12)), std::round(a.y + Px(32) + Px(16) * 0.55f)}, Px(3), Ca(204, 176, 122, 0.8f));
-			Spaced(dl, cinzel, Px(16), {lx + cw + Px(24), a.y + Px(32)}, gold, pct, U(1));
+			const float pw = Spaced(dl, cinzel, Px(16), {lx + cw + Px(24), a.y + Px(32)}, gold, pct, U(1));
+			// (rando-trofeos) The randomizer's trophies beside it: their shield medal and their count.
+			if (g_rando_all > 0) {
+				char rc[32];
+				std::snprintf(rc, sizeof(rc), "%d / %d", g_rando_have, g_rando_all);
+				const float ms = Px(20), mx = std::round(lx + cw + Px(24) + pw + Px(14));
+				const float rw = Spaced(nullptr, cinzel, Px(16), {0, 0}, 0, rc, U(1));
+				if (mx + ms + Px(6) + rw < b.x - Px(40)) {
+					static ImTextureData* medal_tex  = nullptr;
+					static bool           medal_made = false;
+					if (!medal_made) {
+						medal_made = true;
+						std::vector<uint8_t> px;
+						Libs::Trophy::RandoMedal(64, Libs::Trophy::kRandoAll, &px);
+						if (px.size() == 64u * 64u * 4u) {
+							auto* t = IM_NEW(ImTextureData)();
+							t->Create(ImTextureFormat_RGBA32, 64, 64);
+							std::memcpy(t->GetPixels(), px.data(), px.size());
+							t->UseColors = true;
+							ImGui::RegisterUserTexture(t);
+							medal_tex = t;
+						}
+					}
+					if (medal_tex != nullptr)
+						dl->AddImage(medal_tex->GetTexRef(), {mx, std::round(a.y + Px(30))}, {mx + ms, std::round(a.y + Px(30)) + ms});
+					Spaced(dl, cinzel, Px(16), {mx + ms + Px(6), a.y + Px(32)}, IM_COL32(236, 226, 204, 240), rc, U(1));
+				}
+			}
 		}
 		// The fine progress line along the bottom.
 		const float px0 = lx, px1 = b.x - Px(46), py = std::round(b.y - Px(8));
@@ -6147,8 +6211,8 @@ void DrawRandomizer(float width, float height) {
 		const float mr0  = std::round(th * (on ? 0.28f : 0.34f));
 		const float lx0  = tx + Px(on ? 8 : 12) + 2.0f * mr0 + Px(on ? 6 : 10); // the text after the medal
 		const float rx   = tx + tw - Px(8);
-		float       cfs  = Px(14), labw = 0, valw = 0;
-		for (int it = 0; it < 4; it++) {
+		float       cfs  = Px(18), labw = 0, valw = 0; // (rando-ui4) bigger text; shrinks to fit as before
+		for (int it = 0; it < 8; it++) {
 			labw = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "NIVEL:", 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "MUNDOS:", 0.0f));
 			valw = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "S\xC3\x8D", 0.0f);
 			for (const char* d: kDiff) valw = std::max(valw, Spaced(nullptr, cinzel, cfs, {0, 0}, 0, d, 0.0f));
@@ -6216,19 +6280,19 @@ void DrawRandomizer(float width, float height) {
 			return size;
 		};
 		const float tsp = on ? U(0.5f) : U(2.5f); // tighter letters while the sub-columns share the tile
-		const float ts  = fit("RANDOMIZER", Px(19), tsp);
-		Spaced(dl, cinzel, ts, {lx, std::round(a.y + Px(8) + (Px(19) - ts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", tsp);
+		const float ts  = fit("RANDOMIZER", Px(22), tsp);
+		Spaced(dl, cinzel, ts, {lx, std::round(a.y + Px(7) + (Px(22) - ts) * 0.5f)}, Ca(222, 196, 140, 0.85f + 0.15f * hot), "RANDOMIZER", tsp);
 		char sub[64];
 		if (on && g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "Semilla %d", g_saved.randomizer_seed);
 		else if (on) std::snprintf(sub, sizeof(sub), "Semilla aleatoria");
 		else std::snprintf(sub, sizeof(sub), "Desactivado");
-		float ss = fit(sub, Px(14), 0.0f);
+		float ss = fit(sub, Px(16), 0.0f);
 		if (on && ss < Px(11)) { // too small: the short form
 			if (g_saved.randomizer_seed != 0) std::snprintf(sub, sizeof(sub), "#%d", g_saved.randomizer_seed);
 			else std::snprintf(sub, sizeof(sub), "Aleatoria");
-			ss = fit(sub, Px(14), 0.0f);
+			ss = fit(sub, Px(16), 0.0f);
 		}
-		Spaced(dl, cinzel, ss, {lx, a.y + Px(34)}, IM_COL32(236, 214, 190, 230), sub, 0.0f);
+		Spaced(dl, cinzel, ss, {lx, a.y + Px(33)}, IM_COL32(236, 214, 190, 230), sub, 0.0f);
 		if (on) { // (rando-ui3) "NIVEL: x" over "MUNDOS: y", labels light grey-gold, values bright
 			const int   d   = std::clamp(g_saved.randomizer_difficulty, 1, 3);
 			const float vx  = c1x + Px(8) + labw + Px(5);
@@ -10017,7 +10081,7 @@ void FriendsInline(float unit) {
 			g_open_with  = n;
 			g_unread[n]  = 0;
 		}
-		if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", I18n::T("Abrir el chat con este amigo"));
+		if (ImGui::IsItemHovered()) TipText(I18n::T("Abrir el chat con este amigo"));
 		ImGui::PopID();
 	}
 }
