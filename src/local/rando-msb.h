@@ -743,6 +743,16 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 	const std::string pname = GuestStr(reinterpret_cast<const char*>(name_p));
 	const std::string model = GuestStr(reinterpret_cast<const char*>(mname));
 	const int32_t     npc   = *reinterpret_cast<const int32_t*>(td + 0xC);
+	if (DemonioOn() && pname == "c2000_0000") { // (demonio) dato: el juego llega a crear la parte (sea cual sea el sitio)
+		static std::atomic<int> dn {0};
+		if (dn.fetch_add(1) < 20) {
+			float pp[3];
+			std::memcpy(pp, reinterpret_cast<const void*>(part + 0x20), 12);
+			std::printf("[demonio] 0x359990: parte %d %s modelo %s npc %d en (%.1f, %.1f, %.1f)\n", idx, pname.c_str(), model.c_str(), npc,
+			            static_cast<double>(pp[0]), static_cast<double>(pp[1]), static_cast<double>(pp[2]));
+			std::fflush(stdout);
+		}
+	}
 	const HookSwap*   hit   = nullptr;
 	bool              tabla = false;
 	std::string       where = "?";
@@ -1641,6 +1651,8 @@ struct Swap {
 	const File* donor      = nullptr;
 	size_t      donor_top  = 0;
 	uint64_t    guid_salt  = 0; // (rando12) != 0: GUID nuevos y deterministas para el subárbol (donante repetido)
+	bool        has_dest   = false; // (demonio) matriz de destino propia en vez de la del registro sustituido
+	float       dest[12] {};
 };
 
 // (rando12) GUID del subárbol del donante -> GUID nuevos (XOR con una clave del enemigo destino); el raíz pasa a ser el
@@ -1702,7 +1714,7 @@ inline bool Transplant(const File& t, const std::vector<Swap>& swaps, std::vecto
 		const Root  rd = RootInfo(dn, dr);
 		const Root  rt = RootInfo(t, tr);
 		Delta       dl;
-		if (!rd.ok || !rt.ok || !MakeDelta(rd.m, rt.m, &dl)) return false;
+		if (!rd.ok || !rt.ok || !MakeDelta(rd.m, sw.has_dest ? sw.dest : rt.m, &dl)) return false;
 		std::vector<uint32_t> refs;
 		CollectRefs(dr, &refs);
 		auto&         rm = remaps[s];
@@ -2694,24 +2706,36 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 	return true;
 }
 
-// (demonio) Una sola parte: el soldado c2000_0000 del primer patio de m02_00_00_00 pasa a ser el Vanguard de
-// m03_01_00_00 (c1030_0000): MSB (modelo c1030 añadido al grupo de enemigos, typedata del donante, sin patrulla; colision
-// 766 y grupos +0x44 del sitio) + entidad de Bluepoint trasplantada entera (cmdl, caws, ragdoll, sonido) con la matriz y
-// el enlace al MSB del soldado + gancho en memoria (0x359990/0x1451700) solo para la parte en esa posicion.
-inline bool BuildDemonio(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_out,
-                         std::vector<uint8_t>* cgpr_out) {
-	static const char* kTarget = "c2000_0000";
+// (demonio) Una sola parte: el soldado c2000_0000 de m02_00_00_00 pasa a ser el Vanguard de m03_01_00_00 (c1030_0000)
+// y se pone en la arena de la Falange, entre el centro (c5001_0000, 17.5 30.5 -3.2) y la archipiedra de 1-2
+// (o0300_0001 / punto del jugador c0000_0006, 17.5 30.5 5.9): sitio (17.5, 30.5, -1.0), colision y grupos +0x44 de
+// c5001_0000 (colision 820), sin patrulla, sin estado pasivo. Va ENCIMA de lo que haya hecho el randomizer (fuertes /
+// barajado): |msb| y |cg| entran ya construidos (vacios: los originales).
+// Log 20261127-032608-861: con el modelo c1030 METIDO en la tabla de modelos del MSB (indices de modelo corridos) no
+// hubo ni una peticion de c1030 (0x1451700) ni la linea del gancho 0x359990 (comparaba el modelo con "c2000" y el MSB
+// ya decia c1030). Ghidra: FUN_003effe0 crea un ChrIns por cada parte de tipo 2 (0x34ae50 -> 0x367220 -> 0x3233d0 ->
+// 0x359800, vtable 0x2581ee8); su entrada 5 (0x359990) lee modelo y NpcParam de la tabla de partes en memoria
+// (map+0x928 / +0x860, hechas del MSB por FUN_006c2e90) y llama 0x367030 -> 0x366130 -> 0x1451700. Ahora el MSB NO
+// cambia de modelo ni de tabla de modelos (soldado c2000, su NpcParam): el cambio a c1030 / 103001 (typedata del
+// donante + modelo y chrid) lo hace el gancho en memoria solo para la parte en ese sitio, igual que el resto del mapa.
+inline bool BuildDemonio(const std::string& map, const std::filesystem::path& app0, std::vector<uint8_t>* msb_io,
+                         std::vector<uint8_t>* cgpr_io) {
+	static const char* kTarget   = "c2000_0000";
 	static const char* kDonorMap = "m03_01_00_00";
-	static const char* kDonor = "c1030_0000";
+	static const char* kDonor    = "c1030_0000";
+	static const char* kArena    = "c5001_0000"; // Falange
+	static const float kSpot[3]  = {17.5f, 30.5f, -1.0f};
 	if (map != "m02_00_00_00") return false;
 	auto fail = [&](const char* why) {
-		std::printf("[demonio] %s: %s; se deja el mapa original\n", map.c_str(), why);
+		std::printf("[demonio] %s: %s; el Vanguard no se pone\n", map.c_str(), why);
 		std::fflush(stdout);
 		return false;
 	};
-	std::vector<uint8_t> msb, dmsb;
+	std::vector<uint8_t> msb = *msb_io, dmsb;
 	Cg::File             tf;
-	if (!ReadWhole(MsbPathOf(app0, map), &msb) || !ReadWhole(CgprPathOf(app0, map), &tf.d)) return fail("no se leen el MSB o el cgpr");
+	tf.d = *cgpr_io;
+	if (msb.empty() && !ReadWhole(MsbPathOf(app0, map), &msb)) return fail("no se lee el MSB");
+	if (tf.d.empty() && !ReadWhole(CgprPathOf(app0, map), &tf.d)) return fail("no se lee el cgpr");
 	if (!Cg::Parse(&tf)) return fail("legacy_instances con formato no reconocido");
 	std::vector<Table> t, dt;
 	if (!ParseTables(msb, &t) || BuildTables(t) != msb) return fail("MSB no reconocido");
@@ -2722,10 +2746,13 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	auto& models = t[0].blobs;
 	auto& parts  = t[3].blobs;
 
-	size_t pi = ps.size();
-	for (size_t i = 0; i < ps.size(); i++)
+	size_t pi = ps.size(), ai = ps.size();
+	for (size_t i = 0; i < ps.size(); i++) {
 		if (ps[i].name == kTarget && ModelName(models[static_cast<size_t>(ps[i].model)]) == "c2000") pi = i;
+		if (ps[i].name == kArena) ai = i;
+	}
 	if (pi == ps.size()) return fail("no esta el soldado c2000_0000");
+	if (ai == ps.size()) return fail("no esta la Falange c5001_0000");
 	size_t         top = 0;
 	const Cg::Rec* tr  = TopByName(tf, kTarget, &top);
 	if (tr == nullptr || !Cg::RootInfo(tf, *tr).ok || Cg::RootInfo(tf, *tr).part != ps[pi].index)
@@ -2735,9 +2762,8 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	for (size_t i = 0; i < dps.size(); i++)
 		if (dps[i].name == kDonor && ModelName(dt[0].blobs[static_cast<size_t>(dps[i].model)]) == "c1030") dpi = i;
 	if (dpi == dps.size()) return fail("no esta el Vanguard c1030_0000 en m03_01_00_00");
-	const auto&          dmodel = dt[0].blobs[static_cast<size_t>(dps[dpi].model)];
-	const auto&          dpart  = dt[3].blobs[dps[dpi].index];
-	uint8_t              td_head[0x14], td_init[4];
+	const auto& dpart = dt[3].blobs[dps[dpi].index];
+	uint8_t     td_head[0x14], td_init[4];
 	std::memcpy(td_head, dpart.data() + dps[dpi].td, 0x14);
 	std::memcpy(td_init, dpart.data() + dps[dpi].td + 0x18, 4);
 	const Cg::File* df = DonorFile(app0, kDonorMap);
@@ -2745,77 +2771,60 @@ inline bool BuildDemonio(const std::string& map, const std::filesystem::path& ap
 	size_t         dtop = 0;
 	const Cg::Rec* dr   = TopByName(*df, kDonor, &dtop);
 	if (dr == nullptr || !Cg::RootInfo(*df, *dr).ok) return fail("el Vanguard no tiene entidad en el cgpr de m03_01");
+	for (const auto& m: models)
+		if (BI32(m, 0x8) == 2 && ModelName(m) == "c1030") return fail("c1030 ya esta en el mapa");
 
-	size_t  last_enemy = models.size();
-	int32_t type_idx   = 0;
-	for (size_t i = 0; i < models.size(); i++)
-		if (BI32(models[i], 0x8) == 2) {
-			if (ModelName(models[i]) == "c1030") return fail("c1030 ya esta en el mapa");
-			last_enemy = i;
-			type_idx++;
-		}
-	if (last_enemy == models.size()) return fail("sin modelos de enemigo");
-	std::vector<uint8_t> blob = dmodel;
-	std::memcpy(blob.data() + 0xC, &type_idx, 4);
-	const size_t insert_at = last_enemy + 1;
-	models.insert(models.begin() + static_cast<ptrdiff_t>(insert_at), blob);
-	for (auto& p: parts) {
-		int32_t mi = BI32(p, 0x10);
-		if (mi >= static_cast<int32_t>(insert_at)) {
-			mi++;
-			std::memcpy(p.data() + 0x10, &mi, 4);
-		}
-	}
-	const auto& e  = ps[pi];
-	auto&       pb = parts[e.index];
-	HookSwap    h;
-	h.has_pos = true;
-	std::memcpy(h.pos, pb.data() + 0x20, 12);
-	h.name = kTarget;
-	std::snprintf(h.orig_model, sizeof(h.orig_model), "c2000");
-	h.orig_npc = BI32(pb, e.td + 0xC);
-	std::snprintf(h.new_model, sizeof(h.new_model), "c1030");
-	std::memcpy(&h.new_npc, td_head + 0xC, 4);
-	std::memcpy(h.td_head, td_head, sizeof(h.td_head));
-	std::memcpy(h.td_init, td_init, sizeof(h.td_init));
-	const int32_t mi = static_cast<int32_t>(insert_at);
-	std::memcpy(pb.data() + 0x10, &mi, 4);
-	std::memcpy(pb.data() + e.td, td_head, 0x14);
-	std::memcpy(pb.data() + e.td + 0x18, td_init, 4);
-	std::memset(pb.data() + e.td + 0x20, 0xFF, 24); // sin patrulla
-	std::vector<int32_t> count(models.size(), 0);
-	for (const auto& p: parts) {
-		const int32_t m = BI32(p, 0x10);
-		if (m >= 0 && static_cast<size_t>(m) < count.size()) count[static_cast<size_t>(m)]++;
-	}
-	for (size_t i = 0; i < models.size(); i++) std::memcpy(models[i].data() + 0x18, &count[i], 4);
+	// Sitio: arena de la Falange (lógica en el MSB).
+	const auto&  ap  = parts[ps[ai].index];
+	const size_t atd = ps[ai].td;
+	auto&        pb  = parts[ps[pi].index];
+	const size_t td  = ps[pi].td;
+	const float  rot[3] {0.0f, 0.0f, 0.0f}; // mirando a la archipiedra (+Z)
+	std::memcpy(pb.data() + 0x20, kSpot, 12);
+	std::memcpy(pb.data() + 0x2C, rot, 12);
+	std::memcpy(pb.data() + 0x44, ap.data() + 0x44, 32);
+	std::memcpy(pb.data() + td + 0x1C, ap.data() + atd + 0x1C, 4);
+	std::memset(pb.data() + td + 0x20, 0xFF, 24); // sin patrulla
+	pb[td + 0x14] = 0;                            // sin estado pasivo
 	std::vector<uint8_t> msb2 = BuildTables(t);
 
-	std::vector<Cg::Swap> swaps;
-	swaps.push_back({top, df, dtop});
+	// Aspecto: entidad entera del Vanguard, con la matriz en el sitio nuevo y el enlace al MSB del soldado.
+	Cg::Swap sw {top, df, dtop};
+	sw.has_dest = true;
+	std::memset(sw.dest, 0, sizeof(sw.dest));
+	sw.dest[0] = sw.dest[4] = sw.dest[8] = 1.0f;
+	std::memcpy(sw.dest + 9, kSpot, 12);
 	std::vector<uint32_t> refs;
 	Cg::CollectRefs(df->tops[dtop], &refs);
 	const size_t           new_objs = tf.objs.size() + std::set<uint32_t>(refs.begin(), refs.end()).size();
 	std::vector<uint8_t>   cg2;
 	std::vector<Table>     check;
 	std::vector<EnemyPart> check_ps;
-	if (!Cg::Transplant(tf, swaps, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) || !EnemyParts(check, &check_ps) ||
+	if (!Cg::Transplant(tf, {sw}, &cg2) || !Cg::Check(cg2, new_objs) || !ParseTables(msb2, &check) || !EnemyParts(check, &check_ps) ||
 	    check_ps.size() != ps.size())
 		return fail("el resultado no se relee bien");
+
+	HookSwap h;
+	h.has_pos = true;
+	std::memcpy(h.pos, kSpot, 12);
+	h.name = kTarget;
+	std::snprintf(h.orig_model, sizeof(h.orig_model), "c2000");
+	h.orig_npc = BI32(pb, td + 0xC);
+	std::snprintf(h.new_model, sizeof(h.new_model), "c1030");
+	std::memcpy(&h.new_npc, td_head + 0xC, 4);
+	std::memcpy(h.td_head, td_head, sizeof(h.td_head));
+	std::memcpy(h.td_init, td_init, sizeof(h.td_init));
 	{
 		std::lock_guard<std::mutex> lock(HookMutex());
-		HookSwaps().push_back(std::move(h));
+		HookSwaps().push_back(h);
 	}
-	float pos[3];
-	std::memcpy(pos, pb.data() + 0x20, 12);
-	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en (%.1f, %.1f, %.1f), colision %d; "
-	            "cgpr %zu -> %zu objetos\n",
-	            map.c_str(), kTarget, HookSwaps().back().orig_npc, HookSwaps().back().new_npc, kDonorMap, kDonor,
-	            static_cast<double>(pos[0]), static_cast<double>(pos[1]), static_cast<double>(pos[2]), BI32(pb, e.td + 0x1C),
-	            tf.objs.size(), new_objs);
+	std::printf("[demonio] %s: %s (c2000, npc %d) -> Vanguard c1030 npc %d (entidad de %s %s) en la arena de la Falange "
+	            "(%.1f, %.1f, %.1f), colision %d; MSB sin cambio de modelo (lo cambia el gancho); cgpr %zu -> %zu objetos\n",
+	            map.c_str(), kTarget, h.orig_npc, h.new_npc, kDonorMap, kDonor, static_cast<double>(kSpot[0]),
+	            static_cast<double>(kSpot[1]), static_cast<double>(kSpot[2]), BI32(pb, td + 0x1C), tf.objs.size(), new_objs);
 	std::fflush(stdout);
-	msb_out->swap(msb2);
-	cgpr_out->swap(cg2);
+	msb_io->swap(msb2);
+	cgpr_io->swap(cg2);
 	return true;
 }
 
@@ -2864,9 +2873,20 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 	RedirectEntry        e;
 	e.done = true;
 	std::vector<uint8_t> msb, cg;
-	const bool built = DemonioOn() ? BuildDemonio(map, app0, &msb, &cg)
-	                               : (FuertesOn() ? BuildFuertes(map, app0, &msb, &cg) : BuildCross3(map, app0, &msb, &cg));
-	if (!DemonioOn() && DynVisualOn()) { // (rando16) indice de partes de TODOS los mapas, tal como los lee el juego
+	// (demonio) El Vanguard va ENCIMA de lo que haga el randomizer (antes lo sustituia: sin "[rando] mapa" en ningun mapa).
+	bool built = false;
+	if (FuertesOn()) built = BuildFuertes(map, app0, &msb, &cg);
+	else if (CrossWorldsOn()) built = BuildCross3(map, app0, &msb, &cg);
+	if (built && !DynVisualOn() && !FuertesOn() && Enabled()) ShuffleBytes(map, msb); // barajado de la fase 1 en la copia
+	if (DemonioOn() && map == "m02_00_00_00") {
+		if (!built) { // sin copia del randomizer: los originales (modo barajar: barajados antes, como en memoria)
+			msb.clear();
+			cg.clear();
+			if (Enabled() && !FuertesOn() && !CrossWorldsOn() && ReadWhole(MsbPathOf(app0, map), &msb)) ShuffleBytes(map, msb);
+		}
+		built = BuildDemonio(map, app0, &msb, &cg) || built;
+	}
+	if (DynVisualOn()) { // (rando16) indice de partes de TODOS los mapas, tal como los lee el juego
 		std::vector<uint8_t> orig;
 		if (built) DynRegister(map, msb);
 		else if (ReadWhole(MsbPathOf(app0, map), &orig)) DynRegister(map, orig);
@@ -2874,9 +2894,8 @@ inline const RedirectEntry& EntryFor(const std::string& map, const std::filesyst
 	if (built) {
 		// (rando16) Con entidad visual trasplantada no se baraja: la matriz de cada entidad de Bluepoint es la del sitio
 		// original de su parte; si la parte se mueve, aspecto y logica quedan en sitios distintos.
-		if (!DemonioOn() && !DynVisualOn() && !FuertesOn()) ShuffleBytes(map, msb);
 		std::error_code ec;
-		const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" / Utf8Path(DemonioOn() ? "demonio-patio" : Seed());
+		const auto      dir = std::filesystem::temp_directory_path(ec) / "kyty-rando" / Utf8Path(DemonioOn() ? std::string("demonio-") + Seed() : std::string(Seed()));
 		if (!ec) std::filesystem::create_directories(dir, ec);
 		const auto cm = dir / Utf8Path(map + ".msb");
 		const auto cc = dir / Utf8Path(map + "_legacy_instances.cgpr");
@@ -2929,8 +2948,8 @@ inline std::optional<uint64_t> RedirectedSize(const std::string& path) {
 
 // Fase 1 sobre lo leído en memoria. Si el mapa ya va por la copia (fase 2), la copia ya está barajada: no se toca.
 inline bool Shuffle(const std::string& path, std::vector<uint8_t>& bytes) {
-	if (DemonioOn() || FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
-	if (CrossWorldsOn() && !RedirectRead(path).empty()) return false;
+	if (FuertesOn()) return false; // (rando18) va por la copia (lógica + aspecto juntos) o se deja el original
+	if ((CrossWorldsOn() || DemonioOn()) && !RedirectRead(path).empty()) return false; // la copia ya va barajada
 	return ShuffleBytes(MapName(path), bytes);
 }
 
