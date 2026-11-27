@@ -2715,6 +2715,117 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		}
 		last.valid = false; // (valid again only once this call is drawn: a refusal below leaves no group behind)
 	}
+	// (do2-rapido, KYTY_DO2_RAPIDO; local/do2-rapido.h) A direct draw right after a direct table draw of the same pair,
+	// variant, state, set and pipeline, with the same user data, in the same command buffer, rendering and pass, no
+	// image / buffer registration / mapping change and no packet but registers in between: what TableEvaluate,
+	// TableGather, TableSet, the BDA and the blocks would make is the last draw's (the same inputs), still bound; only
+	// the indices, count, instances and vertex offset are this draw's. Off: one static load.
+	const bool do2 = Do2Rapido::Mode() != 0 && Role() == 0 && Spec::Current() == nullptr;
+	if (do2) {
+		auto&      s      = Do2Rapido::g_snap;
+		const bool was    = s.valid;
+		s.valid           = false; // (valid again only once this call is drawn)
+		uint32_t   why    = Do2Rapido::WCount;
+		auto&      bcache = m_context.GetBufferCache();
+		auto&      emit   = cache.emit;
+		const auto vk_now = buffer.IsInvalid() ? uint64_t {0}
+		                                       : reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(buffer.RawHandle()));
+		if (direct == nullptr) {
+			// (not a direct draw: not counted)
+		} else if (!was || !direct->indexed) {
+			why = Do2Rapido::WNoSnap;
+		} else if (Do2Rapido::t_seq != s.seq + 1) {
+			why = Do2Rapido::WSeq;
+		} else if (s.pair != &pair || s.variant != &variant || s.state != &draw_state || s.programs[0] != pair.programs[0] ||
+		           s.programs[1] != pair.programs[1] || s.frame != m_context.FrameNumber() ||
+		           s.shader_gen != ShaderMapGeneration() || s.index_type != static_cast<uint32_t>(index_type) ||
+		           s.pipeline != variant.pipeline || table.last_pair != &pair || table.last_state != &draw_state ||
+		           table.last_set != s.set || table.last_variant != static_cast<size_t>(&variant - pair.variants.data())) {
+			why = Do2Rapido::WKey;
+		} else if (vk_now == 0 || vk_now != s.command || buffer.GraphicsGeneration() != s.generation ||
+		           LiveCounters::Value(LiveCounters::RenderPasses) != s.passes || !buffer.RenderingWith(draw_state.rendering) ||
+		           buffer.InCopyRun() || buffer.ComputeChainPending() ||
+		           reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(emit.command)) != vk_now ||
+		           emit.generation != s.generation || emit.state != &draw_state || emit.pipeline != s.pipeline ||
+		           emit.index_base != s.ib_base || emit.index_bytes != s.ib_bytes || emit.index_type != index_type) {
+			why = Do2Rapido::WCommand;
+		} else if (m_context.GetTextureCache().ImagesEpoch() != s.images_epoch || table.images_epoch != s.images_epoch ||
+		           bcache.RegistrationEpoch() != s.registration || m_context.GetGpuResources().MappingEpoch() != s.mapping) {
+			why = Do2Rapido::WEpoch;
+		} else if (HwScene::Active() || Render1::Mode() != 0 || PortR::Verifying() || LiveCensus::Mdraw::Active() ||
+		           TrustedDepth::Mode() != 0 || TrustedDepth::StatsOn() || NativeRender::NoteTargetsWanted() ||
+		           (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) != 0) {
+			why = Do2Rapido::WExcluded;
+		} else {
+			bool same_ud = true;
+			for (uint32_t st = 0; st < 2 && same_ud; ++st) {
+				const auto size = st < stages ? static_cast<uint32_t>(user_data[st].size()) : 0u;
+				same_ud = size == s.ud_size[st] && size <= 32 &&
+				          (size == 0 || std::memcmp(user_data[st].data(), s.ud[st].data(), size * sizeof(uint32_t)) == 0);
+			}
+			if (!same_ud) {
+				why = Do2Rapido::WUd;
+			} else if (s.ib_buffer == nullptr || index_base == 0 || index_bytes == 0 || index_base < s.ib_begin ||
+			           index_base + index_bytes > s.ib_end || bcache.RegistrationEpoch() != s.ib_registration ||
+			           s.ib_cpu_epoch == 0 || bcache.CpuModificationEpoch(s.ib_begin, s.ib_end - s.ib_begin) != s.ib_cpu_epoch) {
+				why = Do2Rapido::WIndex;
+			} else if (!Do2Rapido::Active()) {
+				Do2Rapido::g_would.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				// The fast draw: the last draw's bindings stand (pipeline, set, targets, images in their layouts).
+				const auto  vk_buffer = buffer.Handle();
+				auto*       ib        = static_cast<Buffer*>(s.ib_buffer);
+				const auto* bound     = static_cast<const PipelineCache::Pipeline*>(s.pipeline);
+				if (index_base != emit.index_base || index_bytes != emit.index_bytes) {
+					vk_buffer.bindIndexBuffer(ib->Handle(), ib->Offset(index_base), index_type);
+					emit.index_base  = index_base;
+					emit.index_bytes = index_bytes;
+				}
+				if (s.push_dwords != 0)
+					vk_buffer.pushConstants(bound->pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+					                        0, s.push_dwords * sizeof(uint32_t), s.push.data());
+				// The game-side hooks the normal path calls with the (same) blocks.
+				const std::span<const uint32_t> slots(table.blocks[0].data(), pair.programs[0]->table_plan.slots.size());
+				if (Render5Flags::Capturing()) FrameGen::OnDraw(pair.programs[0]->shader_hash, slots, 't');
+				if (PathTrace::Requested()) PathTrace::OnDraw(pair.programs[0]->shader_hash, slots);
+				if (Render5Flags::Wanted(Render5Flags::Ssr)) FrameGen::OnSsrDraw(pair.programs[0]->shader_hash, slots);
+				if (Render5Flags::Wanted(Render5Flags::Contact)) FrameGen::OnShadowDraw(pair.programs[0]->shader_hash, slots, false);
+				if (Render5Flags::Wanted(Render5Flags::RtSun) && draw_state.targets.size() == 1) {
+					const auto& t = draw_state.targets[0];
+					const auto& r = t.requested;
+					if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
+						FrameGen::OnSunCascadeDraw(pair.programs[0]->shader_hash, slots, t.range.base_layer, r.data.address);
+				}
+				// This draw's offsets, as the normal path's direct draw gives them.
+				const auto& vertex = *pair.programs[0];
+				const auto  word   = [&](int32_t sgpr) {
+					const auto index = int64_t {sgpr} - vertex.user_data_base;
+					return index >= 0 && index < static_cast<int64_t>(user_data[0].size()) ? user_data[0][index] : 0u;
+				};
+				const uint32_t index_offset   = buffer.GetUserConfig().GetIndexOffset();
+				const uint32_t vertex_offset  = variant.fetch_embedded && index_offset == 0 ? word(vertex.info.vertex_offset_sgpr)
+				                                                                            : index_offset;
+				const uint32_t first_instance = variant.fetch_embedded ? word(vertex.info.instance_offset_sgpr) : 0u;
+				vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset),
+				                      first_instance);
+				if (Render5Flags::Wanted(Render5Flags::ParticlesDebug) && !draw_state.targets.empty())
+					FrameGen::NoteOtherPathDraw(draw_state.targets[0].requested.data.address, 0, false, 1);
+				if (Render5Flags::Capturing()) FrameGen::AfterDraw(buffer);
+				draw_state.Use(m_context.FrameNumber());
+				LiveCounters::Add(LiveCounters::TableDraws, 1);
+				s.ib_base  = emit.index_base;
+				s.ib_bytes = emit.index_bytes;
+				s.seq      = Do2Rapido::t_seq;
+				s.valid    = true;
+				Do2Rapido::g_taken.fetch_add(1, std::memory_order_relaxed);
+				return TableResult::Drawn;
+			}
+		}
+		if (why != Do2Rapido::WCount) {
+			Do2Rapido::g_fallback.fetch_add(1, std::memory_order_relaxed);
+			Do2Rapido::g_why[why].fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 	// (port-r, KYTY_PORT_R=2; local/port-r.h) A draw of the game's geometry list run by the host (eboot+0xab57d0): its
 	// native description (found by the table address its user data carries) is compared with what this draw translates
 	// to, after the evaluation (PortR::End below); the clock takes the whole step, every return. Off: one load.
@@ -3485,6 +3596,51 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	table.last_set     = set;
 	table.images_epoch = texture_cache.ImagesEpoch();
 	LiveCounters::Add(LiveCounters::TableDraws, std::max<size_t>(commands.size(), 1));
+	// (do2-rapido) This direct draw, drawn the normal way, as the base of the next one's fast draw.
+	if (do2 && direct != nullptr && direct->indexed && !writes && !hwrt_capture && !render1 && bound_pipeline == variant.pipeline &&
+	    push_dwords <= 32 && user_data[0].size() <= 32 && (stages < 2 || user_data[1].size() <= 32)) {
+		auto& s = Do2Rapido::g_snap;
+		// The index buffer bound: this draw's lookup, else the one the last snapshot held for the same base.
+		auto&   held = table.indices[(emit.index_base * 0x9e3779b97f4a7c15ull) >> 51u];
+		Buffer* ib   = !same_index ? indices.first
+		               : (s.ib_buffer != nullptr && s.ib_base == emit.index_base && s.ib_bytes == emit.index_bytes)
+		                   ? static_cast<Buffer*>(s.ib_buffer)
+		                   : nullptr;
+		if (ib != nullptr && held.buffer == ib && held.cpu_epoch != 0 && emit.index_base >= held.begin &&
+		    emit.index_base + emit.index_bytes <= held.end) {
+			s.pair         = &pair;
+			s.variant      = &variant;
+			s.state        = &draw_state;
+			s.programs[0]  = pair.programs[0];
+			s.programs[1]  = pair.programs[1];
+			s.set          = set;
+			s.pipeline     = bound_pipeline;
+			s.frame        = m_context.FrameNumber();
+			s.shader_gen   = ShaderMapGeneration();
+			s.command      = reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(vk_buffer));
+			s.generation   = buffer.GraphicsGeneration();
+			s.passes       = LiveCounters::Value(LiveCounters::RenderPasses);
+			s.images_epoch = texture_cache.ImagesEpoch();
+			s.registration = buffer_cache.RegistrationEpoch();
+			s.mapping      = m_context.GetGpuResources().MappingEpoch();
+			s.index_type   = static_cast<uint32_t>(index_type);
+			for (uint32_t st = 0; st < 2; ++st) {
+				s.ud_size[st] = st < stages ? static_cast<uint32_t>(user_data[st].size()) : 0u;
+				if (s.ud_size[st] != 0) std::memcpy(s.ud[st].data(), user_data[st].data(), s.ud_size[st] * sizeof(uint32_t));
+			}
+			s.push_dwords = push_dwords;
+			if (push_dwords != 0) std::memcpy(s.push.data(), push_data.dwords.data(), push_dwords * sizeof(uint32_t));
+			s.ib_buffer       = ib;
+			s.ib_begin        = held.begin;
+			s.ib_end          = held.end;
+			s.ib_cpu_epoch    = held.cpu_epoch;
+			s.ib_registration = held.registration;
+			s.ib_base         = emit.index_base;
+			s.ib_bytes        = emit.index_bytes;
+			s.seq             = Do2Rapido::t_seq;
+			s.valid           = true;
+		}
+	}
 	// (thread1, KYTY_RENDER_STATS: the draws by what they draw into, LiveCensus::g_draw_targets; nothing otherwise.)
 	if (LiveCensus::g_render && LiveCensus::RenderStatsOn()) {
 		uint32_t drawn_into = LiveCensus::DrawColor;

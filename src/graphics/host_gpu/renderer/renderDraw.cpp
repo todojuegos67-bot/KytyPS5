@@ -1,3 +1,4 @@
+#include "local/do2-rapido.h" // (do2-rapido, KYTY_DO2_RAPIDO: table-xpr.inc)
 #include "local/bda-repite.h" // (bda-repite, KYTY_TECHO: solo mide; table-xpr.inc)
 #include "local/envio1.h" // (envio1: table-xpr.inc)
 #include "local/ds-nativo-sombras.h" // (F5 pase 2, =3/=1: el estado dinamico de los draws de la cascada marcada)
