@@ -56,6 +56,7 @@
 #include "local/ds-nativo-pase.h" // (F5 pase 1, KYTY_NATIVO_PASE_SSRCLEAR)
 #include "local/ds-nativo-sombras.h" // (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=2: volcado del VS de sombras)
 #include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: [censo-dcb])
+#include "local/perfil.h"       // (KYTY_PERFIL)
 #include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
 #include "render1.h" // (render1 F0+F1)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
@@ -1202,6 +1203,7 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 	LiveControl::Start();
 	Blackbox::Start(); // (the crash / freeze black box: logs/blackbox-<stamp>.txt, local/blackbox-run.h)
+	Perfil::Start();   // (KYTY_PERFIL=1: sampling profiler of this thread, logs/perfil-<stamp>.txt, local/perfil.h)
 	XprCapture::Initialize();
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	LocalVulkanRecording::ProducerScope recording;
