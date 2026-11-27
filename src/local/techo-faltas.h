@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 namespace TechoFaltas {
 
@@ -25,6 +26,36 @@ inline const char* const kVias[Vias] = {"diferida", "primera", "sin-vigilar", "v
 inline thread_local uint8_t t_via      = VNoMapeada;
 inline thread_local bool    t_envio    = false; // este hilo llama a sceAgcSuspendPoint
 inline void                 SetVia(Via v) noexcept { t_via = v; }
+
+// (faltas2) KYTY_FALTAS_TEX: la falta de escritura normal (via "escritura") no toma el cerrojo de la cache de texturas
+// cuando el mapa de granulos de 64 KiB dice que alli no hay ninguna imagen (TextureCache::MayHaveImagesRead, el mismo
+// atajo que IsRegionGpuModified). =1 encendido, =2 A/B dentro de la partida (cambia cada ventana de 5 s de techo),
+// sin variable o =0 como antes. Seguro: una imagen que se registre despues protege la pagina y la escritura vuelve a
+// fallar por el camino normal.
+inline std::atomic<int> g_tex_mode {-1};
+inline std::atomic<bool> g_tex_now {false};
+[[nodiscard]] inline int TexMode() noexcept {
+	int m = g_tex_mode.load(std::memory_order_relaxed);
+	if (m >= 0) return m;
+	const char* v = std::getenv("KYTY_FALTAS_TEX");
+	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
+	g_tex_mode.store(m, std::memory_order_relaxed);
+	g_tex_now.store(m == 1, std::memory_order_relaxed);
+	std::printf("[techo-faltas] KYTY_FALTAS_TEX=%d: %s\n", m,
+	            m == 1 ? "encendido (falta de escritura sin cerrojo de texturas donde no hay imagenes)"
+	                   : m == 2 ? "A/B: cambia cada 5 s" : "apagado (como antes)");
+	std::fflush(stdout);
+	return m;
+}
+[[nodiscard]] inline bool TexSkip() noexcept {
+	return TexMode() != 0 && g_tex_now.load(std::memory_order_relaxed);
+}
+// Tramos de la via "escritura": [0] ventana intentada, [1] RestoreIfUnwatched, [2] BufferCache::InvalidateMemory
+// (incluye la lectura de vuelta de la GPU si la pagina era suya), [3] TextureCache::InvalidateMemory. Ciclos y llamadas.
+inline std::atomic<uint64_t> g_tramo[4] {};
+inline std::atomic<uint64_t> g_tramo_n {0}, g_tex_skipped {0};
+inline std::atomic<uint64_t> g_lect_cyc {0}; // lectura: BufferCache::ReadMemory
+
 
 constexpr uint32_t Zonas = FrameNativo::CCount;
 // [hilo 0 otros / 1 envio][zona][via]: ciclos y llamadas.
@@ -142,6 +173,31 @@ inline void Report(double frames, double ms_cyc) noexcept {
 		std::printf(" %s %s %.2f %.1f%s", z < Zonas ? FrameNativo::kNames[z] : "?", v < Vias ? kVias[v] : "?", ms(top[k].cyc) * 4.0,
 		            static_cast<double>(top[k].n) * 4.0 / frames, top[k].envio != 0 ? " (envio)" : "");
 		std::printf(k + 1 < used ? "," : "");
+	}
+	// Tramos de "escritura" y la A/B de KYTY_FALTAS_TEX.
+	static uint64_t lt[4] {}, ltn = 0, lsk = 0, llc = 0;
+	double          tr[4];
+	for (int i = 0; i < 4; ++i) {
+		const uint64_t c = g_tramo[i].load(std::memory_order_relaxed);
+		tr[i] = ms(c - lt[i]), lt[i] = c;
+	}
+	const uint64_t tn = g_tramo_n.load(std::memory_order_relaxed), sk = g_tex_skipped.load(std::memory_order_relaxed),
+	               lc = g_lect_cyc.load(std::memory_order_relaxed);
+	const double esc_n = static_cast<double>(tn - ltn) / frames, sk_n = static_cast<double>(sk - lsk) / frames, lect = ms(lc - llc);
+	ltn = tn, lsk = sk, llc = lc;
+	std::printf(" | escritura por tramo (%.0f/fot): ventana %.2f restaurar %.2f buffers %.2f texturas %.2f ms (sin cerrojo %.0f/fot);"
+	            " lectura ReadMemory %.2f ms",
+	            esc_n, tr[0], tr[1], tr[2], tr[3], sk_n, lect);
+	const int mode = TexMode();
+	if (mode == 2) {
+		static double sum[2] {}, cnt[2] {};
+		const bool    was = g_tex_now.load(std::memory_order_relaxed);
+		sum[was ? 1 : 0] += hilo_ms[0] + hilo_ms[1];
+		cnt[was ? 1 : 0] += 1;
+		const double a = cnt[0] > 0 ? sum[0] / cnt[0] : 0, b = cnt[1] > 0 ? sum[1] / cnt[1] : 0;
+		std::printf(" | A/B KYTY_FALTAS_TEX: esta ventana %s; media faltas A(antes) %.2f ms (%.0f v) B(nuevo) %.2f ms (%.0f v) -> %+.2f ms/fot",
+		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
+		g_tex_now.store(!was, std::memory_order_relaxed);
 	}
 	std::printf(" | perdidos %llu\n", static_cast<unsigned long long>(g_lost.exchange(0, std::memory_order_relaxed)));
 	std::fflush(stdout);

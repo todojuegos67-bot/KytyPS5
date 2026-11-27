@@ -1,3 +1,4 @@
+#include "local/techo-faltas.h" // (faltas2, KYTY_FALTAS_TEX)
 #include <atomic>
 #include <memory>
 #include <tuple>
@@ -5712,6 +5713,14 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id,
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// (faltas2, KYTY_FALTAS_TEX; off: one relaxed load) No image over the range (the 64 KiB granule map, a superset):
+	// no m_lock, which the render thread holds while it translates. The pending downloads have their own mutex. An image
+	// registered after this check protects the page, and the write faults again on the normal path.
+	if (TechoFaltas::TexSkip() && !m_lock.ReadShared([&] { return MayHaveImagesRead(address, size); })) {
+		ReleaseDownloadPages(address, size);
+		TechoFaltas::g_tex_skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	ReleaseDownloadPages(address, size);

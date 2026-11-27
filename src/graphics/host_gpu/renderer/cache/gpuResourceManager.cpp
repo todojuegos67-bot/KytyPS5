@@ -431,6 +431,8 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		// (A write to a watched page of a view a partial unmap is mapping again: unseen while such a view came back
 		// writable.)
 		const bool in_remap = LibKernel::Memory::InRemapWindow(fault_vaddr);
+		const bool     tramos = Techo::On();
+		const uint64_t tr0    = tramos ? __rdtsc() : 0; // (techo-faltas: the "escritura" path's parts)
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::WindowFault);
 			if (FaultStatsOn()) NoteFault(fault_vaddr, 0);
@@ -445,14 +447,25 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		if (::Loader::DemonsSoulsWriteAudit::On()) ::Loader::DemonsSoulsWriteAudit::NoteWriteFault(fault_vaddr, 1);
 		// No watcher holds the page, so no cache expects this fault: the protection outlived its
 		// watchers and would fault forever. It gets the guest's own protection back.
+		const uint64_t tr1 = tramos ? __rdtsc() : 0;
 		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
 			LiveCounters::Add(LiveCounters::StaleProtectRepairs);
 			TechoFaltas::SetVia(TechoFaltas::VRestaurada);
 			return true;
 		}
+		const uint64_t tr2 = tramos ? __rdtsc() : 0;
 		if (in_remap) LiveCounters::Add(LiveCounters::RemapWindowWrites);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		const uint64_t tr3 = tramos ? __rdtsc() : 0;
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		if (tramos) {
+			const uint64_t tr4 = __rdtsc();
+			TechoFaltas::g_tramo[0].fetch_add(tr1 - tr0, std::memory_order_relaxed);
+			TechoFaltas::g_tramo[1].fetch_add(tr2 - tr1, std::memory_order_relaxed);
+			TechoFaltas::g_tramo[2].fetch_add(tr3 - tr2, std::memory_order_relaxed);
+			TechoFaltas::g_tramo[3].fetch_add(tr4 - tr3, std::memory_order_relaxed);
+			TechoFaltas::g_tramo_n.fetch_add(1, std::memory_order_relaxed);
+		}
 	} else {
 		LiveCounters::Add(LiveCounters::ReadFault);
 		TechoFaltas::SetVia(TechoFaltas::VLectura);
@@ -473,7 +486,9 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 			}
 		} normal_path;
 		SyncStats::g_fault_address = fault_vaddr;
+		const uint64_t rd0 = Techo::On() ? __rdtsc() : 0;
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		if (rd0 != 0) TechoFaltas::g_lect_cyc.fetch_add(__rdtsc() - rd0, std::memory_order_relaxed);
 	}
 	return true;
 }
