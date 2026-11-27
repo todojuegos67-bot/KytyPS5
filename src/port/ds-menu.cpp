@@ -6133,28 +6133,28 @@ void DrawRandomizer(float width, float height) {
 		    "Clic en \"MUNDOS\" (a la derecha, con el randomizer activo): enemigos de otros mundos s\xC3\xAD / no (experimental). "
 		    "Clic en \"NIVEL\": f\xC3\xA1" "cil (menos copias), intermedio (todas), dif\xC3\xAD" "cil (todas + el Vanguard en el primer patio).");
 		// (rando20) The right part of the tile (only while on) toggles the enemies from other worlds.
-		// (rando-ui2) Layout of the ON state, measured: [medal | title + seed | NIVEL | MUNDOS]. Each sub-column takes the
-		// width of its widest label/value (fixed, so nothing jumps when cycling); the hit-test uses the same x's.
+		// (rando-ui3) Readable ON state: [medal | title + seed | NIVEL: x / MUNDOS: y stacked]. Labels and values share one
+		// size (>= the seed line, ~75 % of the title); the medal and its padding shrink instead. Hit-test: right block,
+		// top half = NIVEL (cycles), bottom half = MUNDOS (toggles); right-click anywhere = new seed.
 		const char* kDiff[3] = {"F\xC3\x81" "CIL", "INTERM.", "DIF\xC3\x8D" "CIL"};
-		float       cfs      = Px(12); // the sub-columns' font size, shrunk if the left column gets too narrow
-		float       col_pad  = Px(6), c1w = 0, c2w = 0;
-		const float lx0      = tx + Px(12) + 2.0f * std::round(th * 0.34f) + Px(10); // the text after the medal
-		const float rx       = tx + tw - Px(5);
+		const float mr0  = std::round(th * (on ? 0.28f : 0.34f));
+		const float lx0  = tx + Px(on ? 8 : 12) + 2.0f * mr0 + Px(on ? 6 : 10); // the text after the medal
+		const float rx   = tx + tw - Px(8);
+		float       cfs  = Px(14), labw = 0, valw = 0;
 		for (int it = 0; it < 4; it++) {
-			c1w = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "NIVEL", 0.0f);
-			for (const char* d: kDiff) c1w = std::max(c1w, Spaced(nullptr, cinzel, cfs, {0, 0}, 0, d, 0.0f));
-			c2w = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "MUNDOS", 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "S\xC3\x8D", 0.0f));
-			c1w = std::ceil(c1w + 2 * col_pad);
-			c2w = std::ceil(c2w + 2 * col_pad);
-			if ((rx - c1w - c2w) - lx0 >= Px(110) || cfs <= Px(9)) break;
-			cfs     = std::max(Px(9), cfs - Px(1));
-			col_pad = std::max(Px(4), col_pad - Px(1));
+			labw = std::max(Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "NIVEL:", 0.0f), Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "MUNDOS:", 0.0f));
+			valw = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, "S\xC3\x8D", 0.0f);
+			for (const char* d: kDiff) valw = std::max(valw, Spaced(nullptr, cinzel, cfs, {0, 0}, 0, d, 0.0f));
+			if ((rx - labw - Px(5) - valw - Px(8)) - lx0 >= Px(80) || cfs <= Px(12)) break;
+			cfs -= Px(1) > 0 ? Px(1) : 1.0f;
 		}
-		const float c2x        = std::round(rx - c2w), c1x = std::round(c2x - c1w); // the dividers' x
+		const float c1x = std::round(rx - valw - Px(5) - labw - Px(8)); // the divider's x
+		const float my  = ImGui::GetIO().MousePos.y;
 		const float mx         = ImGui::GetIO().MousePos.x;
-		const bool  cross_zone = clicked && !right && g_saved.randomizer && mx >= c2x;
+		const bool  in_right   = clicked && !right && g_saved.randomizer && mx >= c1x;
+		const bool  cross_zone = in_right && my >= ty + th * 0.5f;
 		// (rando27) Zona "NIVEL" (a la izquierda de MUNDOS): FACIL -> INTERMEDIO -> DIFICIL -> FACIL.
-		const bool  diff_zone = clicked && !right && !cross_zone && g_saved.randomizer && mx >= c1x;
+		const bool  diff_zone = in_right && !cross_zone;
 		if (clicked) {
 			Settings on_disk;
 			if (!LoadSettings(g_rt.ini_path, &on_disk)) on_disk = g_saved;
@@ -6187,8 +6187,8 @@ void DrawRandomizer(float width, float height) {
 		dl->AddRect(a, b, Ca(204, 176, 122, 0.45f + 0.45f * hot), rr, 0, std::max(1.0f, U(1.25f)));
 		dl->AddRect({a.x + Px(3), a.y + Px(3)}, {b.x - Px(3), b.y - Px(3)}, Ca(204, 176, 122, 0.12f + 0.10f * hot), Px(4), 0, 1.0f);
 		// The medal: iron disc, gold rim, crossed blades and the soul in the middle (as the trophies' icon).
-		const float  mr = std::round(th * 0.34f);
-		const ImVec2 mc {std::round(a.x + Px(12) + mr), std::round(a.y + th * 0.5f)};
+		const float  mr = mr0;
+		const ImVec2 mc {std::round(a.x + Px(on ? 8 : 12) + mr), std::round(a.y + th * 0.5f)};
 		const float  pl = 0.5f + 0.5f * std::sin(static_cast<float>(ImGui::GetTime()) * 2.2f);
 		dl->AddCircleFilled(mc, mr, IM_COL32(20, 19, 23, 255), 32);
 		dl->AddCircle(mc, mr * 0.92f, Ca(200, 150, 70, 0.75f + 0.25f * hot), 32, std::max(1.5f, U(2.4f)));
@@ -6201,7 +6201,7 @@ void DrawRandomizer(float width, float height) {
 		}
 		for (int k = 3; k >= 1; k--) dl->AddCircleFilled(mc, mr * (0.10f + 0.07f * k + 0.03f * pl), Ca(200, 228, 255, 0.10f * k), 24);
 		dl->AddCircleFilled(mc, mr * 0.12f, IM_COL32(245, 250, 255, 255), 16);
-		const float lx = mc.x + mr + Px(10);
+		const float lx = mc.x + mr + Px(on ? 6 : 10);
 		// (rando-ui2) Title and seed fit their column (smaller, then the seed shortened): never under NIVEL / MUNDOS.
 		const float lw  = (on ? c1x - Px(5) : b.x - Px(10)) - lx;
 		const auto  fit = [&](const char* t, float size, float sp) {
@@ -6222,19 +6222,19 @@ void DrawRandomizer(float width, float height) {
 			ss = fit(sub, Px(14), 0.0f);
 		}
 		Spaced(dl, cinzel, ss, {lx, a.y + Px(34)}, IM_COL32(236, 214, 190, 230), sub, 0.0f);
-		if (on) { // (rando27) "NIVEL" y (rando20) "MUNDOS": label on top, value below, centred in their column
-			const int  d    = std::clamp(g_saved.randomizer_difficulty, 1, 3);
-			const auto cell = [&](float x0, float w, const char* label, const char* value, ImU32 vcol) {
-				dl->AddLine({x0, a.y + Px(10)}, {x0, b.y - Px(10)}, Ca(204, 176, 122, 0.35f), 1.0f);
-				const float w1 = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, label, 0.0f);
-				const float w2 = Spaced(nullptr, cinzel, cfs, {0, 0}, 0, value, 0.0f);
-				Spaced(dl, cinzel, cfs, {std::round(x0 + (w - w1) * 0.5f), std::round(a.y + Px(11))}, Ca(222, 196, 140, 0.75f), label, 0.0f);
-				Spaced(dl, cinzel, cfs, {std::round(x0 + (w - w2) * 0.5f), std::round(b.y - Px(11) - cfs)}, vcol, value, 0.0f);
+		if (on) { // (rando-ui3) "NIVEL: x" over "MUNDOS: y", labels light grey-gold, values bright
+			const int   d   = std::clamp(g_saved.randomizer_difficulty, 1, 3);
+			const float vx  = c1x + Px(8) + labw + Px(5);
+			const float gap = std::max(Px(4), (th - 2.0f * cfs) / 3.0f);
+			dl->AddLine({c1x, a.y + Px(10)}, {c1x, b.y - Px(10)}, Ca(204, 176, 122, 0.35f), 1.0f);
+			const auto row = [&](float y, const char* label, const char* value, ImU32 vcol) {
+				Spaced(dl, cinzel, cfs, {c1x + Px(8), std::round(y)}, IM_COL32(214, 204, 180, 240), label, 0.0f);
+				Spaced(dl, cinzel, cfs, {std::round(vx), std::round(y)}, vcol, value, 0.0f);
 			};
-			cell(c1x, c1w, "NIVEL", kDiff[d - 1],
-			     d == 1 ? IM_COL32(170, 230, 160, 235) : (d == 3 ? IM_COL32(240, 120, 100, 240) : IM_COL32(235, 205, 140, 235)));
-			cell(c2x, c2w, "MUNDOS", g_saved.randomizer_cross ? "S\xC3\x8D" : "NO",
-			     g_saved.randomizer_cross ? IM_COL32(170, 230, 160, 235) : IM_COL32(200, 200, 200, 200));
+			row(a.y + gap, "NIVEL:", kDiff[d - 1],
+			    d == 1 ? IM_COL32(255, 222, 130, 255) : (d == 3 ? IM_COL32(255, 150, 120, 255) : IM_COL32(255, 240, 200, 255)));
+			row(b.y - gap - cfs, "MUNDOS:", g_saved.randomizer_cross ? "S\xC3\x8D" : "NO",
+			    g_saved.randomizer_cross ? IM_COL32(255, 222, 130, 255) : IM_COL32(245, 245, 245, 255));
 		}
 	}
 	ImGui::End();
