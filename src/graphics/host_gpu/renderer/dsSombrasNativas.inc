@@ -22,7 +22,7 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t DsNatRing = 32, DsNatCamRing = 256, DsNatCamStride = 0x800, DsNatResultStride = 16;
+constexpr uint32_t DsNatRing = 32, DsNatCamRing = 256, DsNatCamStride = 0x800, DsNatResultStride = 32;
 
 struct DsNatImage {
 	VkImage         image  = VK_NULL_HANDLE;
@@ -125,6 +125,7 @@ struct DsNatState {
 	// dibuja solo el juego: un pixel donde el emulado queda MAS CERCA puede ser suyo; donde el nativo queda mas cerca, no.)
 	uint64_t    eq[4] {}, total[4] {}, drawn[4] {}, events[4] {}, compared[4] {}, fails[4] {}, replaced[4] {};
 	uint64_t    full_cubes[4] {}, full_eq[4] {}, full_total[4] {};
+	uint64_t    nat_small[4] {}; uint32_t nat_max[4] {}; // (T36: nativo mas cerca por <= KYTY_NATIVO_SOMBRAS_TOL / mayor error de esos)
 	uint64_t    clr_cubes[4] {}, clr_eq[4] {}, clr_total[4] {}, clr_native_near[4] {}; // (empezaron con clear HTILE)
 	uint64_t    skin_cubes[4] {}, skin_eq[4] {}, skin_total[4] {}, skin_native_near[4] {}, skin_drawn[4] {}, skin_missing[4] {};
 	uint64_t    sampled_out[4] {};
@@ -329,7 +330,7 @@ bool DsNatInit(GraphicContext& g, vk::Format format, vk::Extent2D extent) {
 		set.bindingCount = static_cast<uint32_t>(bindings.size());
 		set.pBindings    = bindings.data();
 		if (g.device.createDescriptorSetLayout(&set, nullptr, &s.cmp_set) != vk::Result::eSuccess) return false;
-		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0, 12};
+		const vk::PushConstantRange  push {vk::ShaderStageFlagBits::eCompute, 0, 16};
 		vk::PipelineLayoutCreateInfo layout {};
 		layout.setLayoutCount         = 1;
 		layout.pSetLayouts            = &s.cmp_set;
@@ -434,7 +435,7 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 			auto& p = s.pending[i];
 			if (!p.busy || !scheduler.IsFree(p.tick)) continue;
 			vmaInvalidateAllocation(g.allocator, s.res_mem, VkDeviceSize {i} * DsNatResultStride, DsNatResultStride);
-			uint32_t r[4];
+			uint32_t r[6];
 			std::memcpy(r, s.res_map + uint64_t {i} * DsNatResultStride, sizeof(r));
 			// r: iguales, error maximo (bits), pixeles con el nativo mas cerca, con el emulado mas cerca.
 			const uint32_t c = p.pass;
@@ -443,6 +444,8 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 			s.drawn[c] += p.drawn;
 			++s.compared[c];
 			if (r[1] > s.max_err[c]) s.max_err[c] = r[1];
+			s.nat_small[c] += r[4];
+			if (r[5] > s.nat_max[c]) s.nat_max[c] = r[5];
 			if (r[2] != 0 && H::NatDiag()) {
 				// (DIAG) Cubos con pixeles donde el nativo queda MAS CERCA que el juego (= error del nativo): agregado por
 				// cascada x cubo x mezcla de VS (linea cada 10 s, 10 mas grandes) y los 30 primeros cubos con su detalle.
@@ -595,6 +598,15 @@ void DsNatPoll(CommandScheduler& scheduler, GraphicContext& g) {
 			            pc(s.skin_native_near[c], s.skin_total[c]), static_cast<unsigned long long>(s.skin_drawn[c]),
 			            static_cast<unsigned long long>(s.skin_missing[c]), H::g_nat_skin_proven[c].load() ? "si" : "no",
 			            static_cast<unsigned long long>(s.skin_ok_run[c]));
+		{
+			float f = 0;
+			std::memcpy(&f, &s.nat_max[c], 4);
+			std::printf("[nativo-sombras] =%u cascada %u: TOL nativo mas cerca dentro de tolerancia=%llu px (no cuentan como error), "
+			            "mayor |nativo-juego| con el nativo mas cerca=%g (KYTY_NATIVO_SOMBRAS_TOL)\n",
+			            H::Mode(), c, static_cast<unsigned long long>(s.nat_small[c]), double(f));
+			s.nat_small[c] = 0;
+			s.nat_max[c]   = 0;
+		}
 		s.skin_cubes[c] = s.skin_eq[c] = s.skin_total[c] = s.skin_native_near[c] = s.skin_drawn[c] = s.skin_missing[c] = 0;
 		s.clr_cubes[c] = s.clr_eq[c] = s.clr_total[c] = s.clr_native_near[c] = s.sampled_out[c] = 0;
 		s.part_cubes[c] = s.part_eq[c] = s.part_total[c] = s.part_native_near[c] = s.part_emu_near[c] = 0;
@@ -1190,8 +1202,15 @@ bool DsNatWork(RenderContext& context, CommandBuffer& buffer, int role, uint32_t
 		writes[2].pBufferInfo     = &result;
 		// (less: el test de profundidad del juego guarda el menor; "mas cerca" = menor. Si no, el mayor.)
 		const vk::CompareOp op = static_cast<vk::CompareOp>(d.depth_compare);
-		const uint32_t size[3] {s.extent.width, s.extent.height,
-		                        op == vk::CompareOp::eLess || op == vk::CompareOp::eLessOrEqual ? 1u : 0u};
+		static const float tol = [] {
+			const char* text = std::getenv("KYTY_NATIVO_SOMBRAS_TOL");
+			const float v    = text != nullptr ? std::strtof(text, nullptr) : 0.0f;
+			return v > 0.0f && v < 0.01f ? v : 0.0f;
+		}();
+		uint32_t tol_bits = 0;
+		std::memcpy(&tol_bits, &tol, 4);
+		const uint32_t size[4] {s.extent.width, s.extent.height,
+		                        op == vk::CompareOp::eLess || op == vk::CompareOp::eLessOrEqual ? 1u : 0u, tol_bits};
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, s.cmp_pipeline);
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, s.cmp_layout, 0, static_cast<uint32_t>(writes.size()),
 		                             writes.data());

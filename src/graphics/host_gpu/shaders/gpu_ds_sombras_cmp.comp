@@ -12,10 +12,15 @@ layout(std430, set = 0, binding = 2) buffer Result {
 	uint max_error;       // (floatBitsToUint del error absoluto)
 	uint native_nearer;   // (pixeles distintos con el nativo mas cerca)
 	uint emulated_nearer; // (pixeles distintos con el emulado mas cerca)
+	uint native_small;    // (T36: nativo mas cerca por <= tol; no cuenta como error)
+	uint native_max;      // (floatBitsToUint del mayor |a-b| de los pixeles con el nativo mas cerca, de todos)
+	uint pad0;
+	uint pad1;
 } result;
 layout(push_constant) uniform Params {
 	uvec2 size;
 	uint  less;
+	float tol; // (KYTY_NATIVO_SOMBRAS_TOL; 0 = estricto, como antes)
 } pc;
 
 shared uint group_equal;
@@ -34,7 +39,11 @@ void main() {
 		} else {
 			atomicMax(result.max_error, floatBitsToUint(abs(a - b)));
 			bool native_nearer = pc.less != 0u ? a < b : a > b;
-			if (native_nearer) atomicAdd(result.native_nearer, 1u);
+			if (native_nearer) {
+				atomicMax(result.native_max, floatBitsToUint(abs(a - b)));
+				if (abs(a - b) <= pc.tol) atomicAdd(result.native_small, 1u);
+				else atomicAdd(result.native_nearer, 1u);
+			}
 			else atomicAdd(result.emulated_nearer, 1u);
 		}
 	}
