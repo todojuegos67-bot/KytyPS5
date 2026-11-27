@@ -840,6 +840,55 @@ inline HookPending& Pending() {
 	return p;
 }
 
+// (jefe-giro) NpcParam turnVellocity (f32 +0x10, Paramdex DES NPC_PARAM_ST): bugbears 313000/313001 = 10 grados/s
+// (Vanguard 103001 = 60, soldado 200010 = 180). Con 10 grados/s tarda 18 s en darse la vuelta: lanza sus golpes y el
+// salto 3002 (313000_battle.lua, a 1..4 m) hacia donde mira, no hacia el jugador. Ghidra FUN_006e6080 (NpcParam.cpp,
+// la usan 0xef430 y 0x367220): tabla = *(FUN_006e8420(4,0) + 0x38) = imagen PARAM en memoria (u16 filas +0xA, filas
+// {id, offset, nombre} desde +0x30, indice ordenado {id, fila} en tabla + alinear16(*(int*)(tabla-0x10))); FUN_006e8420:
+// *(*(eboot+0x2832f50) + tipo*0x48 + 0x18 + i*8) si i < *(... + 0x10). El juego escribe en esas filas (+0x104 = 0x26b6).
+// (jefe-giro2) 0xef430 no llega a llamarse (logs 201612/201810: ni una linea suya): se hace en 0x359990 (HookCreate),
+// antes de crear el ChrIns. Cada motivo de fallo sale en el log, una vez por fila.
+// Aqui se sube el giro de la fila del jefe del patio a 60 (el del Vanguard) antes de crear los personajes.
+inline uint64_t NpcParamRow(int32_t id, const char** why) {
+	const uint64_t repo = *reinterpret_cast<const uint64_t*>(kEbootBase + 0x2832f50);
+	if (!GuestPtrOk(repo)) return *why = "repositorio de parametros (eboot+0x2832f50) aun vacio", 0;
+	if (*reinterpret_cast<const int32_t*>(repo + 0x10 + 4 * 0x48) < 1) return *why = "NpcParam (tipo 4) aun sin cargar", 0;
+	const uint64_t res = *reinterpret_cast<const uint64_t*>(repo + 4 * 0x48 + 0x18);
+	if (!GuestPtrOk(res)) return *why = "recurso NpcParam no valido", 0;
+	const uint64_t tab = *reinterpret_cast<const uint64_t*>(res + 0x38);
+	if (tab < 0x10000ull || tab >= 0x0000800000000000ull) return *why = "tabla NpcParam (+0x38) no valida", 0;
+	const uint16_t n = *reinterpret_cast<const uint16_t*>(tab + 10);
+	for (uint32_t r = 0; r < n; r++)
+		if (*reinterpret_cast<const int32_t*>(tab + 0x30 + r * 0xc) == id) return tab + *reinterpret_cast<const uint32_t*>(tab + 0x34 + r * 0xc);
+	return *why = "fila no esta en la tabla", 0;
+}
+inline void JefeGiro(int32_t npc, const char* model) {
+	static std::set<int32_t> done;
+	static std::mutex        mu;
+	std::lock_guard<std::mutex> lock(mu);
+	if (done.count(npc) != 0) return;
+	const char*    why = "";
+	const uint64_t row = NpcParamRow(npc, &why);
+	if (row == 0 || (row & 3) != 0) {
+		std::printf("[jefe] giro: NpcParam %d (%s) no encontrada (%s); se reintenta en la siguiente creacion\n", npc, model, row ? "fila desalineada" : why);
+		std::fflush(stdout);
+		return;
+	}
+	done.insert(npc);
+	float*      tv  = reinterpret_cast<float*>(row + 0x10);
+	const float old = *tv;
+	if (*reinterpret_cast<const int32_t*>(row + 4) <= 0 || !(old > 0.0f && old < 60.0f)) {
+		std::printf("[jefe] giro: NpcParam %d (%s) sin tocar (turnVellocity %.1f, aiThinkId %d)\n", npc, model, static_cast<double>(old),
+		            *reinterpret_cast<const int32_t*>(row + 4));
+		std::fflush(stdout);
+		return;
+	}
+	*tv = 60.0f;
+	std::printf("[jefe] giro: NpcParam %d (%s) turnVellocity %.0f -> %.0f grados/s (como el Vanguard): encara y persigue al jugador\n", npc, model,
+	            static_cast<double>(old), static_cast<double>(*tv));
+	std::fflush(stdout);
+}
+
 // Gancho A: entrada de eboot+0x359990 (crear el enemigo de una parte del MSB del mapa).
 __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_t, uint64_t, uint64_t, uint64_t /*regs*/) {
 	if (const HookSwap* old = Pending().sw; old != nullptr) {
@@ -850,6 +899,16 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 		}
 	}
 	Pending().sw = nullptr;
+	if (DemonioOn()) { // (jefe-giro2) giro del jefe del patio antes de crear su ChrIns
+		int32_t     npc = 0;
+		std::string model;
+		{
+			std::lock_guard<std::mutex> lock(HookMutex());
+			for (const auto& h: HookSwaps())
+				if (!h.dead && h.owner == Detail::Fnv("demonio-jefe")) npc = h.new_npc, model = h.new_model;
+		}
+		if (npc > 0) JefeGiro(npc, model.c_str());
+	}
 	// (demonio) dato: cuantas veces entra el juego aqui y por donde sale (Ghidra: 0x359990 es la entrada +0x28 de la
 	// vtable 0x2581ee8 del cargador 0x359800 que crea 0x3233d0 para cada ChrIns de FUN_003effe0/0x34ae50).
 	static std::atomic<int> calls {0};
@@ -1117,40 +1176,6 @@ __attribute__((sysv_abi, noinline)) inline void DemonioTraceRemove(uint64_t a, u
 // 200010 (think 200000) y 103001_battle.lua no se cargaba (en m02_00 solo 200000, 201000...): aparecia sin IA, quieto.
 // Aqui, a la entrada de 0xef430, la parte del patio recibe ya el typedata del Vanguard (NpcParam 103001, think 103001:
 // logica 10000, batalla 103001), asi el juego carga su script de combate como el de cualquier enemigo del mapa.
-// (jefe-giro) NpcParam turnVellocity (f32 +0x10, Paramdex DES NPC_PARAM_ST): bugbears 313000/313001 = 10 grados/s
-// (Vanguard 103001 = 60, soldado 200010 = 180). Con 10 grados/s tarda 18 s en darse la vuelta: lanza sus golpes y el
-// salto 3002 (313000_battle.lua, a 1..4 m) hacia donde mira, no hacia el jugador. Ghidra FUN_006e6080 (NpcParam.cpp,
-// la usan 0xef430 y 0x367220): tabla = *(FUN_006e8420(4,0) + 0x38) = imagen PARAM en memoria (u16 filas +0xA, filas
-// {id, offset, nombre} desde +0x30, indice ordenado {id, fila} en tabla + alinear16(*(int*)(tabla-0x10))); FUN_006e8420:
-// *(*(eboot+0x2832f50) + tipo*0x48 + 0x18 + i*8) si i < *(... + 0x10). El juego escribe en esas filas (+0x104 = 0x26b6).
-// Aqui se sube el giro de la fila del jefe del patio a 60 (el del Vanguard) antes de crear los personajes.
-inline uint64_t NpcParamRow(int32_t id) {
-	const uint64_t repo = *reinterpret_cast<const uint64_t*>(kEbootBase + 0x2832f50);
-	if (!GuestPtrOk(repo) || *reinterpret_cast<const int32_t*>(repo + 0x10 + 4 * 0x48) < 1) return 0;
-	const uint64_t res = *reinterpret_cast<const uint64_t*>(repo + 4 * 0x48 + 0x18);
-	if (!GuestPtrOk(res)) return 0;
-	const uint64_t tab = *reinterpret_cast<const uint64_t*>(res + 0x38);
-	if (tab < 0x10000ull || tab >= 0x0000800000000000ull) return 0;
-	const uint16_t n = *reinterpret_cast<const uint16_t*>(tab + 10);
-	for (uint32_t r = 0; r < n; r++) // filas en orden de id; n < 1000: lineal basta
-		if (*reinterpret_cast<const int32_t*>(tab + 0x30 + r * 0xc) == id) return tab + *reinterpret_cast<const uint32_t*>(tab + 0x34 + r * 0xc);
-	return 0;
-}
-inline void JefeGiro(int32_t npc, const char* model) {
-	const uint64_t row = NpcParamRow(npc);
-	if (row == 0 || (row & 3) != 0) {
-		std::printf("[jefe] giro: fila NpcParam %d (%s) no encontrada; sin tocar\n", npc, model);
-		std::fflush(stdout);
-		return;
-	}
-	float* tv = reinterpret_cast<float*>(row + 0x10);
-	if (*reinterpret_cast<const int32_t*>(row + 4) <= 0 || !(*tv > 0.0f && *tv < 60.0f)) return; // aiThinkId y giro con sentido
-	std::printf("[jefe] giro: NpcParam %d (%s) turnVellocity %.0f -> 60 grados/s (como el Vanguard): encara y persigue al jugador\n", npc, model,
-	            static_cast<double>(*tv));
-	std::fflush(stdout);
-	*tv = 60.0f;
-}
-
 __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t, uint64_t list, uint64_t, uint64_t) {
 	if (!GuestPtrOk(list)) return;
 	const int32_t nmaps = *reinterpret_cast<const int32_t*>(list + 0x10);
@@ -1163,9 +1188,6 @@ __attribute__((sysv_abi, noinline)) inline void DemonioPreAi(uint64_t, uint64_t,
 	}
 	if (nmaps <= 0 || nmaps > 64) return;
 	std::lock_guard<std::mutex> lock(HookMutex());
-	if (DemonioOn())
-		for (const auto& h: HookSwaps())
-			if (!h.dead && h.owner == Detail::Fnv("demonio-jefe")) JefeGiro(h.new_npc, h.new_model);
 	for (int32_t m = 0; m < nmaps; m++) {
 		const uint64_t map = *reinterpret_cast<const uint64_t*>(list + 0x18 + static_cast<uint64_t>(m) * 8);
 		if (!GuestPtrOk(map)) continue;
@@ -3279,11 +3301,13 @@ inline const JefeDef& JefeDe(int load) {
 	const char* f = JefeForzado();
 	for (const auto& d: j)
 		if (f[0] != '\0' && std::strcmp(f, d.model) == 0) return d;
-	// (jefe-azar) SplitMix64 sobre (FNV de la semilla, carga): bits bien mezclados, 1/3 cada jefe (simulado: 1e6 semillas
+	// (jefe-azar) SplitMix64 sobre (FNV de la semilla, carga): bits bien mezclados, reparto 50/25/25 (simulado: 1e6 semillas
 	// x cargas 0..9, desviacion < 0,5 %). La semilla la pone el lanzador en cada arranque (time % 1e6) salvo semilla fija.
 	uint64_t       st = Fnv(std::string(Seed())) ^ (0xA24BAED4963EE407ull * static_cast<uint64_t>(load + 1));
 	const uint64_t h  = SplitMix(&st);
-	const size_t   k  = static_cast<size_t>(h % j.size());
+	// (jefe-peso) Vanguard 50 %, Gran bugbear 25 %, Bugbear 25 % (el usuario: "siempre salen esos").
+	const uint64_t r  = h % 4;
+	const size_t   k  = j.size() == 3 ? (r < 2 ? 0 : static_cast<size_t>(r - 1)) : static_cast<size_t>(h % j.size());
 	static std::atomic<int> logged {-1};
 	if (logged.exchange(load) != load) {
 		std::printf("[jefe] eleccion: semilla %s, carga %d -> %zu de %zu (%s)\n", Seed(), load, k, j.size(), j[k].model);
