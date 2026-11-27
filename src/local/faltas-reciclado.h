@@ -44,33 +44,6 @@ inline std::atomic<uint64_t> g_inv_lock {0}, g_inv_flush {0}, g_inv_regions {0};
 // guardados (PageManager::ApplyDeferredReleases). Ciclos y lecturas de vuelta asincronas.
 inline std::atomic<uint64_t> g_rb_wait {0}, g_rb_copy {0}, g_rb_release {0}, g_rb_n {0};
 
-// (sync4) KYTY_PUTIN_SOLO_PAGINA (sin variable o 0: como antes; 1 encendido; 2 A/B cada 5 s con KYTY_TECHO). T55: la
-// falta de escritura que lee de vuelta pone, en el hilo del juego, los bytes guardados de TODAS las paginas de la
-// lectura de vuelta (su ventana, ApplyDeferredReleases de request->pages): 2.79 ms/fot. pageManager.h (raiz8): una
-// liberacion diferida la puede aplicar el hilo que espero, una falta en la pagina (lo primero de HandleFault) o el hilo
-// de liberaciones; solo hace la pagina MENOS protegida, asi que una tardia no esconde ninguna escritura (la escritura
-// falla y la aplica antes). Encendido: en la falta de escritura solo se aplica el rango de la falta; las demas paginas
-// las aplica el hilo de liberaciones o su propia falta, como ya pasa con las que nadie espera.
-inline thread_local bool t_falta_escritura = false;
-inline std::atomic<int>  g_putin_mode {-1};
-inline std::atomic<bool> g_putin_now {false};
-inline std::atomic<uint64_t> g_putin_skipped {0};
-[[nodiscard]] inline int PutinMode() noexcept {
-	int m = g_putin_mode.load(std::memory_order_relaxed);
-	if (m >= 0) return m;
-	const char* v = std::getenv("KYTY_PUTIN_SOLO_PAGINA");
-	m             = (v != nullptr && (v[0] == '1' || v[0] == '2')) ? v[0] - '0' : 0;
-	g_putin_now.store(m == 1, std::memory_order_relaxed);
-	g_putin_mode.store(m, std::memory_order_relaxed);
-	std::printf("[faltas-reciclado] KYTY_PUTIN_SOLO_PAGINA=%d: %s\n", m,
-	            m == 1 ? "encendido (la falta de escritura solo pone los guardados de su rango)" : m == 2 ? "A/B cada 5 s" : "apagado (como antes)");
-	std::fflush(stdout);
-	return m;
-}
-[[nodiscard]] inline bool PutinSoloPagina() noexcept {
-	return t_falta_escritura && PutinMode() != 0 && g_putin_now.load(std::memory_order_relaxed);
-}
-
 inline std::atomic<int>  g_mode {-1};
 inline std::atomic<bool> g_now {false}, g_off {false};
 [[nodiscard]] inline int Mode() noexcept {
