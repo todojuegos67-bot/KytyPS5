@@ -1467,7 +1467,9 @@ uint64_t OpenFileForReading(const char* path) {
 	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, MAX_PATH * 2) == 0) return 0;
 	// (cache-cero) KYTY_CACHE_CERO=1: the pipeline stores (static binaries 6.2 GB, blobs) read without the Windows file
 	// cache (FILE_FLAG_RANDOM_ACCESS kept every view of them mapped in the system cache's working set).
-	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO"); return v == nullptr || v[0] != '0'; }();
+	// (27/11) Log 20261127-014257: sin cache, crear pipelines leia el almacen del disco en cada busqueda -> paradas de
+	// 1,8-4,9 s en dispatch.pipeline. Los almacenes de pipelines vuelven a la cache; solo con KYTY_CACHE_CERO_PIPES=1.
+	static const bool cero = [] { const char* v = std::getenv("KYTY_CACHE_CERO_PIPES"); return v != nullptr && v[0] == '1'; }();
 	HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
 	                          cero ? FILE_FLAG_NO_BUFFERING : FILE_FLAG_RANDOM_ACCESS, nullptr);
 	if (file != INVALID_HANDLE_VALUE && cero) {
