@@ -876,6 +876,7 @@ struct PageManager::Impl {
 
 	static void ProtectHost(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
 		if (PauseSkips(vaddr, size, protection)) return; // (KYTY_PROTECT_PAUSE)
+		const LoteTimer lote_timer; // (PROT-LOTE: the render thread's own calls, counted and timed)
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
@@ -909,7 +910,170 @@ struct PageManager::Impl {
 		static_cast<std::vector<uint64_t>*>(user)->push_back(page_vaddr);
 	}
 
+	// ---- (PROT-LOTE) KYTY_PROT_LOTE=1 (off by default) --------------------------------------------------------------------
+	// Log 20261127-014257-039 (Latria), [raiz] PROTECT COST: the render thread makes 323 VirtualProtect a frame, 0.94 ms;
+	// by origin read-flush 121 calls / 1,488 pages 0.66 ms (no-access of what GPU work writes: ~0.44 us a page, the
+	// working-set drop), write-release 188 calls 0.26 ms, write-track 26 calls 0.09 ms. KYTY_FLUSH_ASYNC moved the
+	// read-flush to a worker but joined it at EVERY later protection of the render thread (write-release/track,
+	// ~210/frame) and before every hand-off: the render thread waited for it (gain 0, ESTADO).
+	// Here: one worker per producer thread with a FIFO of batches (sequence numbers). A hand-off never waits. A later
+	// protection of the render thread waits only for the batches that cover its own pages (overlap); a sync point (label,
+	// memory write, wait, guest command, submit: FlushReadProtect) waits for all of them, as before: what the guest can
+	// observe is unchanged (the no-access is in effect before anything tells the guest the GPU work is done). The pages
+	// stay deferred until then exactly as DeferReadProtection already left them pending until the next flush.
+	struct LoteFlusher {
+		std::mutex                                                   mutex;
+		std::condition_variable                                      cv;
+		std::vector<std::pair<uint64_t, std::vector<PendingRange>>> queue;
+		std::atomic<uint64_t>                                        done {0};
+		// (producer only)
+		uint64_t                                         issued = 0;
+		std::vector<std::pair<PendingRange, uint64_t>> inflight;
+		LoteFlusher() {
+			std::thread([this] {
+				for (;;) {
+					std::vector<std::pair<uint64_t, std::vector<PendingRange>>> work;
+					{
+						std::unique_lock lock(mutex);
+						cv.wait(lock, [&] { return !queue.empty(); });
+						work.swap(queue);
+					}
+					for (auto& [seq, ranges]: work) {
+						const auto start = std::chrono::steady_clock::now();
+						{
+							const Raiz::OriginScope origin(Raiz::ProtReadFlush);
+							for (const auto& range: ranges) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+						}
+						g_lote_apply_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+						g_lote_applied_ranges.fetch_add(ranges.size(), std::memory_order_relaxed);
+						done.store(seq, std::memory_order_release);
+						done.notify_all();
+					}
+				}
+			}).detach();
+		}
+	};
+	static inline std::atomic<uint64_t> g_lote_apply_ns {0}, g_lote_applied_ranges {0}, g_lote_batches {0}, g_lote_ranges {0},
+	    g_lote_overlap_waits {0}, g_lote_overlap_ns {0}, g_lote_sync_waits {0}, g_lote_sync_ns {0}, g_lote_sync_flushes {0},
+	    g_lote_rt_calls {0}, g_lote_rt_ns {0};
+	static inline thread_local LoteFlusher* t_lote          = nullptr;
+	static inline thread_local bool         t_lote_producer = false; // (a thread that defers read protections: the render thread)
+
+	static uint64_t ElapsedNs(std::chrono::steady_clock::time_point start) noexcept {
+		return static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+	}
+	static bool LoteOn() noexcept {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_PROT_LOTE");
+			const bool  r = v != nullptr && v[0] == '1';
+			std::printf("[prot-lote] KYTY_PROT_LOTE=%d: %s\n", r ? 1 : 0,
+			            r ? "ENCENDIDO (el sin-acceso de lo que escribe la GPU lo aplica un hilo aparte; el hilo de render solo "
+			                "espera en etiquetas/esperas/envios o si toca esas mismas paginas)"
+			              : "apagado");
+			std::fflush(stdout);
+			return r;
+		}();
+		return on;
+	}
+	struct LoteTimer {
+		std::chrono::steady_clock::time_point start;
+		bool                                  on;
+		LoteTimer() noexcept: on(t_lote_producer && LoteOn()) {
+			if (on) start = std::chrono::steady_clock::now();
+		}
+		~LoteTimer() {
+			if (!on) return;
+			g_lote_rt_calls.fetch_add(1, std::memory_order_relaxed);
+			g_lote_rt_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+		}
+	};
+	static LoteFlusher& Lote() noexcept {
+		if (t_lote == nullptr) t_lote = new LoteFlusher(); // (never destroyed: the worker lives as long as the process)
+		return *t_lote;
+	}
+	static void LoteWaitSeq(LoteFlusher& f, uint64_t seq) noexcept {
+		for (int spin = 0; spin < 256 && f.done.load(std::memory_order_acquire) < seq; ++spin) _mm_pause();
+		for (uint64_t now = f.done.load(std::memory_order_acquire); now < seq; now = f.done.load(std::memory_order_acquire))
+			f.done.wait(now, std::memory_order_acquire);
+	}
+	static void LotePrune(LoteFlusher& f) noexcept {
+		const auto done = f.done.load(std::memory_order_acquire);
+		if (f.inflight.empty() || done < f.inflight.front().second) return;
+		std::erase_if(f.inflight, [done](const auto& e) { return e.second <= done; });
+	}
+	static void LoteWaitOverlapping(uint64_t begin, uint64_t end) noexcept {
+		if (t_lote == nullptr) return;
+		auto& f = *t_lote;
+		LotePrune(f);
+		uint64_t need = 0;
+		for (const auto& [range, seq]: f.inflight)
+			if (range.begin < end && begin < range.end) need = std::max(need, seq);
+		if (need == 0 || f.done.load(std::memory_order_acquire) >= need) return;
+		const auto start = std::chrono::steady_clock::now();
+		LoteWaitSeq(f, need);
+		g_lote_overlap_waits.fetch_add(1, std::memory_order_relaxed);
+		g_lote_overlap_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+		LotePrune(f);
+	}
+	static void LoteHandOff() noexcept {
+		t_lote_producer = true;
+		LoteReport();
+		if (g_read_protects.empty()) return;
+		auto&      f   = Lote();
+		const auto seq = ++f.issued;
+		for (const auto& range: g_read_protects) f.inflight.emplace_back(range, seq);
+		g_lote_batches.fetch_add(1, std::memory_order_relaxed);
+		g_lote_ranges.fetch_add(g_read_protects.size(), std::memory_order_relaxed);
+		{
+			std::lock_guard lock(f.mutex);
+			f.queue.emplace_back(seq, std::move(g_read_protects));
+		}
+		f.cv.notify_one();
+		g_read_protects.clear();
+	}
+	// A sync point: the pending ranges applied here (as before) after every batch in flight (order kept).
+	static void LoteSyncFlush() noexcept {
+		t_lote_producer = true;
+		if (t_lote != nullptr && t_lote->done.load(std::memory_order_acquire) < t_lote->issued) {
+			auto&      f     = *t_lote;
+			const auto start = std::chrono::steady_clock::now();
+			LoteWaitSeq(f, f.issued);
+			g_lote_sync_waits.fetch_add(1, std::memory_order_relaxed);
+			g_lote_sync_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+		}
+		if (t_lote != nullptr) t_lote->inflight.clear();
+		if (!g_read_protects.empty()) g_lote_sync_flushes.fetch_add(1, std::memory_order_relaxed);
+		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
+		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		g_read_protects.clear();
+	}
+	// One line every 5 s: the render thread's own VirtualProtect (calls and ms per second; per frame = / fps) and its
+	// waits for the worker; the worker's work moved off the render thread.
+	static void LoteReport() noexcept {
+		static thread_local auto last = std::chrono::steady_clock::now();
+		const auto               now  = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(5)) return;
+		const double s = std::chrono::duration<double>(now - last).count();
+		last           = now;
+		const auto x   = [s](std::atomic<uint64_t>& a) { return static_cast<double>(a.exchange(0, std::memory_order_relaxed)) / s; };
+		const double calls = x(g_lote_rt_calls), rt_ms = x(g_lote_rt_ns) / 1e6, b = x(g_lote_batches), r = x(g_lote_ranges);
+		const double ow = x(g_lote_overlap_waits), ow_ms = x(g_lote_overlap_ns) / 1e6, sw = x(g_lote_sync_waits),
+		             sw_ms = x(g_lote_sync_ns) / 1e6, sf = x(g_lote_sync_flushes), ap_ms = x(g_lote_apply_ns) / 1e6,
+		             ar = x(g_lote_applied_ranges);
+		std::printf("[prot-lote] %.1f s, hilo de render por segundo: VirtualProtect %.0f llamadas %.2f ms; esperas al hilo "
+		            "aparte: por solape %.0f (%.2f ms), en puntos de sincronia %.0f (%.2f ms); lotes entregados %.0f (%.0f rangos), "
+		            "flushes que siguen en el hilo de render %.0f; hilo aparte aplico %.0f rangos %.2f ms (fuera del hilo de "
+		            "render). Por fotograma: dividir por los fps (y comparar con [raiz] PROTECT COST GPU thread)\n",
+		            s, calls, rt_ms, ow, ow_ms, sw, sw_ms, b, r, sf, ar, ap_ms);
+		std::fflush(stdout);
+	}
+
 	static void FlushReadProtect() noexcept {
+		if (LoteOn()) {
+			LoteSyncFlush();
+			return;
+		}
 		AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: a batch handed off before comes first)
 		NoteSyncFlush();
 		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
@@ -1002,6 +1166,10 @@ struct PageManager::Impl {
 	}
 	// The pending ranges to the worker (after the batch before it). Nothing pending: nothing done.
 	static void FlushReadProtectAsync() noexcept {
+		if (LoteOn()) {
+			LoteHandOff();
+			return;
+		}
 		if (!AsyncReadFlushOn()) {
 			FlushReadProtect();
 			return;
@@ -1024,7 +1192,8 @@ struct PageManager::Impl {
 	// The pending no-access ranges that overlap [begin, end), applied first (a protection change of those pages
 	// comes after them; pages of the others keep theirs pending).
 	static void FlushReadProtectOverlapping(uint64_t begin, uint64_t end) noexcept {
-		AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: the batch handed off before comes first)
+		if (LoteOn()) LoteWaitOverlapping(begin, end); // (PROT-LOTE: only batches over these pages)
+		else AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: the batch handed off before comes first)
 		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
 		auto& ranges = g_read_protects;
 		for (size_t i = 0; i < ranges.size();) {
@@ -1059,7 +1228,10 @@ struct PageManager::Impl {
 		// (11-14) Native memory: no host protection change at all (bug check 0x1A: paging while protections change).
 		if (NativeMemoryNoReadWatch()) return;
 		if (g_defer_read_protect) {
-			AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: a later protection of this thread comes after the batch)
+			// (PROT-LOTE: a no-access range after one in flight gives the same result in any order; any other protection
+			// waits for the batches over its pages only - FlushReadProtectOverlapping -: disjoint pages do not depend on
+			// each other's order.)
+			if (!LoteOn()) AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: a later protection of this thread comes after the batch)
 			if (protection == NO_ACCESS_PROTECTION) {
 				AddReadProtect(vaddr, vaddr + size);
 				return;
