@@ -551,7 +551,18 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
-	if ((f.down || f.up) && GetPadRemap().active) {
+	// (remap-back) A saved 'Mapear mando' map always lists back=None (its default there), so with any map the View / Back
+	// button of a pad without a touch pad (Xbox 360 / One / Series) did nothing: no touch pad at all (messages,
+	// gestures). On such a pad, back=None or back=TouchPad is the touch-pad press below, as without a map. A pad with a
+	// touch pad (DualSense, DualShock 4) keeps its map as it is.
+	const bool back_as_touch = (f.down || f.up) && f.button == SDL_CONTROLLER_BUTTON_BACK && GetPadRemap().active &&
+	                           (GetPadRemap().button[SDL_CONTROLLER_BUTTON_BACK] == 0 ||
+	                            GetPadRemap().button[SDL_CONTROLLER_BUTTON_BACK] == Controller::PAD_BUTTON_TOUCH_PAD) &&
+	                           [&f] {
+		                           auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(f.id));
+		                           return pad != nullptr && SDL_GameControllerGetNumTouchpads(pad) == 0;
+	                           }();
+	if ((f.down || f.up) && GetPadRemap().active && !back_as_touch) {
 		if (f.button >= 0 && f.button < SDL_CONTROLLER_BUTTON_MAX) {
 			PadRemapPress(f.id, GetPadRemap().button[f.button], f.down);
 		}

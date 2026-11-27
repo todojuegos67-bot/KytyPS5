@@ -157,6 +157,7 @@ private:
 		int     raw[4]   = {128, 128, 128, 128};
 		float   center[4] = {127.5f, 127.5f, 127.5f, 127.5f}; // each stick axis's rest (calibrated on connect)
 		bool    dead[4]   = {false, false, false, false};     // an axis resting at an end: not a stick (bad mapping)
+		float   outer     = 1.0f; // (pad-outer) the travel that already gives the full range (non-PlayStation pads: 90%)
 	};
 	std::vector<PadInfo> m_pads;
 	uint64_t             m_active_input_ms = 0; // SDL ticks of the player-1 pad's last significant input
@@ -560,7 +561,7 @@ void EmergencyShutdown() {
 // Rest calibration: on connect each stick axis is read; a rest up to 28% off center becomes that axis's center, one
 // resting at an end (beyond 75%: a trigger or a combined-trigger axis taken for a stick by a bad mapping) is held at
 // center until it ever passes through the middle (then it is a real stick that was held on connect).
-static void PadDeadZones(int id, float* dz, float* center, bool* dead) {
+static void PadDeadZones(int id, float* dz, float* center, bool* dead, float* outer) {
 	dz[0] = dz[1] = 0.0f;
 	if (id == HOST_INPUT_CONTROLLER_ID) return;
 	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
@@ -580,6 +581,13 @@ static void PadDeadZones(int id, float* dz, float* center, bool* dead) {
 		dz[0] = dz[1] = 0.15f;
 	}
 	if (sony) return;
+	// (pad-outer, upstream b6e75dab, issue #236) An Xbox pad's stick pushed all the way reads a little under its full
+	// range at some angles: with the dead zone stretched to the very edge the run broke off and the character walked
+	// slowly. From KYTY_PAD_DEADZONE_OUTER percent of the travel (90 by default, 60-100) the stick is at full range.
+	{
+		const char* v = std::getenv("KYTY_PAD_DEADZONE_OUTER");
+		*outer = (v != nullptr && *v != '\0' ? static_cast<float>(std::clamp(std::atoi(v), 60, 100)) : 90.0f) / 100.0f;
+	}
 	SDL_GameControllerUpdate(); // (the pad was just opened: its first report)
 	static const SDL_GameControllerAxis axes[4] = {SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY,
 	                                               SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY};
@@ -603,7 +611,7 @@ static void PadDeadZones(int id, float* dz, float* center, bool* dead) {
 void GameController::Connect(int id) {
 	PadInfo info;
 	info.id = id;
-	PadDeadZones(id, info.dz, info.center, info.dead); // (SDL lookups before the pad mutex)
+	PadDeadZones(id, info.dz, info.center, info.dead, &info.outer); // (SDL lookups before the pad mutex)
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		std::printf("[pad] zona muerta del mando %d: izq %.0f%%, der %.0f%%\n", id, info.dz[0] * 100.0f,
 		            info.dz[1] * 100.0f);
@@ -891,7 +899,8 @@ int GameController::StickDeadZone(int id, Controller::Axis axis, int value) {
 	const float mag = std::sqrt(x * x + y * y);
 	float       out = 0.0f;
 	if (mag > dz && mag > 0.0f) {
-		const float scaled = std::min((mag - dz) / (1.0f - dz), 1.0f);
+		const float outer  = std::max(dz + 0.05f, info->outer);
+		const float scaled = std::min((mag - dz) / (outer - dz), 1.0f);
 		out                = ((a & 1) == 0 ? x : y) / mag * scaled;
 	}
 	const int v = out < 0.0f ? 128 + static_cast<int>(std::lround(out * 128.0f))
