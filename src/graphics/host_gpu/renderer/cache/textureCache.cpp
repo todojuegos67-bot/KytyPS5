@@ -824,6 +824,7 @@ static uint32_t TestReclaimRounds() {
 
 // (VRAM-REPARTO) Lo expulsado por el recolector (direccion -> bytes) para contar lo que vuelve a subirse: la linea
 // [vram-reparto] cada 30 s (expulsiones/s, MB re-subidos/s, presupuesto efectivo).
+static uint64_t g_techo_alto_mib = 0, g_techo_bajo_mib = 0; // (TECHO8b) techo real del recolector (MiB)
 namespace VramReparto {
 static std::mutex                             mutex;
 static std::unordered_map<uint64_t, uint64_t> evicted;
@@ -9305,8 +9306,10 @@ void TextureCache::RunGarbageCollector() {
 			if (const uint64_t drv = VramDrv::g_drv_budget_bytes.load(std::memory_order_relaxed); drv > (uint64_t {128} << 20u))
 				cap = std::min(cap, drv - (uint64_t {128} << 20u));
 			alto = cap;
-			bajo = cap / 100 * 95;
+			bajo = cap / 100 * 97; // (TECHO8b) 95 -> 97: con 95 % expulsaba ~500 MiB de lo que se estaba usando por pasada
 		}
+		g_techo_alto_mib = alto >> 20u; // (TECHO8b) el que manda, cualquier tarjeta
+		g_techo_bajo_mib = bajo >> 20u;
 		bool           activo = VramDrv::g_activo.load(std::memory_order_relaxed);
 		if (!activo && ut > alto) {
 			activo = true;
@@ -9427,13 +9430,13 @@ void TextureCache::RunGarbageCollector() {
 			            static_cast<unsigned long long>(VramSaverGet(VramEvicted)),
 			            static_cast<unsigned long long>(VramSaverGet(VramEvictedBytes) >> 20u),
 			            static_cast<unsigned long long>(VramDrv::InUseTicks));
-			std::printf("[vram-drv] re-subidas tras expulsion %llu (%llu MiB); techo %s (%llu-%llu %%, activado %llu veces); "
+			std::printf("[vram-drv] re-subidas tras expulsion %llu (%llu MiB); techo %s (%llu-%llu MiB, activado %llu veces); "
 			            "no expulsadas por re-subida reciente (<%llu s) %llu; pasadas cortadas por %llu MiB/s %llu\n",
 			            static_cast<unsigned long long>(VramDrv::g_reup_n.load()),
 			            static_cast<unsigned long long>(VramDrv::g_reup_bytes.load() >> 20u),
 			            VramDrv::g_activo.load() ? "ACTIVO" : "en reposo",
-			            static_cast<unsigned long long>(VramDrv::TechoBajoPct),
-			            static_cast<unsigned long long>(VramDrv::TechoPct),
+			            static_cast<unsigned long long>(g_techo_bajo_mib),
+			            static_cast<unsigned long long>(g_techo_alto_mib),
 			            static_cast<unsigned long long>(VramDrv::g_activaciones.load()),
 			            static_cast<unsigned long long>(VramDrv::ReupProtegeMs / 1000),
 			            static_cast<unsigned long long>(VramDrv::g_skip_reup.load()),

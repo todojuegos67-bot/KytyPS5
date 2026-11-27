@@ -1572,7 +1572,11 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 		// FUN_009015e0 tamano al mip deseado) y para en cuanto cabe; la pasada 2 (todo a mip 0) solo si aun falta. Log
 		// 20261127-102325 (pool 8192): nativas 2130 MiB (pico 2418), VRAM 6365-6764 sobre el tope 6451 -> el recolector
 		// expulsaba y resubia 228-1928 MiB cada 5 s. Asi es el juego quien deja de subir mips lejanos, como un juego de PC.
-		if (pool_mb.empty() && vram_gb > 0 && vram_gb <= 8) pool_mb = "2560"; // (POOL8, 11-27) por defecto en <= 8 GB
+		// (POOL8b, 11-27) 2560 -> 2048. Log 20261127-110153 (11 min, 2560): proceso 6621 MiB sobre el tope 6451 = nativas 1858
+		// (pico 1970) + VMA 3770 (bufferes del juego 1110, imagenes/RT/FSR4/FG 2346, hueco 252) + plain 292 + driver 699; el
+		// recolector siguio ACTIVO (10548 expulsadas, re-subidas 12-36/s). Las nativas son lo unico que el juego baja solo
+		// (Ghidra 0xac9d80: pasada 1, mips lejanos primero): -512 MiB de pool deja el uso bajo el tope.
+		if (pool_mb.empty() && vram_gb > 0 && vram_gb <= 8) pool_mb = "2048"; // (POOL8) por defecto en <= 8 GB
 		// (POOL8) A/B 20261127-104731 (pool 2560, SPILL apagado): >50 ms 3 en 3375 fotogramas; nativas 955-1284 MiB (antes
 		// 2130, pico 2418, con 8192). El emulador lo apunta en su log: [texpool] (textureCache.cpp, primer fotograma).
 		if (!pool_mb.empty() && pool_mb != "0") env.Set("KYTY_DS_TEXTURE_POOL_MB", pool_mb);
