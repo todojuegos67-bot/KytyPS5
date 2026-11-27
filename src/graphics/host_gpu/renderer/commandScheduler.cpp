@@ -783,8 +783,8 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		}
 		m_next_wait_semaphore = nullptr;
 	}
-	// The work may run once submitted: the pages it writes are read-protected first.
-	PageManager::FlushDeferredProtection();
+	// The work may run once submitted: the pages it writes are read-protected first (PROT-LOTE: by the worker).
+	PageManager::FlushDeferredProtectionAtSubmit();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 	EXIT_IF(m_graphics.queue == nullptr || entries.empty() || entries.size() > MaxSubmitEntries);

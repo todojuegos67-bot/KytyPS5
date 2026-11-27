@@ -956,6 +956,9 @@ struct PageManager::Impl {
 	static inline std::atomic<uint64_t> g_lote_apply_ns {0}, g_lote_applied_ranges {0}, g_lote_batches {0}, g_lote_ranges {0},
 	    g_lote_overlap_waits {0}, g_lote_overlap_ns {0}, g_lote_sync_waits {0}, g_lote_sync_ns {0}, g_lote_sync_flushes {0},
 	    g_lote_rt_calls {0}, g_lote_rt_ns {0};
+	// (PROT-LOTE v2) Where each sync wait came from: 0 other, 1 guest command loop, 2 submit, 0x100 + PM4 opcode.
+	static inline std::array<std::atomic<uint64_t>, 0x200> g_lote_site_waits {}, g_lote_site_ns {}, g_lote_site_flushes {};
+	static inline thread_local uint32_t     t_lote_site     = 0;
 	static inline thread_local LoteFlusher* t_lote          = nullptr;
 	static inline thread_local bool         t_lote_producer = false; // (a thread that defers read protections: the render thread)
 
@@ -1035,15 +1038,23 @@ struct PageManager::Impl {
 	// A sync point: the pending ranges applied here (as before) after every batch in flight (order kept).
 	static void LoteSyncFlush() noexcept {
 		t_lote_producer = true;
+		const uint32_t site = t_lote_site & 0x1ffu;
+		t_lote_site         = 0;
 		if (t_lote != nullptr && t_lote->done.load(std::memory_order_acquire) < t_lote->issued) {
 			auto&      f     = *t_lote;
 			const auto start = std::chrono::steady_clock::now();
 			LoteWaitSeq(f, f.issued);
+			const auto ns = ElapsedNs(start);
 			g_lote_sync_waits.fetch_add(1, std::memory_order_relaxed);
-			g_lote_sync_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+			g_lote_sync_ns.fetch_add(ns, std::memory_order_relaxed);
+			g_lote_site_waits[site].fetch_add(1, std::memory_order_relaxed);
+			g_lote_site_ns[site].fetch_add(ns, std::memory_order_relaxed);
 		}
 		if (t_lote != nullptr) t_lote->inflight.clear();
-		if (!g_read_protects.empty()) g_lote_sync_flushes.fetch_add(1, std::memory_order_relaxed);
+		if (!g_read_protects.empty()) {
+			g_lote_sync_flushes.fetch_add(1, std::memory_order_relaxed);
+			g_lote_site_flushes[site].fetch_add(1, std::memory_order_relaxed);
+		}
 		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
 		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
 		g_read_protects.clear();
@@ -1066,6 +1077,24 @@ struct PageManager::Impl {
 		            "flushes que siguen en el hilo de render %.0f; hilo aparte aplico %.0f rangos %.2f ms (fuera del hilo de "
 		            "render). Por fotograma: dividir por los fps (y comparar con [raiz] PROTECT COST GPU thread)\n",
 		            s, calls, rt_ms, ow, ow_ms, sw, sw_ms, b, r, sf, ar, ap_ms);
+		// (v2) The sync points that waited or still flushed on the render thread, the 6 costliest (per second).
+		std::array<std::pair<uint64_t, uint32_t>, 0x200> by {};
+		uint64_t                                         waits[0x200], flushes[0x200];
+		for (uint32_t i = 0; i < 0x200; ++i) {
+			waits[i]   = g_lote_site_waits[i].exchange(0, std::memory_order_relaxed);
+			flushes[i] = g_lote_site_flushes[i].exchange(0, std::memory_order_relaxed);
+			by[i]      = {g_lote_site_ns[i].exchange(0, std::memory_order_relaxed) + flushes[i], i};
+		}
+		std::sort(by.begin(), by.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		std::printf("[prot-lote] puntos de sincronia (esperas/s ms/s flushes/s):");
+		for (int k = 0; k < 6 && by[k].first != 0; ++k) {
+			const uint32_t i = by[k].second;
+			if (i >= 0x100) std::printf(" pm4 0x%02x", i - 0x100);
+			else std::printf(" %s", i == 1 ? "comando" : i == 2 ? "envio" : "otro");
+			std::printf(" %.0f %.2f %.0f;", static_cast<double>(waits[i]) / s,
+			            static_cast<double>(by[k].first - flushes[i]) / 1e6 / s, static_cast<double>(flushes[i]) / s);
+		}
+		std::printf("\n");
 		std::fflush(stdout);
 	}
 
@@ -2201,6 +2230,23 @@ void PageManager::DeferReadProtection(bool on) noexcept {
 		++g_observation_epoch;
 	}
 	g_defer_read_protect = on;
+}
+
+void PageManager::SetLoteSite(uint32_t site) noexcept {
+	Impl::t_lote_site = site;
+}
+
+// (PROT-LOTE v2) At a submit: with KYTY_PROT_LOTE=1 the pending ranges go to the worker (no wait). A submit lets the
+// guest learn nothing: a label or memory write the guest can see is a packet of its own, flushed (and waited) at its
+// translation before the submit; the GPU's results reach guest memory only through readbacks, which fault on (or wait
+// for: Protect / FlushReadProtectOverlapping) those pages. Off: as before.
+void PageManager::FlushDeferredProtectionAtSubmit() noexcept {
+	if (Impl::LoteOn()) {
+		Impl::LoteHandOff();
+		++g_observation_epoch;
+		return;
+	}
+	FlushDeferredProtection();
 }
 
 void PageManager::FlushDeferredProtection() noexcept {

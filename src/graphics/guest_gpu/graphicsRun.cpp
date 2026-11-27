@@ -367,6 +367,7 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		// Fault, readback and mapping callbacks cannot overtake a queued draw.
+		PageManager::SetLoteSite(1);
 		PageManager::FlushDeferredProtection();
 		LiveCounters::Add(LiveCounters::GuestCommands);
 		LiveTrace::Event(LiveTrace::GuestCommand, 1, 0);
@@ -1214,6 +1215,7 @@ void GuestGpu::ThreadRun(void* data) {
 	if (ParQueues::On()) gpu->m_acb_thread = std::thread(AcbThreadRun, gpu, recording_stream);
 
 	for (;;) {
+		PageManager::SetLoteSite(1);
 		PageManager::FlushDeferredProtection(); // (before a guest command, an idle wait, another queue's turn)
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -2689,8 +2691,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			    opcode == Pm4::IT_INDIRECT_BUFFER || opcode == Pm4::IT_INDIRECT_BUFFER_CNST || opcode == Pm4::IT_CONTEXT_CONTROL ||
 			    opcode == Pm4::IT_CLEAR_STATE || opcode == Pm4::IT_PFP_SYNC_ME)
 				PageManager::FlushDeferredProtectionAsync();
-			else
+			else {
+				PageManager::SetLoteSite(0x100u + (opcode & 0xffu)); // (PROT-LOTE v2: which packet waited)
 				PageManager::FlushDeferredProtection();
+			}
 		}
 		// (f5p1 techo, KYTY_F5P1_TECHO=1; local/f5p1-techo.h) In an ON window, a draw of a verified pass 0/1 range of
 		// 0xad8bc0 is passed over (nothing translated, recorded or drawn); everything else runs as always.

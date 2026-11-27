@@ -69,6 +69,8 @@ public:
 	// after a submission, a label or a guest command of the GPU thread: it flushes before each of them.
 	static void DeferReadProtection(bool on) noexcept;
 	static void FlushDeferredProtection() noexcept;
+	static void FlushDeferredProtectionAtSubmit() noexcept; // (PROT-LOTE v2)
+	static void SetLoteSite(uint32_t site) noexcept;         // (PROT-LOTE v2: the next sync flush's origin, for the log)
 	// (FLUSH-ASYNC, KYTY_FLUSH_ASYNC=1) Before a packet that lets the guest learn nothing: the ranges go to a worker.
 	static void FlushDeferredProtectionAsync() noexcept;
 	// Moves with each flush of the calling thread's deferred read protections: on the GPU thread, before each point at
