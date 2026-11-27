@@ -344,12 +344,64 @@ constexpr uint32_t kNativoSombrasSkinVs[95] = {
 	0x3e0c060cu, 0xd5410008u, 0x04020604u, 0x3e120608u, 0x0a001621u, 0x5e020901u, 0xd5410004u, 0x041c2106u,
 	0x3e100c11u, 0x5e000105u, 0xf80008cfu, 0x06090804u, 0xf8000207u, 0x00020100u, 0xbf810000u,
 };
+// (SKIN2, 11-27) Los otros VS de skinning de profundidad (hash del emulador 0xcd218bf8feea0f5b y familia; "otro VS" =
+// 1,52 M entradas en el log 20261127-041016-200), volcados con KYTY_NATIVO_SOMBRAS_DIAG=1 en 20261127-042910-357 y
+// desensamblados (llvm-mc gfx1013): misma posicion que kNativoSombrasSkinVs, op a op y en el mismo orden de redondeo
+// (filas del objeto de tabla[2]+0x10 idxen (s10 & 0xffff) + instance_id en +0/+16/+32; tabla[0]+0x10 format_xyz;
+// 4x4 de tabla[1]+0xc0; desplazamiento por w de tabla[1]+0x1c0; z exportado). Solo cambian los param (UV) que no
+// tocan la profundidad. Asi que gpu_ds_sombras_skin.vert (vs = 1) da el mismo pos0 bit a bit.
+constexpr uint32_t kNativoSombrasSkinVs2[75] = { // (ES @26bc8c000, log 20261127-042910-357)
+	0xbfa00003u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu, 0x887c6a00u, 0xbf800000u,
+	0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u, 0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u,
+	0x4a0810f9u, 0x0684060au, 0xf4041a84u, 0xfa000010u, 0xf4080404u, 0xfa000000u, 0xbf8cc07fu, 0xf4080535u,
+	0xfa000010u, 0xf4080608u, 0xfa000010u, 0xf4100009u, 0xfa0000c0u, 0xf4041a89u, 0xfa0001c0u, 0xbf8cc07fu,
+	0xe0382020u, 0x80050a04u, 0xe0382010u, 0x80050004u, 0xe0382000u, 0x80050604u, 0xe0082000u, 0x80060e05u,
+	0xbf8c3f70u, 0x3e1a1910u, 0xd5410004u, 0x040e2102u, 0x3e121110u, 0x3e1a170fu, 0x3e08030fu, 0x3e120f0fu,
+	0x3e1a150eu, 0xd5410001u, 0x04121d00u, 0x3e120d0eu, 0xd5410004u, 0x000e1a02u, 0xd5410005u, 0x003e1a0eu,
+	0xd5410003u, 0x001e1a06u, 0xd5410002u, 0x002e1a0au, 0x3e080201u, 0x3e0a020du, 0x3e060205u, 0xd5410000u,
+	0x040a0209u, 0xd5410001u, 0x04121200u, 0x3e0a120cu, 0x3e061204u, 0x3e001208u, 0x3e020a6au, 0x3e060a6bu,
+	0xf80008cfu, 0x05000301u, 0xbf810000u,
+};
+constexpr uint32_t kNativoSombrasSkinVs3[82] = { // (ES @26cab8900, log 20261127-042910-357)
+	0xbfa00003u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu, 0x887c6a00u, 0xbf800000u,
+	0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u, 0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u,
+	0x4a0810f9u, 0x0684060au, 0xf4041a84u, 0xfa000010u, 0xf4080404u, 0xfa000000u, 0xbf8cc07fu, 0xf4080535u,
+	0xfa000010u, 0xf4080608u, 0xfa000010u, 0xf4080708u, 0xfa000040u, 0xf4100009u, 0xfa0000c0u, 0xf4041a89u,
+	0xfa0001c0u, 0xbf8cc07fu, 0xe0382020u, 0x80050a04u, 0xe0382010u, 0x80050004u, 0xe0382000u, 0x80050604u,
+	0xe0082000u, 0x80060e05u, 0xe0042000u, 0x80070405u, 0xbf8c3f71u, 0x3e1a1910u, 0x3e060510u, 0x3e121110u,
+	0xbf8c3f70u, 0x5e040b04u, 0x3e1a170fu, 0xd5410001u, 0x040e1f01u, 0x3e120f0fu, 0x3e1a150eu, 0x3e02010eu,
+	0x3e120d0eu, 0xd5410005u, 0x000e1a02u, 0xd5410006u, 0x003e1a0eu, 0xd5410004u, 0x001e1a06u, 0xd5410003u,
+	0x002e1a0au, 0x3e0a0201u, 0x3e0c020du, 0x3e080205u, 0xd5410000u, 0x040e0209u, 0xd5410001u, 0x04161200u,
+	0x3e0c120cu, 0x3e081204u, 0x3e001208u, 0x3e020c6au, 0x3e080c6bu, 0xf80008cfu, 0x06000401u, 0xf8000201u,
+	0x00000002u, 0xbf810000u,
+};
+constexpr uint32_t kNativoSombrasSkinVs4[93] = { // (ES @388468c00, log 20261127-042910-357)
+	0xbfa00003u, 0x93ebff03u, 0x00080008u, 0x8700ff03u, 0x000000ffu, 0x8f6a8c6bu, 0x887c6a00u, 0xbf800000u,
+	0xbf900009u, 0x81ea6bc0u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u, 0x81ea00c0u, 0xbf8cff0fu, 0x90fe6ac1u,
+	0x4a2210f9u, 0x0684060au, 0xf4041a84u, 0xfa000010u, 0xf4080404u, 0xfa000000u, 0xbf8cc07fu, 0xf4080535u,
+	0xfa000010u, 0xf4080608u, 0xfa000010u, 0xf4080708u, 0xfa000040u, 0xf4100009u, 0xfa0000c0u, 0xf4040409u,
+	0xfa0001c0u, 0xf4040809u, 0xfa0002d0u, 0xf4001a89u, 0xfa0002d8u, 0xbf8cc07fu, 0xe0382020u, 0x80050a11u,
+	0xe0382010u, 0x80050611u, 0xe0382000u, 0x80050011u, 0xe0082000u, 0x80060e05u, 0xe0042000u, 0x80070405u,
+	0xbf8c3f71u, 0x3e1a1910u, 0x3e121110u, 0x3e060510u, 0xbf8c3f70u, 0xd52f0002u, 0x00010105u, 0x3e1a170fu,
+	0x3e120f0fu, 0x3e06030fu, 0x3e1a150eu, 0xd5410001u, 0x04261d06u, 0x3e06010eu, 0xd5410007u, 0x000e1a02u,
+	0xd5410008u, 0x003e1a0eu, 0xd5410009u, 0x001e1a06u, 0xd541000au, 0x002e1a0au, 0x0a001a6au, 0x3e0e0201u,
+	0xd5410006u, 0x0422020du, 0xd5410008u, 0x04260205u, 0x3e140209u, 0x0a0a0620u, 0xd5410009u, 0x041e0600u,
+	0x3e0c060cu, 0x3e100604u, 0x3e140608u, 0x0a020221u, 0x5e000900u, 0x3e120c10u, 0x3e100c11u, 0x5e020305u,
+	0xf80008cfu, 0x060a0809u, 0xf800020fu, 0x02000111u, 0xbf810000u,
+};
+[[nodiscard]] inline bool NativoSombrasSkinCode(uint64_t es) {
+	using Libs::Graphics::HostMemoryRangeIsReadable;
+	const auto eq = [es](const uint32_t* code, size_t bytes) {
+		return HostMemoryRangeIsReadable(es, bytes) && std::memcmp(reinterpret_cast<const void*>(es), code, bytes) == 0;
+	};
+	return es != 0 && (eq(kNativoSombrasSkinVs, sizeof(kNativoSombrasSkinVs)) || eq(kNativoSombrasSkinVs2, sizeof(kNativoSombrasSkinVs2)) ||
+	                   eq(kNativoSombrasSkinVs3, sizeof(kNativoSombrasSkinVs3)) || eq(kNativoSombrasSkinVs4, sizeof(kNativoSombrasSkinVs4)));
+}
 // (hilo del juego) 1 si el codigo del ES en `es` es exactamente kNativoSombrasSkinVs (sin cache: la memoria de shaders
 // se reutiliza; son 380 bytes por draw).
 inline uint32_t NativoSombrasVsKind(uint64_t es) {
 	using Libs::Graphics::HostMemoryRangeIsReadable;
-	if (es == 0 || !HostMemoryRangeIsReadable(es, sizeof(kNativoSombrasSkinVs))) return 0;
-	return std::memcmp(reinterpret_cast<const void*>(es), kNativoSombrasSkinVs, sizeof(kNativoSombrasSkinVs)) == 0 ? 1u : 0u;
+	return NativoSombrasSkinCode(es) ? 1u : 0u;
 }
 
 // (COSTE) Log 20261125-065754-173: "recorrido DCB" 622.7 us por cubo (3.3 ms/fot). Cada HostMemoryRangeIsReadable es un
@@ -587,6 +639,10 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 			for (uint32_t i = 2; i + 1 < len; ++i) {
 				const uint64_t a = uint64_t {p[i]} | (uint64_t {p[i + 1] & 0xFFFFu} << 32u);
 				if ((p[i + 1] >> 16u) != 0 || a < 0x100000ull || (a & 7u) != 0 || !HostMemoryRangeIsReadable(a, 32)) continue;
+				// (11-27, log 20261127-042910-357: "reg 0xc" = USER_DATA_PS_0 trae el mismo puntero; tomarlo daba
+				// "s10 fuera de USER_DATA_GS" 1,74 M. El VS de profundidad (ES/NGG) lee s8.. de USER_DATA_GS 0x8C..0xAB.)
+				const uint32_t treg = (p[1] & 0xFFFFu) + (i - 2);
+				if (treg < 0x8Cu || treg + 2u >= 0x8Cu + 32u) continue;
 				if ((reinterpret_cast<const uint64_t*>(a)[1] & 0xFFFFFFFFFFFFull) == cam) {
 					table     = a;
 					table_reg = (p[1] & 0xFFFFu) + (i - 2);
@@ -718,10 +774,7 @@ const char* NativoSombrasNatFill(DsNativoSombras::NatSlot* slot, const uint64_t*
 				auto&          m = NativoSombrasMemo();
 				const uint32_t i = static_cast<uint32_t>((es >> 8u) * 0x9E3779B97F4A7C15ull >> 60u); // (0..15)
 				if (m.es_gen[i] == m.now && m.es_key[i] == es) return m.es_kind[i];
-				const uint32_t r = HostMemoryRangeIsReadable(es, sizeof(kNativoSombrasSkinVs)) &&
-				                           std::memcmp(reinterpret_cast<const void*>(es), kNativoSombrasSkinVs, sizeof(kNativoSombrasSkinVs)) == 0
-				                       ? 1u
-				                       : 0u;
+				const uint32_t r = NativoSombrasSkinCode(es) ? 1u : 0u; // (SKIN2: los 4 VS de skinning conocidos)
 				m.es_key[i]  = es;
 				m.es_gen[i]  = m.now;
 				m.es_kind[i] = static_cast<uint8_t>(r);
