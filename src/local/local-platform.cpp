@@ -2674,7 +2674,7 @@ void ResidentSettle(uint64_t scene_generation, uint32_t frame_kind, int64_t fram
 	// brings the full minimum back meanwhile.
 	static std::atomic<uint64_t> t_run {0};
 	const uint64_t               run = t_run.fetch_add(1, std::memory_order_acq_rel) + 1;
-	std::thread([run, low_mb, full_mb] {
+	std::thread([run, full_mb] {
 		SetThreadDescription(GetCurrentThread(), L"Kyty.RamCarga");
 		const auto     t0           = std::chrono::steady_clock::now();
 		const uint64_t before       = ProcessMemory().working_set;
