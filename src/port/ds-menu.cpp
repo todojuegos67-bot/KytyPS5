@@ -1920,7 +1920,21 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 	if (vchange < 1.0f) Bump();
 	const float vshift = (1.0f - vchange) * 18.0f * g_unit * static_cast<float>(dirs[row_id]);
 	std::string text = I18n::T(label);
-	dl->AddText({at.x + pad, ty}, ink, text.c_str());
+	const char*  shown = I18n::T(value);
+	const ImVec2 vs    = ImGui::CalcTextSize(shown);
+	const float  right = at.x + w - pad;
+	const float  mid   = right - std::max(vs.x, 220.0f * g_unit) * 0.5f - 30.0f * g_unit;
+	{
+		// (fixlayout-1127) The label never runs under the value: a longer one (other languages) is drawn smaller to fit
+		// (down to 72 %), and what is still left over is clipped before the left arrow.
+		const float room = mid - std::max(vs.x, 220.0f * g_unit) * 0.5f - 18.0f * g_unit - 10.0f * g_unit - (at.x + pad);
+		const float tw   = ImGui::CalcTextSize(text.c_str()).x;
+		const float fs   = ImGui::GetFontSize();
+		const float sc   = tw > room && room > 0 ? std::max(0.72f, room / tw) : 1.0f;
+		dl->PushClipRect({at.x, at.y}, {at.x + pad + std::max(room, 0.0f), at.y + h}, true);
+		dl->AddText(nullptr, fs * sc, {at.x + pad, ty + (1.0f - sc) * fs * 0.5f}, ink, text.c_str());
+		dl->PopClipRect();
+	}
 	if (restart && !g_start_mode) { // (10-28b) the launcher applies everything at start: no "(requiere reinicio)" there
 		// (10-28) Only the rows that truly need a restart; saved now, applied at the next start.
 		const ImVec2 ls = ImGui::CalcTextSize(text.c_str());
@@ -1928,10 +1942,6 @@ bool SelectorRow(const char* label, bool restart, int count, int& current, const
 		dl->AddText({at.x + pad + ls.x + 10 * g_unit, ty + 6 * g_unit}, ImGui::GetColorU32(ImVec4 {0.62f, 0.58f, 0.50f, 1.0f}), I18n::T("(requiere reinicio)"));
 		ImGui::PopFont();
 	}
-	const char*  shown = I18n::T(value);
-	const ImVec2 vs    = ImGui::CalcTextSize(shown);
-	const float  right = at.x + w - pad;
-	const float  mid   = right - std::max(vs.x, 220.0f * g_unit) * 0.5f - 30.0f * g_unit;
 	{
 		ImVec4 gc = ImGui::ColorConvertU32ToFloat4(gold);
 		gc.w *= 0.25f + 0.75f * vchange;
@@ -2922,7 +2932,7 @@ void DrawShaderBlock(float unit) {
 		ImGui::ProgressBar(-1.0f * static_cast<float>(ImGui::GetTime()), {-1, 30 * unit}, "Preparando...");
 	}
 	ImGui::TextColored(v.failed ? kWarn : (v.finished ? kGold : kDim), "%s",
-	                   v.text.empty() ? I18n::T("Shaders: la cache de esta grafica ya esta preparada.") : I18n::T(v.text.c_str()));
+	                   v.text.empty() ? I18n::T("Shaders: la cache de esta gráfica ya esta preparada.") : I18n::T(v.text.c_str()));
 	if (v.running) {
 		ImGui::SameLine();
 		if (ImGui::SmallButton(I18n::T("Detener"))) std::thread([] { Precompile::Stop(); }).detach();
@@ -3071,7 +3081,7 @@ void DrawPcTab(float unit) {
 	std::string gpu = pc.gpu.empty() ? std::string(I18n::T("no detectada")) : pc.gpu;
 	if (pc.vram > 0) gpu += "  (" + (g_rt.launched.simulate_vram8 ? std::string(I18n::T("8 GB simulados")) : std::to_string((pc.vram + (512ull << 20)) >> 30) + " GB") + ")";
 	if (!pc.nvidia && !pc.gpu.empty()) gpu += std::string("  (") + I18n::T("sin DLSS: solo NVIDIA") + ")";
-	InfoLine("Grafica", gpu, ink);
+	InfoLine("Gráfica", gpu, ink);
 	InfoLine("Procesador y RAM", (pc.cpu.empty() ? std::string("?") : pc.cpu) + "  |  " + (g_rt.launched.simulate_ram16 ? std::string(I18n::T("16 GB RAM (simulados)")) : std::to_string(pc.ram_gb) + " GB RAM"), ink);
 	if (!pc.recommended.empty()) {
 		InfoLine("Modo recomendado", I18n::T(pc.recommended.c_str()), pc.unsupported ? red : kGold);
@@ -3197,9 +3207,9 @@ void ResolutionRow(Settings& s) {
 	}
 	std::vector<Choice> res;
 	for (size_t i = 0; i < ids.size(); i++) res.push_back({ids[i].c_str(), labels[i].c_str()});
-	if (ChoiceRow("Resolucion", true, res.data(), static_cast<int>(res.size()), value,
-	              s.fullscreen ? "Resolucion de salida en pantalla completa. Escritorio: la de Windows. Otra: el monitor cambia a ella mientras juegas."
-	                           : "Tamano de la ventana.")) {
+	if (ChoiceRow("Resolución", true, res.data(), static_cast<int>(res.size()), value,
+	              s.fullscreen ? "Resolución de salida en pantalla completa. Escritorio: la de Windows. Otra: el monitor cambia a ella mientras juegas."
+	                           : "Tamaño de la ventana.")) {
 		if (s.fullscreen) {
 			s.resolution = value;
 		} else if (int w = 0, h = 0; std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2) {
@@ -3446,13 +3456,13 @@ void Draw(float width, float height) {
 					}
 					ComboRow("Reescalado", true, static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 					         [](const ResMode& m) { return m.label; },
-					         "Reescalado: dibuja el 3D a menos resolucion y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).");
+					         "Reescalado: dibuja el 3D a menos resolución y lo sube a la de la pantalla (más fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las gráficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o más nuevas; el 3D a 360 lineas como mínimo).");
 					ImGui::BeginDisabled(!nvidia);
 					ChoiceRow("Preset DLSS", true, kDlssPresets, kDlssPresetCount, s.dlss_preset,
-					          "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)");
+					          "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (más nitidos, algo más lentos)");
 					ImGui::EndDisabled();
 					if (ChoiceRow("Nitidez", (s.sharpness == "auto") != (g_rt.launched.sharpness == "auto"), kSharpness, kSharpnessCount, s.sharpness,
-					              "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolucion de la pantalla. Mas alto: mas nitido, pero puede marcar bordes y ruido."))
+					              "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolución de la pantalla. Más alto: más nítido, pero puede marcar bordes y ruido."))
 						live_changed = true;
 					// (ds-pc-port10) DLSS 5 (restart).
 					ImGui::BeginDisabled(!nvidia);
@@ -3465,7 +3475,7 @@ void Draw(float width, float height) {
 					ChoiceRow("Intensidad DLSS 5", s.dlss5_strength != g_rt.launched.dlss5_strength, kDlss5Strengths, kDlss5StrengthCount, s.dlss5_strength,
 					          kDlss5StrengthTip);
 					ImGui::EndDisabled();
-					if (!nvidia) ImGui::TextColored(kDim, "%s", I18n::T("Sin DLSS: tu grafica no es NVIDIA."));
+					if (!nvidia) ImGui::TextColored(kDim, "%s", I18n::T("Sin DLSS: tu gráfica no es NVIDIA."));
 					break;
 				}
 				case 1: { // Frame generation
@@ -3479,7 +3489,7 @@ void Draw(float width, float height) {
 					ImGui::BeginDisabled(fixed);
 					std::string locked = "amd-x2";
 					ChoiceRow("Frame generation", true, modes.data(), static_cast<int>(modes.size()), fixed ? locked : s.framegen,
-					          "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50");
+					          "AMD: todas las gráficas (también con reescalado DLSS). DLSS: NVIDIA RTX 40/50");
 					ImGui::EndDisabled();
 					const std::string fg = fixed ? locked : s.framegen;
 					if (fg.rfind("dlss", 0) == 0) {
@@ -3491,7 +3501,7 @@ void Draw(float width, float height) {
 						ImGui::BeginDisabled(fixed);
 						if (ChoiceRow("Anti-Lag", true, g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount,
 						              fixed ? ultra : al,
-						              "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las graficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso). En los modos Souls ligero, equilibrado y low profile va siempre el nuestro en Ultra."))
+						              "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las gráficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso). En los modos Souls ligero, equilibrado y low profile va siempre el nuestro en Ultra."))
 							s.antilag_mode = al;
 						ImGui::EndDisabled();
 					}
@@ -3574,11 +3584,11 @@ void Draw(float width, float height) {
 						std::string mode = s.fullscreen ? "1" : "0";
 						if (ChoiceRow("Modo de pantalla", true, modes, 2, mode, "Pantalla completa o ventana (F11 lo cambia en vivo).")) s.fullscreen = mode == "1";
 					}
-					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows");
+					CheckRow("HDR", true, s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuración de pantalla de Windows");
 					CheckRow("VSync", true, s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando");
 					if (ChoiceRow("Metricas", false, kMetrics, kMetricsCount, s.metrics, "Panel dentro del juego (F8 lo cambia en vivo): FPS, el modo de frame generation, latencia y el detalle. Ya no abre una ventana aparte.")) live_changed = true;
 					static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}, {"48:9", "Monitor 48:9"}};
-					ChoiceRow("Monitor", true, aspects, 4, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.");
+					ChoiceRow("Monitor", true, aspects, 4, s.aspect, "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los vídeos y algunos menús se ven estirados.");
 					CheckRow("Mantener 16:9 (bandas negras)", true, s.aspect_fit);
 					{
 						std::vector<Choice> langs;
@@ -3828,12 +3838,12 @@ void Draw(float width, float height) {
 			TipText("Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez). Sin ella, el juego compila shaders al jugar (tirones).");
 		ImGui::SameLine();
 		ImGui::BeginDisabled(g_upd.busy.load());
-		if (ImGui::Button(I18n::T("Actualizar version"), {bw, bh})) {
+		if (ImGui::Button(I18n::T("Actualizar versión"), {bw, bh})) {
 			g_tab_request = 4;
 			OpenCheck();
 		}
 		ImGui::SameLine();
-		if (ImGui::Button(I18n::T("Volver a la version anterior"), {bw, bh})) {
+		if (ImGui::Button(I18n::T("Volver a la versión anterior"), {bw, bh})) {
 			g_tab_request = 4;
 			OpenRestore();
 		}
@@ -4248,9 +4258,21 @@ void RowEnd(float y, float h = 32) {
 	ImGui::Dummy({g_lbox.w, U(h)});
 }
 
-void Label(float y, const char* text, const char* tip, float x = 10) {
-	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(4)});
-	ImGui::TextUnformatted(I18n::T(text));
+// (fixlayout-1127) `maxw` (unscaled, 0 = no limit): the room before the field; a longer label (other languages) is
+// drawn smaller to fit (down to 72 %), and anything still left over is clipped, so the field never covers it.
+void Label(float y, const char* text, const char* tip, float x = 10, float maxw = 0) {
+	const char* shown = I18n::T(text);
+	float       scale = 1.0f;
+	if (maxw > 0) {
+		const float tw = ImGui::CalcTextSize(shown).x;
+		if (tw > U(maxw)) scale = std::max(0.72f, U(maxw) / tw);
+	}
+	ImGui::SetCursorScreenPos({g_lbox.at.x + U(x), y + U(4) + (1.0f - scale) * ImGui::GetFontSize() * 0.5f});
+	if (scale < 1.0f) ImGui::PushFont(nullptr, ImGui::GetFontSize() * scale);
+	if (maxw > 0) ImGui::PushClipRect({g_lbox.at.x + U(x), y}, {g_lbox.at.x + U(x + maxw), y + U(40)}, true);
+	ImGui::TextUnformatted(shown);
+	if (maxw > 0) ImGui::PopClipRect();
+	if (scale < 1.0f) ImGui::PopFont();
 	Tip(tip);
 }
 
@@ -4291,7 +4313,7 @@ template <typename Item, typename Id, typename Text>
 bool LRow(const char* label, int count, const Item* items, std::string& value, Id id, Text text, const char* tip, float fx = 146,
           float fw = 282, bool brand = false, float lx = 10) {
 	const float y = RowY();
-	if (label != nullptr && *label != '\0' && fx > lx + 40) Label(y, label, tip, lx);
+	if (label != nullptr && *label != '\0' && fx > lx + 40) Label(y, label, tip, lx, fx - lx - 8);
 	int current = 0;
 	for (int i = 0; i < count; i++)
 		if (value == id(items[i])) current = i;
@@ -4476,7 +4498,7 @@ void SetPagefile(int gb) {
 	std::string script = "@echo off\r\n";
 	if (gb > 0) {
 		const std::string mb = std::to_string(static_cast<long long>(gb) * 1024);
-		script += "echo Archivo de paginacion fijo de " + std::to_string(gb) + " GB en C:\r\n"
+		script += "echo Archivo de paginación fijo de " + std::to_string(gb) + " GB en C:\r\n"
 		          "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=False >nul 2>&1\r\n"
 		          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
 		          "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false} } catch {}\" >nul 2>&1\r\n"
@@ -4487,7 +4509,7 @@ void SetPagefile(int gb) {
 		          "echo.\r\n"
 		          "echo Si arriba pone C:\\pagefile.sys " + mb + " " + mb + " esta hecho. REINICIA EL PC para aplicarlo.\r\n";
 	} else {
-		script += "echo Archivo de paginacion: el de Windows por defecto (lo gestiona Windows)\r\n"
+		script += "echo Archivo de paginación: el de Windows por defecto (lo gestiona Windows)\r\n"
 		          "wmic computersystem where name=\"%computername%\" set AutomaticManagedPagefile=True >nul 2>&1\r\n"
 		          "powershell -NoProfile -ExecutionPolicy Bypass -Command \"try { $c=Get-CimInstance Win32_ComputerSystem; "
 		          "Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$true} } catch {}\" >nul 2>&1\r\n"
@@ -4619,18 +4641,18 @@ void LauncherImage(Settings& s) {
 		}
 		LRow("Reescalado", static_cast<int>(shown.size()), shown.data(), s.res, [](const ResMode& m) { return m.id; },
 		     [](const ResMode& m) { return m.label; },
-		     "Reescalado: dibuja el 3D a menos resolución y lo sube a la de la pantalla (mas fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las graficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o mas nuevas; el 3D a 360 lineas como minimo).",
+		     "Reescalado: dibuja el 3D a menos resolución y lo sube a la de la pantalla (más fps). DLSS: NVIDIA RTX. XeSS, FSR 3.1 y FSR 4: todas las gráficas (FSR 4: modelo de AMD con INT8, RTX 20 / RX 6000 o más nuevas; el 3D a 360 lineas como mínimo).",
 		     146, 260, true);
 	}
 	ImGui::BeginDisabled(!nvidia);
 	LChoice("Preset DLSS", kDlssPresets, kDlssPresetCount, s.dlss_preset,
-	        nvidia ? "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (mas nitidos, algo mas lentos)" : "Sin DLSS: tu grafica no es NVIDIA.");
+	        nvidia ? "Modelo de DLSS: auto (el de NVIDIA), K = DLSS 4, L y M = DLSS 4.5 (más nitidos, algo más lentos)" : "Sin DLSS: tu gráfica no es NVIDIA.");
 	ImGui::EndDisabled();
 	LChoice("Nitidez", kSharpness, kSharpnessCount, s.sharpness,
-	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolución de la pantalla. Más alto: mas nitido, pero puede marcar bordes y ruido.");
+	        "Nitidez del reescalado (DLSS, XeSS, FSR 3.1 y FSR 4), aplicada a la resolución de la pantalla. Más alto: más nítido, pero puede marcar bordes y ruido.");
 	// (ds-pc-port10) DLSS 5 (NVIDIA's Neural Rendering on the foveated grid) and which nvngx_dlssnr.dll it may load.
 	ImGui::BeginDisabled(!nvidia);
-	LChoice("DLSS 5", kDlss5Levels, kDlss5LevelCount, s.dlss5, nvidia ? kDlss5Tip : "Sin DLSS 5: tu grafica no es NVIDIA.");
+	LChoice("DLSS 5", kDlss5Levels, kDlss5LevelCount, s.dlss5, nvidia ? kDlss5Tip : "Sin DLSS 5: tu gráfica no es NVIDIA.");
 	ImGui::BeginDisabled(s.dlss5 == "0");
 	{
 		std::string file = s.dlss5_unsigned ? "1" : "0";
@@ -4771,7 +4793,7 @@ void LauncherFrameGen(Settings& s) {
 	ImGui::BeginDisabled(fixed);
 	LRow("Frame generation", static_cast<int>(modes.size()), modes.data(), fixed ? locked : s.framegen, [](const Choice& c) { return c.id; },
 	     [](const Choice& c) { return c.label; },
-	     fixed ? "Con este Modo Souls la frame generation es fija: AMD x2." : "AMD: todas las graficas (tambien con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.",
+	     fixed ? "Con este Modo Souls la frame generation es fija: AMD x2." : "AMD: todas las gráficas (también con reescalado DLSS). DLSS: NVIDIA RTX 40/50. FPS desbloqueados siempre.",
 	     12, 396, true);
 	if (fixed) {
 		LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, ultra,
@@ -4783,7 +4805,7 @@ void LauncherFrameGen(Settings& s) {
 	} else if (s.framegen.rfind("amd", 0) == 0) {
 		std::string al = s.antilag_mode == "auto" || s.antilag_mode.empty() ? (g_rt.pc.amd ? "amd2" : "normal") : s.antilag_mode;
 		if (LChoice("Anti-Lag", g_rt.pc.amd ? kAntiLagAmd : kAntiLagOther, g_rt.pc.amd ? kAntiLagAmdCount : kAntiLagOtherCount, al,
-		            "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las graficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso).",
+		            "Con la frame generation de AMD. Anti-Lag 2 (AMD): el de serie de las gráficas AMD. Anti-Lag: el nuestro, como mucho 2 frames en cola antes de leer el mando. Ultra: 1 (aun menos retraso).",
 		            146, 260))
 			s.antilag_mode = al;
 	}
@@ -4795,7 +4817,7 @@ void LauncherDisplay(Settings& s) {
 	BoxBegin("Pantalla y otros");
 	{
 		const float y = RowY();
-		LCheck(y, "HDR", s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuracion de pantalla de Windows", 12);
+		LCheck(y, "HDR", s.hdr, "HDR10: activa antes \"Usar HDR\" en la configuración de pantalla de Windows", 12);
 		LCheck(y, "VSync", s.vsync, "VSync: sin cortes de imagen (tearing); con FreeSync/G-Sync sigue funcionando", 92);
 		static const Choice aspects[] = {{"16:9", "Monitor 16:9"}, {"21:9", "Monitor 21:9"}, {"32:9", "Monitor 32:9"}, {"48:9", "Monitor 48:9"}};
 		int current = 0;
@@ -4803,7 +4825,7 @@ void LauncherDisplay(Settings& s) {
 			if (s.aspect == aspects[i].id) current = i;
 		const std::function<const char*(int)> list = [](int i) -> const char* { return aspects[i].label; };
 		if (Field("Monitor", y, 4, current, list,
-		          "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los videos y algunos menus se ven estirados.",
+		          "Monitores panoramicos (ultrawide): el juego se dibuja a 21:9, 32:9 o 48:9 en vez de estirarse. Funciona con DLSS, XeSS y FSR. Los vídeos y algunos menús se ven estirados.",
 		          280, 128))
 			s.aspect = aspects[current].id;
 		RowEnd(y);
@@ -4863,7 +4885,7 @@ void LauncherPerformance(Settings& s) {
 		const float y2 = RowY();
 		static int custom_gb = 32;
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y2 + U(6)});
-		ImGui::TextUnformatted( "%s", I18n::T("El que quieras (GB):"));
+		ImGui::TextUnformatted(I18n::T("El que quieras (GB):"));
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(176), y2 + U(2)});
 		ImGui::SetNextItemWidth(U(110));
 		if (ImGui::InputInt("##pagefile_gb", &custom_gb, 4, 16)) custom_gb = std::clamp(custom_gb, 4, 256);
@@ -5007,7 +5029,7 @@ void LauncherControls(Settings& s) {
 // (ds-pc-port9) Modos Souls (Launcher-souls.ps1's group): one at most; choosing one applies its preset (ApplyPreset:
 // the graphics, the upscaler and every ray tracing row to No); unticking it goes back to Maximo.
 void LauncherSoulsModes(Settings& s) {
-	BoxBegin("Graficas de 12 y 16 GB");
+	BoxBegin("Gráficas de 12 y 16 GB");
 	struct Mode {
 		const char* id;
 		const char* label;
@@ -5015,19 +5037,19 @@ void LauncherSoulsModes(Settings& s) {
 	};
 	static const Mode modes[] = {
 	    {"ligero", "Modo Souls ligero",
-	     "Adaptado para graficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p con FSR 4 Calidad. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
+	     "Adaptado para gráficas de 8 GB como RTX 3060, RTX 3060 Ti, RTX 3070, RTX 2070/2080, RX 6600, RX 6600 XT o RX 6650 XT: el juego a 30 FPS estables y frame generation de AMD x2 (60 en pantalla). A 1080p con FSR 4 Calidad. Ajustes preparados para gráficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
 	    {"equilibrado", "Modo Souls equilibrado",
-	     "Para graficas de 10 GB de VRAM o mas, de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas."},
+	     "Para gráficas de 10 GB de VRAM o más, de la potencia de una RTX 3080: RTX 2080 Ti, RTX 3070 Ti, RTX 3080, RTX 3080 Ti, RTX 4060 Ti, RTX 4070, RX 6800, RX 6800 XT, RX 6900 XT, RX 6950 XT, RX 7700 XT, RX 7800 XT o Intel Arc B580: el juego a 45 FPS estables y frame generation de AMD x2 (90 en pantalla). A 1440p, con el reescalado que elijas."},
 	    {"ultra", "Modo Souls ultra",
-	     "Para graficas de 12 y 16 GB de VRAM (RTX 5060 Ti 16 GB / 5070 / 5070 Ti, RX 9070 / 9070 XT): todo al maximo, Detail Very High, Luz RT y Oclusion en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	     "Para gráficas de 12 y 16 GB de VRAM (RTX 5060 Ti 16 GB / 5070 / 5070 Ti, RX 9070 / 9070 XT): todo al máximo, Detail Very High, Luz RT y Oclusión en Alta. Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"extremo", "Modo Souls extremo",
-	     "Para graficas de 16 GB de VRAM. Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al maximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
+	     "Para gráficas de 16 GB de VRAM. Para enfermos de Souls. RTX 5080, RTX 5090 o superior: modo cinematico del juego a 4K y absolutamente todo al máximo (Ultra en todo, filtrado x16 y texturas nitidas). Los FPS dependen de la potencia de tu GPU y tu CPU."},
 	    {"ligero-plus", "Modo Souls ligero +",
-	     "Para monitores de mas de 60 Hz. Como el Modo Souls ligero (mismos graficos), pero con el juego a 40 FPS estables y frame generation de AMD x2 (80 en pantalla): mas fluido y algo menos de latencia. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
+	     "Para monitores de más de 60 Hz. Como el Modo Souls ligero (mismos gráficos), pero con el juego a 40 FPS estables y frame generation de AMD x2 (80 en pantalla): más fluido y algo menos de latencia. Ajustes preparados para gráficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."},
 	    {"low", "Modo Souls PC low profile (900p, todo en bajo)",
-	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los graficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Maximo y a 1440p."},
+	     "Para PCs modestos: 30 FPS reales con frame generation de AMD x2 (60 en pantalla), el juego a 900p reescalado con FSR (nitidez 50 %) y todos los gráficos en bajo (texturas, distancia, sombras, detalle, reflejos, objetos y nitidez). Al quitarlo vuelve todo a Máximo y a 1440p."},
 	    {"sin-tirones", "Optimizado 16 GB RAM / 8 GB VRAM",
-	     "Para PCs de 16 GB de RAM y graficas de 8 GB como RTX 3060 Ti, RTX 3070, RTX 4060, RTX 4060 Ti 8 GB, RTX 5060, RX 6600 XT, RX 6650 XT o RX 7600. 40 FPS estables con frame generation de AMD x2 (80 en pantalla), 1080p con FSR 4 Calidad. Menos carga y menos tirones: sin calcomanias proyectadas, reflejos y desvanecimiento en Normal, sin desenfoque de movimiento. Ajustes preparados para graficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."}};
+	     "Para PCs de 16 GB de RAM y gráficas de 8 GB como RTX 3060 Ti, RTX 3070, RTX 4060, RTX 4060 Ti 8 GB, RTX 5060, RX 6600 XT, RX 6650 XT o RX 7600. 40 FPS estables con frame generation de AMD x2 (80 en pantalla), 1080p con FSR 4 Calidad. Menos carga y menos tirones: sin calcomanias proyectadas, reflejos y desvanecimiento en Normal, sin desenfoque de movimiento. Ajustes preparados para gráficas de 8 GB y 16 GB de RAM: no es conveniente cambiarlos."}};
 	const auto pick = [&](float y, const Mode& m, float x) {
 		bool on = s.souls_mode == m.id;
 		if (!LCheck(y, m.label, on, m.tip, x)) return;
@@ -5050,7 +5072,7 @@ void LauncherSoulsModes(Settings& s) {
 	static const int doce[1][2] = {{2, 3}};
 	rows(doce, 1);
 	BoxEnd();
-	BoxBegin("Graficas de 10 GB o mas");
+	BoxBegin("Gráficas de 10 GB o más");
 	static const int diez[1][2] = {{1, -1}};
 	rows(diez, 1);
 	BoxEnd();
@@ -5058,14 +5080,14 @@ void LauncherSoulsModes(Settings& s) {
 	static const int bajo[1][2] = {{5, -1}};
 	rows(bajo, 1);
 	BoxEnd();
-	BoxBegin("Graficas de 8 GB y 16 GB de RAM");
+	BoxBegin("Gráficas de 8 GB y 16 GB de RAM");
 	static const int ocho[2][2] = {{0, -1}, {6, -1}}; // (11-26) sin "ligero +": solo Souls ligero y Optimizado
 	rows(ocho, 2);
 	{
 		const float y = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), y + U(4)});
 		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
-		ImGui::TextColored(kWarn, "%s", I18n::T("Ajustes preparados especialmente para graficas de 8 GB y 16 GB de RAM (1080p con FSR 4 Calidad). No es conveniente cambiarlos: subirlos puede llenar la memoria de video y dar tirones o texturas que tardan en cargar."));
+		ImGui::TextColored(kWarn, "%s", I18n::T("Ajustes preparados especialmente para gráficas de 8 GB y 16 GB de RAM (1080p con FSR 4 Calidad). No es conveniente cambiarlos: subirlos puede llenar la memoria de vídeo y dar tirones o texturas que tardan en cargar."));
 		ImGui::PopTextWrapPos();
 		// (11-26) Alto real del texto (3 lineas con letra grande): la linea de la frame generation va debajo, sin pisarlo.
 		const float alto = ImGui::GetItemRectMax().y - y + U(6);
@@ -5177,7 +5199,7 @@ void LauncherUpdateBox() {
 		text  = g_upd.text;
 	}
 	if (state == UpdateUi::Idle) return;
-	BoxBegin(state == UpdateUi::Choosing || state == UpdateUi::Confirming ? "Volver a la version anterior" : "Actualizar version");
+	BoxBegin(state == UpdateUi::Choosing || state == UpdateUi::Confirming ? "Volver a la versión anterior" : "Actualizar versión");
 	const float y = RowY();
 	ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y});
 	ImGui::BeginGroup();
@@ -6457,12 +6479,14 @@ void DrawLauncher(float width, float height) {
 		const float  kh    = std::round(ksize + U(9));                     // the cap's height
 		const float  gap   = std::round(U(9));                             // cap -> text
 		const float  t     = static_cast<float>(ImGui::GetTime());
-		float        y     = std::floor(at.y + ts.y + U(7));
+		float        y     = std::floor(margin + U(4));
 		const auto   key_row = [&](const char* key, const char* text, float phase) {
 			const ImVec2 kts = kf->CalcTextSizeA(ksize, FLT_MAX, 0.0f, key);
 			const ImVec2 tts = kf->CalcTextSizeA(tsize, FLT_MAX, 0.0f, text);
 			const float  kw  = std::round(std::max(kh * 1.25f, kts.x + U(14)));
-			const float  rx  = std::floor(width - margin);
+			// (fixlayout-1127) Right-aligned to the left edge of the launcher's column (px), never over it: the options
+			// panel opens inside that column, and the badges used to sit on its first box.
+			const float  rx  = std::floor(px - U(18));
 			const float  tx  = std::floor(rx - tts.x);
 			const ImVec2 k0 {std::floor(tx - gap - kw), y}, k1 {k0.x + kw, y + kh};
 			// The backing: a dark plate behind the cap and the text, feathered in three steps.
@@ -6559,7 +6583,7 @@ void DrawLauncher(float width, float height) {
 	std::string sh_head, sh_detail;
 	float       sh_head_h = 0.0f, sh_detail_h = 0.0f, sh_text_h = 0.0f, sh_h = 0.0f;
 	if (shader_row) {
-		const std::string raw = pv.text.empty() ? std::string("Shaders: la cache de esta grafica ya esta preparada.") : pv.text;
+		const std::string raw = pv.text.empty() ? std::string("Shaders: la cache de esta gráfica ya esta preparada.") : pv.text;
 		const size_t      nl  = raw.find('\n');
 		sh_head               = I18n::T(raw.substr(0, nl).c_str());
 		if (nl != std::string::npos && pv.running) {
@@ -6612,9 +6636,9 @@ void DrawLauncher(float width, float height) {
 	{
 		// (11-10) Skip the PlayStation logo video and the opening cinematic: above the game folder, saved at once.
 		const float y     = RowY();
-		std::string label = std::string(I18n::T("Saltar intro y videos de inicio: ")) + I18n::T(s.skip_intro ? "Si" : "No");
+		std::string label = std::string(I18n::T("Saltar intro y vídeos de inicio: ")) + I18n::T(s.skip_intro ? "Si" : "No");
 		if (LButton(label.c_str(), {g_lbox.at.x, y}, {U(420), U(36)}, s.skip_intro, g_font_semi, U(15),
-		            "Salta el video de PlayStation y la cinematica del principio, hasta la pantalla de titulo.")) {
+		            "Salta el vídeo de PlayStation y la cinematica del principio, hasta la pantalla de titulo.")) {
 			s.skip_intro       = !s.skip_intro;
 			g_saved.skip_intro = s.skip_intro;
 			Settings on_disk;
@@ -6707,7 +6731,7 @@ void DrawLauncher(float width, float height) {
 				            "Detiene la preparacion de shaders (lo hecho se guarda y sigue la proxima vez)."))
 					std::thread([] { Precompile::Stop(); }).detach();
 			} else if (LButton("Preparar shaders", {x0 + sh_pad, cy}, {U(240), U(36)}, false, g_font_semi, U(18),
-			                   "Compila ya todos los pipelines del juego para esta grafica (evita tirones la primera vez)."))
+			                   "Compila ya todos los pipelines del juego para esta gráfica (evita tirones la primera vez)."))
 				StartShaders();
 			{
 				const bool all_now = g_edit.precompile_threads == "todos";
@@ -6836,13 +6860,13 @@ void DrawLauncher(float width, float height) {
 			// (trofeos-exe) Trofeos left the options: the tab at the bottom left (LauncherTrophy::Draw, below).
 			const float by = RowY();
 			ImGui::BeginDisabled(g_upd.busy.load());
-			if (LButton("Actualizar version", {g_lbox.at.x, by}, {U(205), U(40)}, false, g_font_semi, U(15),
-			            "Busca en GitHub la ultima version publicada del port (DemonsSoulsPC) y la instala en esta misma carpeta. Nunca baja de version. Los archivos actuales del motor se guardan en _backup_update; la cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
+			if (LButton("Actualizar versión", {g_lbox.at.x, by}, {U(205), U(40)}, false, g_font_semi, U(15),
+			            "Busca en GitHub la última versión publicada del port (DemonsSoulsPC) y la instala en esta misma carpeta. Nunca baja de versión. Los archivos actuales del motor se guardan en _backup_update; la cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
 				OpenCheck();
 				ImGui::SetScrollY(0.0f);
 			}
-			if (LButton("Volver a la version anterior", {g_lbox.at.x + U(215), by}, {U(205), U(40)}, false, g_font_semi, U(13),
-			            "Vuelve a una version guardada en _backup_update. La actual se guarda antes (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
+			if (LButton("Volver a la versión anterior", {g_lbox.at.x + U(215), by}, {U(205), U(40)}, false, g_font_semi, U(13),
+			            "Vuelve a una versión guardada en _backup_update. La actual se guarda antes (se puede deshacer). La cache de shaders, las partidas, los seeds y los ajustes no se tocan.")) {
 				OpenRestore();
 				ImGui::SetScrollY(0.0f);
 			}
