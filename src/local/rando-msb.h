@@ -2605,6 +2605,10 @@ inline bool BuildFuertes(const std::string& map, const std::filesystem::path& ap
 		std::memcpy(p.data() + 0x20, sp[s].place, 24);
 		std::memcpy(p.data() + 0x44, sp[s].groups, 32); // (rando20) grupos del sitio, no los de la zona de origen
 		if (move_coll) std::memcpy(p.data() + td + 0x1C, sp[s].coll, 4);
+		// (rando22) typedata +0x14, byte bajo: 0x02 solo en los soldados quietos de la sala de 1-1 (c2000_0004/05/06/08/09/
+		// 10/12/14, c2010_0017; 9 de 120 enemigos de m02_00); el resto 0x00. Movido, ese estado pasivo hacia que esperase a
+		// que le pegasen. Al moverlo va con 0x00, como los demas. KYTY_DS_RANDOMIZER_PASIVOS=1 lo deja como estaba.
+		if (!EnvIs("KYTY_DS_RANDOMIZER_PASIVOS", "1")) p[td + 0x14] = 0;
 		if (move_patrol) std::memcpy(p.data() + td + 0x20, sp[s].patrol, 24);
 		else std::memset(p.data() + td + 0x20, 0xFF, 24); // sin patrulla: no vuelve andando al sitio viejo
 		moved++;
