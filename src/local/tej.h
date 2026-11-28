@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <immintrin.h>
 #include <memory>
@@ -45,6 +46,8 @@
 #include "local/local-platform.h"
 #include "local/speculation-state.h"
 #include "local/techo.h"
+#include "local/buffercache-par.h"
+#include "local/tej-lag.h"
 
 
 namespace Tej {
@@ -98,8 +101,15 @@ enum C : uint32_t {
 	WCalls, WAssumed, WFixNs, WCallsMeasured, WTransMeasuredNs,
 	NCount
 };
-inline std::atomic<uint64_t> g_c[NCount] {};
-inline void Add(C i, uint64_t v = 1) { g_c[i].fetch_add(v, std::memory_order_relaxed); }
+// (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
+// solo array de atomicos: el render y los 6 trabajadores escribian las mismas lineas = false sharing).
+struct alignas(64) Bank {
+	std::atomic<uint64_t> c[NCount] {};
+};
+inline constexpr uint32_t Banks = 10; // 0 render, 1 lector, 2..7 trabajadores, 8 juego (Enqueue), 9 resto
+inline Bank               g_bank[Banks];
+inline thread_local uint32_t t_bank = 9;
+inline void Add(C i, uint64_t v = 1) { g_bank[t_bank].c[i].fetch_add(v, std::memory_order_relaxed); }
 
 inline std::atomic<uint64_t> g_gpu_serial {0};
 inline std::atomic<uint32_t> g_render_cpu {0xffffffffu};
@@ -166,14 +176,38 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 	return false;
 }
 
-// Mascara de los trabajadores: L3 del render (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
+[[nodiscard]] inline uint32_t CoresIn(uint64_t mask);
+// (tej-lag) KYTY_TEJ_CCD: mismo/0 = L3 del render (como antes); otro/1 = OTRA L3 (en X3D el CCD sin V-Cache: el render se queda
+// su L3 entera); por defecto 1 si la otra L3 tiene >= 2 nucleos de rendimiento en la mascara del proceso, si no 0.
+[[nodiscard]] inline int CcdPref() {
+	static const int v = [] {
+		const char* e = std::getenv("KYTY_TEJ_CCD");
+		if (e == nullptr) return -1;
+		if (std::strcmp(e, "mismo") == 0) return 0; // (simula una CPU de una sola L3)
+		if (std::strcmp(e, "otro") == 0) return 1;
+		return std::atoi(e) != 0 ? 1 : 0;
+	}();
+	return v;
+}
+// Mascara de los trabajadores: L3 elegida (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
 [[nodiscard]] inline uint64_t WorkMask(uint32_t rc) {
 	if (rc >= 64) return 0;
-	uint64_t base = LocalPlatform::CpuListToMask(std::getenv("KYTY_RENDER_CPUS"));
-	if (base == 0) base = LocalPlatform::L3MaskOfCpu(rc);
-	if (const uint64_t perf = LocalPlatform::PerformanceCpuMask(); perf != 0 && (base & perf) != 0) base &= perf;
 	uint64_t core = LocalPlatform::CoreMaskOfCpu(rc);
 	if (core == 0) core = uint64_t {1} << rc;
+	const uint64_t perf = LocalPlatform::PerformanceCpuMask();
+	uint64_t       base = LocalPlatform::CpuListToMask(std::getenv("KYTY_RENDER_CPUS"));
+	if (base == 0) {
+		const uint64_t own = LocalPlatform::L3MaskOfCpu(rc);
+		base               = own;
+		if (CcdPref() != 0 && own != 0) {
+			uint64_t idle = 0, proc = 0;
+			if (!LocalPlatform::ProcessCpusIdleTime(&idle, &proc) || proc == 0) proc = ~uint64_t {0};
+			uint64_t other = proc & ~own;
+			if (perf != 0 && (other & perf) != 0) other &= perf;
+			if (other != 0 && (CcdPref() == 1 || CoresIn(other) >= 2)) base = other;
+		}
+	}
+	if (perf != 0 && (base & perf) != 0) base &= perf;
 	return base & ~core;
 }
 [[nodiscard]] inline uint32_t CoresIn(uint64_t mask) {
@@ -252,14 +286,17 @@ public:
 		// N: KYTY_TEJ_N o nucleos de rendimiento de la L3 del render sin el suyo (el render aun no corre: el de este hilo).
 		uint32_t n = 0;
 		if (const char* v = std::getenv("KYTY_TEJ_N"); v != nullptr) n = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+		// (tej-lag) Por defecto 2 (modelo medido: N=2 87.8 %, N=6 88.0 %: N alto solo quema CPU y L3); CPUs modestas:
+		// con < 4 nucleos libres en la mascara, 1.
 		if (n == 0) {
 			const uint32_t cores = CoresIn(WorkMask(LocalPlatform::CurrentCpu()));
-			n                    = cores > 0 ? cores : 1;
+			n                    = cores >= 4 ? 2 : 1;
 		}
 		// (ranuras de paquete: 0 el lector, 1..N los trabajadores; Spec::MaxPacketSlots = 8; con KYTY_SPECULATE se pisan)
 		n          = std::clamp<uint32_t>(n, 1, std::min<uint32_t>(MaxWorkers, static_cast<uint32_t>(Libs::Graphics::Spec::MaxPacketSlots) - 1));
 		m_n        = n;
-		std::printf("[tej] F1b: lector + %u trabajadores (ranuras 0..%u)\n", n, n);
+		std::printf("[tej] F1b: lector + %u trabajadores (ranuras 0..%u), CCD %s, prioridad por debajo de normal\n", n, n,
+		            CcdPref() == 0 ? "mismo, L3 del render (KYTY_TEJ_CCD=mismo)" : CcdPref() == 1 ? "otro (KYTY_TEJ_CCD=otro)" : "otro si hay (auto)");
 		for (uint32_t i = 0; i < n; ++i) m_workers.push_back(std::make_unique<Worker>(*this, r, i, i + 1));
 		m_reader = std::thread([this] { ReaderRun(); });
 		for (auto& w: m_workers) w->thread = std::thread([p = w.get()] { p->Run(); });
@@ -282,23 +319,28 @@ public:
 
 	// Hilo del juego (Enqueue): la orden copiada.
 	void Push(uint64_t serial, Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
+		t_bank = 8;
+		Job job;
 		{
 			std::lock_guard g(m_mutex);
 			if (m_jobs.size() >= MaxQueued) {
 				Add(LDropFull);
 				return;
 			}
-			Job job;
 			if (!m_pool.empty()) job.cmds = std::move(m_pool.back()), m_pool.pop_back();
-			job.serial = serial;
-			job.kind   = kind;
-			job.reset  = reset;
-			if (kind == Job::Graphics) {
-				job.cmds.assign(commands.begin(), commands.end());
-				Add(LCopyBytes, commands.size() * 4u);
-			} else {
-				job.cmds.clear();
-			}
+		}
+		// (tej-lag) La copia FUERA del cerrojo: el lector no espera al juego ni el juego al lector.
+		job.serial = serial;
+		job.kind   = kind;
+		job.reset  = reset;
+		if (kind == Job::Graphics) {
+			job.cmds.assign(commands.begin(), commands.end());
+			Add(LCopyBytes, commands.size() * 4u);
+		} else {
+			job.cmds.clear();
+		}
+		{
+			std::lock_guard g(m_mutex);
 			m_jobs.push_back(std::move(job));
 		}
 		m_cv.notify_all();
@@ -307,7 +349,13 @@ public:
 	// Hilo de render, al acabar un envio de la cola 0.
 	void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 		if (m_want_serial.load(std::memory_order_acquire) != serial) return;
-		std::lock_guard g(m_pub_mutex);
+		// (tej-lag) El render NUNCA espera al lector: ocupado (copiando el publicado anterior) -> no publica (el lector
+		// lo cuenta como 'sin estado' y la DCB va sin sombra).
+		std::unique_lock g(m_pub_mutex, std::try_to_lock);
+		if (!g.owns_lock()) {
+			TejLag::g_acc[TejLag::Publish].n.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
 		m_published->CopyStateFrom(cp, false);
 		m_pub_serial = serial;
 		m_want_serial.store(0, std::memory_order_relaxed);
@@ -402,6 +450,8 @@ public:
 private:
 	void ReaderRun() {
 		LocalPlatform::SetThreadName("Kyty.Tej.L");
+		LocalPlatform::MakeBackgroundThread(nullptr); // (tej-lag: por debajo del render, como los trabajadores)
+		t_bank = 1;
 		m_reader_spec.ShadowThreadInit(); // (executors y ranura propios: la pasada de estado predice dispatches con el catalogo)
 		t_side = 3;
 		std::unique_lock lock(m_mutex);
@@ -448,6 +498,11 @@ private:
 			return false;
 		}
 		Add(LJobs);
+		// (tej-lag) El lector, con los trabajadores (fuera del nucleo del render y, en X3D, fuera de su CCD).
+		if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed); rc < 64 && rc != m_reader_pinned_for) {
+			m_reader_pinned_for = rc;
+			if (const uint64_t m = WorkMask(rc); m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
+		}
 		uint64_t gpu = g_gpu_serial.load(std::memory_order_acquire);
 		if (job.serial <= gpu) {
 			m_chain_ok = false;
@@ -541,6 +596,7 @@ private:
 	bool                                  m_quit = false;
 	bool                                  m_chain_ok = false;
 	uint64_t                              m_chain_serial = 0, m_last_idle = 0;
+	uint32_t                              m_reader_pinned_for = 0xffffffffu;
 	std::chrono::steady_clock::time_point m_sample_at {};
 	std::mutex                            m_pub_mutex;
 	uint64_t                              m_pub_serial = 0;
@@ -556,6 +612,7 @@ inline void Worker::Run() {
 	LocalPlatform::SetThreadName(name);
 	LocalPlatform::MakeBackgroundThread(nullptr); // (por debajo del render)
 	m_spec.ShadowThreadInit();
+	t_bank = 2 + (m_index % 6u);
 	Libs::Graphics::Spec::t_hole_hook = [](const uint32_t* packet, const char* reason) {
 		if (t_worker != nullptr && t_side == 2) t_worker->Hole(packet, reason);
 	};
@@ -704,6 +761,12 @@ inline void Window(double busy_ms, double fps, double frames, bool keep);
 
 inline void Start(RenderContext& r) {
 	if (Mode() == 0 || g_shadow.load(std::memory_order_relaxed) != nullptr) return;
+	// (tej-lag) CPUs modestas: con menos de 2 nucleos fuera del render (y su hermano SMT), la sombra no arranca.
+	if (std::getenv("KYTY_TEJ_N") == nullptr && CoresIn(WorkMask(LocalPlatform::CurrentCpu())) < 2) {
+		std::printf("[tej] sombra NO arranca: menos de 2 nucleos libres fuera del render (coste 0)\n");
+		std::fflush(stdout);
+		return;
+	}
 	g_shadow.store(new Shadow(r), std::memory_order_release);
 	Techo::g_tej_window = &Window;
 }
@@ -773,6 +836,8 @@ struct GpuSlice {
 	GpuSlice(bool graphics_q0, uint64_t serial, bool first_slice) {
 		if (Mode() == 0 || !graphics_q0) return;
 		if (first_slice) {
+			TejLag::t_render = true;
+			t_bank           = 0;
 			g_gpu_serial.store(serial, std::memory_order_release);
 			g_render_cpu.store(LocalPlatform::CurrentCpu(), std::memory_order_relaxed);
 			g_gpu        = {};
@@ -1036,8 +1101,9 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		const double db = cnt[1] > 0 ? sum[1] / cnt[1] : 0, da = cnt[0] > 0 ? sum[0] / cnt[0] : 0;
 		delta = (cnt[0] > 0 && cnt[1] > 0) ? 0.5 * (db - da) : cnt[1] > 0 ? db : -da;
 	}
-	uint64_t v[NCount];
-	for (uint32_t i = 0; i < NCount; ++i) v[i] = g_c[i].exchange(0, std::memory_order_relaxed);
+	uint64_t v[NCount] {};
+	for (auto& b: g_bank)
+		for (uint32_t i = 0; i < NCount; ++i) v[i] += b.c[i].exchange(0, std::memory_order_relaxed);
 	static uint64_t last_tsc = 0;
 	static auto     last_t   = std::chrono::steady_clock::now();
 	const uint64_t  tsc      = __rdtsc();
@@ -1080,6 +1146,24 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	            fn != 0 ? static_cast<double>(fs) / 100.0 / static_cast<double>(fn) : -1.0);
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)", cnt[0], cnt[1], delta);
+	{
+		// (tej-lag) Lo que el render espero por cerrojos compartidos con la sombra (solo si los encontro ocupados) y el
+		// coste fijo de los cerrojos de escritor de BufferCache que KYTY_TEJ enciende TAMBIEN en A.
+		double wn[TejLag::Count], wms[TejLag::Count];
+		for (uint32_t k = 0; k < TejLag::Count; ++k) {
+			wn[k]  = static_cast<double>(TejLag::g_acc[k].n.exchange(0, std::memory_order_relaxed)) / f;
+			wms[k] = static_cast<double>(TejLag::g_acc[k].ticks.exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+		}
+		double bl = 0, bt = 0;
+		if (BcPar::Mode() == 0) { // (con KYTY_BC_PAR los cuenta y vacia su propia linea)
+			bl = static_cast<double>(BcPar::g_write_locks.exchange(0, std::memory_order_relaxed)) / f;
+			bt = static_cast<double>(BcPar::g_write_ns.exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+		}
+		std::printf(" | CCD trabajadores %s", CcdPref() == 0 ? "mismo (L3 del render)" : CcdPref() == 1 ? "otro" : "auto");
+		std::printf(" | LAG render espera por la sombra: cerrojo buffers %.1f veces %.3f ms/fot, etiquetas %.1f %.3f ms/fot,"
+		            " publicar estado saltado %.1f/fot | cerrojos escritor buffers (tambien en A) %.1f/fot %.3f ms/fot",
+		            wn[TejLag::BcWrite], wms[TejLag::BcWrite], wn[TejLag::Labels], wms[TejLag::Labels], wn[TejLag::Publish], bl, bt);
+	}
 	std::printf("\n");
 	// Modelo N=1,2,4,6 con los tiempos de esta ventana (solo B / modo 1: con draws contados).
 	std::vector<DcbRec> dcbs;

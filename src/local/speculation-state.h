@@ -28,6 +28,8 @@
 #include <deque>
 #include <immintrin.h>
 #include <mutex>
+
+#include "local/tej-lag.h"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -518,11 +520,11 @@ struct Labels {
 };
 inline Labels g_labels;
 inline void   NoteLabel(uint64_t address) {
-	  std::lock_guard lock(g_labels.mutex);
+	  const TejLag::Guard lock(g_labels.mutex, TejLag::Labels); // (tej-lag)
 	  g_labels.addresses.Insert(address & ~uint64_t {3});
 }
 [[nodiscard]] inline bool IsLabel(uint64_t address) {
-	std::lock_guard lock(g_labels.mutex);
+	const TejLag::Guard lock(g_labels.mutex, TejLag::Labels); // (tej-lag)
 	return g_labels.addresses.Contains(address & ~uint64_t {3});
 }
 

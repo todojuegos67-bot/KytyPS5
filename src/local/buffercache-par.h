@@ -28,6 +28,7 @@
 #include <shared_mutex>
 
 #include "local/techo.h"
+#include "local/tej-lag.h"
 
 extern "C" { extern volatile std::atomic_uint32_t kyty_local_speculate_mode; } // (fix) misma linkage C que speculation.h
 
@@ -78,7 +79,11 @@ inline std::shared_mutex  g_shard[Shards];
 
 // Contadores (por fotograma en [buffercache-par]).
 enum Why : uint32_t { RegNew, LookupMiss, LookupTexel, JournalRefused, Count };
-inline std::atomic<uint64_t> g_lookups {0}, g_write_locks {0}, g_write_ns {0}, g_splits {0}, g_queued {0};
+// (tej-lag) Los del escritor (render) en su propia linea de cache: los lectores (sombra) no la tocan (false sharing).
+alignas(64) inline std::atomic<uint64_t> g_write_locks {0};
+inline std::atomic<uint64_t>             g_write_ns {0};
+alignas(64) inline std::atomic<uint64_t> g_lookups {0};
+inline std::atomic<uint64_t>             g_splits {0}, g_queued {0};
 inline std::atomic<uint64_t> g_refused[Count] {};
 inline thread_local bool     t_journal = false; // (el rechazo actual es "memory the processor writes" de BufferCache)
 inline thread_local bool     t_reader  = false; // (hilo de traduccion especulativa: lee el indice sin ser el escritor)
@@ -113,7 +118,7 @@ struct WriteGuard {
 			for (uint64_t g = first; g <= last; ++g) mask |= uint64_t {1} << (g & (Shards - 1));
 		t0 = Techo::On() ? __rdtsc() : 0;
 		for (uint32_t i = 0; i < Shards; ++i)
-			if (mask & (uint64_t {1} << i)) g_shard[i].lock();
+			if (mask & (uint64_t {1} << i)) TejLag::Lock(g_shard[i], TejLag::BcWrite); // (tej-lag: espera del render)
 	}
 	~WriteGuard() {
 		if (mask == 0) return;
