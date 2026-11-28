@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "libs/errno.h"
@@ -41,10 +42,20 @@ struct AjmGaplessState {
 	}
 
 	void Set(const AjmSidebandGaplessDecode& params, bool reset) {
+		// (KYTY_AJM_REARM, default on.) A stream that reached its sample limit (IsEnd) and gets new gapless params
+		// with a total is armed again, as the hardware does (the params set the remaining samples). Before, the
+		// samples it had skipped kept it at its end: every later decode gave nothing (a looping sound went silent
+		// until the game started it again, ~1 min).
+		static const bool rearm = [] {
+			const char* v = std::getenv("KYTY_AJM_REARM");
+			return v == nullptr || v[0] != '0';
+		}();
+		const bool ended   = IsEnd();
 		init.total_samples = params.total_samples;
 		init.skip_samples  = params.skip_samples;
 		if (reset || (current.total_samples == 0 && current.skip_samples == 0 &&
-		              current.skipped_samples == 0)) {
+		              current.skipped_samples == 0) ||
+		    (rearm && ended && params.total_samples != 0)) {
 			Reset();
 		}
 	}

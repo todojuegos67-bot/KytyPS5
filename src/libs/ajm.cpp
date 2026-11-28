@@ -360,6 +360,8 @@ struct AjmInstanceState {
 	AjmGaplessState             gapless;
 	std::unique_ptr<AjmDecoder> decoder;
 	AjmInstanceStats            stats;
+	bool                        produced      = false;
+	bool                        silent_logged = false;
 };
 
 static std::mutex                                     g_ajm_instances_mutex;
@@ -679,7 +681,22 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
+	const bool was_end = state->gapless.IsEnd();
 	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames, &state->gapless);
+	// [ajm-vacio] (always, once per instance and stretch): an instance that was producing gives nothing with input.
+	if (result.output_written != 0) {
+		state->silent_logged = false;
+		state->produced      = true;
+	} else if (state->produced && !state->silent_logged && input_size != 0 && result.result == OK) {
+		state->silent_logged = true;
+		std::printf("[ajm-vacio] instancia 0x%05x codec %u flags 0x%llx: entrada %zu bytes y salida 0 (fin gapless %d->%d, "
+		            "total restante %u, skip %u, saltados %u, limite %u)\n",
+		            instance, state->codec, static_cast<unsigned long long>(state->flags), input_size, was_end ? 1 : 0,
+		            state->gapless.IsEnd() ? 1 : 0, state->gapless.current.total_samples,
+		            static_cast<unsigned>(state->gapless.current.skip_samples),
+		            static_cast<unsigned>(state->gapless.current.skipped_samples), state->gapless.init.total_samples);
+		std::fflush(stdout);
+	}
 	if (Libs::Audio::AudioInternal::StatsWanted()) AjmNoteDecode(instance, *state, input, input_size, output, result);
 	if ((result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL | AJM_RESULT_INVALID_DATA | AJM_RESULT_NOT_INITIALIZED |
 	                      AJM_RESULT_INVALID_PARAMETER)) != 0)
