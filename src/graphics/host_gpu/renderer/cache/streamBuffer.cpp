@@ -707,10 +707,6 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 }
 
 void StreamBuffer::Commit() {
-	// (tej-repro paso A3, KYTY_TEJ=3 solo en la sombra) contenido subido -> direccion/(handle, offset)
-	if (TejRepro::t_rec && !TejRepro::t_in_copy && m_mapped_size != 0 && m_offset + m_mapped_size <= Mapped().size())
-		TejRepro::ContentNote(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(Handle())), HasDeviceAddress() ? BufferDeviceAddress() : 0,
-		                      m_offset, Mapped().data() + m_offset, m_mapped_size);
 	if (Usage() != MemoryUsage::Download && m_mapped_size != 0) {
 		Flush(m_offset, m_mapped_size);
 	}
@@ -740,12 +736,11 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 	const auto [data, offset] = Map(size, alignment);
 	EXIT_IF(data == nullptr);
 	std::memcpy(data, source, static_cast<size_t>(size));
-	TejRepro::t_in_copy = true; // (tej-repro A3) el tamano exacto, no la reserva redondeada
 	Commit();
-	TejRepro::t_in_copy = false;
+	// (tej-repro A3b, KYTY_TEJ=3) hash del ORIGEN (memoria del host), nunca del anillo mapeado (combinado en escritura)
 	if (TejRepro::t_rec)
 		TejRepro::ContentNote(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(Handle())), HasDeviceAddress() ? BufferDeviceAddress() : 0,
-		                      offset, data, size);
+		                      offset, static_cast<const uint8_t*>(source), size);
 	return offset;
 }
 

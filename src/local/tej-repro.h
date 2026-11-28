@@ -14,6 +14,11 @@
 //    draws indexados; push constants por offset (el layout/stages no cambian lo que el shader lee); el trabajo de COMPUTE
 //    (pipeline/sets/push del punto compute: copias, detile, lod del propio emulador en el render) no es estado de draw.
 // Solo el generador (vulkan-recording) y vulkan-recording.cpp escriben aqui; tej-coser.h compara y cuenta.
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +78,7 @@ inline void                  CountBad(const char* name) {
 // los bytes subidos, y (handle, offset) -> hash para VB/IB. La variante "sin handles" (vn) compara ese hash en lugar
 // del valor: igual = el shader lee los MISMOS datos. Tabla global (el render busca direcciones del trabajador), sin
 // cerrojo: clave guardada como clave^hash; una lectura rota no casa y cuenta como distinta (nunca igual por error).
+[[nodiscard]] inline bool t_cap_on() noexcept;
 struct Content {
 	static constexpr uint32_t kN = 1u << 16; // varios fotogramas de bloques de ambos hilos
 	struct E {
@@ -82,7 +88,11 @@ struct Content {
 };
 inline Content                g_content;
 inline std::atomic<uint64_t>  g_content_n {0}, g_content_big {0};
-constexpr uint64_t            kContentMax = 64 * 1024; // subidas mayores: no se apuntan (distintas por valor)
+// (A3b) solo se apunta lo que pasa por StreamBuffer::Copy, hasheando el ORIGEN en memoria del host (cacheable); nunca se
+// leen los bytes ya escritos en el anillo mapeado (memoria de GPU combinada en escritura: leerla costaba ~90 ms/fot en B).
+constexpr uint64_t            kContentMax = 16 * 1024; // subidas mayores: no se apuntan (distintas por valor)
+// (A3b, diag) coste de apuntar/sustituir, ticks de rdtsc: [0] hilo de render (seguidor), [1] trabajador (captura)
+inline std::atomic<uint64_t> g_cost_note[2] {}, g_cost_subst[2] {};
 [[nodiscard]] inline uint64_t ContentSlot(uint64_t key) noexcept { return (key ^ (key >> 23) ^ (key >> 41)) * 0x9e3779b97f4a7c15ull; }
 inline void ContentPut(uint64_t key, uint64_t hash) noexcept {
 	auto& s = g_content.e[ContentSlot(key) >> 48];
@@ -105,6 +115,10 @@ inline void ContentPut(uint64_t key, uint64_t hash) noexcept {
 // Gancho de StreamBuffer::Commit: [data, data+size) recien subido en (handle, offset), direccion bda (0: sin BDA).
 inline void ContentNote(uint64_t handle, uint64_t bda, uint64_t offset, const uint8_t* data, uint64_t size) noexcept {
 	if (data == nullptr || size == 0) return;
+	struct T {
+		uint64_t t0 = __rdtsc();
+		~T() { g_cost_note[t_cap_on() ? 1 : 0].fetch_add(__rdtsc() - t0, std::memory_order_relaxed); }
+	} timer;
 	if (size > kContentMax) {
 		g_content_big.fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -129,6 +143,7 @@ inline void ContentNote(uint64_t handle, uint64_t bda, uint64_t offset, const ui
 // Push por contenido: cada par de dwords (cualquier alineacion: TableBlockDword puede ser impar) que es una direccion
 // apuntada se sustituye por el hash de lo que apunta. Devuelve cuantas sustituyo.
 inline uint32_t PushByContent(uint32_t* d, size_t dwords) noexcept {
+	const uint64_t t0 = __rdtsc();
 	uint32_t n = 0;
 	for (size_t i = 0; i + 1 < dwords; ++i) {
 		const uint64_t a = d[i] | (uint64_t {d[i + 1]} << 32);
@@ -138,6 +153,7 @@ inline uint32_t PushByContent(uint32_t* d, size_t dwords) noexcept {
 		d[i] = static_cast<uint32_t>(h), d[i + 1] = static_cast<uint32_t>(h >> 32);
 		++i, ++n;
 	}
+	g_cost_subst[t_cap_on() ? 1 : 0].fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
 	return n;
 }
 inline std::atomic<uint64_t> g_push_subst {0}; // (diag) direcciones de push sustituidas por contenido
@@ -211,8 +227,8 @@ inline thread_local std::vector<uint64_t>*                   t_cap = nullptr; //
 inline thread_local std::vector<std::shared_ptr<const void>>* t_own = nullptr; // retencion de duenos de paquetes
 inline thread_local bool                                     t_rec = false;   // t_acc || t_cap (un solo TLS en cada vkCmd)
 inline thread_local bool                                     t_bad = false;   // llamada no capturable en el paquete
-inline thread_local bool                                     t_in_copy = false; // (A3) StreamBuffer::Copy apunta el tamano exacto
 
+[[nodiscard]] inline bool t_cap_on() noexcept { return t_cap != nullptr; }
 inline void Sync() { t_rec = t_acc != nullptr || t_cap != nullptr; }
 
 template <typename T>

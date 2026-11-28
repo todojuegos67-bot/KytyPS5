@@ -2051,6 +2051,16 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			std::printf(" [%s] %.3f / %.3f (%.0f / %.0f/fot)", HName[k], last_ms[0][k], last_ms[1][k], last_n[0][k], last_n[1][k]);
 		std::printf(" = TOTAL A %.3f / B %.3f ms/fot (objetivo B-A <= 0.2) | registro de efectos A %.3f / B %.3f ms/fot",
 		            last_tot[0], last_tot[1], last_ms[0][HEff], last_ms[1][HEff]);
+		{ // (tej-repro A3b) coste de apuntar contenido (StreamBuffer::Copy) y de sustituir push por contenido, ms/fot
+			static double cn[2][2] {}, cs[2][2] {}; // [lado A/B][hilo render/trabajador]
+			for (int t = 0; t < 2; ++t) {
+				cn[sd][t] = static_cast<double>(TejRepro::g_cost_note[t].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+				cs[sd][t] = static_cast<double>(TejRepro::g_cost_subst[t].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+			}
+			std::printf(" | contenido A / B ms/fot: registro render %.3f / %.3f, sustitucion render %.3f / %.3f (trabajador: registro"
+			            " %.3f / %.3f, sustitucion %.3f / %.3f)",
+			            cn[0][0], cn[1][0], cs[0][0], cs[1][0], cn[0][1], cn[1][1], cs[0][1], cs[1][1]);
+		}
 		for (int q = 0; q < 2; ++q) {
 			const double dn = static_cast<double>(g_hook.dcb_n[q].exchange(0, std::memory_order_relaxed));
 			const double dw = static_cast<double>(g_hook.dcb_wall[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
