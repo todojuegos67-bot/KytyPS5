@@ -66,6 +66,83 @@ inline void                  CountBad(const char* name) {
 	g_bad_other.fetch_add(1, std::memory_order_relaxed);
 }
 
+// (paso A3) CONTENIDO de los anillos de subida. El push de graficos del camino de tabla lleva, por etapa, la direccion de
+// dispositivo de su bloque (table-xpr.inc TableBlocks: blocks[st] = TableUploadBuffer.BDA + Copy(bloque), 64 bits en
+// TableBlockDword) y el trabajador sube a SU anillo (Spec table_upload/shader_upload/draw): mismo bloque, otra direccion.
+// StreamBuffer::Commit (solo con t_rec: render en seguimiento o trabajador capturando) apunta aqui direccion -> hash de
+// los bytes subidos, y (handle, offset) -> hash para VB/IB. La variante "sin handles" (vn) compara ese hash en lugar
+// del valor: igual = el shader lee los MISMOS datos. Tabla global (el render busca direcciones del trabajador), sin
+// cerrojo: clave guardada como clave^hash; una lectura rota no casa y cuenta como distinta (nunca igual por error).
+struct Content {
+	static constexpr uint32_t kN = 1u << 16; // varios fotogramas de bloques de ambos hilos
+	struct E {
+		std::atomic<uint64_t> kx {0}, h {0};
+	};
+	E e[kN];
+};
+inline Content                g_content;
+inline std::atomic<uint64_t>  g_content_n {0}, g_content_big {0};
+constexpr uint64_t            kContentMax = 64 * 1024; // subidas mayores: no se apuntan (distintas por valor)
+[[nodiscard]] inline uint64_t ContentSlot(uint64_t key) noexcept { return (key ^ (key >> 23) ^ (key >> 41)) * 0x9e3779b97f4a7c15ull; }
+inline void ContentPut(uint64_t key, uint64_t hash) noexcept {
+	auto& s = g_content.e[ContentSlot(key) >> 48];
+	s.kx.store(0, std::memory_order_relaxed);
+	s.h.store(hash, std::memory_order_relaxed);
+	s.kx.store(key ^ hash, std::memory_order_release);
+}
+[[nodiscard]] inline bool ContentGet(uint64_t key, uint64_t& hash) noexcept {
+	if (key == 0) return false;
+	auto&          s  = g_content.e[ContentSlot(key) >> 48];
+	const uint64_t kx = s.kx.load(std::memory_order_acquire);
+	const uint64_t h  = s.h.load(std::memory_order_relaxed);
+	if (kx == 0 || (kx ^ h) != key || s.kx.load(std::memory_order_relaxed) != kx) return false;
+	hash = h;
+	return true;
+}
+[[nodiscard]] inline uint64_t HandleKey(uint64_t handle, uint64_t offset) noexcept {
+	return TejCoser::Mix(TejCoser::Mix(0x5a17ull, handle), offset) | 1;
+}
+// Gancho de StreamBuffer::Commit: [data, data+size) recien subido en (handle, offset), direccion bda (0: sin BDA).
+inline void ContentNote(uint64_t handle, uint64_t bda, uint64_t offset, const uint8_t* data, uint64_t size) noexcept {
+	if (data == nullptr || size == 0) return;
+	if (size > kContentMax) {
+		g_content_big.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	uint64_t h = TejCoser::Mix(0xc0ffeeull, size);
+	uint64_t i = 0;
+	for (; i + 8 <= size; i += 8) {
+		uint64_t w;
+		std::memcpy(&w, data + i, 8);
+		h = TejCoser::Mix(h, w);
+	}
+	if (i < size) {
+		uint64_t w = 0;
+		std::memcpy(&w, data + i, size - i);
+		h = TejCoser::Mix(h, w);
+	}
+	h |= 1;
+	if (bda != 0) ContentPut(bda + offset, h);
+	ContentPut(HandleKey(handle, offset), h);
+	g_content_n.fetch_add(1, std::memory_order_relaxed);
+}
+// Push por contenido: cada par de dwords (cualquier alineacion: TableBlockDword puede ser impar) que es una direccion
+// apuntada se sustituye por el hash de lo que apunta. Devuelve cuantas sustituyo.
+inline uint32_t PushByContent(uint32_t* d, size_t dwords) noexcept {
+	uint32_t n = 0;
+	for (size_t i = 0; i + 1 < dwords; ++i) {
+		const uint64_t a = d[i] | (uint64_t {d[i + 1]} << 32);
+		if (a < 0x10000) continue;
+		uint64_t h;
+		if (!ContentGet(a, h)) continue;
+		d[i] = static_cast<uint32_t>(h), d[i + 1] = static_cast<uint32_t>(h >> 32);
+		++i, ++n;
+	}
+	return n;
+}
+inline std::atomic<uint64_t> g_push_subst {0}; // (diag) direcciones de push sustituidas por contenido
+inline std::atomic<uint64_t> g_vb_subst {0};   // (diag) VB/IB en anillo sustituidos por contenido
+
 struct Acc {
 	static constexpr uint32_t kSlots = 256; // tabla abierta (potencia de 2)
 	struct Slot {
@@ -134,6 +211,7 @@ inline thread_local std::vector<uint64_t>*                   t_cap = nullptr; //
 inline thread_local std::vector<std::shared_ptr<const void>>* t_own = nullptr; // retencion de duenos de paquetes
 inline thread_local bool                                     t_rec = false;   // t_acc || t_cap (un solo TLS en cada vkCmd)
 inline thread_local bool                                     t_bad = false;   // llamada no capturable en el paquete
+inline thread_local bool                                     t_in_copy = false; // (A3) StreamBuffer::Copy apunta el tamano exacto
 
 inline void Sync() { t_rec = t_acc != nullptr || t_cap != nullptr; }
 
@@ -186,6 +264,8 @@ struct Rec {
 	const void*            ap[4] {};
 	size_t                 ab[4] {};
 	uint64_t               vh = kBasis, vn = kBasis;
+	uint64_t               pc[kPushQ] {}; // (paso A3) push con las direcciones de anillo sustituidas por contenido
+	size_t                 pcb = 0;
 	bool                   bad = false;
 	Rec(uint32_t id_, uint32_t cat_, bool capture, uint32_t mode_ = MNone)
 	    : id(id_), cat(cat_), mode(mode_), out(capture ? t_cap : nullptr) {
@@ -215,12 +295,21 @@ struct Rec {
 			if (bytes != 0) std::memcpy(out->data() + at, p, bytes);
 		}
 		if (t_acc == nullptr || mode == MVb) return; // (VB: Done los mezcla por binding)
+		// (paso A3) push: la variante sin handles compara por CONTENIDO (direcciones de anillo -> hash de lo apuntado)
+		const bool push = mode == MPush && !handle && na == 1 && bytes != 0 && bytes <= sizeof(pc);
+		if (push) {
+			std::memset(pc, 0, sizeof(pc));
+			std::memcpy(pc, p, bytes);
+			const uint32_t n = PushByContent(reinterpret_cast<uint32_t*>(pc), bytes / 4);
+			if (n != 0) g_push_subst.fetch_add(n, std::memory_order_relaxed);
+			pcb = bytes;
+		}
 		for (size_t i = 0; i < words; ++i) {
 			uint64_t w = 0;
 			if (out != nullptr) w = (*out)[at + i];
 			else std::memcpy(&w, static_cast<const uint8_t*>(p) + i * 8, i * 8 + 8 <= bytes ? 8 : bytes - i * 8);
 			vh = Mix(vh, w);
-			if (!handle) vn = Mix(vn, w);
+			if (!handle) vn = Mix(vn, push ? pc[i] : w);
 		}
 	}
 	void Vb(Acc& a) const {
@@ -234,7 +323,10 @@ struct Rec {
 			const uint64_t b = buf ? buf[i] : 0, o = off ? off[i] : 0, z = size ? size[i] : ~uint64_t {0};
 			const uint64_t st = strd ? strd[i] : 0;
 			const uint64_t vv = Mix(Mix(Mix(kBasis, o), z), st);
-			a.Apply(CVbib, Mix(Mix(kBasis, kVb), first + i), Mix(vv, b), vv);
+			// (paso A3) VB en un anillo de subida: el contenido subido en lugar del offset
+			uint64_t ch = 0, vc = vv;
+			if (ContentGet(HandleKey(b, o), ch)) vc = Mix(Mix(Mix(kBasis, ch), z), st), g_vb_subst.fetch_add(1, std::memory_order_relaxed);
+			a.Apply(CVbib, Mix(Mix(kBasis, kVb), first + i), Mix(vv, b), vc);
 		}
 	}
 	void Done() {
@@ -247,7 +339,13 @@ struct Rec {
 			case MDraw:
 			case MDrawI: a.Draw(mode == MDrawI, Mix(vh, id), Mix(vn, id)); return;
 			case MVb: Vb(a); return;
-			case MIb: a.ib = Mix(vh, id), a.ibn = Mix(vn, id); return;
+			case MIb: {
+				a.ib = Mix(vh, id), a.ibn = Mix(vn, id);
+				uint64_t ch = 0; // (paso A3) IB en un anillo de subida: (buffer, offset, tipo) -> contenido
+				if (ContentGet(HandleKey(k[0], k[1]), ch))
+					a.ibn = Mix(Mix(Mix(kBasis, ch), k[2]), id), g_vb_subst.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
 			case MPipe:
 			case MSets:
 				if (k[0] != 0) { // VK_PIPELINE_BIND_POINT_GRAPHICS = 0
@@ -265,7 +363,7 @@ struct Rec {
 				// (diag) contenido por posicion: offset 0 (los 128 bytes del PushData del emulador)
 				if (k[2] == 0 && na > 0 && ap[0] != nullptr) {
 					const size_t q = ab[0] / 8 < kPushQ ? ab[0] / 8 : kPushQ;
-					std::memcpy(a.pcur, ap[0], q * 8);
+					std::memcpy(a.pcur, pcb != 0 ? static_cast<const void*>(pc) : ap[0], q * 8);
 				}
 				break;
 			}

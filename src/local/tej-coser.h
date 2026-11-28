@@ -91,7 +91,7 @@ enum K : uint32_t {
 	RPk, RFunnel, RFunnelDraws, RNoCap, RBad, RFail, RFirst, ROverflow, RDrawsDiff, RArgs, RArgsNh,
 	RCat0, RCat1, RCat2, RCat3, RCat4, RNh0, RNh1, RNh2, RNh3, RNh4, REq, REqDraws, REqNh, REqNhDraws, ROk, ROkDraws,
 	ROkNh, ROkNhDraws, RShadowNs, RShadowDraws, RWinNs, RWinDraws, RWords,
-	RPushHandleOnly, RPushQ0, RPushQEnd = RPushQ0 + TejRepro::kPushQ, KN
+	RPushHandleOnly, RDrawsMore, RDrawsLess, RDrawsDcbEnd, RPushQ0, RPushQEnd = RPushQ0 + TejRepro::kPushQ, KN
 };
 inline std::atomic<uint64_t> g_k[KN] {};
 inline void                  Add(K k, uint64_t v = 1) { g_k[k].fetch_add(v, std::memory_order_relaxed); }
@@ -114,7 +114,7 @@ inline Live g_live;
 inline TejRepro::Acc g_track;
 inline bool          g_track_on = false;
 
-inline void ReproFinish(Live& l) {
+inline void ReproFinish(Live& l, bool dcb_end) {
 	if (!l.r_on) return;
 	l.r_on = false;
 	const auto& r  = g_track;
@@ -134,7 +134,11 @@ inline void ReproFinish(Live& l) {
 	Add(RShadowNs, l.shadow_ns), Add(RShadowDraws, sh.draws);
 	Add(RWinNs, win), Add(RWinDraws, r.draws);
 	bool eq = sh.draws == r.draws && !r.overflow && !sh.overflow, eqn = eq;
-	if (sh.draws != r.draws) Add(RDrawsDiff);
+	if (sh.draws != r.draws) {
+		// (paso A3, diag) limite del paquete: el render conto de mas (no vio el primer draw del siguiente) o de menos
+		Add(RDrawsDiff), Add(r.draws > sh.draws ? RDrawsMore : RDrawsLess);
+		if (dcb_end) Add(RDrawsDcbEnd);
+	}
 	if (sh.hd != r.hd) Add(RArgs), eq = false;
 	if (sh.hdn != r.hdn) Add(RArgsNh), eqn = false;
 	for (uint32_t c = 0; c < TejRepro::kState; ++c) {
@@ -199,7 +203,7 @@ inline void Finish(bool dcb_end) {
 	auto& l = g_live;
 	if (!l.on) return;
 	l.on            = false;
-	ReproFinish(l); // (tej-repro)
+	ReproFinish(l, dcb_end); // (tej-repro)
 	const Probe rp  = Stop();
 	const bool  eq  = rp.hash == l.w.hash;
 	Add(KPk);
@@ -319,11 +323,12 @@ inline void Print(double frames) {
 	const double gainnh = tra_us > rep_us ? static_cast<double>(v[ROkNhDraws]) / f * (tra_us - rep_us) / 1000.0 : 0.0;
 	std::printf("[tej] F2 reproduccion (paso A, sombra: nada llega al buffer real) | paquetes con lista %.1f/fot (sin lista %.1f,"
 	            " primer paquete de la DCB %.1f, llamada no capturable %.1f, lista rota %.1f, ranuras llenas %.1f) | pasan embudo %.1f"
-	            " pk/fot = %.0f draws/fot | REPRODUCIBLES (embudo + estado igual en cada draw) %.1f pk/fot = %.0f draws/fot; sin"
-	            " handles %.1f pk/fot = %.0f draws/fot | iguales %.1f %% (sin handles %.1f %%) | distintos por motivo (%% de paquetes):"
+	            " pk/fot = %.0f draws/fot | REPRODUCIBLES exactos (embudo + estado igual en cada draw) %.1f pk/fot = %.0f draws/fot;"
+	            " REPRODUCIBLES POR CONTENIDO (anillos de subida comparados por lo subido) %.1f pk/fot = %.0f draws/fot | iguales"
+	            " %.1f %% (por contenido %.1f %%) | distintos por motivo (%% de paquetes):"
 	            " cuenta de draws %.1f, args de draw %.1f (sin handles %.1f), pipeline %.1f (%.1f), sets %.1f (%.1f), push %.1f (%.1f),"
 	            " VB/IB %.1f (%.1f), estado dinamico %.1f (%.1f) | coste: reproducir %.3f us/draw, traducir ~%.3f us/draw (ventana"
-	            " %.3f) | lista %.0f palabras/pk | AHORRO ESTIMADO paso B %.2f ms/fot (sin handles %.2f)\n",
+	            " %.3f) | lista %.0f palabras/pk | AHORRO ESTIMADO paso B %.2f ms/fot (por contenido %.2f)\n",
 	            rpk / f, v[RNoCap] / f, v[RFirst] / f, v[RBad] / f, v[RFail] / f, v[ROverflow] / f, v[RFunnel] / f,
 	            v[RFunnelDraws] / f, v[ROk] / f, v[ROkDraws] / f, v[ROkNh] / f, v[ROkNhDraws] / f, rpc(v[REq]), rpc(v[REqNh]),
 	            rpc(v[RDrawsDiff]), rpc(v[RArgs]), rpc(v[RArgsNh]), rpc(v[RCat0]), rpc(v[RNh0]), rpc(v[RCat1]), rpc(v[RNh1]),
@@ -350,10 +355,16 @@ inline void Print(double frames) {
 		if (w > 0) qa += static_cast<size_t>(w);
 	}
 	std::printf("[tej] F2 reproduccion (2) | no capturable por nombre (/fot): %s%s (otros %.1f) | compute fuera del estado de"
-	            " draw %.0f binds/fot | push (%% de paquetes): igual %.1f, direccion/layout distinta con contenido igual %.1f,"
-	            " contenido distinto %.1f [%s] | ranuras llenas %.1f %%\n",
+	            " draw %.0f binds/fot | push (%% de paquetes): igual %.1f, valor distinto con contenido apuntado igual %.1f,"
+	            " contenido distinto %.1f [%s] | cuenta de draws distinta: render mas %.1f, menos %.1f, al fin de la DCB %.1f"
+	            " (%% de paquetes) | sustituidas por contenido: direcciones de push %.0f/fot, VB/IB %.0f/fot; subidas"
+	            " apuntadas %.0f/fot (>64 KiB sin apuntar %.1f) | ranuras llenas %.1f %%\n",
 	            at ? names : "ninguna", "", other / f, comp / f, 100.0 - rpc(v[RCat2]), rpc(v[RPushHandleOnly]),
-	            rpc(v[RNh2]), qa ? q : "-", rpc(v[ROverflow]));
+	            rpc(v[RNh2]), qa ? q : "-", rpc(v[RDrawsMore]), rpc(v[RDrawsLess]), rpc(v[RDrawsDcbEnd]),
+	            TejRepro::g_push_subst.exchange(0, std::memory_order_relaxed) / f,
+	            TejRepro::g_vb_subst.exchange(0, std::memory_order_relaxed) / f,
+	            TejRepro::g_content_n.exchange(0, std::memory_order_relaxed) / f,
+	            TejRepro::g_content_big.exchange(0, std::memory_order_relaxed) / f, rpc(v[ROverflow]));
 }
 
 } // namespace TejCoser
