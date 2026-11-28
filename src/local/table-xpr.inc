@@ -377,8 +377,19 @@ struct RenderExecutor::TableXpr {
 	uint64_t                      trad1_clock = 0;
 	// The entry of [address, address + size): the way that holds it, else the one to replace (address 0 there).
 	Trad1Range& Trad1Find(uint64_t address, uint64_t size) {
-		if (trad1_ranges == nullptr) trad1_ranges = std::make_unique<Trad1Range[]>(2 * Trad1Sets);
-		const auto set = (((address >> 2u) ^ (size * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull) >> 52u;
+		// (trad1-prueba, KYTY_TRAD1_PRUEBA) 4 vias x 16384 conjuntos; apagado: las 2 vias x 4096 de antes.
+		if (trad1_ranges == nullptr) trad1_ranges = std::make_unique<Trad1Range[]>(4 * Trad1Sets * 4);
+		const auto mix = ((address >> 2u) ^ (size * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull;
+		if (Trad1Prueba::Active()) {
+			auto* way = &trad1_ranges[4 * (mix >> 50u)];
+			Trad1Range* old = &way[0];
+			for (int i = 0; i < 4; ++i) {
+				if (way[i].address == address && way[i].size == size) return way[i];
+				if (way[i].used < old->used) old = &way[i];
+			}
+			return *old;
+		}
+		const auto set = mix >> 52u;
 		auto*      way = &trad1_ranges[2 * set];
 		if (way[0].address == address && way[0].size == size) return way[0];
 		if (way[1].address == address && way[1].size == size) return way[1];
@@ -2178,7 +2189,10 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 						if (trad1 != 0) {
 							buffer_cache.Trad1EnableCoverage();
 							range = &table.Trad1Find(address, size);
-							if (range->address != address || range->size != size) why = Trad1::NoProof;
+							if (range->address != address || range->size != size) {
+								why = Trad1::NoProof;
+								Trad1Prueba::NoteNoProof(address, size); // (trad1-prueba, solo TECHO)
+							}
 							// (bloques-rapido, KYTY_BLOQUES_RAPIDO) the registration per 4 MiB region of the range, as the
 							// read-only V#s prove theirs; then restamped (no region of it changed since).
 							else if (!BloquesRapido::RegistrationHolds(buffer_cache, address, size, range->registration,
@@ -2186,8 +2200,20 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							                                           TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE))
 								why = Trad1::Registration;
 							else if (buffer_cache.GetBufferIfLive(range->owner) != range->owner_buffer) why = Trad1::BufferGone;
-							else if (buffer_cache.Trad1CoverageMoved(address, size, range->coverage)) why = Trad1::Coverage;
-							else eligible = true;
+							else if (buffer_cache.Trad1CoverageMoved(address, size, range->coverage)) {
+								why = Trad1::Coverage;
+								// (trad1-prueba) la region de 4 MiB se movio: la prueba exacta del rango decide.
+								const bool active = Trad1Prueba::Active();
+								if (active || Techo::On()) {
+									const bool exact = buffer_cache.Trad1CoverageExact(address, size);
+									if (Techo::On()) ++(exact ? Trad1Prueba::g_cov_exact_ok : Trad1Prueba::g_cov_real);
+									if (active && exact) {
+										range->coverage = buffer_cache.GpuCoverageEpoch();
+										eligible        = true;
+										if (Techo::On()) ++Trad1Prueba::g_cov_won;
+									}
+								}
+							} else eligible = true;
 							if (eligible) range->registration = buffer_cache.RegistrationEpoch(); // (bloques-rapido)
 							if (eligible && trad1 == 1) {
 								const bool     sample = Trad1::SampleFast();
@@ -2274,6 +2300,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								proof.obtain_epoch = buffer_cache.WrittenObtainEpoch();
 								proof.cpu_epoch    = epoch;
 							}
+							if (trad1 != 0) Trad1Prueba::NoteKept(address, size); // (trad1-prueba, solo TECHO)
 							if (trad1 != 0)
 								*range = {.address      = address,
 								          .size         = size,

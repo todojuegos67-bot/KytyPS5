@@ -297,6 +297,11 @@ public:
 	// (trad1, KYTY_TRAD1=2) Whether SynchronizeBuffer of the range as written would upload anything (some page of it not
 	// GPU-owned), as ObtainBuffer would find it now.
 	[[nodiscard]] bool Trad1SyncWouldUpload(uint64_t vaddr, uint64_t size);
+	// (trad1-prueba, KYTY_TRAD1_PRUEBA) La prueba exacta de cobertura del rango escrito: todas sus paginas GPU-owned y el
+	// rango entero en m_gpu_modified_ranges (SynchronizeBuffer no subiria nada, el Add no anadiria nada).
+	[[nodiscard]] bool Trad1CoverageExact(uint64_t vaddr, uint64_t size) {
+		return size != 0 && m_gpu_modified_ranges.Contains(vaddr, size) && m_memory_tracker.IsRegionFullyGpuModified(vaddr, size);
+	}
 	// Moves whenever a buffer is unregistered (deleted, or joined into a new one): Vulkan buffers a binding resolved
 	// before it is unchanged are still the owners of their bytes. A join copies the old buffer's bytes into the new
 	// one in the open command buffer, so a binding to the old one GPU work records after it reads or writes bytes
