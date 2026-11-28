@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 #include "local-platform.h"
 #include "local/serie1.h" // (serie1: KYTY_SERIE1)
+#include "local/tej-lag.h" // (tej-var)
 
 #include <algorithm>
 #include <cstdlib>
@@ -41,7 +42,14 @@ void RenderMutex::ResignOwner() {
 void RenderMutex::OwnerLockSlow() {
 	// A requester holds the mutex or is about to: out, and in after it (or the host has no flush: the mutex always).
 	m_busy.store(0, std::memory_order_release);
-	m_mutex.Lock();
+	if (TejLag::t_render) { // (tej-var: lo que el render espera a un hilo que pidio el cerrojo)
+		const uint64_t t0 = __rdtsc();
+		m_mutex.Lock();
+		TejLag::g_acc[TejLag::RmOwner].n.fetch_add(1, std::memory_order_relaxed);
+		TejLag::g_acc[TejLag::RmOwner].ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	} else {
+		m_mutex.Lock();
+	}
 	m_owner_locked = true;
 }
 
@@ -52,13 +60,21 @@ void RenderMutex::OwnerUnlockSlow() {
 
 void RenderMutex::RequesterLock() {
 	if (t_requester_depth++ != 0) return;
+	// (tej-var) Variante cortes: la sombra espera fuera a que el render salga (lectura relajada, sin IPI), como mucho ~50 us.
+	if (TejLag::t_shadow && TejLag::g_polite.load(std::memory_order_relaxed))
+		for (uint32_t i = 0; i < 2000 && m_busy.load(std::memory_order_relaxed) != 0; ++i) _mm_pause();
 	m_mutex.Lock();
 	if (!m_owner_exists || !m_asymmetric) return;
+	const uint64_t t0 = TejLag::t_shadow ? __rdtsc() : 0;
 	m_requested.store(1, std::memory_order_relaxed);
 	std::atomic_thread_fence(std::memory_order_seq_cst);
 	// The owner's `busy` store is visible now if it made it, and its next acquisition sees the request.
 	(void)LocalPlatform::FlushProcessWriteBuffers();
 	while (m_busy.load(std::memory_order_acquire) != 0) std::this_thread::yield();
+	if (TejLag::t_shadow) {
+		TejLag::g_acc[TejLag::RmReq].n.fetch_add(1, std::memory_order_relaxed);
+		TejLag::g_acc[TejLag::RmReq].ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	}
 }
 
 void RenderMutex::RequesterUnlock() {

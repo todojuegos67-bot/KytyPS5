@@ -8,12 +8,19 @@
 
 namespace TejLag {
 
-enum Kind : uint32_t { BcWrite, Labels, Publish, Count };
+// (tej-var) RmOwner: el render encontro una peticion del RenderMutex (OwnerLockSlow) y espero el cerrojo (ticks);
+// RmReq: peticiones de hilos de la sombra (cada una = FlushProcessWriteBuffers = IPI a todos los nucleos, tambien al
+// del render; ticks: lo que la sombra espero a que el render saliera).
+enum Kind : uint32_t { BcWrite, Labels, Publish, RmOwner, RmReq, Count };
 struct alignas(64) Acc {
 	std::atomic<uint64_t> n {0}, ticks {0}; // (veces que el render encontro el cerrojo ocupado, ticks TSC esperando)
 };
 inline Acc                g_acc[Count];
 inline thread_local bool  t_render = false; // (lo pone tej.h en el hilo de render)
+inline thread_local bool  t_shadow = false; // (tej-var: lector y trabajadores de la sombra)
+// (tej-var) Variante 4 'cortes': la sombra no pide el RenderMutex mientras el render esta dentro (sin IPI ni espera del
+// render); espera fuera, como mucho ~50 us, y luego pide como siempre. Solo retrasa a la sombra.
+inline std::atomic<bool>  g_polite {false};
 
 // Toma `m` (lock()); si el render lo encuentra ocupado, cuenta el tiempo de espera.
 template <class M>

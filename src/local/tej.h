@@ -78,6 +78,22 @@ using Libs::Graphics::Speculation;
 }
 
 inline std::atomic<bool> g_ab_on {false};
+// (tej-var) KYTY_TEJ_VAR=1 (con KYTY_TEJ=2): cada ventana B es una VARIANTE distinta, en rotacion, siempre entre dos A:
+//   0 normal | 1 sin traducir (la sombra recibe y prepara la DCB pero no la traduce: sin RenderMutex, LRU, cachés ni
+//   objetos Vulkan; mide lo que cuesta el resto) | 2 N=1 (solo el trabajador 0) | 3 mismo CCD (trabajadores y lector en
+//   la L3 del render) | 4 cortes (la sombra no pide el RenderMutex mientras el render esta dentro).
+// Linea [tej] VARIANTES: delta interpolado B-A de cada una. Una sola ejecucion dice cual quita el lag.
+inline constexpr int    VarN = 5;
+inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes"};
+[[nodiscard]] inline bool VarOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEJ_VAR");
+		return v != nullptr && std::atoi(v) != 0;
+	}();
+	return on;
+}
+inline std::atomic<int> g_var {0}; // (variante de la ventana B actual; 0 sin KYTY_TEJ_VAR)
+[[nodiscard]] inline int Var() { return g_var.load(std::memory_order_relaxed); }
 [[nodiscard]] inline bool Active() {
 	const int m = Mode();
 	return m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed));
@@ -100,6 +116,7 @@ enum C : uint32_t {
 	WJobs, WNs, WTransNs, WCycles, WDraws, WBehind, WFailed, WStops, WHolesDraw, WHolesOther, WOver, WRepins, WPassDiff,
 	WIdleNoCpu, WBiggest,
 	WCalls, WAssumed, WFixNs, WCallsMeasured, WTransMeasuredNs,
+	WVarIdle, WVarSkip, // (tej-var)
 	NCount
 };
 // (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
@@ -231,6 +248,8 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 	}();
 	return v;
 }
+// (tej-var) La preferencia de CCD de la ventana: variante 3 = mismo.
+[[nodiscard]] inline int CcdNow() { return Var() == 3 ? 0 : CcdPref(); }
 // Mascara de los trabajadores: L3 elegida (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
 [[nodiscard]] inline uint64_t WorkMask(uint32_t rc) {
 	if (rc >= 64) return 0;
@@ -241,12 +260,12 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 	if (base == 0) {
 		const uint64_t own = LocalPlatform::L3MaskOfCpu(rc);
 		base               = own;
-		if (CcdPref() != 0 && own != 0) {
+		if (CcdNow() != 0 && own != 0) {
 			uint64_t idle = 0, proc = 0;
 			if (!LocalPlatform::ProcessCpusIdleTime(&idle, &proc) || proc == 0) proc = ~uint64_t {0};
 			uint64_t other = proc & ~own;
 			if (perf != 0 && (other & perf) != 0) other &= perf;
-			if (other != 0 && (CcdPref() == 1 || CoresIn(other) >= 2)) base = other;
+			if (other != 0 && (CcdNow() == 1 || CoresIn(other) >= 2)) base = other;
 		}
 	}
 	if (perf != 0 && (base & perf) != 0) base &= perf;
@@ -303,6 +322,7 @@ private:
 	Slot*                                     m_slot = nullptr;
 	int                                       m_open = -1;
 	uint32_t                                  m_ord = 0, m_pinned_for = 0xffffffffu;
+	int                                       m_ccd = -9; // (tej-var: CCD de la ultima afinidad)
 	uint64_t                                  m_last_key = 0;
 	uint32_t                                  m_calls = 0;
 	bool                                      m_assumed = false;
@@ -423,7 +443,9 @@ public:
 					++it;
 				}
 			if (!m_items.empty()) {
-				if (static_cast<int64_t>(k + 1) * 100 > g_free_x100.load(std::memory_order_relaxed) &&
+				if (k >= 1 && Var() == 2) {
+					Add(WVarIdle); // (tej-var N=1: los demas no toman)
+				} else if (static_cast<int64_t>(k + 1) * 100 > g_free_x100.load(std::memory_order_relaxed) &&
 				    g_free_x100.load(std::memory_order_relaxed) >= 0) {
 					Add(WIdleNoCpu); // (no hay nucleo libre para este trabajador: lo deja a otro / nadie)
 				} else {
@@ -495,6 +517,7 @@ private:
 		LocalPlatform::SetThreadName("Kyty.Tej.L");
 		LocalPlatform::MakeBackgroundThread(nullptr); // (tej-lag: por debajo del render, como los trabajadores)
 		t_bank = 1;
+		TejLag::t_shadow = true;
 		m_reader_spec.ShadowThreadInit(); // (executors y ranura propios: la pasada de estado predice dispatches con el catalogo)
 		t_side = 3;
 		std::unique_lock lock(m_mutex);
@@ -542,8 +565,10 @@ private:
 		}
 		Add(LJobs);
 		// (tej-lag) El lector, con los trabajadores (fuera del nucleo del render y, en X3D, fuera de su CCD).
-		if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed); rc < 64 && rc != m_reader_pinned_for) {
+		if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed);
+		    rc < 64 && (rc != m_reader_pinned_for || CcdNow() != m_reader_ccd)) {
 			m_reader_pinned_for = rc;
+			m_reader_ccd        = CcdNow();
 			if (const uint64_t m = WorkMask(rc); m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
 		}
 		uint64_t gpu = g_gpu_serial.load(std::memory_order_acquire);
@@ -640,6 +665,7 @@ private:
 	bool                                  m_chain_ok = false;
 	uint64_t                              m_chain_serial = 0, m_last_idle = 0;
 	uint32_t                              m_reader_pinned_for = 0xffffffffu;
+	int                                   m_reader_ccd        = -9;
 	std::chrono::steady_clock::time_point m_sample_at {};
 	std::mutex                            m_pub_mutex;
 	uint64_t                              m_pub_serial = 0;
@@ -655,6 +681,7 @@ inline void Worker::Run() {
 	LocalPlatform::SetThreadName(name);
 	LocalPlatform::MakeBackgroundThread(nullptr); // (por debajo del render)
 	m_spec.ShadowThreadInit();
+	TejLag::t_shadow = true;
 	t_bank = 2 + (m_index % 6u);
 	Libs::Graphics::Spec::t_hole_hook = [](const uint32_t* packet, const char* reason) {
 		if (t_worker != nullptr && t_side == 2) t_worker->Hole(packet, reason);
@@ -673,8 +700,9 @@ inline void Worker::Run() {
 }
 
 inline void Worker::Translate(Item& item) {
-	if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed); rc < 64 && rc != m_pinned_for) {
+	if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed); rc < 64 && (rc != m_pinned_for || CcdNow() != m_ccd)) {
 		m_pinned_for = rc;
+		m_ccd        = CcdNow();
 		if (const uint64_t m = WorkMask(rc); m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
 	}
 	auto& slot = m_owner.SlotOf(item.serial);
@@ -690,6 +718,12 @@ inline void Worker::Translate(Item& item) {
 	m_assumed  = false;
 	m_job_holes.clear();
 	m_job_waits.clear();
+	if (Var() == 1) { // (tej-var sin traducir: la DCB llega y se descarta; el render no ve paquetes)
+		slot.done.store(true, std::memory_order_release);
+		m_slot = nullptr;
+		Add(WVarSkip);
+		return;
+	}
 	const uint64_t c0  = LocalPlatform::CurrentThreadCycles();
 	const auto     t0  = Now();
 	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
@@ -1195,12 +1229,23 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
 	const bool was   = g_ab_on.load(std::memory_order_relaxed);
+	const int  var   = Var();
 	double     delta = 0, cnt[2] {};
+	// (tej-var) Por variante: B entre dos A, B - media de sus A; ms/fot del lag del render y cerrojo/IPI.
+	static double vsum[VarN] {}, vcnt[VarN] {}, vmin[VarN] {}, vmax[VarN] {};
 	if (m == 2) {
-		struct W { bool b; double busy; };
+		struct W { bool b; double busy; int var; };
 		static W      w[4096];
 		static size_t k = 0;
-		if (keep && k < 4096) w[k++] = {was, busy_ms};
+		if (keep && k < 4096) w[k++] = {was, busy_ms, var};
+		// (la B de en medio de las tres ultimas, ya con su A siguiente)
+		if (VarOn() && keep && k >= 3 && w[k - 2].b && !w[k - 1].b && !w[k - 3].b) {
+			const auto&  b = w[k - 2];
+			const double d = b.busy - 0.5 * (w[k - 3].busy + w[k - 1].busy);
+			if (vcnt[b.var] == 0 || d < vmin[b.var]) vmin[b.var] = d;
+			if (vcnt[b.var] == 0 || d > vmax[b.var]) vmax[b.var] = d;
+			vsum[b.var] += d, vcnt[b.var] += 1;
+		}
 		double sum[2] {};
 		for (size_t i = 1; i + 1 < k; ++i)
 			if (w[i - 1].b != w[i].b && w[i + 1].b != w[i].b) {
@@ -1254,7 +1299,8 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	            v[LOther] / f, v[LDropFull] / f, v[LAheadWaitNs] / 1e6 / f, v[LCopyBytes] / 1024.0 / f, v[WRepins] / f,
 	            fn != 0 ? static_cast<double>(fs) / 100.0 / static_cast<double>(fn) : -1.0);
 	if (m == 2)
-		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)", cnt[0], cnt[1], delta);
+		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)%s%s", cnt[0], cnt[1], delta,
+		            VarOn() && was ? " | variante " : "", VarOn() && was ? VarName[var] : "");
 	{
 		// (tej-lag) Lo que el render espero por cerrojos compartidos con la sombra (solo si los encontro ocupados) y el
 		// coste fijo de los cerrojos de escritor de BufferCache que KYTY_TEJ enciende TAMBIEN en A.
@@ -1288,10 +1334,15 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 				            " efectivos; B-A: sube pared y no ciclos = esperas/expulsion, suben ciclos = calcula mas o cache)",
 				            dn / f, dw, dc, dw > 0 ? dc / dw : 0.0);
 		}
-		std::printf(" | CCD trabajadores %s", CcdPref() == 0 ? "mismo (L3 del render)" : CcdPref() == 1 ? "otro" : "auto");
+		std::printf(" | CCD trabajadores %s", CcdNow() == 0 ? "mismo (L3 del render)" : CcdNow() == 1 ? "otro" : "auto");
 		std::printf(" | LAG render espera por la sombra: cerrojo buffers %.1f veces %.3f ms/fot, etiquetas %.1f %.3f ms/fot,"
 		            " publicar estado saltado %.1f/fot | cerrojos escritor buffers (tambien en A) %.1f/fot %.3f ms/fot",
 		            wn[TejLag::BcWrite], wms[TejLag::BcWrite], wn[TejLag::Labels], wms[TejLag::Labels], wn[TejLag::Publish], bl, bt);
+		// (tej-var) RenderMutex: el render esperando a un hilo que lo pidio (OwnerLockSlow) y las peticiones de la sombra
+		// (cada una un FlushProcessWriteBuffers: IPI a todos los nucleos, el del render incluido).
+		std::printf(" | RENDERMUTEX render espera %.1f veces %.3f ms/fot | sombra pide %.1f/fot (IPI), espera %.3f ms/fot |"
+		            " var: no toman (N=1) %.1f/fot, sin traducir %.1f DCB/fot",
+		            wn[TejLag::RmOwner], wms[TejLag::RmOwner], wn[TejLag::RmReq], wms[TejLag::RmReq], v[WVarIdle] / f, v[WVarSkip] / f);
 	}
 	std::printf("\n");
 	// Modelo N=1,2,4,6 con los tiempos de esta ventana (solo B / modo 1: con draws contados).
@@ -1409,8 +1460,23 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0,
 		            v[GValN] != 0 ? static_cast<double>(v[GRgRaw]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
 	}
+	if (m == 2 && VarOn()) {
+		std::printf("[tej] VARIANTES delta interpolado B-A del render ms/fot (media [min..max] n):");
+		for (int i = 0; i < VarN; ++i)
+			std::printf(" | %s %+.3f [%+.2f..%+.2f] %.0f", VarName[i], vcnt[i] > 0 ? vsum[i] / vcnt[i] : 0.0, vmin[i], vmax[i], vcnt[i]);
+		std::printf(" | objetivo <= +0.2\n");
+	}
 	std::fflush(stdout);
-	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
+	if (m == 2) {
+		// (tej-var) Al pasar de A a B: la siguiente variante.
+		static int next = 0;
+		if (!was && VarOn()) {
+			g_var.store(next, std::memory_order_relaxed);
+			TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
+			next = (next + 1) % VarN;
+		}
+		g_ab_on.store(!was, std::memory_order_relaxed);
+	}
 }
 
 } // namespace Tej
