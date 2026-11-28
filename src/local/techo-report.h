@@ -8,6 +8,7 @@
 #include "local/techo-faltas.h"
 #include "local/techo-escena.h"
 #include "local/vp-render.h"
+#include "local/prot-lote-ab.h" // (prot-lote-ab)
 #include "local/postnativo.h"
 #include "local/buffercache-par.h" // (buffercache-par)
 #include "local/bloques-rapido.h"
@@ -228,6 +229,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		if (Techo::g_tej_window != nullptr) Techo::g_tej_window(busy, n * 1e3 / wall_ms, n, keep); // (tej, KYTY_TEJ F1 sombra)
 		PostNativo::Window(busy, n * 1e3 / wall_ms, n, keep);     // (postnativo, contador del postproceso)
 		BloquesRapido::Window(busy, n * 1e3 / wall_ms, n, keep);  // (bloques-rapido)
+		ProtLoteAb::Window(busy, n * 1e3 / wall_ms, n, keep);     // (prot-lote-ab, KYTY_PROT_LOTE)
 		Trad1Prueba::Window(busy, n, keep);                      // (trad1-prueba, KYTY_TRAD1_PRUEBA)
 		RegsRapido::Window(busy, n, keep);                      // (regs-rapido, KYTY_REGS_RAPIDO)
 		OtrosRapido::Window(busy, n, keep);                     // (otros-rapido, KYTY_OTROS_RAPIDO)

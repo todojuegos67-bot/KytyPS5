@@ -7,6 +7,7 @@
 #include "local/proteger-junto.h" // (proteger-junto: KYTY_TECHO=1, contigüidad de las protecciones del hilo de render)
 #include "local/tej-lag.h"       // (tej-lag4: VirtualProtect del hilo de render, A/B, solo KYTY_TECHO=1)
 #include "local/vp-render.h"     // (vp-render: KYTY_VP_RENDER / KYTY_RENDER_IDEAL)
+#include "local/prot-lote-ab.h"   // (prot-lote-ab: KYTY_PROT_LOTE=1/2)
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -980,19 +981,14 @@ struct PageManager::Impl {
 		return static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 	}
+	// (prot-lote-ab) The mode of this thread: changes only at a full sync point (LoteSyncFlush / FlushReadProtect: nothing
+	// in flight, nothing pending), so with KYTY_PROT_LOTE=2 the A and B windows never mix.
+	static inline thread_local int t_lote_active = -1;
 	static bool LoteOn() noexcept {
-		static const bool on = [] {
-			const char* v = std::getenv("KYTY_PROT_LOTE");
-			const bool  r = v != nullptr && v[0] == '1';
-			std::printf("[prot-lote] KYTY_PROT_LOTE=%d: %s\n", r ? 1 : 0,
-			            r ? "ENCENDIDO (el sin-acceso de lo que escribe la GPU lo aplica un hilo aparte; el hilo de render solo "
-			                "espera en etiquetas/esperas/envios o si toca esas mismas paginas)"
-			              : "apagado");
-			std::fflush(stdout);
-			return r;
-		}();
-		return on;
+		if (t_lote_active < 0) t_lote_active = ProtLoteAb::Wanted() ? 1 : 0;
+		return t_lote_active == 1;
 	}
+	static void LoteResync() noexcept { t_lote_active = ProtLoteAb::Wanted() ? 1 : 0; }
 	struct LoteTimer {
 		std::chrono::steady_clock::time_point start;
 		bool                                  on;
@@ -1029,8 +1025,10 @@ struct PageManager::Impl {
 		if (need == 0 || f.done.load(std::memory_order_acquire) >= need) return;
 		const auto start = std::chrono::steady_clock::now();
 		LoteWaitSeq(f, need);
+		const auto ns = ElapsedNs(start);
 		g_lote_overlap_waits.fetch_add(1, std::memory_order_relaxed);
-		g_lote_overlap_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+		g_lote_overlap_ns.fetch_add(ns, std::memory_order_relaxed);
+		ProtLoteAb::NoteWait(true, ns);
 		LotePrune(f);
 	}
 	static void LoteHandOff() noexcept {
@@ -1042,6 +1040,7 @@ struct PageManager::Impl {
 		for (const auto& range: g_read_protects) f.inflight.emplace_back(range, seq);
 		g_lote_batches.fetch_add(1, std::memory_order_relaxed);
 		g_lote_ranges.fetch_add(g_read_protects.size(), std::memory_order_relaxed);
+		ProtLoteAb::NoteHandOff(g_read_protects.size());
 		{
 			std::lock_guard lock(f.mutex);
 			f.queue.emplace_back(seq, std::move(g_read_protects));
@@ -1063,15 +1062,20 @@ struct PageManager::Impl {
 			g_lote_sync_ns.fetch_add(ns, std::memory_order_relaxed);
 			g_lote_site_waits[site].fetch_add(1, std::memory_order_relaxed);
 			g_lote_site_ns[site].fetch_add(ns, std::memory_order_relaxed);
+			ProtLoteAb::NoteWait(false, ns);
 		}
 		if (t_lote != nullptr) t_lote->inflight.clear();
 		if (!g_read_protects.empty()) {
 			g_lote_sync_flushes.fetch_add(1, std::memory_order_relaxed);
 			g_lote_site_flushes[site].fetch_add(1, std::memory_order_relaxed);
 		}
-		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
-		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		ProtLoteAb::NoteFlush(g_read_protects.size());
+		{
+			const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
+			for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		}
 		g_read_protects.clear();
+		LoteResync(); // (prot-lote-ab: nothing in flight or pending: the mode may change here)
 	}
 	// One line every 5 s: the render thread's own VirtualProtect (calls and ms per second; per frame = / fps) and its
 	// waits for the worker; the worker's work moved off the render thread.
@@ -1119,9 +1123,13 @@ struct PageManager::Impl {
 		}
 		AsyncReadFlushJoin(); // (KYTY_FLUSH_ASYNC: a batch handed off before comes first)
 		NoteSyncFlush();
-		const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
-		for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		ProtLoteAb::NoteFlush(g_read_protects.size());
+		{
+			const Raiz::OriginScope origin(Raiz::ProtReadFlush); // (raiz8)
+			for (const auto& range: g_read_protects) ProtectHost(range.begin, range.end - range.begin, NO_ACCESS_PROTECTION);
+		}
 		g_read_protects.clear();
+		LoteResync(); // (prot-lote-ab: nothing in flight or pending: the mode may change here)
 	}
 
 	// ---- (FLUSH-ASYNC) KYTY_FLUSH_ASYNC=1 (off by default) -------------------------------------------------------------
