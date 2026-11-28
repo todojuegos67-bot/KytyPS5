@@ -1176,6 +1176,7 @@ inline bool Worker::Assume(uint64_t addr) {
 inline void Worker::Hole(const uint32_t* packet, const char* reason) {
 	const bool draw = packet != nullptr && IsDrawHeader(*packet);
 	if (draw && m_open >= 0 && m_slot != nullptr) ++m_slot->pk[m_open].holes;
+	if (draw) TejRepro::MarkHole(); // (A4: la sombra sabe que ese draw del render no tiene pareja por hueco)
 	Add(draw ? WHolesDraw : WHolesOther);
 	if (draw) ++m_job_holes[reason != nullptr ? reason : "?"];
 }
@@ -1866,8 +1867,8 @@ inline void     OnRenderFlip() {
 }
 
 inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
-	if (t_side == 1) GpuDraw(cp, r, key);
-	else if (t_side == 2 && t_worker != nullptr) t_worker->WorkerDraw(cp, r, key);
+	if (t_side == 1) GpuDraw(cp, r, key), TejRepro::t_key = key, TejRepro::t_sub = 0; // (A4: ID de los vkCmdDraw que siguen)
+	else if (t_side == 2 && t_worker != nullptr) t_worker->WorkerDraw(cp, r, key), TejRepro::MarkDraw(key);
 }
 
 // Hilo de render: un envio de la cola 0 acabado.

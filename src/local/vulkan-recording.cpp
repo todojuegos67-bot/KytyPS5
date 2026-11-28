@@ -555,7 +555,11 @@ bool TejReplay(const uint64_t* words, size_t count, VkCommandBuffer cb, const vk
         const uint64_t* body = p + 2;
         if (static_cast<uint64_t>(e - body) < n) return false;
         const uint64_t* const be = body + n;
-        if (id == TejRepro::kPacket) {
+        if (id == TejRepro::kDrawKey || id == TejRepro::kHoleKey) { // (A4) ID estable de los draws del trabajador
+            if (n != 1) return false;
+            if (id == TejRepro::kDrawKey) TejRepro::t_key = body[0], TejRepro::t_sub = 0;
+            else if (TejRepro::t_holes != nullptr) TejRepro::t_holes->push_back(body[0]);
+        } else if (id == TejRepro::kPacket) {
             if (n < 2 || body[1] > 8) return false;
             const auto replay = reinterpret_cast<ReplayPacket>(static_cast<uintptr_t>(body[0]));
             if (!TejAllowed(replay)) return false;

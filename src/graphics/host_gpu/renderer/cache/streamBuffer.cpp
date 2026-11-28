@@ -738,7 +738,7 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 	std::memcpy(data, source, static_cast<size_t>(size));
 	Commit();
 	// (tej-repro A3b, KYTY_TEJ=3) hash del ORIGEN (memoria del host), nunca del anillo mapeado (combinado en escritura)
-	if (TejRepro::t_rec)
+	if (TejRepro::t_rec || TejRepro::t_note) // (A4: t_note, apuntar tambien entre paquetes muestreados)
 		TejRepro::ContentNote(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(Handle())), HasDeviceAddress() ? BufferDeviceAddress() : 0,
 		                      offset, static_cast<const uint8_t*>(source), size);
 	return offset;

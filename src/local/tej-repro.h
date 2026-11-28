@@ -185,6 +185,21 @@ inline uint32_t PushByContent(uint32_t* d, size_t dwords) noexcept {
 	return n;
 }
 inline std::atomic<uint64_t> g_push_subst {0}; // (diag) direcciones de push sustituidas por contenido
+// (A4, alineacion) Cada draw lleva un ID ESTABLE = (clave PM4 del draw = posicion en la DCB raiz << 32 | en el bufer
+// actual, la misma en el render y en la copia del trabajador; sub = n-esimo vkCmdDraw* desde ese draw PM4). Antes se
+// comparaba el draw i con el draw i: un hueco del trabajador o un draw de mas del emulador desalineaba todo lo posterior.
+struct DrawRec {
+	uint64_t key = 0;
+	uint32_t sub = 0, indexed = 0;
+	uint64_t x[kState] {}, xn[kState] {}; // estado vigente por categoria (exacto / sin handles) en ESTE draw
+	uint64_t v = 0, vn = 0;               // argumentos del draw
+	uint64_t pw[kPushQ] {};               // push de graficos (offset 0) por palabra, por contenido
+};
+inline thread_local uint64_t t_key = 0; // clave PM4 del draw en curso (render: OnDraw; sombra: marcador @draw)
+inline thread_local uint32_t t_sub = 0;
+inline thread_local uint64_t t_done = 0; // (A4, diag) llamadas aplicadas al seguidor en este hilo
+inline thread_local bool     t_note = false; // (A4) apuntar subidas aunque no se siga (muestreo: los bloques se reutilizan)
+inline thread_local std::vector<uint64_t>* t_holes = nullptr; // (A4) sombra: claves de draws que el trabajador dejo en hueco
 inline std::atomic<uint64_t> g_vb_subst {0};   // (diag) VB/IB en anillo sustituidos por contenido
 
 struct Acc {
@@ -204,11 +219,13 @@ struct Acc {
 	uint64_t pcur[kPushQ] {};
 	uint32_t draws = 0;
 	bool     overflow = false;
+	std::vector<DrawRec>* dl = nullptr; // (A4) lista por draw con su ID (render: g_rdl, sombra: g_sdl)
 
 	void ResetDraws() {
 		for (uint32_t c = 0; c < kState; ++c) h[c] = hn[c] = kBasis;
 		for (uint32_t i = 0; i < kPushQ; ++i) pq[i] = 0;
 		hd = hdn = kBasis, draws = 0;
+		if (dl != nullptr) dl->clear();
 	}
 	void ResetAll() {
 		for (auto& e : slot) e.key = 0;
@@ -220,10 +237,17 @@ struct Acc {
 	Acc() { ResetDraws(); }
 	void Draw(bool indexed, uint64_t v, uint64_t vn) {
 		++draws;
+		DrawRec* r = nullptr;
+		if (dl != nullptr) {
+			r = &dl->emplace_back();
+			r->key = t_key, r->sub = t_sub++, r->indexed = indexed ? 1 : 0, r->v = v, r->vn = vn;
+			std::memcpy(r->pw, pcur, sizeof(pcur));
+		}
 		for (uint32_t c = 0; c < kState; ++c) {
 			uint64_t x = s[c], xn = sn[c];
 			if (c == CVbib && indexed) x += ib, xn += ibn;
 			h[c] = Mix(h[c], x), hn[c] = Mix(hn[c], xn);
+			if (r != nullptr) r->x[c] = x, r->xn[c] = xn;
 		}
 		for (uint32_t i = 0; i < kPushQ; ++i) pq[i] = ((pq[i] << 7) | (pq[i] >> 57)) ^ pcur[i];
 		hd = Mix(hd, v), hdn = Mix(hdn, vn);
@@ -296,6 +320,16 @@ template <typename T>
 
 constexpr uint32_t kPacket = Id("@paquete");
 constexpr uint32_t kVb     = Id("@vb");
+constexpr uint32_t kDrawKey = Id("@draw");  // (A4) [id, 1, clave PM4]: los vkCmd siguientes son de ese draw
+constexpr uint32_t kHoleKey = Id("@hueco"); // (A4) [id, 1, clave PM4]: el trabajador dejo ese draw en hueco
+// (A4) Un draw PM4 empieza (render: Tej::OnDraw; trabajador: lo apunta en su lista para que la sombra lo vea).
+inline void MarkDraw(uint64_t key) noexcept {
+	t_key = key, t_sub = 0;
+	if (t_cap != nullptr) t_cap->push_back(kDrawKey), t_cap->push_back(1), t_cap->push_back(key);
+}
+inline void MarkHole() {
+	if (t_cap != nullptr) t_cap->push_back(kHoleKey), t_cap->push_back(1), t_cap->push_back(t_key);
+}
 constexpr uint64_t kGraphicsStages = 0x1f | 0x40 | 0x80; // VS..FS, task, mesh (VkShaderStageFlagBits)
 
 // Una llamada: argumentos en orden (V valor, A arreglo); Done la aplica al seguidor y cierra la captura.
@@ -377,6 +411,7 @@ struct Rec {
 		if (out != nullptr) (*out)[hdr + 1] = out->size() - hdr - 2;
 		if (bad) t_bad = true;
 		if (t_acc == nullptr) return;
+		++t_done;
 		auto&    a   = *t_acc;
 		uint64_t key = Mix(kBasis, id);
 		switch (mode) {
