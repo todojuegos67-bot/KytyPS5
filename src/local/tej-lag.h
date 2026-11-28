@@ -11,7 +11,10 @@ namespace TejLag {
 // (tej-var) RmOwner: el render encontro una peticion del RenderMutex (OwnerLockSlow) y espero el cerrojo (ticks);
 // RmReq: peticiones de hilos de la sombra (cada una = FlushProcessWriteBuffers = IPI a todos los nucleos, tambien al
 // del render; ticks: lo que la sombra espero a que el render saliera).
-enum Kind : uint32_t { BcWrite, Labels, Publish, RmOwner, RmReq, Count };
+// (tej-sinmutex) RmSkip: peticiones de la sombra evitadas (KYTY_TEJ_SINMUTEX: el draw normal que la pediria = hueco
+// 'sin mutex'); BarFree: barreras / cortes de cadena compute grabados por la sombra en SU buffer sin el RenderMutex;
+// CatW: el render esperando el catalogo de tablas (CatalogWrite) porque la sombra lo lee (CatalogRead).
+enum Kind : uint32_t { BcWrite, Labels, Publish, RmOwner, RmReq, RmSkip, BarFree, CatW, Count };
 struct alignas(64) Acc {
 	std::atomic<uint64_t> n {0}, ticks {0}; // (veces que el render encontro el cerrojo ocupado, ticks TSC esperando)
 };
@@ -21,6 +24,12 @@ inline thread_local bool  t_shadow = false; // (tej-var: lector y trabajadores d
 // (tej-var) Variante 4 'cortes': la sombra no pide el RenderMutex mientras el render esta dentro (sin IPI ni espera del
 // render); espera fuera, como mucho ~50 us, y luego pide como siempre. Solo retrasa a la sombra.
 inline std::atomic<bool>  g_polite {false};
+// (tej-sinmutex) KYTY_TEJ_SINMUTEX (por defecto 1 con KYTY_TEJ>0): la sombra nunca pide el RenderMutex. t_translating:
+// dentro de Speculation::Shadow de un trabajador (alli una RecorderRefusal se convierte en hueco contado por motivo).
+inline std::atomic<bool>  g_sinmutex {false};
+inline thread_local bool  t_translating = false;
+[[nodiscard]] inline bool NoMutex() { return t_shadow && t_translating && g_sinmutex.load(std::memory_order_relaxed); }
+inline void Note(Kind k) { g_acc[k].n.fetch_add(1, std::memory_order_relaxed); }
 
 // Toma `m` (lock()); si el render lo encuentra ocupado, cuenta el tiempo de espera.
 template <class M>

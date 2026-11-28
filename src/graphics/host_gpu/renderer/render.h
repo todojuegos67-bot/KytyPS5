@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "local/tej-lag.h" // (tej-sinmutex: CatalogWrite)
 
 #include <array>
 #include <memory>
@@ -513,7 +514,19 @@ private:
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
 	mutable std::shared_mutex m_catalog_mutex;
-	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const { return std::unique_lock(m_catalog_mutex); }
+	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
+		// (tej-sinmutex) Si la sombra lo esta leyendo, el render espera: se cuenta (solo cuando lo encuentra ocupado).
+		std::unique_lock l(m_catalog_mutex, std::try_to_lock);
+		if (!l.owns_lock()) {
+			const uint64_t t0 = __rdtsc();
+			l.lock();
+			if (TejLag::t_render) {
+				TejLag::g_acc[TejLag::CatW].n.fetch_add(1, std::memory_order_relaxed);
+				TejLag::g_acc[TejLag::CatW].ticks.fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+			}
+		}
+		return l;
+	}
 	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
 	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
 	// The catalog's table (null: nothing learned yet), and this executor's own table state.

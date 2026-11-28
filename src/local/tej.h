@@ -68,6 +68,14 @@ using Libs::Graphics::Speculation;
 			std::printf("[tej] KYTY_TEJ=2 sin KYTY_TECHO=1: modo 1 (sombra siempre, sin linea)\n");
 			m = 1;
 		}
+		if (m != 0) { // (tej-sinmutex) sin KYTY_TEJ_VAR: KYTY_TEJ_SINMUTEX (1 por defecto); con VAR solo su variante
+			const char* sm  = std::getenv("KYTY_TEJ_SINMUTEX");
+			const char* var = std::getenv("KYTY_TEJ_VAR");
+			const bool  on  = (sm == nullptr || std::atoi(sm) != 0) && (var == nullptr || std::atoi(var) == 0);
+			TejLag::g_sinmutex.store(on, std::memory_order_relaxed);
+			std::printf("[tej] KYTY_TEJ_SINMUTEX: la sombra %s el RenderMutex%s\n", on ? "NO pide" : "pide",
+			            var != nullptr && std::atoi(var) != 0 ? " (KYTY_TEJ_VAR: solo en la variante 'sin mutex')" : "");
+		}
 		if (m != 0)
 			std::printf("[tej] KYTY_TEJ=%d (%s): F1b sombra paralela, SOLO MIDE (nada se cose ni se envia)\n", m,
 			            m == 1 ? "sombra encendida" : "A/B cada 5 s, B = sombra encendida");
@@ -83,8 +91,9 @@ inline std::atomic<bool> g_ab_on {false};
 //   objetos Vulkan; mide lo que cuesta el resto) | 2 N=1 (solo el trabajador 0) | 3 mismo CCD (trabajadores y lector en
 //   la L3 del render) | 4 cortes (la sombra no pide el RenderMutex mientras el render esta dentro).
 // Linea [tej] VARIANTES: delta interpolado B-A de cada una. Una sola ejecucion dice cual quita el lag.
-inline constexpr int    VarN = 5;
-inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes"};
+//   5 sin mutex (KYTY_TEJ_SINMUTEX: la sombra nunca pide el RenderMutex; las variantes 0-4 lo piden, como antes).
+inline constexpr int    VarN = 6;
+inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes", "sin mutex"};
 [[nodiscard]] inline bool VarOn() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEJ_VAR");
@@ -726,7 +735,9 @@ inline void Worker::Translate(Item& item) {
 	}
 	const uint64_t c0  = LocalPlatform::CurrentThreadCycles();
 	const auto     t0  = Now();
+	TejLag::t_translating = true; // (tej-sinmutex: aqui una RecorderRefusal 'sin mutex' es hueco)
 	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
+	TejLag::t_translating = false;
 	const auto     t1  = Now();
 	Close();
 	slot.done.store(true, std::memory_order_release);
@@ -1343,6 +1354,11 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		std::printf(" | RENDERMUTEX render espera %.1f veces %.3f ms/fot | sombra pide %.1f/fot (IPI), espera %.3f ms/fot |"
 		            " var: no toman (N=1) %.1f/fot, sin traducir %.1f DCB/fot",
 		            wn[TejLag::RmOwner], wms[TejLag::RmOwner], wn[TejLag::RmReq], wms[TejLag::RmReq], v[WVarIdle] / f, v[WVarSkip] / f);
+		// (tej-sinmutex) Con KYTY_TEJ_SINMUTEX: 'sombra pide' debe ser 0; evitadas = huecos 'sin mutex' (en huecos por motivo).
+		std::printf(" | SINMUTEX %s: peticiones evitadas %.1f/fot (huecos 'sin mutex'), barreras sin cerrojo %.1f/fot | render espera"
+		            " catalogo (CatalogWrite) %.1f veces %.3f ms/fot",
+		            TejLag::g_sinmutex.load(std::memory_order_relaxed) ? "si" : "no", wn[TejLag::RmSkip], wn[TejLag::BarFree],
+		            wn[TejLag::CatW], wms[TejLag::CatW]);
 	}
 	std::printf("\n");
 	// Modelo N=1,2,4,6 con los tiempos de esta ventana (solo B / modo 1: con draws contados).
@@ -1473,6 +1489,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		if (!was && VarOn()) {
 			g_var.store(next, std::memory_order_relaxed);
 			TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
+			TejLag::g_sinmutex.store(next == 5, std::memory_order_relaxed); // (tej-sinmutex: solo su variante)
 			next = (next + 1) % VarN;
 		}
 		g_ab_on.store(!was, std::memory_order_relaxed);

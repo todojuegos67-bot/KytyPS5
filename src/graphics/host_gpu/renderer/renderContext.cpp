@@ -59,6 +59,12 @@ void RenderMutex::OwnerUnlockSlow() {
 }
 
 void RenderMutex::RequesterLock() {
+	// (tej-sinmutex) La sombra no pide el cerrojo (ni IPI ni espera del render): lo que lo necesitaria es hueco 'sin mutex'
+	// (Speculation::Translate la recoge como las demas RecorderRefusal: hueco por paquete o parada contada).
+	if (t_requester_depth == 0 && TejLag::NoMutex()) {
+		TejLag::Note(TejLag::RmSkip);
+		throw CommandScheduler::RecorderRefusal {"sin mutex"};
+	}
 	if (t_requester_depth++ != 0) return;
 	// (tej-var) Variante cortes: la sombra espera fuera a que el render salga (lectura relajada, sin IPI), como mucho ~50 us.
 	if (TejLag::t_shadow && TejLag::g_polite.load(std::memory_order_relaxed))

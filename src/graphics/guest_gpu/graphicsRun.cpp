@@ -1,3 +1,4 @@
+#include "local/tej-lag.h" // (tej-sinmutex)
 #include "local/techo-faltas.h" // (sync1, KYTY_TECHO)
 #include "local/skip-shader.h"
 #include "local/vgeo-nativo.h" // (w11, KYTY_NATIVO_VGEO)
@@ -4936,7 +4937,10 @@ void CommandProcessor::EmitGlobalBarrier() {
 #endif
 
 	CensoPm4::RetagIf(0x46u, CensoPm4::KEvBarrier); // (r0: an EVENT_WRITE that records a barrier, apart in the census)
-	RenderLockGuard lock(m_renderer.GetMutex());
+	// (tej-sinmutex) La sombra graba la barrera en SU buffer (grabador del hilo) sin el RenderMutex: nada compartido.
+	std::optional<RenderLockGuard> lock;
+	if (TejLag::NoMutex()) TejLag::Note(TejLag::BarFree);
+	else lock.emplace(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -4963,7 +4967,9 @@ void CommandProcessor::BreakComputeChain() {
 	// Guest synchronization may be implemented without a host command.
 	// It still ends the compatibility profile's independent dispatch group.
 	if (!GetScheduler().Active()) return;
-	RenderLockGuard lock(m_renderer.GetMutex());
+	std::optional<RenderLockGuard> lock; // (tej-sinmutex: la sombra, su buffer, sin el RenderMutex)
+	if (TejLag::NoMutex()) TejLag::Note(TejLag::BarFree);
+	else lock.emplace(m_renderer.GetMutex());
 	auto& buffer = CurrentBuffer();
 	if (buffer.ComputeChainPending()) (void)buffer.Handle();
 }
