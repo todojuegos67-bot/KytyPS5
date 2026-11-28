@@ -7,6 +7,7 @@
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "local/audio-modos.h"
 
 #include <algorithm>
 #include <array>
@@ -206,6 +207,9 @@ struct AudioOut2PortStateEntry {
 	// (Diagnostic, issue #40.) The pushes in a row that were fed the same bytes.
 	uint64_t               pcm_hash   = 0;
 	uint32_t               pcm_repeat = 0;
+	// [audio-modos] grains in a row this port was fed, and whether it counts as fed every grain.
+	uint32_t               fed_run    = 0;
+	bool                   per_grain  = false;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -445,7 +449,8 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 	for (const auto& object: g_audioout2_ports) {
 		if (!object.used || object.context != ctx || !audioout2_port_type_is_object(object.port_type) ||
 		    object.pcm_data == nullptr || !object.pcm_fresh || object.audio_format != AudioInternal::Format::FloatMono ||
-		    object.samples_num != frames) {
+		    object.samples_num != frames ||
+		    (AudioModos::Enabled() && object.pcm_repeat >= AudioModos::REPEAT_STALE)) {
 			continue;
 		}
 		float left = HALF_POWER, right = HALF_POWER;
@@ -505,6 +510,21 @@ static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 	for (auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data == nullptr) continue;
 		state.pcm_stale = state.pcm_fresh ? 0 : state.pcm_stale + 1;
+		if (!audioout2_port_type_is_object(state.port_type)) {
+			if (state.pcm_fresh) {
+				state.fed_run++;
+				if (state.fed_run >= 100) state.per_grain = true;
+			} else {
+				if (state.per_grain && state.pcm_stale == 1 && AudioModos::Allow()) {
+					std::printf("[audio-modos] puerto 0x%llx (tipo 0x%x, formato 0x%x) deja de recibir PCM tras %u granos: %s\n",
+					            static_cast<unsigned long long>(state.handle), static_cast<uint32_t>(state.port_type),
+					            state.data_format, state.fed_run,
+					            AudioModos::Enabled() ? "silencio (KYTY_AUDIO_MODOS=1)" : "repite el ultimo grano");
+				}
+				if (state.per_grain && state.pcm_stale >= 1000) state.per_grain = false; // set-once port: back to old rule
+				state.fed_run = 0;
+			}
+		}
 		if (audioout2_port_type_is_object(state.port_type)) (state.pcm_fresh ? fed : unfed)++;
 		if (state.pcm_stale == 100 && audioout2_port_type_is_object(state.port_type) &&
 		    reported.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -512,7 +532,7 @@ static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 			            static_cast<unsigned long long>(state.handle), state.ambisonics);
 		}
 		if (!state.pcm_fresh) continue;
-		const auto bytes = std::min<uint64_t>(256, static_cast<uint64_t>(state.samples_num) *
+		const auto bytes = std::min<uint64_t>(1024, static_cast<uint64_t>(state.samples_num) *
 		                                                audioout2_data_format_channels(state.data_format) * 2);
 		const auto* data = static_cast<const uint8_t*>(state.pcm_data);
 		uint64_t    hash = 0xcbf29ce484222325ull;
@@ -526,6 +546,12 @@ static void audioout2_note_grain_locked(AudioOut2ContextHandle ctx) {
 		const bool repeat = any != 0 && hash == state.pcm_hash;
 		state.pcm_hash    = hash;
 		state.pcm_repeat  = repeat ? state.pcm_repeat + 1 : 0;
+		if (state.pcm_repeat == AudioModos::REPEAT_STALE && AudioModos::Allow()) {
+			std::printf("[audio-modos] puerto 0x%llx (tipo 0x%x, formato 0x%x, ambisonics 0x%x) recibe el mismo grano %u veces: %s\n",
+			            static_cast<unsigned long long>(state.handle), static_cast<uint32_t>(state.port_type), state.data_format,
+			            state.ambisonics, AudioModos::REPEAT_STALE,
+			            AudioModos::Enabled() ? "silencio (KYTY_AUDIO_MODOS=1)" : "se sigue mezclando (pitido)");
+		}
 		if (state.pcm_repeat == 100 && reported.fetch_add(1, std::memory_order_relaxed) < 8) {
 			std::printf("AudioOut2: port 0x%llx (type %u, ambisonics 0x%x) was fed the same grain 100 times in a row\n",
 			            static_cast<unsigned long long>(state.handle), static_cast<uint32_t>(state.port_type),
@@ -555,6 +581,11 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    state.pcm_data != nullptr && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			const void* data = state.pcm_data;
+			if (AudioModos::Enabled() && ((!state.pcm_fresh && state.per_grain) || state.pcm_repeat >= AudioModos::REPEAT_STALE)) {
+				const bool is_float = (state.data_format & 0x7fu) == 0;
+				data = AudioModos::Silence(static_cast<size_t>(state.samples_num) *
+				                           audioout2_data_format_channels(state.data_format) * (is_float ? 4u : 2u));
+			}
 			if (!objects_mixed && (state.port_type & 0xffu) == 0 &&
 			    (state.audio_format == AudioInternal::Format::FloatStereo ||
 			     state.audio_format == AudioInternal::Format::Float8Ch ||
@@ -700,6 +731,12 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 ", num = %" PRIu32 "\n", ctx, num);
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
+	for (uint32_t i = 0; i < num && AudioModos::Allow(); i++) {
+		uint32_t v = 0;
+		if (attributes[i].value != nullptr && attributes[i].value_size >= 4) std::memcpy(&v, attributes[i].value, 4);
+		std::printf("[audio-modos] ContextSetAttributes ctx 0x%llx atributo %u tam %zu valor0 0x%x\n",
+		            static_cast<unsigned long long>(ctx), attributes[i].attribute_id, attributes[i].value_size, v);
+	}
 	return OK;
 }
 
@@ -1176,6 +1213,7 @@ int KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint3
 int KYTY_SYSV_ABI AudioOut2MasteringInit(uint32_t flags) {
 	PRINT_NAME();
 	LOGF("\t flags = 0x%08" PRIx32 "\n", flags);
+	if (AudioModos::Allow()) std::printf("[audio-modos] MasteringInit flags 0x%x\n", flags);
 	return OK;
 }
 
@@ -1184,6 +1222,10 @@ int KYTY_SYSV_ABI AudioOut2MasteringSetParam(const AudioOut2MasteringParamsHeade
 	PRINT_NAME();
 	LOGF("\t param = 0x%016" PRIx64 ", output = %" PRIu32 ", flags = 0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(param), output, flags);
+	if (AudioModos::Allow()) {
+		std::printf("[audio-modos] MasteringSetParam id 0x%x salida %u flags 0x%x\n", param != nullptr ? param->params_id : 0u,
+		            output, flags);
+	}
 	return OK;
 }
 
