@@ -6,6 +6,7 @@
 #include "local/live-census.h"
 #include "local/proteger-junto.h" // (proteger-junto: KYTY_TECHO=1, contigüidad de las protecciones del hilo de render)
 #include "local/tej-lag.h"       // (tej-lag4: VirtualProtect del hilo de render, A/B, solo KYTY_TECHO=1)
+#include "local/vp-render.h"     // (vp-render: KYTY_VP_RENDER / KYTY_RENDER_IDEAL)
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -881,12 +882,20 @@ struct PageManager::Impl {
 		if (PauseSkips(vaddr, size, protection)) return; // (KYTY_PROTECT_PAUSE)
 		const TejLag::ProtTimer tej_prot; // (tej-lag4)
 		const LoteTimer lote_timer; // (PROT-LOTE: the render thread's own calls, counted and timed)
+		uint64_t        vp_t0 = 0;  // (vp-render: el render, KYTY_TECHO=1)
+		if (LiveCensus::g_render) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			VpRender::OnRenderProtect(static_cast<uint32_t>(GetCurrentProcessorNumber()));
+#endif
+			if (Techo::On()) vp_t0 = __rdtsc();
+		}
 		if (Techo::On() && LiveCensus::g_render) ProtegerJunto::Note(vaddr, size, protection); // (proteger-junto)
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
 		                                                     ToMemoryMode(protection))) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", new=0x%08" PRIx32, vaddr,
 			      protection);
 		}
+		if (vp_t0 != 0) VpRender::NoteProtect(__rdtsc() - vp_t0);
 		if (protection == NO_ACCESS_PROTECTION && GetWatchMode() == WatchMode::Poll) CaptureAfterNoAccess(vaddr, size);
 	}
 
@@ -1529,6 +1538,16 @@ struct PageManager::Impl {
 					if (g_defer_read_protect)
 						FlushReadProtectOverlapping(base_addr + range_begin * PAGE_SIZE, base_addr + range_begin * PAGE_SIZE + range_bytes);
 					DeferRelease(region, base_addr, static_cast<size_t>(range_begin), static_cast<size_t>(range_bytes / PAGE_SIZE));
+				} else if (!track && !is_read && !offload && perms != NO_ACCESS_PROTECTION && VpRender::DeferWriteRelease() &&
+				           DeferReleasesHere()) {
+					// (vp-render, KYTY_VP_RENDER) Una liberacion de escritura del render (solo lectura -> su estado), dejada
+					// a otros como las de lectura: el host sigue en solo lectura (mas estricto) hasta que se aplique; una
+					// escritura antes falla y la aplica (HandleFault -> ApplyDeferredReleaseAt). Lo pendiente sin acceso
+					// sobre estas paginas primero, como arriba.
+					if (g_defer_read_protect)
+						FlushReadProtectOverlapping(base_addr + range_begin * PAGE_SIZE, base_addr + range_begin * PAGE_SIZE + range_bytes);
+					DeferRelease(region, base_addr, static_cast<size_t>(range_begin), static_cast<size_t>(range_bytes / PAGE_SIZE));
+					VpRender::NoteDeferred(range_bytes / PAGE_SIZE);
 				} else {
 					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
 					// (raiz8: marked pages this protected have their state's protection now.)
@@ -2482,3 +2501,72 @@ template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, Re
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
 
 } // namespace Libs::Graphics
+
+// (vp-render, KYTY_RENDER_IDEAL) El CPU ideal del hilo de render: primer hilo SMT de un nucleo de la clase de eficiencia
+// mas alta (nucleo P en hibridos), dentro de la L3 mas grande si las L3 difieren (X3D), sin el nucleo del CPU 0.
+// Con KYTY_RENDER_CPUS (afinidad dura dada) no se toca. on=false: vuelve el ideal que tenia.
+int VpRender::ApplyIdeal(bool on) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static thread_local PROCESSOR_NUMBER saved {};
+	static thread_local bool             have_saved = false;
+	if (const char* cpus = std::getenv("KYTY_RENDER_CPUS"); cpus != nullptr && *cpus != '\0') return -1;
+	if (!on) {
+		if (have_saved) (void)SetThreadIdealProcessorEx(GetCurrentThread(), &saved, nullptr);
+		return -1;
+	}
+	static const int chosen = [] {
+		DWORD size = 0;
+		(void)GetLogicalProcessorInformationEx(RelationAll, nullptr, &size);
+		if (size == 0) return -1;
+		std::vector<uint8_t> buf(size);
+		auto* first = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+		if (!GetLogicalProcessorInformationEx(RelationAll, first, &size)) return -1;
+		struct Core { uint64_t mask; int eff; };
+		std::vector<Core> cores;
+		uint64_t big_l3 = 0, big_size = 0, min_size = ~uint64_t(0);
+		int      l3s = 0, max_eff = 0;
+		for (DWORD off = 0; off < size;) {
+			const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off);
+			if (info->Size == 0) break;
+			if (info->Relationship == RelationProcessorCore && info->Processor.GroupCount >= 1 &&
+			    info->Processor.GroupMask[0].Group == 0) {
+				cores.push_back({static_cast<uint64_t>(info->Processor.GroupMask[0].Mask), static_cast<int>(info->Processor.EfficiencyClass)});
+				max_eff = std::max<int>(max_eff, info->Processor.EfficiencyClass);
+			} else if (info->Relationship == RelationCache && info->Cache.Level == 3 && info->Cache.GroupMask.Group == 0) {
+				++l3s;
+				const uint64_t bytes = info->Cache.CacheSize;
+				min_size             = std::min(min_size, bytes);
+				if (bytes > big_size) big_size = bytes, big_l3 = static_cast<uint64_t>(info->Cache.GroupMask.Mask);
+			}
+			off += info->Size;
+		}
+		const bool asym = l3s >= 2 && big_size != min_size && big_l3 != 0;
+		DWORD_PTR  proc = 0, sys = 0;
+		if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) == 0) proc = ~DWORD_PTR(0);
+		int pick = -1;
+		for (const auto& c: cores) {
+			if (c.eff != max_eff || (c.mask & 1u) != 0 || (asym && (c.mask & ~big_l3) != 0)) continue;
+			const uint64_t m = c.mask & static_cast<uint64_t>(proc);
+			if (m == 0) continue;
+			int cpu = 0;
+			while (((m >> cpu) & 1u) == 0) ++cpu;
+			if (pick < 0 || cpu < pick) pick = cpu;
+		}
+		std::printf("[vp-render] KYTY_RENDER_IDEAL: CPU ideal del render %d (%zu nucleos, clase P %d, L3 %s)\n", pick,
+		            cores.size(), max_eff, asym ? "asimetrica: la grande" : "una");
+		std::fflush(stdout);
+		return pick;
+	}();
+	if (chosen < 0) return -1;
+	PROCESSOR_NUMBER pn {};
+	pn.Group  = 0;
+	pn.Number = static_cast<BYTE>(chosen);
+	PROCESSOR_NUMBER prev {};
+	if (SetThreadIdealProcessorEx(GetCurrentThread(), &pn, &prev) == 0) return -1;
+	if (!have_saved) saved = prev, have_saved = true;
+	return chosen;
+#else
+	(void)on;
+	return -1;
+#endif
+}
