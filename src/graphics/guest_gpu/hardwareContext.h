@@ -1127,6 +1127,10 @@ public:
 		KYTY_TEJ_D(m_cs.cs_user_sgpr);
 	}
 
+	// (tej F1d) Lo que leen los draws (vs/ps) frente a lo que leen los dispatches (cs).
+	[[nodiscard]] bool SameGraphics(const Shader& o) const { return m_vs == o.m_vs && m_ps == o.m_ps; }
+	[[nodiscard]] bool SameCompute(const Shader& o) const { return m_cs == o.m_cs; }
+
 	void Reset() { *this = Shader(); }
 
 	void SetEsShaderBase(uint64_t addr) { m_vs.es_regs.data_addr = addr; }

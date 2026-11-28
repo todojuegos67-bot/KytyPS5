@@ -94,6 +94,10 @@ public:
 	// The image (of `serial`) still registered, and no image registered or unregistered over its pages since `epoch`
 	// (a speculation's work used it: speculation.cpp).
 	[[nodiscard]] bool StillResolved(const Image& image, uint64_t serial, uint64_t epoch) const;
+	// (tej F1d) Alguna imagen registrada o quitada sobre [address, address+size) desde `epoch` (hilo de render).
+	[[nodiscard]] bool RegisteredOverSince(uint64_t address, uint64_t size, uint64_t epoch) const {
+		return RegistrationsSince(address, size, epoch);
+	}
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}

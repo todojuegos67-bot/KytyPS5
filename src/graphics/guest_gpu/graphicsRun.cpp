@@ -638,6 +638,20 @@ bool CommandProcessor::SameState(const CommandProcessor& other) const {
 	       m_ucfg == other.m_ucfg && m_sh_ctx == other.m_sh_ctx && SameDrawState(other);
 }
 
+bool CommandProcessor::SameGraphicsState(const CommandProcessor& o) const {
+	return m_draw_run_skip == o.m_draw_run_skip && m_ctx == o.m_ctx && m_saved_ctx == o.m_saved_ctx && m_ucfg == o.m_ucfg &&
+	       m_sh_ctx.SameGraphics(o.m_sh_ctx) && m_context_state_pushed == o.m_context_state_pushed &&
+	       m_user_data_marker == o.m_user_data_marker && m_index_type_and_size == o.m_index_type_and_size &&
+	       m_index_buffer_size == o.m_index_buffer_size && m_index_base_addr == o.m_index_base_addr &&
+	       m_draw_indirect_args_base_addr == o.m_draw_indirect_args_base_addr && m_num_instances == o.m_num_instances &&
+	       m_de_count == o.m_de_count && m_ce_count == o.m_ce_count &&
+	       m_synthetic_occlusion_counter == o.m_synthetic_occlusion_counter && m_predicate_skip == o.m_predicate_skip;
+}
+
+bool CommandProcessor::SameComputeState(const CommandProcessor& o) const {
+	return m_sh_ctx.SameCompute(o.m_sh_ctx) && m_dispatch_indirect_args_base_addr == o.m_dispatch_indirect_args_base_addr;
+}
+
 void CommandProcessor::DiffState(const CommandProcessor& o, void (*note)(const char*)) const {
 	if (m_draw_run_skip != o.m_draw_run_skip) note("draw_run_skip");
 	m_ctx.DiffNames(o.m_ctx, [&](const char* n) { note(n); });

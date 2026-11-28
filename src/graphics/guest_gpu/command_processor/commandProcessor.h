@@ -68,6 +68,10 @@ public:
 	[[nodiscard]] bool SameState(const CommandProcessor& other) const;
 	// (tej F1c, solo medida) Los nombres de lo que SameState ve distinto (registros por campo y estado de draw).
 	void DiffState(const CommandProcessor& other, void (*note)(const char*)) const;
+	// (tej F1d) SameState sin lo que solo leen los dispatches (registros CS, base de argumentos de dispatch indirecto):
+	// el punto de cose de un paquete de draws; y lo de los dispatches aparte (paquete con dispatches).
+	[[nodiscard]] bool SameGraphicsState(const CommandProcessor& other) const;
+	[[nodiscard]] bool SameComputeState(const CommandProcessor& other) const;
 	// A state pass (KYTY_SPECULATE=4): Process runs only the packets that change this processor's state (registers,
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.

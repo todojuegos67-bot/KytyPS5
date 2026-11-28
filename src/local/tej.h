@@ -87,6 +87,9 @@ enum C : uint32_t {
 	GPkSkip, GTailLate, GValTicks, GValN, GPublish,
 	GDrawsOnTime, // draws de paquetes publicados antes de que el render llegara (traducidos a tiempo)
 	GCalls, GPkAllHoles, GPkAssumed, GDrawsOkAssumed, GDrawsOnTimeAssumed, GRegDiffNames,
+	// (F1d) registros solo de draws; epocas por rangos de lo que el paquete leyo
+	GPkCsIgnored, GPkCsDispatch, GDrawsOkGfx, GDrawsOkRanges, GPkRgBuf, GPkRgImg, GPkRgMap, GPkRgNoList, GRgEntries,
+	GPkRgFailBuf, GPkRgFailImg, GPkRgFailMap,
 	// lector
 	LJobs, LSelf, LPassNs, LPassFail, LFromRender, LNoState, LBehind, LNoCpu, LOther, LDropFull, LAheadWaitNs, LCopyBytes,
 	// trabajadores
@@ -120,6 +123,12 @@ struct Packet {
 	uint64_t                          ep_buf = 0, ep_img = 0, ep_map = 0;
 	uint64_t                          publish_tsc = 0;
 	bool                              assumed = false; // (tej F1c: traducido tras una espera supuesta cumplida)
+	// (tej F1d) dispatches traducidos dentro del paquete; rangos que leyo (buffers, lecturas limpias, imagenes: inicio,
+	// fin) desde los 8 ultimos del segmento abierto al abrir (lo que Note no repite) hasta el cierre; lists: los rangos estan.
+	uint32_t                                  dispatches = 0;
+	bool                                      lists      = false;
+	size_t                                    fi_buf = 0, fi_read = 0, fi_img = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> bufs, reads, imgs;
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
@@ -197,14 +206,18 @@ public:
 	void WorkerDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key);
 	void Hole(const uint32_t* packet, const char* reason);
 	bool Assume(uint64_t addr);
-	void Dispatch() { ++m_calls; }
+	void Dispatch() {
+		++m_calls;
+		if (m_slot != nullptr && m_open >= 0) ++m_slot->pk[m_open].dispatches;
+	}
+	void Close(const Libs::Graphics::Spec::State* st);
 	std::thread                               thread;
 	std::unordered_map<uint64_t, uint64_t>    waits; // (direccion de espera supuesta -> veces; bajo reason_mutex)
 	std::mutex                                reason_mutex;
 	std::unordered_map<const char*, uint64_t> holes, stops;
 
 private:
-	void Close();
+	void Close() { Close(Libs::Graphics::Spec::t_state); }
 	void Translate(Item& item);
 	Shadow&                                   m_owner;
 	RenderContext&                            m_r;
@@ -546,6 +559,9 @@ inline void Worker::Run() {
 	Libs::Graphics::Spec::t_hole_hook = [](const uint32_t* packet, const char* reason) {
 		if (t_worker != nullptr && t_side == 2) t_worker->Hole(packet, reason);
 	};
+	Libs::Graphics::Spec::t_shadow_end_hook = [](const Libs::Graphics::Spec::State* st) {
+		if (t_worker != nullptr && t_side == 2) t_worker->Close(st); // (F1d: el ultimo paquete con sus rangos)
+	};
 	t_side   = 2;
 	t_worker = this;
 	while (auto item = m_owner.Take(m_index)) {
@@ -607,8 +623,24 @@ inline void Worker::Translate(Item& item) {
 	if (out.stop != nullptr) ++stops[out.stop];
 }
 
-inline void Worker::Close() {
+inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 	if (m_slot == nullptr || m_open < 0) return;
+	{
+		// (F1d) Lo que el paquete leyo: rangos de buffers, lecturas limpias e imagenes tocadas. Sin estado: sin lista.
+		auto& p = m_slot->pk[m_open];
+		p.bufs.clear(), p.reads.clear(), p.imgs.clear();
+		p.lists = st != nullptr && p.fi_buf != ~size_t {0};
+		if (p.lists) {
+			for (size_t i = std::min(p.fi_buf, st->buffer_ranges.size()); i < st->buffer_ranges.size(); ++i)
+				p.bufs.emplace_back(st->buffer_ranges[i].begin, st->buffer_ranges[i].end);
+			for (size_t i = std::min(p.fi_read, st->clean_reads.size()); i < st->clean_reads.size(); ++i)
+				p.reads.emplace_back(st->clean_reads[i].begin, st->clean_reads[i].end);
+			for (size_t i = std::min(p.fi_img, st->touched_images.size()); i < st->touched_images.size(); ++i) {
+				const auto* im = st->touched_images[i].first;
+				if (im != nullptr) p.imgs.emplace_back(im->info.data.address, im->info.data.address + im->info.data.size);
+			}
+		}
+	}
 	m_slot->pk[m_open].publish_tsc = __rdtsc();
 	m_slot->count.store(static_cast<uint32_t>(m_open) + 1, std::memory_order_release);
 	m_open = -1;
@@ -635,6 +667,18 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 		p.ep_img = r.GetTextureCache().ResolutionEpoch();
 		p.ep_map  = r.GetGpuResources().MappingEpoch();
 		p.assumed = m_assumed;
+		p.dispatches = 0;
+		p.lists      = false;
+		if (const auto* st = Libs::Graphics::Spec::t_state; st != nullptr) {
+			// (Note no repite un rango que ya esta entre los 8 ultimos del segmento abierto: desde ahi)
+			const auto sealed = st->Sealed();
+			const auto back8  = [](size_t size, size_t seal) { return std::max<size_t>(seal, size >= 8 ? size - 8 : 0); };
+			p.fi_buf  = back8(st->buffer_ranges.size(), sealed.buffer_ranges);
+			p.fi_read = back8(st->clean_reads.size(), sealed.clean_reads);
+			p.fi_img  = back8(st->touched_images.size(), sealed.touched_images);
+		} else {
+			p.fi_buf = p.fi_read = p.fi_img = ~size_t {0};
+		}
 		m_open    = static_cast<int>(j);
 	}
 	if (m_open >= 0) ++m_slot->pk[m_open].draws;
@@ -827,6 +871,44 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		const bool     em   = ei && r.GetGpuResources().MappingEpoch() == p.ep_map;
 		const uint32_t sewn = p.draws > p.holes ? p.draws - p.holes : 0;
 		const bool     same = em && sewn != 0 && cp.SameState(*p.cp);
+		// (F1d) Registros: solo lo que leen los draws; los CS solo si el paquete traduce dispatches.
+		const bool gfx  = sewn != 0 && cp.SameGraphicsState(*p.cp);
+		const bool cseq = cp.SameComputeState(*p.cp);
+		const bool csok = p.dispatches == 0 || cseq;
+		if (gfx && !csok) Add(GPkCsDispatch);
+		if (gfx && csok && !cseq) Add(GPkCsIgnored);
+		// (F1d) Epocas por rangos: solo si la global cambio, lo que el paquete leyo.
+		bool rb = eb, ri = r.GetTextureCache().ResolutionEpoch() == p.ep_img, rm = r.GetGpuResources().MappingEpoch() == p.ep_map;
+		if ((!rb || !ri || !rm) && !p.lists) {
+			Add(GPkRgNoList);
+		} else if (!rb || !ri || !rm) {
+			auto&      bc = r.GetBufferCache();
+			auto&      tc = r.GetTextureCache();
+			auto&      gr = r.GetGpuResources();
+			const bool b0 = rb, i0 = ri, m0 = rm;
+			rb = rm = ri = true;
+			uint64_t   n  = 0;
+			const auto each = [&](const std::vector<std::pair<uint64_t, uint64_t>>& v, bool buf) {
+				for (const auto& [a, e]: v) {
+					if (e <= a) continue;
+					++n;
+					if (!b0 && buf && rb && bc.RegisteredSince(a, e - a, p.ep_buf)) rb = false;
+					if (!i0 && ri && tc.RegisteredOverSince(a, e - a, p.ep_img)) ri = false;
+					if (!m0 && rm && gr.UnmappedSince(p.ep_map, a, e - a)) rm = false;
+				}
+			};
+			each(p.bufs, true);
+			each(p.reads, false);
+			each(p.imgs, false);
+			Add(GRgEntries, n);
+			if (!b0) Add(rb ? GPkRgBuf : GPkRgFailBuf);
+			if (!i0) Add(ri ? GPkRgImg : GPkRgFailImg);
+			if (!m0) Add(rm ? GPkRgMap : GPkRgFailMap);
+		}
+		if (gfx && csok) {
+			if (eb && ei && em) Add(GDrawsOkGfx, sewn);
+			if (rb && ri && rm) Add(GDrawsOkRanges, sewn);
+		}
 		Add(GValTicks, __rdtsc() - t0);
 		Add(GValN);
 		if (!eb) Add(GPkEpBuf);
@@ -1100,6 +1182,15 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            v[WCallsMeasured] != 0 ? static_cast<double>(v[WTransMeasuredNs]) / 1e3 / static_cast<double>(v[WCallsMeasured]) : 0.0,
 		            v[WJobs] != 0 ? static_cast<double>(v[WFixNs]) / 1e3 / static_cast<double>(v[WJobs]) : 0.0, v[GPkAllHoles] / f,
 		            pct(v[GDrawsOk] - v[GDrawsOkAssumed]), pct(v[GDrawsOkAssumed]), pct(v[GDrawsOnTimeAssumed]));
+		// (F1d) Cosibles con registros solo de draws, y ademas con epocas por rangos.
+		std::printf("[tej] F1d COSIBLES regs de draws %.1f %% | + epocas por rangos %.1f %% (antes %.1f %%) | CS distinto ignorado"
+		            " (paquete sin dispatches) %.1f/fot, CS distinto con dispatches %.1f/fot | rangos salvan: buffers %.1f"
+		            " (fallan %.1f), imagenes %.1f (fallan %.1f), mapeos %.1f (fallan %.1f), sin lista %.1f /fot, %.1f rangos/paquete"
+		            " | validacion %.0f ns/paquete\n",
+		            pct(v[GDrawsOkGfx]), pct(v[GDrawsOkRanges]), pct(v[GDrawsOk]), v[GPkCsIgnored] / f, v[GPkCsDispatch] / f,
+		            v[GPkRgBuf] / f, v[GPkRgFailBuf] / f, v[GPkRgImg] / f, v[GPkRgFailImg] / f, v[GPkRgMap] / f,
+		            v[GPkRgFailMap] / f, v[GPkRgNoList] / f,
+		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
 	}
 	std::fflush(stdout);
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);

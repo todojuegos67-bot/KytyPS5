@@ -144,6 +144,7 @@ Speculation::ShadowOut Speculation::Shadow(const CommandProcessor& start, std::s
 	out.holes      = static_cast<uint32_t>(result->holes.size());
 	out.progressed = result->progressed;
 	out.translate_ns = t1 - t0;
+	if (Spec::t_shadow_end_hook != nullptr) Spec::t_shadow_end_hook(&result->state); // (tej F1d)
 	end.CopyStateFrom(*result->end_state, false);
 	// (Never submitted: its command buffers discarded, its rings' and executors' pending work freed before the next.)
 	Finish(std::move(result), 0);

@@ -602,6 +602,8 @@ struct Effects {
 inline thread_local EffectsLog* t_effects = nullptr;
 // (tej, KYTY_TEJ F1) A packet a translation made a hole of, and why (Speculation::Translate): the shadow thread's count.
 inline thread_local void (*t_hole_hook)(const uint32_t* packet, const char* reason) = nullptr;
+// (tej F1d) Speculation::Shadow, antes de Finish, con el estado de la traduccion aun vivo: cierra el ultimo paquete.
+inline thread_local void (*t_shadow_end_hook)(const State* state) = nullptr;
 
 // The speculation threads' packets (KYTY_SPECULATE=4): each thread's number while it translates one (its slot:
 // t_packet_slot), 0 between translations. A buffer or image the thread that commits releases (unregistered: no later
