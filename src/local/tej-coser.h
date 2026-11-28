@@ -54,7 +54,9 @@ inline void WorkerClose(PkInfo& p) {
 
 enum K : uint32_t {
 	KPk, KDraws, KF1d, KNoHoles, KWValid, KWInRendering, KCompat, KHashEq, KHashEqSameDraws, KRValid, KAll, KAllDraws,
-	KAbandon, KWBarrier, KWCopy, KWDispatch, KWBegin, KWEnd, KDiffDraws, KDiffArgs, KNoProbe, KDcbEnd, KN
+	KAbandon, KWBarrier, KWCopy, KWDispatch, KWBegin, KWEnd, KDiffDraws, KDiffArgs, KNoProbe, KDcbEnd,
+	KDSeq, KDIds, KDClr, KDArg0, KDArg1, KDArg2, KDArg3, KDArg4, KDRel0, KDRel1, KDRel2, KDRel3, KDRel4, KDOnlyShift,
+	KDNone, KN
 };
 inline std::atomic<uint64_t> g_k[KN] {};
 inline void                  Add(K k, uint64_t v = 1) { g_k[k].fetch_add(v, std::memory_order_relaxed); }
@@ -84,7 +86,24 @@ inline void Finish(bool dcb_end) {
 	if (l.compat) Add(KCompat);
 	if (rp.SecondaryOk()) Add(KRValid);
 	if (eq) Add(KHashEq);
-	else Add(rp.draws != l.w.draws ? KDiffDraws : KDiffArgs);
+	else if (rp.draws != l.w.draws) Add(KDiffDraws);
+	else {
+		// (diag) Que difiere con los mismos draws. Un paquete puede sumar en varias columnas.
+		Add(KDiffArgs);
+		const auto& w = l.w;
+		bool any = false, real = false;
+		if (rp.seq != w.seq) Add(KDSeq), any = real = true;
+		if (rp.ids != w.ids) Add(KDIds), any = real = true;
+		if (rp.clr != w.clr) Add(KDClr), any = real = true;
+		for (uint32_t k = 0; k < Probe::kArgs; ++k) {
+			if (rp.arg[k] == w.arg[k]) continue;
+			any = true;
+			Add(static_cast<K>(KDArg0 + k));
+			if (rp.rel[k] != w.rel[k]) Add(static_cast<K>(KDRel0 + k)), real = true;
+		}
+		if (any && !real) Add(KDOnlyShift);
+		if (!any) Add(KDNone);
+	}
 	if (l.w.barriers != 0) Add(KWBarrier);
 	if (l.w.copies != 0) Add(KWCopy);
 	if (l.w.dispatches != 0) Add(KWDispatch);
@@ -150,6 +169,16 @@ inline void Print(double frames) {
 	            pc(v[KAll]), pc(v[KF1d]), pc(v[KNoHoles]), pc(v[KWInRendering]), pc(v[KWValid]), pc(v[KCompat]), pc(v[KRValid]),
 	            pc(v[KHashEq]), v[KWBarrier] / f, v[KWCopy] / f, v[KWDispatch] / f, v[KWBegin] / f, v[KWEnd] / f,
 	            (v[KDiffDraws] + v[KDiffArgs]) / f, v[KDiffDraws] / f, v[KDiffArgs] / f);
+	// (diag) Mismos draws otros argumentos, por escalar: arg = difiere el valor; rel = difiere tambien relativo al primer
+	// draw del paquete (no es un desplazamiento constante). SOLO DESPLAZAMIENTO = todo lo distinto es un offset constante
+	// en firstIndex/vertexOffset/firstInstance (anillo propio del trabajador: equivalente al reproducir con remapeo).
+	std::printf("[tej] F2 coser diag (mismos draws otros argumentos %.1f pk/fot) | llamadas no-draw distintas (barreras/copias/"
+	            "Begin/End o sus cuentas) %.1f | orden/tipo de draws %.1f | ClearAttachments %.1f | indexCount %.1f (rel %.1f),"
+	            " instanceCount %.1f (rel %.1f), firstIndex %.1f (rel %.1f), vertexOffset %.1f (rel %.1f), firstInstance %.1f"
+	            " (rel %.1f) pk/fot | SOLO DESPLAZAMIENTO CONSTANTE %.1f pk/fot | sin causa vista %.1f\n",
+	            v[KDiffArgs] / f, v[KDSeq] / f, v[KDIds] / f, v[KDClr] / f, v[KDArg0] / f, v[KDRel0] / f, v[KDArg1] / f,
+	            v[KDRel1] / f, v[KDArg2] / f, v[KDRel2] / f, v[KDArg3] / f, v[KDRel3] / f, v[KDArg4] / f, v[KDRel4] / f,
+	            v[KDOnlyShift] / f, v[KDNone] / f);
 }
 
 } // namespace TejCoser

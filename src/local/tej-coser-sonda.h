@@ -28,6 +28,14 @@ enum Cls : uint32_t {
 struct Probe {
 	uint64_t hash = 0xcbf29ce484222325ull;
 	uint32_t draws = 0, copies = 0, barriers = 0, begins = 0, ends = 0, execs = 0, dispatches = 0, calls = 0;
+	// (tej-coser diag) Desglose para saber QUE escalar difiere cuando el hash no coincide con los mismos draws:
+	// seq = llamadas no-draw (id+escalares+posicion en draws), ids = secuencia de ids de draw, arg[k] = k-esimo escalar
+	// de cada vkCmdDraw*, rel[k] = el mismo relativo al primer valor del paquete (igual rel y distinto arg = desplazamiento
+	// constante: anillo propio del trabajador, equivalente al remapear), clr = escalares de ClearAttachments.
+	static constexpr uint32_t kArgs = 5;
+	uint64_t seq = 0, ids = 0, clr = 0, arg[kArgs] {}, rel[kArgs] {};
+	uint64_t base[kArgs] {};
+	bool     based = false;
 	// Valido como secundario DENTRO del rendering que hereda: solo draws (y ClearAttachments).
 	[[nodiscard]] bool SecondaryOk() const noexcept {
 		return copies == 0 && barriers == 0 && begins == 0 && ends == 0 && execs == 0 && dispatches == 0;
@@ -63,6 +71,33 @@ inline std::atomic<bool>  g_installed {false}; // (la sonda solo existe con KYTY
 	}
 	p.hash = Mix(p.hash, id);
 	for (const auto v: scalars) p.hash = Mix(p.hash, v);
+	if (cls != CDraw) {
+		p.seq = Mix(Mix(p.seq, id), p.draws);
+		for (const auto v: scalars) p.seq = Mix(p.seq, v);
+		return;
+	}
+	p.ids = Mix(p.ids, id);
+	constexpr uint32_t kClear = Id("vkCmdClearAttachments");
+	if (id == kClear) {
+		for (const auto v: scalars) p.clr = Mix(p.clr, v);
+		return;
+	}
+	// vkCmdDraw no tiene vertexOffset: se normaliza a (count, instances, first, 0, firstInstance) como DrawIndexed.
+	uint64_t a[Probe::kArgs] {};
+	uint32_t i = 0;
+	const bool indexed = scalars.size() >= 5;
+	for (const auto v: scalars) {
+		if (!indexed && i == 3) a[i++] = 0;
+		if (i < Probe::kArgs) a[i++] = v;
+	}
+	if (!p.based) {
+		for (uint32_t k = 0; k < Probe::kArgs; ++k) p.base[k] = a[k];
+		p.based = true;
+	}
+	for (uint32_t k = 0; k < Probe::kArgs; ++k) {
+		p.arg[k] = Mix(p.arg[k], a[k]);
+		p.rel[k] = Mix(p.rel[k], static_cast<uint32_t>(a[k] - p.base[k]));
+	}
 }
 
 inline void Start() noexcept {
