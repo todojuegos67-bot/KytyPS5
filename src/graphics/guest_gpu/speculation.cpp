@@ -78,14 +78,15 @@ static const char* WroteWhatItRead(const Spec::EffectsLog::Entry* entry) {
 	return names[entry->kind == Spec::EffectsLog::Kind::GpuWrite ? 0 : 1][static_cast<size_t>(entry->source)];
 }
 
-Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, int queue_event_id)
+Speculation::Translator::Translator(RenderContext& renderer, uint32_t number, int queue_event_id, uint32_t table_mib,
+                                    uint32_t shader_mib)
     : index(number), draw(std::make_unique<RenderExecutor>(renderer)), compute(std::make_unique<RenderExecutor>(renderer)),
       executors {draw.get(), compute.get()}, cp(std::make_unique<CommandProcessor>(renderer, queue_event_id)),
       table_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(), MemoryUsage::Upload,
-                                                  uint64_t {64} << 20u,
+                                                  uint64_t {table_mib} << 20u,
                                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress)),
       shader_upload(std::make_unique<StreamBuffer>(renderer.GetGraphics(), renderer.GetCommandScheduler(),
-                                                   MemoryUsage::Upload, uint64_t {16} << 20u)) {
+                                                   MemoryUsage::Upload, uint64_t {shader_mib} << 20u)) {
 	draw->ReadCatalogOf(renderer.DefaultRenderExecutor(), 1 + number);
 	compute->ReadCatalogOf(renderer.DefaultComputeRenderExecutor(), 1 + number);
 }
@@ -110,6 +111,40 @@ Speculation::Speculation(RenderContext& renderer, int queue_event_id, std::funct
 	m_max_in_flight  = Envio3::Mode() != 0 ? Envio3::MaxInFlight : 1;
 	m_translators.push_back(std::make_unique<Translator>(renderer, 0, queue_event_id));
 	m_detached = std::thread([this] { DetachedRun(); });
+}
+
+// (tej, KYTY_TEJ F1) The shadow translator: number 7 (packet slot 7, catalog role 8; KYTY_SPECULATE=4 uses 0..threads-1,
+// envio2 0), rings of 16 + 8 MiB instead of 64 + 16.
+Speculation::Speculation(RenderContext& renderer, ShadowTag)
+    : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, 0)),
+      m_state(std::make_unique<CommandProcessor>(renderer, 0)), m_name("Speculation (tej, sombra)") {
+	m_translators.push_back(std::make_unique<Translator>(renderer, static_cast<uint32_t>(Spec::MaxPacketSlots - 1), 0, 16, 8));
+}
+
+void Speculation::ShadowThreadInit() {
+	auto& translator = *m_translators[0];
+	RenderContext::SetThreadExecutors(&translator.executors);
+	GuestGpu::SetSpeculationThread(true);
+	Spec::t_packet_slot = translator.index;
+	BcPar::t_reader     = true; // (buffercache-par: lee el indice de BufferCache con cerrojo compartido)
+}
+
+Speculation::ShadowOut Speculation::Shadow(const CommandProcessor& start, std::span<const uint32_t> commands,
+                                           CommandProcessor& end) {
+	auto&     translator = *m_translators[0];
+	auto      result     = Translate(translator, start, commands, Pm4Execution {});
+	// (Its packets passed: what the GPU thread retired while it read is destroyed once this is seen, Spec::PacketsPassed.)
+	Spec::LeavePackets();
+	ShadowOut out;
+	out.stop       = result->stop == ChunkEnd ? nullptr : result->stop;
+	out.failed     = result->failed;
+	out.holes      = static_cast<uint32_t>(result->holes.size());
+	out.progressed = result->progressed;
+	end.CopyStateFrom(*result->end_state, false);
+	// (Never submitted: its command buffers discarded, its rings' and executors' pending work freed before the next.)
+	Finish(std::move(result), 0);
+	m_hole_reasons.clear(); // (Finish counts them for a report this translator never prints)
+	return out;
 }
 
 void Speculation::DetachedRun() {
@@ -801,6 +836,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			hole.packet = packet;
 			hole.dwords = dwords;
 			hole.reason = r.state.refused;
+			if (Spec::t_hole_hook != nullptr) Spec::t_hole_hook(packet, r.state.refused); // (tej: el hueco, contado)
 			CommandProcessor::SkipSuspendedPacket(spec);
 			hole.after = spec;
 			scheduler.EndRecording(*r.recorder);

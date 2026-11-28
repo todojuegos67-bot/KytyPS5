@@ -31,6 +31,10 @@
 
 namespace Techo {
 
+// (tej, KYTY_TEJ) La linea [tej] de la ventana de 5 s (local/tej.h la pone al arrancar su hilo; sin incluirla aqui).
+inline void (*g_tej_window)(double busy_ms, double fps, double frames, bool keep) = nullptr;
+
+
 [[nodiscard]] inline bool On() {
 	static const bool on = [] {
 		const char* t = std::getenv("KYTY_TECHO");

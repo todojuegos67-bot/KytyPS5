@@ -596,6 +596,56 @@ NormalPriority::~NormalPriority() {
 	if (m_changed) (void)SetThreadPriority(GetCurrentThread(), m_saved);
 }
 
+// (tej) The CPU the calling thread runs on; the CPUs of its core (SMT siblings) and of its L3; the calling thread's
+// affinity set to a mask (within the process's).
+uint32_t CurrentCpu() {
+	return static_cast<uint32_t>(GetCurrentProcessorNumber());
+}
+
+static uint64_t RelationMaskOfCpu(LOGICAL_PROCESSOR_RELATIONSHIP relation, uint32_t cpu) {
+	if (cpu >= 64) return 0;
+	DWORD size = 0;
+	(void)GetLogicalProcessorInformationEx(relation, nullptr, &size);
+	if (size == 0) return 0;
+	std::vector<uint8_t> buffer(size);
+	if (!GetLogicalProcessorInformationEx(relation, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+	                                      &size))
+		return 0;
+	for (DWORD offset = 0; offset < size;) {
+		const auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+		if (info->Size == 0) break;
+		uint64_t mask = 0;
+		if (info->Relationship == RelationProcessorCore && relation == RelationProcessorCore &&
+		    info->Processor.GroupMask[0].Group == 0)
+			mask = static_cast<uint64_t>(info->Processor.GroupMask[0].Mask);
+		if (info->Relationship == RelationCache && relation == RelationCache && info->Cache.Level == 3 &&
+		    info->Cache.GroupMask.Group == 0)
+			mask = static_cast<uint64_t>(info->Cache.GroupMask.Mask);
+		if ((mask >> cpu) & 1u) return mask;
+		offset += info->Size;
+	}
+	return 0;
+}
+
+uint64_t CoreMaskOfCpu(uint32_t cpu) {
+	return RelationMaskOfCpu(RelationProcessorCore, cpu);
+}
+
+uint64_t L3MaskOfCpu(uint32_t cpu) {
+	return RelationMaskOfCpu(RelationCache, cpu);
+}
+
+uint64_t CpuListToMask(const char* list) {
+	return CpuListMask(list);
+}
+
+bool SetCurrentThreadMask(uint64_t mask) {
+	DWORD_PTR process = 0, system = 0;
+	if (mask == 0 || GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) return false;
+	const auto m = static_cast<DWORD_PTR>(mask) & process;
+	return m != 0 && SetThreadAffinityMask(GetCurrentThread(), m) != 0;
+}
+
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
 	// NtQuerySystemInformation's SystemProcessorPerformanceInformation (8): each processor of the calling thread's group.
 	struct ProcessorTimes {
@@ -3100,6 +3150,37 @@ NormalPriority::NormalPriority() {
 
 NormalPriority::~NormalPriority() {
 	if (m_changed) (void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), m_saved);
+}
+
+uint32_t CurrentCpu() {
+#if defined(__linux__)
+	const int cpu = sched_getcpu();
+	return cpu >= 0 ? static_cast<uint32_t>(cpu) : 0;
+#else
+	return 0;
+#endif
+}
+
+uint64_t CoreMaskOfCpu(uint32_t /*cpu*/) {
+	return 0;
+}
+
+uint64_t L3MaskOfCpu(uint32_t /*cpu*/) {
+	return 0;
+}
+
+uint64_t CpuListToMask(const char* list) {
+	return CpuListMask(list);
+}
+
+bool SetCurrentThreadMask(uint64_t mask) {
+#if defined(__linux__)
+	cpu_set_t set;
+	return MaskToSet(mask, &set) && sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+	(void)mask;
+	return false;
+#endif
 }
 
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {

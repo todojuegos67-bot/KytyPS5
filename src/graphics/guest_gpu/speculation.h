@@ -55,6 +55,21 @@ public:
 	~Speculation();
 	KYTY_CLASS_NO_COPY(Speculation);
 
+	// (tej, KYTY_TEJ F1 "sombra", local/tej.h) One translator (number 7: its own packet slot and catalog role), small
+	// rings, no thread of its own: the caller's thread (Kyty.Tej) translates graphics command buffers with it into a
+	// recorder that is never submitted (Shadow: dropped at once, Finish), from a state of its own (`start`), leaving the
+	// state after it in `end`. Nothing is committed, nothing is logged as an effect.
+	struct ShadowTag {};
+	Speculation(RenderContext& renderer, ShadowTag);
+	struct ShadowOut {
+		const char* stop      = nullptr; // why it stopped before the end (null: it did not)
+		bool        failed    = false;   // partly recorded packet / recorder refusal
+		uint32_t    holes     = 0;
+		bool        progressed = false;
+	};
+	void      ShadowThreadInit(); // (on the thread that calls Shadow, once)
+	ShadowOut Shadow(const CommandProcessor& start, std::span<const uint32_t> commands, CommandProcessor& end);
+
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins).
 	enum class Outcome { Whole, Partly, None, Blocked, Chunk };
@@ -182,7 +197,8 @@ private:
 	// 3), the serial it translates, its latest result (the commits unlink it), when the translation going on began
 	// (m_clock; 0: none: it walks no speculation before it).
 	struct Translator {
-		explicit Translator(RenderContext& renderer, uint32_t number, int queue_event_id = 0);
+		explicit Translator(RenderContext& renderer, uint32_t number, int queue_event_id = 0, uint32_t table_mib = 64,
+		                    uint32_t shader_mib = 16);
 		uint32_t                                   index = 0;
 		std::unique_ptr<RenderExecutor>            draw, compute;
 		RenderContext::Executors                   executors;

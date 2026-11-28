@@ -65,6 +65,7 @@
 #include "render1.h" // (render1 F0+F1)
 #include "local/normal-why.h" // (vg1)
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
+#include "local/tej.h" // (tej, KYTY_TEJ F1 sombra: solo mide)
 #include "local/postnativo.h" // (postnativo, KYTY_POSTNATIVO: contador del tramo del postproceso)
 #include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
 #include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
@@ -1135,6 +1136,15 @@ void GuestGpu::Enqueue(Submission submission) {
 		             : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
 		                 ? Speculation::Job::Kind::Graphics
 		                 : Speculation::Job::Kind::Other});
+	// (tej, KYTY_TEJ F1) La sombra recibe una copia de cada envio de la cola 0 (sus ordenes copiadas aqui).
+	if (submission.queue_id == 0 && Tej::Mode() != 0)
+		Tej::OnEnqueue(submission.queue_id, submission.serial,
+		               submission.type == SubmissionType::FlipPreparation || submission.type == SubmissionType::FrameBoundary
+		                   ? Tej::Worker::Job::Flip
+		               : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
+		                   ? Tej::Worker::Job::Graphics
+		                   : Tej::Worker::Job::Other,
+		               submission.reset_processor, submission.commands);
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -1208,6 +1218,7 @@ void GuestGpu::ThreadRun(void* data) {
 		gpu->m_speculation = std::make_unique<Speculation>(gpu->m_renderer);
 		gpu->m_ahead.store(gpu->m_speculation.get(), std::memory_order_release);
 	}
+	Tej::Start(gpu->m_renderer); // (tej, KYTY_TEJ: el hilo Kyty.Tej; nada con 0)
 	// (envio2) KYTY_ENVIO2=1/2: the compute queues translated on their own thread (local/envio2.h). Not with what else
 	// translates elsewhere or in another order (KYTY_PAR_QUEUES, KYTY_SPECULATE: one effects log per thread) nor with the
 	// second Vulkan queue (its commits go to the one queue, lane 0).
@@ -1378,6 +1389,7 @@ void GuestGpu::ThreadRun(void* data) {
 			// (par1) The ACB thread first: it records into this thread's stream, gone when this thread returns.
 			if (gpu->m_acb_thread.joinable()) gpu->m_acb_thread.join();
 			gpu->m_acb_spec.reset(); // (envio2: its thread; nothing is handed, the queues are empty)
+			Tej::Stop();             // (tej: su hilo, antes que el renderer)
 			{
 				ParQueues::WorkScope work;
 				gpu->m_gfx_cp->BufferWait();
@@ -1716,6 +1728,10 @@ bool GuestGpu::Process(Submission& submission) {
 	} effects_scope {m_speculation ? m_speculation.get()
 	                 : m_acb_spec && m_acb_spec->Pending() ? m_acb_spec.get() // (envio2: one handed or blocked)
 	                                                        : nullptr};
+	// (tej, KYTY_TEJ F1) Una DCB de la cola 0: el hilo de render compara en el primer draw de cada paquete de la sombra.
+	const Tej::GpuSlice tej_slice(submission.queue_id == 0 && submission.type == SubmissionType::Graphics &&
+	                                  submission.constant_commands.empty(),
+	                              submission.serial, first_slice);
 
 	cp.BufferInit();
 	bool complete = true;
@@ -2035,6 +2051,7 @@ bool GuestGpu::Process(Submission& submission) {
 	// (KYTY_SPECULATE=4: the state after the graphics queue's submission, for a chain that could not follow it.)
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
+	if (complete && submission.queue_id == 0) Tej::GpuDone(submission.serial, cp); // (tej)
 
 	par2_dcb.Done(complete); // (par2)
 	return complete;
@@ -2422,6 +2439,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			execution.m_made_progress = true;
 			continue;
 		}
+		// (tej, KYTY_TEJ F1) Un draw: la sombra corta paquetes de 64 y guarda la foto; el hilo de render compara con ella.
+		// Clave = posicion en la DCB raiz << 32 | en el bufer actual (la misma en la copia de la sombra).
+		if (Tej::t_side != 0 && !m_state_only && (Tej::t_side == 2 || spec == nullptr) &&
+		    Pm4ClassOf(opcode) == LiveCensus::Pm4Draw && (packet_header >> 30u) == 3u)
+			Tej::OnDraw(*this, m_renderer,
+			            uint64_t {execution.m_buffer_stack[0].offset_dw} << 32u | cursor.offset_dw);
 
 		// (render1 F2, KYTY_RENDER1=2) A packet that is not state (nor a draw, decided when paired) ends the native batch
 		// first: it is drawn and compared as the pass left the depth.

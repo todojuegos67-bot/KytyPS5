@@ -3234,7 +3234,12 @@ void PipelineCache::EvictIdlePipelines() {
 	// sweep ends in about half a minute instead of minutes, ~1.5 ms every 6 frames on the render thread.
 	const bool     sweep_pending = settings.budget_us > 0 && SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	const uint32_t every         = sweep_pending ? 6u : CheckFlips;
-	if (!settings.on || flip % every != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) return;
+	// (tej, KYTY_TEJ: el hilo de la sombra traduce con pares/pipelines del catalogo; como con KYTY_SPECULATE, sin barrido)
+	static const bool tej = [] {
+		const char* v = std::getenv("KYTY_TEJ");
+		return v != nullptr && (std::atoi(v) == 1 || std::atoi(v) == 2);
+	}();
+	if (!settings.on || flip % every != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 || tej) return;
 	const bool scene_left = SweepsWorldsLeft() && !m_scene_swept && now - m_scene_since >= SceneSettle;
 	uint64_t video = 0, budget = 0;
 	const bool known = m_graphics.QueryLocalVideoMemory(&video, &budget);

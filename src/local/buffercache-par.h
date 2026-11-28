@@ -52,12 +52,20 @@ namespace BcPar {
 inline std::atomic<bool> g_ab_on {false};
 
 [[nodiscard]] inline bool SpecThreads() { return kyty_local_speculate_mode.load(std::memory_order_relaxed) == 4; }
+// (tej, KYTY_TEJ=1/2) La sombra lee el indice desde su hilo: cerrojos de lector y escritor siempre puestos (no el corte).
+[[nodiscard]] inline bool TejOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEJ");
+		return v != nullptr && (std::atoi(v) == 1 || std::atoi(v) == 2);
+	}();
+	return on;
+}
 // Lectores (hilos de traduccion): fijo durante toda la ejecucion.
-[[nodiscard]] inline bool ReadLocks() { return Mode() != 0; }
+[[nodiscard]] inline bool ReadLocks() { return Mode() != 0 || TejOn(); }
 // Escritor (hilo GPU).
 [[nodiscard]] inline bool WriteLocks() {
 	const int m = Mode();
-	return m == 1 || (m == 2 && (SpecThreads() || g_ab_on.load(std::memory_order_relaxed)));
+	return m == 1 || (m == 2 && (SpecThreads() || g_ab_on.load(std::memory_order_relaxed))) || TejOn();
 }
 [[nodiscard]] inline bool SplitOn() {
 	const int m = Mode();

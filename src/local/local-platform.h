@@ -40,6 +40,13 @@ uint64_t CurrentThreadCycles();
 int CurrentThreadPriority();
 // The idle time (100 ns units) of the CPUs this process may run on, and their mask (spin-gate.h).
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus);
+// (tej) The CPU the calling thread runs on; the CPUs of its core (SMT siblings; 0: unknown) and of its L3 (0: unknown);
+// a CPU list as a mask; the calling thread's affinity set to a mask (within the process's; false: not set).
+uint32_t CurrentCpu();
+uint64_t CoreMaskOfCpu(uint32_t cpu);
+uint64_t L3MaskOfCpu(uint32_t cpu);
+uint64_t CpuListToMask(const char* list);
+bool     SetCurrentThreadMask(uint64_t mask);
 // While it lives, the calling thread at the normal priority if it was above it, then back (AsyncUpload's Help).
 class NormalPriority {
 public:

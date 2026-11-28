@@ -223,6 +223,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		            keep ? "" : " (arranque: fuera de la tabla)");
 		std::fflush(stdout);
 		TechoEscena::Window(busy, n * 1e3 / wall_ms, n, keep);    // (techo-escena, solo prueba)
+		if (Techo::g_tej_window != nullptr) Techo::g_tej_window(busy, n * 1e3 / wall_ms, n, keep); // (tej, KYTY_TEJ F1 sombra)
 		PostNativo::Window(busy, n * 1e3 / wall_ms, n, keep);     // (postnativo, contador del postproceso)
 		BloquesRapido::Window(busy, n * 1e3 / wall_ms, n, keep);  // (bloques-rapido)
 		Trad1Prueba::Window(busy, n, keep);                      // (trad1-prueba, KYTY_TRAD1_PRUEBA)
