@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <vector>
 
 #include "local/techo.h"
@@ -100,7 +101,13 @@ inline bool Resolve(State& s) {
 }
 
 // Un draw (draw = true) o dispatch de la cola que se traduce. vs/ps/cs: direcciones de programa; cb0/z: destinos.
+namespace Luz {
+inline void Work(uint32_t, bool, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+inline void Flip();
+inline void Window(double, double);
+} // namespace Luz
 inline void Work(uint32_t opcode, bool draw, uint64_t vs, uint64_t ps, uint64_t cs, uint64_t cb0, uint64_t z) {
+	Luz::Work(opcode, draw, vs, ps, cs, cb0, z); // (luz)
 	if (!NativeRender::Cut::OnGpuThread() || NativeRender::Cut::Queue() != 0) return;
 	if (g_state == nullptr) g_state = new State;
 	State& s = *g_state;
@@ -133,6 +140,7 @@ inline void ShWrite() {
 
 // CommandProcessor::Flip (hilo GPU).
 inline void Flip() {
+	Luz::Flip(); // (luz)
 	g_frames.fetch_add(1, std::memory_order_relaxed);
 	if (g_state == nullptr) return;
 	State& s = *g_state;
@@ -158,6 +166,7 @@ inline void Flip() {
 
 // Ventana de 5 s de [techo] (hilo del informe). ms: tiempo inclusivo del hilo GPU con el ambito abierto (mapa).
 inline void Window(double busy_ms, double /*fps*/, double frames, bool /*keep*/) {
+	Luz::Window(busy_ms, frames); // (luz)
 	if (Mode() == 0 || frames <= 0 || g_state == nullptr || !g_state->resolved) return;
 	static int64_t last[Subs] {};
 	double         ms[Subs] {};
@@ -185,5 +194,114 @@ inline void Window(double busy_ms, double /*fps*/, double frames, bool /*keep*/)
 	std::printf("\n");
 	std::fflush(stdout);
 }
+
+
+// (luz) Con KYTY_POSTNATIVO=1..3 (y KYTY_TECHO=1) tambien se miden los ambitos de ILUMINACION del juego. SOLO MIDE.
+// Ghidra (eboot 01.007.000), llamadores de FUN_00999220 (ScopeBegin) con el nombre literal (funcion -> ambito):
+//   GI: 0x9a2c20 GIPreFrameAsync, 0x9a3720 GIPreFrame, 0x9a45e0 GIRender, 0x9a2ee0 GIPostFrame, 0x9ab420 GICaptureSkyProbe,
+//       0x9bb670 GITreeManager::UpdateTree (bajo AllScenesUpdate 0xa16c60).
+//   Luces: 0x9e3240 GPULightCulling, 0x9a15b0/0x9a1640 CreateClusters, 0x9dec40 RenderLights, 0x9e0a00 ResolveLighting,
+//       0x9dffe0 ResolveSunShadows, 0xa98040 ParticleLighting.
+//   Sombras: 0xa11220 CascadedShadows, 0xa10e20 SpotShadows, 0x9d1060/0x9d1fc0 AmbientShadowing.
+//   IBL/SSR: 0x9d66d0 RenderIBL, 0x9d5eb0 IBLOcclusion, 0xa079f0 RenderSpecularIBL, 0x9d5120 RenderSSR, 0x9d6030 SSRClear /
+//       SSRPreRender, 0x9d6110 SSRGetActiveTiles, 0x9d54c0 SSRCreateRays, 0x9d5880 SSRRaymarch.
+//   Cielo/niebla: 0xa090e0 SkyboxOpaque / SkyboxAlpha (escena diferida), 0x9949d0 ParticleGroup_Fog.
+// Por ambito (inclusivo, cualquier cola): ms/fot del hilo GPU (mapa, Cut::InclNs), draws, dispatches, pipelines distintos
+// y huella igual/DIFERENTE al fotograma anterior. Linea "[luz]" cada 5 s junto a [postnativo]. Los que no aparecen: no salen.
+namespace Luz {
+
+constexpr int      N = 27;
+inline const char* kName[N] = {"GIPreFrameAsync", "GIPreFrame",       "GIRender",          "GIPostFrame",      "GICaptureSkyProbe",
+                               "GITreeManager::UpdateTree",           "GPULightCulling",   "CreateClusters",   "RenderLights",
+                               "ResolveLighting", "ResolveSunShadows", "ParticleLighting", "CascadedShadows",  "SpotShadows",
+                               "AmbientShadowing", "RenderIBL",       "IBLOcclusion",      "RenderSpecularIBL", "RenderSSR",
+                               "SSRClear",        "SSRPreRender",     "SSRGetActiveTiles", "SSRCreateRays",    "SSRRaymarch",
+                               "SkyboxOpaque",    "SkyboxAlpha",      "ParticleGroup_Fog"};
+
+struct Scope {
+	uint32_t              id = NativeRender::NoPass;
+	uint32_t              draws = 0, disp = 0;
+	uint64_t              hash = 0xcbf29ce484222325ull, prev = 0;
+	bool                  have_prev = false;
+	std::vector<uint64_t> pipes;
+	// acumulado de la ventana
+	uint64_t w_draws = 0, w_disp = 0, w_pipes = 0, w_frames = 0, w_same = 0, w_diff = 0;
+	int64_t  last_ns = 0;
+};
+struct State {
+	Scope    s[N];
+	bool     any = false;
+	uint32_t tries = 0;
+};
+inline State*      g = nullptr;
+inline std::mutex  g_mx; // (hilo GPU escribe la ventana; el informe la lee)
+
+inline void Resolve(State& st) {
+	if (!NativeRender::PassRegistry::Ready() || (++st.tries & 1023u) != 1u) return;
+	for (auto& sc : st.s)
+		if (sc.id == NativeRender::NoPass)
+			for (uint32_t i = 0, n = NativeRender::PassRegistry::Count(); i < n; ++i)
+				if (NativeRender::PassRegistry::SameName(NativeRender::PassRegistry::Name(i), kName[&sc - st.s])) {
+					sc.id  = i;
+					st.any = true;
+					break;
+				}
+}
+
+inline void Work(uint32_t opcode, bool draw, uint64_t vs, uint64_t ps, uint64_t cs, uint64_t cb0, uint64_t z) {
+	if (!NativeRender::Cut::OnGpuThread()) return;
+	if (g == nullptr) g = new State;
+	Resolve(*g);
+	if (!g->any) return;
+	const uint64_t pipe = draw ? Fold(Fold(vs, ps), 1) : Fold(cs, 2);
+	const uint64_t q    = static_cast<uint64_t>(NativeRender::Cut::Queue());
+	for (auto& sc : g->s) {
+		if (sc.id == NativeRender::NoPass || !NativeRender::Cut::IsOpen(sc.id)) continue;
+		if (draw) ++sc.draws; else ++sc.disp;
+		sc.hash = Fold(Fold(Fold(Fold(sc.hash, opcode), pipe), q), draw ? Fold(cb0, z) : 0);
+		sc.pipes.push_back(pipe);
+	}
+}
+
+inline void Flip() {
+	if (g == nullptr) return;
+	std::lock_guard<std::mutex> lk(g_mx);
+	for (auto& sc : g->s) {
+		if (sc.draws + sc.disp != 0) {
+			++sc.w_frames;
+			if (sc.have_prev) ++(sc.hash == sc.prev ? sc.w_same : sc.w_diff);
+			sc.prev = sc.hash, sc.have_prev = true;
+			sc.w_draws += sc.draws, sc.w_disp += sc.disp, sc.w_pipes += Distinct(sc.pipes);
+		} else {
+			sc.have_prev = false;
+		}
+		sc.draws = sc.disp = 0;
+		sc.hash = 0xcbf29ce484222325ull;
+		sc.pipes.clear();
+	}
+}
+
+inline void Window(double busy_ms, double frames) {
+	if (Mode() == 0 || frames <= 0 || g == nullptr || !g->any) return;
+	std::lock_guard<std::mutex> lk(g_mx);
+	std::printf("[luz] ambitos de iluminacion, ms/fot hilo GPU inclusivo (render ocupado %.2f) | nombre ms (fot con trabajo, "
+	            "draws disp pipelines /fot, huella igual%%):", busy_ms);
+	for (auto& sc : g->s) {
+		if (sc.id == NativeRender::NoPass) continue;
+		const int64_t now = NativeRender::Cut::InclNs(sc.id);
+		const double  ms  = static_cast<double>(now - sc.last_ns) * 1e-6 / frames;
+		sc.last_ns        = now;
+		const double d    = sc.w_frames > 0 ? static_cast<double>(sc.w_frames) : 1.0;
+		const double sd   = static_cast<double>(sc.w_same + sc.w_diff);
+		std::printf(" | %s %.3f (%llu, %.1f %.1f %.1f, %.0f%%)", kName[&sc - g->s], ms,
+		            static_cast<unsigned long long>(sc.w_frames), sc.w_draws / d, sc.w_disp / d, sc.w_pipes / d,
+		            sd > 0 ? 100.0 * sc.w_same / sd : 0.0);
+		sc.w_draws = sc.w_disp = sc.w_pipes = sc.w_frames = sc.w_same = sc.w_diff = 0;
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
+} // namespace Luz
 
 } // namespace PostNativo
