@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "local/buffercache-par.h" // (buffercache-par, KYTY_BC_PAR)
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "speculation-state.h"
 
@@ -101,9 +102,11 @@ public:
 	// FindBuffer's registered buffer over the range, none registered: the null id (a speculative translation's
 	// question whether ObtainBuffer gave the range's buffer).
 	[[nodiscard]] BufferId RegisteredBuffer(uint64_t vaddr, uint64_t size) {
+		if (BcPar::t_reader) return RegisteredBufferShared(vaddr, size); // (buffercache-par: hilo de traduccion)
 		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 		return owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size) ? *owner : BufferId {};
 	}
+	[[nodiscard]] BufferId RegisteredBufferShared(uint64_t vaddr, uint64_t size);
 	void                   EnsureBufferContents(uint64_t vaddr, uint64_t size);
 	// The start of each range shaders read through pointers held by a buffer with the guest's bytes (see the definition).
 	void                   EnsureBdaReadable(std::span<const GuestRange> ranges);

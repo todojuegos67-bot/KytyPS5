@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/speculation.h"
+#include "local/buffercache-par.h" // (buffercache-par, KYTY_BC_PAR)
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -120,6 +121,7 @@ void Speculation::DetachedRun() {
 	RenderContext::SetThreadExecutors(&translator.executors);
 	GuestGpu::SetSpeculationThread(true);
 	Spec::t_packet_slot = translator.index;
+	BcPar::t_reader     = true; // (buffercache-par: hilo lector del indice de BufferCache)
 	std::unique_lock lock(m_detached_mutex);
 	for (;;) {
 		m_detached_job_cv.wait(lock, [&] { return m_detached_quit || !m_detached_jobs.empty(); });
@@ -419,6 +421,7 @@ void Speculation::AheadRun(Translator& translator) {
 	RenderContext::SetThreadExecutors(&translator.executors);
 	GuestGpu::SetSpeculationThread(true);
 	Spec::t_packet_slot = translator.index;
+	BcPar::t_reader     = true; // (buffercache-par: hilo lector del indice de BufferCache)
 	std::unique_lock lock(m_mutex);
 	for (;;) {
 		Entry*   pass       = nullptr;
@@ -748,6 +751,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 			uint32_t   dwords  = 0;
 			const auto packet  = CommandProcessor::SuspendedPacket(spec, dwords);
 			const bool partial = LocalVulkanRecording::RecordedWrites() != r.state.checkpoint_work;
+			const bool journal = std::exchange(BcPar::t_journal, false);
 			r.state.Rollback();
 			if (partial) { // (its recorded work cannot be taken back)
 				static const auto names = [] {
@@ -762,6 +766,30 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 				r.stop   = names[(*packet >> 8u) & 0xffu].c_str();
 				break;
 			}
+			// (buffercache-par, KYTY_BC_PAR) Lee memoria que escribe el procesador en el segmento abierto: el segmento se
+			// cierra antes del paquete (un corte sin paquete: el Commit hace las escrituras de la DCB de los segmentos
+			// anteriores antes del trabajo del siguiente) y el paquete se traduce otra vez en el nuevo. Una vez por paquete; solo
+			// draws/dispatches (los que ya serian hueco: misma suposicion de estado del procesador que RunHole).
+			if (journal && IsHole(*packet) && !r.state.stop && BcPar::SplitOn() &&
+			    (r.holes.empty() || r.holes.back().dwords != 0 || r.holes.back().packet != packet)) {
+				if (r.hole_states.size() == r.holes.size()) r.hole_states.push_back(std::make_unique<CommandProcessor>(m_renderer, 0));
+				r.hole_states[r.holes.size()]->CopyStateFrom(processor, false);
+				auto& cut  = r.holes.emplace_back();
+				cut.packet = packet;
+				cut.dwords = 0; // (corte: ningun paquete en el Commit)
+				cut.reason = "buffercache-par: corte por escrituras de la DCB";
+				cut.after  = spec; // (el paquete otra vez, si el Commit para aqui)
+				scheduler.EndRecording(*r.recorder);
+				r.state.CloseSegment(r.recorder->recorded.size());
+				r.segment_ends.push_back(NowNs());
+				r.state.refused = nullptr;
+				BcPar::g_splits.fetch_add(1, std::memory_order_relaxed);
+				DrawStateObserver::Invalidate();
+				translator.draw->NativeXprForgetState();
+				processor.BufferInit();
+				continue;
+			}
+			if (journal) BcPar::Refused(BcPar::JournalRefused);
 			if (!IsHole(*packet) || r.state.stop) {
 				r.stop = r.state.refused;
 				break;
@@ -1124,6 +1152,7 @@ void Speculation::After(Result& result, size_t index) {
 Speculation::HoleRun Speculation::RunHole(Result& result, CommandProcessor& cp, size_t index) {
 	const Spec::EffectSourceScope source(Spec::EffectSource::Hole);
 	const auto& hole  = result.holes[index];
+	if (hole.dwords == 0) return HoleRun::Done; // (buffercache-par: corte sin paquete)
 	const auto& state = *result.hole_states[index];
 	cp.CopyStateFrom(state, false);
 	// (The draw state it starts from is not the shadow's.)

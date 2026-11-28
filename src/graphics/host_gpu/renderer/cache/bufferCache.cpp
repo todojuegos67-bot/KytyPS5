@@ -115,6 +115,7 @@ uint64_t g_bufvram_evicted = 0, g_bufvram_evicted_bytes = 0, g_bufvram_dirty = 0
 #include <utility>
 #include <vector>
 #include "speculation-state.h"
+#include "local/buffercache-par.h" // (buffercache-par, KYTY_BC_PAR)
 #include "local/vram-drv.h" // (VRAM-DRV)
 #include "vram-tope.h"      // (BUF-RAM: nivel 2 del tope)
 #include "buf-mem.h"         // (BUF-MEM: KYTY_BUF_MEM)
@@ -1463,11 +1464,14 @@ void BufferCache::ChangeRegister(BufferId id) {
 	if constexpr (!insert) InvalidateCopyFeedback(buffer.CpuAddress(), buffer.Size());
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
-	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
-		if constexpr (insert) {
-			m_page_table[page] = id;
-		} else {
-			m_page_table[page] = {};
+	{ // (buffercache-par: los fragmentos que leen los hilos de traduccion, en exclusiva)
+		const BcPar::WriteGuard index_lock(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size());
+		for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
+			if constexpr (insert) {
+				m_page_table[page] = id;
+			} else {
+				m_page_table[page] = {};
+			}
 		}
 	}
 	const auto size_pages = pages.last_exclusive - pages.first;
@@ -3699,6 +3703,15 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 }
 
+// (buffercache-par) Pregunta de un hilo de traduccion especulativa: lectura bajo el fragmento del vaddr.
+BufferId BufferCache::RegisteredBufferShared(uint64_t vaddr, uint64_t size) {
+	const BcPar::ReadGuard index_lock(vaddr);
+	const auto*            owner  = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const BufferId         id     = owner != nullptr ? *owner : BufferId {};
+	const auto*            buffer = id ? m_slot_buffers.try_get(id) : nullptr;
+	return buffer != nullptr && buffer->IsInBounds(vaddr, size) ? id : BufferId {};
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	auto* const spec = Spec::Current();
 	// Registration changes still drain separately before retiring an owner. (Not a speculation's: its work reads the
@@ -3710,17 +3723,29 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
+	if (spec != nullptr) { // (buffercache-par: lectura concurrente bajo el fragmento del vaddr)
+		BufferId found {};
+		{
+			const BcPar::ReadGuard index_lock(vaddr);
+			const auto*            owner  = m_page_table.Find(vaddr >> PageTable::kPageBits);
+			const BufferId         id     = owner != nullptr ? *owner : BufferId {};
+			auto*                  buffer = id ? m_slot_buffers.try_get(id) : nullptr;
+			if (buffer != nullptr && buffer->IsInBounds(vaddr, size)) found = id;
+		}
+		if (found) {
+			// (A speculation's work holds it: its commit checks nothing registered over the range since.)
+			spec->NoteBufferRange(vaddr, size);
+			return found;
+		}
+		// (A speculative translation registers nothing.)
+		BcPar::Refused(BcPar::RegNew);
+		return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
+	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
-		if (buffer.IsInBounds(vaddr, size)) {
-			// (A speculation's work holds it: its commit checks nothing registered over the range since.)
-			if (spec != nullptr) spec->NoteBufferRange(vaddr, size);
-			return *owner;
-		}
+		if (buffer.IsInBounds(vaddr, size)) return *owner;
 	}
-	// (A speculative translation registers nothing.)
-	if (spec != nullptr) return Spec::Refuse("buffer registration"), NULL_BUFFER_ID;
 	return CreateBuffer(vaddr, size);
 }
 
@@ -5091,7 +5116,10 @@ void BufferCache::EnsureBufferContents(uint64_t vaddr, uint64_t size) {
 	if (auto* spec = Spec::Current()) {
 		// Made current when the speculative translation is committed (an earlier segment's guest memory writes
 		// before it, the open segment's after its work).
-		if (spec->open_journal_set.Intersects(vaddr, size)) return Spec::Refuse("memory the processor writes");
+		if (spec->open_journal_set.Intersects(vaddr, size)) {
+			if (spec->refused == nullptr) BcPar::t_journal = true; // (buffercache-par: corte de segmento en vez de hueco)
+			return Spec::Refuse("memory the processor writes");
+		}
 		if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec->JournalIntersects(vaddr, size))
 			spec->NoteCurrent(vaddr, size);
 		return;
@@ -5402,15 +5430,30 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		// A speculative translation (speculation-state.h): the registered buffer over the range, which its commit
 		// obtains again before the work (a range it reads made current, one it writes made GPU-owned).
-		const auto* owner  = m_page_table.Find(vaddr >> PageTable::kPageBits);
-		auto*       buffer = owner != nullptr && *owner ? m_slot_buffers.try_get(*owner) : nullptr;
-		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size) ||
-		    (is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)))
+		BufferId owner_id {};
+		Buffer*  buffer = nullptr;
+		{ // (buffercache-par: lectura concurrente bajo el fragmento del vaddr)
+			const BcPar::ReadGuard index_lock(vaddr);
+			const auto*            owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+			owner_id                     = owner != nullptr ? *owner : BufferId {};
+			buffer                       = owner_id ? m_slot_buffers.try_get(owner_id) : nullptr;
+			if (buffer != nullptr && (buffer->is_deleted || !buffer->IsInBounds(vaddr, size))) buffer = nullptr;
+		}
+		if (buffer == nullptr) {
+			BcPar::Refused(BcPar::LookupMiss);
 			return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+		}
+		if (is_texel_buffer && m_texture_cache.HasGpuWrittenImageOverlap(vaddr, size)) {
+			BcPar::Refused(BcPar::LookupTexel);
+			return Spec::Refuse("buffer lookup"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+		}
+		const auto* owner = &owner_id;
 		// (An earlier segment's guest memory writes are made before its work, the open segment's after it, and its
 		// copies read their sources then.)
-		if (spec->open_journal_set.Intersects(vaddr, size) || (is_written && spec->open_copy_sources.Intersects(vaddr, size)))
+		if (spec->open_journal_set.Intersects(vaddr, size) || (is_written && spec->open_copy_sources.Intersects(vaddr, size))) {
+			if (spec->refused == nullptr) BcPar::t_journal = true; // (buffercache-par: corte de segmento en vez de hueco)
 			return Spec::Refuse("memory the processor writes"), std::pair<Buffer*, uint64_t> {nullptr, 0};
+		}
 		if (is_written) spec->NoteWritten(vaddr, size);
 		else if (m_memory_tracker.IsRegionCpuModified(vaddr, size) || spec->JournalIntersects(vaddr, size))
 			spec->NoteCurrent(vaddr, size);

@@ -7,6 +7,7 @@
 #include "local/techo.h"
 #include "local/techo-faltas.h"
 #include "local/techo-escena.h"
+#include "local/buffercache-par.h" // (buffercache-par)
 #include "local/bloques-rapido.h"
 #include "local/trad1-prueba.h"
 #include "local/regs-rapido.h"
@@ -228,6 +229,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		RecorridoRapido::Window(busy, n, keep);                 // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
 		ProtegerJunto::Window(n);                              // (proteger-junto: contadores de proteccion del render)
 		IndirectTabla::Window(busy, n * 1e3 / wall_ms, n, keep); // (indirect-tabla, KYTY_INDIRECT_TABLA)
+		BcPar::Window(busy, n, keep);                           // (buffercache-par, KYTY_BC_PAR)
 		Par2::Window(busy, n, keep);                           // (par2, KYTY_PAR2)
 		NormalWhy::Report(n);                                // (vg1, porque los draws van al camino normal)
 		TechoFaltas::Report(n, ms_cyc); // (techo-faltas: the game threads' faults, a line beside this one)
