@@ -4,7 +4,9 @@
 // no sirven al render (ya va fijado a los P por KYTY_RECORDING_CPUS=auto). KYTY_HIBRIDO=0: solo cuenta hilos (<=12),
 // como antes. Las dos opciones que activa (KYTY_UPLOAD_HELP=2, KYTY_SPIN_GATE=1) son adaptativas: solo actuan con la
 // CPU cargada. Sin efecto en CPUs con 7+ nucleos P ni en no hibridas de 13+ hilos.
-#pragma once
+// Sin #pragma once: ds-settings.cpp lo incluye arriba (declaraciones) y al final con CPU5_HIBRIDO_IMPL (cuerpo).
+#ifndef CPU5_HIBRIDO_DECL
+#define CPU5_HIBRIDO_DECL
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -22,14 +24,18 @@ struct Topologia {
 Topologia Detectar();
 const Topologia& Get();
 void Log();
+} // namespace Cpu5
+#endif // CPU5_HIBRIDO_DECL
 
-#ifdef CPU5_HIBRIDO_IMPL
+#if defined(CPU5_HIBRIDO_IMPL) && !defined(CPU5_HIBRIDO_HECHO)
+#define CPU5_HIBRIDO_HECHO
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #endif
+namespace Cpu5 {
 Topologia Detectar() {
 	Topologia t;
 	t.hilos = static_cast<int>(std::thread::hardware_concurrency());
@@ -82,5 +88,5 @@ void Log() {
 	            t.por_p ? "<=6 nucleos P" : (t.pocos ? "<=12 hilos" : "CPU grande"), t.apagado ? "; KYTY_HIBRIDO=0" : "");
 	std::fflush(stdout);
 }
-#endif
 } // namespace Cpu5
+#endif // CPU5_HIBRIDO_IMPL

@@ -4,6 +4,7 @@
 #include "port/ds-i18n.h"
 #include "port/ds-online.h"
 #include "local/cpu5-hibrido.h" // (cpu5-hibrido)
+#include "local/cpu-auto.h"     // (cpu-auto)
 
 #include <algorithm>
 #include <atomic>
@@ -381,6 +382,9 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	}
 	boo("rend_ayuda_subidas_v2", s->perf_upload_help);
 	boo("rend_espera_hilos_v2", s->perf_spin_gate);
+	// (cpu-auto) Optimizacion de CPU: automatico (por defecto) fija esas opciones segun la CPU; manual = las del usuario.
+	boo("cpu_optimizacion_auto", s->cpu_auto);
+	if (s->cpu_auto) CpuAuto::Aplicar(*s);
 	// (11-22) rend_registros_pm4, rend_subidas_dos_hilos_v2, rend_feedback_anticipado and rend_feedback_agrupado: always on
 	// in code (no boxes); an old value in settings.ini is not read.
 	s->perf_pm4_regfile = s->perf_upload_lanes = s->perf_eager_feedback = s->perf_feedback_batch = true;
@@ -630,6 +634,8 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "rend_ayuda_subidas_v2=" << b(s.perf_upload_help) << "\n"
 	  << "; Los hilos de ayuda dejan de esperar activos si la CPU va cargada (KYTY_SPIN_GATE=1)\n"
 	  << "rend_espera_hilos_v2=" << b(s.perf_spin_gate) << "\n"
+	  << "; Optimizacion de CPU: 1 = automatica segun el procesador (ayuda subidas, espera, precompilar, shaders, CCD); 0 = manual\n"
+	  << "cpu_optimizacion_auto=" << b(s.cpu_auto) << "\n"
 	  << "; Shaders lane-local ampliados (KYTY_LANE_LOCAL_WIDE; recompila parte de los shaders)\n"
 	  << "rend_shaders_lane_local=" << b(s.perf_lane_wide) << "\n\n"
 	  << "[Interfaz]\n"
@@ -2208,3 +2214,5 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 // (cpu5-hibrido) La deteccion de la topologia, la ultima (windows.h).
 #define CPU5_HIBRIDO_IMPL
 #include "local/cpu5-hibrido.h"
+#define CPUAUTO_IMPL
+#include "local/cpu-auto.h"

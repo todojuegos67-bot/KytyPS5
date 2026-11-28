@@ -20,6 +20,7 @@
 #include "local/local-platform.h"
 #include "local/ram-guard.h"
 #include "local/port-live.h"
+#include "local/cpu-auto.h" // (cpu-auto) Optimizacion de CPU automatica
 #include "kernel/memory.h" // (trucos) the cheats' guest reads / writes
 #include "loader/demonsSoulsInventory.h" // (trucos3) items and spells added on the game thread
 #include "graphics/presentation/window/hostInput.h"
@@ -3660,6 +3661,19 @@ void Draw(float width, float height) {
 					const bool small = s.simulate_ram16 || (g_rt.pc.ram_gb > 0 && g_rt.pc.ram_gb <= 20);
 					(void)small; // (port28) always shown and usable; off by default
 					s.profile16 = LowRam(s, g_rt.pc);
+					// (cpu-auto) Con la optimizacion de CPU automatica estas opciones las fija el lanzador (grises aqui).
+					{
+						bool manual = !s.cpu_auto;
+						if (CheckRow("Optimización de CPU manual", false, manual,
+						             "No = automática: el procesador decide Todos los CCD, las ayudas del procesador, la precompilación y la carga de shaders (si cambiaste alguna a mano, se pone la decisión automática). Sí = las eliges tú."))
+							s.cpu_auto = !manual;
+						if (s.cpu_auto) {
+							const std::string antes = s.precompile_threads;
+							CpuAuto::Aplicar(s);
+							if (s.precompile_threads != antes) Precompile::SetAllThreads(s.precompile_threads == "todos");
+						}
+					}
+					ImGui::BeginDisabled(s.cpu_auto);
 					CheckRow("Usar todos los CCD (Ryzen de dos CCD)", true, s.all_ccds, "Ryzen de dos CCD: No = el juego en el CCD con más caché L3 (más rápido); Sí = todos los núcleos.");
 					// (perfopts-1107) Opciones de rendimiento (upstream's opt-in switches; at the next start).
 					ImGui::Spacing();
@@ -3671,8 +3685,10 @@ void Draw(float width, float height) {
 					         "Si la CPU va cargada, el hilo de render hace él mismo las subidas pendientes en vez de esperar. Bueno en CPUs de 4-6 núcleos y portátiles (KYTY_UPLOAD_HELP).");
 					CheckRow("Hilos sin espera activa con CPU cargada", s.perf_spin_gate != g_rt.launched.perf_spin_gate, s.perf_spin_gate,
 					         "Los hilos de ayuda dejan de girar en vacío cuando quedan menos de 3 núcleos libres, dejando la CPU al juego. Para CPUs justas (KYTY_SPIN_GATE).");
+					ImGui::EndDisabled();
 					CheckRow("Shaders lane-local ampliados", s.perf_lane_wide != g_rt.launched.perf_lane_wide, s.perf_lane_wide,
 					         "Más shaders de cálculo se traducen en su forma rápida. Cambia esos shaders: la primera vez se vuelven a compilar (algo de carga al empezar). Experimental (KYTY_LANE_LOCAL_WIDE).");
+					ImGui::BeginDisabled(s.cpu_auto);
 					CheckRow("Carga de shaders al máximo", true, s.shader_turbo,
 					         "La preparación de shaders al empezar la partida con todos los hilos de la CPU (en prioridad baja: el juego va primero). Mucho más rápida; mientras dura pueden bajar algo los FPS. No = pocos hilos, como antes (para portátiles o CPUs justas).");
 					{
@@ -3682,6 +3698,7 @@ void Draw(float width, float height) {
 						             "Sí = máxima velocidad, el PC irá cargado; No = modo relajado. Se aplica la próxima vez que se preparen los shaders."))
 							s.precompile_threads = all ? "todos" : "relajado", Precompile::SetAllThreads(all);
 					}
+					ImGui::EndDisabled(); // (cpu-auto)
 					break;
 				}
 				case 7: { // Controles (the launcher's "Controles" and "Mapear mando")
@@ -4906,6 +4923,31 @@ void LauncherPerformance(Settings& s) {
 	}
 	s.profile16 = LowRam(s, g_rt.pc);
 	{
+		// (cpu-auto) Optimizacion de CPU: Automatico fija "Todos los nucleos", las dos ayudas del procesador, la
+		// precompilacion y la carga de shaders segun la CPU detectada; Manual = cada opcion a mano, como antes.
+		const char* tip = "Automático: el lanzador mira tu procesador (núcleos, hilos, núcleos P y E, AVX2, caché) y pone él solo las opciones del procesador que mejor le van: Todos los núcleos, Ayuda extra si el procesador va justo, Liberar el procesador cuando va saturado, la precompilación de shaders y la carga de shaders al máximo. Si antes cambiaste alguna a mano, al pasar a Automático se cambia por la decisión automática. Manual: las eliges tú una a una.";
+		const float y = RowY();
+		Label(y, "Optimización de CPU", tip, 14, 158);
+		if (LButton("Automático", {g_lbox.at.x + U(176), y}, {U(116), U(30)}, s.cpu_auto, g_font_semi, U(15), tip)) s.cpu_auto = true;
+		if (LButton("Manual", {g_lbox.at.x + U(296), y}, {U(116), U(30)}, !s.cpu_auto, g_font_semi, U(15), tip)) s.cpu_auto = false;
+		RowEnd(y, 36);
+		if (s.cpu_auto) CpuAuto::Aplicar(s);
+		const CpuAuto::Decision d = CpuAuto::Calcular();
+		const char* cat = d.cat == CpuAuto::Cat::Vieja ? "Vieja" : d.cat == CpuAuto::Cat::Justa ? "Justa" : d.cat == CpuAuto::Cat::X3D ? "X3D (doble caché)" : "Moderna";
+		char        line[512];
+		std::snprintf(line, sizeof(line), I18n::T("CPU detectada: %s. %s: ayudas del procesador %s, precompilar %s, shaders al máximo %s."), I18n::T(cat),
+		              I18n::T(s.cpu_auto ? "Aplicado" : "Manual"), I18n::T(s.perf_upload_help || s.perf_spin_gate ? "sí" : "no"),
+		              I18n::T(s.precompile_threads == "relajado" ? "relajado" : "todos"), I18n::T(s.shader_turbo ? "sí" : "no"));
+		const float ly = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ly});
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12));
+		ImGui::TextColored(kGoldL, "%s", line);
+		ImGui::PopTextWrapPos();
+		const float lh = ImGui::GetItemRectSize().y / std::max(0.01f, U(1));
+		RowEnd(ly, lh + 6);
+	}
+	ImGui::BeginDisabled(s.cpu_auto);
+	{
 		const float y = RowY();
 		LCheck(y, "Todos los núcleos", s.all_ccds, "Solo para Ryzen con dos bloques de núcleos (CCD), como un 7950X3D o un 5900X; en otros procesadores no cambia nada. Apagado: el juego usa solo el bloque con más caché (memoria rápida dentro del procesador), que suele dar más FPS y menos tirones. Encendido: usa todos los núcleos. Déjalo apagado salvo que notes que encendido te va mejor.", 216);
 		RowEnd(y);
@@ -4929,6 +4971,7 @@ void LauncherPerformance(Settings& s) {
 	          "Cuando el procesador va muy ocupado, el hilo que dibuja cada imagen hace él mismo los envíos de texturas pendientes en vez de quedarse esperando. En procesadores de 4 a 6 núcleos y portátiles puede dar unos FPS más (en pruebas, hasta un 4 %). Con un procesador sobrado casi nunca actúa: ahí da igual.");
 	LCheckRow("Liberar el procesador cuando va saturado", s.perf_spin_gate,
 	          "Unos hilos de ayuda del emulador esperan trabajo dando vueltas sin parar (gastan procesador sin hacer nada útil). Con esto dejan de hacerlo cuando quedan menos de 3 núcleos libres, y ese procesador vuelve al juego. En procesadores de 4 a 6 núcleos reduce bastante los bajones de FPS y los tirones. Con muchos núcleos casi nunca actúa. Recomendado en portátiles y PCs modestos.");
+	ImGui::EndDisabled(); // (cpu-auto)
 	LCheckRow("Traducción rápida para más efectos", s.perf_lane_wide,
 	          "Más programas de efectos del juego (shaders: los pequeños programas que usa la gráfica para calcular y dibujar) se traducen a una versión más rápida. Puede dar algo más de FPS en la gráfica. La primera vez que lo actives esos shaders se vuelven a preparar: más carga y algún tirón al empezar. Experimental: si ves fallos gráficos, apágalo.");
 	// (11-12) "Simular 16 GB RAM" removed too (the owner).

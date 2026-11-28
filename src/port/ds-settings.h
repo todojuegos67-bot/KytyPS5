@@ -220,6 +220,7 @@ struct Settings {
 	bool        perf_upload_lanes = true;   // KYTY_UPLOAD_LANES=2 (21-11 log, upload thread -29%, fewer >50 ms seconds; 11-22: always on, no box)
 	bool        perf_upload_help = false;   // KYTY_UPLOAD_HELP=2
 	bool        perf_spin_gate = false;     // KYTY_SPIN_GATE=1
+	bool        cpu_auto = true;            // (cpu-auto) cpu_optimizacion_auto: Optimizacion de CPU automatica
 	bool        perf_eager_feedback = true;  // KYTY_EAGER_FEEDBACK=1 (11-22: always on in code, no box)
 	bool        perf_feedback_batch = true;  // KYTY_FEEDBACK_BATCH=1 (11-22: always on in code, no box)
 	bool        perf_lane_wide = false;     // KYTY_LANE_LOCAL_WIDE=1
