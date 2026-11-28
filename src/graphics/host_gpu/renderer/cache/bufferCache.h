@@ -316,6 +316,38 @@ public:
 			if (RegionRegistrationEpoch(region * TRACKER_REGION_SIZE) > epoch) return true;
 		return false;
 	}
+	// (tej-cos) A buffer registered or unregistered over the EXACT bytes [vaddr, vaddr+size) since `epoch` (the region test
+	// above at byte granularity: a lookup of the range finds the same buffers while no buffer covering any of its bytes
+	// came or went; a join unregisters the old buffer over its whole span, so it is seen). From a ring of the last
+	// RegLogN changes, each tagged by its epoch (written last); `known` false: the ring no longer reaches back (or an entry
+	// was being rewritten): the caller must fall back to RegisteredSince.
+	// `ranges`: [begin, end) sorted by begin, not overlapping (any of them).
+	[[nodiscard]] bool RegisteredOverlapSince(const std::pair<uint64_t, uint64_t>* ranges, size_t n, uint64_t epoch,
+	                                          bool& known) const {
+		const uint64_t now = m_registration_epoch.load(std::memory_order_acquire);
+		known              = now <= epoch || now - epoch <= RegLogN;
+		if (!known || now <= epoch || n == 0) return !known;
+		for (uint64_t e = epoch + 1; e <= now; ++e) {
+			const auto& slot = m_reg_log[e % RegLogN];
+			if (slot.epoch.load(std::memory_order_acquire) != e) return known = false, true;
+			const uint64_t b = slot.begin.load(std::memory_order_relaxed), en = slot.end.load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (slot.epoch.load(std::memory_order_relaxed) != e) return known = false, true;
+			// (the first range ending after b: overlaps iff it begins before en)
+			size_t lo = 0, hi = n;
+			while (lo < hi) {
+				const size_t mid = (lo + hi) / 2;
+				if (ranges[mid].second <= b) lo = mid + 1;
+				else hi = mid;
+			}
+			if (lo < n && ranges[lo].first < en) return true;
+		}
+		return false;
+	}
+	[[nodiscard]] bool RegisteredOverlapSince(uint64_t vaddr, uint64_t size, uint64_t epoch, bool& known) const {
+		const std::pair<uint64_t, uint64_t> one {vaddr, vaddr + size};
+		return RegisteredOverlapSince(&one, 1, epoch, known);
+	}
 	// The registration epoch of the last change of a buffer covering the tracker region of `vaddr`: a region
 	// request's proof only depends on the buffers of its own region.
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
@@ -542,6 +574,12 @@ private:
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
 	std::vector<GuestRange> m_registration_spans; // see TakeRegistrationSpans
 	bool                    m_registration_spans_lost = true;
+	// (tej-cos) RegisteredOverlapSince: the last RegLogN registrations/unregistrations, by epoch % RegLogN.
+	static constexpr uint64_t RegLogN = 4096;
+	struct RegLogEntry {
+		std::atomic<uint64_t> epoch {0}, begin {0}, end {0};
+	};
+	std::unique_ptr<RegLogEntry[]> m_reg_log = std::make_unique<RegLogEntry[]>(RegLogN);
 	struct SyncBuffer {
 		uint64_t start;
 		uint64_t end;

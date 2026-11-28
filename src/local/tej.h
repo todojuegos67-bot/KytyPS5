@@ -23,6 +23,7 @@
 // - Latencia Enqueue->flip (primer envio grafico del fotograma hasta que el render procesa su flip) media y p99, y
 //   fotogramas > 25 ms (flip a flip en el render), A frente a B.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -150,6 +151,11 @@ enum C : uint32_t {
 	GEffEntries,
 	// (tej F2p) render, 1 de cada BeforeEvery paquetes que pasan: lo que Before haria (consultas de solo lectura)
 	GBfPk, GBfTicks, GBfRanges, GBfDirtyRanges, GBfDirtyBytes, GBfBda, GBfBdaAll, GBfInv, GBfImg,
+	// (tej-cos) embudo en draws (render): a tiempo sin huecos, registros de draws, rangos por tipo; draws por motivo F2p;
+	// buffers por rango EXACTO (anillo de BufferCache) frente a regiones de 4 MiB; imagenes solo sobre imagenes (Changed)
+	GCosSewn, GCosGfxOk, GCosCsBad, GCosLostBuf, GCosLostImg, GCosLostMap, GCosBufExactOk, GCosBufExactFail,
+	GCosBufExactLost, GCosImgOnlyOk, GCosImgOverOther, GCosReadGpu, GCosReadHost, GCosRegSampled,
+	GRkD0, GRkD1, GRkD2, GRkD3, GRkD4, GRkD5, GRkD6, GRkD7, GRkD8,
 	NCount
 };
 // (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
@@ -248,11 +254,19 @@ struct Packet {
 	std::vector<std::pair<uint64_t, uint32_t>>      metas;
 	uint32_t n_bda = 0, n_inv = 0, n_img = 0;
 	bool     bda_all = false;
+	// (tej-cos) rbx: TODOS los rangos de buffers de la DCB hasta el cierre, exactos, ordenados y fusionados (sin el corte
+	// de los 8 ultimos: una busqueda de antes reutilizada tambien cuenta); ep_buf0: epoca de registro al empezar la DCB
+	// (mas estricta que la del paquete); rbx_ok: la lista esta entera. ri: solo imagenes (tocadas + usadas por los
+	// segmentos), lo que Speculation::Changed comprueba de imagenes.
+	std::vector<std::pair<uint64_t, uint64_t>> rbx, ri;
+	uint64_t                                   ep_buf0 = 0;
+	bool                                       rbx_ok  = false;
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
 	std::atomic<uint64_t> serial {0};
 	std::atomic<uint64_t> eff_from {0}; // (tej F2p) fin del registro de efectos del render al empezar la traduccion
+	std::atomic<uint64_t> ep_buf0 {0};  // (tej-cos) epoca de registro de buffers al empezar la traduccion
 	std::atomic<uint32_t> count {0};
 	std::atomic<bool>     done {false};
 	Packet                pk[MaxPackets];
@@ -379,6 +393,11 @@ private:
 	bool                                      m_assumed = false;
 	std::unordered_map<const char*, uint64_t> m_job_holes;
 	std::unordered_map<uint64_t, uint64_t>    m_job_waits;
+	// (tej-cos) rangos de buffers de la DCB acumulados (fusionados) hasta el ultimo cierre; de que estado y hasta donde
+	std::vector<std::pair<uint64_t, uint64_t>> m_acc_bufs;
+	const Libs::Graphics::Spec::State*         m_acc_st   = nullptr;
+	size_t                                     m_acc_from = 0;
+	bool                                       m_acc_ok   = true;
 };
 inline thread_local Worker* t_worker = nullptr;
 
@@ -787,6 +806,8 @@ inline void Worker::Translate(Item& item) {
 	slot.count.store(0, std::memory_order_release);
 	slot.done.store(false, std::memory_order_release);
 	slot.eff_from.store(g_eff.End(), std::memory_order_relaxed);
+	slot.ep_buf0.store(m_r.GetBufferCache().RegistrationEpoch(), std::memory_order_relaxed);
+	m_acc_bufs.clear(), m_acc_st = nullptr, m_acc_from = 0, m_acc_ok = true;
 	slot.serial.store(item.serial, std::memory_order_release);
 	m_slot     = &slot;
 	m_open     = -1;
@@ -866,6 +887,8 @@ inline void Compact(Packet& p) {
 	p.rx.insert(p.rx.end(), p.reads.begin(), p.reads.end());
 	p.rx.insert(p.rx.end(), p.imgs.begin(), p.imgs.end());
 	Merge(p.rx, 0);
+	p.ri.assign(p.imgs.begin(), p.imgs.end()); // (tej-cos)
+	Merge(p.ri, 0);
 }
 
 inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
@@ -905,6 +928,29 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 				p.bda_all = p.bda_all || st->closed[k].bda_all;
 			}
 			p.n_img += static_cast<uint32_t>(st->used.size()); // (las del segmento abierto)
+			// (tej-cos) las imagenes que usan los segmentos del paquete (Changed: StillResolved) y las del abierto
+			for (size_t k = std::min(p.seg_open, st->closed.size()); k < st->closed.size(); ++k)
+				for (const auto& use: st->closed[k].images)
+					if (use.image != nullptr)
+						p.imgs.emplace_back(use.image->info.data.address, use.image->info.data.address + use.image->info.data.size);
+			for (const auto idx: st->used)
+				if (idx < st->overlay.size() && st->overlay[idx].image != nullptr) {
+					const auto* im = st->overlay[idx].image;
+					p.imgs.emplace_back(im->info.data.address, im->info.data.address + im->info.data.size);
+				}
+			// (tej-cos) todos los buffers de la DCB hasta aqui (mismo estado desde el primer paquete; si no, sin lista)
+			if (m_acc_st == nullptr) m_acc_st = st;
+			if (m_acc_st != st || m_acc_from > st->buffer_ranges.size()) m_acc_ok = false;
+			if (m_acc_ok) {
+				for (size_t i = m_acc_from; i < st->buffer_ranges.size(); ++i)
+					m_acc_bufs.emplace_back(st->buffer_ranges[i].begin, st->buffer_ranges[i].end);
+				m_acc_from = st->buffer_ranges.size();
+				Merge(m_acc_bufs, 0);
+			}
+			p.rbx_ok = m_acc_ok;
+			if (m_acc_ok) p.rbx.assign(m_acc_bufs.begin(), m_acc_bufs.end());
+			else p.rbx.clear();
+			p.ep_buf0 = m_slot->ep_buf0.load(std::memory_order_relaxed);
 			const size_t seg_close = st->closed.size();
 			p.metas.clear();
 			for (const auto& fact: st->meta_facts)
@@ -912,6 +958,7 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 		} else {
 			p.wr.clear(), p.cur.clear(), p.copies.clear(), p.sets.clear(), p.chains.clear(), p.waits.clear(), p.metas.clear();
 			p.n_bda = p.n_inv = p.n_img = 0;
+			p.rbx.clear(), p.rbx_ok = false;
 		}
 		Compact(p);
 	}
@@ -1135,6 +1182,37 @@ inline void    NoteRegDiff(const CommandProcessor& render, const CommandProcesso
 	Add(GRegDiffNames, d.n);
 }
 
+// (tej-cos) Diagnostico del embudo (render; solo en fallos): registros de DRAWS distintos por nombre (sin m_cs, 1 de
+// cada 16), lecturas limpias escritas (rango leido, quien escribio: GPU/CPU y su rango), metadatos borrados (superficie,
+// slice, origen del borrado: TextureCache::MetaClearOrigin).
+struct CosDiag {
+	std::mutex                                mutex;
+	std::unordered_map<const char*, uint64_t> regs;
+	struct Rd {
+		uint64_t n = 0, size = 0, w_addr = 0, w_size = 0;
+		uint8_t  kind = 0, source = 0;
+	};
+	std::unordered_map<uint64_t, Rd>                        reads;
+	std::unordered_map<uint64_t, std::array<uint64_t, 16>> metas; // (por superficie: veces por origen)
+	const char*                                             names[64] {};
+	uint32_t                                                n = 0;
+};
+inline CosDiag              g_cos;
+inline uint32_t             g_cos_k = 0;
+inline constexpr uint32_t   CosRegEvery = 16;
+inline void NoteGfxDiff(const CommandProcessor& render, const CommandProcessor& worker) {
+	if (g_cos_k++ % CosRegEvery != 0) return;
+	const HookTimer tm(HRegDiff);
+	Add(GCosRegSampled);
+	auto& d = g_cos;
+	d.n     = 0;
+	render.DiffState(worker, [](const char* name) {
+		if (g_cos.n < 64 && std::strncmp(name, "m_cs", 4) != 0) g_cos.names[g_cos.n++] = name;
+	});
+	std::lock_guard g(d.mutex);
+	for (uint32_t i = 0; i < d.n; ++i) ++d.regs[d.names[i]];
+}
+
 // (tej F1c) WAIT_REG_MEM en memoria que no es etiqueta conocida: la sombra la supone cumplida y sigue
 // (KYTY_TEJ_ESPERA=0: se para como antes). El render cuenta, por direccion, si al llegar ya estaba cumplida.
 [[nodiscard]] inline bool AssumeOn() {
@@ -1241,6 +1319,36 @@ inline void EffDcbStart() {
 	}
 	return 0;
 }
+// (tej-cos) El primer culpable del paquete: la lectura escrita (y su escritor) o la superficie borrada.
+inline void CosWhy(const Packet& p, RenderContext& r, const EffAcc& a, uint64_t from, uint32_t why) {
+	auto& d = g_cos;
+	if (why == 4) {
+		for (const auto& [b, en]: p.reads) {
+			if (en <= b) continue;
+			const bool gw = !a.gw.Empty() && a.gw.Intersects(b, en - b);
+			const bool hw = !gw && !a.hw.Empty() && a.hw.Intersects(b, en - b);
+			if (!gw && !hw) continue;
+			Add(gw ? GCosReadGpu : GCosReadHost, RealEvery); // (muestra 1/RealEvery DCB: escalado)
+			const auto*     w = g_eff.FirstWriteOver(from, b, en - b);
+			std::lock_guard g(d.mutex);
+			if (d.reads.size() >= 4096 && !d.reads.contains(b)) return;
+			auto& x = d.reads[b];
+			x.n += RealEvery, x.size = en - b, x.kind = gw ? 1 : 2;
+			if (w != nullptr) x.w_addr = w->address, x.w_size = w->size, x.source = static_cast<uint8_t>(w->source);
+			return;
+		}
+		return;
+	}
+	auto& tc = r.GetTextureCache();
+	for (const auto& [addr, slice]: p.metas)
+		if (tc.IsMetaCleared(addr, slice)) {
+			const uint8_t   o = tc.MetaClearOrigin(addr) & 15u;
+			std::lock_guard g(d.mutex);
+			if (d.metas.size() >= 4096 && !d.metas.contains(addr)) return;
+			d.metas[addr][o] += RealEvery;
+			return;
+		}
+}
 inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 	auto& e = g_ec;
 	if (!e.sample) return; // (tej-lag: 1 de cada RealEvery DCB)
@@ -1260,6 +1368,8 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 		const uint32_t why = RealWhy(p, r, e.all, e.lost);
 		constexpr uint64_t k = RealEvery; // (muestra: cuentas escaladas)
 		Add(static_cast<C>(GRk0 + why), k);
+		Add(static_cast<C>(GRkD0 + why), sewn * k); // (tej-cos)
+		if (why == 3 || why == 4) CosWhy(p, r, e.all, e.from, why);
 		if (why == 0) Add(GRealPk, k), Add(GRealDraws, sewn * k), Add(GRealCalls, (sewn + p.dispatches) * k);
 		if (why == 0 || RealWhy(p, r, e.pre, e.lost) == 0) Add(GRealPkPre, k), Add(GRealDrawsPre, sewn * k);
 		if (why != 0) return;
@@ -1332,24 +1442,52 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		if (gfx && csok && !cseq) Add(GPkCsIgnored);
 		// (F1d) Epocas por rangos: solo si la global cambio y los registros cosen, lo que el paquete leyo; listas
 		// compactas del trabajador (rb: regiones de 4 MiB; rx: todo fusionado).
-		bool rb = eb, ri = ei0, rm = em0;
+		// (tej-cos) Buffers por rango EXACTO (anillo de BufferCache: ningun buffer vino ni se fue sobre los bytes que la
+		// DCB busco desde que empezo a traducirse; misma prueba que las regiones de 4 MiB, a nivel de byte); si el anillo
+		// no llega, las regiones como antes. Imagenes: solo sobre las imagenes del paquete (lo que Changed mira); mapeos:
+		// todo lo leido (rx), como Changed.
+		const bool eb0 = bc.RegistrationEpoch() == p.ep_buf0;
+		bool       rb = p.rbx_ok ? eb0 : eb, ri = ei0, rm = em0;
 		if ((!rb || !ri || !rm) && !p.lists) {
 			Add(GPkRgNoList);
 		} else if ((!rb || !ri || !rm) && gfx && csok) {
 			const HookTimer tr(HRanges);
 			const bool      b0 = rb, i0 = ri, m0 = rm;
 			uint64_t        k  = 0;
-			if (!b0)
-				for (const auto& [a, e]: p.rb) {
-					++k;
-					if (bc.RegisteredSince(a, e - a, p.ep_buf)) { rb = false; break; }
+			if (!b0) {
+				bool known = false;
+				if (p.rbx_ok) {
+					const bool hit = bc.RegisteredOverlapSince(p.rbx.data(), p.rbx.size(), p.ep_buf0, known);
+					k += p.rbx.size();
+					if (known) rb = !hit, Add(hit ? GCosBufExactFail : GCosBufExactOk);
 				}
-			if (rb && (!i0 || !m0))
+				if (!known) {
+					Add(GCosBufExactLost);
+					rb = eb;
+					if (!rb) {
+						rb = true;
+						for (const auto& [a, e]: p.rb) {
+							++k;
+							if (bc.RegisteredSince(a, e - a, p.ep_buf)) { rb = false; break; }
+						}
+					}
+				}
+			}
+			if (rb && !i0) {
+				for (const auto& [a, e]: p.ri) {
+					++k;
+					if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { ri = false; break; }
+				}
+				if (ri) {
+					Add(GCosImgOnlyOk);
+					for (const auto& [a, e]: p.rx)
+						if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { Add(GCosImgOverOther); break; }
+				}
+			}
+			if (rb && ri && !m0)
 				for (const auto& [a, e]: p.rx) {
 					++k;
-					if (!i0 && ri && tc.RegisteredOverSince(a, e - a, p.ep_img)) ri = false;
-					if (!m0 && rm && gr.UnmappedSince(p.ep_map, a, e - a)) rm = false;
-					if (!ri || !rm) break;
+					if (gr.UnmappedSince(p.ep_map, a, e - a)) { rm = false; break; }
 				}
 			Add(GRgEntries, k);
 			Add(GRgRaw, p.raw_ranges);
@@ -1357,8 +1495,15 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 			if (!i0 && rb) Add(ri ? GPkRgImg : GPkRgFailImg);
 			if (!m0 && rb && ri) Add(rm ? GPkRgMap : GPkRgFailMap);
 		}
+		Add(GCosSewn, sewn);
+		if (gfx && !csok) Add(GCosCsBad, sewn);
+		if (sewn != 0 && !gfx) NoteGfxDiff(cp, *p.cp);
 		if (gfx && csok) {
+			Add(GCosGfxOk, sewn);
 			if (eb && ei && em) Add(GDrawsOkGfx, sewn);
+			if (!rb) Add(GCosLostBuf, sewn);
+			else if (!ri) Add(GCosLostImg, sewn);
+			else if (!rm) Add(GCosLostMap, sewn);
 			if (rb && ri && rm) {
 				Add(GDrawsOkRanges, sewn);
 				if (p.lists) Real(p, r, sewn, *s); // (tej F2p)
@@ -1759,6 +1904,59 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            " estimado %.2f us/paquete (solo consultas) | ahorro neto en el render = %.0f x 1.15 us - %.1f x %.2f us ="
 		            " %+.2f ms/fot (sin submit: con secundarios desaparece; sin el coste de subidas/BDA/imagenes)\n",
 		            pct(v[GRealDraws]), calls_f, pk_f, bf_us, calls_f, pk_f, bf_us, (calls_f * 1.15 - pk_f * bf_us) / 1e3);
+		// (tej-cos) Embudo en % de todos los draws: cada paso y su caida, con el motivo principal.
+		const uint64_t c_meta  = v[GDrawsOkRanges] - std::min(v[GDrawsOkRanges], v[GRkD1] + v[GRkD2] + v[GRkD3]);
+		const uint64_t c_reads = c_meta - std::min(c_meta, v[GRkD4]);
+		std::printf("[tej] COS embudo: draws %.0f/fot -> a tiempo %.1f %% -> sin huecos %.1f %% -> regs draws %.1f %% (CS con"
+		            " dispatches %.1f) -> rangos %.1f %% (pierde buffers %.1f, imagenes %.1f, mapeos %.1f) -> metadatos %.1f %% ->"
+		            " clean_reads %.1f %% -> PASA %.1f %% | buffers exactos: salvan %.1f pk/fot, fallan %.1f, sin anillo %.1f |"
+		            " imagenes solo sobre imagenes salvan %.1f pk/fot (de ellas tocarian buffers/lecturas %.1f) | clean_reads"
+		            " escritos por GPU %.1f pk/fot, por CPU %.1f\n",
+		            draws / f, pct(v[GDrawsOnTime]), pct(v[GCosSewn]), pct(v[GCosGfxOk]), pct(v[GCosCsBad]), pct(v[GDrawsOkRanges]),
+		            pct(v[GCosLostBuf]), pct(v[GCosLostImg]), pct(v[GCosLostMap]), pct(c_meta), pct(c_reads), pct(v[GRkD0]),
+		            v[GCosBufExactOk] / f, v[GCosBufExactFail] / f, v[GCosBufExactLost] / f, v[GCosImgOnlyOk] / f,
+		            v[GCosImgOverOther] / f, v[GCosReadGpu] / f, v[GCosReadHost] / f);
+		std::vector<std::pair<const char*, uint64_t>>  regs;
+		std::vector<std::pair<uint64_t, CosDiag::Rd>> reads;
+		std::vector<std::pair<uint64_t, std::array<uint64_t, 16>>> metas;
+		{
+			std::lock_guard g(g_cos.mutex);
+			regs.assign(g_cos.regs.begin(), g_cos.regs.end());
+			reads.assign(g_cos.reads.begin(), g_cos.reads.end());
+			metas.assign(g_cos.metas.begin(), g_cos.metas.end());
+			g_cos.regs.clear(), g_cos.reads.clear(), g_cos.metas.clear();
+		}
+		std::ranges::sort(regs, [](const auto& x, const auto& y) { return x.second > y.second; });
+		std::ranges::sort(reads, [](const auto& x, const auto& y) { return x.second.n > y.second.n; });
+		const auto msum = [](const std::array<uint64_t, 16>& o) {
+			uint64_t t = 0;
+			for (const auto x: o) t += x;
+			return t;
+		};
+		std::ranges::sort(metas, [&](const auto& x, const auto& y) { return msum(x.second) > msum(y.second); });
+		std::printf("[tej] COS regs de draws distintos (muestra 1/%u, x%u, pk/fot):", CosRegEvery, CosRegEvery);
+		for (size_t i = 0; i < regs.size() && i < 10; ++i)
+			std::printf(" [%s] %.1f", regs[i].first, static_cast<double>(regs[i].second) * CosRegEvery / f);
+		std::printf(" | clean_reads escritos (leido -> escritor, pk/fot):");
+		static constexpr const char* src_name[3] = {"normal", "hueco", "commit"};
+		for (size_t i = 0; i < reads.size() && i < 8; ++i) {
+			const auto& x = reads[i].second;
+			std::printf(" [0x%llx +%llu <- %s %s 0x%llx +%llu] %.2f", static_cast<unsigned long long>(reads[i].first),
+			            static_cast<unsigned long long>(x.size), x.kind == 1 ? "GPU" : "CPU", src_name[x.source % 3],
+			            static_cast<unsigned long long>(x.w_addr), static_cast<unsigned long long>(x.w_size),
+			            static_cast<double>(x.n) / f);
+		}
+		std::printf(" | metadatos borrados (superficie: origen=veces, pk/fot):");
+		static constexpr const char* org[8] = {"otro", "compute clear", "depth clear draw", "CP fill", "DCC fill",
+		                                       "depth bind record", "?6", "?7"};
+		for (size_t i = 0; i < metas.size() && i < 8; ++i) {
+			std::printf(" [0x%llx %.2f:", static_cast<unsigned long long>(metas[i].first), static_cast<double>(msum(metas[i].second)) / f);
+			for (uint32_t o = 0; o < 16; ++o)
+				if (metas[i].second[o] != 0) std::printf(" %s%s=%llu", org[o & 7u], o >= 8 ? " en hueco" : "",
+				                                          static_cast<unsigned long long>(metas[i].second[o]));
+			std::printf("]");
+		}
+		std::printf("\n");
 	}
 	if (m == 2 && VarOn()) {
 		std::printf("[tej] VARIANTES delta interpolado B-A del render ms/fot (media [min..max] n):");

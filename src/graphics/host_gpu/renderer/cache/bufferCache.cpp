@@ -1440,6 +1440,15 @@ void BufferCache::ChangeRegister(BufferId id) {
 			m_sync_changes_lost = true;
 	}
 	const auto epoch = m_registration_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+	{
+		// (tej-cos) The exact span, tagged by its epoch last (RegisteredOverlapSince).
+		auto& slot = m_reg_log[epoch % RegLogN];
+		slot.epoch.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		slot.begin.store(m_slot_buffers[id].CpuAddress(), std::memory_order_relaxed);
+		slot.end.store(m_slot_buffers[id].CpuAddress() + m_slot_buffers[id].Size(), std::memory_order_relaxed);
+		slot.epoch.store(epoch, std::memory_order_release);
+	}
 	if (m_registration_spans.size() < 64) {
 		m_registration_spans.push_back({m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size()});
 	} else {
