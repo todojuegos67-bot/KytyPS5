@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "local/reent.h"
 #include "local/techo.h"
 
 namespace BloquesRapido {
@@ -38,8 +39,11 @@ namespace BloquesRapido {
 }
 
 inline std::atomic<bool> g_ab_on {false};
-// Hilo de render: tomados por region (donde el global habria fallado), global ok, y fallos por motivo.
-inline uint64_t g_taken = 0, g_global_ok = 0, g_region_moved = 0, g_far = 0;
+// Tomados por region (donde el global habria fallado), global ok, y fallos por motivo. (reentrante) Antes uint64_t
+// globales sin atomica (carrera con dos carriles): ahora celdas por hilo (Reent), el informe suma los carriles.
+struct Tag;
+enum Cell : uint32_t { CTaken, CGlobalOk, CRegionMoved, CFar, NCells };
+inline void Count(Cell c) { Reent::Add<Tag, NCells>(c); }
 
 [[nodiscard]] inline bool Active() {
 	const int m = Mode();
@@ -51,20 +55,20 @@ template <class Cache>
 [[nodiscard]] inline bool RegistrationHolds(const Cache& cache, uint64_t address, uint64_t size, uint64_t registration,
                                             uint64_t region_size, uint64_t regions) {
 	if (cache.RegistrationEpoch() == registration) {
-		++g_global_ok;
+		Count(CGlobalOk);
 		return true;
 	}
 	if (!Active() || size == 0) return false;
 	const auto first = address / region_size, last = (address + size - 1) / region_size;
 	if (last >= regions || last - first > 64) {
-		++g_far;
+		Count(CFar);
 		return false;
 	}
 	if (cache.RegisteredSince(address, size, registration)) {
-		++g_region_moved;
+		Count(CRegionMoved);
 		return false;
 	}
-	++g_taken;
+	Count(CTaken);
 	return true;
 }
 
@@ -72,6 +76,8 @@ template <class Cache>
 inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
+	uint64_t cells[NCells];
+	Reent::Take<Tag, NCells>(cells);
 	const bool was = g_ab_on.load(std::memory_order_relaxed);
 	double     delta = 0, cnt[2] {};
 	if (m == 2) {
@@ -94,12 +100,11 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	std::printf("[bloques-rapido] ventana %s: render ocupado %.2f ms, %.1f fps | tomados por region %.0f/fot, global ok %.0f, "
 	            "region movida %.0f, fuera %.0f",
 	            m == 2 ? (was ? "B (encendido)" : "A (normal)") : "encendido", busy_ms, fps,
-	            static_cast<double>(g_taken) / frames, static_cast<double>(g_global_ok) / frames,
-	            static_cast<double>(g_region_moved) / frames, static_cast<double>(g_far) / frames);
+	            static_cast<double>(cells[CTaken]) / frames, static_cast<double>(cells[CGlobalOk]) / frames,
+	            static_cast<double>(cells[CRegionMoved]) / frames, static_cast<double>(cells[CFar]) / frames);
 	if (m == 2) std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot", cnt[0], cnt[1], delta);
 	std::printf("\n");
 	std::fflush(stdout);
-	g_taken = g_global_ok = g_region_moved = g_far = 0;
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
 }
 

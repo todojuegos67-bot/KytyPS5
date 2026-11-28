@@ -2206,11 +2206,11 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 								const bool active = Trad1Prueba::Active();
 								if (active || Techo::On()) {
 									const bool exact = buffer_cache.Trad1CoverageExact(address, size);
-									if (Techo::On()) ++(exact ? Trad1Prueba::g_cov_exact_ok : Trad1Prueba::g_cov_real);
+									if (Techo::On()) Trad1Prueba::Count(exact ? Trad1Prueba::CCovExactOk : Trad1Prueba::CCovReal);
 									if (active && exact) {
 										range->coverage = buffer_cache.GpuCoverageEpoch();
 										eligible        = true;
-										if (Techo::On()) ++Trad1Prueba::g_cov_won;
+										if (Techo::On()) Trad1Prueba::Count(Trad1Prueba::CCovWon);
 									}
 								}
 							} else eligible = true;

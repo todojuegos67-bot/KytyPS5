@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "local/reent.h"
 #include "local/techo.h"
 
 namespace RecorridoRapido {
@@ -50,18 +51,23 @@ inline std::atomic<bool> g_ab_on {false}; // (=2) esta ventana usa el carril (B)
 // ventana B, no llamo; en la A llamo para nada). g_taken: listas PM4 recorridas con B (modos raros fuera).
 enum Why : uint32_t { WCommands, WReady, WSaved, WCount };
 inline constexpr const char* WhyNames[WCount] = {"ordenes/juego3", "feedback terminado", "feedback sin terminar (A quita)"};
-inline std::atomic<uint64_t> g_taken {0};
-inline std::atomic<uint64_t> g_why[WCount] {};
+// (reentrante) celdas por hilo (Reent): g_taken = celda WCount, g_why[i] = celda i; el informe suma los carriles.
+struct Tag;
+constexpr uint32_t                  NCells = WCount + 1;
+inline constexpr Reent::Slot        g_taken {WCount};
+inline constexpr Reent::Slot        g_why[WCount] = {{0}, {1}, {2}};
 
-inline void Note(std::atomic<uint64_t>& c) { c.fetch_add(1, std::memory_order_relaxed); }
+inline void Note(Reent::Slot c) { Reent::Add<Tag, NCells>(c.i); }
 
 // Ventana de 5 s de [techo] (hilo del informe).
 inline void Window(double busy_ms, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
-	const double t = static_cast<double>(g_taken.exchange(0, std::memory_order_relaxed));
+	uint64_t cells[NCells];
+	Reent::Take<Tag, NCells>(cells);
+	const double t = static_cast<double>(cells[g_taken.i]);
 	double       why[WCount];
-	for (uint32_t i = 0; i < WCount; ++i) why[i] = static_cast<double>(g_why[i].exchange(0, std::memory_order_relaxed));
+	for (uint32_t i = 0; i < WCount; ++i) why[i] = static_cast<double>(cells[i]);
 	const bool was   = g_ab_on.load(std::memory_order_relaxed);
 	double     delta = 0, cnt[2] {};
 	if (m == 2) {

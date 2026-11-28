@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "local/reent.h"
+
 namespace IndirectTabla {
 
 [[nodiscard]] inline int Mode() {
@@ -38,14 +40,17 @@ namespace IndirectTabla {
 
 inline std::atomic<bool>     g_ab_on {false};   // (=2) esta ventana por la tabla (B)
 inline std::atomic<uint32_t> g_frame {0};       // (=3)
-inline std::atomic<uint64_t> g_table {0}, g_table_ns {0}, g_normal {0}, g_normal_ns {0}, g_refused {0};
 // Motivo de cada rechazo (ti1 no los contaba: 16.6/fot rechazados sin saber por que).
 enum Why : uint32_t { RNinguno, RForma, RArgs, RDecal, RHud, RSinPrograma, RMalla, RPortR, RParticula, RObtener, RTabla, Whys };
 inline constexpr const char* kWhy[Whys] = {"-", "forma", "args no mapeados/imagen", "decal", "hud", "sin programa",
                                            "malla", "port-r", "particula FG", "obtener args", "tabla (otro)"};
 inline thread_local uint32_t t_why = RNinguno;
-inline std::atomic<uint64_t> g_why[Whys] {};
-inline std::atomic<uint64_t> g_normal_gpu {0}; // el normal dibujo con los args en la GPU (TryGpuIndirectDraw); resto = leidos en CPU
+// (reentrante) Contadores en celdas por hilo (Reent; antes atomicas globales con lock xadd): el informe suma los carriles.
+// g_frame y g_ab_on siguen globales: son interruptores (mismo fotograma/ventana para todos los carriles).
+// CNormalGpu: el normal dibujo con los args en la GPU (TryGpuIndirectDraw); resto = leidos en CPU. Celdas CWhy0 + motivo.
+struct Tag;
+enum Cell : uint32_t { CTable, CTableNs, CNormal, CNormalNs, CRefused, CNormalGpu, CWhy0, NCells = CWhy0 + Whys };
+inline void Add(uint32_t cell, uint64_t v = 1) { Reent::Add<Tag, NCells>(cell, v); }
 
 inline void OnFrame(uint32_t frame) {
 	if (Mode() == 3) g_frame.store(frame, std::memory_order_relaxed);
@@ -69,12 +74,14 @@ inline void OnFrame(uint32_t frame) {
 inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
-	const double t = static_cast<double>(g_table.exchange(0, std::memory_order_relaxed));
-	const double tn = static_cast<double>(g_table_ns.exchange(0, std::memory_order_relaxed));
-	const double n = static_cast<double>(g_normal.exchange(0, std::memory_order_relaxed));
-	const double nn = static_cast<double>(g_normal_ns.exchange(0, std::memory_order_relaxed));
-	const double r = static_cast<double>(g_refused.exchange(0, std::memory_order_relaxed));
-	const double ng = static_cast<double>(g_normal_gpu.exchange(0, std::memory_order_relaxed));
+	uint64_t c[NCells];
+	Reent::Take<Tag, NCells>(c);
+	const double t  = static_cast<double>(c[CTable]);
+	const double tn = static_cast<double>(c[CTableNs]);
+	const double n  = static_cast<double>(c[CNormal]);
+	const double nn = static_cast<double>(c[CNormalNs]);
+	const double r  = static_cast<double>(c[CRefused]);
+	const double ng = static_cast<double>(c[CNormalGpu]);
 	const bool   was = g_ab_on.load(std::memory_order_relaxed);
 	double       delta = 0, cnt[2] {};
 	if (m == 2) {
@@ -97,8 +104,8 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	            t > 0 ? tn / t / 1e3 : 0.0, n / frames, n > 0 ? nn / n / 1e3 : 0.0, r / frames);
 	std::printf(" | normal con args GPU %.1f, leidos en CPU %.1f | rechazo por motivo:", ng / frames, (n - ng) / frames);
 	for (uint32_t i = 1; i < Whys; ++i)
-		if (const auto c = g_why[i].exchange(0, std::memory_order_relaxed); c != 0)
-			std::printf(" %s %.1f", kWhy[i], static_cast<double>(c) / frames);
+		if (const auto w = c[CWhy0 + i]; w != 0)
+			std::printf(" %s %.1f", kWhy[i], static_cast<double>(w) / frames);
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (negativo = la tabla ahorra)", cnt[0],
 		            cnt[1], delta);

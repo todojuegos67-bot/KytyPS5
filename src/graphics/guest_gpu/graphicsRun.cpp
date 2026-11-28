@@ -2266,6 +2266,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	                  NativeRender::WalkOn() || F5p1Techo::On() || DsNativoSombras::Mode() != 0;
 	const bool rr_count = RecorridoRapido::Mode() != 0 && Techo::On();
 	if (rr_count && fast && !rare) RecorridoRapido::Note(RecorridoRapido::g_taken);
+	// (reentrante) Contadores de regs-rapido por hilo: el bloque TLS se busca una vez por lista, no por paquete.
+	auto& regs_cells = Reent::Local<RegsRapido::Tag, RegsRapido::NCells>();
 	const auto     preamble    = [&] {
         // (w20) Between packets nothing is usually queued: two inline checks instead of two calls (each with its own
         // checks: GPU thread, par queues, juego3, native memory, the semaphore's tick) on every packet. ACB #4 a0ed3e
@@ -2516,7 +2518,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					preamble();
 					EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1); // (the walk assumes the same)
 				}
-				if (regs_lane && !RegLaneOpcode(op)) RegsRapido::Note(RegsRapido::g_taken);
+				if (regs_lane && !RegLaneOpcode(op)) regs_cells.Add(RegsRapido::g_taken.i);
 				const auto handler = g_cp_op_func[op];
 				if (verify && (!KeepsDeferredProtection(op) || handler == nullptr || header == DsLinearCopyHook::Header))
 					++Render5::g_lane[Render5::LaneDifferent];
@@ -2566,9 +2568,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if (RegsRapido::Mode() != 0 && spec == nullptr && !m_state_only &&
 		    (opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
 		     opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT))
-			RegsRapido::Note(RegsRapido::g_why[!RegsRapido::Active() ? RegsRapido::WOff
+			regs_cells.Add(RegsRapido::g_why[!RegsRapido::Active() ? RegsRapido::WOff
 			                                   : KYTY_PM4_LEN(packet_header) != 5u ? RegsRapido::WLen
-			                                                                       : RegsRapido::WModes]);
+			                                                                       : RegsRapido::WModes].i);
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
 		if (m_chunk_every != 0 && IsChunkWork(opcode)) {
@@ -3009,16 +3011,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				const auto     consumed = TryNativeIndirectDraw({packet, remaining_dw});
 				G1::WalkMark(G1::WTried);
 				if (consumed) {
-					IndirectTabla::g_table.fetch_add(1, std::memory_order_relaxed);
-					IndirectTabla::g_table_ns.fetch_add(IndirectTabla::Now() - ti_t0, std::memory_order_relaxed);
+					auto& ti_c = Reent::Local<IndirectTabla::Tag, IndirectTabla::NCells>(); // (reentrante) por hilo
+					ti_c.Add(IndirectTabla::CTable);
+					ti_c.Add(IndirectTabla::CTableNs, IndirectTabla::Now() - ti_t0);
 					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
 					execution.m_made_progress = true;
 					GetScheduler().CompleteDraws(1);
 					continue;
 				}
-				IndirectTabla::g_refused.fetch_add(1, std::memory_order_relaxed);
-				IndirectTabla::g_why[IndirectTabla::t_why == IndirectTabla::RNinguno ? IndirectTabla::RTabla : IndirectTabla::t_why]
-				    .fetch_add(1, std::memory_order_relaxed);
+				IndirectTabla::Add(IndirectTabla::CRefused);
+				IndirectTabla::Add(IndirectTabla::CWhy0 +
+				                   (IndirectTabla::t_why == IndirectTabla::RNinguno ? IndirectTabla::RTabla : IndirectTabla::t_why));
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
@@ -3089,8 +3092,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			const uint64_t ti_t0 = opcode == Pm4::IT_DRAW_INDIRECT && IndirectTabla::Mode() != 0 ? IndirectTabla::Now() : 0; // (indirect-tabla)
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 			if (ti_t0 != 0) {
-				IndirectTabla::g_normal.fetch_add(1, std::memory_order_relaxed);
-				IndirectTabla::g_normal_ns.fetch_add(IndirectTabla::Now() - ti_t0, std::memory_order_relaxed);
+				IndirectTabla::Add(IndirectTabla::CNormal);
+				IndirectTabla::Add(IndirectTabla::CNormalNs, IndirectTabla::Now() - ti_t0);
 			}
 		} else {
 			// What would submit or wait for the GPU refuses the packet.
@@ -4178,7 +4181,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 	if (TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, 1,
 	                       indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs), indexed)) {
-		if (!indexed && IndirectTabla::Mode() != 0) IndirectTabla::g_normal_gpu.fetch_add(1, std::memory_order_relaxed); // (indirect-tabla)
+		if (!indexed && IndirectTabla::Mode() != 0) IndirectTabla::Add(IndirectTabla::CNormalGpu); // (indirect-tabla)
 		return;
 	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(

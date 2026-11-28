@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <x86intrin.h>
 
+#include "local/reent.h"
 #include "local/techo.h"
 
 namespace OtrosRapido {
@@ -44,12 +45,14 @@ inline std::atomic<bool> g_ab_on {false};
 }
 
 // Contadores (hilo de render; solo con KYTY_TECHO=1).
-inline std::atomic<uint64_t> g_steps {0}; // pasos del recorrido con preambulo posible
-inline std::atomic<uint64_t> g_idle {0};  // de ellos, sin nada pendiente (los que el atajo toma)
+// (reentrante) celdas por hilo (Reent), sumadas por el informe: 0 pasos del recorrido con preambulo posible, 1 de ellos
+// sin nada pendiente (los que el atajo toma).
+struct Tag;
 inline void Note(bool idle) {
 	if (!Techo::On()) return;
-	g_steps.fetch_add(1, std::memory_order_relaxed);
-	if (idle) g_idle.fetch_add(1, std::memory_order_relaxed);
+	auto& c = Reent::Local<Tag, 2>();
+	c.Add(0);
+	if (idle) c.Add(1);
 }
 
 // Coste de un par rdtsc + suma atomica en esta maquina (ns), medido una vez.
@@ -73,8 +76,10 @@ inline void Note(bool idle) {
 inline void Window(double busy_ms, double frames, bool keep) {
 	const int m = Mode();
 	if (!Techo::On() || frames <= 0) return;
-	const double steps = static_cast<double>(g_steps.exchange(0, std::memory_order_relaxed)) / frames;
-	const double idle  = static_cast<double>(g_idle.exchange(0, std::memory_order_relaxed)) / frames;
+	uint64_t     cells[2];
+	Reent::Take<Tag, 2>(cells);
+	const double steps = static_cast<double>(cells[0]) / frames;
+	const double idle  = static_cast<double>(cells[1]) / frames;
 	const double pair  = PairNs();
 	const bool   was   = g_ab_on.load(std::memory_order_relaxed);
 	double       delta = 0, cnt[2] {};

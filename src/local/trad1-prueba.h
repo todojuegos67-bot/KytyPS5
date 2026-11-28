@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <memory>
 
+#include "local/reent.h"
 #include "local/techo.h"
 
 namespace Trad1Prueba {
@@ -48,35 +49,46 @@ inline std::atomic<bool> g_ab_on {false};
 	return m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed));
 }
 
-// Contadores (solo con KYTY_TECHO=1, hilo de render).
-inline uint64_t g_new = 0, g_evicted = 0, g_size = 0, g_cov_exact_ok = 0, g_cov_real = 0, g_cov_won = 0;
+// Contadores (solo con KYTY_TECHO=1). (reentrante) Antes uint64_t globales sin atomica: ahora celdas por hilo (Reent),
+// el informe suma los carriles.
+// La cache de pruebas en si (TableXpr::trad1_ranges, 4x16384 x 56 B = 3.7 MB, table-xpr.inc) NO es global: es miembro
+// de la TableXpr de cada RenderExecutor, y cada carril de par2 tiene sus executors (Par2::Lane::executors), asi que ya
+// es por carril. Lo que esa cache prueba (registro, cobertura GPU, buffers vivos) vive en la BufferCache compartida:
+// con varios carriles esas lecturas necesitan el bloqueo/diferido de la fase 2-3 de par2, no algo de este archivo.
+struct Tag;
+enum Cell : uint32_t { CNew, CEvicted, CSize, CCovExactOk, CCovReal, CCovWon, NCells };
+inline void Count(Cell c) { Reent::Add<Tag, NCells>(c); }
 
 struct Key {
 	uint64_t address = 0, size = 0;
 };
-inline std::unique_ptr<Key[]> g_hist;
-constexpr uint64_t             HistSize = 65536;
+// Historial de claves (solo TECHO, 1 MiB): por hilo, para que dos carriles no lo creen/escriban a la vez. Con un hilo,
+// el mismo historial de antes.
+inline thread_local Key* t_hist = nullptr;
+constexpr uint64_t       HistSize = 65536;
+[[nodiscard]] inline Key* Hist() {
+	if (t_hist == nullptr) t_hist = new Key[HistSize](); // vive hasta el final del proceso (un bloque por hilo)
+	return t_hist;
+}
 
 [[nodiscard]] inline uint64_t HistSlot(uint64_t address) { return ((address >> 2u) * 0x9e3779b97f4a7c15ull) >> 48u; }
 
 inline void NoteKept(uint64_t address, uint64_t size) {
 	if (!Techo::On()) return;
-	if (g_hist == nullptr) g_hist = std::make_unique<Key[]>(HistSize);
-	g_hist[HistSlot(address)] = {address, size};
+	Hist()[HistSlot(address)] = {address, size};
 }
 
 inline void NoteNoProof(uint64_t address, uint64_t size) {
 	if (!Techo::On()) return;
-	if (g_hist == nullptr) g_hist = std::make_unique<Key[]>(HistSize);
-	const auto& k = g_hist[HistSlot(address)];
-	if (k.address != address) ++g_new;
-	else if (k.size == size) ++g_evicted;
-	else ++g_size;
+	const auto& k = Hist()[HistSlot(address)];
+	Count(k.address != address ? CNew : k.size == size ? CEvicted : CSize);
 }
 
 inline void Window(double busy_ms, double frames, bool keep) {
 	const int m = Mode();
 	if (!Techo::On() || frames <= 0) return;
+	uint64_t c[NCells];
+	Reent::Take<Tag, NCells>(c);
 	const bool was   = g_ab_on.load(std::memory_order_relaxed);
 	double     delta = 0, cnt[2] {};
 	if (m == 2) {
@@ -96,18 +108,17 @@ inline void Window(double busy_ms, double frames, bool keep) {
 		const double db = cnt[1] > 0 ? sum[1] / cnt[1] : 0, da = cnt[0] > 0 ? sum[0] / cnt[0] : 0;
 		delta = (cnt[0] > 0 && cnt[1] > 0) ? 0.5 * (db - da) : cnt[1] > 0 ? db : -da;
 	}
-	if (g_new + g_evicted + g_size + g_cov_exact_ok + g_cov_real + g_cov_won != 0 || m != 0) {
+	if (c[CNew] + c[CEvicted] + c[CSize] + c[CCovExactOk] + c[CCovReal] + c[CCovWon] != 0 || m != 0) {
 		std::printf("[trad1-prueba] ventana %s: render ocupado %.2f ms | sin_prueba nuevo %.1f/fot desalojado %.1f tamano %.1f | "
 		            "cobertura exacta_ok %.1f real %.1f ganados %.1f",
 		            m == 2 ? (was ? "B (encendido)" : "A (normal)") : m == 1 ? "encendido" : "apagado", busy_ms,
-		            static_cast<double>(g_new) / frames, static_cast<double>(g_evicted) / frames,
-		            static_cast<double>(g_size) / frames, static_cast<double>(g_cov_exact_ok) / frames,
-		            static_cast<double>(g_cov_real) / frames, static_cast<double>(g_cov_won) / frames);
+		            static_cast<double>(c[CNew]) / frames, static_cast<double>(c[CEvicted]) / frames,
+		            static_cast<double>(c[CSize]) / frames, static_cast<double>(c[CCovExactOk]) / frames,
+		            static_cast<double>(c[CCovReal]) / frames, static_cast<double>(c[CCovWon]) / frames);
 		if (m == 2) std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot", cnt[0], cnt[1], delta);
 		std::printf("\n");
 		std::fflush(stdout);
 	}
-	g_new = g_evicted = g_size = g_cov_exact_ok = g_cov_real = g_cov_won = 0;
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
 }
 
