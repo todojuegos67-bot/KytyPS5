@@ -25,7 +25,7 @@ namespace Trad1Prueba {
 [[nodiscard]] inline int Mode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_TRAD1_PRUEBA");
-		int         m = v != nullptr ? std::atoi(v) : 0;
+		int         m = v != nullptr ? std::atoi(v) : 1; // (t69) encendido por defecto: medido sin fallos, DIFERENCIAS 0
 		if (m != 1 && m != 2) m = 0;
 		if (m == 2 && !Techo::On()) {
 			std::printf("[trad1-prueba] KYTY_TRAD1_PRUEBA=2 sin KYTY_TECHO=1: queda en 1\n");

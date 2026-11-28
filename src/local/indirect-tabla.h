@@ -24,7 +24,7 @@ namespace IndirectTabla {
 [[nodiscard]] inline int Mode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_INDIRECT_TABLA");
-		const int   m = v != nullptr ? std::atoi(v) : 0;
+		const int   m = v != nullptr ? std::atoi(v) : 1; // (t69) encendido por defecto: medido sin fallos, DIFERENCIAS 0
 		std::printf("[indirect-tabla] KYTY_INDIRECT_TABLA=%d (%s)\n", m,
 		            m == 1   ? "DRAW_INDIRECT no indexado por la tabla"
 		            : m == 2 ? "A/B cada 5 s con KYTY_TECHO=1 (B = por la tabla)"

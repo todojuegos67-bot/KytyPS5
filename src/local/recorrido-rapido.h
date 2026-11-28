@@ -24,7 +24,7 @@ namespace RecorridoRapido {
 [[nodiscard]] inline int Mode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_RECORRIDO_RAPIDO");
-		int         m = v != nullptr ? std::atoi(v) : 0;
+		int         m = v != nullptr ? std::atoi(v) : 1; // (t69) encendido por defecto: medido sin fallos, DIFERENCIAS 0
 		if (m != 1 && m != 2) m = 0;
 		if (m == 2 && !Techo::On()) {
 			std::printf("[recorrido-rapido] KYTY_RECORRIDO_RAPIDO=2 sin KYTY_TECHO=1: se usa 1 (siempre encendido)\n");
