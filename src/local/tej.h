@@ -104,9 +104,10 @@ inline std::atomic<bool> g_ab_on {false};
 //   5 sin mutex (KYTY_TEJ_SINMUTEX: la sombra nunca pide el RenderMutex; las variantes 0-4 lo piden, como antes).
 //   6 N=1 otro CCD prioridad normal (tej-lag3: un solo trabajador, en la otra L3, a prioridad normal: termina antes y
 //   compite menos tiempo con el render por memoria/driver?).
-inline constexpr int    VarN = 7;
+//   7 muestreo 1/8 (tej-lag4: sin mutex, la sombra solo recibe DCB 1 de cada 8 tramos de 40 ms).
+inline constexpr int    VarN = 8;
 inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes", "sin mutex",
-                                              "N=1 otro CCD normal"};
+                                              "N=1 otro CCD normal", "muestreo 1/8"};
 [[nodiscard]] inline bool VarOn() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEJ_VAR");
@@ -1248,6 +1249,8 @@ inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Shadow::Job::Kind kind
 	}
 	auto* s = g_shadow.load(std::memory_order_acquire);
 	if (s == nullptr || !Active()) return; // (ventana A: nada se copia)
+	// (tej-lag4) muestreo: fuera del tramo, como en A (nada se copia; la sombra duerme).
+	if (TejLag::SampleOff(now, VarOn() ? (Var() == 7 ? 8u : 1u) : TejLag::SampleDiv())) return;
 	s->Push(serial, kind, reset, commands);
 }
 
@@ -1267,6 +1270,10 @@ struct GpuSlice {
 	GpuSlice(bool graphics_q0, uint64_t serial, bool first_slice) {
 		if (Mode() == 0 || !graphics_q0) return;
 		if (first_slice) {
+			// (tej-lag4) sonda de frecuencia real / migraciones del render (solo KYTY_TECHO=1), antes de medir la DCB.
+			TejLag::g_measure.store(Techo::On(), std::memory_order_relaxed);
+			TejLag::g_side.store(Active() ? 1 : 0, std::memory_order_relaxed);
+			TejLag::RenderDcbStart(LocalPlatform::CurrentCpu());
 			const uint64_t t0 = __rdtsc();
 			FlushHooks(); // (lo de antes de esta DCB: flips y esperas sueltas, a su lado)
 			g_hook_side = Active();
@@ -2049,6 +2056,30 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 				            " efectivos; B-A: sube pared y no ciclos = esperas/expulsion, suben ciclos = calcula mas o cache)",
 				            dn / f, dw, dc, dw > 0 ? dc / dw : 0.0);
 		}
+		{ // (tej-lag4) frecuencia REAL del nucleo del render, migraciones y VirtualProtect, A / B (ultima ventana de cada lado)
+			static double gq[2] {}, gmax[2] {}, mig[2] {}, pn[2] {}, pt[2] {};
+			auto& P = TejLag::g_probe;
+			for (int q = 0; q < 2; ++q) {
+				const double n = static_cast<double>(P.fq_n[q].exchange(0, std::memory_order_relaxed));
+				const double t = static_cast<double>(P.fq_ticks[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick;
+				const double mn = static_cast<double>(P.fq_min[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick;
+				const double dc = static_cast<double>(P.dcb[q].exchange(0, std::memory_order_relaxed));
+				const double mg = static_cast<double>(P.mig[q].exchange(0, std::memory_order_relaxed));
+				const double prn = static_cast<double>(P.prot_n[q].exchange(0, std::memory_order_relaxed));
+				const double prt = static_cast<double>(P.prot_t[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6;
+				if (dc == 0 && prn == 0) continue;
+				const double cyc = static_cast<double>(TejLag::FreqIters * TejLag::FreqCyclesPerIter);
+				gq[q] = n > 0 && t > 0 ? cyc * n / t : 0.0, gmax[q] = mn > 0 ? cyc / mn : 0.0;
+				mig[q] = mg / f, pn[q] = prn / f, pt[q] = prt / f;
+			}
+			const uint32_t rc = P.cpu.load(std::memory_order_relaxed);
+			std::printf(" | LAG4 nucleo del render %d: GHz REALES (cadena imul) A %.2f (max %.2f) / B %.2f (max %.2f) = B/A %.3f"
+			            " (<0.98: boost/frecuencia) | migraciones del render A %.2f / B %.2f /fot | VirtualProtect del render A %.0f/fot"
+			            " %.3f ms/fot (%.2f us) / B %.0f/fot %.3f ms/fot (%.2f us) (B sube por llamada = TLB shootdown a mas nucleos)",
+			            rc < 1024 ? static_cast<int>(rc) : -1, gq[0], gmax[0], gq[1], gmax[1], gq[0] > 0 ? gq[1] / gq[0] : 0.0, mig[0],
+			            mig[1], pn[0], pt[0], pn[0] > 0 ? pt[0] * 1e3 / pn[0] : 0.0, pn[1], pt[1], pn[1] > 0 ? pt[1] * 1e3 / pn[1] : 0.0);
+			if (!VarOn() && TejLag::SampleDiv() > 1) std::printf(" | MUESTREO 1/%u (KYTY_TEJ_MUESTREO)", TejLag::SampleDiv());
+		}
 		std::printf(" | CCD trabajadores %s", CcdNow() == 0 ? "mismo (L3 del render)" : CcdNow() == 1 ? "otro" : "auto");
 		std::printf(" | RAM proteccion %s", g_mem_lvl.load() == 2 ? "SOMBRA APAGADA" : g_mem_lvl.load() == 1 ? "N=1" : "no"); // (tej-lag3)
 		std::printf(" | LAG render espera por la sombra: cerrojo buffers %.1f veces %.3f ms/fot, etiquetas %.1f %.3f ms/fot,"
@@ -2305,7 +2336,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		if (!was && VarOn()) {
 			g_var.store(next, std::memory_order_relaxed);
 			TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
-			TejLag::g_sinmutex.store(next == 5 || next == 6, std::memory_order_relaxed); // (tej-sinmutex; tej-lag3: 6 tambien)
+			TejLag::g_sinmutex.store(next == 5 || next == 6 || next == 7, std::memory_order_relaxed); // (tej-sinmutex; tej-lag3: 6 tambien)
 			next = (next + 1) % VarN;
 		}
 		g_ab_on.store(!was, std::memory_order_relaxed);

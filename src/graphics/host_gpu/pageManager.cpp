@@ -5,6 +5,7 @@
 #include "native/g1-probe.h" // (g1, KYTY_G1_PROBE: the pages GPU work marks no-access)
 #include "local/live-census.h"
 #include "local/proteger-junto.h" // (proteger-junto: KYTY_TECHO=1, contigüidad de las protecciones del hilo de render)
+#include "local/tej-lag.h"       // (tej-lag4: VirtualProtect del hilo de render, A/B, solo KYTY_TECHO=1)
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -878,6 +879,7 @@ struct PageManager::Impl {
 
 	static void ProtectHost(uint64_t vaddr, uint64_t size, uint32_t protection) noexcept {
 		if (PauseSkips(vaddr, size, protection)) return; // (KYTY_PROTECT_PAUSE)
+		const TejLag::ProtTimer tej_prot; // (tej-lag4)
 		const LoteTimer lote_timer; // (PROT-LOTE: the render thread's own calls, counted and timed)
 		if (Techo::On() && LiveCensus::g_render) ProtegerJunto::Note(vaddr, size, protection); // (proteger-junto)
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size,
