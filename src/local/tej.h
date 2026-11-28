@@ -2074,8 +2074,9 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			std::printf(" [%s] %.3f / %.3f (%.0f / %.0f/fot)", HName[k], last_ms[0][k], last_ms[1][k], last_n[0][k], last_n[1][k]);
 		std::printf(" = TOTAL A %.3f / B %.3f ms/fot (objetivo B-A <= 0.2) | registro de efectos A %.3f / B %.3f ms/fot",
 		            last_tot[0], last_tot[1], last_ms[0][HEff], last_ms[1][HEff]);
+		static double cn[2][2] {}, cs[2][2] {}; // [lado A/B][hilo render/trabajador] (tej-lagmedida: fuera del bloque)
+		static double g_blk_dc[2] {}, g_blk_dw[2] {};
 		{ // (tej-repro A3b) coste de apuntar contenido (StreamBuffer::Copy) y de sustituir push por contenido, ms/fot
-			static double cn[2][2] {}, cs[2][2] {}; // [lado A/B][hilo render/trabajador]
 			for (int t = 0; t < 2; ++t) {
 				cn[sd][t] = static_cast<double>(TejRepro::g_cost_note[t].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
 				cs[sd][t] = static_cast<double>(TejRepro::g_cost_subst[t].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
@@ -2092,6 +2093,22 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 				std::printf(" | DCB cola 0 del render: %.1f/fot, pared %.2f ms/fot (con esperas), CPU %.2f Mciclos/fot (%.2f GHz"
 				            " efectivos; B-A: sube pared y no ciclos = esperas/expulsion, suben ciclos = calcula mas o cache)",
 				            dn / f, dw, dc, dw > 0 ? dc / dw : 0.0);
+			if (q == sd && dn > 0) g_blk_dc[sd] = dc, g_blk_dw[sd] = dw;
+		}
+		{ // (tej-lagmedida) COSTE POR BLOQUE en el render, lado B (ultima ventana B): base de la sombra (KYTY_TEJ=2 tambien),
+		  // medida del paso A (solo KYTY_TEJ=3, 1/Div paquetes) y lo NO cronometrado = ciclos de DCB B-A menos lo anterior
+		  // (contencion de cache/coherencia con los trabajadores, TLB).
+			const double med_c = cn[1][0] + cs[1][0];
+			const double med_r = TejCoser::g_last_open_ms.load(std::memory_order_relaxed) +
+			                     TejCoser::g_last_fin_ms.load(std::memory_order_relaxed);
+			const double ghz   = g_blk_dw[1] > 0 ? g_blk_dc[1] / g_blk_dw[1] : 0.0;
+			const double dcyc  = g_blk_dc[1] - g_blk_dc[0];
+			const double extra = ghz > 0 ? dcyc / ghz : 0.0;
+			std::printf(" | COSTE POR BLOQUE B ms/fot: [base sombra (TOTAL)] %.3f [medida: contenido registro+sustitucion] %.3f"
+			            " [medida: abrir+reproducir+comparar 1/%u] %.3f = cronometrado %.3f | ciclos DCB B-A %+.2f Mciclos = %+.3f ms"
+			            " -> sin cronometrar (contencion/cache) %+.3f ms/fot",
+			            last_tot[1], med_c, TejCoser::Div(), med_r, last_tot[1] + med_c + med_r, dcyc, extra,
+			            extra - (last_tot[1] - last_tot[0]) - med_c - med_r);
 		}
 		{ // (tej-lag4) frecuencia REAL del nucleo del render, migraciones y VirtualProtect, A / B (ultima ventana de cada lado)
 			static double gq[2] {}, gmax[2] {}, mig[2] {}, pn[2] {}, pt[2] {};

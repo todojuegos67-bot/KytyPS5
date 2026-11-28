@@ -329,7 +329,11 @@ struct RenderExecutor::NativeXprDrawState {
 	mutable uint64_t                 emitted_epoch = UINT64_MAX;
 	// The frame a draw last used it (NativeXprCollect lets one go that none used for NativeXprCache::StateKeepFrames).
 	mutable uint64_t                 used_frame = 0;
-	void Use(uint64_t frame) const { std::atomic_ref<uint64_t>(used_frame).store(frame, std::memory_order_relaxed); }
+	// (tej-lagmedida) solo si cambia: sombra y render comparten estados; la escritura por draw costaba la linea al otro.
+	void Use(uint64_t frame) const {
+		std::atomic_ref<uint64_t> u(used_frame);
+		if (u.load(std::memory_order_relaxed) != frame) u.store(frame, std::memory_order_relaxed);
+	}
 	[[nodiscard]] uint64_t UsedFrame() const { return std::atomic_ref<uint64_t>(used_frame).load(std::memory_order_relaxed); }
 };
 

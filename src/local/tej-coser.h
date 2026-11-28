@@ -58,7 +58,7 @@ struct PkInfo {
 [[nodiscard]] inline uint32_t Div() noexcept {
 	static const uint32_t d = [] {
 		const char* v = std::getenv("KYTY_TEJ_REPRO_MUESTREO");
-		const int   n = v != nullptr ? std::atoi(v) : 4;
+		const int   n = v != nullptr ? std::atoi(v) : 16; // (tej-lagmedida: 4 -> 16)
 		return static_cast<uint32_t>(n < 1 ? 1 : n > 64 ? 64 : n);
 	}();
 	return d;
@@ -120,6 +120,8 @@ enum K : uint32_t {
 	AKOnlyHoles, CSkip, COpenTicks, CFinTicks, CCalls, KN
 };
 inline std::atomic<uint64_t> g_k[KN] {};
+// (tej-lagmedida) ultimo coste en el render de abrir+reproducir y de comparar (ms/fot), para la linea COSTE POR BLOQUE.
+inline std::atomic<double> g_last_open_ms {0.0}, g_last_fin_ms {0.0};
 inline void                  Add(K k, uint64_t v = 1) { g_k[k].fetch_add(v, std::memory_order_relaxed); }
 
 // Render (solo el hilo de render).
@@ -352,12 +354,16 @@ inline void RenderTick(uint64_t key) {
 inline void RenderOpen(const PkInfo& p, uint32_t draws, bool f1d, bool no_holes, Libs::Graphics::RenderContext& r) {
 	if (g_live.on) Finish(false), Add(KAbandon);
 	if (!On()) return;
-	TejRepro::t_note = true; // (A4) el render apunta sus subidas en ventanas B aunque no siga (bloques reutilizados)
-	g_opened        = true;
+	g_opened = true;
 	if (!p.sampled) {
+		// (tej-lagmedida) el render solo apunta subidas en los paquetes muestreados (antes en toda la ventana B: 0.312
+		// ms/fot en el log 20261128-122630-433, medida pura). Un bloque reutilizado de un paquete no muestreado sale como
+		// 'sin contenido' en la comparacion (pesimista), nunca como igual.
+		TejRepro::t_note = false;
 		Add(CSkip);
 		return;
 	}
+	TejRepro::t_note = true;
 	const uint64_t o0 = __rdtsc();
 	struct OT {
 		uint64_t t;
@@ -486,6 +492,8 @@ inline void Print(double frames) {
 		            v[AKOkNh] / f, v[AKOkNhDraws] / f, v[AKOkNhF] / f, v[AKOkNhFDraws] / f, gain_al,
 		            static_cast<double>(v[COpenTicks]) * npt / 1e6 / frames, static_cast<double>(v[CFinTicks]) * npt / 1e6 / frames,
 		            v[CCalls] / static_cast<double>(frames), v[CSkip] / static_cast<double>(frames));
+		g_last_open_ms.store(static_cast<double>(v[COpenTicks]) * npt / 1e6 / frames, std::memory_order_relaxed);
+		g_last_fin_ms.store(static_cast<double>(v[CFinTicks]) * npt / 1e6 / frames, std::memory_order_relaxed);
 	}
 	// (paso A2) por que no es capturable (por nombre, llamadas/fot del trabajador) y de que es distinto el push.
 	char   names[640] = "";

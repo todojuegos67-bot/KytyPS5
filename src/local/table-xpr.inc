@@ -537,7 +537,7 @@ static void TablePrefetchArrays(const Pair& pair, const Set* set) {
 // same cost +3% a draw.)
 template <typename Pair>
 static void TablePrefetchNext(Pair*& previous, Pair& pair) {
-	if (previous != nullptr && previous != &pair) previous->next = &pair;
+	if (previous != nullptr && previous != &pair && previous->next != &pair) previous->next = &pair; // (tej-lagmedida)
 	previous = &pair;
 	auto* const next = pair.next;
 	if (next == nullptr || next == &pair) return;
@@ -842,7 +842,8 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	                  pair.variant_hint < pair.variants.size() && pair.variants[pair.variant_hint].state == cache.state_key;
 	const auto variant = hint ? pair.variants.begin() + pair.variant_hint
 	                          : std::ranges::find(pair.variants, cache.state_key, &TableXpr::Variant::state);
-	if (variant != pair.variants.end()) pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin());
+	if (variant != pair.variants.end() && pair.variant_hint != static_cast<uint32_t>(variant - pair.variants.begin()))
+		pair.variant_hint = static_cast<uint32_t>(variant - pair.variants.begin()); // (tej-lagmedida: solo si cambia)
 	if (variant != pair.variants.end() && variant->refused) return Spec::Refuse("table: variant refused"), TableResult::Native;
 	if (pair.programs[0] == nullptr || variant == pair.variants.end() || variant->pipeline == nullptr)
 		return LiveCounters::Add(LiveCounters::TableStoreVariant), request_store();
@@ -1597,7 +1598,9 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 		pair.last_set[Role()] = set;
 		if (set == nullptr) return nullptr; // (a program still translating)
 	}
-	set->used_frame.store(frame, std::memory_order_relaxed);
+	// (tej-lagmedida) solo si cambia: la sombra y el render usan los mismos sets; una escritura por draw del trabajador
+	// quitaba la linea al render en cada draw (coherencia entre nucleos/CCD). Una vez por fotograma basta.
+	if (set->used_frame.load(std::memory_order_relaxed) != frame) set->used_frame.store(frame, std::memory_order_relaxed);
 	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
 	if (!TableValidateSet(*set)) {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table: set validation"), nullptr;
