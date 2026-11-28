@@ -4942,7 +4942,9 @@ void LauncherPerformance(Settings& s) {
 		              I18n::T(s.precompile_threads == "relajado" ? "relajado" : "todos"), I18n::T(s.shader_turbo ? "sí" : "no"));
 		const float ly = RowY();
 		ImGui::SetCursorScreenPos({g_lbox.at.x + U(14), ly});
-		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12));
+		// (cpu-line) PushTextWrapPos va en coordenadas locales de la ventana, no de pantalla: con la x de pantalla
+		// el texto no se ajustaba y se salia de la caja / pisaba la fila siguiente.
+		ImGui::PushTextWrapPos(g_lbox.at.x + g_lbox.w - U(12) - ImGui::GetWindowPos().x);
 		ImGui::TextColored(kGoldL, "%s", line);
 		ImGui::PopTextWrapPos();
 		const float lh = ImGui::GetItemRectSize().y / std::max(0.01f, U(1));
