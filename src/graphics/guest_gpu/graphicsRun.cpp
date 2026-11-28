@@ -2189,6 +2189,9 @@ static bool SpeculationTakes(uint32_t opcode, uint32_t header) {
 		}
 		// Draws only as table draws (TryNativeXprDraws, TryNativeDirectDraw, TryNativeAutoDraw).
 		case Pm4::IT_DRAW_INDEX_AUTO: return header == 0xc0012d00u;
+		// (huecos1) DRAW_INDIRECT no indexado (AgcDcbDrawIndirect, eboot FUN_00a41ac0 / FUN_00a9af40): por la tabla
+		// (TryNativeIndirectDraw, KYTY_INDIRECT_TABLA), como el render; antes "packet 36" (15.0 huecos/fot).
+		case Pm4::IT_DRAW_INDIRECT: return header == 0xc0032400u && IndirectTabla::Try();
 		case Pm4::IT_DRAW_INDEX_INDIRECT: return header == 0xc0032500u;
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return header == 0xc0083800u;
 		case Pm4::IT_DRAW_INDEX_2: return header == 0xc0042700u;
@@ -3042,7 +3045,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					GetScheduler().CompleteDraws(Gancho2::t_last_draws); // (gancho2: gaps make it not consumed / 5)
 					continue;
 				}
-				if (spec != nullptr) return refuse("draw");
+				if (spec != nullptr) return refuse("draw: tabla");
 				auto& executor            = m_renderer.GetRenderExecutor();
 				native_store_end.executor = &executor;
 				if (auto* log = executor.NativeXprReadLog()) {
@@ -3065,7 +3068,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					GetScheduler().CompleteDraws(packet[5]);
 					continue;
 				}
-				if (spec != nullptr) return refuse("draw");
+				if (spec != nullptr) return refuse("draw: tabla");
 				auto& executor            = m_renderer.GetRenderExecutor();
 				native_store_end.executor = &executor;
 				if (auto* log = executor.NativeXprReadLog()) {
@@ -3088,8 +3091,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					GetScheduler().CompleteDraws(1);
 					continue;
 				}
-				if (spec != nullptr) return refuse("draw");
-			} else if (packet_header == 0xc0032400u && spec == nullptr && IndirectTabla::Try() &&
+				if (spec != nullptr) return refuse("draw: tabla");
+			} else if (packet_header == 0xc0032400u && IndirectTabla::Try() &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// (indirect-tabla, KYTY_INDIRECT_TABLA) Un DRAW_INDIRECT no indexado por la tabla (el normal guarda el par).
 				G1::WalkMark(G1::WObserved);
@@ -3106,6 +3109,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					GetScheduler().CompleteDraws(1);
 					continue;
 				}
+				if (spec != nullptr) return refuse("draw: indirecto"); // (huecos1: el render lo dibuja)
 				IndirectTabla::Add(IndirectTabla::CRefused);
 				IndirectTabla::Add(IndirectTabla::CWhy0 +
 				                   (IndirectTabla::t_why == IndirectTabla::RNinguno ? IndirectTabla::RTabla : IndirectTabla::t_why));
@@ -3122,7 +3126,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					GetScheduler().CompleteDraws(1);
 					continue;
 				}
-				if (spec != nullptr) return refuse("draw");
+				if (spec != nullptr) return refuse("draw: tabla");
 				auto& executor            = m_renderer.GetRenderExecutor();
 				native_store_end.executor = &executor;
 				if (auto* log = executor.NativeXprReadLog()) {
@@ -3164,7 +3168,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		if (spec != nullptr && (opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_2 ||
+		if (spec != nullptr && (opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDIRECT ||
 		                        opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO))
 			return refuse("draw"); // (no table draw took it)
 		if (spec == nullptr && NormalWhy::On() &&
@@ -3460,11 +3464,13 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	auto& executor = m_renderer.GetRenderExecutor();
 	if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RCalls);
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) { // a recorded frame sees every draw on the normal path
+		Spec::Refuse("draw: captura");
 		executor.NativeXprForgetState();
 		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
 	}
 	if (DecalTakesNormalPath(m_ctx)) {
+		Spec::Refuse("draw: decal");
 		executor.NativeXprForgetState();
 		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
@@ -3473,6 +3479,7 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	    !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList) {
 		// The cached draw-state key covers only draws the native path saw.
+		Spec::Refuse("draw: forma");
 		executor.NativeXprForgetState();
 		if (Gancho2::Mode() != 0) Gancho2::Note(Gancho2::RExitEarly);
 		return 0;
@@ -3742,7 +3749,7 @@ uint32_t CommandProcessor::TryNativeMultiDraw(std::span<const uint32_t> packet) 
 	    m_index_type_and_size > 1 || !m_index_base_addr || !m_index_buffer_size || !m_draw_indirect_args_base_addr ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return skip();
-	if (DecalTakesNormalPath(m_ctx)) return skip();
+	if (DecalTakesNormalPath(m_ctx)) return Spec::Refuse("draw: decal"), skip();
 	const uint32_t                  count = packet[5];
 	std::array<uint64_t, max_draws> commands; // the first `count` are written, only they are read
 	for (uint32_t i = 0; i < count; ++i)
@@ -3781,7 +3788,7 @@ uint32_t CommandProcessor::TryNativeDirectDraw(std::span<const uint32_t> packet)
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() || m_index_type_and_size > 1 ||
 	    m_ucfg.GetPrimType() != Prospero::PrimitiveType::kTriList)
 		return skip();
-	if (DecalTakesNormalPath(m_ctx)) return skip();
+	if (DecalTakesNormalPath(m_ctx)) return Spec::Refuse("draw: decal"), skip();
 	// What CpOpDrawIndex / CpOpDrawIndexOffset accept (anything else takes them).
 	const uint64_t element = m_index_type_and_size == 0 ? 2 : 4;
 	uint64_t       index_address = 0;
