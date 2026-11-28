@@ -6,6 +6,7 @@
 #include "local/trad1.h" // (trad1: table-xpr.inc, KYTY_TRAD1)
 #include "local/trad1-prueba.h" // (trad1-prueba: table-xpr.inc, KYTY_TRAD1_PRUEBA)
 #include "local/bloques-rapido.h" // (bloques-rapido: table-xpr.inc, KYTY_BLOQUES_RAPIDO)
+#include "local/emision-draws.h" // (emision-draws: table-xpr.inc, KYTY_EMISION_RAPIDA)
 #include "local/live-control.h" // (trad1b: LiveControl::g_flips, the [trad1] line's frames)
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"

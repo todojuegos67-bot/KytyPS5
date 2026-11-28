@@ -883,9 +883,11 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
 	std::optional<RenderLockGuard> lock;
 	if (Role() == 0) lock.emplace(m_context.GetMutex());
 	if (!NativeXprTargetsCurrent(*table.last_state)) return false;
-	if (TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes, index_type,
-	              direct) != TableResult::Drawn)
-		return false;
+	EmisionDraws::t_cont = true; // (emision-draws: the call's class)
+	const auto drawn = TableDraw(buffer, *table.last_pair, variant, *table.last_state, commands, index_base, index_bytes,
+	                             index_type, direct);
+	EmisionDraws::t_cont = false;
+	if (drawn != TableResult::Drawn) return false;
 	LiveCounters::Add(LiveCounters::TableContinued, std::max<size_t>(commands.size(), 1));
 	// (thread1, KYTY_RENDER_STATS: the calls continued, runs and direct draws apart.)
 	if (LiveCensus::g_render && LiveCensus::RenderStatsOn()) LiveCensus::g_continued_calls[direct != nullptr ? 1 : 0] += 1;
@@ -2977,6 +2979,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (set == nullptr) return LiveCounters::Add(LiveCounters::TableNoSet), Spec::Refuse("table: no set"), TableResult::Native;
 
 	phase.reset();
+	// (emision-draws, KYTY_TECHO) ns por llamada de las fases 3/9/4, continuadas frente a nuevas.
+	const bool ed_measure = Techo::On() && Role() == 0 && Spec::Current() == nullptr;
+	uint64_t   ed_t3 = 0, ed_t9 = 0, ed_t4 = 0;
+	if (ed_measure) {
+		EmisionDraws::NoteUserData(user_data.data(), stages);
+		ed_t3 = __rdtsc();
+	}
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 3);
 	// Emission, as NativeXprEmit's: indices and arguments are read by the GPU; lookups may restart the
 	// scheduler, so the command buffer handle is taken after them.
@@ -3253,6 +3262,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			                           t.range.base_layer, r.data.address);
 	}
 	phase.reset();
+	if (ed_measure) ed_t9 = __rdtsc();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 9);
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
 	std::array<uint32_t, 64>                     group_sizes;
@@ -3318,6 +3328,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	// (A speculation's lookups and preparation refuse without failing: nothing is recorded for a refused draw.)
 	if (const auto* spec = Spec::Current(); spec != nullptr && spec->refused != nullptr) return TableResult::Native;
 	phase.reset();
+	if (ed_measure) ed_t4 = __rdtsc();
 	phase.emplace(LiveCensus::DrawPhase, 0x7ab1e, 4);
 	if (mdraw) mdraw_emit = __rdtsc(); // (mdraw C0: the emission from here)
 	if (buffer.IsInvalid()) return Spec::Refuse("table: buffer"), TableResult::Native;
@@ -3474,10 +3485,22 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[st]);
 		push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword() + 1] = static_cast<uint32_t>(blocks[st] >> 32u);
 	}
-	if (push_dwords != 0)
+	// (emision-draws, KYTY_EMISION_RAPIDA) The same bytes the previous table draw pushed in this command buffer, under
+	// this layout, with no PM4 packet but registers and indices in between (nothing else pushed): not pushed again.
+	const bool ed_push = EmisionDraws::Mode() != 0 || Techo::On();
+	const bool ed_eligible = ed_push && Role() == 0 && own && !hwrt_capture && !render1 && !Render5Flags::Capturing() &&
+	                         push_dwords != 0 && push_dwords <= 32;
+	const auto ed_command = reinterpret_cast<uint64_t>(static_cast<VkCommandBuffer>(vk_buffer));
+	const auto ed_layout  = reinterpret_cast<uint64_t>(static_cast<VkPipelineLayout>(pipeline.pipeline_layout));
+	if (push_dwords != 0 &&
+	    !(ed_push && EmisionDraws::CanSkip(ed_command, buffer.GraphicsGeneration(), ed_layout, push_data.dwords.data(),
+	                                       push_dwords, ed_eligible)))
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
+	if (ed_push)
+		EmisionDraws::NotePush(ed_command, buffer.GraphicsGeneration(), ed_layout, push_data.dwords.data(), push_dwords,
+		                       ed_eligible);
 	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
 	const auto push_cursor = [&](uint32_t cursor) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
@@ -3522,6 +3545,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	if (writes) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader);
+	}
+	if (ed_measure) {
+		const int c = EmisionDraws::t_cont ? 1 : 0;
+		EmisionDraws::g_cyc[c][EmisionDraws::F3] += ed_t9 - ed_t3;
+		EmisionDraws::g_cyc[c][EmisionDraws::F9] += ed_t4 - ed_t9;
+		EmisionDraws::g_cyc[c][EmisionDraws::F4] += __rdtsc() - ed_t4;
+		++EmisionDraws::g_calls[c];
 	}
 	emit.command     = vk_buffer;
 	emit.generation  = buffer.GraphicsGeneration();
