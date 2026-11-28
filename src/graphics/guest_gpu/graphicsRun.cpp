@@ -65,6 +65,7 @@
 #include "render1.h" // (render1 F0+F1)
 #include "local/normal-why.h" // (vg1)
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
+#include "local/postnativo.h" // (postnativo, KYTY_POSTNATIVO: contador del tramo del postproceso)
 #include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
 #include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
 #include "local/recorrido-rapido.h" // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
@@ -2376,6 +2377,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		pm4_clock.Key(packet_header); // (otros1)
 		CensoPm4::Packet(CensoPm4::KeyOf(packet_header)); // (w18)
 		G1::WalkDecoded(Pm4ClassOf(opcode) == LiveCensus::Pm4Draw); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
+		// (postnativo, KYTY_POSTNATIVO con KYTY_TECHO=1) draws / dispatches / user data del tramo PostProcessing del juego.
+		if (PostNativo::Mode() != 0 && !m_state_only && spec == nullptr) {
+			const auto pclass = Pm4ClassOf(opcode);
+			if (pclass == LiveCensus::Pm4Draw || pclass == LiveCensus::Pm4Dispatch) {
+				const auto& vs = m_sh_ctx.GetVs();
+				PostNativo::Work(opcode, pclass == LiveCensus::Pm4Draw, vs.es_regs.data_addr ^ (vs.gs_regs.data_addr << 1u),
+				                 m_sh_ctx.GetPs().ps_regs.data_addr, m_sh_ctx.GetCs().cs_regs.data_addr,
+				                 m_ctx.GetRenderTarget(0).base.addr, m_ctx.GetDepthRenderTarget().z_read_base_addr);
+			} else if (opcode == Pm4::IT_SET_SH_REG || opcode == Pm4::IT_SET_SH_REG_INDIRECT) {
+				PostNativo::ShWrite();
+			}
+		}
 		if (rare && DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu && DsNativoSombras::Mode() == 2)
 			DsNativoSombras::GpuNotePacket(opcode, packet, remaining_dw, m_sh_ctx.GetCs().cs_regs.data_addr); // (F5 pase 2, =2)
 		// (otros1, KYTY_OTROS1) The register pairs an indirect block carries (its handler and the draw state observer
@@ -4978,6 +4991,7 @@ void CommandProcessor::Flip() {
 	NativeFlipSync(GetGpuResources(), m_state_only);
 	if (!m_state_only) // (f5, KYTY_NATIVE_RENDER=map; f5b: the per-pass ceiling's windows read the GPU thread's times)
 		NativeRender::Flip(LiveControl::g_render_idle_ns, LiveCensus::g_kind_cycles[LiveCensus::Submission]);
+	if (!m_state_only && PostNativo::Mode() != 0) PostNativo::Flip(); // (postnativo)
 	if (!m_state_only) PathTrace::Flip(); // (pt1, BB_PATHTRACING: its frame, calibrations and 5 s line; nothing when off)
 	LiveControl::Flip();
 	FrameCapture::OnFlip();

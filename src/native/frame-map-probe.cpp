@@ -259,6 +259,12 @@ RunMode ReadRunMode() noexcept {
 	const char* v = std::getenv("KYTY_NATIVE_RENDER");
 	// (pt1) BB_PATHTRACING=1 needs the game's scopes (its passes and capture are placed by them): the map, unless set.
 	if ((v == nullptr || v[0] == '\0') && Libs::Graphics::PathTrace::Requested()) v = "map";
+	// (postnativo) KYTY_POSTNATIVO=1..3 con KYTY_TECHO=1 cuenta el tramo del ambito PostProcessing: el mapa, si no esta puesto.
+	if (v == nullptr || v[0] == '\0') {
+		const char* pn = std::getenv("KYTY_POSTNATIVO");
+		const char* te = std::getenv("KYTY_TECHO");
+		if (pn != nullptr && pn[0] >= '1' && pn[0] <= '3' && te != nullptr && te[0] == '1') v = "map";
+	}
 	if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0) return RunMode::Off;
 	RunMode mode = RunMode::Off;
 	if (std::strcmp(v, "map") == 0) mode = RunMode::FrameMap;

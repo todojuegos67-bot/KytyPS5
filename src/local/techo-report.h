@@ -7,6 +7,7 @@
 #include "local/techo.h"
 #include "local/techo-faltas.h"
 #include "local/techo-escena.h"
+#include "local/postnativo.h"
 #include "local/buffercache-par.h" // (buffercache-par)
 #include "local/bloques-rapido.h"
 #include "local/trad1-prueba.h"
@@ -222,6 +223,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		            keep ? "" : " (arranque: fuera de la tabla)");
 		std::fflush(stdout);
 		TechoEscena::Window(busy, n * 1e3 / wall_ms, n, keep);    // (techo-escena, solo prueba)
+		PostNativo::Window(busy, n * 1e3 / wall_ms, n, keep);     // (postnativo, contador del postproceso)
 		BloquesRapido::Window(busy, n * 1e3 / wall_ms, n, keep);  // (bloques-rapido)
 		Trad1Prueba::Window(busy, n, keep);                      // (trad1-prueba, KYTY_TRAD1_PRUEBA)
 		RegsRapido::Window(busy, n, keep);                      // (regs-rapido, KYTY_REGS_RAPIDO)
