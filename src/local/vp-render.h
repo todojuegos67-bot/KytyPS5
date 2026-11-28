@@ -1,7 +1,7 @@
 #pragma once
 // (vp-render) Dos cosas del hilo de render que valen para todo el juego (con o sin KYTY_TEJ):
 //
-// 1) KYTY_VP_RENDER (0 apagado por defecto; =1 encendido; =2 A/B cada 5 s con KYTY_TECHO=1): las LIBERACIONES DE
+// 1) KYTY_VP_RENDER (1 encendido por defecto; =0 apagado; =2 A/B cada 5 s con KYTY_TECHO=1): las LIBERACIONES DE
 //    ESCRITURA del hilo de render (UpdateRegionWatchers, origen write-release: solo lectura -> lectura/escritura) se
 //    dejan al hilo de liberacion, igual que KYTY_RAIZ_ASYNC_RELEASE (encendido por defecto) ya hace con las de lectura:
 //    la pagina se marca (Region::deferred), su estado ya dice liberada y el host sigue en solo lectura (MAS estricto)
@@ -14,7 +14,7 @@
 //    read-flush 148 / 0.76 ms, write-track 50 / 0.10 ms; LAG4: 394-490 VirtualProtect/fot, 1.28-1.58 ms/fot.
 //    No es identico al 100 % (una escritura del juego antes de que se aplique cuesta una falta en SU hilo, contada en
 //    [raiz] ASYNC RELEASE "fault"): por eso apagado por defecto hasta medirlo.
-// 2) KYTY_RENDER_IDEAL (0 apagado por defecto; =1; =2 A/B): procesador IDEAL (SetThreadIdealProcessorEx: solo una
+// 2) KYTY_RENDER_IDEAL (1 encendido por defecto; =0 apagado; =2 A/B): procesador IDEAL (SetThreadIdealProcessorEx: solo una
 //    preferencia, no afinidad dura) del hilo de render: un nucleo P (hibridos), de la L3 grande (X3D), nunca el nucleo
 //    del CPU 0 (interrupciones), el primer hilo SMT del nucleo. Con KYTY_RENDER_CPUS (afinidad dura) no se toca.
 //    LAG4: el render migra 1.66-2.83 veces/fot (aparece en los nucleos 0 y 11; KYTY_VCACHE_PIN=0 en ese log).
@@ -30,8 +30,10 @@
 namespace VpRender {
 
 [[nodiscard]] inline int ModeOf(const char* name) {
+	// (28/11) ENCENDIDO POR DEFECTO: medido en el PC del usuario (log 20261128-105930, build 9378cf3): VirtualProtect
+	// del render 1.28-1.58 -> 0.83-0.94 ms/fot y migraciones 1.66-2.83 -> 1.17-1.48/fot, sin errores. =0 lo apaga.
 	const char* v = std::getenv(name);
-	int         m = v != nullptr ? std::atoi(v) : 0;
+	int         m = v != nullptr ? std::atoi(v) : 1;
 	if (m != 1 && m != 2) m = 0;
 	if (m == 2 && !Techo::On()) m = 1; // (A/B solo con KYTY_TECHO=1; sin el, encendido)
 	return m;
