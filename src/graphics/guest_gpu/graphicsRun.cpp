@@ -64,6 +64,7 @@
 #include "render1.h" // (render1 F0+F1)
 #include "local/normal-why.h" // (vg1)
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
+#include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -297,6 +298,16 @@ static bool RegLanePacket(const uint32_t* commands, uint32_t at, uint32_t total)
 	const uint32_t header = commands[at];
 	return (header >> 30u) == 3u && (header & 1u) == 0 && RegLaneOpcode((header >> 8u) & 0xffu) &&
 	       KYTY_PM4_LEN(header) <= total - at;
+}
+// (regs-rapido, KYTY_REGS_RAPIDO; local/regs-rapido.h) A whole 5-dword SET_*_REG_INDIRECT block packet without the
+// predicate bit at dword `at` of `total` (Agc's per-draw register blocks, FUN_01d182f0 / FUN_01d185d0).
+static bool RegsIndirectPacket(const uint32_t* commands, uint32_t at, uint32_t total) {
+	if (at >= total || total - at < 5) return false;
+	const uint32_t header = commands[at];
+	const uint32_t op     = (header >> 8u) & 0xffu;
+	return (header >> 30u) == 3u && (header & 1u) == 0 && KYTY_PM4_LEN(header) == 5u &&
+	       (op == Pm4::IT_SET_CONTEXT_REG_INDIRECT || op == Pm4::IT_SET_SH_REG_INDIRECT ||
+	        op == Pm4::IT_SET_UCONFIG_REG_INDIRECT);
 }
 // Packets a lane run takes at most before the walk's per-packet work runs again (the guest commands and the copy
 // feedback between packets wait at most this long: ~64 register packets, a few microseconds).
@@ -2216,6 +2227,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	};
 	LiveCensus::Pm4Clock pm4_clock; // (render3, KYTY_RENDER_STATS: the walk's time by packet class; nothing otherwise)
 	const uint32_t       lane_mode = Render5::Mode(Render5::RegLane); // (render5, KYTY_REG_LANE)
+	// (regs-rapido, KYTY_REGS_RAPIDO) The indirect register blocks join the lane (mode 1 only, and only while no mode that
+	// acts on them between packets is on: par1 unlocked runs, render1=2 batches, port1, path tracing, shadows=2).
+	const bool regs_lane = lane_mode == 1 && RegsRapido::Active() && !ParQueues::On() && Render1::Mode() != 2 &&
+	                       Port1::Mode() == 0 && !PathTrace::Requested() && DsNativoSombras::Mode() != 2 &&
+	                       !NativeRender::WalkOn();
+	const auto lane_packet = [&](const uint32_t* commands, uint32_t at, uint32_t total) {
+		return RegLanePacket(commands, at, total) || (regs_lane && RegsIndirectPacket(commands, at, total));
+	};
 	// (otros1, KYTY_OTROS1: with KYTY_RENDER_STATS, the walk's time by packet kind, otros1.h)
 	const bool otros1_on = Otros1::Mode() != 0 && LiveCensus::RenderStatsOn();
 	// (otros2, KYTY_OTROS2: A, otros2.h) The preamble waits past steps that cannot need it; `pre_skips` steps since it
@@ -2406,7 +2425,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// walk would have acted on (a difference) are counted ([render5]).
 		if (lane_mode != 0 && spec == nullptr && !m_state_only && m_chunk_every == 0 && m_stop_at == nullptr &&
 		    g_gpu_state != nullptr && !GraphicsRunDebugDumpEnabled() &&
-		    RegLanePacket(cursor.commands.data(), cursor.offset_dw, total_dw)) {
+		    lane_packet(cursor.commands.data(), cursor.offset_dw, total_dw)) {
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 			const bool observe = kyty_local_native_xpr_mode.load(std::memory_order_relaxed) != 0 &&
 			                     (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) == 0;
@@ -2448,6 +2467,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					pm4_clock.Key(header); // (otros1)
 					CensoPm4::Packet(CensoPm4::KeyOf(header)); // (w18)
 				}
+				// (regs-rapido) An indirect block after the run's first packet: the preamble first, as the walk runs it
+				// before every such packet (never postponed for one: not a lane opcode for otros2 either).
+				if (taken != 0 && regs_lane && !RegLaneOpcode(op)) {
+					pre_skips = 0;
+					preamble();
+					EXIT_IF(execution.m_buffer_stack.size() != buffer_index + 1); // (the walk assumes the same)
+				}
+				if (regs_lane && !RegLaneOpcode(op)) RegsRapido::Note(RegsRapido::g_taken);
 				const auto handler = g_cp_op_func[op];
 				if (verify && (!KeepsDeferredProtection(op) || handler == nullptr || header == DsLinearCopyHook::Header))
 					++Render5::g_lane[Render5::LaneDifferent];
@@ -2480,7 +2507,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					cursor.offset_dw++;
 					++taken;
 				}
-				if (taken >= RegLaneMaxPackets || !RegLanePacket(cursor.commands.data(), cursor.offset_dw, total_dw)) break;
+				if (taken >= RegLaneMaxPackets || !lane_packet(cursor.commands.data(), cursor.offset_dw, total_dw)) break;
 			}
 			} // (par1: the queue lock again)
 			// (par1) The other thread may have begun its slice meanwhile: the open command buffer, shared, is bound to its
@@ -2493,6 +2520,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			Render5::g_lane[Render5::LanePackets] += taken;
 			if (taken != 0) continue;
 		}
+		// (regs-rapido) An indirect block the lane did not take, by reason.
+		if (RegsRapido::Mode() != 0 && spec == nullptr && !m_state_only &&
+		    (opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+		     opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT))
+			RegsRapido::Note(RegsRapido::g_why[!RegsRapido::Active() ? RegsRapido::WOff
+			                                   : KYTY_PM4_LEN(packet_header) != 5u ? RegsRapido::WLen
+			                                                                       : RegsRapido::WModes]);
 		// A state pass's chunk boundary (SetChunking): not within a run of indirect draws, which a translation takes
 		// together (the packet runs when the pass resumes, counted again).
 		if (m_chunk_every != 0 && IsChunkWork(opcode)) {
