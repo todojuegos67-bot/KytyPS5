@@ -8,6 +8,8 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "local/audio-modos.h"
+#include "local/audio-exacto.h"
+#include <cmath>
 
 #include <algorithm>
 #include <array>
@@ -210,6 +212,9 @@ struct AudioOut2PortStateEntry {
 	// [audio-modos] grains in a row this port was fed, and whether it counts as fed every grain.
 	uint32_t               fed_run    = 0;
 	bool                   per_grain  = false;
+	// [audio-exacto] object attribute 3 (listener-relative x, y, z) and how many grains carried one.
+	bool                   has_pos    = false;
+	float                  pos[3]     = {0.0f, 0.0f, 0.0f};
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -243,6 +248,7 @@ static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_POSITION   = 3;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
 static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL           = 0x40;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
@@ -436,7 +442,8 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 // that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
 // the front left and right of the context's first float main port. Adding the 36 channels up instead
 // cancelled most directions.
-static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
+static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target,
+                                                const void* bed_data) {
 	constexpr float HALF_POWER = 0.70710677f;
 	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
 	constexpr float W_GAIN = 0.85355339f;
@@ -466,9 +473,16 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			} else {
 				continue;
 			}
+		} else if (object.has_pos && AudioExacto::PosMode() != 0) {
+			// [audio-exacto] KYTY_AUDIO_POS: constant-power pan by the object's azimuth (x right, z ahead; =2 mirrored).
+			const float x  = AudioExacto::PosMode() == 2 ? -object.pos[0] : object.pos[0];
+			const float az = std::atan2(x, object.pos[2]);
+			const float p  = std::clamp(std::sin(az), -1.0f, 1.0f);
+			left           = std::cos((p + 1.0f) * 0.78539816f);
+			right          = std::sin((p + 1.0f) * 0.78539816f);
 		}
 		if (!mixed) {
-			const auto* bed = static_cast<const float*>(target.pcm_data);
+			const auto* bed = static_cast<const float*>(bed_data);
 			mix.assign(bed, bed + static_cast<size_t>(frames) * channels);
 			mixed = true;
 		}
@@ -480,7 +494,7 @@ static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, cons
 			mix[static_cast<size_t>(frame) * channels + 1] += in[frame] * right;
 		}
 	}
-	return mixed ? mix.data() : target.pcm_data;
+	return mixed ? mix.data() : bed_data;
 }
 
 // Before a push queues the context's grain: the ports the game gave no PCM since the last push count as unfed. Issue #40:
@@ -573,6 +587,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	// The gains live in the port states, which the call below reads after the lock is dropped: keep
 	// a copy per parameter (fixed size, so these addresses stay put).
 	std::array<std::array<float, 16>, AudioInternal::OUT_PORTS_MAX> gain_storage {};
+	thread_local std::array<std::vector<float>, AudioInternal::OUT_PORTS_MAX> scaled_storage;
 
 	g_audioout2_port_mutex.Lock();
 	audioout2_note_grain_locked(ctx);
@@ -586,11 +601,28 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 				data = AudioModos::Silence(static_cast<size_t>(state.samples_num) *
 				                           audioout2_data_format_channels(state.data_format) * (is_float ? 4u : 2u));
 			}
+			// [audio-exacto] KYTY_AUDIO_EXACTO=1: a main port's attribute 1 gains scale it (the game's master level),
+			// before the objects join it (their own gain carries that level already).
+			const auto type = state.port_type & 0xffu;
+			if (AudioExacto::Enabled() && state.gains_set && !audioout2_port_type_is_object(state.port_type) &&
+			    (type == 0 || type == 1 || type == 2 || type == 4 || type == 5) &&
+			    (state.data_format & 0x7fu) == 0 && params.size() < scaled_storage.size()) {
+				const auto ch = audioout2_data_format_channels(state.data_format);
+				bool unity = true;
+				for (uint32_t c = 0; c < ch; c++) unity = unity && state.gains[c] == 1.0f;
+				if (!unity) {
+					auto&       out = scaled_storage[params.size()];
+					const auto* in  = static_cast<const float*>(data);
+					out.resize(static_cast<size_t>(state.samples_num) * ch);
+					for (size_t i = 0; i < out.size(); i++) out[i] = in[i] * state.gains[i % ch];
+					data = out.data();
+				}
+			}
 			if (!objects_mixed && (state.port_type & 0xffu) == 0 &&
 			    (state.audio_format == AudioInternal::Format::FloatStereo ||
 			     state.audio_format == AudioInternal::Format::Float8Ch ||
 			     state.audio_format == AudioInternal::Format::Float8ChStd)) {
-				data          = audioout2_mix_objects_locked(ctx, state);
+				data          = audioout2_mix_objects_locked(ctx, state, data);
 				objects_mixed = true;
 			}
 			const float* gains = nullptr;
@@ -601,8 +633,44 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 			params.push_back(AudioInternal::OutputParam {state.audio_handle, data, gains});
 		}
 	}
+	// [audio-exacto] once, at the 1000th push: what the game set up (always printed, one line block).
+	static std::atomic<uint32_t> exacto_pushes {0};
+	char exacto_line[640] = {};
+	int  exacto_handle    = 0;
+	if (exacto_pushes.fetch_add(1, std::memory_order_relaxed) == 999) {
+		uint32_t mains = 0, m8 = 0, m2 = 0, m1 = 0, objects = 0, ambi = 0, positioned = 0, fed = 0;
+		float    gain0 = -1.0f;
+		for (const auto& st: g_audioout2_ports) {
+			if (!st.used || st.context != ctx) continue;
+			if (audioout2_port_type_is_object(st.port_type)) {
+				objects++;
+				if ((st.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) ambi++;
+				else if (st.has_pos) positioned++;
+				if (st.pcm_fresh) fed++;
+				continue;
+			}
+			mains++;
+			const auto ch = audioout2_data_format_channels(st.data_format);
+			(ch == 8 ? m8 : ch == 2 ? m2 : m1)++;
+			if (exacto_handle == 0 && (st.port_type & 0xffu) == 0 && st.audio_handle > 0) {
+				exacto_handle = st.audio_handle;
+				gain0         = st.gains_set ? st.gains[0] : -1.0f;
+			}
+		}
+		std::snprintf(exacto_line, sizeof(exacto_line),
+		              "[audio-exacto] puertos principales %u (8ch %u, 2ch %u, 1ch %u), objetos %u (ambisonics %u, con posicion %u, "
+		              "con PCM este grano %u), ganancia puerto principal %.3f (-1: no puesta), mastering: el juego no lo importa; "
+		              "EXACTO %s, POS %d",
+		              mains, m8, m2, m1, objects, ambi, positioned, fed, static_cast<double>(gain0),
+		              AudioExacto::Enabled() ? "on" : "off", AudioExacto::PosMode());
+	}
 	audioout2_end_grain_locked(ctx);
 	g_audioout2_port_mutex.Unlock();
+	if (exacto_line[0] != 0) {
+		std::printf("%s, canales del dispositivo %d, SpeakerInfo tipo 0 bits 0x03 (-30/+30)\n", exacto_line,
+		            exacto_handle > 0 ? AudioInternal::AudioOutDeviceChannels(exacto_handle) : 0);
+		std::fflush(stdout);
+	}
 
 	if (params.empty()) {
 		return;
@@ -927,6 +995,8 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	bool        has_gains      = false;
 	uint32_t    ambisonics     = 0;
 	bool        has_ambisonics = false;
+	float       position[3]    = {0.0f, 0.0f, 0.0f};
+	bool        has_position   = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
@@ -955,6 +1025,11 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				has_gain    = true;
 			}
 		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_POSITION && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(AudioOut2Position)) {
+			std::memcpy(position, attributes[i].value, sizeof(AudioOut2Position));
+			has_position = std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]);
+		}
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS && attributes[i].value != nullptr &&
 		    attributes[i].value_size == sizeof(uint32_t)) {
 			std::memcpy(&ambisonics, attributes[i].value, sizeof(uint32_t));
@@ -962,7 +1037,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 		}
 	}
 
-	if (has_pcm || has_gain || has_gains || has_ambisonics) {
+	if (has_pcm || has_gain || has_gains || has_ambisonics || has_position) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
 			if (has_pcm) {
@@ -975,6 +1050,10 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 				state->gains_set = true;
 			}
 			if (has_ambisonics) state->ambisonics = ambisonics;
+			if (has_position) {
+				state->has_pos = true;
+				std::memcpy(state->pos, position, sizeof(position));
+			}
 		}
 		g_audioout2_port_mutex.Unlock();
 	}
@@ -994,11 +1073,22 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	state->reroute_counter = 0;
 	state->flags           = 0;
 
+	int audio_handle = 0;
 	g_audioout2_port_mutex.Lock();
 	if (auto* port_state = audioout2_find_port_locked(port); port_state != nullptr) {
 		state->num_channels = audioout2_data_format_channels(port_state->data_format);
+		if (!audioout2_port_type_is_object(port_state->port_type)) audio_handle = port_state->audio_handle;
 	}
 	g_audioout2_port_mutex.Unlock();
+	// [audio-exacto] KYTY_AUDIO_EXACTO=1: the output's real channels, as the console reports them. The game
+	// (FUN_01dda120) turns this into its speaker mask and mixes for it: 2 on a stereo device, not the port's 8.
+	if (AudioExacto::Enabled() && audio_handle > 0) {
+		const int dev = AudioInternal::AudioOutDeviceChannels(audio_handle);
+		if (dev > 0) {
+			const int real      = dev >= 8 ? 8 : (dev >= 6 ? 6 : (dev >= 2 ? 2 : 1));
+			state->num_channels = static_cast<uint8_t>(std::min<int>(real, state->num_channels));
+		}
+	}
 
 	// LOGF("\t port = 0x%016" PRIx64 "\n", port);
 	// LOGF("\t num_channels = %" PRIu8 "\n", state->num_channels);

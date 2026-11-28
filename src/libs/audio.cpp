@@ -102,6 +102,7 @@ public:
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
+	int      AudioOutDeviceChannels(Id handle); // [audio-exacto] the host device's real channels (0: none)
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -196,6 +197,10 @@ void AudioOutClose(int handle) {
 
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+}
+
+int AudioOutDeviceChannels(int handle) {
+	return (g_audio != nullptr && handle > 0) ? g_audio->AudioOutDeviceChannels(Audio::Id(handle)) : 0;
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -922,6 +927,15 @@ bool Audio::AudioOutHasDevice(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].audio_device != 0);
+}
+
+int Audio::AudioOutDeviceChannels(Id handle) {
+	Common::LockGuard lock(m_mutex);
+	if (handle.GetId() < 0 || handle.GetId() >= OUT_PORTS_MAX || !m_out_ports[handle.GetId()].used ||
+	    m_out_ports[handle.GetId()].audio_device == 0) {
+		return 0;
+	}
+	return m_out_ports[handle.GetId()].audio_spec.channels;
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {

@@ -38,6 +38,7 @@ static constexpr int OUT_PORTS_MAX = 32;
 int      AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format);
 void     AudioOutClose(int handle);
 bool     AudioOutHasDevice(int handle);
+int      AudioOutDeviceChannels(int handle); // [audio-exacto]
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking = true);
 
 // KYTY_AUDIO_STATS (on unless =0): every 5 s the run log shows what each audio stage carried (AJM decodes,
