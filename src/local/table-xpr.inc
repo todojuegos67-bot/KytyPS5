@@ -2736,6 +2736,7 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 			why = Do2Rapido::WNoSnap;
 		} else if (Do2Rapido::t_seq != s.seq + 1) {
 			why = Do2Rapido::WSeq;
+			Do2Rapido::g_seq_op[Do2Rapido::t_prev_op & 511u].fetch_add(1, std::memory_order_relaxed);
 		} else if (s.pair != &pair || s.variant != &variant || s.state != &draw_state || s.programs[0] != pair.programs[0] ||
 		           s.programs[1] != pair.programs[1] || s.frame != m_context.FrameNumber() ||
 		           s.shader_gen != ShaderMapGeneration() || s.index_type != static_cast<uint32_t>(index_type) ||
@@ -2753,9 +2754,16 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		           bcache.RegistrationEpoch() != s.registration || m_context.GetGpuResources().MappingEpoch() != s.mapping) {
 			why = Do2Rapido::WEpoch;
 		} else if (HwScene::Active() || Render1::Mode() != 0 || PortR::Verifying() || LiveCensus::Mdraw::Active() ||
-		           TrustedDepth::Mode() != 0 || TrustedDepth::StatsOn() || NativeRender::NoteTargetsWanted() ||
 		           (kyty_local_native_xpr_diag.load(std::memory_order_relaxed) & 16u) != 0) {
+			// (The trusted-depth registry takes no direct draw (trust_depth: direct == nullptr); a verified pass's
+			// targets are noted below as the normal path notes them.)
 			why = Do2Rapido::WExcluded;
+			const uint32_t x = HwScene::Active()                    ? Do2Rapido::XHwScene
+			                   : Render1::Mode() != 0               ? Do2Rapido::XRender1
+			                   : PortR::Verifying()                 ? Do2Rapido::XPortR
+			                   : LiveCensus::Mdraw::Active()        ? Do2Rapido::XMdraw
+			                                                        : Do2Rapido::XDiag16;
+			Do2Rapido::g_excl[x].fetch_add(1, std::memory_order_relaxed);
 		} else {
 			bool same_ud = true;
 			for (uint32_t st = 0; st < 2 && same_ud; ++st) {
@@ -2796,6 +2804,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 					if (r.IsDepth() && r.resources.layers >= 4 && r.extent.width == r.extent.height && r.extent.width >= 512)
 						FrameGen::OnSunCascadeDraw(pair.programs[0]->shader_hash, slots, t.range.base_layer, r.data.address);
 				}
+				// (f5b) A verified pass's targets, as the normal path notes them.
+				if (NativeRender::NoteTargetsWanted())
+					for (const auto& target: draw_state.targets)
+						NativeRender::NoteTarget(target.id.index, target.id.generation, target.range.base_level,
+						                         target.range.base_layer, target.requested.IsDepth());
 				// This draw's offsets, as the normal path's direct draw gives them.
 				const auto& vertex = *pair.programs[0];
 				const auto  word   = [&](int32_t sgpr) {

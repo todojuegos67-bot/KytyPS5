@@ -86,16 +86,32 @@ inline bool RegisterOnly(uint32_t opcode, uint32_t r_field) {
 		case 0x76: // IT_SET_SH_REG
 		case 0x79: // IT_SET_UCONFIG_REG
 		case 0x7a: // IT_SET_UCONFIG_REG_INDEX
+		case 0x9f: // IT_SET_CONTEXT_REG_INDIRECT (pares registro/valor leidos de memoria: solo registros)
+		case 0x63: // IT_SET_SH_REG_INDIRECT
+		case 0x64: // IT_SET_UCONFIG_REG_INDIRECT
 		case 0x26: // IT_INDEX_BASE
 		case 0x13: // IT_INDEX_BUFFER_SIZE
 		case 0x2a: // IT_INDEX_TYPE
 		case 0x2f: // IT_NUM_INSTANCES
+		case 0x11: // IT_SET_BASE (bases de argumentos indirectos: registro)
 			return true;
-		case 0x10: // IT_NOP (no los que cambian contexto: el observador los invalida)
-			return r_field == 0;
+		case 0x10: // IT_NOP: solo las marcas push/pop (R_ZERO es el anuncio de copia lineal: escribe memoria)
+			return r_field == 0x0b || r_field == 0x0c;
 		default: return false;
 	}
 }
+
+// (diagnostico) El ultimo paquete no-registro antes del draw actual (0x100 | R para un NOP), y su histograma en los
+// draws que fallan por "paquetes-entre"; los motivos de "excluido".
+inline thread_local uint32_t t_cur_op = 0, t_prev_op = 0;
+inline void NoteBump(uint32_t code) {
+	t_prev_op = t_cur_op;
+	t_cur_op  = code;
+}
+inline std::atomic<uint64_t> g_seq_op[512] {};
+enum Excl : uint32_t { XHwScene, XRender1, XPortR, XMdraw, XDiag16, XCount };
+inline constexpr const char* ExclNames[XCount] = {"hwscene", "render1", "port-r", "mdraw", "diag16"};
+inline std::atomic<uint64_t> g_excl[XCount] {};
 
 // Ventana de 5 s de [techo] (hilo del informe).
 inline void Window(double busy_ms, double frames, bool keep) {
@@ -125,7 +141,25 @@ inline void Window(double busy_ms, double frames, bool keep) {
 	std::printf("[do2-rapido] ventana %s: render ocupado %.2f ms | atajo %.0f/fot, aptos sin usar (A) %.0f/fot, normal %.0f/fot (",
 	            m == 2 ? (was ? "B (atajo)" : "A (normal)") : "atajo", busy_ms, t / frames, w / frames, f / frames);
 	for (uint32_t i = 0; i < WCount; ++i) std::printf("%s%s %.0f", i ? ", " : "", WhyNames[i], why[i] / frames);
-	std::printf(")");
+	std::printf(") | entre:");
+	{
+		uint64_t v[512];
+		for (uint32_t i = 0; i < 512; ++i) v[i] = g_seq_op[i].exchange(0, std::memory_order_relaxed);
+		for (int top = 0; top < 6; ++top) {
+			uint32_t best = 0;
+			for (uint32_t i = 1; i < 512; ++i)
+				if (v[i] > v[best]) best = i;
+			if (v[best] == 0) break;
+			if (best >= 0x100) std::printf(" NOP/R%02x %.0f", best & 0xffu, static_cast<double>(v[best]) / frames);
+			else std::printf(" op%02x %.0f", best, static_cast<double>(v[best]) / frames);
+			v[best] = 0;
+		}
+	}
+	std::printf(" | excluido:");
+	for (uint32_t i = 0; i < XCount; ++i) {
+		const double x = static_cast<double>(g_excl[i].exchange(0, std::memory_order_relaxed));
+		if (x > 0) std::printf(" %s %.0f", ExclNames[i], x / frames);
+	}
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (negativo = ahorro)", cnt[0], cnt[1], delta);
 	std::printf("\n");
