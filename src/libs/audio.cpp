@@ -13,6 +13,7 @@
 #include "kernel/semaphore.h"
 #include "libs/audio_internal.h"
 #include "libs/audio_latency.h"
+#include "local/audio-fix.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
@@ -656,6 +657,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	// (A stream that went on: a port the game left quiet for 200 ms and more is starting again, not underrunning.)
 	if (port->last_output_time != 0 && queue_size != 0 && now - port->last_output_time < 200000) {
 		if (queued_bytes == 0) {
+			AudioFix::g_underruns.fetch_add(1, std::memory_order_relaxed);
 			++port->stat_underruns;
 			++port->gap_underruns;
 			static const bool adapt = [] {
@@ -730,7 +732,13 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		const uint32_t frames      = sample_size * channels != 0 ? queue_size / (sample_size * channels) : 0;
 		const auto     decision    = Latency::Decide(queued_us, target_us, frames);
 		static std::atomic<uint32_t> cap_clears {0}, cap_shortened {0};
+		if (decision.action == Latency::Action::Clear && AudioFix::Enabled()) {
+			// (KYTY_AUDIO_FIX: only this grain is left out; the queued sound plays on, no hole.)
+			AudioFix::g_cap_kept.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
 		if (decision.action == Latency::Action::Clear) {
+			AudioFix::g_cap_clears.fetch_add(1, std::memory_order_relaxed);
 			SDL_ClearQueuedAudio(port->audio_device);
 			const auto count = cap_clears.fetch_add(1, std::memory_order_relaxed) + 1;
 			if (count <= 20 || count % 100 == 0) {
@@ -773,6 +781,12 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		const auto wait_start      = now;
 		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
+				if (AudioFix::Enabled()) {
+					// (KYTY_AUDIO_FIX: the device is stalled; stop waiting, keep what is queued.)
+					AudioFix::g_drain_kept.fetch_add(1, std::memory_order_relaxed);
+					break;
+				}
+				AudioFix::g_drain_clears.fetch_add(1, std::memory_order_relaxed);
 				SDL_ClearQueuedAudio(port->audio_device);
 				if (log_queue) {
 					std::printf("AudioOut: port type %d queue cleared after 200 ms without draining (#%u)\n", port->type,
@@ -1064,7 +1078,12 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	if (AudioInternal::StatsWanted()) NoteOutputs(params, num);
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
-		if (port.type == AUDIO_OUT_PORT_TYPE_MAIN && port.audio_device != 0) NoteSilenceGap(&port, params[i].data);
+		if (port.type == AUDIO_OUT_PORT_TYPE_MAIN && port.audio_device != 0) {
+			NoteSilenceGap(&port, params[i].data);
+			if (port.last_output_time != 0 && current_time > port.last_output_time)
+				AudioFix::NoteGap(current_time - port.last_output_time);
+			AudioFix::OnMainOutput(current_time);
+		}
 	}
 
 	for (uint32_t i = 0; i < num; i++) {
