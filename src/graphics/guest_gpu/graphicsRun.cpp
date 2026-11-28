@@ -2389,6 +2389,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				PostNativo::ShWrite();
 			}
 		}
+		// (luz-nativa, medida) bytes PM4 de los ambitos de iluminacion abiertos.
+		if (PostNativo::Mode() != 0 && !m_state_only && spec == nullptr && packet_header != 0x80000000u &&
+		    (packet_header >> 30u) == 3u && KYTY_PM4_LEN(packet_header) <= remaining_dw) {
+			const bool memw = opcode == Pm4::IT_WRITE_DATA || opcode == Pm4::IT_EVENT_WRITE_EOP || opcode == Pm4::IT_RELEASE_MEM ||
+			                  (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM);
+			PostNativo::Luz::Packet(packet, KYTY_PM4_LEN(packet_header), opcode, memw, opcode == Pm4::IT_SET_SH_REG);
+		}
 		if (rare && DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu && DsNativoSombras::Mode() == 2)
 			DsNativoSombras::GpuNotePacket(opcode, packet, remaining_dw, m_sh_ctx.GetCs().cs_regs.data_addr); // (F5 pase 2, =2)
 		// (otros1, KYTY_OTROS1) The register pairs an indirect block carries (its handler and the draw state observer

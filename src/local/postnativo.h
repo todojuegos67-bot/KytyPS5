@@ -224,8 +224,14 @@ struct Scope {
 	uint64_t              hash = 0xcbf29ce484222325ull, prev = 0;
 	bool                  have_prev = false;
 	std::vector<uint64_t> pipes;
+	// (luz-nativa, medida de fase 1) bytes PM4 del tramo: todo el paquete (b) y sin los que escriben memoria
+	// (RELEASE_MEM / EVENT_WRITE_EOP / WRITE_DATA, con direcciones de anillo por fotograma) (bs); user data SH (ud).
+	uint64_t bh = 0xcbf29ce484222325ull, bsh = 0xcbf29ce484222325ull, udh = 0xcbf29ce484222325ull;
+	uint64_t bprev = 0, bsprev = 0, udprev = 0;
+	uint32_t pk = 0, dw = 0, memw = 0, ud = 0;
 	// acumulado de la ventana
 	uint64_t w_draws = 0, w_disp = 0, w_pipes = 0, w_frames = 0, w_same = 0, w_diff = 0;
+	uint64_t w_bsame = 0, w_bssame = 0, w_udsame = 0, w_pk = 0, w_dw = 0, w_memw = 0, w_ud = 0;
 	int64_t  last_ns = 0;
 };
 struct State {
@@ -263,12 +269,40 @@ inline void Work(uint32_t opcode, bool draw, uint64_t vs, uint64_t ps, uint64_t 
 	}
 }
 
+// Cada paquete PM4 (hilo GPU) con su longitud ya validada: se pliega en los ambitos abiertos.
+inline void Packet(const uint32_t* p, uint32_t len, uint32_t opcode, bool mem_write, bool sh_write) {
+	if (g == nullptr || !g->any || !NativeRender::Cut::OnGpuThread()) return;
+	const uint32_t n = len < 64u ? len : 64u;
+	for (auto& sc : g->s) {
+		if (sc.id == NativeRender::NoPass || !NativeRender::Cut::IsOpen(sc.id)) continue;
+		++sc.pk, sc.dw += len;
+		uint64_t h = sc.bh;
+		for (uint32_t i = 0; i < n; ++i) h = Fold(h, p[i]);
+		sc.bh = h;
+		if (mem_write) {
+			++sc.memw;
+			sc.bsh = Fold(sc.bsh, opcode);
+		} else {
+			sc.bsh = h ^ sc.bsh * 31u;
+		}
+		if (sh_write) {
+			++sc.ud;
+			for (uint32_t i = 1; i < n; ++i) sc.udh = Fold(sc.udh, p[i]);
+		}
+	}
+}
+
 inline void Flip() {
 	if (g == nullptr) return;
 	std::lock_guard<std::mutex> lk(g_mx);
 	for (auto& sc : g->s) {
 		if (sc.draws + sc.disp != 0) {
 			++sc.w_frames;
+			if (sc.have_prev) {
+				sc.w_bsame += sc.bh == sc.bprev, sc.w_bssame += sc.bsh == sc.bsprev, sc.w_udsame += sc.udh == sc.udprev;
+			}
+			sc.bprev = sc.bh, sc.bsprev = sc.bsh, sc.udprev = sc.udh;
+			sc.w_pk += sc.pk, sc.w_dw += sc.dw, sc.w_memw += sc.memw, sc.w_ud += sc.ud;
 			if (sc.have_prev) ++(sc.hash == sc.prev ? sc.w_same : sc.w_diff);
 			sc.prev = sc.hash, sc.have_prev = true;
 			sc.w_draws += sc.draws, sc.w_disp += sc.disp, sc.w_pipes += Distinct(sc.pipes);
@@ -277,6 +311,8 @@ inline void Flip() {
 		}
 		sc.draws = sc.disp = 0;
 		sc.hash = 0xcbf29ce484222325ull;
+		sc.bh = sc.bsh = sc.udh = 0xcbf29ce484222325ull;
+		sc.pk = sc.dw = sc.memw = sc.ud = 0;
 		sc.pipes.clear();
 	}
 }
@@ -297,6 +333,19 @@ inline void Window(double busy_ms, double frames) {
 		            static_cast<unsigned long long>(sc.w_frames), sc.w_draws / d, sc.w_disp / d, sc.w_pipes / d,
 		            sd > 0 ? 100.0 * sc.w_same / sd : 0.0);
 		sc.w_draws = sc.w_disp = sc.w_pipes = sc.w_frames = sc.w_same = sc.w_diff = 0;
+	}
+	std::printf("\n");
+	// (luz-nativa) dato decisivo de la fase 1: si el PM4 del tramo (y su user data) es igual palabra a palabra al del
+	// fotograma anterior, el tramo se podria reproducir sin traducir; si solo cambian los paquetes que escriben memoria,
+	// esos se ejecutarian aparte. Sin descriptores en memoria (V#/T#/S#): eso falta aun.
+	std::printf("[luz-nativa] ambito (paquetes dw escr.mem userdata /fot; PM4 igual%% | igual sin escr.mem%% | user data igual%%):");
+	for (auto& sc : g->s) {
+		if (sc.id == NativeRender::NoPass || sc.w_frames == 0) continue;
+		const double d  = static_cast<double>(sc.w_frames);
+		const double dp = sc.w_frames > 1 ? static_cast<double>(sc.w_frames - 1) : 1.0;
+		std::printf(" | %s %.1f %.0f %.1f %.1f; %.0f%% %.0f%% %.0f%%", kName[&sc - g->s], sc.w_pk / d, sc.w_dw / d, sc.w_memw / d,
+		            sc.w_ud / d, 100.0 * sc.w_bsame / dp, 100.0 * sc.w_bssame / dp, 100.0 * sc.w_udsame / dp);
+		sc.w_bsame = sc.w_bssame = sc.w_udsame = sc.w_pk = sc.w_dw = sc.w_memw = sc.w_ud = 0;
 	}
 	std::printf("\n");
 	std::fflush(stdout);
