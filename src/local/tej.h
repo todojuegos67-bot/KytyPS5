@@ -82,10 +82,10 @@ using Libs::Graphics::Speculation;
 		if (m != 0) { // (tej-sinmutex) sin KYTY_TEJ_VAR: KYTY_TEJ_SINMUTEX (1 por defecto); con VAR solo su variante
 			const char* sm  = std::getenv("KYTY_TEJ_SINMUTEX");
 			const char* var = std::getenv("KYTY_TEJ_VAR");
-			const bool  on  = (sm == nullptr || std::atoi(sm) != 0) && (var == nullptr || std::atoi(var) == 0);
+			const bool  on  = (sm == nullptr || std::atoi(sm) != 0) && (var == nullptr || std::atoi(var) == 0 || VarCcd());
 			TejLag::g_sinmutex.store(on, std::memory_order_relaxed);
 			std::printf("[tej] KYTY_TEJ_SINMUTEX: la sombra %s el RenderMutex%s\n", on ? "NO pide" : "pide",
-			            var != nullptr && std::atoi(var) != 0 ? " (KYTY_TEJ_VAR: solo en la variante 'sin mutex')" : "");
+			            var != nullptr && std::atoi(var) != 0 && !VarCcd() ? " (KYTY_TEJ_VAR: solo en la variante 'sin mutex')" : "");
 		}
 		if (m != 0)
 			std::printf("[tej] KYTY_TEJ=%d (%s): F1b sombra paralela, SOLO MIDE (nada se cose ni se envia)\n", m,
@@ -108,12 +108,21 @@ inline std::atomic<bool> g_ab_on {false};
 //   compite menos tiempo con el render por memoria/driver?).
 //   7 muestreo 1/8 (tej-lag4: sin mutex, la sombra solo recibe DCB 1 de cada 8 tramos de 40 ms).
 inline constexpr int    VarN = 8;
-inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes", "sin mutex",
+inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "CCD contrario al defecto", "cortes", "sin mutex",
                                               "N=1 otro CCD normal", "muestreo 1/8"};
+// (tej-ccd) KYTY_TEJ_VAR=ccd: solo dos variantes B alternas, 0 (CCD por defecto) y 3 (CCD contrario), cada una entre dos
+// A y con el RenderMutex como sin VAR (KYTY_TEJ_SINMUTEX): una sola partida decide 'mismo' contra 'otro'.
+[[nodiscard]] inline bool VarCcd() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEJ_VAR");
+		return v != nullptr && std::strcmp(v, "ccd") == 0;
+	}();
+	return on;
+}
 [[nodiscard]] inline bool VarOn() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEJ_VAR");
-		return v != nullptr && std::atoi(v) != 0;
+		return v != nullptr && (std::atoi(v) != 0 || std::strcmp(v, "ccd") == 0);
 	}();
 	return on;
 }
@@ -355,11 +364,14 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 
 [[nodiscard]] inline uint32_t CoresIn(uint64_t mask);
 // (tej-lag) KYTY_TEJ_CCD: mismo/0 = L3 del render (como antes); otro/1 = OTRA L3 (en X3D el CCD sin V-Cache: el render se queda
-// su L3 entera); por defecto 1 si la otra L3 tiene >= 2 nucleos de rendimiento en la mascara del proceso, si no 0.
+// su L3 entera); auto/-1 = otro si la otra L3 tiene >= 2 nucleos de rendimiento. (tej-ccd) Por defecto MISMO: dato
+// KYTY_TEJ_VAR (9950X3D) mismo CCD +0.96 ms contra otro +1.87; la sombra lee y escribe lineas que el render usa (cerrojos de
+// seguimiento 5170/fot, cachés): dentro de la L3 el traspaso de linea es ~40-50 ns, entre CCD ~100-200 (banco tej-linea).
 [[nodiscard]] inline int CcdPref() {
 	static const int v = [] {
 		const char* e = std::getenv("KYTY_TEJ_CCD");
-		if (e == nullptr) return -1;
+		if (e == nullptr) return 0;
+		if (std::strcmp(e, "auto") == 0) return -1;
 		if (std::strcmp(e, "mismo") == 0) return 0; // (simula una CPU de una sola L3)
 		if (std::strcmp(e, "otro") == 0) return 1;
 		return std::atoi(e) != 0 ? 1 : 0;
@@ -367,7 +379,7 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 	return v;
 }
 // (tej-var) La preferencia de CCD de la ventana: variante 3 = mismo.
-[[nodiscard]] inline int CcdNow() { return Var() == 3 ? 0 : Var() == 6 ? 1 : CcdPref(); }
+[[nodiscard]] inline int CcdNow() { return Var() == 3 ? (CcdPref() == 0 ? 1 : 0) : Var() == 6 ? 1 : CcdPref(); }
 // Mascara de los trabajadores: L3 elegida (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
 [[nodiscard]] inline uint64_t WorkMask(uint32_t rc) {
 	if (rc >= 64) return 0;
@@ -2394,9 +2406,13 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		static int next = 0;
 		if (!was && VarOn()) {
 			g_var.store(next, std::memory_order_relaxed);
-			TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
-			TejLag::g_sinmutex.store(next == 5 || next == 6 || next == 7, std::memory_order_relaxed); // (tej-sinmutex; tej-lag3: 6 tambien)
-			next = (next + 1) % VarN;
+			if (VarCcd()) { // (tej-ccd) solo 0 y 3; mutex como sin VAR (fijado al arrancar)
+				next = next == 0 ? 3 : 0;
+			} else {
+				TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
+				TejLag::g_sinmutex.store(next == 5 || next == 6 || next == 7, std::memory_order_relaxed); // (tej-sinmutex; tej-lag3: 6 tambien)
+				next = (next + 1) % VarN;
+			}
 		}
 		g_ab_on.store(!was, std::memory_order_relaxed);
 	}
