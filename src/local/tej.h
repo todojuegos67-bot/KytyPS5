@@ -65,6 +65,7 @@ using Libs::Graphics::Pm4ProcessResult;
 using Libs::Graphics::RenderContext;
 using Libs::Graphics::Speculation;
 
+[[nodiscard]] inline bool VarCcd(); // (tej-ccd) definida mas abajo; Mode() la usa
 [[nodiscard]] inline int Mode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_TEJ");
