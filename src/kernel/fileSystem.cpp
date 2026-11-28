@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "local/f0-measure.h" // (esperas, KYTY_ESPERAS: the game thread's file calls)
 #include "local/rando-msb.h" // (randomizer)
+#include "local/golpes.h"    // (golpes) KYTY_TECHO=1
 #include "local/soft-release.h"
 #include "local/tiron4-counters.h" // (tiron4)
 
@@ -491,6 +492,7 @@ bool IntroMovieBlocked(const char* path) {
 }
 
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
+	Golpes::InstallOnce(); // (golpes) solo con KYTY_TECHO=1: contador [golpes]
 	F0Measure::WaitScope f0w_(8, KYTY_F0_RET()); // (esperas: the game thread's file call, KYTY_ESPERAS)
 	PRINT_NAME();
 	const Tiron4::FileScope tiron4_scope(true); // (tiron4: ms in the guest's file calls)

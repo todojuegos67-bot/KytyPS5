@@ -1045,6 +1045,37 @@ __attribute__((sysv_abi, noinline)) inline void HookCreate(uint64_t obj, uint64_
 	Pending().sw = hit;
 }
 
+// (golpes) Ghidra FUN_00366130: guarda el modelo en r14 (0x366165), llama a 0x1451700 (0x36628f, el gancho B cambia
+// solo rsi/edx de esa llamada) y despues FUN_00363510(entrada, r14) (0x366363) carga "chr:/%s/%s.chrbnd" (0x23b6fec)
+// con el modelo ORIGINAL: la copia se veia como el donante pero llevaba colision/esqueleto/capsulas del soldado.
+// Gancho C (entrada de 0x363510, retorno 0x366368): con un cambio pendiente de este hilo y el modelo original en rsi,
+// rsi = modelo del donante. KYTY_DS_RANDOMIZER_CHRBND=0 lo apaga.
+inline const HookSwap*& PendingBnd() {
+	static thread_local const HookSwap* p = nullptr;
+	return p;
+}
+inline bool ChrbndOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_DS_RANDOMIZER_CHRBND");
+		return !(v != nullptr && v[0] == '0');
+	}();
+	return on;
+}
+__attribute__((sysv_abi, noinline)) inline void ChrbndHook(uint64_t, const char* name, uint64_t, uint64_t ret, uint64_t regs) {
+	const HookSwap* sw = PendingBnd();
+	PendingBnd()       = nullptr;
+	const uint64_t from = ret >= kEbootBase ? ret - kEbootBase : ret;
+	if (sw == nullptr || from != 0x366368 || name == nullptr || std::strncmp(name, sw->orig_model, sizeof(sw->orig_model)) != 0 ||
+	    std::strncmp(sw->orig_model, sw->new_model, sizeof(sw->new_model)) == 0)
+		return;
+	*reinterpret_cast<uint64_t*>(regs + 0x228) = reinterpret_cast<uint64_t>(sw->new_model);
+	static std::atomic<int> n {0};
+	if (n.fetch_add(1) < 200) {
+		std::printf("[rando] chrbnd: %s carga chr:/%s/%s.chrbnd (antes %s)\n", sw->name.c_str(), sw->new_model, sw->new_model, sw->orig_model);
+		std::fflush(stdout);
+	}
+}
+
 // Gancho B: entrada de eboot+0x1451700 (modelo y chrid de un personaje). Sonda (traza 2) y sustitucion (rando10).
 __attribute__((sysv_abi, noinline)) inline void ProbeModel(uint64_t /*self*/, const char* name, uint64_t chrid, uint64_t ret,
                                                            uint64_t regs) {
@@ -1058,6 +1089,7 @@ __attribute__((sysv_abi, noinline)) inline void ProbeModel(uint64_t /*self*/, co
 	if (const HookSwap* sw = Pending().sw; sw != nullptr && from == 0x366294 &&
 	                                       (DynVisualOnFwd() || (model == sw->orig_model && (id == sw->orig_npc || id == sw->new_npc)))) {
 		Pending().sw = nullptr;
+		PendingBnd() = sw; // (golpes) el chrbnd (colision/esqueleto) del donante, en FUN_00363510 justo despues
 		*reinterpret_cast<uint64_t*>(regs + 0x228) = reinterpret_cast<uint64_t>(sw->new_model);
 		*reinterpret_cast<uint64_t*>(regs + 0x230) = static_cast<uint64_t>(static_cast<uint32_t>(sw->new_npc));
 		static std::atomic<int> changed {0};
@@ -1248,6 +1280,8 @@ inline void InstallModelProbe() {
 		}
 		const bool mezcla_hooks = MezclaHooksOn(); // (rando26) otros mundos / turnos: tipo por gancho + IA en 0xef430
 		if (b && (HookOn() || DemonioOn() || mezcla_hooks)) InstallStub(0x359990, reinterpret_cast<uint64_t>(&HookCreate), "gancho de creacion de enemigos");
+		if (b && (HookOn() || DemonioOn() || mezcla_hooks) && ChrbndOn())
+			InstallStub(0x363510, reinterpret_cast<uint64_t>(&ChrbndHook), "chrbnd del donante en FUN_00363510");
 		if (b && DemonioOn()) {
 			InstallStub(0x1473fb0, reinterpret_cast<uint64_t>(&DemonioTraceCreate), "[demonio] traza FUN_01473fb0");
 			InstallStub(0x1472490, reinterpret_cast<uint64_t>(&DemonioTraceRemove), "[demonio] traza FUN_01472490");
