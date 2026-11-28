@@ -340,7 +340,7 @@ thread_local uint64_t g_packets       = 0;
 void TejPushDescriptors(bool capture, uint32_t id, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t set,
                         uint32_t count, const VkWriteDescriptorSet* writes) {
     using TejRepro::W;
-    TejRepro::Rec r(id, TejRepro::CSet, capture);
+    TejRepro::Rec r(id, TejRepro::CSet, capture, TejRepro::MSets);
     r.V(W(point), false), r.V(W(layout), true), r.V(W(set), false), r.V(W(count), false);
     for (uint32_t i = 0; i < count; ++i) {
         const auto& w = writes[i];
@@ -363,7 +363,8 @@ void TejPushDescriptors(bool capture, uint32_t id, VkPipelineBindPoint point, Vk
                 case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
                 case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
                     if (w.pBufferInfo == nullptr) { r.bad = true; r.V(0, false), r.V(0, false), r.V(0, false); break; }
-                    r.V(W(w.pBufferInfo[j].buffer), true), r.V(W(w.pBufferInfo[j].offset), false);
+                    // (paso A2) sin handles = tambien sin el offset: el trabajador sube a SU posicion del anillo
+                    r.V(W(w.pBufferInfo[j].buffer), true), r.V(W(w.pBufferInfo[j].offset), true);
                     r.V(W(w.pBufferInfo[j].range), false);
                     break;
                 case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
@@ -491,15 +492,19 @@ bool TejAllowed(ReplayPacket replay) {
     return false;
 }
 void TejNote(ReplayPacket replay, std::span<const Segment> segments, const std::shared_ptr<const void>& owner) {
+    // (paso A2) En el render (sin captura) un paquete que no es de draws/descriptores es trabajo propio del emulador
+    // (DLSS, hwrt): lo graba el render por su camino y no es estado de draw; no marca nada (antes: draw fantasma y
+    // t_bad del render pegado para siempre). En el trabajador, el paquete no cabe en la lista: no reproducible.
     if (!TejAllowed(replay) || segments.size() > 8) {
-        TejRepro::Bad(TejRepro::kPacket, TejRepro::CDraw);
+        if (TejRepro::t_cap != nullptr)
+            TejRepro::BadPacket(segments.size() > 8 ? "paquete de mas de 8 segmentos" : "paquete propio del emulador (DLSS/hwrt)");
         return;
     }
     if (auto* c = TejRepro::t_cap) {
         bool needs_owner = false;
         for (const auto& a : g_tej_owned) needs_owner |= a.load(std::memory_order_relaxed) == replay;
         if (needs_owner && (!owner || TejRepro::t_own == nullptr)) {
-            TejRepro::Bad(TejRepro::kPacket, TejRepro::CDraw);
+            TejRepro::BadPacket("descriptores sin dueno (cola llena: ReplayInline)");
             return;
         }
         const size_t hdr = c->size();

@@ -62,6 +62,9 @@ inline void WorkerOpen(PkInfo& p) {
 	}
 	Start();
 	if (t_on) {
+		// (paso A2) el camino directo del trabajador vuelve a grabar pipeline/estado dinamico/IB al abrir: la lista no
+		// depende de lo que SU buffer ya tenia (en el paso B se reproduce sobre el buffer del render). Solo binds de mas.
+		if (rec != nullptr && rec->command && !rec->command->IsInvalid()) rec->command->InvalidateGraphicsState();
 		// (tej-repro) captura de este paquete (la escriben los vkCmd* del trabajador y sus paquetes de draw/descriptores)
 		p.cap.clear(), p.own.clear();
 		TejRepro::t_cap = &p.cap, TejRepro::t_own = &p.own, TejRepro::t_bad = false;
@@ -87,7 +90,8 @@ enum K : uint32_t {
 	// (tej-repro) reproduccion en sombra
 	RPk, RFunnel, RFunnelDraws, RNoCap, RBad, RFail, RFirst, ROverflow, RDrawsDiff, RArgs, RArgsNh,
 	RCat0, RCat1, RCat2, RCat3, RCat4, RNh0, RNh1, RNh2, RNh3, RNh4, REq, REqDraws, REqNh, REqNhDraws, ROk, ROkDraws,
-	ROkNh, ROkNhDraws, RShadowNs, RShadowDraws, RWinNs, RWinDraws, RWords, KN
+	ROkNh, ROkNhDraws, RShadowNs, RShadowDraws, RWinNs, RWinDraws, RWords,
+	RPushHandleOnly, RPushQ0, RPushQEnd = RPushQ0 + TejRepro::kPushQ, KN
 };
 inline std::atomic<uint64_t> g_k[KN] {};
 inline void                  Add(K k, uint64_t v = 1) { g_k[k].fetch_add(v, std::memory_order_relaxed); }
@@ -137,6 +141,11 @@ inline void ReproFinish(Live& l) {
 		if (sh.h[c] != r.h[c]) Add(static_cast<K>(RCat0 + c)), eq = false;
 		if (sh.hn[c] != r.hn[c]) Add(static_cast<K>(RNh0 + c)), eqn = false;
 	}
+	// (paso A2, diag push) distinto solo por el layout (handle) o por el contenido; y que palabra de 8 bytes difiere.
+	if (sh.h[TejRepro::CPush] != r.h[TejRepro::CPush] && sh.hn[TejRepro::CPush] == r.hn[TejRepro::CPush]) Add(RPushHandleOnly);
+	if (sh.hn[TejRepro::CPush] != r.hn[TejRepro::CPush])
+		for (uint32_t i = 0; i < TejRepro::kPushQ; ++i)
+			if (sh.pq[i] != r.pq[i]) Add(static_cast<K>(RPushQ0 + i));
 	if (l.r_bad) eq = eqn = false;
 	if (eq) Add(REq), Add(REqDraws, r.draws);
 	if (eqn) Add(REqNh), Add(REqNhDraws, r.draws);
@@ -145,7 +154,7 @@ inline void ReproFinish(Live& l) {
 }
 // Al abrir: la lista del trabajador se reproduce YA, por el dispatcher de descarte, sobre una copia del estado del render
 // (lo que el paso B haria en su buffer real); el render sigue por su camino normal y Finish compara draw a draw.
-inline void ReproOpen(const PkInfo& p) {
+inline void ReproOpen(const PkInfo& p, Libs::Graphics::RenderContext& rc) {
 	auto& l = g_live;
 	l.r_on  = false;
 	if (!p.cap_on) {
@@ -154,12 +163,20 @@ inline void ReproOpen(const PkInfo& p) {
 	}
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	l.r_first = !g_track_on;
-	if (!g_track_on) g_track.ResetAll(), g_track_on = true;
+	if (!g_track_on) {
+		g_track.ResetAll(), g_track_on = true;
+		// (paso A2) el seguidor empieza vacio: el camino directo del render vuelve a grabar su estado (lo que ya tenia
+		// su buffer no se veria). Solo binds de mas, una vez por DCB y solo en la sombra.
+		auto& sch = rc.GetCommandScheduler();
+		if (Libs::Graphics::CommandScheduler::ThreadRecorder() == nullptr && sch.Active() && !sch.Current().IsInvalid())
+			sch.Current().InvalidateGraphicsState();
+	}
 	l.shadow = g_track;
 	l.shadow.ResetDraws();
 	l.r_bad = p.cap_bad;
 	Add(RWords, p.cap.size());
 	const bool saved_bad = TejRepro::t_bad;
+	TejRepro::t_bad      = false; // (paso A2) antes: el t_bad del render (nunca se limpiaba) marcaba el 100 % como no capturable
 	TejRepro::t_acc = &l.shadow, TejRepro::t_cap = nullptr, TejRepro::Sync();
 	const auto t = std::chrono::steady_clock::now();
 	l.r_ok = LocalVulkanRecording::TejReplay(p.cap.data(), p.cap.size(), nullptr, LocalVulkanRecording::TejStubDispatch());
@@ -244,7 +261,7 @@ inline void RenderOpen(const PkInfo& p, uint32_t draws, bool f1d, bool no_holes,
 	l.w_valid  = p.rs_on && p.probe.SecondaryOk();
 	if (p.rs_on) Add(KWInRendering);
 	l.compat = p.rs_on && cb != nullptr && cb->RenderingWith(p.rs);
-	ReproOpen(p); // (tej-repro: antes de Start, la sombra no entra en la sonda)
+	ReproOpen(p, r); // (tej-repro: antes de Start, la sombra no entra en la sonda)
 	Start();
 }
 inline void RenderDcbEnd() {
@@ -312,6 +329,31 @@ inline void Print(double frames) {
 	            rpc(v[RDrawsDiff]), rpc(v[RArgs]), rpc(v[RArgsNh]), rpc(v[RCat0]), rpc(v[RNh0]), rpc(v[RCat1]), rpc(v[RNh1]),
 	            rpc(v[RCat2]), rpc(v[RNh2]), rpc(v[RCat3]), rpc(v[RNh3]), rpc(v[RCat4]), rpc(v[RNh4]), rep_us, tra_us, win_us,
 	            rpk > 0 ? static_cast<double>(v[RWords]) / rpk : 0.0, gain, gainnh);
+	// (paso A2) por que no es capturable (por nombre, llamadas/fot del trabajador) y de que es distinto el push.
+	char   names[640] = "";
+	size_t at         = 0;
+	for (auto& e : TejRepro::g_bad) {
+		const char* n = e.name.load(std::memory_order_relaxed);
+		const uint64_t c = e.n.exchange(0, std::memory_order_relaxed);
+		if (n == nullptr || c == 0 || at + 96 >= sizeof(names)) continue;
+		const int w = std::snprintf(names + at, sizeof(names) - at, "%s%s %.1f", at ? ", " : "", n, c / f);
+		if (w > 0) at += static_cast<size_t>(w);
+	}
+	const uint64_t other = TejRepro::g_bad_other.exchange(0, std::memory_order_relaxed);
+	const uint64_t comp  = TejRepro::g_compute.exchange(0, std::memory_order_relaxed);
+	char   q[256] = "";
+	size_t qa     = 0;
+	for (uint32_t i = 0; i < TejRepro::kPushQ; ++i) {
+		const uint64_t c = v[RPushQ0 + i];
+		if (c == 0 || qa + 24 >= sizeof(q)) continue;
+		const int w = std::snprintf(q + qa, sizeof(q) - qa, "%sdw%u-%u %.0f%%", qa ? " " : "", 2 * i, 2 * i + 1, rpc(c));
+		if (w > 0) qa += static_cast<size_t>(w);
+	}
+	std::printf("[tej] F2 reproduccion (2) | no capturable por nombre (/fot): %s%s (otros %.1f) | compute fuera del estado de"
+	            " draw %.0f binds/fot | push (%% de paquetes): igual %.1f, direccion/layout distinta con contenido igual %.1f,"
+	            " contenido distinto %.1f [%s] | ranuras llenas %.1f %%\n",
+	            at ? names : "ninguna", "", other / f, comp / f, 100.0 - rpc(v[RCat2]), rpc(v[RPushHandleOnly]),
+	            rpc(v[RNh2]), qa ? q : "-", rpc(v[ROverflow]));
 }
 
 } // namespace TejCoser

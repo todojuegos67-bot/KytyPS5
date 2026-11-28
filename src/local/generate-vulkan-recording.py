@@ -170,8 +170,19 @@ def generate(registry, header):
                 elif flat(t): nbytes = f'static_cast<size_t>({size}) * sizeof({t})'
                 else: rok = False; break
                 rparts.append(('a', n, t, is_handle, nbytes))
+            # (paso A2) como forma su ranura (tej-repro.h Mode): el estado que Vulkan guarda, nunca el valor.
+            first = params[1].findtext('name') if len(params) > 1 else ''
+            if rcat == 'CDraw': rmode = 'MDrawI' if 'Indexed' in base else 'MDraw'
+            elif re.match(r'vkCmdBindPipeline$', base): rmode = 'MPipe'
+            elif re.match(r'vkCmdBindDescriptorSets$', base): rmode = 'MSets'
+            elif re.match(r'vkCmdPushConstants$', base): rmode = 'MPush'
+            elif re.match(r'vkCmdBindVertexBuffers2?(EXT)?$', base): rmode = 'MVb'
+            elif re.match(r'vkCmdBindIndexBuffer2?(EXT)?$', base): rmode = 'MIb'
+            elif first in ('firstBinding', 'faceMask', 'firstViewport', 'firstScissor', 'firstAttachment',
+                           'firstExclusiveScissor', 'firstDiscardRectangle'): rmode = 'MK0'
+            else: rmode = 'MNone'
             def rec_body(capture):
-                out = [f'TejRepro::Rec r_(TejCoser::Id("{name}"), TejRepro::{rcat}, {capture});']
+                out = [f'TejRepro::Rec r_(TejCoser::Id("{name}"), TejRepro::{rcat}, {capture}, TejRepro::{rmode});']
                 for kind, n, t, h, nbytes in rparts:
                     hv = 'true' if h else 'false'
                     out.append(f'r_.V(TejRepro::W({n}), {hv});' if kind == 'v' else f'r_.A({n}, {nbytes}, {hv});')
@@ -192,8 +203,8 @@ def generate(registry, header):
                 tej_cases.append(f'case TejCoser::Id("{name}"): {{ if (e - p < {sum(1 for r in rparts)}) return false; '
                                  f'{" ".join(dec)} if (p > e) return false; d.{name}({call}); return true; }}')
             elif rcat is not None:
-                declarations.append(f'    if (TejRepro::t_rec) TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat});')
-                stub_body = f'TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat});'
+                declarations.append(f'    if (TejRepro::t_rec) TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat}, "{name}");')
+                stub_body = f'TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat}, "{name}");'
             else:
                 stub_body = ''
             stubs.append(f'static VKAPI_ATTR void VKAPI_CALL Stub_{name}({", ".join(decl(p) for p in params)}) {{ {stub_body} }}')
