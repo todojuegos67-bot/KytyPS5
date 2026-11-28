@@ -447,6 +447,7 @@ private:
 	void DiscardGpuWrites(uint64_t vaddr, uint64_t size);
 	void FrameNativo2DropGpu(uint64_t vaddr, uint64_t size); // (FRAME-NATIVO2 v10)
 	void TouchBuffer(const Buffer& buffer);
+	void TouchBufferNow(const Buffer& buffer); // (par2 fase 2: el toque en si; TouchBuffer lo difiere en un carril)
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);

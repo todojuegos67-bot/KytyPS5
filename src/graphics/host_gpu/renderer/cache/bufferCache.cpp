@@ -120,6 +120,7 @@ uint64_t g_bufvram_evicted = 0, g_bufvram_evicted_bytes = 0, g_bufvram_dirty = 0
 #include "buf-mem.h"         // (BUF-MEM: KYTY_BUF_MEM)
 
 #define VRAM_EMU_OWNER ::VramEmu::kBufCache
+#include "local/par2.h"     // (par2 fase 2: LRU diferida en el carril, Drain antes de leerla)
 #include "local/vram-emu.h" // (VRAM-EMU) sus asignaciones de VMA y CreateImage apuntadas con su dueno
 
 namespace Libs::Graphics {
@@ -1428,6 +1429,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
+	if constexpr (!insert) Par2::Drain(); // (par2 fase 2: toques diferidos antes de liberar su hueco de LRU)
 	DrainGuestReadback(m_slot_buffers[id].CpuAddress(), m_slot_buffers[id].Size());
 	m_sync_buffers_valid = false;
 	if (!m_sync_changes_lost) {
@@ -1512,6 +1514,20 @@ bool BufferCache::IsGpuMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
+	// (par2 fase 2, KYTY_PAR2=3/4) En un carril diferido el toque de LRU se guarda y se aplica en el Commit del trozo
+	// (o antes, en el Drain de quien lee la LRU o borra buffers: recolector, BufRamPass, EraseRetired, DeleteBuffer).
+	// m_gc_tick solo cambia en RunGarbageCollector (que drena antes): mismo tick; el Buffer no se mueve (SlotVector en
+	// trozos fijos) y no se destruye sin Drain antes.
+	if (Par2::t_lane != nullptr && !Par2::t_lane->in_order) {
+		Par2::Prepare(
+		    [](void* cache, void* b) { static_cast<BufferCache*>(cache)->TouchBufferNow(*static_cast<const Buffer*>(b)); }, this,
+		    const_cast<Buffer*>(&buffer));
+		return;
+	}
+	TouchBufferNow(buffer);
+}
+
+void BufferCache::TouchBufferNow(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		// (BDA-RETIRO) Todo uso real pasa por aqui; el recolector toca la LRU sin esto (RetireStaleBuffers).
 		if (buffer.bda_read)
@@ -1523,6 +1539,7 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
+	Par2::Drain(); // (par2 fase 2)
 	const Envio1::Scope envio1_miss(Envio1::BufMiss); // (envio1: cleanup)
 	auto* buffer = m_slot_buffers.try_get(id);
 	if (buffer == nullptr || buffer->is_deleted) {
@@ -3906,6 +3923,7 @@ void BufferCache::UploadDirtyRanges(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, &ring); }, &last_dirty);
 	if (total_size != 0) {
+		Par2::NoteImmediate(); // (par2 fase 2: subida no diferible en el carril 0; fase 3 = Recorder + prologo)
 		LaneSync::NoteRange(buffer.lane_marks, vaddr, size, true);
 		++Trad2::g_upload_runs; // (trad2: its verification)
 	}
@@ -6233,6 +6251,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 // collector's) and buffers BDA shaders read with no buffer registered (Buffer::bda_read: those reads touch no LRU
 // entry, and one after the buffer went would read zeros once) - none faulted back over that route (bda_fault_pages ~0).
 void BufferCache::RetireStaleBuffers(uint64_t tick) {
+	const Par2::Immediate par2_now; // (par2 fase 2: drena la LRU diferida; aqui dentro todo al momento)
 	constexpr auto     StaleTime           = std::chrono::seconds(30);
 	constexpr auto     PressureTime        = std::chrono::seconds(10);
 	constexpr size_t   MaxRetirements      = 64;
@@ -6360,6 +6379,7 @@ void BufferCache::BufMemCensus() {
 }
 
 void BufferCache::BufRamPass(uint64_t tick) {
+	const Par2::Immediate par2_now; // (par2 fase 2: drena la LRU diferida; aqui dentro todo al momento)
 	// (VG-AB, 11-25) 5 s -> 30 s: log 102943 migro 616 MiB en 30 s y volvieron ~540 (en RAM 73 MiB a los 60 s; el
 	// recolector borro 582 MiB vs 154 sin el grupo) y [buf-vram] daba "sin usar >30 s" 0 MiB: eran bufferes en uso.
 	constexpr int64_t  ColdMs      = 30000;
@@ -6524,6 +6544,7 @@ void BufferCache::BufRamPass(uint64_t tick) {
 }
 
 void BufferCache::EraseRetired() {
+	const Par2::Immediate par2_now; // (par2 fase 2: drena la LRU diferida; aqui dentro todo al momento)
 	std::erase_if(m_retired, [&](const auto& retired) {
 		if (!Spec::PacketsPassed(retired.second)) return false;
 		// (A defragmentation move's new buffer destroyed before its pass ended: the pass frees the moved allocation, or,
@@ -6540,6 +6561,7 @@ void BufferCache::EraseRetired() {
 }
 
 bool BufferCache::MoveSpilledBufferBack() {
+	const Par2::Immediate par2_now; // (par2 fase 2: drena la LRU diferida; aqui dentro todo al momento)
 	// What a buffer moved back leaves of the budget: VMA's largest new block and the next frames' allocations. (A game
 	// buffer in system memory is read over the bus every frame: 28 fps where there were 60 on a 16 GB GPU, until a
 	// restart.)
@@ -6758,6 +6780,7 @@ void BufferCache::EndDefragmentation() {
 }
 
 void BufferCache::RunGarbageCollector(bool collect) {
+	const Par2::Immediate par2_now; // (par2 fase 2: drena la LRU diferida; aqui dentro todo al momento)
 	EraseRetired();
 	VramBufReport(); // (VRAM-BUF)
 	const auto tick = m_gc_tick++;
