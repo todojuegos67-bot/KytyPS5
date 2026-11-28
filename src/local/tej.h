@@ -86,11 +86,13 @@ enum C : uint32_t {
 	GDraws, GDcbs, GDcbSlot, GPkOk, GDrawsOk, GHolesOk, GPkRegs, GDrawsRegsOk, GPkEpBuf, GPkEpImg, GPkEpMap, GPkLate,
 	GPkSkip, GTailLate, GValTicks, GValN, GPublish,
 	GDrawsOnTime, // draws de paquetes publicados antes de que el render llegara (traducidos a tiempo)
+	GCalls, GPkAllHoles, GPkAssumed, GDrawsOkAssumed, GDrawsOnTimeAssumed, GRegDiffNames,
 	// lector
 	LJobs, LSelf, LPassNs, LPassFail, LFromRender, LNoState, LBehind, LNoCpu, LOther, LDropFull, LAheadWaitNs, LCopyBytes,
 	// trabajadores
 	WJobs, WNs, WTransNs, WCycles, WDraws, WBehind, WFailed, WStops, WHolesDraw, WHolesOther, WOver, WRepins, WPassDiff,
 	WIdleNoCpu, WBiggest,
+	WCalls, WAssumed, WFixNs, WCallsMeasured, WTransMeasuredNs,
 	NCount
 };
 inline std::atomic<uint64_t> g_c[NCount] {};
@@ -117,6 +119,7 @@ struct Packet {
 	uint32_t                          draws = 0, holes = 0;
 	uint64_t                          ep_buf = 0, ep_img = 0, ep_map = 0;
 	uint64_t                          publish_tsc = 0;
+	bool                              assumed = false; // (tej F1c: traducido tras una espera supuesta cumplida)
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
@@ -193,7 +196,10 @@ public:
 	void Run();
 	void WorkerDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key);
 	void Hole(const uint32_t* packet, const char* reason);
+	bool Assume(uint64_t addr);
+	void Dispatch() { ++m_calls; }
 	std::thread                               thread;
+	std::unordered_map<uint64_t, uint64_t>    waits; // (direccion de espera supuesta -> veces; bajo reason_mutex)
 	std::mutex                                reason_mutex;
 	std::unordered_map<const char*, uint64_t> holes, stops;
 
@@ -209,7 +215,10 @@ private:
 	int                                       m_open = -1;
 	uint32_t                                  m_ord = 0, m_pinned_for = 0xffffffffu;
 	uint64_t                                  m_last_key = 0;
+	uint32_t                                  m_calls = 0;
+	bool                                      m_assumed = false;
 	std::unordered_map<const char*, uint64_t> m_job_holes;
+	std::unordered_map<uint64_t, uint64_t>    m_job_waits;
 };
 inline thread_local Worker* t_worker = nullptr;
 
@@ -340,14 +349,17 @@ public:
 		return m_quit;
 	}
 
-	void TakeReasons(std::vector<std::pair<const char*, uint64_t>>& holes, std::vector<std::pair<const char*, uint64_t>>& stops) {
+	void TakeReasons(std::vector<std::pair<const char*, uint64_t>>& holes, std::vector<std::pair<const char*, uint64_t>>& stops,
+	                 std::unordered_map<uint64_t, uint64_t>& waits) {
 		std::unordered_map<const char*, uint64_t> h, s;
 		for (auto& w: m_workers) {
 			std::lock_guard g(w->reason_mutex);
 			for (const auto& [k, v]: w->holes) h[k] += v;
 			for (const auto& [k, v]: w->stops) s[k] += v;
+			for (const auto& [k, v]: w->waits) waits[k] += v;
 			w->holes.clear();
 			w->stops.clear();
+			w->waits.clear();
 		}
 		holes.assign(h.begin(), h.end());
 		stops.assign(s.begin(), s.end());
@@ -558,7 +570,10 @@ inline void Worker::Translate(Item& item) {
 	m_open     = -1;
 	m_ord      = 0;
 	m_last_key = ~uint64_t {0};
+	m_calls    = 0;
+	m_assumed  = false;
 	m_job_holes.clear();
+	m_job_waits.clear();
 	const uint64_t c0  = LocalPlatform::CurrentThreadCycles();
 	const auto     t0  = Now();
 	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
@@ -571,15 +586,24 @@ inline void Worker::Translate(Item& item) {
 	Add(WNs, t1 - t0);
 	Add(WTransNs, out.translate_ns);
 	Add(WDraws, m_ord);
+	// (tej F1c) Llamadas = draws + dispatches: el coste por llamada es el del render (1.8 us/llamada con dispatches);
+	// fijo = Shadow menos Translate (copia de estado final y Finish), una vez por DCB.
+	const uint32_t calls = m_ord + m_calls;
+	Add(WCalls, calls);
+	Add(WFixNs, (t1 - t0) - out.translate_ns);
+	if (calls >= 32) Add(WCallsMeasured, calls), Add(WTransMeasuredNs, out.translate_ns);
 	if (out.failed) Add(WFailed);
 	if (out.stop != nullptr) Add(WStops);
 	// (la pasada de estado del lector frente a la traduccion: el estado que deja cada una)
 	if (item.pass_ok && !out.failed && out.stop == nullptr && !m_end->SameState(*item.pass_end)) Add(WPassDiff);
-	if (m_ord != 0)
+	// (tej F1c) Coste por LLAMADA traducida (antes: tiempo total, con el fijo, entre draws solo: con la DCB cortada en
+	// la espera del principio daba 19.8 us/draw). Solo DCB con >= 32 llamadas (las cortas son casi todo fijo).
+	if (calls >= 32)
 		if (auto& rec = g_rec[item.serial % RecN]; rec.serial.load(std::memory_order_relaxed) == item.serial)
-			rec.cw_ps.store((t1 - t0) * 1000u / m_ord, std::memory_order_relaxed);
+			rec.cw_ps.store(out.translate_ns * 1000u / calls, std::memory_order_relaxed);
 	std::lock_guard g(reason_mutex);
 	for (const auto& [why, n]: m_job_holes) holes[why] += n;
+	for (const auto& [a, n]: m_job_waits) waits[a] += n;
 	if (out.stop != nullptr) ++stops[out.stop];
 }
 
@@ -609,10 +633,20 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 		p.holes  = 0;
 		p.ep_buf = r.GetBufferCache().RegistrationEpoch();
 		p.ep_img = r.GetTextureCache().ResolutionEpoch();
-		p.ep_map = r.GetGpuResources().MappingEpoch();
-		m_open   = static_cast<int>(j);
+		p.ep_map  = r.GetGpuResources().MappingEpoch();
+		p.assumed = m_assumed;
+		m_open    = static_cast<int>(j);
 	}
 	if (m_open >= 0) ++m_slot->pk[m_open].draws;
+}
+
+inline bool Worker::Assume(uint64_t addr) {
+	if (m_slot == nullptr) return false;
+	m_assumed = true;
+	if (m_open >= 0) m_slot->pk[m_open].assumed = true;
+	++m_job_waits[addr];
+	Add(WAssumed);
+	return true;
 }
 
 inline void Worker::Hole(const uint32_t* packet, const char* reason) {
@@ -656,7 +690,7 @@ inline uint64_t   g_last_flip_ns = 0;
 // Registros por DCB (render) para el modelo de N trabajadores.
 struct DcbRec {
 	uint64_t ready, rs, re, cw_ps;
-	uint32_t draws;
+	uint32_t draws, calls;
 };
 inline std::mutex          g_dcb_mutex;
 inline std::vector<DcbRec> g_dcbs;
@@ -683,7 +717,7 @@ inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Shadow::Job::Kind kind
 }
 
 struct GpuDcb {
-	uint64_t serial = 0, prev_tsc = 0, draws = 0, rs = 0;
+	uint64_t serial = 0, prev_tsc = 0, draws = 0, rs = 0, calls = 0;
 	Slot*    slot = nullptr;
 	uint32_t next = 0;
 	bool     on   = false;
@@ -724,6 +758,51 @@ struct GpuSlice {
 	GpuSlice& operator=(const GpuSlice&) = delete;
 };
 
+// (tej F1c) Registros distintos en el punto de cose (solo paquetes que fallan por registros, render): por nombre,
+// "aparece" y "unico" (es lo UNICO distinto: arreglarlo cose ese paquete).
+struct RegDiff {
+	std::mutex                                mutex;
+	std::unordered_map<const char*, uint64_t> any, sole;
+	const char*                               names[64] {};
+	uint32_t                                  n = 0;
+};
+inline RegDiff g_regdiff;
+inline void    NoteRegDiff(const CommandProcessor& render, const CommandProcessor& worker) {
+	auto& d = g_regdiff;
+	d.n     = 0;
+	render.DiffState(worker, [](const char* name) {
+		if (g_regdiff.n < 64) g_regdiff.names[g_regdiff.n++] = name;
+	});
+	std::lock_guard g(d.mutex);
+	for (uint32_t i = 0; i < d.n; ++i) ++d.any[d.names[i]];
+	if (d.n == 1) ++d.sole[d.names[0]];
+	Add(GRegDiffNames, d.n);
+}
+
+// (tej F1c) WAIT_REG_MEM en memoria que no es etiqueta conocida: la sombra la supone cumplida y sigue
+// (KYTY_TEJ_ESPERA=0: se para como antes). El render cuenta, por direccion, si al llegar ya estaba cumplida.
+[[nodiscard]] inline bool AssumeOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEJ_ESPERA");
+		return v == nullptr || std::atoi(v) != 0;
+	}();
+	return on;
+}
+[[nodiscard]] inline bool AssumeWait(uint64_t addr, uint64_t /*value*/, uint64_t /*ref*/, uint32_t /*func*/) {
+	return AssumeOn() && t_worker != nullptr && t_worker->Assume(addr);
+}
+struct RenderWaits {
+	std::mutex                                                  mutex;
+	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_addr; // (cumplida al llegar, tuvo que esperar)
+};
+inline RenderWaits g_rwaits;
+inline void        RenderWait(uint64_t addr, bool satisfied) {
+	std::lock_guard g(g_rwaits.mutex);
+	if (g_rwaits.by_addr.size() > 4096 && !g_rwaits.by_addr.contains(addr)) return;
+	auto& e = g_rwaits.by_addr[addr];
+	(satisfied ? e.first : e.second) += 1;
+}
+
 // Hilo de render: primer draw de cada paquete; epocas primero (baratas), registros solo si coinciden.
 inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 	auto& c = g_gpu;
@@ -741,6 +820,7 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 			continue;
 		}
 		Add(GDrawsOnTime, p.draws);
+		if (p.assumed) Add(GDrawsOnTimeAssumed, p.draws);
 		const uint64_t t0   = __rdtsc();
 		const bool     eb   = r.GetBufferCache().RegistrationEpoch() == p.ep_buf;
 		const bool     ei   = eb && r.GetTextureCache().ResolutionEpoch() == p.ep_img;
@@ -752,16 +832,48 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		if (!eb) Add(GPkEpBuf);
 		else if (!ei) Add(GPkEpImg);
 		else if (!em) Add(GPkEpMap);
-		else if (!same) Add(GPkRegs);
-		else {
+		else if (sewn == 0) Add(GPkAllHoles); // (tej F1c: antes contado como 'registros')
+		else if (!same) {
+			Add(GPkRegs);
+			NoteRegDiff(cp, *p.cp);
+		} else {
 			Add(GDrawsRegsOk, sewn);
 			Add(GPkOk);
 			Add(GDrawsOk, sewn);
 			Add(GHolesOk, p.holes);
+			if (p.assumed) Add(GPkAssumed), Add(GDrawsOkAssumed, sewn);
 		}
 		break;
 	}
 	c.prev_tsc = now;
+}
+
+inline void OnDispatch() {
+	if (t_side == 1) ++g_gpu.calls;
+	else if (t_side == 2 && t_worker != nullptr) t_worker->Dispatch();
+}
+
+// (tej F1c) Latencia: el render procesa el flip (CommandProcessor::Flip, dentro de la ultima DCB del fotograma: el
+// juego hace submit+flip en FUN_00911d60; FlipPreparation sola no llega en partida: por eso antes 0 muestras).
+// Inicio = Enqueue de la DCB siguiente a la del flip anterior (la primera del fotograma). Lado A/B = Active().
+inline uint64_t g_last_flip_serial = 0;
+inline void     OnRenderFlip() {
+	const uint64_t  now    = Now();
+	const uint64_t  serial = g_gpu_serial.load(std::memory_order_relaxed);
+	const int       side   = Active() ? 1 : 0;
+	const auto&     first  = g_rec[(g_last_flip_serial + 1) % RecN];
+	std::lock_guard g(g_lat_mutex);
+	if (g_last_flip_serial != 0 && serial > g_last_flip_serial &&
+	    first.serial.load(std::memory_order_relaxed) == g_last_flip_serial + 1) {
+		const uint64_t enq = first.enq.load(std::memory_order_relaxed);
+		if (enq != 0 && now > enq) g_lat[side].Lat(now - enq);
+	}
+	if (g_last_flip_ns != 0) {
+		++g_lat[side].frames;
+		if (now - g_last_flip_ns > 25000000u) ++g_lat[side].over25;
+	}
+	g_last_flip_ns     = now;
+	g_last_flip_serial = serial;
 }
 
 inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
@@ -780,50 +892,45 @@ inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 		g_gpu.slot = nullptr;
 		if (g_gpu.on) {
 			Add(GDraws, g_gpu.draws);
+			Add(GCalls, g_gpu.draws + g_gpu.calls);
 			if (mine && g_gpu.draws != 0) {
 				std::lock_guard g(g_dcb_mutex);
 				if (g_dcbs.size() < 65536)
 					g_dcbs.push_back({rec.ready.load(std::memory_order_relaxed) != 0 ? rec.ready.load(std::memory_order_relaxed)
 					                                                                 : rec.enq.load(std::memory_order_relaxed),
 					                  g_gpu.rs, now, rec.cw_ps.load(std::memory_order_relaxed),
-					                  static_cast<uint32_t>(g_gpu.draws)});
+					                  static_cast<uint32_t>(g_gpu.draws), static_cast<uint32_t>(g_gpu.draws + g_gpu.calls)});
 			}
 		}
 		g_gpu.on = false;
-	}
-	if (mine && rec.kind.load(std::memory_order_relaxed) == Shadow::Job::Flip) {
-		const int      side  = Active() ? 1 : 0;
-		const uint64_t first = rec.frame_first.load(std::memory_order_relaxed);
-		std::lock_guard g(g_lat_mutex);
-		if (first != 0 && now > first) g_lat[side].Lat(now - first);
-		if (g_last_flip_ns != 0) {
-			++g_lat[side].frames;
-			if (now - g_last_flip_ns > 25000000u) ++g_lat[side].over25;
-		}
-		g_last_flip_ns = now;
 	}
 	if (auto* s = g_shadow.load(std::memory_order_acquire); s != nullptr) s->GpuDone(serial, cp);
 }
 
 // Modelo: % de draws en paquetes de 64 que estarian publicados antes de que el render llegue, con n trabajadores
 // (cola por llegada, coste por draw medido de cada DCB o la media), sobre las DCB de la ventana.
-[[nodiscard]] inline double Model(const std::vector<DcbRec>& dcbs, uint32_t n, double avg_cw_ns) {
+// (tej F1c) Trabajador = llamadas (draws + dispatches) x coste por llamada + fijo por DCB; el paquete j esta listo
+// cuando el trabajador lleva esa fraccion de llamadas; el render llega a la misma fraccion de su tiempo de DCB.
+// Antes: tiempo total / draws (con DCB cortadas en la espera del principio: 19.8 us/draw) por TODOS los draws.
+[[nodiscard]] inline double Model(const std::vector<DcbRec>& dcbs, uint32_t n, double avg_cw_ns, double fix_ns) {
 	std::vector<double> free_at(n, 0.0);
 	double              ok = 0, all = 0;
 	for (const auto& d: dcbs) {
 		all += d.draws;
 		const double cw = d.cw_ps != 0 ? d.cw_ps / 1000.0 : avg_cw_ns;
-		if (cw <= 0) continue;
+		if (cw <= 0 || d.draws == 0) continue;
 		auto         w  = std::min_element(free_at.begin(), free_at.end());
 		const double w0 = std::max(*w, static_cast<double>(d.ready));
 		const double rs = static_cast<double>(d.rs);
 		if (w0 >= rs) continue; // (el render ya empezo: no se toma)
-		const double cr = d.draws != 0 ? static_cast<double>(d.re - d.rs) / d.draws : 0;
+		const double calls = std::max<double>(d.calls, d.draws);
+		const double span  = static_cast<double>(d.re - d.rs);
 		for (uint32_t j = 0; j * PacketDraws < d.draws && j < MaxPackets; ++j) {
-			const uint32_t last = std::min<uint32_t>((j + 1) * PacketDraws, d.draws);
-			if (w0 + last * cw <= rs + j * PacketDraws * cr) ok += last - j * PacketDraws;
+			const uint32_t last  = std::min<uint32_t>((j + 1) * PacketDraws, d.draws);
+			const double   ready = w0 + calls * cw * last / d.draws;
+			if (ready <= rs + span * (j * PacketDraws) / d.draws) ok += last - j * PacketDraws;
 		}
-		*w = w0 + d.draws * cw;
+		*w = w0 + calls * cw + fix_ns; // (el fijo despues: Finish va tras publicar el ultimo paquete)
 	}
 	return all > 0 ? 100.0 * ok / all : 0;
 }
@@ -899,18 +1006,25 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		dcbs.swap(g_dcbs);
 	}
 	if (!dcbs.empty()) {
-		double sum = 0, n = 0;
-		for (const auto& d: dcbs)
-			if (d.cw_ps != 0) sum += d.cw_ps / 1000.0 * d.draws, n += d.draws;
-		const double avg = n > 0 ? sum / n : w_us * 1e3;
-		std::printf("[tej] modelo (%zu DCB, coste trabajador %.2f us/draw): traducidos a tiempo con N=1 %.1f %%, N=2 %.1f %%,"
-		            " N=4 %.1f %%, N=6 %.1f %% (N actual %u: modelo %.1f %% frente a medido %.1f %%)",
-		            dcbs.size(), avg / 1e3, Model(dcbs, 1, avg), Model(dcbs, 2, avg), Model(dcbs, 4, avg), Model(dcbs, 6, avg),
-		            sh != nullptr ? sh->N() : 0u, Model(dcbs, sh != nullptr ? sh->N() : 1u, avg), pct(v[GDrawsOnTime]));
-		std::printf(" | mismo modelo con trabajador a 1.8 us/draw (coste del render): N=1 %.1f %%, N=2 %.1f %%, N=4 %.1f %%\n",
-		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 1, 1800); }(),
-		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 2, 1800); }(),
-		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 4, 1800); }());
+		// (F1c) coste por LLAMADA traducida (solo DCB con >= 32), media ponderada por llamadas; fijo por DCB aparte.
+		const double avg = v[WCallsMeasured] != 0 ? static_cast<double>(v[WTransMeasuredNs]) / static_cast<double>(v[WCallsMeasured])
+		                                          : 0.0;
+		const double fix = v[WJobs] != 0 ? static_cast<double>(v[WFixNs]) / static_cast<double>(v[WJobs]) : 0.0;
+		double       rc = 0, rn = 0; // (coste del render por llamada en estas DCB: su tiempo de DCB entre sus llamadas)
+		for (const auto& d: dcbs) rc += static_cast<double>(d.re - d.rs), rn += std::max(d.calls, d.draws);
+		const double render_cw = rn > 0 ? rc / rn : 0.0;
+		std::printf("[tej] modelo (%zu DCB, trabajador %.2f us/llamada + fijo %.1f us/DCB; render %.2f us/llamada): traducidos a"
+		            " tiempo con N=1 %.1f %%, N=2 %.1f %%, N=4 %.1f %%, N=6 %.1f %% (N actual %u: modelo %.1f %% frente a medido %.1f %%)",
+		            dcbs.size(), avg / 1e3, fix / 1e3, render_cw / 1e3, Model(dcbs, 1, avg, fix), Model(dcbs, 2, avg, fix),
+		            Model(dcbs, 4, avg, fix), Model(dcbs, 6, avg, fix), sh != nullptr ? sh->N() : 0u,
+		            Model(dcbs, sh != nullptr ? sh->N() : 1u, avg, fix), pct(v[GDrawsOnTime]));
+		const auto at = [&](double cw_ns, uint32_t n) {
+			auto c = dcbs;
+			for (auto& d: c) d.cw_ps = static_cast<uint64_t>(cw_ns * 1000.0);
+			return Model(c, n, cw_ns, fix);
+		};
+		std::printf(" | con trabajador al coste del render (%.2f us/llamada): N=1 %.1f %%, N=2 %.1f %%, N=4 %.1f %%\n", render_cw / 1e3,
+		            at(render_cw, 1), at(render_cw, 2), at(render_cw, 4));
 	}
 	{
 		std::lock_guard g(g_lat_mutex);
@@ -925,7 +1039,8 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	}
 	if (sh != nullptr) {
 		std::vector<std::pair<const char*, uint64_t>> holes, stops;
-		sh->TakeReasons(holes, stops);
+		std::unordered_map<uint64_t, uint64_t>        waits;
+		sh->TakeReasons(holes, stops, waits);
 		const auto top = [&](const char* title, std::vector<std::pair<const char*, uint64_t>>& list) {
 			std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second > b.second; });
 			std::printf(" %s:", title);
@@ -937,6 +1052,54 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			top("| paradas", stops);
 			std::printf("\n");
 		}
+		// (F1c) Esperas supuestas: direccion, veces/fot que el trabajador la supuso, y en el render: cumplida al llegar
+		// frente a tuvo que esperar, y si ahora es etiqueta escrita por un procesador (Spec::IsLabel).
+		std::vector<std::pair<uint64_t, uint64_t>> wl(waits.begin(), waits.end());
+		std::ranges::sort(wl, [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> rw;
+		{
+			std::lock_guard g(g_rwaits.mutex);
+			rw.swap(g_rwaits.by_addr);
+		}
+		std::printf("[tej] F1c esperas supuestas %.1f/fot (%s), direcciones %zu:", v[WAssumed] / f,
+		            AssumeOn() ? "KYTY_TEJ_ESPERA=1, sigue" : "KYTY_TEJ_ESPERA=0, para", wl.size());
+		for (size_t i = 0; i < wl.size() && i < 6; ++i) {
+			const auto it = rw.find(wl[i].first);
+			std::printf(" [0x%llx %.1f/fot, render: cumplida %llu, espero %llu, etiqueta %s]",
+			            static_cast<unsigned long long>(wl[i].first), wl[i].second / f,
+			            static_cast<unsigned long long>(it != rw.end() ? it->second.first : 0),
+			            static_cast<unsigned long long>(it != rw.end() ? it->second.second : 0),
+			            Libs::Graphics::Spec::IsLabel(wl[i].first) ? "si" : "no");
+		}
+		std::printf("\n");
+	}
+	{
+		// (F1c) Registros: lo que difiere en el punto de cose, top 10 (aparece / unico).
+		std::vector<std::pair<const char*, uint64_t>> any, sole;
+		{
+			std::lock_guard g(g_regdiff.mutex);
+			any.assign(g_regdiff.any.begin(), g_regdiff.any.end());
+			sole.assign(g_regdiff.sole.begin(), g_regdiff.sole.end());
+			g_regdiff.any.clear();
+			g_regdiff.sole.clear();
+		}
+		std::ranges::sort(any, [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::printf("[tej] F1c registros distintos (paquetes/fot: %.1f, %.1f nombres/paquete): aparece", v[GPkRegs] / f,
+		            v[GPkRegs] != 0 ? static_cast<double>(v[GRegDiffNames]) / static_cast<double>(v[GPkRegs]) : 0.0);
+		for (size_t i = 0; i < any.size() && i < 10; ++i) std::printf(" [%s] %.1f", any[i].first, any[i].second / f);
+		std::ranges::sort(sole, [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::printf(" | unico (arreglarlo cose el paquete):");
+		for (size_t i = 0; i < sole.size() && i < 10; ++i) std::printf(" [%s] %.1f", sole[i].first, sole[i].second / f);
+		std::printf("\n");
+		// (F1c) Resumen por llamada y cosibles con/sin espera supuesta.
+		std::printf("[tej] F1c llamadas render %.0f/fot (draws %.0f) | trabajador %.0f llamadas/fot, traducir %.2f us/llamada"
+		            " (DCB >=32: %.2f), fijo %.1f us/DCB | paquetes todo huecos %.1f/fot | COSIBLES sin espera supuesta %.1f %%,"
+		            " con espera supuesta %.1f %% (a tiempo tras espera %.1f %%)\n",
+		            v[GCalls] / f, draws / f, v[WCalls] / f,
+		            v[WCalls] != 0 ? static_cast<double>(v[WTransNs]) / 1e3 / static_cast<double>(v[WCalls]) : 0.0,
+		            v[WCallsMeasured] != 0 ? static_cast<double>(v[WTransMeasuredNs]) / 1e3 / static_cast<double>(v[WCallsMeasured]) : 0.0,
+		            v[WJobs] != 0 ? static_cast<double>(v[WFixNs]) / 1e3 / static_cast<double>(v[WJobs]) : 0.0, v[GPkAllHoles] / f,
+		            pct(v[GDrawsOk] - v[GDrawsOkAssumed]), pct(v[GDrawsOkAssumed]), pct(v[GDrawsOnTimeAssumed]));
 	}
 	std::fflush(stdout);
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);

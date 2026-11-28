@@ -66,6 +66,8 @@ public:
 	[[nodiscard]] bool SameDrawState(const CommandProcessor& other) const;
 	// The same registers and draw state (all CopyStateFrom copies but the flip, submit id and constant engine).
 	[[nodiscard]] bool SameState(const CommandProcessor& other) const;
+	// (tej F1c, solo medida) Los nombres de lo que SameState ve distinto (registros por campo y estado de draw).
+	void DiffState(const CommandProcessor& other, void (*note)(const char*)) const;
 	// A state pass (KYTY_SPECULATE=4): Process runs only the packets that change this processor's state (registers,
 	// index and indirect bases, instances, counters, predication, context pushes), translating and executing nothing:
 	// the state a command buffer leaves, before it is translated.

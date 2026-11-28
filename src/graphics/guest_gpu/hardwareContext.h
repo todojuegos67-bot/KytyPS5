@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HARDWARECONTEXT_H_
 
 #include "common/abi.h"
+#include <cstring>
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
@@ -684,6 +685,7 @@ struct GeUserVgprEn {
 	bool vgpr3 = false;
 };
 
+#define KYTY_TEJ_D(f) if (!(f == o.f)) note(#f)
 class Context {
 public:
 	Context()  = default;
@@ -691,6 +693,61 @@ public:
 
 	KYTY_CLASS_DEFAULT_COPY(Context);
 	bool operator==(const Context&) const = default;
+	// (tej F1c) Los campos distintos (nombres), para la linea [tej] registros.
+	template <class F> void DiffNames(const Context& o, F note) const {
+		KYTY_TEJ_D(m_line_width);
+		KYTY_TEJ_D(m_primitive_reset_index);
+		KYTY_TEJ_D(m_blend_color);
+		KYTY_TEJ_D(m_render_target_mask);
+		KYTY_TEJ_D(m_screen_viewport);
+		KYTY_TEJ_D(m_clip_control);
+		KYTY_TEJ_D(m_color_control);
+		KYTY_TEJ_D(m_scan_mode_control);
+		KYTY_TEJ_D(m_aa_sample_control);
+		KYTY_TEJ_D(m_aa_config);
+		KYTY_TEJ_D(m_shader_stages);
+		KYTY_TEJ_D(m_depth_render_target);
+		KYTY_TEJ_D(m_render_control);
+		KYTY_TEJ_D(m_depth_render_override);
+		KYTY_TEJ_D(m_depth_control);
+		KYTY_TEJ_D(m_stencil_control);
+		KYTY_TEJ_D(m_stencil_mask);
+		KYTY_TEJ_D(m_depth_clear_value);
+		KYTY_TEJ_D(m_depth_bounds_min);
+		KYTY_TEJ_D(m_depth_bounds_max);
+		KYTY_TEJ_D(m_stencil_clear_value);
+		KYTY_TEJ_D(m_mode_control);
+		KYTY_TEJ_D(m_poly_offset);
+		KYTY_TEJ_D(m_eqaa_control);
+		for (int i = 0; i < 8; ++i) if (!(m_blend_control[i] == o.m_blend_control[i])) note("m_blend_control[]");
+		for (int i = 0; i < 8; ++i) if (!(m_render_targets[i] == o.m_render_targets[i])) note("m_render_targets[]");
+		if (!(m_sh_regs.m_spiVsOutConfig == o.m_sh_regs.m_spiVsOutConfig)) note("sh_regs.m_spiVsOutConfig");
+		if (!(m_sh_regs.m_spiShaderPosFormat == o.m_sh_regs.m_spiShaderPosFormat)) note("sh_regs.m_spiShaderPosFormat");
+		if (!(m_sh_regs.m_paClVsOutCntl == o.m_sh_regs.m_paClVsOutCntl)) note("sh_regs.m_paClVsOutCntl");
+		if (!(m_sh_regs.m_spiShaderIdxFormat == o.m_sh_regs.m_spiShaderIdxFormat)) note("sh_regs.m_spiShaderIdxFormat");
+		if (!(m_sh_regs.m_geNggSubgrpCntl == o.m_sh_regs.m_geNggSubgrpCntl)) note("sh_regs.m_geNggSubgrpCntl");
+		if (!(m_sh_regs.m_vgtGsInstanceCnt == o.m_sh_regs.m_vgtGsInstanceCnt)) note("sh_regs.m_vgtGsInstanceCnt");
+		if (!(m_sh_regs.m_vgtGsOnchipCntl == o.m_sh_regs.m_vgtGsOnchipCntl)) note("sh_regs.m_vgtGsOnchipCntl");
+		if (!(m_sh_regs.m_vgtEsgsRingItemsize == o.m_sh_regs.m_vgtEsgsRingItemsize)) note("sh_regs.m_vgtEsgsRingItemsize");
+		if (!(m_sh_regs.m_vgtGsMaxVertOut == o.m_sh_regs.m_vgtGsMaxVertOut)) note("sh_regs.m_vgtGsMaxVertOut");
+		if (!(m_sh_regs.m_vgtGsOutPrimType == o.m_sh_regs.m_vgtGsOutPrimType)) note("sh_regs.m_vgtGsOutPrimType");
+		if (!(m_sh_regs.m_vgtPrimitiveIdEn == o.m_sh_regs.m_vgtPrimitiveIdEn)) note("sh_regs.m_vgtPrimitiveIdEn");
+		if (!(m_sh_regs.m_vgtReuseOff == o.m_sh_regs.m_vgtReuseOff)) note("sh_regs.m_vgtReuseOff");
+		if (!(m_sh_regs.m_vgtLsHsConfig == o.m_sh_regs.m_vgtLsHsConfig)) note("sh_regs.m_vgtLsHsConfig");
+		if (!(m_sh_regs.m_vgtTfParam == o.m_sh_regs.m_vgtTfParam)) note("sh_regs.m_vgtTfParam");
+		if (!(m_sh_regs.shader_z_format == o.m_sh_regs.shader_z_format)) note("sh_regs.shader_z_format");
+		if (!(m_sh_regs.ps_input_ena == o.m_sh_regs.ps_input_ena)) note("sh_regs.ps_input_ena");
+		if (!(m_sh_regs.ps_input_addr == o.m_sh_regs.ps_input_addr)) note("sh_regs.ps_input_addr");
+		if (!(m_sh_regs.ps_in_control == o.m_sh_regs.ps_in_control)) note("sh_regs.ps_in_control");
+		if (!(m_sh_regs.baryc_cntl == o.m_sh_regs.baryc_cntl)) note("sh_regs.baryc_cntl");
+		if (!(m_sh_regs.m_cbShaderMask == o.m_sh_regs.m_cbShaderMask)) note("sh_regs.m_cbShaderMask");
+		if (!(m_sh_regs.m_paScShaderControl == o.m_sh_regs.m_paScShaderControl)) note("sh_regs.m_paScShaderControl");
+		if (!(m_sh_regs.db_shader_control == o.m_sh_regs.db_shader_control)) note("sh_regs.db_shader_control");
+		if (!(m_sh_regs.m_dbAlphaToMask == o.m_sh_regs.m_dbAlphaToMask)) note("sh_regs.m_dbAlphaToMask");
+		if (std::memcmp(m_sh_regs.ps_interpolator_settings, o.m_sh_regs.ps_interpolator_settings, sizeof(m_sh_regs.ps_interpolator_settings)) != 0) note("sh_regs.ps_interpolator_settings");
+		if (std::memcmp(m_sh_regs.target_output_mode, o.m_sh_regs.target_output_mode, 8) != 0) note("sh_regs.target_output_mode");
+		if (!(m_sh_regs.m_vgtHosMaxTessLevel == o.m_sh_regs.m_vgtHosMaxTessLevel && m_sh_regs.m_vgtHosMinTessLevel == o.m_sh_regs.m_vgtHosMinTessLevel && m_sh_regs.m_geMaxOutputPerSubgroup == o.m_sh_regs.m_geMaxOutputPerSubgroup && m_sh_regs.m_vgtTessDistribution == o.m_sh_regs.m_vgtTessDistribution)) note("sh_regs.tess/subgroup");
+	}
 
 	void Reset() { *this = Context(); }
 
@@ -1005,6 +1062,15 @@ public:
 
 	KYTY_CLASS_DEFAULT_COPY(UserConfig);
 	bool operator==(const UserConfig&) const = default;
+	template <class F> void DiffNames(const UserConfig& o, F note) const {
+		KYTY_TEJ_D(m_prim_type);
+		KYTY_TEJ_D(m_index_offset);
+		KYTY_TEJ_D(m_object_id);
+		KYTY_TEJ_D(m_primitive_reset_control);
+		KYTY_TEJ_D(m_ge_cntl);
+		KYTY_TEJ_D(m_ge_user_vgpr_en);
+		KYTY_TEJ_D(m_gds_oa);
+	}
 
 	void Reset() { *this = UserConfig(); }
 
@@ -1047,6 +1113,19 @@ public:
 
 	KYTY_CLASS_DEFAULT_COPY(Shader);
 	bool operator==(const Shader&) const = default;
+	template <class F> void DiffNames(const Shader& o, F note) const {
+		KYTY_TEJ_D(m_vs.es_regs);
+		KYTY_TEJ_D(m_vs.ls_regs);
+		KYTY_TEJ_D(m_vs.hs_regs);
+		KYTY_TEJ_D(m_vs.gs_regs);
+		KYTY_TEJ_D(m_vs.hs_user_sgpr);
+		KYTY_TEJ_D(m_vs.gs_user_sgpr);
+		KYTY_TEJ_D(m_vs.start_instance_user_sgpr);
+		KYTY_TEJ_D(m_ps.ps_regs);
+		KYTY_TEJ_D(m_ps.ps_user_sgpr);
+		KYTY_TEJ_D(m_cs.cs_regs);
+		KYTY_TEJ_D(m_cs.cs_user_sgpr);
+	}
 
 	void Reset() { *this = Shader(); }
 

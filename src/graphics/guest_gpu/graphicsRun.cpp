@@ -638,6 +638,20 @@ bool CommandProcessor::SameState(const CommandProcessor& other) const {
 	       m_ucfg == other.m_ucfg && m_sh_ctx == other.m_sh_ctx && SameDrawState(other);
 }
 
+void CommandProcessor::DiffState(const CommandProcessor& o, void (*note)(const char*)) const {
+	if (m_draw_run_skip != o.m_draw_run_skip) note("draw_run_skip");
+	m_ctx.DiffNames(o.m_ctx, [&](const char* n) { note(n); });
+	if (!(m_saved_ctx == o.m_saved_ctx)) note("saved_ctx");
+	m_ucfg.DiffNames(o.m_ucfg, [&](const char* n) { note(n); });
+	m_sh_ctx.DiffNames(o.m_sh_ctx, [&](const char* n) { note(n); });
+#define KYTY_TEJ_DS(f) if (!(f == o.f)) note(#f)
+	KYTY_TEJ_DS(m_context_state_pushed); KYTY_TEJ_DS(m_user_data_marker); KYTY_TEJ_DS(m_index_type_and_size);
+	KYTY_TEJ_DS(m_index_buffer_size); KYTY_TEJ_DS(m_index_base_addr); KYTY_TEJ_DS(m_draw_indirect_args_base_addr);
+	KYTY_TEJ_DS(m_dispatch_indirect_args_base_addr); KYTY_TEJ_DS(m_num_instances); KYTY_TEJ_DS(m_de_count);
+	KYTY_TEJ_DS(m_ce_count); KYTY_TEJ_DS(m_synthetic_occlusion_counter); KYTY_TEJ_DS(m_predicate_skip);
+#undef KYTY_TEJ_DS
+}
+
 void CommandProcessor::CopyStateFrom(const CommandProcessor& other, bool const_ram) {
 	m_draw_run_skip                    = other.m_draw_run_skip;
 	m_ctx                              = other.m_ctx;
@@ -969,12 +983,19 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		// it is satisfied: GuestGpu::Process).
 		if (Spec::Current() != nullptr) {
 			if (Spec::IsLabel(reinterpret_cast<uint64_t>(addr))) return Spec::Refuse("wait");
+			// (tej F1c, solo la sombra: la espera se supone cumplida y la traduccion sigue; los paquetes desde aqui se
+			// cuentan aparte como "con espera supuesta". KYTY_TEJ_ESPERA=0: se para como antes.)
+			if (Tej::t_side == 2 && Tej::AssumeWait(reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(value),
+			                                        static_cast<uint64_t>(ref), func))
+				return;
 			return Spec::Stop("wait on memory the CPU writes");
 		}
+		if (Tej::t_side == 1) Tej::RenderWait(reinterpret_cast<uint64_t>(addr), false); // (tej F1c: el render tuvo que esperar)
 		LiveTrace::Event(LiveTrace::FrontSuspend, reinterpret_cast<uint64_t>(addr),
 		                 (static_cast<uint64_t>(value) << 32u) | static_cast<uint32_t>(ref));
 		SuspendPm4();
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
+		if (Tej::t_side == 1) Tej::RenderWait(reinterpret_cast<uint64_t>(addr), true); // (tej F1c: ya cumplida al llegar)
 		LiveCensus::Par2::Waited(reinterpret_cast<uint64_t>(addr)); // (thread1, KYTY_RENDER_STATS: measurement only)
 		// (KYTY_NATIVE_MEMORY: what the guest wrote before the label it waited for, seen before the packets after it.)
 		// (ww2, KYTY_WRITE_WATCH_MODE=poll: not when the value that satisfies the wait is one a command processor wrote
@@ -2441,10 +2462,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 		// (tej, KYTY_TEJ F1) Un draw: la sombra corta paquetes de 64 y guarda la foto; el hilo de render compara con ella.
 		// Clave = posicion en la DCB raiz << 32 | en el bufer actual (la misma en la copia de la sombra).
-		if (Tej::t_side != 0 && !m_state_only && (Tej::t_side == 2 || spec == nullptr) &&
-		    Pm4ClassOf(opcode) == LiveCensus::Pm4Draw && (packet_header >> 30u) == 3u)
-			Tej::OnDraw(*this, m_renderer,
-			            uint64_t {execution.m_buffer_stack[0].offset_dw} << 32u | cursor.offset_dw);
+		if (Tej::t_side != 0 && !m_state_only && (Tej::t_side == 2 || spec == nullptr) && (packet_header >> 30u) == 3u) {
+			if (const auto cls = Pm4ClassOf(opcode); cls == LiveCensus::Pm4Draw)
+				Tej::OnDraw(*this, m_renderer,
+				            uint64_t {execution.m_buffer_stack[0].offset_dw} << 32u | cursor.offset_dw);
+			else if (cls == LiveCensus::Pm4Dispatch)
+				Tej::OnDispatch(); // (tej F1c: llamadas = draws + dispatches, para el coste por llamada)
+		}
 
 		// (render1 F2, KYTY_RENDER1=2) A packet that is not state (nor a draw, decided when paired) ends the native batch
 		// first: it is drawn and compared as the pass left the depth.
@@ -5018,6 +5042,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 void CommandProcessor::Flip() {
 	if (!m_state_only && DsCensoEscena::Mode() != 0) DsCensoEscena::OnFlip(); // (F5 pase 3: [censo-escena] cada 5 s)
+	if (!m_state_only && Spec::Current() == nullptr && Tej::Mode() != 0) Tej::OnRenderFlip(); // (tej F1c: latencia)
 	NativeFlipSync(GetGpuResources(), m_state_only);
 	if (!m_state_only) // (f5, KYTY_NATIVE_RENDER=map; f5b: the per-pass ceiling's windows read the GPU thread's times)
 		NativeRender::Flip(LiveControl::g_render_idle_ns, LiveCensus::g_kind_cycles[LiveCensus::Submission]);
@@ -5044,6 +5069,7 @@ void CommandProcessor::Flip() {
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
+	if (!m_state_only && Spec::Current() == nullptr && Tej::Mode() != 0) Tej::OnRenderFlip(); // (tej F1c: latencia)
 	CheckBuffer();
 	NativeFlipSync(GetGpuResources(), m_state_only);
 
