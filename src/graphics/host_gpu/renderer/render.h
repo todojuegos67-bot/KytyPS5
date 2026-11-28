@@ -445,6 +445,7 @@ public:
 		uint32_t index_count    = 0;
 		uint32_t instance_count = 1;
 		bool     indexed        = true;
+		uint64_t indirect_args  = 0; // (indirect-tabla) no indexado: drawIndirect de estos argumentos (DrawIndirectArgs en la GPU)
 	};
 	// `direct`: that draw instead of the DRAW_INDEX_INDIRECT run `commands`.
 	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, bool clean, std::span<const uint64_t> commands,

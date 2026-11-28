@@ -2665,6 +2665,19 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
                                                       std::span<const uint64_t> commands, uint64_t index_base,
                                                       uint64_t index_bytes, vk::IndexType index_type,
                                                       const NativeXprDirectDraw* direct) {
+	// (indirect-tabla, KYTY_INDIRECT_TABLA) Un draw de argumentos en la GPU: no con lo que el camino normal hace aparte para ellos
+	// (malla: su rejilla sale de las cuentas; las particulas de la generacion de frames, la verificacion de port-r).
+	// ti1 (b0f72a96) rechazaba aqui el 100 %: miraba FrameGen::ParticleNativeWanted(), que es global (encendido con
+	// KYTY_FG_PARTICLE_MV=1 en el log del usuario). Ahora solo el VS de particulas que captura el normal (ParticleNativeVs,
+	// renderDraw.cpp) se queda fuera.
+	if (direct != nullptr && direct->indirect_args != 0) {
+		const auto* vs = pair.programs[0];
+		if (vs == nullptr) return IndirectTabla::t_why = IndirectTabla::RSinPrograma, TableResult::Native;
+		if (vs->stage == ShaderType::Mesh) return IndirectTabla::t_why = IndirectTabla::RMalla, TableResult::Native;
+		if (PortR::Verifying()) return IndirectTabla::t_why = IndirectTabla::RPortR, TableResult::Native;
+		if (FrameGen::ParticleNativeWanted() && FrameGen::ParticleNativeVs(vs->shader_hash))
+			return IndirectTabla::t_why = IndirectTabla::RParticula, TableResult::Native;
+	}
 	auto&       table  = OwnTable();
 	auto&       cache  = *m_native_xpr;
 	const auto& sh     = buffer.GetShaders();
@@ -3244,6 +3257,11 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	std::array<std::pair<Buffer*, uint64_t>, 64> arguments;
 	std::array<uint32_t, 64>                     group_sizes;
 	uint32_t                                     groups = 0;
+	std::pair<Buffer*, uint64_t> indirect_args {}; // (indirect-tabla)
+	if (direct != nullptr && direct->indirect_args != 0) {
+		indirect_args = obtain(table.args, direct->indirect_args, sizeof(vk::DrawIndirectCommand), [] {});
+		if (indirect_args.first == nullptr) return IndirectTabla::t_why = IndirectTabla::RObtener, TableResult::Native;
+	}
 	for (size_t first = 0; first < commands.size();) {
 		size_t count = 1;
 		while (first + count < commands.size() && commands[first + count] == commands[first] + count * stride) ++count;
@@ -3481,6 +3499,9 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		if (indexed)
 			vk_buffer.drawIndexed(direct->index_count, direct->instance_count, 0, static_cast<int32_t>(vertex_offset),
 			                      first_instance);
+		else if (direct->indirect_args != 0) // (indirect-tabla: cuentas, primer vertice y primera instancia de la GPU)
+			vk_buffer.drawIndirect(indirect_args.first->Handle(), indirect_args.second, 1,
+			                       static_cast<uint32_t>(sizeof(vk::DrawIndirectCommand)));
 		else
 			vk_buffer.draw(direct->index_count, direct->instance_count, vertex_offset, first_instance);
 	}

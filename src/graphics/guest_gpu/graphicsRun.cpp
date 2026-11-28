@@ -67,6 +67,7 @@
 #include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
 #include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
 #include "local/recorrido-rapido.h" // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
+#include "local/indirect-tabla.h" // (indirect-tabla)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -2985,6 +2986,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 					continue;
 				}
 				if (spec != nullptr) return refuse("draw");
+			} else if (packet_header == 0xc0032400u && spec == nullptr && IndirectTabla::Try() &&
+			           !GraphicsRunDebugDumpEnabled()) {
+				// (indirect-tabla, KYTY_INDIRECT_TABLA) Un DRAW_INDIRECT no indexado por la tabla (el normal guarda el par).
+				G1::WalkMark(G1::WObserved);
+				NormalWhy::t_why = NormalWhy::Table;
+				const uint64_t ti_t0    = IndirectTabla::Now();
+				const auto     consumed = TryNativeIndirectDraw({packet, remaining_dw});
+				G1::WalkMark(G1::WTried);
+				if (consumed) {
+					IndirectTabla::g_table.fetch_add(1, std::memory_order_relaxed);
+					IndirectTabla::g_table_ns.fetch_add(IndirectTabla::Now() - ti_t0, std::memory_order_relaxed);
+					execution.m_buffer_stack[buffer_index].offset_dw += consumed;
+					execution.m_made_progress = true;
+					GetScheduler().CompleteDraws(1);
+					continue;
+				}
+				IndirectTabla::g_refused.fetch_add(1, std::memory_order_relaxed);
+				IndirectTabla::g_why[IndirectTabla::t_why == IndirectTabla::RNinguno ? IndirectTabla::RTabla : IndirectTabla::t_why]
+				    .fetch_add(1, std::memory_order_relaxed);
 			} else if ((packet_header == 0xc0042700u || packet_header == 0xc0033500u) &&
 			           !GraphicsRunDebugDumpEnabled()) {
 				// Direct indexed draws from the same records (the normal path stores them).
@@ -3052,7 +3072,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			NormalWhy::t_why = NormalWhy::NoTry;
 		uint32_t packet_dw = 0;
 		if (spec == nullptr) {
+			const uint64_t ti_t0 = opcode == Pm4::IT_DRAW_INDIRECT && IndirectTabla::Mode() != 0 ? IndirectTabla::Now() : 0; // (indirect-tabla)
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			if (ti_t0 != 0) {
+				IndirectTabla::g_normal.fetch_add(1, std::memory_order_relaxed);
+				IndirectTabla::g_normal_ns.fetch_add(IndirectTabla::Now() - ti_t0, std::memory_order_relaxed);
+			}
 		} else {
 			// What would submit or wait for the GPU refuses the packet.
 			try {
@@ -3729,6 +3754,59 @@ uint32_t CommandProcessor::TryNativeAutoDraw(std::span<const uint32_t> packet) {
 #endif
 }
 
+// (indirect-tabla, KYTY_INDIRECT_TABLA; local/indirect-tabla.h) DRAW_INDIRECT no indexado por la tabla: lo que acepta
+// CpOpDrawIndirect y TryGpuIndirectDraw dibuja en la GPU (argumentos alineados, mapeados, no de una imagen), de un tipo
+// que la tabla dibuja tal cual (lista / tira de triangulos, como TryNativeAutoDraw). La tabla emite drawIndirect sobre el
+// bufer de los argumentos: cuentas, primer vertice y primera instancia los pone la GPU, como en el camino normal.
+uint32_t CommandProcessor::TryNativeIndirectDraw(std::span<const uint32_t> packet) {
+	LiveCensus::Scope census(LiveCensus::NativeXpr, 2);
+	TrustedDepth::ClassClock class_clock(2);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	using Prospero::PrimitiveType;
+	const auto primitive = m_ucfg.GetPrimType();
+	IndirectTabla::t_why = IndirectTabla::RForma;
+	if (packet.size() < 5 || packet[0] != 0xc0032400u || (packet[4] & ~0x20u) != 2u || m_draw_indirect_args_base_addr == 0 ||
+	    (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled() ||
+	    Render1::On() ||
+	    (primitive != PrimitiveType::kTriList && primitive != PrimitiveType::kTriStrip))
+		return 0;
+	const uint64_t args = m_draw_indirect_args_base_addr + packet[1];
+	auto&          resources = GetGpuResources();
+	IndirectTabla::t_why = IndirectTabla::RArgs;
+	if ((args & 3u) != 0 || !resources.IsMapped(args, sizeof(DrawIndirectArgs)) ||
+	    resources.GetTextureCache().IsRegionGpuModified(args, sizeof(DrawIndirectArgs)))
+		return 0;
+	IndirectTabla::t_why = IndirectTabla::RDecal;
+	if (DecalTakesNormalPath(m_ctx)) {
+		m_renderer.GetRenderExecutor().NativeXprForgetState();
+		return 0;
+	}
+	CheckBuffer();
+	// KYTY_RENDER_ASPECT: como DrawIndexAuto con los argumentos en la GPU (cuenta 1); varias areas van por el normal.
+	const auto hud = HudAnchor::Split(HudAnchor::Classify(m_ctx, m_sh_ctx.GetVs(), m_ucfg.GetIndexOffset(), 1));
+	if (hud.Several()) return IndirectTabla::t_why = IndirectTabla::RHud, 0u;
+	IndirectTabla::t_why = IndirectTabla::RNinguno; // (TableDraw pone el suyo; si no, "tabla (otro)")
+	std::optional<HudAnchor::Scope>        anchor;
+	std::optional<HudAnchor::StretchScope> widen;
+	if (hud.Single()) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), static_cast<uint32_t>(std::countr_zero(hud.areas)), false);
+	} else if (hud.marker) {
+		anchor.emplace(m_ctx, m_sh_ctx.GetPs(), HudAnchor::MarkerArea, false);
+	} else {
+		HudAnchor::RestoreMask(m_sh_ctx.GetPs());
+		if (HudAnchor::Stretched(m_ctx)) widen.emplace(m_ctx, m_sh_ctx.GetPs());
+	}
+	RenderExecutor::NativeXprDirectDraw draw {0, 1, 1, false};
+	draw.indirect_args = args;
+	return m_renderer.GetRenderExecutor().NativeXprTry(CurrentBuffer(), false, {}, 0, 0, vk::IndexType::eUint16, &draw)
+	           ? 5u
+	           : 0u;
+#else
+	(void)packet;
+	return 0;
+#endif
+}
+
 uint32_t CommandProcessor::TryDrawIndirectRun(std::span<const uint32_t> packets) {
 	constexpr uint32_t max_draws = 64;
 	if ((FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed))) return 0; // one record per draw while a frame is recorded
@@ -4085,8 +4163,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 		                  Parpadeo::PathNormal);
 	}
 	if (TryGpuIndirectDraw(m_draw_indirect_args_base_addr + data_offset, 1,
-	                       indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs), indexed))
+	                       indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs), indexed)) {
+		if (!indexed && IndirectTabla::Mode() != 0) IndirectTabla::g_normal_gpu.fetch_add(1, std::memory_order_relaxed); // (indirect-tabla)
 		return;
+	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(
 	        m_draw_indirect_args_base_addr + data_offset,
 	        indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs))) {
@@ -4269,6 +4349,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		CheckBuffer();
 		frame_num = m_renderer.GetGpu().GetFrameNum();
 		VgeoNativo::OnFrame(frame_num); // (w11)
+		IndirectTabla::OnFrame(frame_num); // (indirect-tabla)
 		if (GraphicsRunDebugDumpEnabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.load(std::memory_order_relaxed) < 1024 && log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
