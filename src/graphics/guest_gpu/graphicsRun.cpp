@@ -66,6 +66,7 @@
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
 #include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
 #include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
+#include "local/recorrido-rapido.h" // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -2243,11 +2244,29 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	const uint32_t otros2_mode = Otros2::Active() && spec == nullptr && g_gpu_state != nullptr ? Otros2::Mode() : 0u;
 	uint32_t       pre_skips   = 0;
 	auto* const    preamble_cache = g_gpu_state != nullptr ? &g_gpu_state->m_renderer.GetBufferCache() : nullptr;
+	// (recorrido-rapido, KYTY_RECORRIDO_RAPIDO, local/recorrido-rapido.h) `fast`: this list with A and B; `rare`: some
+	// mode the walk checks at every packet is on (all static since start-up); without `fast` always true (as before).
+	const bool fast = RecorridoRapido::Active();
+	const bool rare = !fast || Render1::Mode() != 0 || Port1::Mode() != 0 || PathTrace::Requested() ||
+	                  NativeRender::WalkOn() || F5p1Techo::On() || DsNativoSombras::Mode() != 0;
+	const bool rr_count = RecorridoRapido::Mode() != 0 && Techo::On();
+	if (rr_count && fast && !rare) RecorridoRapido::Note(RecorridoRapido::g_taken);
 	const auto     preamble    = [&] {
         // (w20) Between packets nothing is usually queued: two inline checks instead of two calls (each with its own
         // checks: GPU thread, par queues, juego3, native memory, the semaphore's tick) on every packet. ACB #4 a0ed3e
         // ~10700 packets/f, "preambulo+vuelta" 1026 us/f (measured with [censo-pm4], its marks included).
         if (Juego3::Mode() == 0 && !g_gpu_state->HasPendingCommands() && (preamble_cache == nullptr || !preamble_cache->FeedbackPending())) return;
+        // (recorrido-rapido A) Queued but its tick not complete, no guest command: both calls below would do nothing.
+        if (rr_count || fast) {
+	        const bool idle = Juego3::Mode() == 0 && !g_gpu_state->HasPendingCommands() &&
+	                          (preamble_cache == nullptr || !preamble_cache->FeedbackReady());
+	        if (rr_count)
+		        RecorridoRapido::Note(RecorridoRapido::g_why[idle ? RecorridoRapido::WSaved
+		                                                         : Juego3::Mode() != 0 || g_gpu_state->HasPendingCommands()
+		                                                               ? RecorridoRapido::WCommands
+		                                                               : RecorridoRapido::WReady]);
+	        if (fast && idle) return;
+        }
         const uint64_t pre0 = otros1_on ? __rdtsc() : 0; // (otros1: the preamble's own time)
         g_gpu_state->ProcessCommands();
         // (KYTY_EAGER_FEEDBACK: completed copy-feedback snapshots written back between packets.)
@@ -2340,7 +2359,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		pm4_clock.Key(packet_header); // (otros1)
 		CensoPm4::Packet(CensoPm4::KeyOf(packet_header)); // (w18)
 		G1::WalkDecoded(Pm4ClassOf(opcode) == LiveCensus::Pm4Draw); // (g1 NP1, KYTY_G1_PROBE: one relaxed load when off)
-		if (DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu && DsNativoSombras::Mode() == 2)
+		if (rare && DsNativoSombras::g_gpu_pending.load(std::memory_order_relaxed) != 0xFFFFFFFFu && DsNativoSombras::Mode() == 2)
 			DsNativoSombras::GpuNotePacket(opcode, packet, remaining_dw, m_sh_ctx.GetCs().cs_regs.data_addr); // (F5 pase 2, =2)
 		// (otros1, KYTY_OTROS1) The register pairs an indirect block carries (its handler and the draw state observer
 		// each read the block).
@@ -2369,7 +2388,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		// (render1 F2, KYTY_RENDER1=2) A packet that is not state (nor a draw, decided when paired) ends the native batch
 		// first: it is drawn and compared as the pass left the depth.
-		if (Render1::Mode() == 2 && spec == nullptr && !m_state_only) {
+		if (rare && Render1::Mode() == 2 && spec == nullptr && !m_state_only) {
 			auto& executor = m_renderer.GetRenderExecutor();
 			if (executor.Render1BatchOpen() &&
 			    !Render1::KeepsBatch(opcode, opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_ZERO &&
@@ -2801,7 +2820,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		}
 		// (f5p1 techo, KYTY_F5P1_TECHO=1; local/f5p1-techo.h) In an ON window, a draw of a verified pass 0/1 range of
 		// 0xad8bc0 is passed over (nothing translated, recorded or drawn); everything else runs as always.
-		if (F5p1Techo::On() && !m_state_only) {
+		if (rare && F5p1Techo::On() && !m_state_only) {
 			if (const uint32_t skip = F5p1Techo::SkipDraw(opcode, packet, remaining_dw, cursor.commands.data(), total_dw)) {
 				m_draw_run_skip = 0;
 				cursor.offset_dw += skip;
@@ -2814,8 +2833,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// marks). One static load per packet when neither is set.
 		// (pt1) BB_PATHTRACING's GPU work at the packet after a game scope mark (TLAS build after GBuffer, shadows before
 		// RenderLights, reflections before RenderIBL). One static load per packet when off.
-		if (PathTrace::Requested() && !m_state_only && spec == nullptr && PathTrace::WorkPending()) PathTrace::RunWork(CurrentBuffer());
-		if (NativeRender::WalkOn() && !m_state_only && spec == nullptr) {
+		if (rare && PathTrace::Requested() && !m_state_only && spec == nullptr && PathTrace::WorkPending()) PathTrace::RunWork(CurrentBuffer());
+		if (rare && NativeRender::WalkOn() && !m_state_only && spec == nullptr) {
 			if (NativeRender::GpuWorkPending()) NativeRender::RunGpuWork(CurrentBuffer());
 			if (const uint32_t skip =
 			        NativeRender::WalkPacketSlow(opcode, packet, remaining_dw, cursor.commands.data(), total_dw)) {
@@ -2829,10 +2848,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// de cualquier camino que lo dibuje (tablas, XPR nativo o el handler): con =3, el primero copia la capa emulada; con
 		// =1, en un cubo reemplazado, el draw de una entrada que dibuja el nativo se salta entero (solo este paquete: los
 		// de estado siguen). Indices como CommandProcessor::DrawIndexOffset / DRAW_INDEX_2.
-		if ((opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) &&
+		if (rare && (opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) &&
 		    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && (m_state_only || spec != nullptr || !GuestGpu::IsGpuThread()))
 			DsNativoSombras::g_nat_draws_elsewhere[m_state_only ? 0 : spec != nullptr ? 1 : 2].fetch_add(1, std::memory_order_relaxed); // (diagnostico)
-		if ((opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) && !m_state_only && spec == nullptr &&
+		if (rare && (opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_2) && !m_state_only && spec == nullptr &&
 		    (DsNativoSombras::Mode() == 1 || DsNativoSombras::Mode() == 3) && GuestGpu::IsGpuThread() &&
 		    m_renderer.GetRenderExecutor().DsNatWants()) {
 			const uint32_t packet_dw = KYTY_PM4_LEN(packet_header);
@@ -2855,10 +2874,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		G1::WalkMark(G1::WChecked); // (g1 NP1: the walk's checks done)
 		auto handler = g_cp_op_func[opcode];
 		LiveCounters::AddPm4(opcode);
-		if (Port1::Mode() != 0) Port1::OnPacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw)); // (port1)
+		if (rare && Port1::Mode() != 0) Port1::OnPacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw)); // (port1)
 		// (render1) KYTY_RENDER1=1/2: this draw (a run that takes more packets below observes the rest).
 		Render1Step render1_step; // (F2: the step of a p0/p1 draw; ends with this iteration)
-		if (opcode == Pm4::IT_DRAW_INDEX_INDIRECT && Render1::On() && !m_state_only && packet_header == 0xc0032500u) {
+		if (rare && opcode == Pm4::IT_DRAW_INDEX_INDIRECT && Render1::On() && !m_state_only && packet_header == 0xc0032500u) {
 			bool       all    = false;
 			const auto native = Render1Observe(m_ctx, packet, 1, all);
 			if (Render1::Mode() >= 2 && spec == nullptr) {

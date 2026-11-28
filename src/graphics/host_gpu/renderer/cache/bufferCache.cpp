@@ -1022,6 +1022,13 @@ void BufferCache::NoteNativeWrite(uint64_t vaddr, uint64_t size) {
 // (ReadMemoryOnGpu: a snapshot if one holds them, else one download; the pages then CPU-owned). Bounded:
 //   KYTY_NATIVE_EAGER_SMALL_KB (64): larger ranges only over a 64 KiB granule some CPU-side read pulled back before;
 //   KYTY_NATIVE_EAGER_BUDGET_KB (4096): bytes per call; the rest waits for the next call.
+bool BufferCache::FeedbackReady() const noexcept {
+	if (m_eager_feedback.empty() && m_native_writes.empty()) return false;
+	const auto known = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	return (!m_eager_feedback.empty() && m_eager_feedback.front().tick <= known) ||
+	       (!m_native_writes.empty() && m_native_writes.front().tick <= known);
+}
+
 void BufferCache::WriteBackNativeWrites() {
 	if (m_native_writes.empty()) return;
 	auto& master = m_scheduler.GetMasterSemaphore();

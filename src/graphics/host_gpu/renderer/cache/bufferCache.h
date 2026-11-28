@@ -187,6 +187,9 @@ public:
 	// (w20) Whether WriteBackCompletedFeedback could do anything (a copy-feedback snapshot or a native write queued): the
 	// PM4 walk's per-packet preamble skips the call otherwise. GPU thread, as the queues' other readers.
 	[[nodiscard]] bool FeedbackPending() const noexcept { return !m_eager_feedback.empty() || !m_native_writes.empty(); }
+	// (recorrido-rapido, KYTY_RECORRIDO_RAPIDO) Whether it would do anything NOW: a queued snapshot or native write whose
+	// tick has completed (the oldest of each is the first to complete; both write-backs return at once otherwise).
+	[[nodiscard]] bool FeedbackReady() const noexcept;
 	// GPU thread: retire a pending guest read before touching overlapping backing.
 	// With no range, drain before mapping changes, unknown BDA access, or shutdown.
 	// `gpu_write`: the range is about to be written by the GPU again; a read whose
