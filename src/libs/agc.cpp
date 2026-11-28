@@ -29,6 +29,7 @@
 #include "local/port2.h" // (port2, KYTY_PORT2)
 #include "local/f0-measure.h" // (f0, KYTY_F0)
 #include "local/techo-faltas.h" // (techo-faltas, KYTY_TECHO)
+#include "local/faltas-emu.h" // (faltas-emu, KYTY_FALTAS_EMU)
 #include "local/juego3.h" // (juego3, KYTY_JUEGO3)
 #include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: censo por DCB y sitio del juego)
 #include "native/native-render.h" // (f5, KYTY_NATIVE_RENDER)
@@ -338,6 +339,7 @@ struct CommandBuffer {
 		auto* ret_ptr = cursor_up;
 		if (Port1::Mode() != 0) Port1::OnAlloc(this, ret_ptr, size_dw); // (port1: the packets the API writes here)
 		if (Port2::Mode() != 0) Port2::OnAlloc(this, ret_ptr, port2_draw); // (port2: seal at a draw, segment check)
+		FaltasEmu::BeforeWrite(ret_ptr, uint64_t {size_dw} * 4u); // (faltas-emu: its pages opened before, no own fault)
 		cursor_up += size_dw;
 		if (port2_draw) Port2::AfterDrawAlloc(this); // (port2: the next span's marker, right after the packet)
 		return ret_ptr;

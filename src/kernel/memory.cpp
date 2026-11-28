@@ -2473,6 +2473,26 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+// (faltas-emu, KYTY_FALTAS_EMU; local/faltas-emu.h) The emulator is about to write [vaddr, vaddr + size) of guest memory
+// itself (an Agc packet in the game's command buffer): each page of it the trackers protect now gets what its write fault
+// would get (HandleFault, this thread), page by page, before the write instead of from inside an exception. Pages whose
+// state is not protected are left alone (their write would not fault). Without host protection of written pages
+// (KYTY_NATIVE_MEMORY unless KYTY_WRITE_WATCH_MODE=protect) nothing is done: there a write faults only on read-watched
+// pages, as before.
+uint32_t OpenWatchedForEmulatorWrite(uint64_t vaddr, uint64_t size) noexcept {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return 0;
+	if (Graphics::PageManager::NativeWriteWatch() && !Graphics::PageManager::WatchProtects()) return 0;
+	uint32_t       n    = 0;
+	const uint64_t end  = vaddr + size;
+	for (uint64_t page = vaddr & ~uint64_t {4095}; page < end; page += 4096) {
+		const uint64_t at = page < vaddr ? vaddr : page;
+		uint64_t       first = 0, last = 0;
+		if (!g_gpu_resources->WatchedSpan(at, 1, &first, &last)) continue;
+		if (g_gpu_resources->HandleFault(Graphics::PageFaultAccess::Write, at)) ++n;
+	}
+	return n;
+}
+
 bool TryReadbackRange(uint64_t vaddr, uint64_t size) noexcept {
 	return g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) && g_gpu_resources->HasReadWatchers(vaddr, size) &&
 	       g_gpu_resources->ReadbackRange(vaddr, size);

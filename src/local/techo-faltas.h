@@ -13,6 +13,7 @@
 #include "local/techo.h"
 #include "local/frame-nativo.h"
 #include "local/faltas-reciclado.h"
+#include "local/faltas-emu.h"
 
 #include <atomic>
 #include <cstdint>
@@ -327,6 +328,7 @@ inline void Report(double frames, double ms_cyc) noexcept {
 	ReportUnknown(frames, ms_cyc);
 	std::printf(" | perdidos %llu\n", static_cast<unsigned long long>(g_lost.exchange(0, std::memory_order_relaxed)));
 	std::fflush(stdout);
+	FaltasEmu::Report(frames, ms_cyc, hilo_ms[1]); // (faltas-emu: its own line, A/B in the same 5 s window)
 }
 
 } // namespace TechoFaltas
