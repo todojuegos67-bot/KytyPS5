@@ -1499,7 +1499,11 @@ inline void EffDcbStart() {
 	e.ring[e.ring_k++ % 32] = e.dcb_end;
 	if (old != 0) g_eff.DropBefore(old);
 	if (!g_hook_side) e.gap_end = e.dcb_end;
-	e.sample = g_hook_side && (g_gpu_serial.load(std::memory_order_relaxed) % RealEvery) == 0;
+	// (tej-rep) ARREGLO de la medida rota en 29a8bea (PASA/F2p/COS3 0.0 %, muestra x0.00): 'serial % 32' no caia
+	// nunca en 0 (los seriales de la cola 0 no recorren todos los restos), asi que Real() no entraba y sc = 0. Ahora:
+	// contador propio de DCB del lado del gancho, mezclado (no siempre las mismas posiciones del fotograma), 1/RealEvery.
+	static uint32_t dcb_k = 0;
+	e.sample = g_hook_side && ((static_cast<uint32_t>(dcb_k++) * 0x9E3779B1u) >> 27) == 0;
 	static uint64_t last = 0;
 	Add(GEffEntries, e.dcb_end - last);
 	t_hook.t[HEff] += g_eff_ticks - e.ticks0, t_hook.n[HEff] += e.dcb_end - last;
