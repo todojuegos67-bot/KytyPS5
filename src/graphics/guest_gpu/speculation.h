@@ -70,7 +70,10 @@ public:
 		uint64_t    translate_ns = 0; // (tej F1b) Translate alone (the rest: Finish)
 	};
 	void      ShadowThreadInit(); // (on the thread that calls Shadow, once)
-	ShadowOut Shadow(const CommandProcessor& start, std::span<const uint32_t> commands, CommandProcessor& end);
+	// (tej-cosibles) `chain`: pending guest memory writes before it (the state passes of the command buffers before, not
+	// processed yet): read from there as from a previous speculation's (chain reads, checked by value). Null: none.
+	ShadowOut Shadow(const CommandProcessor& start, std::span<const uint32_t> commands, CommandProcessor& end,
+	                 const Spec::State* chain = nullptr);
 
 	// Blocked: committed up to a wait hole not satisfied yet (the submission waits; Resume goes on from there). Chunk:
 	// committed up to the end of its chunk (mode 4: the execution is where the next begins).
@@ -211,6 +214,7 @@ private:
 		std::thread                                thread;
 		uint64_t                                   translating = 0; // (under m_mutex: serial, chunk)
 		uint32_t                                   translating_chunk = 0;
+		const Spec::State*                         shadow_chain = nullptr; // (tej-cosibles: Shadow's `chain`, its thread)
 		Result*                                    current     = nullptr;
 		uint64_t                                   since       = 0;
 	};

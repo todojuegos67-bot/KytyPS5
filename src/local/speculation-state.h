@@ -47,6 +47,12 @@ struct Range {
 
 // A guest memory write of the command processor (a label) or a copy made on the CPU (a linear copy:
 // BufferCache::CopyBuffer), applied at commit in order.
+// (tej-cosibles) Los bytes que una lectura limpia leyo (los mismos que la traduccion usa), para quien los quiera
+// (la sombra de KYTY_TEJ: valida por VALOR en el render). Nulo: nada (todo lo demas, identico).
+inline thread_local void (*t_clean_value_hook)(uint64_t address, uint64_t bytes, const void* data) = nullptr;
+inline void CleanValue(uint64_t address, uint64_t bytes, const void* data) {
+	if (t_clean_value_hook != nullptr) t_clean_value_hook(address, bytes, data);
+}
 struct MemoryWrite {
 	uint64_t address = 0;
 	uint64_t value   = 0; // a copy's source address
@@ -314,21 +320,21 @@ struct State {
 		const uint64_t bytes = uint64_t {4} * count;
 		if (bytes != 0 && !pending.MayHold(address, bytes)) {
 			std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
-			if (clean) NoteCleanRead(address, bytes);
+			if (clean) NoteCleanRead(address, bytes), CleanValue(address, bytes, out);
 			return true;
 		}
 		if (bytes != 0 && !journal_set.Intersects(address, bytes) && !written_set.Intersects(address, bytes) &&
 		    !chain_written.Intersects(address, bytes) &&
 		    (previous.load(std::memory_order_relaxed) == nullptr || !chain_journal.Intersects(address, bytes))) {
 			std::memcpy(out, reinterpret_cast<const void*>(address), bytes);
-			if (clean) NoteCleanRead(address, bytes);
+			if (clean) NoteCleanRead(address, bytes), CleanValue(address, bytes, out);
 			return true;
 		}
 		for (uint32_t i = 0; i < count; ++i) {
 			const uint64_t at = address + 4ull * i;
 			const State*   by = nullptr;
 			if (!ReadWord(at, out[i], by)) return false;
-			if (by == nullptr && clean) NoteCleanRead(at, 4);
+			if (by == nullptr && clean) NoteCleanRead(at, 4), CleanValue(at, 4, &out[i]);
 			else if (by != nullptr && by != this) chain_reads.push_back({at, out[i]});
 		}
 		return true;
@@ -362,8 +368,8 @@ struct State {
 		}
 		const auto source = latest->value + (at - latest->address);
 		if (state.JournalIntersects(source, 4) || state.WrittenIntersects(source, 4)) return false;
-		if (&state == this) NoteCleanRead(source, 4);
 		std::memcpy(&value, reinterpret_cast<const void*>(source), 4);
+		if (&state == this) NoteCleanRead(source, 4), CleanValue(source, 4, &value);
 		return true;
 	}
 

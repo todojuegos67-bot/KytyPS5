@@ -191,6 +191,10 @@ enum C : uint32_t {
 	// F1d x pasa/base); imagenes y mapeos por rango exacto (anillos); metadatos borrados sobre imagen del paquete o no
 	GRealBaseD, GRealBasePk, GCosImgExactOk, GCosImgExactFail, GCosImgExactLost, GCosMapExactOk, GCosMapExactFail,
 	GCosMapExactLost, GCosMetaOnImg, GCosMetaOffImg, GCosCsSampled,
+	// (tej-cosibles) lecturas limpias que el render escribio (CPU) validadas por VALOR (bytes que la traduccion leyo ==
+	// memoria al llegar el render): pasan, distintas, sin bytes guardados; lecturas reenviadas de las DCB anteriores
+	// (pasada del lector: la escritura del procesador aun no hecha) por paquete; paquetes con bytes guardados de mas
+	GCosValOk, GCosValDiff, GCosValNone, GCosFwdReads, GCosFwdDcb, GCosFwdWrites, GCosSnapOver,
 	NCount
 };
 // (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
@@ -304,6 +308,9 @@ struct Packet {
 	uint64_t                                   ep_buf0 = 0;
 	bool                                       rbx_ok  = false;
 	TejCoser::PkInfo                           coser; // (tej-coser)
+	// (tej-cosibles) bytes de las lecturas limpias tal como la traduccion los leyo (direccion, tamano; bytes seguidos)
+	std::vector<std::pair<uint64_t, uint32_t>> rv;
+	std::vector<uint8_t>                       rvb;
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
@@ -395,6 +402,10 @@ struct Item {
 	std::vector<uint32_t>             cmds;
 	std::unique_ptr<CommandProcessor> start, pass_end;
 	bool                              pass_ok = false, has_end = false;
+	// (tej-cosibles) escrituras pendientes del procesador de las DCB anteriores aun no procesadas por el render (sus
+	// pasadas de estado): la traduccion las lee de aqui (lecturas de cadena, validadas por valor en el render)
+	std::unique_ptr<Libs::Graphics::Spec::State> chain;
+	bool                                         has_chain = false;
 };
 
 class Shadow;
@@ -414,6 +425,18 @@ public:
 		if (m_slot != nullptr && m_open >= 0) ++m_slot->pk[m_open].dispatches;
 	}
 	void Close(const Libs::Graphics::Spec::State* st);
+	// (tej-cosibles) una lectura limpia de la traduccion con sus bytes (Spec::t_clean_value_hook)
+	void Snap(uint64_t address, uint64_t bytes, const void* data) {
+		if (m_slot == nullptr) return;
+		if (bytes > SnapMax || m_snap_bytes.size() + bytes > SnapDcbMax) {
+			m_snap_over = true;
+			return;
+		}
+		m_snaps.push_back({address, static_cast<uint32_t>(bytes), static_cast<uint32_t>(m_snap_bytes.size())});
+		const auto* b = static_cast<const uint8_t*>(data);
+		m_snap_bytes.insert(m_snap_bytes.end(), b, b + bytes);
+	}
+	static constexpr uint64_t SnapMax = 256, SnapDcbMax = 256 * 1024;
 	std::thread                               thread;
 	std::unordered_map<uint64_t, uint64_t>    waits; // (direccion de espera supuesta -> veces; bajo reason_mutex)
 	std::mutex                                reason_mutex;
@@ -437,6 +460,15 @@ private:
 	bool                                      m_assumed = false;
 	std::unordered_map<const char*, uint64_t> m_job_holes;
 	std::unordered_map<uint64_t, uint64_t>    m_job_waits;
+	// (tej-cosibles) lecturas limpias de la DCB con sus bytes; desde cual copia el paquete abierto
+	struct SnapE {
+		uint64_t address;
+		uint32_t size, at;
+	};
+	std::vector<SnapE>   m_snaps;
+	std::vector<uint8_t> m_snap_bytes;
+	size_t               m_snap_open = 0;
+	bool                 m_snap_over = false;
 	// (tej-cos) rangos de buffers de la DCB acumulados (fusionados) hasta el ultimo cierre; de que estado y hasta donde
 	std::vector<std::pair<uint64_t, uint64_t>> m_acc_bufs;
 	const Libs::Graphics::Spec::State*         m_acc_st   = nullptr;
@@ -763,6 +795,8 @@ private:
 		Add(LPassNs, Now() - t0);
 		item.pass_ok  = res == Pm4ProcessResult::Complete;
 		item.has_end  = false;
+		ChainFor(job.serial, item); // (tej-cosibles: antes de guardar las de esta, solo las anteriores)
+		KeepWrites(job.serial);
 		if (item.pass_ok) {
 			// (el estado final de la pasada solo para el diagnostico 'estado distinto de la pasada': 1 de cada 16 DCB)
 			if ((++m_end_k & 15u) == 0) {
@@ -782,6 +816,46 @@ private:
 		return true;
 	}
 
+	// (tej-cosibles) Escrituras del procesador de cada pasada (WRITE_DATA, rellenos pequenos: no copias), por serial;
+	// solo tramos contiguos >= 64 bytes (las etiquetas de fin de tuberia, 4-8 bytes, se escriben al acabar la GPU y no al
+	// procesar: reenviarlas haria fallar la validacion por valor). 3184 bytes medidos (COS, 0x269c83000).
+	struct PassW {
+		uint64_t                                     serial = 0;
+		std::vector<Libs::Graphics::Spec::MemoryWrite> w;
+	};
+	static constexpr uint32_t PassWN = 16, FwdMinBytes = 64;
+	PassW                     m_passw[PassWN];
+	void KeepWrites(uint64_t serial) {
+		auto& k  = m_passw[serial % PassWN];
+		k.serial = serial;
+		k.w.clear();
+		const auto& w = m_record.writes;
+		for (size_t i = 0; i < w.size();) {
+			size_t   j     = i + 1;
+			uint64_t bytes = w[i].copy ? 0 : w[i].size;
+			while (j < w.size() && !w[j].copy && !w[i].copy && w[j].address == w[j - 1].address + w[j - 1].size) bytes += w[j++].size;
+			if (!w[i].copy && bytes >= FwdMinBytes) k.w.insert(k.w.end(), w.begin() + i, w.begin() + j);
+			i = j;
+		}
+	}
+	void ChainFor(uint64_t serial, Item& item) {
+		item.has_chain = false;
+		const uint64_t gpu = g_gpu_serial.load(std::memory_order_acquire);
+		uint64_t       n   = 0;
+		for (uint64_t s = std::max(gpu + 1, serial > PassWN ? serial - PassWN + 1 : 1); s < serial; ++s) {
+			const auto& k = m_passw[s % PassWN];
+			if (k.serial != s || k.w.empty()) continue;
+			if (!item.has_chain) {
+				if (!item.chain) item.chain = std::make_unique<Libs::Graphics::Spec::State>();
+				item.chain->Clear();
+				item.has_chain = true;
+				Add(GCosFwdDcb);
+			}
+			for (const auto& x: k.w) item.chain->Journal(x.address, x.value, x.size);
+			n += k.w.size();
+		}
+		Add(GCosFwdWrites, n);
+	}
 	RenderContext&                        m_r;
 	Speculation                           m_reader_spec;
 	std::unique_ptr<CommandProcessor>     m_chain, m_published;
@@ -829,6 +903,9 @@ inline void Worker::Run() {
 	Libs::Graphics::Spec::t_shadow_end_hook = [](const Libs::Graphics::Spec::State* st) {
 		if (t_worker != nullptr && t_side == 2) t_worker->Close(st); // (F1d: el ultimo paquete con sus rangos)
 	};
+	Libs::Graphics::Spec::t_clean_value_hook = [](uint64_t address, uint64_t bytes, const void* data) {
+		if (t_worker != nullptr && t_side == 2) t_worker->Snap(address, bytes, data); // (tej-cosibles)
+	};
 	t_side   = 2;
 	t_worker = this;
 	while (auto item = m_owner.Take(m_index)) {
@@ -866,6 +943,7 @@ inline void Worker::Translate(Item& item) {
 	m_assumed  = false;
 	m_job_holes.clear();
 	m_job_waits.clear();
+	m_snaps.clear(), m_snap_bytes.clear(), m_snap_open = 0, m_snap_over = false; // (tej-cosibles)
 	if (Var() == 1) { // (tej-var sin traducir: la DCB llega y se descarta; el render no ve paquetes)
 		slot.done.store(true, std::memory_order_release);
 		m_slot = nullptr;
@@ -876,7 +954,8 @@ inline void Worker::Translate(Item& item) {
 	const auto     t0  = Now();
 	const bool     render_in0 = g_render_in.load(std::memory_order_relaxed);
 	TejLag::t_translating = true; // (tej-sinmutex: aqui una RecorderRefusal 'sin mutex' es hueco)
-	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
+	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end,
+	                                   item.has_chain ? item.chain.get() : nullptr); // (tej-cosibles)
 	TejLag::t_translating = false;
 	const auto     t1  = Now();
 	// (tej-enq) solape con el render: render dentro de una DCB al empezar y al acabar la traduccion (estimacion)
@@ -953,6 +1032,15 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 				p.bufs.emplace_back(st->buffer_ranges[i].begin, st->buffer_ranges[i].end);
 			for (size_t i = std::min(p.fi_read, st->clean_reads.size()); i < st->clean_reads.size(); ++i)
 				p.reads.emplace_back(st->clean_reads[i].begin, st->clean_reads[i].end);
+			// (tej-cosibles) sus bytes (si alguno no cupo, ninguno: el render no valida por valor)
+			p.rv.clear(), p.rvb.clear();
+			if (!m_snap_over && !p.reads.empty())
+				for (size_t i = std::min(m_snap_open, m_snaps.size()); i < m_snaps.size(); ++i) {
+					const auto& x = m_snaps[i];
+					p.rv.emplace_back(x.address, x.size);
+					p.rvb.insert(p.rvb.end(), m_snap_bytes.begin() + x.at, m_snap_bytes.begin() + x.at + x.size);
+				}
+			if (m_snap_over) Add(GCosSnapOver);
 			for (size_t i = std::min(p.fi_img, st->touched_images.size()); i < st->touched_images.size(); ++i) {
 				const auto* im = st->touched_images[i].first;
 				if (im != nullptr) p.imgs.emplace_back(im->info.data.address, im->info.data.address + im->info.data.size);
@@ -968,6 +1056,7 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 			cp2(p.copies, st->cpu_copies, p.fi_copy, rg);
 			cp2(p.sets, st->sets, p.fi_set, [](uint64_t x) { return x; });
 			cp2(p.chains, st->chain_reads, p.fi_chain, [](const auto& x) { return x; });
+			if (!p.chains.empty()) Add(GCosFwdReads, p.chains.size()); // (tej-cosibles)
 			cp2(p.waits, st->waits, p.fi_wait, [](const auto& x) { return x; });
 			p.n_bda = static_cast<uint32_t>(st->bda.size() - std::min(p.fi_bda, st->bda.size()));
 			p.n_inv = static_cast<uint32_t>(st->invalidated.size() - std::min(p.fi_inv, st->invalidated.size()));
@@ -1067,6 +1156,8 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 			p.fi_buf = p.fi_read = p.fi_img = ~size_t {0};
 		}
 		m_open    = static_cast<int>(j);
+		// (tej-cosibles) los bytes desde 64 lecturas antes (las 8 ultimas de Note que el paquete hereda, de sobra)
+		m_snap_open = m_snaps.size() > 64 ? m_snaps.size() - 64 : 0;
 		TejCoser::WorkerOpen(p.coser); // (tej-coser: herencia de rendering + sonda desde aqui)
 	}
 	if (m_open >= 0) ++m_slot->pk[m_open].draws;
@@ -1408,7 +1499,39 @@ inline void EffDcbStart() {
 	e.ticks0 = g_eff_ticks;
 	last = e.dcb_end;
 }
-[[nodiscard]] inline uint32_t RealWhy(const Packet& p, RenderContext& r, const EffAcc& a, bool lost) {
+// (tej-cosibles) Una lectura limpia [b, e) que el render escribio en la CPU (WRITE_DATA etc., ya en memoria al llegar el
+// render a este paquete): la traduccion es la misma si TODOS los bytes que leyo ahi son los que hay ahora (lo que la
+// traduccion normal leeria ahora). Cubierta entera por los bytes guardados (p.rv) y todos iguales; si no, falla.
+// 0 pasa por valor, 1 distinta, 2 sin bytes guardados.
+[[nodiscard]] inline int ReadByValue(const Packet& p, uint64_t b, uint64_t e) {
+	if (e <= b || e - b > Worker::SnapMax) return 2;
+	uint8_t  cov[Worker::SnapMax] {};
+	size_t   at  = 0;
+	for (const auto& [a, n]: p.rv) {
+		const uint8_t* v = p.rvb.data() + at;
+		at += n;
+		if (a >= e || a + n <= b) continue;
+		if (std::memcmp(v, reinterpret_cast<const void*>(a), n) != 0) return 1;
+		for (uint64_t x = std::max(a, b); x < std::min(a + n, e); ++x) cov[x - b] = 1;
+	}
+	for (uint64_t x = 0; x < e - b; ++x)
+		if (cov[x] == 0) return 2;
+	return 0;
+}
+// Lecturas limpias: GPU encima = falla; CPU (render) encima = por valor. count: contadores (solo la pasada 'all').
+[[nodiscard]] inline bool ReadsFail(const Packet& p, const EffAcc& a, bool count) {
+	if (a.gw.Empty() && a.hw.Empty()) return false;
+	for (const auto& [b, e]: p.reads) {
+		if (e <= b) continue;
+		if (!a.gw.Empty() && a.gw.Intersects(b, e - b)) return true;
+		if (a.hw.Empty() || !a.hw.Intersects(b, e - b)) continue;
+		const int v = ReadByValue(p, b, e);
+		if (count) Add(v == 0 ? GCosValOk : v == 1 ? GCosValDiff : GCosValNone);
+		if (v != 0) return true;
+	}
+	return false;
+}
+[[nodiscard]] inline uint32_t RealWhy(const Packet& p, RenderContext& r, const EffAcc& a, bool lost, bool count = false) {
 	if (lost) return 1;
 	const auto in = [](const Libs::Graphics::RangeSet& rs, const auto& v) {
 		if (rs.Empty()) return false;
@@ -1420,7 +1543,7 @@ inline void EffDcbStart() {
 	auto& tc = r.GetTextureCache();
 	for (const auto& [addr, slice]: p.metas)
 		if (tc.IsMetaCleared(addr, slice)) return 3;
-	if (in(a.gw, p.reads) || in(a.hw, p.reads)) return 4;
+	if (ReadsFail(p, a, count)) return 4; // (tej-cosibles: antes cualquier escritura del render encima)
 	for (const auto set: a.sets)
 		if (std::find(p.sets.begin(), p.sets.end(), set) != p.sets.end()) return 5;
 	if (in(a.gw, p.copies)) return 6;
@@ -1440,7 +1563,7 @@ inline void CosWhy(const Packet& p, RenderContext& r, const EffAcc& a, uint64_t 
 		for (const auto& [b, en]: p.reads) {
 			if (en <= b) continue;
 			const bool gw = !a.gw.Empty() && a.gw.Intersects(b, en - b);
-			const bool hw = !gw && !a.hw.Empty() && a.hw.Intersects(b, en - b);
+			const bool hw = !gw && !a.hw.Empty() && a.hw.Intersects(b, en - b) && ReadByValue(p, b, en) != 0;
 			if (!gw && !hw) continue;
 			Add(gw ? GCosReadGpu : GCosReadHost); // (muestra: sin escalar; la linea escala por F1d/base)
 			const auto*     w = g_eff.FirstWriteOver(from, b, en - b);
@@ -1482,7 +1605,7 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 			e.pre.Reset(from);
 		}
 		e.all.TakeTo(g_eff, ~uint64_t {0});
-		const uint32_t why = RealWhy(p, r, e.all, e.lost);
+		const uint32_t why = RealWhy(p, r, e.all, e.lost, true);
 		if (why != 0) e.pre.TakeTo(g_eff, e.dcb_end); // (tej-lag3: 'pre' solo hace falta si 'all' falla)
 		// (tej-cos2) SIN escalar: antes x RealEvery, pero la DCB muestreada (serial % 8) cae siempre en las mismas
 		// posiciones del fotograma (las grandes) y salia 171 %. Ahora: base de la muestra y % = F1d x pasa / base.
@@ -2094,6 +2217,12 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            pct(v[GCosLostBuf]), pct(v[GCosLostImg]), pct(v[GCosLostMap]), pct(c_meta), pct(c_reads), pr(v[GRkD0]),
 		            v[GCosBufRegionOk] / f, v[GCosBufExactOk] / f, v[GCosBufExactFail] / f, v[GCosBufExactLost] / f, v[GCosImgOnlyOk] / f,
 		            v[GCosImgOverOther] / f, v[GCosReadGpu] * sc / f, v[GCosReadHost] * sc / f);
+		// (tej-cosibles) validacion por valor de las lecturas limpias escritas por el render y reenvio de las DCB anteriores
+		std::printf("[tej] COS3 por valor: lecturas escritas por el render que pasan %.1f/fot, distintas %.1f, sin bytes %.1f"
+		            " (muestra x%.2f) | reenvio: DCB con escrituras de antes %.1f/fot (%.0f escrituras/fot), lecturas de cadena"
+		            " %.1f/fot | bytes de mas %.1f DCB/fot\n",
+		            v[GCosValOk] * sc / f, v[GCosValDiff] * sc / f, v[GCosValNone] * sc / f, sc, v[GCosFwdDcb] / f,
+		            v[GCosFwdWrites] / f, v[GCosFwdReads] / f, v[GCosSnapOver] / f);
 		std::printf("[tej] COS2 exactos: imagenes (4 KiB, anillo) pasan %.1f pk/fot, fallan %.1f, sin anillo %.1f | desmapeos (bytes,"
 		            " anillo) pasan %.1f, fallan %.1f, sin anillo %.1f | metadatos borrados sobre imagen del paquete %.1f, fuera %.1f"
 		            " pk/fot | CS distinto muestreado %.1f/fot\n",

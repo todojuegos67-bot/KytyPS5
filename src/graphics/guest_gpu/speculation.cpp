@@ -131,10 +131,12 @@ void Speculation::ShadowThreadInit() {
 }
 
 Speculation::ShadowOut Speculation::Shadow(const CommandProcessor& start, std::span<const uint32_t> commands,
-                                           CommandProcessor& end) {
+                                           CommandProcessor& end, const Spec::State* chain) {
 	auto&     translator = *m_translators[0];
 	const auto t0         = NowNs();
+	translator.shadow_chain = chain;
 	auto      result     = Translate(translator, start, commands, Pm4Execution {});
+	translator.shadow_chain = nullptr;
 	const auto t1         = NowNs();
 	// (Its packets passed: what the GPU thread retired while it read is destroyed once this is seen, Spec::PacketsPassed.)
 	Spec::LeavePackets();
@@ -750,7 +752,7 @@ std::unique_ptr<Speculation::Result> Speculation::Translate(Translator& translat
 		         }))
 			r.state.previous = record;
 		else
-			r.state.previous = nullptr;
+			r.state.previous = translator.shadow_chain; // (tej-cosibles: null but in Shadow with a chain)
 		// (Where its effects begin, as it becomes the translation going on: the log keeps what it may need.)
 		r.effects_from     = m_log.End();
 		translator.current = &r;
