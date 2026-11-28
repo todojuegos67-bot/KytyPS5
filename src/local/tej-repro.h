@@ -19,6 +19,7 @@
 #else
 #include <x86intrin.h>
 #endif
+#include <nmmintrin.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -80,7 +81,7 @@ inline void                  CountBad(const char* name) {
 // cerrojo: clave guardada como clave^hash; una lectura rota no casa y cuenta como distinta (nunca igual por error).
 [[nodiscard]] inline bool t_cap_on() noexcept;
 struct Content {
-	static constexpr uint32_t kN = 1u << 16; // varios fotogramas de bloques de ambos hilos
+	static constexpr uint32_t kN = 1u << 14; // (A3b) 256 KiB, cabe en L2: ~2 fotogramas de subidas de ambos hilos
 	struct E {
 		std::atomic<uint64_t> kx {0}, h {0};
 	};
@@ -90,19 +91,27 @@ inline Content                g_content;
 inline std::atomic<uint64_t>  g_content_n {0}, g_content_big {0};
 // (A3b) solo se apunta lo que pasa por StreamBuffer::Copy, hasheando el ORIGEN en memoria del host (cacheable); nunca se
 // leen los bytes ya escritos en el anillo mapeado (memoria de GPU combinada en escritura: leerla costaba ~90 ms/fot en B).
-constexpr uint64_t            kContentMax = 16 * 1024; // subidas mayores: no se apuntan (distintas por valor)
+constexpr uint64_t            kContentMax = 4 * 1024; // subidas mayores: no se apuntan (distintas por valor)
 // (A3b, diag) coste de apuntar/sustituir, ticks de rdtsc: [0] hilo de render (seguidor), [1] trabajador (captura)
 inline std::atomic<uint64_t> g_cost_note[2] {}, g_cost_subst[2] {};
+inline thread_local uint32_t t_cost_tick = 0;
 [[nodiscard]] inline uint64_t ContentSlot(uint64_t key) noexcept { return (key ^ (key >> 23) ^ (key >> 41)) * 0x9e3779b97f4a7c15ull; }
+// (A3b) rango de direcciones de anillo apuntadas: filtro antes de buscar en la tabla (un push tiene 31 pares de dwords y casi
+// ninguno es direccion; sin filtro cada par era una falta de cache en la tabla de 1 MiB)
+inline std::atomic<uint64_t> g_bda_lo {~0ull}, g_bda_hi {0};
+inline void BdaRange(uint64_t a, uint64_t size) noexcept {
+	if (a < g_bda_lo.load(std::memory_order_relaxed)) g_bda_lo.store(a, std::memory_order_relaxed);
+	if (a + size > g_bda_hi.load(std::memory_order_relaxed)) g_bda_hi.store(a + size, std::memory_order_relaxed);
+}
 inline void ContentPut(uint64_t key, uint64_t hash) noexcept {
-	auto& s = g_content.e[ContentSlot(key) >> 48];
+	auto& s = g_content.e[ContentSlot(key) >> 50];
 	s.kx.store(0, std::memory_order_relaxed);
 	s.h.store(hash, std::memory_order_relaxed);
 	s.kx.store(key ^ hash, std::memory_order_release);
 }
 [[nodiscard]] inline bool ContentGet(uint64_t key, uint64_t& hash) noexcept {
 	if (key == 0) return false;
-	auto&          s  = g_content.e[ContentSlot(key) >> 48];
+	auto&          s  = g_content.e[ContentSlot(key) >> 50];
 	const uint64_t kx = s.kx.load(std::memory_order_acquire);
 	const uint64_t h  = s.h.load(std::memory_order_relaxed);
 	if (kx == 0 || (kx ^ h) != key || s.kx.load(std::memory_order_relaxed) != kx) return false;
@@ -112,48 +121,67 @@ inline void ContentPut(uint64_t key, uint64_t hash) noexcept {
 [[nodiscard]] inline uint64_t HandleKey(uint64_t handle, uint64_t offset) noexcept {
 	return TejCoser::Mix(TejCoser::Mix(0x5a17ull, handle), offset) | 1;
 }
+// (A3b) hash de lo subido: 3 carriles de CRC32C (1 instruccion por 8 bytes y carril, ~3x el multiplicador; SSE4.2, que
+// tiene toda CPU capaz de correr el juego). Es comparacion de igualdad, no criptografia.
+#ifdef _MSC_VER
+#define KYTY_TEJ_CRC
+#else
+#define KYTY_TEJ_CRC __attribute__((target("sse4.2")))
+#endif
+KYTY_TEJ_CRC [[nodiscard]] inline uint64_t ContentHash(const uint8_t* d, uint64_t n) noexcept {
+	uint64_t a = 0x243f6a8885a308d3ull ^ n, b = 0x13198a2e03707344ull, c = 0xa4093822299f31d0ull, i = 0;
+	for (; i + 24 <= n; i += 24) {
+		uint64_t w[3];
+		std::memcpy(w, d + i, 24);
+		a = _mm_crc32_u64(a, w[0]), b = _mm_crc32_u64(b, w[1]), c = _mm_crc32_u64(c, w[2]);
+	}
+	for (; i + 8 <= n; i += 8) {
+		uint64_t w;
+		std::memcpy(&w, d + i, 8);
+		a = _mm_crc32_u64(a, w);
+	}
+	if (i < n) {
+		uint64_t w = 0;
+		std::memcpy(&w, d + i, n - i);
+		b = _mm_crc32_u64(b, w);
+	}
+	return a ^ (b << 21 | b >> 43) ^ (c << 42 | c >> 22) ^ (n * 0x9e3779b97f4a7c15ull);
+}
 // Gancho de StreamBuffer::Commit: [data, data+size) recien subido en (handle, offset), direccion bda (0: sin BDA).
 inline void ContentNote(uint64_t handle, uint64_t bda, uint64_t offset, const uint8_t* data, uint64_t size) noexcept {
 	if (data == nullptr || size == 0) return;
-	struct T {
-		uint64_t t0 = __rdtsc();
-		~T() { g_cost_note[t_cap_on() ? 1 : 0].fetch_add(__rdtsc() - t0, std::memory_order_relaxed); }
+	struct T { // (A3b) cronometra 1 de cada 16 llamadas (x16): rdtsc cuesta ~10-20 ns, tanto como una subida pequena
+		uint64_t t0 = (++t_cost_tick & 15) == 0 ? __rdtsc() : 0;
+		~T() {
+			if (t0 != 0) g_cost_note[t_cap_on() ? 1 : 0].fetch_add((__rdtsc() - t0) * 16, std::memory_order_relaxed);
+		}
 	} timer;
 	if (size > kContentMax) {
 		g_content_big.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	uint64_t h = TejCoser::Mix(0xc0ffeeull, size);
-	uint64_t i = 0;
-	for (; i + 8 <= size; i += 8) {
-		uint64_t w;
-		std::memcpy(&w, data + i, 8);
-		h = TejCoser::Mix(h, w);
-	}
-	if (i < size) {
-		uint64_t w = 0;
-		std::memcpy(&w, data + i, size - i);
-		h = TejCoser::Mix(h, w);
-	}
+	const uint64_t h0 = ContentHash(data, size);
+	uint64_t h = TejCoser::Mix(0x5eedull, h0);
 	h |= 1;
-	if (bda != 0) ContentPut(bda + offset, h);
+	if (bda != 0) BdaRange(bda + offset, size), ContentPut(bda + offset, h);
 	ContentPut(HandleKey(handle, offset), h);
 	g_content_n.fetch_add(1, std::memory_order_relaxed);
 }
 // Push por contenido: cada par de dwords (cualquier alineacion: TableBlockDword puede ser impar) que es una direccion
 // apuntada se sustituye por el hash de lo que apunta. Devuelve cuantas sustituyo.
 inline uint32_t PushByContent(uint32_t* d, size_t dwords) noexcept {
-	const uint64_t t0 = __rdtsc();
-	uint32_t n = 0;
+	const uint64_t t0 = (++t_cost_tick & 15) == 0 ? __rdtsc() : 0;
+	uint32_t       n  = 0;
+	const uint64_t lo = g_bda_lo.load(std::memory_order_relaxed), hi = g_bda_hi.load(std::memory_order_relaxed);
 	for (size_t i = 0; i + 1 < dwords; ++i) {
 		const uint64_t a = d[i] | (uint64_t {d[i + 1]} << 32);
-		if (a < 0x10000) continue;
+		if (a < lo || a >= hi || a < 0x10000) continue;
 		uint64_t h;
 		if (!ContentGet(a, h)) continue;
 		d[i] = static_cast<uint32_t>(h), d[i + 1] = static_cast<uint32_t>(h >> 32);
 		++i, ++n;
 	}
-	g_cost_subst[t_cap_on() ? 1 : 0].fetch_add(__rdtsc() - t0, std::memory_order_relaxed);
+	if (t0 != 0) g_cost_subst[t_cap_on() ? 1 : 0].fetch_add((__rdtsc() - t0) * 16, std::memory_order_relaxed);
 	return n;
 }
 inline std::atomic<uint64_t> g_push_subst {0}; // (diag) direcciones de push sustituidas por contenido

@@ -1940,6 +1940,28 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
 	const bool was   = g_ab_on.load(std::memory_order_relaxed);
+	// (tej-freno) si 2 ventanas B seguidas pasan a su A vecina en > 4 ms de render ocupado o caen bajo el 70 % de sus fps,
+	// la sombra se apaga para el resto de la partida (ninguna medida puede volver a dejar el juego a 10 fps).
+	static bool   freno = false;
+	static double a_busy = -1, a_fps = 0;
+	static int    malas = 0;
+	if (m == 2 && freno) return;
+	if (m == 2 && keep) {
+		if (!was) a_busy = busy_ms, a_fps = fps;
+		else if (a_busy >= 0) {
+			const bool mala = busy_ms > a_busy + 4.0 || (a_fps > 0 && fps < 0.7 * a_fps);
+			malas           = mala ? malas + 1 : 0;
+			if (malas >= 2) {
+				freno = true;
+				g_ab_on.store(false, std::memory_order_relaxed);
+				std::printf("[tej] FRENO: 2 ventanas B seguidas peores que A (B %.2f ms %.1f fps / A %.2f ms %.1f fps; limite +4 ms o"
+				            " 70 %% fps): sombra apagada el resto de la partida\n",
+				            busy_ms, fps, a_busy, a_fps);
+				std::fflush(stdout);
+				return;
+			}
+		}
+	}
 	const int  var   = Var();
 	double     delta = 0, cnt[2] {};
 	// (tej-var) Por variante: B entre dos A, B - media de sus A; ms/fot del lag del render y cerrojo/IPI.
