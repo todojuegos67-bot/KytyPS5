@@ -543,6 +543,37 @@ struct EffectSourceScope {
 	return static_cast<uint8_t>((origin & 7u) | (t_effect_source == EffectSource::Hole ? 8u : 0u));
 }
 
+// (tej-lag) Cola circular de las entradas del registro: potencia de dos que solo crece (doblando) y nunca devuelve la
+// memoria; sin una asignacion por entrada (std::deque de MSVC guarda 16 bytes por bloque: un malloc/free por entrada de
+// 24 bytes). Mismas operaciones que usaba el registro: push_back, pop_front, front, empty, size, [].
+template <class T>
+class EffRing {
+public:
+	[[nodiscard]] size_t   size() const noexcept { return static_cast<size_t>(m_tail - m_head); }
+	[[nodiscard]] bool     empty() const noexcept { return m_tail == m_head; }
+	[[nodiscard]] const T& operator[](size_t i) const noexcept { return m_v[(m_head + i) & m_mask]; }
+	[[nodiscard]] const T& front() const noexcept { return m_v[m_head & m_mask]; }
+	void                   pop_front() noexcept { ++m_head; }
+	void                   push_back(const T& x) {
+		                  if (size() == m_v.size()) Grow();
+		                  m_v[m_tail++ & m_mask] = x;
+	}
+
+private:
+	void Grow() {
+		const size_t   n = m_v.empty() ? 8192 : m_v.size() * 2;
+		std::vector<T> v(n);
+		for (size_t i = 0; i < size(); ++i) v[i] = (*this)[i];
+		m_tail -= m_head;
+		m_head = 0;
+		m_v.swap(v);
+		m_mask = n - 1;
+	}
+	std::vector<T> m_v;
+	uint64_t       m_head = 0, m_tail = 0;
+	size_t         m_mask = 0;
+};
+
 // What the translation of the thread that commits does (the normal translation, holes) that a speculation translated
 // before it must see, in order (each speculation is checked against what was logged since it began): the ranges its
 // GPU work writes, the guest memory it writes on the CPU (the processor's writes, copies, fills), the descriptor sets
@@ -554,13 +585,16 @@ struct EffectsLog {
 		EffectSource source = EffectSource::Normal;
 		uint64_t     address = 0, size = 0; // a set: its handle
 	};
-	std::deque<Entry>     entries;
+	EffRing<Entry>        entries; // (tej-lag: anillo, sin asignacion por entrada)
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
+	uint64_t*             cost_ticks = nullptr; // (tej-lag: si no es nulo, TSC gastado en Add; solo el registro de tej)
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
 	void                   Add(Kind kind, uint64_t address, uint64_t size) {
+		                  const uint64_t t0 = cost_ticks != nullptr ? __rdtsc() : 0;
 		                  entries.push_back({kind, t_effect_source, address, size});
 		                  end.store(base + entries.size(), std::memory_order_release);
+		                  if (cost_ticks != nullptr) *cost_ticks += __rdtsc() - t0;
 	}
 	// The first write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstWriteOver(uint64_t from, uint64_t address, uint64_t size) const {

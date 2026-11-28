@@ -115,12 +115,14 @@ inline std::atomic<int> g_var {0}; // (variante de la ventana B actual; 0 sin KY
 inline Libs::Graphics::Spec::EffectsLog g_eff;
 inline std::atomic<bool>                 g_eff_owned {false};
 inline thread_local bool                 t_eff_owner = false;
-[[nodiscard]] inline Libs::Graphics::Spec::EffectsLog* EffLog() { return Mode() != 0 && t_eff_owner ? &g_eff : nullptr; }
+// (tej-lag) Solo en B (Active): en A el render no escribe nada en el registro (lo que A no vio marca 'perdido').
+[[nodiscard]] inline Libs::Graphics::Spec::EffectsLog* EffLog() { return Mode() != 0 && t_eff_owner && Active() ? &g_eff : nullptr; }
 inline void ClaimEff() {
 	if (t_eff_owner || g_eff_owned.load(std::memory_order_relaxed)) return;
 	bool no = false;
 	if (g_eff_owned.compare_exchange_strong(no, true)) t_eff_owner = true;
 }
+inline uint64_t g_eff_ticks = 0; // (tej-lag: TSC de EffectsLog::Add en el registro de tej; solo el hilo dueno)
 
 inline constexpr uint32_t PacketDraws = 64, MaxPackets = 16, Slots = 16, MaxAhead = 12, MaxQueued = 24, MaxWorkers = 6;
 
@@ -164,10 +166,11 @@ inline void Add(C i, uint64_t v = 1) { g_bank[t_bank].c[i].fetch_add(v, std::mem
 // atomicos por draw) y vuelca por DCB (GpuDone); la linea [tej] coste lo da en ms/fot. Ademas, por DCB de la cola 0, el
 // tiempo de pared del render y sus ciclos de CPU (QueryThreadCycleTime): si en B sube la pared y no los ciclos, el render
 // espera / es expulsado; si suben los ciclos, calcula mas o mas lento (cache/memoria).
-enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HReal, HBefore, HN };
+enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HReal, HBefore, HEff, HN };
 inline constexpr const char* HName[HN] = {"inicio DCB", "draw (todo)", "validar regs", "rangos", "DiffState 1/64",
                                           "dispatch", "espera WAIT_REG_MEM", "flip (latencia)", "fin DCB", "publicar estado",
-                                          "F2p cosibles reales", "F2p Before 1/8"};
+                                          "F2p cosibles reales 1/8 DCB", "F2p Before 1/8",
+                                          "registro de efectos (entradas)"};
 struct alignas(64) HookAcc {
 	std::atomic<uint64_t> t[2][HN] {}, n[2][HN] {};
 	std::atomic<uint64_t> dcb_n[2] {}, dcb_wall[2] {}, dcb_cyc[2] {};
@@ -1187,20 +1190,30 @@ struct EffCheck {
 	uint64_t ring[32] {};
 	uint32_t ring_k = 0;
 	uint32_t before_k = 0;
+	uint64_t gap_end  = 0;     // (tej-lag) fin del registro en la ultima DCB de A (lo de antes no se registro)
+	bool     sample   = false; // (tej-lag) esta DCB se comprueba (1 de cada RealEvery)
+	uint64_t ticks0   = 0;
 };
 inline EffCheck g_ec;
-inline constexpr uint32_t BeforeEvery = 8;
+inline constexpr uint32_t BeforeEvery = 8, RealEvery = 8; // (tej-lag: F2p muestreado por DCB; cuentas x RealEvery)
 // (F2p) Render, inicio de DCB de la cola 0: fin del registro y poda de lo anterior a 32 DCB atras.
 inline void EffDcbStart() {
 	ClaimEff();
 	if (!t_eff_owner) return;
 	auto& e   = g_ec;
+	g_eff.cost_ticks = &g_eff_ticks;
 	e.dcb_end = g_eff.End();
+	// (tej-lag) Poda fija a 32 DCB atras (antes: tambien el inicio del ultimo paquete comprobado, que podia quedarse
+	// viejo y no podar nunca). Un paquete que empezo antes sale como 'registro de efectos perdido'.
 	const uint64_t old = e.ring[e.ring_k % 32];
 	e.ring[e.ring_k++ % 32] = e.dcb_end;
-	if (old != 0) g_eff.DropBefore(std::min(old, e.from == ~uint64_t {0} ? old : e.from));
+	if (old != 0) g_eff.DropBefore(old);
+	if (!g_hook_side) e.gap_end = e.dcb_end;
+	e.sample = g_hook_side && (g_gpu_serial.load(std::memory_order_relaxed) % RealEvery) == 0;
 	static uint64_t last = 0;
 	Add(GEffEntries, e.dcb_end - last);
+	t_hook.t[HEff] += g_eff_ticks - e.ticks0, t_hook.n[HEff] += e.dcb_end - last;
+	e.ticks0 = g_eff_ticks;
 	last = e.dcb_end;
 }
 [[nodiscard]] inline uint32_t RealWhy(const Packet& p, RenderContext& r, const EffAcc& a, bool lost) {
@@ -1230,6 +1243,7 @@ inline void EffDcbStart() {
 }
 inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 	auto& e = g_ec;
+	if (!e.sample) return; // (tej-lag: 1 de cada RealEvery DCB)
 	{
 		const HookTimer tm(HReal);
 		const uint64_t  from = s.eff_from.load(std::memory_order_relaxed);
@@ -1237,16 +1251,17 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 		if (e.from != from || e.serial != g_gpu_serial.load(std::memory_order_relaxed)) {
 			e.from   = from;
 			e.serial = g_gpu_serial.load(std::memory_order_relaxed);
-			e.lost   = from < g_eff.base;
+			e.lost   = from < g_eff.base || from <= e.gap_end;
 			e.all.Reset(from);
 			e.pre.Reset(from);
 		}
 		e.all.TakeTo(g_eff, ~uint64_t {0});
 		e.pre.TakeTo(g_eff, e.dcb_end);
 		const uint32_t why = RealWhy(p, r, e.all, e.lost);
-		Add(static_cast<C>(GRk0 + why));
-		if (why == 0) Add(GRealPk), Add(GRealDraws, sewn), Add(GRealCalls, sewn + p.dispatches);
-		if (why == 0 || RealWhy(p, r, e.pre, e.lost) == 0) Add(GRealPkPre), Add(GRealDrawsPre, sewn);
+		constexpr uint64_t k = RealEvery; // (muestra: cuentas escaladas)
+		Add(static_cast<C>(GRk0 + why), k);
+		if (why == 0) Add(GRealPk, k), Add(GRealDraws, sewn * k), Add(GRealCalls, (sewn + p.dispatches) * k);
+		if (why == 0 || RealWhy(p, r, e.pre, e.lost) == 0) Add(GRealPkPre, k), Add(GRealDrawsPre, sewn * k);
 		if (why != 0) return;
 	}
 	// (F2p) Lo que Before haria, 1 de cada BeforeEvery paquetes que pasan: solo las consultas de solo lectura del hilo
@@ -1571,15 +1586,20 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		}
 		// (tej-coste) Coste de cada gancho de tej en el render, ms/fot (lado de esta ventana) y pared/ciclos por DCB.
 		const int sd = was ? 1 : 0;
-		double    tot = 0;
-		std::printf(" | COSTE tej en el render (%s) ms/fot:", m == 2 ? (was ? "B" : "A") : "sombra");
+		// (tej-lag) A y B en la misma linea: el lado de esta ventana y el ultimo valor del otro (su ventana anterior).
+		static double last_ms[2][HN] {}, last_n[2][HN] {}, last_tot[2] {};
+		double        tot = 0;
 		for (uint32_t k = 0; k < HN; ++k) {
-			const double ms = static_cast<double>(g_hook.t[sd][k].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
-			const double nn = static_cast<double>(g_hook.n[sd][k].exchange(0, std::memory_order_relaxed)) / f;
-			if (k != HVal && k != HRanges && k != HRegDiff && k != HPublish && k != HReal && k != HBefore) tot += ms; // (esos van dentro de draw / fin DCB)
-			std::printf(" [%s] %.3f (%.0f/fot)", HName[k], ms, nn);
+			last_ms[sd][k] = static_cast<double>(g_hook.t[sd][k].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+			last_n[sd][k]  = static_cast<double>(g_hook.n[sd][k].exchange(0, std::memory_order_relaxed)) / f;
+			if (k != HVal && k != HRanges && k != HRegDiff && k != HPublish && k != HReal && k != HBefore) tot += last_ms[sd][k]; // (esos van dentro de draw / fin DCB)
 		}
-		std::printf(" = TOTAL %.3f ms/fot (objetivo <= 0.2)", tot);
+		last_tot[sd] = tot;
+		std::printf(" | COSTE tej en el render ms/fot (A / B; esta ventana %s):", m == 2 ? (was ? "B" : "A") : "sombra");
+		for (uint32_t k = 0; k < HN; ++k)
+			std::printf(" [%s] %.3f / %.3f (%.0f / %.0f/fot)", HName[k], last_ms[0][k], last_ms[1][k], last_n[0][k], last_n[1][k]);
+		std::printf(" = TOTAL A %.3f / B %.3f ms/fot (objetivo B-A <= 0.2) | registro de efectos A %.3f / B %.3f ms/fot",
+		            last_tot[0], last_tot[1], last_ms[0][HEff], last_ms[1][HEff]);
 		for (int q = 0; q < 2; ++q) {
 			const double dn = static_cast<double>(g_hook.dcb_n[q].exchange(0, std::memory_order_relaxed));
 			const double dw = static_cast<double>(g_hook.dcb_wall[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
@@ -1728,10 +1748,10 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		for (uint32_t k = 0; k < RN; ++k) std::printf(" [%s] %.1f", RNames[k], v[GRk0 + k] / f);
 		const double bf_us  = v[GBfPk] != 0 ? static_cast<double>(v[GBfTicks]) * ns_per_tick / 1e3 / static_cast<double>(v[GBfPk]) : 0.0;
 		const double bpk    = v[GBfPk] != 0 ? static_cast<double>(v[GBfPk]) : 1.0;
-		std::printf(" | efectos del render %.0f entradas/fot | Before (muestra 1/%u, %.1f paquetes/fot): consultas %.2f us/paquete,"
+		std::printf(" | efectos del render %.0f entradas/fot | Before (muestra 1/%u de las DCB 1/%u, %.1f paquetes/fot): consultas %.2f us/paquete,"
 		            " %.1f rangos/paquete, sucios %.1f (%.1f KiB a subir), BDA %.1f rangos/paquete (todo %.1f %%), invalidaciones"
 		            " %.1f, imagenes %.1f (BDA/imagenes/subidas sin coste medido: no se ejecutan)\n",
-		            v[GEffEntries] / f, BeforeEvery, v[GBfPk] / f, bf_us, v[GBfRanges] / bpk, v[GBfDirtyRanges] / bpk,
+		            v[GEffEntries] / f, BeforeEvery, RealEvery, v[GBfPk] / f, bf_us, v[GBfRanges] / bpk, v[GBfDirtyRanges] / bpk,
 		            static_cast<double>(v[GBfDirtyBytes]) / 1024.0 / bpk, v[GBfBda] / bpk, 100.0 * v[GBfBdaAll] / bpk,
 		            v[GBfInv] / bpk, v[GBfImg] / bpk);
 		const double calls_f = v[GRealCalls] / f, pk_f = v[GRealPk] / f;
