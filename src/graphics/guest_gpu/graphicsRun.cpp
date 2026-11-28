@@ -1140,10 +1140,10 @@ void GuestGpu::Enqueue(Submission submission) {
 	if (submission.queue_id == 0 && Tej::Mode() != 0)
 		Tej::OnEnqueue(submission.queue_id, submission.serial,
 		               submission.type == SubmissionType::FlipPreparation || submission.type == SubmissionType::FrameBoundary
-		                   ? Tej::Worker::Job::Flip
+		                   ? Tej::Shadow::Job::Flip
 		               : submission.type == SubmissionType::Graphics && submission.constant_commands.empty()
-		                   ? Tej::Worker::Job::Graphics
-		                   : Tej::Worker::Job::Other,
+		                   ? Tej::Shadow::Job::Graphics
+		                   : Tej::Shadow::Job::Other,
 		               submission.reset_processor, submission.commands);
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());

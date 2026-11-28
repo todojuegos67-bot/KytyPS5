@@ -47,6 +47,8 @@ uint64_t CoreMaskOfCpu(uint32_t cpu);
 uint64_t L3MaskOfCpu(uint32_t cpu);
 uint64_t CpuListToMask(const char* list);
 bool     SetCurrentThreadMask(uint64_t mask);
+// (tej F1b) The CPUs of the highest efficiency class (hybrid Intel: the P-cores; others: all); 0: unknown.
+uint64_t PerformanceCpuMask();
 // While it lives, the calling thread at the normal priority if it was above it, then back (AsyncUpload's Help).
 class NormalPriority {
 public:

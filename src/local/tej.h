@@ -1,31 +1,27 @@
 #pragma once
-// (tej) KYTY_TEJ, tejido propio FASE 1 "sombra" (tools/plan-weave-propio.md §5). Apagado por defecto. SOLO MIDE: la imagen
-// no puede cambiar (nada de lo que hace el trabajador se envia, se cose ni se sube a recursos del juego).
+// (tej) KYTY_TEJ, tejido propio. FASE 1b "sombra paralela" (tools/plan-weave-propio.md). Apagado por defecto. SOLO MIDE: la
+// imagen no puede cambiar (nada de lo que hacen los trabajadores se envia, se cose ni se sube a recursos del juego), y el
+// hilo de render nunca espera a la sombra (ni cola de fotogramas extra ni retraso de la presentacion).
 //   0 apagado (identico a antes: un static por gancho).
 //   1 sombra encendida.
-//   2 A/B cada ventana de 5 s de [techo] (KYTY_TECHO=1): B = sombra encendida; delta interpolado B-A del render ocupado
-//     (objetivo 0 +-0.2 ms/fot: lo que la sombra le cuesta al juego).
-// Que hace:
-// - Un solo hilo (Kyty.Tej, lector + trabajador), prioridad por debajo de la normal (por debajo del render), afinidad a
-//   KYTY_RENDER_CPUS (o a la L3 del hilo de render) SIN el nucleo del hilo de render (ni su hermano SMT; se rehace cuando
-//   el render cambia de nucleo). Lo despierta cada envio de la cola 0 (GuestGpu::Enqueue: ahi se COPIAN las ordenes de
-//   la DCB, la memoria del juego no se lee despues). Solo traduce si en la ventana anterior (100 ms) hubo >= 1 nucleo
-//   libre en la maquina (CPU ociosa de los CPUs del proceso); si no, no toma nada (coste 0 para el juego).
-// - Adelanta registros: su propio CommandProcessor encadenado DCB a DCB (el estado que deja una es el inicio de la
-//   siguiente); si la cadena se rompe pide al hilo de render el estado tras la DCB anterior (una copia, solo entonces).
-// - Traduce la DCB con la ruta normal en modo especulativo (Speculation::Shadow = Translate de KYTY_SPECULATE: estado
-//   por hilo, Spec::State rechaza todo lo que escribiria estado compartido: registros de buffers nuevos, pares, sets,
-//   subidas, transiciones -> "hueco" contado; bc_par: lookup concurrente del indice de BufferCache con cerrojo
-//   compartido, que KYTY_TEJ enciende) a un recorder propio que NUNCA se envia (Finish: descartado al acabar) y a
-//   anillos de subida propios (16 + 8 MiB) que nadie lee. Lo que el hilo de render libera mientras lee: lo protege el
-//   punto de espera que ya existe (Spec::EnterPacket/LeavePackets: buffers e imagenes retirados se destruyen cuando el
-//   paquete paso) y el catalogo se lee bajo su cerrojo compartido; el barrido de pipelines de mundos dejados se salta
-//   con KYTY_TEJ (como con KYTY_SPECULATE).
-// - Corta paquetes de 64 draws: al primer draw de cada uno guarda la foto del procesador y las epocas (buffers
-//   registrados, imagenes, mapeos) y lo publica al acabarlo.
-// - El hilo de render NO cambia su camino: en el primer draw de cada paquete (misma posicion en la DCB) compara su
-//   estado con la foto (SameState) y las epocas, y cuenta si el paquete se habria podido coser y si llego a tiempo.
-// Linea [tej] cada 5 s (con KYTY_TECHO=1).
+//   2 A/B cada ventana de 5 s de [techo] (KYTY_TECHO=1): B = sombra encendida; delta interpolado B-A.
+//   KYTY_TEJ_N=1..6: trabajadores (por defecto: nucleos de rendimiento de la L3 del render sin el suyo, tope 6).
+// F1b (frente a F1, que tenia un solo hilo que llegaba tarde: 1.1 de 15 DCB con sombra, 'render ya paso' 9/fot):
+// - Lector (Kyty.Tej.L) despertado en GuestGpu::Enqueue (hilo del juego: alli se COPIA la DCB): encadena el estado DCB a
+//   DCB con una PASADA DE ESTADO (CommandProcessor::SetStateOnly, la de KYTY_SPECULATE: solo registros, las escrituras a
+//   memoria a un Spec::State propio que nadie lee) en vez de traducir; asi el estado inicial de cada DCB esta listo en
+//   cuanto llega y N trabajadores traducen DCB distintas EN PARALELO. Si la cadena se rompe, como F1: estado publicado
+//   por el render. Cuenta DCB autocontenidas (reset o CLEAR_STATE antes del primer draw).
+// - N trabajadores (Kyty.Tej.0..5), uno por DCB; el trabajador k solo toma trabajo si en la ventana anterior (100 ms)
+//   hubo >= k+1 nucleos libres (con 1 libre, solo 1 trabaja; con 0, nada: coste 0). Prioridad por coste: con mas DCB en
+//   cola que trabajadores libres, la mas grande primero. Afinidad: L3 del render (en X3D la de V-Cache, donde esta el
+//   render) & nucleos de rendimiento (Intel hibrida: P-cores) sin el nucleo del render ni su hermano SMT.
+// - Validacion en el render (primer draw de cada paquete de 64): epocas primero (baratas), registros (SameState) solo si
+//   las epocas coinciden.
+// - Modelo N=1,2,4,6 con los tiempos medidos de cada DCB (llegada, estado listo, render inicio/fin, coste por draw del
+//   trabajador): % de draws en paquetes que llegarian a tiempo.
+// - Latencia Enqueue->flip (primer envio grafico del fotograma hasta que el render procesa su flip) media y p99, y
+//   fotogramas > 25 ms (flip a flip en el render), A frente a B.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -50,9 +46,12 @@
 #include "local/speculation-state.h"
 #include "local/techo.h"
 
+
 namespace Tej {
 
 using Libs::Graphics::CommandProcessor;
+using Libs::Graphics::Pm4Execution;
+using Libs::Graphics::Pm4ProcessResult;
 using Libs::Graphics::RenderContext;
 using Libs::Graphics::Speculation;
 
@@ -66,7 +65,7 @@ using Libs::Graphics::Speculation;
 			m = 1;
 		}
 		if (m != 0)
-			std::printf("[tej] KYTY_TEJ=%d (%s): F1 sombra, SOLO MIDE (nada se cose ni se envia)\n", m,
+			std::printf("[tej] KYTY_TEJ=%d (%s): F1b sombra paralela, SOLO MIDE (nada se cose ni se envia)\n", m,
 			            m == 1 ? "sombra encendida" : "A/B cada 5 s, B = sombra encendida");
 		std::fflush(stdout);
 		return m;
@@ -80,58 +79,54 @@ inline std::atomic<bool> g_ab_on {false};
 	return m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed));
 }
 
-inline constexpr uint32_t PacketDraws = 64, MaxPackets = 16, Slots = 8, MaxAhead = 6, MaxQueued = 16;
+inline constexpr uint32_t PacketDraws = 64, MaxPackets = 16, Slots = 16, MaxAhead = 12, MaxQueued = 24, MaxWorkers = 6;
 
-// Contadores (relaxed; los del hilo de render por paquete o por DCB, no por draw).
 enum C : uint32_t {
 	// hilo de render
-	GDraws,     // draws de las DCB de la cola 0 en ventanas encendidas
-	GDcbs,      // DCB de graficos de la cola 0
-	GDcbSlot,   // de ellas, con traduccion de la sombra
-	GPkOk,      // paquetes validados a tiempo (registros y epocas iguales)
-	GDrawsOk,   // draws cosibles (de paquetes validados, sin los huecos)
-	GHolesOk,   // huecos (draws) dentro de paquetes validados
-	GPkRegs,    // paquete a tiempo, registros distintos
-	GDrawsRegsOk, // draws de paquetes con registros iguales (cota sin epocas)
-	GPkEpBuf,   // registros iguales, epoca de buffers movida
-	GPkEpImg,   // ... de imagenes
-	GPkEpMap,   // ... de mapeos
-	GPkLate,    // publicado despues de que el render pasara
-	GPkSkip,    // el render no paso por esa posicion (lote / otro camino)
-	GTailLate,  // DCB acabada por el render antes que por la sombra
-	GValTicks,  // ticks TSC de validacion
-	GValN,      // validaciones
-	GPublish,   // estados publicados para reenganchar la cadena
-	// trabajador
-	WJobs, WNs, WDraws, WDropFull, WBehind, WNoCpu, WNoState, WOther, WStops, WFailed, WHolesDraw, WHolesOther, WOver,
-	WRepins, WAheadWaitNs, WCopyBytes,
+	GDraws, GDcbs, GDcbSlot, GPkOk, GDrawsOk, GHolesOk, GPkRegs, GDrawsRegsOk, GPkEpBuf, GPkEpImg, GPkEpMap, GPkLate,
+	GPkSkip, GTailLate, GValTicks, GValN, GPublish,
+	GDrawsOnTime, // draws de paquetes publicados antes de que el render llegara (traducidos a tiempo)
+	// lector
+	LJobs, LSelf, LPassNs, LPassFail, LFromRender, LNoState, LBehind, LNoCpu, LOther, LDropFull, LAheadWaitNs, LCopyBytes,
+	// trabajadores
+	WJobs, WNs, WTransNs, WCycles, WDraws, WBehind, WFailed, WStops, WHolesDraw, WHolesOther, WOver, WRepins, WPassDiff,
+	WIdleNoCpu, WBiggest,
 	NCount
 };
 inline std::atomic<uint64_t> g_c[NCount] {};
 inline void Add(C i, uint64_t v = 1) { g_c[i].fetch_add(v, std::memory_order_relaxed); }
 
-// Hilo de render: el ultimo serial de la cola 0 que empezo y su CPU.
 inline std::atomic<uint64_t> g_gpu_serial {0};
 inline std::atomic<uint32_t> g_render_cpu {0xffffffffu};
-// CPU libre (nucleos, x100) en la ultima muestra; suma y muestras para la linea.
 inline std::atomic<int64_t>  g_free_x100 {-100};
 inline std::atomic<uint64_t> g_free_sum {0}, g_free_n {0};
+
+[[nodiscard]] inline uint64_t Now() { return Speculation::NowNs(); }
+
+// Por serial (anillo): llegada, estado listo, coste por draw del trabajador; flips: primer envio del fotograma.
+struct Rec {
+	std::atomic<uint64_t> serial {0}, enq {0}, ready {0}, cw_ps {0}, frame_first {0};
+	std::atomic<uint8_t>  kind {0};
+};
+inline constexpr uint32_t RecN = 512;
+inline Rec                g_rec[RecN];
+inline std::atomic<uint64_t> g_frame_first {0};
 
 struct Packet {
 	uint64_t                          key = 0;
 	uint32_t                          draws = 0, holes = 0;
 	uint64_t                          ep_buf = 0, ep_img = 0, ep_map = 0;
 	uint64_t                          publish_tsc = 0;
-	std::unique_ptr<CommandProcessor> cp; // (foto al primer draw; del trabajador, creada en su hilo)
+	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
 	std::atomic<uint64_t> serial {0};
-	std::atomic<uint32_t> count {0}; // paquetes publicados (inmutables desde entonces)
+	std::atomic<uint32_t> count {0};
 	std::atomic<bool>     done {false};
 	Packet                pk[MaxPackets];
 };
 
-inline thread_local int t_side = 0; // 1 hilo de render (en una DCB con sombra encendida), 2 trabajador
+inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendida), 2 trabajador, 3 lector
 
 [[nodiscard]] inline bool IsDrawHeader(uint32_t header) {
 	switch ((header >> 8u) & 0xffu) {
@@ -146,7 +141,79 @@ inline thread_local int t_side = 0; // 1 hilo de render (en una DCB con sombra e
 	}
 }
 
+// Autocontenida: CLEAR_STATE en la DCB raiz antes de su primer draw (o reset del procesador).
+[[nodiscard]] inline bool SelfContained(std::span<const uint32_t> cmds) {
+	for (size_t at = 0; at < cmds.size();) {
+		const uint32_t h = cmds[at];
+		if ((h >> 30u) == 2u) { ++at; continue; }
+		if ((h >> 30u) != 3u) return false;
+		if (((h >> 8u) & 0xffu) == Libs::Graphics::Pm4::IT_CLEAR_STATE) return true;
+		if (IsDrawHeader(h)) return false;
+		at += ((h >> 16u) & 0x3fffu) + 2u;
+	}
+	return false;
+}
+
+// Mascara de los trabajadores: L3 del render (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
+[[nodiscard]] inline uint64_t WorkMask(uint32_t rc) {
+	if (rc >= 64) return 0;
+	uint64_t base = LocalPlatform::CpuListToMask(std::getenv("KYTY_RENDER_CPUS"));
+	if (base == 0) base = LocalPlatform::L3MaskOfCpu(rc);
+	if (const uint64_t perf = LocalPlatform::PerformanceCpuMask(); perf != 0 && (base & perf) != 0) base &= perf;
+	uint64_t core = LocalPlatform::CoreMaskOfCpu(rc);
+	if (core == 0) core = uint64_t {1} << rc;
+	return base & ~core;
+}
+[[nodiscard]] inline uint32_t CoresIn(uint64_t mask) {
+	uint32_t n = 0;
+	for (uint32_t c = 0; c < 64; ++c)
+		if ((mask >> c) & 1u) {
+			const uint64_t core = LocalPlatform::CoreMaskOfCpu(c);
+			if (core != 0) mask &= ~core;
+			++n;
+		}
+	return n;
+}
+
+struct Item {
+	uint64_t                          serial = 0;
+	std::vector<uint32_t>             cmds;
+	std::unique_ptr<CommandProcessor> start, pass_end;
+	bool                              pass_ok = false;
+};
+
+class Shadow;
+
+// Un trabajador: su traductor (ranura de paquete y rol de catalogo propios), su foto por paquete.
 class Worker {
+public:
+	Worker(Shadow& owner, RenderContext& r, uint32_t index, uint32_t number)
+	    : m_owner(owner), m_r(r), m_index(index), m_spec(r, Speculation::ShadowTag {}, number, 16, 8),
+	      m_end(std::make_unique<CommandProcessor>(r, 0)) {}
+	void Run();
+	void WorkerDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key);
+	void Hole(const uint32_t* packet, const char* reason);
+	std::thread                               thread;
+	std::mutex                                reason_mutex;
+	std::unordered_map<const char*, uint64_t> holes, stops;
+
+private:
+	void Close();
+	void Translate(Item& item);
+	Shadow&                                   m_owner;
+	RenderContext&                            m_r;
+	uint32_t                                  m_index;
+	Speculation                               m_spec;
+	std::unique_ptr<CommandProcessor>         m_end;
+	Slot*                                     m_slot = nullptr;
+	int                                       m_open = -1;
+	uint32_t                                  m_ord = 0, m_pinned_for = 0xffffffffu;
+	uint64_t                                  m_last_key = 0;
+	std::unordered_map<const char*, uint64_t> m_job_holes;
+};
+inline thread_local Worker* t_worker = nullptr;
+
+class Shadow {
 public:
 	struct Job {
 		enum Kind : uint8_t { Graphics, Flip, Other };
@@ -156,28 +223,47 @@ public:
 		std::vector<uint32_t> cmds;
 	};
 
-	explicit Worker(RenderContext& r)
-	    : m_r(r), m_spec(r, Speculation::ShadowTag {}), m_chain(std::make_unique<CommandProcessor>(r, 0)),
-	      m_end(std::make_unique<CommandProcessor>(r, 0)), m_published(std::make_unique<CommandProcessor>(r, 0)) {
-		m_thread = std::thread([this] { Run(); });
+	explicit Shadow(RenderContext& r)
+	    : m_r(r), m_reader_spec(r, Speculation::ShadowTag {}, 0, 1, 1), m_chain(std::make_unique<CommandProcessor>(r, 0)),
+	      m_pass(std::make_unique<CommandProcessor>(r, 0)), m_published(std::make_unique<CommandProcessor>(r, 0)) {
+		m_pass->SetStateOnly(true);
+		// N: KYTY_TEJ_N o nucleos de rendimiento de la L3 del render sin el suyo (el render aun no corre: el de este hilo).
+		uint32_t n = 0;
+		if (const char* v = std::getenv("KYTY_TEJ_N"); v != nullptr) n = static_cast<uint32_t>(std::max(0, std::atoi(v)));
+		if (n == 0) {
+			const uint32_t cores = CoresIn(WorkMask(LocalPlatform::CurrentCpu()));
+			n                    = cores > 0 ? cores : 1;
+		}
+		// (ranuras de paquete: 0 el lector, 1..N los trabajadores; Spec::MaxPacketSlots = 8; con KYTY_SPECULATE se pisan)
+		n          = std::clamp<uint32_t>(n, 1, std::min<uint32_t>(MaxWorkers, static_cast<uint32_t>(Libs::Graphics::Spec::MaxPacketSlots) - 1));
+		m_n        = n;
+		std::printf("[tej] F1b: lector + %u trabajadores (ranuras 0..%u)\n", n, n);
+		for (uint32_t i = 0; i < n; ++i) m_workers.push_back(std::make_unique<Worker>(*this, r, i, i + 1));
+		m_reader = std::thread([this] { ReaderRun(); });
+		for (auto& w: m_workers) w->thread = std::thread([p = w.get()] { p->Run(); });
 	}
-	~Worker() {
+	~Shadow() {
 		{
 			std::lock_guard g(m_mutex);
 			m_quit = true;
 		}
 		m_cv.notify_all();
-		if (m_thread.joinable()) m_thread.join();
+		m_work_cv.notify_all();
+		if (m_reader.joinable()) m_reader.join();
+		for (auto& w: m_workers)
+			if (w->thread.joinable()) w->thread.join();
 	}
-	Worker(const Worker&)            = delete;
-	Worker& operator=(const Worker&) = delete;
+	Shadow(const Shadow&)            = delete;
+	Shadow& operator=(const Shadow&) = delete;
 
-	// Hilo del juego (GuestGpu::Enqueue, bajo su cerrojo de colas): la orden copiada.
+	[[nodiscard]] uint32_t N() const { return m_n; }
+
+	// Hilo del juego (Enqueue): la orden copiada.
 	void Push(uint64_t serial, Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
 		{
 			std::lock_guard g(m_mutex);
 			if (m_jobs.size() >= MaxQueued) {
-				Add(WDropFull); // (la cadena se rompe sola: el serial siguiente no sigue al ultimo traducido)
+				Add(LDropFull);
 				return;
 			}
 			Job job;
@@ -187,16 +273,16 @@ public:
 			job.reset  = reset;
 			if (kind == Job::Graphics) {
 				job.cmds.assign(commands.begin(), commands.end());
-				Add(WCopyBytes, commands.size() * 4u);
+				Add(LCopyBytes, commands.size() * 4u);
 			} else {
 				job.cmds.clear();
 			}
 			m_jobs.push_back(std::move(job));
 		}
-		m_cv.notify_one();
+		m_cv.notify_all();
 	}
 
-	// Hilo de render, al acabar un envio de la cola 0: si la sombra espera el estado tras ese serial, una copia.
+	// Hilo de render, al acabar un envio de la cola 0.
 	void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 		if (m_want_serial.load(std::memory_order_acquire) != serial) return;
 		std::lock_guard g(m_pub_mutex);
@@ -208,71 +294,78 @@ public:
 
 	[[nodiscard]] Slot& SlotOf(uint64_t serial) { return m_slots[serial % Slots]; }
 
-	// Trabajador: un draw de su traduccion (tope del bucle PM4, antes de traducirlo).
-	void WorkerDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
-		if (m_slot == nullptr || key == m_last_key) return; // (el mismo paquete traducido otra vez: corte de bc_par)
-		m_last_key     = key;
-		const auto ord = m_ord++;
-		if (ord % PacketDraws == 0) {
-			Close();
-			const uint32_t j = ord / PacketDraws;
-			if (j >= MaxPackets) {
-				Add(WOver);
-				return;
+	// Trabajador k: el siguiente Item (la DCB mas grande si hay mas en cola que trabajadores; null: salir).
+	std::unique_ptr<Item> Take(uint32_t k) {
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			if (m_quit) return nullptr;
+			// (descarta lo que el render ya empezo)
+			const uint64_t gpu = g_gpu_serial.load(std::memory_order_acquire);
+			for (auto it = m_items.begin(); it != m_items.end();)
+				if ((*it)->serial <= gpu) {
+					Add(WBehind);
+					Recycle(std::move(*it));
+					it = m_items.erase(it);
+				} else {
+					++it;
+				}
+			if (!m_items.empty()) {
+				if (static_cast<int64_t>(k + 1) * 100 > g_free_x100.load(std::memory_order_relaxed) &&
+				    g_free_x100.load(std::memory_order_relaxed) >= 0) {
+					Add(WIdleNoCpu); // (no hay nucleo libre para este trabajador: lo deja a otro / nadie)
+				} else {
+					auto best = m_items.begin();
+					if (m_items.size() > 1) {
+						for (auto it = m_items.begin(); it != m_items.end(); ++it)
+							if ((*it)->cmds.size() > (*best)->cmds.size()) best = it;
+						if (best != m_items.begin()) Add(WBiggest);
+					}
+					auto item = std::move(*best);
+					m_items.erase(best);
+					return item;
+				}
 			}
-			auto& p = m_slot->pk[j];
-			if (!p.cp) p.cp = std::make_unique<CommandProcessor>(m_r, 0);
-			p.cp->CopyStateFrom(cp, false);
-			p.key    = key;
-			p.draws  = 0;
-			p.holes  = 0;
-			p.ep_buf = r.GetBufferCache().RegistrationEpoch();
-			p.ep_img = r.GetTextureCache().ResolutionEpoch();
-			p.ep_map = r.GetGpuResources().MappingEpoch();
-			m_open   = static_cast<int>(j);
+			m_work_cv.wait_for(lock, std::chrono::milliseconds(2));
 		}
-		if (m_open >= 0) ++m_slot->pk[m_open].draws;
+	}
+	void Recycle(std::unique_ptr<Item> item) {
+		if (item && m_spare.size() < MaxQueued) m_spare.push_back(std::move(item));
+	}
+	void Give(std::unique_ptr<Item> item) {
+		std::lock_guard g(m_mutex);
+		Recycle(std::move(item));
+	}
+	[[nodiscard]] bool Quit() {
+		std::lock_guard g(m_mutex);
+		return m_quit;
 	}
 
-	static void HoleHook(const uint32_t* packet, const char* reason);
-	void        Hole(const uint32_t* packet, const char* reason) {
-        const bool draw = packet != nullptr && IsDrawHeader(*packet);
-        if (draw && m_open >= 0) ++m_slot->pk[m_open].holes;
-        Add(draw ? WHolesDraw : WHolesOther);
-        if (draw) ++m_job_holes[reason != nullptr ? reason : "?"];
-	}
-
-	// Hilo del informe.
 	void TakeReasons(std::vector<std::pair<const char*, uint64_t>>& holes, std::vector<std::pair<const char*, uint64_t>>& stops) {
-		std::lock_guard g(m_reason_mutex);
-		holes.assign(m_holes.begin(), m_holes.end());
-		stops.assign(m_stops.begin(), m_stops.end());
-		m_holes.clear();
-		m_stops.clear();
+		std::unordered_map<const char*, uint64_t> h, s;
+		for (auto& w: m_workers) {
+			std::lock_guard g(w->reason_mutex);
+			for (const auto& [k, v]: w->holes) h[k] += v;
+			for (const auto& [k, v]: w->stops) s[k] += v;
+			w->holes.clear();
+			w->stops.clear();
+		}
+		holes.assign(h.begin(), h.end());
+		stops.assign(s.begin(), s.end());
 	}
 
-private:
-	void Close() {
-		if (m_slot == nullptr || m_open < 0) return;
-		m_slot->pk[m_open].publish_tsc = __rdtsc();
-		m_slot->count.store(static_cast<uint32_t>(m_open) + 1, std::memory_order_release);
-		m_open = -1;
-	}
-
+	// Muestra de CPU libre (lector, cada 100 ms).
 	void SampleCpu() {
 		const auto now = std::chrono::steady_clock::now();
 		if (now - m_sample_at < std::chrono::milliseconds(100)) return;
 		uint64_t idle = 0, mask = 0;
 		if (!LocalPlatform::ProcessCpusIdleTime(&idle, &mask)) {
-			m_gate = true; // (sin dato: no se limita)
-			g_free_x100.store(-100, std::memory_order_relaxed);
+			g_free_x100.store(-100, std::memory_order_relaxed); // (sin dato: no se limita)
 			m_sample_at = now;
 			return;
 		}
 		if (m_last_idle != 0 && idle >= m_last_idle) {
 			const double wall_100ns = std::chrono::duration<double>(now - m_sample_at).count() * 1e7;
 			const double free       = wall_100ns > 0 ? static_cast<double>(idle - m_last_idle) / wall_100ns : 0;
-			m_gate                  = free >= 1.0;
 			g_free_x100.store(static_cast<int64_t>(free * 100), std::memory_order_relaxed);
 			g_free_sum.fetch_add(static_cast<uint64_t>(free * 100), std::memory_order_relaxed);
 			g_free_n.fetch_add(1, std::memory_order_relaxed);
@@ -281,25 +374,11 @@ private:
 		m_sample_at = now;
 	}
 
-	// Afinidad: la CCD/L3 del render (KYTY_RENDER_CPUS si existe) sin el nucleo del render (ni su hermano SMT).
-	void Pin() {
-		const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed);
-		if (rc >= 64 || rc == m_pinned_for) return;
-		m_pinned_for = rc;
-		uint64_t base = LocalPlatform::CpuListToMask(std::getenv("KYTY_RENDER_CPUS"));
-		if (base == 0) base = LocalPlatform::L3MaskOfCpu(rc);
-		uint64_t core = LocalPlatform::CoreMaskOfCpu(rc);
-		if (core == 0) core = uint64_t {1} << rc;
-		const uint64_t m = base & ~core;
-		if (m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
-	}
-
-	void Run() {
-		LocalPlatform::SetThreadName("Kyty.Tej");
-		LocalPlatform::MakeBackgroundThread(nullptr); // (THREAD_PRIORITY_BELOW_NORMAL: por debajo del render)
-		m_spec.ShadowThreadInit();
-		Libs::Graphics::Spec::t_hole_hook = &Worker::HoleHook;
-		t_side                            = 2;
+private:
+	void ReaderRun() {
+		LocalPlatform::SetThreadName("Kyty.Tej.L");
+		m_reader_spec.ShadowThreadInit(); // (executors y ranura propios: la pasada de estado predice dispatches con el catalogo)
+		t_side = 3;
 		std::unique_lock lock(m_mutex);
 		for (;;) {
 			m_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return m_quit || !m_jobs.empty(); });
@@ -310,49 +389,63 @@ private:
 			if (m_jobs.empty()) continue;
 			Job job = std::move(m_jobs.front());
 			m_jobs.pop_front();
+			std::unique_ptr<Item> item;
+			if (!m_spare.empty()) item = std::move(m_spare.back()), m_spare.pop_back();
 			lock.unlock();
-			Handle(job);
+			if (!item) item = std::make_unique<Item>();
+			if (Handle(job, *item)) {
+				lock.lock();
+				m_items.push_back(std::move(item));
+				lock.unlock();
+				m_work_cv.notify_all();
+			} else {
+				lock.lock();
+				Recycle(std::move(item));
+				lock.unlock();
+			}
 			lock.lock();
 			if (m_pool.size() < MaxQueued) m_pool.push_back(std::move(job.cmds));
 		}
 		t_side = 0;
 	}
 
-	void Handle(Job& job) {
-		// (La cadena sigue solo con serial consecutivo: un envio perdido la rompe.)
+	// Lector: el estado inicial de la DCB y la pasada de estado que deja el de la siguiente; true: a los trabajadores.
+	bool Handle(Job& job, Item& item) {
 		const bool consecutive = m_chain_ok && m_chain_serial + 1 == job.serial;
-		if (job.kind == Job::Flip) { // (entre DCB el estado del procesador sigue: Speculation::Job::Kind::Flip)
+		if (job.kind == Job::Flip) {
 			if (consecutive) m_chain_serial = job.serial;
 			else m_chain_ok = false;
-			return;
+			return false;
 		}
 		if (job.kind == Job::Other) {
 			m_chain_ok = false;
-			Add(WOther);
-			return;
+			Add(LOther);
+			return false;
 		}
+		Add(LJobs);
 		uint64_t gpu = g_gpu_serial.load(std::memory_order_acquire);
-		if (job.serial <= gpu) { // (el render ya la empezo: llegaria tarde entera)
+		if (job.serial <= gpu) {
 			m_chain_ok = false;
-			Add(WBehind);
-			return;
+			Add(LBehind);
+			return false;
 		}
-		if (job.serial > gpu + MaxAhead) { // (no pisar una ranura que el render aun lee)
-			const auto t0 = Speculation::NowNs();
+		if (job.serial > gpu + MaxAhead) {
+			const auto t0 = Now();
 			while (job.serial > gpu + MaxAhead && !Quit()) {
 				std::this_thread::sleep_for(std::chrono::microseconds(200));
 				gpu = g_gpu_serial.load(std::memory_order_acquire);
 			}
-			Add(WAheadWaitNs, Speculation::NowNs() - t0);
-			if (Quit()) return;
+			Add(LAheadWaitNs, Now() - t0);
+			if (Quit()) return false;
 		}
-		if (!m_gate) {
-			m_chain_ok = false;
-			Add(WNoCpu);
-			return;
+		if (g_free_x100.load(std::memory_order_relaxed) >= 0 && g_free_x100.load(std::memory_order_relaxed) < 100) {
+			m_chain_ok = false; // (ni un nucleo libre: nada, coste 0)
+			Add(LNoCpu);
+			return false;
 		}
-		if (!consecutive) {
-			// Estado tras la anterior: lo pide al render (una copia al acabarla) y espera, sin pasar a la siguiente.
+		const bool self = job.reset || SelfContained(job.cmds);
+		if (self) Add(LSelf);
+		if (!consecutive && !self) {
 			m_want_serial.store(job.serial - 1, std::memory_order_release);
 			bool got = false;
 			for (;;) {
@@ -368,113 +461,234 @@ private:
 			}
 			if (!got) {
 				m_want_serial.store(0, std::memory_order_relaxed);
-				Add(WNoState);
-				return;
+				m_chain_ok = false;
+				Add(LNoState);
+				return false;
 			}
+			Add(LFromRender);
 		}
-		Pin();
 		if (job.reset) m_chain->Reset();
 		m_chain->ResetDeCe();
-		auto& slot = SlotOf(job.serial);
-		slot.serial.store(0, std::memory_order_release);
-		slot.count.store(0, std::memory_order_release);
-		slot.done.store(false, std::memory_order_release);
-		slot.serial.store(job.serial, std::memory_order_release);
-		m_slot     = &slot;
-		m_open     = -1;
-		m_ord      = 0;
-		m_last_key = ~uint64_t {0};
-		m_job_holes.clear();
-		const auto t0  = Speculation::NowNs();
-		const auto out = m_spec.Shadow(*m_chain, std::span<const uint32_t>(job.cmds.data(), job.cmds.size()), *m_end);
-		const auto t1  = Speculation::NowNs();
-		Close();
-		slot.done.store(true, std::memory_order_release);
-		m_slot = nullptr;
-		m_chain->CopyStateFrom(*m_end, false);
-		m_chain_serial = job.serial;
-		m_chain_ok     = !out.failed && out.stop == nullptr;
-		Add(WJobs);
-		Add(WNs, t1 - t0);
-		Add(WDraws, m_ord);
-		if (out.failed) Add(WFailed);
-		if (out.stop != nullptr) Add(WStops);
-		std::lock_guard g(m_reason_mutex);
-		for (const auto& [why, n]: m_job_holes) m_holes[why] += n;
-		if (out.stop != nullptr) ++m_stops[out.stop];
+		if (!item.start) item.start = std::make_unique<CommandProcessor>(m_r, 0);
+		if (!item.pass_end) item.pass_end = std::make_unique<CommandProcessor>(m_r, 0);
+		item.start->CopyStateFrom(*m_chain, false);
+		// Pasada de estado (solo registros; escrituras a memoria a un registro propio que nadie lee).
+		const auto t0 = Now();
+		m_pass->CopyStateFrom(*m_chain, false);
+		m_pass->SetFlip({});
+		m_pass->SetChunking(0);
+		m_record.Clear();
+		Libs::Graphics::Spec::t_record = &m_record;
+		Pm4Execution execution;
+		const auto   res               = m_pass->Process(execution, std::span<const uint32_t>(job.cmds.data(), job.cmds.size()));
+		Libs::Graphics::Spec::t_record = nullptr;
+		Add(LPassNs, Now() - t0);
+		item.pass_ok = res == Pm4ProcessResult::Complete;
+		if (item.pass_ok) {
+			m_chain->CopyStateFrom(*m_pass, false);
+			item.pass_end->CopyStateFrom(*m_pass, false);
+			m_chain_serial = job.serial;
+			m_chain_ok     = true;
+		} else {
+			m_chain_ok = false; // (la siguiente pide el estado al render)
+			Add(LPassFail);
+		}
+		item.serial = job.serial;
+		std::swap(item.cmds, job.cmds);
+		if (auto& rec = g_rec[job.serial % RecN]; rec.serial.load(std::memory_order_relaxed) == job.serial)
+			rec.ready.store(Now(), std::memory_order_relaxed);
+		return true;
 	}
 
-	[[nodiscard]] bool Quit() {
-		std::lock_guard g(m_mutex);
-		return m_quit;
-	}
-
-	RenderContext&                    m_r;
-	Speculation                       m_spec;
-	std::unique_ptr<CommandProcessor> m_chain, m_end, m_published;
-	std::thread                       m_thread;
-	std::mutex                        m_mutex;
-	std::condition_variable           m_cv;
-	std::deque<Job>                   m_jobs;
-	std::vector<std::vector<uint32_t>> m_pool;
-	bool                              m_quit = false;
-	// (trabajador)
-	bool                                       m_chain_ok = false, m_gate = true;
-	uint64_t                                   m_chain_serial = 0, m_last_idle = 0, m_last_key = 0;
-	uint32_t                                   m_pinned_for = 0xffffffffu, m_ord = 0;
-	int                                        m_open = -1;
-	Slot*                                      m_slot = nullptr;
-	std::chrono::steady_clock::time_point      m_sample_at {};
-	std::unordered_map<const char*, uint64_t>  m_job_holes;
-	// (estado publicado por el render para reenganchar)
-	std::mutex            m_pub_mutex;
-	uint64_t              m_pub_serial = 0;
-	std::atomic<uint64_t> m_want_serial {0};
-	// (motivos, para el informe)
-	std::mutex                                m_reason_mutex;
-	std::unordered_map<const char*, uint64_t> m_holes, m_stops;
-	Slot                                      m_slots[Slots];
+	RenderContext&                        m_r;
+	Speculation                           m_reader_spec;
+	std::unique_ptr<CommandProcessor>     m_chain, m_pass, m_published;
+	Libs::Graphics::Spec::State           m_record;
+	uint32_t                              m_n = 1;
+	std::vector<std::unique_ptr<Worker>>  m_workers;
+	std::thread                           m_reader;
+	std::mutex                            m_mutex;
+	std::condition_variable               m_cv, m_work_cv;
+	std::deque<Job>                       m_jobs;
+	std::deque<std::unique_ptr<Item>>     m_items;
+	std::vector<std::unique_ptr<Item>>    m_spare;
+	std::vector<std::vector<uint32_t>>    m_pool;
+	bool                                  m_quit = false;
+	bool                                  m_chain_ok = false;
+	uint64_t                              m_chain_serial = 0, m_last_idle = 0;
+	std::chrono::steady_clock::time_point m_sample_at {};
+	std::mutex                            m_pub_mutex;
+	uint64_t                              m_pub_serial = 0;
+	std::atomic<uint64_t>                 m_want_serial {0};
+	Slot                                  m_slots[Slots];
 };
 
-inline std::atomic<Worker*> g_worker {nullptr};
+inline std::atomic<Shadow*> g_shadow {nullptr};
 
-inline void Worker::HoleHook(const uint32_t* packet, const char* reason) {
-	if (auto* w = g_worker.load(std::memory_order_relaxed); w != nullptr && t_side == 2) w->Hole(packet, reason);
+inline void Worker::Run() {
+	char name[32];
+	std::snprintf(name, sizeof(name), "Kyty.Tej.%u", m_index);
+	LocalPlatform::SetThreadName(name);
+	LocalPlatform::MakeBackgroundThread(nullptr); // (por debajo del render)
+	m_spec.ShadowThreadInit();
+	Libs::Graphics::Spec::t_hole_hook = [](const uint32_t* packet, const char* reason) {
+		if (t_worker != nullptr && t_side == 2) t_worker->Hole(packet, reason);
+	};
+	t_side   = 2;
+	t_worker = this;
+	while (auto item = m_owner.Take(m_index)) {
+		Translate(*item);
+		m_owner.Give(std::move(item));
+	}
+	t_side   = 0;
+	t_worker = nullptr;
+}
+
+inline void Worker::Translate(Item& item) {
+	if (const uint32_t rc = g_render_cpu.load(std::memory_order_relaxed); rc < 64 && rc != m_pinned_for) {
+		m_pinned_for = rc;
+		if (const uint64_t m = WorkMask(rc); m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
+	}
+	auto& slot = m_owner.SlotOf(item.serial);
+	slot.serial.store(0, std::memory_order_release);
+	slot.count.store(0, std::memory_order_release);
+	slot.done.store(false, std::memory_order_release);
+	slot.serial.store(item.serial, std::memory_order_release);
+	m_slot     = &slot;
+	m_open     = -1;
+	m_ord      = 0;
+	m_last_key = ~uint64_t {0};
+	m_job_holes.clear();
+	const uint64_t c0  = LocalPlatform::CurrentThreadCycles();
+	const auto     t0  = Now();
+	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
+	const auto     t1  = Now();
+	Close();
+	slot.done.store(true, std::memory_order_release);
+	m_slot = nullptr;
+	Add(WCycles, LocalPlatform::CurrentThreadCycles() - c0);
+	Add(WJobs);
+	Add(WNs, t1 - t0);
+	Add(WTransNs, out.translate_ns);
+	Add(WDraws, m_ord);
+	if (out.failed) Add(WFailed);
+	if (out.stop != nullptr) Add(WStops);
+	// (la pasada de estado del lector frente a la traduccion: el estado que deja cada una)
+	if (item.pass_ok && !out.failed && out.stop == nullptr && !m_end->SameState(*item.pass_end)) Add(WPassDiff);
+	if (m_ord != 0)
+		if (auto& rec = g_rec[item.serial % RecN]; rec.serial.load(std::memory_order_relaxed) == item.serial)
+			rec.cw_ps.store((t1 - t0) * 1000u / m_ord, std::memory_order_relaxed);
+	std::lock_guard g(reason_mutex);
+	for (const auto& [why, n]: m_job_holes) holes[why] += n;
+	if (out.stop != nullptr) ++stops[out.stop];
+}
+
+inline void Worker::Close() {
+	if (m_slot == nullptr || m_open < 0) return;
+	m_slot->pk[m_open].publish_tsc = __rdtsc();
+	m_slot->count.store(static_cast<uint32_t>(m_open) + 1, std::memory_order_release);
+	m_open = -1;
+}
+
+inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
+	if (m_slot == nullptr || key == m_last_key) return;
+	m_last_key     = key;
+	const auto ord = m_ord++;
+	if (ord % PacketDraws == 0) {
+		Close();
+		const uint32_t j = ord / PacketDraws;
+		if (j >= MaxPackets) {
+			Add(WOver);
+			return;
+		}
+		auto& p = m_slot->pk[j];
+		if (!p.cp) p.cp = std::make_unique<CommandProcessor>(m_r, 0);
+		p.cp->CopyStateFrom(cp, false);
+		p.key    = key;
+		p.draws  = 0;
+		p.holes  = 0;
+		p.ep_buf = r.GetBufferCache().RegistrationEpoch();
+		p.ep_img = r.GetTextureCache().ResolutionEpoch();
+		p.ep_map = r.GetGpuResources().MappingEpoch();
+		m_open   = static_cast<int>(j);
+	}
+	if (m_open >= 0) ++m_slot->pk[m_open].draws;
+}
+
+inline void Worker::Hole(const uint32_t* packet, const char* reason) {
+	const bool draw = packet != nullptr && IsDrawHeader(*packet);
+	if (draw && m_open >= 0 && m_slot != nullptr) ++m_slot->pk[m_open].holes;
+	Add(draw ? WHolesDraw : WHolesOther);
+	if (draw) ++m_job_holes[reason != nullptr ? reason : "?"];
 }
 
 inline void Window(double busy_ms, double fps, double frames, bool keep);
 
-// Hilo de render, al arrancar / al parar.
 inline void Start(RenderContext& r) {
-	if (Mode() == 0 || g_worker.load(std::memory_order_relaxed) != nullptr) return;
-	g_worker.store(new Worker(r), std::memory_order_release);
+	if (Mode() == 0 || g_shadow.load(std::memory_order_relaxed) != nullptr) return;
+	g_shadow.store(new Shadow(r), std::memory_order_release);
 	Techo::g_tej_window = &Window;
 }
 inline void Stop() {
 	Techo::g_tej_window = nullptr;
-	if (auto* w = g_worker.exchange(nullptr, std::memory_order_acq_rel)) delete w;
+	if (auto* s = g_shadow.exchange(nullptr, std::memory_order_acq_rel)) delete s;
 }
+
+// Latencia y picos (hilo de render), por lado A/B: histograma en pasos de 0.1 ms hasta 100 ms.
+struct LatAcc {
+	uint64_t n = 0, sum_ns = 0, frames = 0, over25 = 0;
+	uint32_t hist[1001] {};
+	void     Lat(uint64_t ns) {
+        ++n, sum_ns += ns;
+        ++hist[std::min<uint64_t>(ns / 100000u, 1000u)];
+	}
+	[[nodiscard]] double P99() const {
+		uint64_t want = n - n / 100, acc = 0;
+		for (uint32_t i = 0; i <= 1000; ++i)
+			if ((acc += hist[i]) >= want && n != 0) return (i + 1) * 0.1;
+		return 0;
+	}
+};
+inline std::mutex g_lat_mutex;
+inline LatAcc     g_lat[2];        // total de la partida (A, B)
+inline uint64_t   g_last_flip_ns = 0;
+
+// Registros por DCB (render) para el modelo de N trabajadores.
+struct DcbRec {
+	uint64_t ready, rs, re, cw_ps;
+	uint32_t draws;
+};
+inline std::mutex          g_dcb_mutex;
+inline std::vector<DcbRec> g_dcbs;
 
 // Hilo del juego: un envio de la cola 0.
-inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Worker::Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
+inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Shadow::Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
 	if (queue_id != 0 || Mode() == 0) return;
-	auto* w = g_worker.load(std::memory_order_acquire);
-	if (w == nullptr) return;
-	// (Ventana A: nada se copia; el serial no seguido rompe la cadena, que se reengancha en la B.)
-	if (!Active()) return;
-	w->Push(serial, kind, reset, commands);
+	auto& rec = g_rec[serial % RecN];
+	const uint64_t now = Now();
+	rec.serial.store(serial, std::memory_order_relaxed);
+	rec.enq.store(now, std::memory_order_relaxed);
+	rec.ready.store(0, std::memory_order_relaxed);
+	rec.cw_ps.store(0, std::memory_order_relaxed);
+	rec.kind.store(static_cast<uint8_t>(kind), std::memory_order_relaxed);
+	if (kind == Shadow::Job::Graphics) {
+		uint64_t zero = 0;
+		(void)g_frame_first.compare_exchange_strong(zero, now, std::memory_order_relaxed);
+	} else if (kind == Shadow::Job::Flip) {
+		rec.frame_first.store(g_frame_first.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+	}
+	auto* s = g_shadow.load(std::memory_order_acquire);
+	if (s == nullptr || !Active()) return; // (ventana A: nada se copia)
+	s->Push(serial, kind, reset, commands);
 }
 
-// Hilo de render: la DCB de la cola 0 que traduce (una por vez, en orden; varias rebanadas si para en esperas).
 struct GpuDcb {
-	uint64_t serial   = 0;
-	Slot*    slot     = nullptr;
-	uint32_t next     = 0;
-	uint64_t prev_tsc = 0;
-	uint64_t draws    = 0;
-	bool     on       = false;
+	uint64_t serial = 0, prev_tsc = 0, draws = 0, rs = 0;
+	Slot*    slot = nullptr;
+	uint32_t next = 0;
+	bool     on   = false;
 };
-inline GpuDcb g_gpu; // (solo el hilo de render)
+inline GpuDcb g_gpu;
 
 struct GpuSlice {
 	bool set = false;
@@ -485,13 +699,14 @@ struct GpuSlice {
 			g_render_cpu.store(LocalPlatform::CurrentCpu(), std::memory_order_relaxed);
 			g_gpu        = {};
 			g_gpu.serial = serial;
+			g_gpu.rs     = Now();
 			g_gpu.on     = Active();
 			if (g_gpu.on) {
 				Add(GDcbs);
-				if (auto* w = g_worker.load(std::memory_order_acquire); w != nullptr) {
-					auto& s = w->SlotOf(serial);
-					if (s.serial.load(std::memory_order_acquire) == serial) {
-						g_gpu.slot = &s;
+				if (auto* s = g_shadow.load(std::memory_order_acquire); s != nullptr) {
+					auto& sl = s->SlotOf(serial);
+					if (sl.serial.load(std::memory_order_acquire) == serial) {
+						g_gpu.slot = &sl;
 						Add(GDcbSlot);
 					}
 				}
@@ -504,14 +719,12 @@ struct GpuSlice {
 	~GpuSlice() {
 		if (!set) return;
 		t_side = 0;
-		Add(GDraws, std::exchange(g_gpu.draws, 0));
 	}
 	GpuSlice(const GpuSlice&)            = delete;
 	GpuSlice& operator=(const GpuSlice&) = delete;
 };
 
-// Hilo de render: el primer draw de cada paquete de la sombra (la misma posicion: clave = desplazamiento en la DCB
-// raiz << 32 | en el bufer actual), comparado; lo publicado y no visto, tarde o saltado.
+// Hilo de render: primer draw de cada paquete; epocas primero (baratas), registros solo si coinciden.
 inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 	auto& c = g_gpu;
 	++c.draws;
@@ -523,30 +736,28 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		const Packet& p = s->pk[c.next];
 		if (p.key > key) break;
 		++c.next;
-		if (p.key < key) { // (paso sin verlo: publicado despues del draw anterior = tarde; antes = el render no paso por ahi)
+		if (p.key < key) {
 			Add(p.publish_tsc > c.prev_tsc ? GPkLate : GPkSkip);
 			continue;
 		}
+		Add(GDrawsOnTime, p.draws);
 		const uint64_t t0   = __rdtsc();
-		const bool     same = cp.SameState(*p.cp);
 		const bool     eb   = r.GetBufferCache().RegistrationEpoch() == p.ep_buf;
-		const bool     ei   = r.GetTextureCache().ResolutionEpoch() == p.ep_img;
-		const bool     em   = r.GetGpuResources().MappingEpoch() == p.ep_map;
+		const bool     ei   = eb && r.GetTextureCache().ResolutionEpoch() == p.ep_img;
+		const bool     em   = ei && r.GetGpuResources().MappingEpoch() == p.ep_map;
+		const uint32_t sewn = p.draws > p.holes ? p.draws - p.holes : 0;
+		const bool     same = em && sewn != 0 && cp.SameState(*p.cp);
 		Add(GValTicks, __rdtsc() - t0);
 		Add(GValN);
-		const uint32_t sewn = p.draws > p.holes ? p.draws - p.holes : 0;
-		if (!same) {
-			Add(GPkRegs);
-		} else {
+		if (!eb) Add(GPkEpBuf);
+		else if (!ei) Add(GPkEpImg);
+		else if (!em) Add(GPkEpMap);
+		else if (!same) Add(GPkRegs);
+		else {
 			Add(GDrawsRegsOk, sewn);
-			if (!eb) Add(GPkEpBuf);
-			else if (!ei) Add(GPkEpImg);
-			else if (!em) Add(GPkEpMap);
-			else {
-				Add(GPkOk);
-				Add(GDrawsOk, sewn);
-				Add(GHolesOk, p.holes);
-			}
+			Add(GPkOk);
+			Add(GDrawsOk, sewn);
+			Add(GHolesOk, p.holes);
 		}
 		break;
 	}
@@ -555,20 +766,68 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 
 inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 	if (t_side == 1) GpuDraw(cp, r, key);
-	else if (auto* w = g_worker.load(std::memory_order_relaxed); w != nullptr) w->WorkerDraw(cp, r, key);
+	else if (t_side == 2 && t_worker != nullptr) t_worker->WorkerDraw(cp, r, key);
 }
 
-// Hilo de render: un envio de la cola 0 acabado (estado para reenganchar la cadena; cola de la DCB tarde).
+// Hilo de render: un envio de la cola 0 acabado.
 inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 	if (Mode() == 0) return;
-	if (g_gpu.serial == serial && g_gpu.slot != nullptr) {
-		if (!g_gpu.slot->done.load(std::memory_order_acquire)) Add(GTailLate);
+	const uint64_t now = Now();
+	const auto&    rec = g_rec[serial % RecN];
+	const bool     mine = rec.serial.load(std::memory_order_relaxed) == serial;
+	if (g_gpu.serial == serial) {
+		if (g_gpu.slot != nullptr && !g_gpu.slot->done.load(std::memory_order_acquire)) Add(GTailLate);
 		g_gpu.slot = nullptr;
+		if (g_gpu.on) {
+			Add(GDraws, g_gpu.draws);
+			if (mine && g_gpu.draws != 0) {
+				std::lock_guard g(g_dcb_mutex);
+				if (g_dcbs.size() < 65536)
+					g_dcbs.push_back({rec.ready.load(std::memory_order_relaxed) != 0 ? rec.ready.load(std::memory_order_relaxed)
+					                                                                 : rec.enq.load(std::memory_order_relaxed),
+					                  g_gpu.rs, now, rec.cw_ps.load(std::memory_order_relaxed),
+					                  static_cast<uint32_t>(g_gpu.draws)});
+			}
+		}
+		g_gpu.on = false;
 	}
-	if (auto* w = g_worker.load(std::memory_order_acquire); w != nullptr) w->GpuDone(serial, cp);
+	if (mine && rec.kind.load(std::memory_order_relaxed) == Shadow::Job::Flip) {
+		const int      side  = Active() ? 1 : 0;
+		const uint64_t first = rec.frame_first.load(std::memory_order_relaxed);
+		std::lock_guard g(g_lat_mutex);
+		if (first != 0 && now > first) g_lat[side].Lat(now - first);
+		if (g_last_flip_ns != 0) {
+			++g_lat[side].frames;
+			if (now - g_last_flip_ns > 25000000u) ++g_lat[side].over25;
+		}
+		g_last_flip_ns = now;
+	}
+	if (auto* s = g_shadow.load(std::memory_order_acquire); s != nullptr) s->GpuDone(serial, cp);
 }
 
-// Ventana de 5 s de [techo] (hilo del informe).
+// Modelo: % de draws en paquetes de 64 que estarian publicados antes de que el render llegue, con n trabajadores
+// (cola por llegada, coste por draw medido de cada DCB o la media), sobre las DCB de la ventana.
+[[nodiscard]] inline double Model(const std::vector<DcbRec>& dcbs, uint32_t n, double avg_cw_ns) {
+	std::vector<double> free_at(n, 0.0);
+	double              ok = 0, all = 0;
+	for (const auto& d: dcbs) {
+		all += d.draws;
+		const double cw = d.cw_ps != 0 ? d.cw_ps / 1000.0 : avg_cw_ns;
+		if (cw <= 0) continue;
+		auto         w  = std::min_element(free_at.begin(), free_at.end());
+		const double w0 = std::max(*w, static_cast<double>(d.ready));
+		const double rs = static_cast<double>(d.rs);
+		if (w0 >= rs) continue; // (el render ya empezo: no se toma)
+		const double cr = d.draws != 0 ? static_cast<double>(d.re - d.rs) / d.draws : 0;
+		for (uint32_t j = 0; j * PacketDraws < d.draws && j < MaxPackets; ++j) {
+			const uint32_t last = std::min<uint32_t>((j + 1) * PacketDraws, d.draws);
+			if (w0 + last * cw <= rs + j * PacketDraws * cr) ok += last - j * PacketDraws;
+		}
+		*w = w0 + d.draws * cw;
+	}
+	return all > 0 ? 100.0 * ok / all : 0;
+}
+
 inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const int m = Mode();
 	if (m == 0 || frames <= 0) return;
@@ -590,7 +849,6 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	}
 	uint64_t v[NCount];
 	for (uint32_t i = 0; i < NCount; ++i) v[i] = g_c[i].exchange(0, std::memory_order_relaxed);
-	// (TSC -> ns, calibrado entre ventanas)
 	static uint64_t last_tsc = 0;
 	static auto     last_t   = std::chrono::steady_clock::now();
 	const uint64_t  tsc      = __rdtsc();
@@ -598,38 +856,76 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const double    ns_per_tick =
         last_tsc != 0 && tsc > last_tsc ? std::chrono::duration<double, std::nano>(t - last_t).count() / static_cast<double>(tsc - last_tsc) : 0.25;
 	last_tsc = tsc, last_t = t;
-	const double f = frames;
-	const double draws = static_cast<double>(v[GDraws]);
-	const auto   pct   = [&](uint64_t x) { return draws > 0 ? 100.0 * static_cast<double>(x) / draws : 0.0; };
+	const double f       = frames;
+	const double draws   = static_cast<double>(v[GDraws]);
+	const auto   pct     = [&](uint64_t x) { return draws > 0 ? 100.0 * static_cast<double>(x) / draws : 0.0; };
 	const double on_time = static_cast<double>(v[GPkOk] + v[GPkRegs] + v[GPkEpBuf] + v[GPkEpImg] + v[GPkEpMap]);
 	const double seen_pk = on_time + static_cast<double>(v[GPkLate]);
 	const double val_ns  = v[GValN] != 0 ? static_cast<double>(v[GValTicks]) * ns_per_tick / static_cast<double>(v[GValN]) : 0;
 	const double val_per_sewn =
 	    v[GDrawsOk] != 0 ? static_cast<double>(v[GValTicks]) * ns_per_tick / static_cast<double>(v[GDrawsOk]) : 0;
-	const double w_us = v[WDraws] != 0 ? static_cast<double>(v[WNs]) / 1e3 / static_cast<double>(v[WDraws]) : 0;
+	const double w_us   = v[WDraws] != 0 ? static_cast<double>(v[WNs]) / 1e3 / static_cast<double>(v[WDraws]) : 0;
+	const double wt_us  = v[WDraws] != 0 ? static_cast<double>(v[WTransNs]) / 1e3 / static_cast<double>(v[WDraws]) : 0;
+	const double ghz    = v[WNs] != 0 ? static_cast<double>(v[WCycles]) / static_cast<double>(v[WNs]) : 0;
 	const uint64_t fn = g_free_n.exchange(0, std::memory_order_relaxed), fs = g_free_sum.exchange(0, std::memory_order_relaxed);
-	std::printf("[tej] ventana %s: render ocupado %.2f ms, %.1f fps | por fot: DCB %.1f (con sombra %.1f), draws %.0f |"
-	            " COSIBLES %.1f %% (%.0f/fot; cota solo registros %.1f %%) | paquetes a tiempo %.1f %% (%.1f/fot validados, tarde"
-	            " %.1f, saltados %.1f, DCB acabadas antes que la sombra %.1f) | fallo de paquete por fot: registros %.1f,"
-	            " epoca buffers %.1f, imagenes %.1f, mapeos %.1f | validacion %.0f ns/paquete = %.0f ns/llamada cosida |"
-	            " trabajador %.2f us/llamada (%.0f draws/fot, %.2f ms/fot), huecos draw %.1f/fot (otros %.1f), paradas %.1f,"
-	            " fallos %.1f, +64*%d %.1f | sin traducir por fot: sin nucleo libre %.1f, render ya paso %.1f, sin estado %.1f"
-	            " (publicados %.1f), otro tipo %.1f, cola llena %.1f; espera adelanto %.2f ms/fot; copia %.0f KiB/fot;"
-	            " reafinidad %.1f/fot | CPU libre %.2f nucleos",
-	            m == 2 ? (was ? "B (sombra)" : "A (apagada)") : "sombra", busy_ms, fps, v[GDcbs] / f, v[GDcbSlot] / f, draws / f,
-	            pct(v[GDrawsOk]), v[GDrawsOk] / f, pct(v[GDrawsRegsOk]), seen_pk > 0 ? 100.0 * on_time / seen_pk : 0.0,
-	            on_time / f, v[GPkLate] / f, v[GPkSkip] / f, v[GTailLate] / f, v[GPkRegs] / f, v[GPkEpBuf] / f,
-	            v[GPkEpImg] / f, v[GPkEpMap] / f, val_ns, val_per_sewn, w_us, v[WDraws] / f, v[WNs] / 1e6 / f,
-	            v[WHolesDraw] / f, v[WHolesOther] / f, v[WStops] / f, v[WFailed] / f, static_cast<int>(MaxPackets),
-	            v[WOver] / f, v[WNoCpu] / f, v[WBehind] / f, v[WNoState] / f, v[GPublish] / f, v[WOther] / f,
-	            v[WDropFull] / f, v[WAheadWaitNs] / 1e6 / f, v[WCopyBytes] / 1024.0 / f, v[WRepins] / f,
+	auto*          sh = g_shadow.load(std::memory_order_acquire);
+	std::printf("[tej] ventana %s: render ocupado %.2f ms, %.1f fps | N %u trabajadores | por fot: DCB %.1f (con sombra %.1f),"
+	            " draws %.0f | TRADUCIDOS A TIEMPO %.1f %% | COSIBLES %.1f %% (%.0f/fot; cota solo registros %.1f %%) |"
+	            " paquetes a tiempo %.1f %% (%.1f/fot validados, tarde %.1f, saltados %.1f, DCB acabadas antes que la sombra %.1f)"
+	            " | fallo de paquete por fot: registros %.1f, epoca buffers %.1f, imagenes %.1f, mapeos %.1f | validacion %.0f"
+	            " ns/paquete = %.0f ns/llamada cosida | trabajador %.2f us/llamada (traducir %.2f, %.2f GHz efectivos: <4 ="
+	            " expulsado/esperas), %.0f draws/fot, %.2f ms/fot, huecos draw %.1f/fot (otros %.1f), paradas %.1f, fallos %.1f,"
+	            " +64*%d %.1f, estado distinto de la pasada %.1f, la mas grande primero %.1f, sin nucleo para el k %.1f |"
+	            " lector: DCB %.1f/fot, autocontenidas %.1f, pasada de estado %.1f us/DCB (falla %.1f), estado del render %.1f"
+	            " (publicados %.1f), sin estado %.1f, render ya paso %.1f, sin nucleo libre %.1f, otro tipo %.1f, cola llena %.1f,"
+	            " espera adelanto %.2f ms/fot; copia %.0f KiB/fot; reafinidad %.1f/fot | CPU libre %.2f nucleos",
+	            m == 2 ? (was ? "B (sombra)" : "A (apagada)") : "sombra", busy_ms, fps, sh != nullptr ? sh->N() : 0u, v[GDcbs] / f,
+	            v[GDcbSlot] / f, draws / f, pct(v[GDrawsOnTime]), pct(v[GDrawsOk]), v[GDrawsOk] / f, pct(v[GDrawsRegsOk]),
+	            seen_pk > 0 ? 100.0 * on_time / seen_pk : 0.0, on_time / f, v[GPkLate] / f, v[GPkSkip] / f, v[GTailLate] / f,
+	            v[GPkRegs] / f, v[GPkEpBuf] / f, v[GPkEpImg] / f, v[GPkEpMap] / f, val_ns, val_per_sewn, w_us, wt_us, ghz,
+	            v[WDraws] / f, v[WNs] / 1e6 / f, v[WHolesDraw] / f, v[WHolesOther] / f, v[WStops] / f, v[WFailed] / f,
+	            static_cast<int>(MaxPackets), v[WOver] / f, v[WPassDiff] / f, v[WBiggest] / f, v[WIdleNoCpu] / f, v[LJobs] / f,
+	            v[LSelf] / f, v[LJobs] != 0 ? v[LPassNs] / 1e3 / static_cast<double>(v[LJobs]) : 0.0, v[LPassFail] / f,
+	            v[LFromRender] / f, v[GPublish] / f, v[LNoState] / f, v[LBehind] / f + v[WBehind] / f, v[LNoCpu] / f,
+	            v[LOther] / f, v[LDropFull] / f, v[LAheadWaitNs] / 1e6 / f, v[LCopyBytes] / 1024.0 / f, v[WRepins] / f,
 	            fn != 0 ? static_cast<double>(fs) / 100.0 / static_cast<double>(fn) : -1.0);
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)", cnt[0], cnt[1], delta);
 	std::printf("\n");
-	if (auto* w = g_worker.load(std::memory_order_acquire); w != nullptr) {
+	// Modelo N=1,2,4,6 con los tiempos de esta ventana (solo B / modo 1: con draws contados).
+	std::vector<DcbRec> dcbs;
+	{
+		std::lock_guard g(g_dcb_mutex);
+		dcbs.swap(g_dcbs);
+	}
+	if (!dcbs.empty()) {
+		double sum = 0, n = 0;
+		for (const auto& d: dcbs)
+			if (d.cw_ps != 0) sum += d.cw_ps / 1000.0 * d.draws, n += d.draws;
+		const double avg = n > 0 ? sum / n : w_us * 1e3;
+		std::printf("[tej] modelo (%zu DCB, coste trabajador %.2f us/draw): traducidos a tiempo con N=1 %.1f %%, N=2 %.1f %%,"
+		            " N=4 %.1f %%, N=6 %.1f %% (N actual %u: modelo %.1f %% frente a medido %.1f %%)",
+		            dcbs.size(), avg / 1e3, Model(dcbs, 1, avg), Model(dcbs, 2, avg), Model(dcbs, 4, avg), Model(dcbs, 6, avg),
+		            sh != nullptr ? sh->N() : 0u, Model(dcbs, sh != nullptr ? sh->N() : 1u, avg), pct(v[GDrawsOnTime]));
+		std::printf(" | mismo modelo con trabajador a 1.8 us/draw (coste del render): N=1 %.1f %%, N=2 %.1f %%, N=4 %.1f %%\n",
+		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 1, 1800); }(),
+		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 2, 1800); }(),
+		            [&] { auto c = dcbs; for (auto& d: c) d.cw_ps = 1800; return Model(c, 4, 1800); }());
+	}
+	{
+		std::lock_guard g(g_lat_mutex);
+		const auto& a = g_lat[0];
+		const auto& b = g_lat[1];
+		std::printf("[tej] latencia Enqueue->flip (partida): A media %.2f ms p99 %.1f ms, >25 ms %.2f %% (%llu fot) | B media"
+		            " %.2f ms p99 %.1f ms, >25 ms %.2f %% (%llu fot) | B-A media %+.2f ms (no pasa si > +0.2 o picos suben)\n",
+		            a.n ? a.sum_ns / 1e6 / a.n : 0.0, a.P99(), a.frames ? 100.0 * a.over25 / a.frames : 0.0,
+		            static_cast<unsigned long long>(a.frames), b.n ? b.sum_ns / 1e6 / b.n : 0.0, b.P99(),
+		            b.frames ? 100.0 * b.over25 / b.frames : 0.0, static_cast<unsigned long long>(b.frames),
+		            (b.n ? b.sum_ns / 1e6 / b.n : 0.0) - (a.n ? a.sum_ns / 1e6 / a.n : 0.0));
+	}
+	if (sh != nullptr) {
 		std::vector<std::pair<const char*, uint64_t>> holes, stops;
-		w->TakeReasons(holes, stops);
+		sh->TakeReasons(holes, stops);
 		const auto top = [&](const char* title, std::vector<std::pair<const char*, uint64_t>>& list) {
 			std::ranges::sort(list, [](const auto& a, const auto& b) { return a.second > b.second; });
 			std::printf(" %s:", title);

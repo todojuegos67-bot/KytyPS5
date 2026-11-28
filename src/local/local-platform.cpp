@@ -646,6 +646,28 @@ bool SetCurrentThreadMask(uint64_t mask) {
 	return m != 0 && SetThreadAffinityMask(GetCurrentThread(), m) != 0;
 }
 
+uint64_t PerformanceCpuMask() {
+	ULONG length = 0;
+	(void)GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+	if (length == 0) return 0;
+	std::vector<uint8_t> buffer(length);
+	auto* first = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data());
+	if (!GetSystemCpuSetInformation(first, length, &length, GetCurrentProcess(), 0)) return 0;
+	uint64_t masks[256] {};
+	int      best = -1;
+	for (ULONG offset = 0; offset < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+		if (info->Size == 0) break;
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 && info->CpuSet.LogicalProcessorIndex < 64) {
+			const int cls = info->CpuSet.EfficiencyClass;
+			masks[cls] |= uint64_t {1} << info->CpuSet.LogicalProcessorIndex;
+			best = std::max(best, cls);
+		}
+		offset += info->Size;
+	}
+	return best >= 0 ? masks[best] : 0;
+}
+
 bool ProcessCpusIdleTime(uint64_t* idle_100ns, uint64_t* cpus) {
 	// NtQuerySystemInformation's SystemProcessorPerformanceInformation (8): each processor of the calling thread's group.
 	struct ProcessorTimes {
@@ -3171,6 +3193,10 @@ uint64_t L3MaskOfCpu(uint32_t /*cpu*/) {
 
 uint64_t CpuListToMask(const char* list) {
 	return CpuListMask(list);
+}
+
+uint64_t PerformanceCpuMask() {
+	return 0;
 }
 
 bool SetCurrentThreadMask(uint64_t mask) {

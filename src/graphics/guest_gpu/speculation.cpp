@@ -115,10 +115,11 @@ Speculation::Speculation(RenderContext& renderer, int queue_event_id, std::funct
 
 // (tej, KYTY_TEJ F1) The shadow translator: number 7 (packet slot 7, catalog role 8; KYTY_SPECULATE=4 uses 0..threads-1,
 // envio2 0), rings of 16 + 8 MiB instead of 64 + 16.
-Speculation::Speculation(RenderContext& renderer, ShadowTag)
+Speculation::Speculation(RenderContext& renderer, ShadowTag, uint32_t number, uint32_t table_mib, uint32_t shader_mib)
     : m_renderer(renderer), m_chain(std::make_unique<CommandProcessor>(renderer, 0)),
       m_state(std::make_unique<CommandProcessor>(renderer, 0)), m_name("Speculation (tej, sombra)") {
-	m_translators.push_back(std::make_unique<Translator>(renderer, static_cast<uint32_t>(Spec::MaxPacketSlots - 1), 0, 16, 8));
+	m_translators.push_back(std::make_unique<Translator>(
+	    renderer, std::min(number, static_cast<uint32_t>(Spec::MaxPacketSlots - 1)), 0, table_mib, shader_mib));
 }
 
 void Speculation::ShadowThreadInit() {
@@ -132,7 +133,9 @@ void Speculation::ShadowThreadInit() {
 Speculation::ShadowOut Speculation::Shadow(const CommandProcessor& start, std::span<const uint32_t> commands,
                                            CommandProcessor& end) {
 	auto&     translator = *m_translators[0];
+	const auto t0         = NowNs();
 	auto      result     = Translate(translator, start, commands, Pm4Execution {});
+	const auto t1         = NowNs();
 	// (Its packets passed: what the GPU thread retired while it read is destroyed once this is seen, Spec::PacketsPassed.)
 	Spec::LeavePackets();
 	ShadowOut out;
@@ -140,6 +143,7 @@ Speculation::ShadowOut Speculation::Shadow(const CommandProcessor& start, std::s
 	out.failed     = result->failed;
 	out.holes      = static_cast<uint32_t>(result->holes.size());
 	out.progressed = result->progressed;
+	out.translate_ns = t1 - t0;
 	end.CopyStateFrom(*result->end_state, false);
 	// (Never submitted: its command buffers discarded, its rings' and executors' pending work freed before the next.)
 	Finish(std::move(result), 0);

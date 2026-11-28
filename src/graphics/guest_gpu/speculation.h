@@ -60,12 +60,14 @@ public:
 	// recorder that is never submitted (Shadow: dropped at once, Finish), from a state of its own (`start`), leaving the
 	// state after it in `end`. Nothing is committed, nothing is logged as an effect.
 	struct ShadowTag {};
-	Speculation(RenderContext& renderer, ShadowTag);
+	// (tej F1b) `number`: its packet slot (catalog role 1 + number); rings of table_mib + shader_mib.
+	Speculation(RenderContext& renderer, ShadowTag, uint32_t number = 7, uint32_t table_mib = 16, uint32_t shader_mib = 8);
 	struct ShadowOut {
 		const char* stop      = nullptr; // why it stopped before the end (null: it did not)
 		bool        failed    = false;   // partly recorded packet / recorder refusal
 		uint32_t    holes     = 0;
 		bool        progressed = false;
+		uint64_t    translate_ns = 0; // (tej F1b) Translate alone (the rest: Finish)
 	};
 	void      ShadowThreadInit(); // (on the thread that calls Shadow, once)
 	ShadowOut Shadow(const CommandProcessor& start, std::span<const uint32_t> commands, CommandProcessor& end);
