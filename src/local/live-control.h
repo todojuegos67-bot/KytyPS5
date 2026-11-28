@@ -33,6 +33,7 @@
 #include "port2-report.h" // (port2)
 #include "p7-report.h" // (p7, KYTY_P7)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
+#include "local/gpu-tiempo.h" // (gpu-tiempo)
 #include "f0-measure.h" // (f0)
 #include "live-counters.h"
 #include "tiron1.h" // (tiron1)
@@ -553,6 +554,7 @@ inline void Flip() {
 	TrustedDepth::OnFlip(flip_ns); // (trust1: the [trust1] line, KYTY_RENDER_STATS / KYTY_DS_TRUSTED_DEPTH)
 	Render5Report(flip_ns); // (render5)
 	Techo::Report(flip_ns, g_render_idle_ns); // (techo; nada si apagado)
+	GpuTiempo::Flip(flip_ns, g_render_idle_ns); // (gpu-tiempo, KYTY_TECHO=1; nada si apagado)
 	DsSombrasAb::OnFlip(flip_ns, g_render_idle_ns, LiveCensus::g_waits_ns[LiveCensus::WaitCompile]); // (sombras-ab; nada si apagado)
 	R0Ab::OnFlip(flip_ns, g_render_idle_ns); // (r0, KYTY_R0_AB; nada si apagado)
 	Copia1::NoteFrame();    // (copia1: the [copia1] line's frames)

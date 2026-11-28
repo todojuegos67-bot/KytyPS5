@@ -17,6 +17,7 @@
 #include "lane-sync.h"
 #include "local/serie1.h" // (serie1: KYTY_SERIE1)
 #include "local/f0-measure.h" // (f0: KYTY_F0)
+#include "local/gpu-tiempo.h" // (gpu-tiempo: KYTY_TECHO=1)
 
 #include <algorithm>
 #include <atomic>
@@ -607,6 +608,18 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_command.m_buffer), true); // (f0)
+	if (GpuTiempo::On()) { // (gpu-tiempo: marca de inicio; nada si KYTY_TECHO apagado)
+		static const bool init = [this] {
+			const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+			GpuTiempo::Init(static_cast<VkDevice>(m_graphics.device), static_cast<VkPhysicalDevice>(m_graphics.physical_device),
+			                m_graphics.queue_family, m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod,
+			                d.vkCmdWriteTimestamp, d.vkGetQueryPoolResults, d.vkResetQueryPool, d.vkCreateQueryPool,
+			                d.vkGetPhysicalDeviceQueueFamilyProperties);
+			return true;
+		}();
+		(void)init;
+		GpuTiempo::Begin(static_cast<VkCommandBuffer>(m_command.m_buffer), true);
+	}
 	LiveTrace::g_mark_command = static_cast<VkCommandBuffer>(m_command.m_buffer);
 	return m_command;
 }
@@ -706,6 +719,7 @@ vk::CommandBuffer CommandScheduler::UploadPrologue(uint64_t last_dirty, uint64_t
 		m_prologue.m_buffer = m_command_pool.Commit();
 		m_prologue.Begin();
 		F0Measure::BufferBegin(&m_graphics, static_cast<VkCommandBuffer>(m_prologue.m_buffer), false); // (f0)
+		if (GpuTiempo::On()) GpuTiempo::Begin(static_cast<VkCommandBuffer>(m_prologue.m_buffer), false); // (gpu-tiempo)
 		// The copies after everything submitted before (which may read or write their destinations).
 		VulkanMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -769,6 +783,8 @@ void CommandScheduler::WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t va
 uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, SubmitInfo submit) {
 	if (F0Measure::On()) // (f0: the end stamps, recorded before the buffers end)
 		for (const auto& entry: entries) F0Measure::BufferSubmit(static_cast<VkCommandBuffer>(entry.buffer), entry.ended, m_lane);
+	if (GpuTiempo::On()) // (gpu-tiempo: marcas de fin, antes de cerrar los buffers)
+		for (const auto& entry: entries) GpuTiempo::Submit(static_cast<VkCommandBuffer>(entry.buffer), entry.ended);
 	// (P5) Los ligados de texturas nativas pendientes, en un solo vkQueueBindSparse; esta entrega los espera (abajo).
 	SparseFlushPendingBinds(m_graphics, *this);
 	if (m_next_wait_semaphore != nullptr) {

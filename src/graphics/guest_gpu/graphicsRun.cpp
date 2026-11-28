@@ -59,6 +59,7 @@
 #include "local/ds-nativo-sombras.h"
 #include "local/ds-sombras-ab.h" // (T43: tiempo de los cubos del sol) // (F5 pase 2, KYTY_NATIVO_PASE_SOMBRAS=2: volcado del VS de sombras)
 #include "local/ds-censo-dcb.h" // (w7, KYTY_CENSO_DCB: [censo-dcb])
+#include "local/gpu-tiempo.h" // (gpu-tiempo)
 #include "local/perfil.h"       // (KYTY_PERFIL)
 #include "local/ds-censo-escena.h" // (F5 pase 3, KYTY_NATIVO_PASE_ESCENA=2: censo por pase)
 #include "render1.h" // (render1 F0+F1)
@@ -1617,6 +1618,12 @@ bool GuestGpu::Process(Submission& submission) {
 	std::optional<DsCensoDcb::Slice> censo_dcb;
 	if (DsCensoDcb::On())
 		censo_dcb.emplace(submission.queue_id == 0 && submission.type == SubmissionType::Graphics, submission.commands.data());
+	// (gpu-tiempo, KYTY_TECHO=1) marca de GPU con el grupo del sitio al empezar el trozo y "emulador" al acabarlo.
+	const GpuTiempo::SliceScope gpu_tiempo(censo_dcb.has_value(),
+	                                       censo_dcb ? static_cast<uint32_t>(DsCensoDcb::g_sites[censo_dcb->site].key.load(
+	                                                       std::memory_order_relaxed))
+	                                                 : 0u,
+	                                       !(submission.queue_id == 0 && submission.type == SubmissionType::Graphics));
 	// (w11b) [nativo-vgeo]: dispatches por CS dentro de la ACB #4 de a0ed3e.
 	const VgeoNativo::TargetScope vgeo_target(censo_dcb ? DsCensoDcb::g_sites[censo_dcb->site].key.load(std::memory_order_relaxed) : 0);
 	// (w18) [censo-pm4]: tiempo por paquete PM4 y por fase en los bloques caros del censo.
