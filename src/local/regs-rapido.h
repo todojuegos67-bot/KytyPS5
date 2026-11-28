@@ -24,7 +24,7 @@ namespace RegsRapido {
 [[nodiscard]] inline int Mode() {
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_REGS_RAPIDO");
-		int         m = v != nullptr ? std::atoi(v) : 0;
+		int         m = v != nullptr ? std::atoi(v) : 1; // (t67) encendido por defecto: -1 ms/fot medido, DIFERENCIAS 0
 		if (m != 1 && m != 2) m = 0;
 		if (m == 2 && !Techo::On()) {
 			std::printf("[regs-rapido] KYTY_REGS_RAPIDO=2 sin KYTY_TECHO=1: se usa 1 (siempre encendido)\n");
