@@ -42,6 +42,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/speculation.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "local/local-platform.h"
 #include "local/speculation-state.h"
@@ -89,7 +90,7 @@ enum C : uint32_t {
 	GDraws, GDcbs, GDcbSlot, GPkOk, GDrawsOk, GHolesOk, GPkRegs, GDrawsRegsOk, GPkEpBuf, GPkEpImg, GPkEpMap, GPkLate,
 	GPkSkip, GTailLate, GValTicks, GValN, GPublish,
 	GDrawsOnTime, // draws de paquetes publicados antes de que el render llegara (traducidos a tiempo)
-	GCalls, GPkAllHoles, GPkAssumed, GDrawsOkAssumed, GDrawsOnTimeAssumed, GRegDiffNames,
+	GCalls, GPkAllHoles, GPkAssumed, GDrawsOkAssumed, GDrawsOnTimeAssumed, GRegDiffNames, GPkRegsSampled, GRgRaw,
 	// (F1d) registros solo de draws; epocas por rangos de lo que el paquete leyo
 	GPkCsIgnored, GPkCsDispatch, GDrawsOkGfx, GDrawsOkRanges, GPkRgBuf, GPkRgImg, GPkRgMap, GPkRgNoList, GRgEntries,
 	GPkRgFailBuf, GPkRgFailImg, GPkRgFailMap,
@@ -110,6 +111,42 @@ inline constexpr uint32_t Banks = 10; // 0 render, 1 lector, 2..7 trabajadores, 
 inline Bank               g_bank[Banks];
 inline thread_local uint32_t t_bank = 9;
 inline void Add(C i, uint64_t v = 1) { g_bank[t_bank].c[i].fetch_add(v, std::memory_order_relaxed); }
+
+// (tej-coste) Coste de CADA gancho de tej en el hilo de render (TSC), por lado (0 A, 1 B). Acumula en el hilo (sin
+// atomicos por draw) y vuelca por DCB (GpuDone); la linea [tej] coste lo da en ms/fot. Ademas, por DCB de la cola 0, el
+// tiempo de pared del render y sus ciclos de CPU (QueryThreadCycleTime): si en B sube la pared y no los ciclos, el render
+// espera / es expulsado; si suben los ciclos, calcula mas o mas lento (cache/memoria).
+enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HN };
+inline constexpr const char* HName[HN] = {"inicio DCB", "draw (todo)", "validar regs", "rangos", "DiffState 1/64",
+                                          "dispatch", "espera WAIT_REG_MEM", "flip (latencia)", "fin DCB", "publicar estado"};
+struct alignas(64) HookAcc {
+	std::atomic<uint64_t> t[2][HN] {}, n[2][HN] {};
+	std::atomic<uint64_t> dcb_n[2] {}, dcb_wall[2] {}, dcb_cyc[2] {};
+};
+inline HookAcc g_hook;
+struct HookLocal {
+	uint64_t t[HN] {}, n[HN] {};
+};
+inline thread_local HookLocal t_hook;
+inline bool                   g_hook_side = false; // (render: lado de la DCB actual)
+inline uint64_t               g_dcb_tsc0 = 0, g_dcb_cyc0 = 0;
+struct HookTimer {
+	H        h;
+	uint64_t t0;
+	explicit HookTimer(H k): h(k), t0(__rdtsc()) {}
+	~HookTimer() { t_hook.t[h] += __rdtsc() - t0, ++t_hook.n[h]; }
+	HookTimer(const HookTimer&)            = delete;
+	HookTimer& operator=(const HookTimer&) = delete;
+};
+inline void FlushHooks() {
+	const int sd = g_hook_side ? 1 : 0;
+	for (uint32_t i = 0; i < HN; ++i)
+		if (t_hook.n[i] != 0) {
+			g_hook.t[sd][i].fetch_add(t_hook.t[i], std::memory_order_relaxed);
+			g_hook.n[sd][i].fetch_add(t_hook.n[i], std::memory_order_relaxed);
+			t_hook.t[i] = t_hook.n[i] = 0;
+		}
+}
 
 inline std::atomic<uint64_t> g_gpu_serial {0};
 inline std::atomic<uint32_t> g_render_cpu {0xffffffffu};
@@ -139,6 +176,11 @@ struct Packet {
 	bool                                      lists      = false;
 	size_t                                    fi_buf = 0, fi_read = 0, fi_img = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> bufs, reads, imgs;
+	// (tej-coste) Listas compactas que prepara el TRABAJADOR (el render solo las recorre): rb = buffers a regiones de 4 MiB
+	// (la granularidad de BufferCache::RegisteredSince: misma respuesta), ordenados y fusionados; rx = buffers + lecturas
+	// + imagenes ordenados y fusionados (solapados/contiguos: mismas direcciones, misma respuesta en imagenes y mapeos).
+	std::vector<std::pair<uint64_t, uint64_t>> rb, rx;
+	uint32_t                                   raw_ranges = 0;
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
@@ -356,6 +398,7 @@ public:
 			TejLag::g_acc[TejLag::Publish].n.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
+		const HookTimer tm(HPublish);
 		m_published->CopyStateFrom(cp, false);
 		m_pub_serial = serial;
 		m_want_serial.store(0, std::memory_order_relaxed);
@@ -680,6 +723,34 @@ inline void Worker::Translate(Item& item) {
 	if (out.stop != nullptr) ++stops[out.stop];
 }
 
+// (tej-coste) Trabajador: ordena y fusiona (rangos vacios fuera). gran: alinear a esa granularidad antes (0: exacto).
+inline void Merge(std::vector<std::pair<uint64_t, uint64_t>>& v, uint64_t gran) {
+	size_t k = 0;
+	for (auto [a, e]: v) {
+		if (e <= a) continue;
+		if (gran != 0) a -= a % gran, e = (e + gran - 1) / gran * gran;
+		v[k++] = {a, e};
+	}
+	v.resize(k);
+	std::sort(v.begin(), v.end());
+	k = 0;
+	for (size_t i = 0; i < v.size(); ++i) {
+		if (k != 0 && v[i].first <= v[k - 1].second) v[k - 1].second = std::max(v[k - 1].second, v[i].second);
+		else v[k++] = v[i];
+	}
+	v.resize(k);
+}
+inline void Compact(Packet& p) {
+	p.raw_ranges = static_cast<uint32_t>(p.bufs.size() + p.reads.size() + p.imgs.size());
+	p.rb.assign(p.bufs.begin(), p.bufs.end());
+	Merge(p.rb, Libs::Graphics::TRACKER_REGION_SIZE);
+	p.rx.clear();
+	p.rx.insert(p.rx.end(), p.bufs.begin(), p.bufs.end());
+	p.rx.insert(p.rx.end(), p.reads.begin(), p.reads.end());
+	p.rx.insert(p.rx.end(), p.imgs.begin(), p.imgs.end());
+	Merge(p.rx, 0);
+}
+
 inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 	if (m_slot == nullptr || m_open < 0) return;
 	{
@@ -697,6 +768,7 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 				if (im != nullptr) p.imgs.emplace_back(im->info.data.address, im->info.data.address + im->info.data.size);
 			}
 		}
+		Compact(p);
 	}
 	m_slot->pk[m_open].publish_tsc = __rdtsc();
 	m_slot->count.store(static_cast<uint32_t>(m_open) + 1, std::memory_order_release);
@@ -831,11 +903,17 @@ struct GpuDcb {
 };
 inline GpuDcb g_gpu;
 
+
 struct GpuSlice {
 	bool set = false;
 	GpuSlice(bool graphics_q0, uint64_t serial, bool first_slice) {
 		if (Mode() == 0 || !graphics_q0) return;
 		if (first_slice) {
+			const uint64_t t0 = __rdtsc();
+			FlushHooks(); // (lo de antes de esta DCB: flips y esperas sueltas, a su lado)
+			g_hook_side = Active();
+			g_dcb_cyc0  = LocalPlatform::CurrentThreadCycles();
+			g_dcb_tsc0  = t0;
 			TejLag::t_render = true;
 			t_bank           = 0;
 			g_gpu_serial.store(serial, std::memory_order_release);
@@ -854,6 +932,7 @@ struct GpuSlice {
 					}
 				}
 			}
+			t_hook.t[HSlice] += __rdtsc() - t0, ++t_hook.n[HSlice];
 		}
 		if (g_gpu.serial != serial || !g_gpu.on) return;
 		t_side = 1;
@@ -875,8 +954,13 @@ struct RegDiff {
 	const char*                               names[64] {};
 	uint32_t                                  n = 0;
 };
-inline RegDiff g_regdiff;
+inline RegDiff  g_regdiff;
+inline uint32_t g_regdiff_k = 0;
+inline constexpr uint32_t RegDiffEvery = 64; // (tej-coste: 1 de cada 64 paquetes que fallan por registros; la linea x64)
 inline void    NoteRegDiff(const CommandProcessor& render, const CommandProcessor& worker) {
+	if (g_regdiff_k++ % RegDiffEvery != 0) return;
+	const HookTimer tm(HRegDiff);
+	Add(GPkRegsSampled);
 	auto& d = g_regdiff;
 	d.n     = 0;
 	render.DiffState(worker, [](const char* name) {
@@ -906,6 +990,7 @@ struct RenderWaits {
 };
 inline RenderWaits g_rwaits;
 inline void        RenderWait(uint64_t addr, bool satisfied) {
+	const HookTimer tm(HWait);
 	std::lock_guard g(g_rwaits.mutex);
 	if (g_rwaits.by_addr.size() > 4096 && !g_rwaits.by_addr.contains(addr)) return;
 	auto& e = g_rwaits.by_addr[addr];
@@ -918,8 +1003,9 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 	++c.draws;
 	Slot* const s = c.slot;
 	if (s == nullptr) return;
-	const uint64_t now = __rdtsc();
-	const uint32_t n   = s->count.load(std::memory_order_acquire);
+	const HookTimer tm(HDraw);
+	const uint64_t  now = tm.t0;
+	const uint32_t  n   = s->count.load(std::memory_order_acquire);
 	while (c.next < n) {
 		const Packet& p = s->pk[c.next];
 		if (p.key > key) break;
@@ -931,44 +1017,53 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		Add(GDrawsOnTime, p.draws);
 		if (p.assumed) Add(GDrawsOnTimeAssumed, p.draws);
 		const uint64_t t0   = __rdtsc();
-		const bool     eb   = r.GetBufferCache().RegistrationEpoch() == p.ep_buf;
-		const bool     ei   = eb && r.GetTextureCache().ResolutionEpoch() == p.ep_img;
-		const bool     em   = ei && r.GetGpuResources().MappingEpoch() == p.ep_map;
+		auto&          bc   = r.GetBufferCache();
+		auto&          tc   = r.GetTextureCache();
+		auto&          gr   = r.GetGpuResources();
+		const bool     eb   = bc.RegistrationEpoch() == p.ep_buf;
+		const bool     ei0  = tc.ResolutionEpoch() == p.ep_img;
+		const bool     em0  = gr.MappingEpoch() == p.ep_map;
+		const bool     ei   = eb && ei0;
+		const bool     em   = ei && em0;
 		const uint32_t sewn = p.draws > p.holes ? p.draws - p.holes : 0;
-		const bool     same = em && sewn != 0 && cp.SameState(*p.cp);
-		// (F1d) Registros: solo lo que leen los draws; los CS solo si el paquete traduce dispatches.
-		const bool gfx  = sewn != 0 && cp.SameGraphicsState(*p.cp);
-		const bool cseq = cp.SameComputeState(*p.cp);
+		// (tej-coste) Dos comparaciones en vez de tres: SameState == SameGraphicsState && SameComputeState (Shader:
+		// m_vs, m_ps, m_cs; SameDrawState: los de draws + base de dispatch indirecto). Mismo resultado.
+		bool gfx = false, cseq = false;
+		{
+			const HookTimer tv(HVal);
+			gfx  = sewn != 0 && cp.SameGraphicsState(*p.cp);
+			cseq = gfx && cp.SameComputeState(*p.cp); // (solo cuenta con gfx)
+		}
+		const bool same = em && gfx && cseq;
 		const bool csok = p.dispatches == 0 || cseq;
 		if (gfx && !csok) Add(GPkCsDispatch);
 		if (gfx && csok && !cseq) Add(GPkCsIgnored);
-		// (F1d) Epocas por rangos: solo si la global cambio, lo que el paquete leyo.
-		bool rb = eb, ri = r.GetTextureCache().ResolutionEpoch() == p.ep_img, rm = r.GetGpuResources().MappingEpoch() == p.ep_map;
+		// (F1d) Epocas por rangos: solo si la global cambio y los registros cosen, lo que el paquete leyo; listas
+		// compactas del trabajador (rb: regiones de 4 MiB; rx: todo fusionado).
+		bool rb = eb, ri = ei0, rm = em0;
 		if ((!rb || !ri || !rm) && !p.lists) {
 			Add(GPkRgNoList);
-		} else if (!rb || !ri || !rm) {
-			auto&      bc = r.GetBufferCache();
-			auto&      tc = r.GetTextureCache();
-			auto&      gr = r.GetGpuResources();
-			const bool b0 = rb, i0 = ri, m0 = rm;
-			rb = rm = ri = true;
-			uint64_t   n  = 0;
-			const auto each = [&](const std::vector<std::pair<uint64_t, uint64_t>>& v, bool buf) {
-				for (const auto& [a, e]: v) {
-					if (e <= a) continue;
-					++n;
-					if (!b0 && buf && rb && bc.RegisteredSince(a, e - a, p.ep_buf)) rb = false;
+		} else if ((!rb || !ri || !rm) && gfx && csok) {
+			const HookTimer tr(HRanges);
+			const bool      b0 = rb, i0 = ri, m0 = rm;
+			uint64_t        k  = 0;
+			if (!b0)
+				for (const auto& [a, e]: p.rb) {
+					++k;
+					if (bc.RegisteredSince(a, e - a, p.ep_buf)) { rb = false; break; }
+				}
+			if (rb && (!i0 || !m0))
+				for (const auto& [a, e]: p.rx) {
+					++k;
 					if (!i0 && ri && tc.RegisteredOverSince(a, e - a, p.ep_img)) ri = false;
 					if (!m0 && rm && gr.UnmappedSince(p.ep_map, a, e - a)) rm = false;
+					if (!ri || !rm) break;
 				}
-			};
-			each(p.bufs, true);
-			each(p.reads, false);
-			each(p.imgs, false);
-			Add(GRgEntries, n);
+			Add(GRgEntries, k);
+			Add(GRgRaw, p.raw_ranges);
 			if (!b0) Add(rb ? GPkRgBuf : GPkRgFailBuf);
-			if (!i0) Add(ri ? GPkRgImg : GPkRgFailImg);
-			if (!m0) Add(rm ? GPkRgMap : GPkRgFailMap);
+			if (!i0 && rb) Add(ri ? GPkRgImg : GPkRgFailImg);
+			if (!m0 && rb && ri) Add(rm ? GPkRgMap : GPkRgFailMap);
 		}
 		if (gfx && csok) {
 			if (eb && ei && em) Add(GDrawsOkGfx, sewn);
@@ -996,7 +1091,10 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 }
 
 inline void OnDispatch() {
-	if (t_side == 1) ++g_gpu.calls;
+	if (t_side == 1) {
+		const HookTimer tm(HDispatch);
+		++g_gpu.calls;
+	}
 	else if (t_side == 2 && t_worker != nullptr) t_worker->Dispatch();
 }
 
@@ -1005,6 +1103,7 @@ inline void OnDispatch() {
 // Inicio = Enqueue de la DCB siguiente a la del flip anterior (la primera del fotograma). Lado A/B = Active().
 inline uint64_t g_last_flip_serial = 0;
 inline void     OnRenderFlip() {
+	const HookTimer tm(HFlip);
 	const uint64_t  now    = Now();
 	const uint64_t  serial = g_gpu_serial.load(std::memory_order_relaxed);
 	const int       side   = Active() ? 1 : 0;
@@ -1031,6 +1130,7 @@ inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 // Hilo de render: un envio de la cola 0 acabado.
 inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 	if (Mode() == 0) return;
+	const uint64_t t_in = __rdtsc();
 	const uint64_t now = Now();
 	const auto&    rec = g_rec[serial % RecN];
 	const bool     mine = rec.serial.load(std::memory_order_relaxed) == serial;
@@ -1052,6 +1152,15 @@ inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 		g_gpu.on = false;
 	}
 	if (auto* s = g_shadow.load(std::memory_order_acquire); s != nullptr) s->GpuDone(serial, cp);
+	t_hook.t[HDone] += __rdtsc() - t_in, ++t_hook.n[HDone];
+	if (g_gpu.serial == serial && g_dcb_tsc0 != 0) {
+		const int sd = g_hook_side ? 1 : 0;
+		g_hook.dcb_n[sd].fetch_add(1, std::memory_order_relaxed);
+		g_hook.dcb_wall[sd].fetch_add(__rdtsc() - g_dcb_tsc0, std::memory_order_relaxed);
+		g_hook.dcb_cyc[sd].fetch_add(LocalPlatform::CurrentThreadCycles() - g_dcb_cyc0, std::memory_order_relaxed);
+		g_dcb_tsc0 = 0;
+	}
+	FlushHooks();
 }
 
 // Modelo: % de draws en paquetes de 64 que estarian publicados antes de que el render llegue, con n trabajadores
@@ -1159,6 +1268,26 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			bl = static_cast<double>(BcPar::g_write_locks.exchange(0, std::memory_order_relaxed)) / f;
 			bt = static_cast<double>(BcPar::g_write_ns.exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
 		}
+		// (tej-coste) Coste de cada gancho de tej en el render, ms/fot (lado de esta ventana) y pared/ciclos por DCB.
+		const int sd = was ? 1 : 0;
+		double    tot = 0;
+		std::printf(" | COSTE tej en el render (%s) ms/fot:", m == 2 ? (was ? "B" : "A") : "sombra");
+		for (uint32_t k = 0; k < HN; ++k) {
+			const double ms = static_cast<double>(g_hook.t[sd][k].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+			const double nn = static_cast<double>(g_hook.n[sd][k].exchange(0, std::memory_order_relaxed)) / f;
+			if (k != HVal && k != HRanges && k != HRegDiff && k != HPublish) tot += ms; // (esos van dentro de draw / fin DCB)
+			std::printf(" [%s] %.3f (%.0f/fot)", HName[k], ms, nn);
+		}
+		std::printf(" = TOTAL %.3f ms/fot (objetivo <= 0.2)", tot);
+		for (int q = 0; q < 2; ++q) {
+			const double dn = static_cast<double>(g_hook.dcb_n[q].exchange(0, std::memory_order_relaxed));
+			const double dw = static_cast<double>(g_hook.dcb_wall[q].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
+			const double dc = static_cast<double>(g_hook.dcb_cyc[q].exchange(0, std::memory_order_relaxed)) / 1e6 / f;
+			if (q == sd) // (Mciclos/ms = GHz)
+				std::printf(" | DCB cola 0 del render: %.1f/fot, pared %.2f ms/fot (con esperas), CPU %.2f Mciclos/fot (%.2f GHz"
+				            " efectivos; B-A: sube pared y no ciclos = esperas/expulsion, suben ciclos = calcula mas o cache)",
+				            dn / f, dw, dc, dw > 0 ? dc / dw : 0.0);
+		}
 		std::printf(" | CCD trabajadores %s", CcdPref() == 0 ? "mismo (L3 del render)" : CcdPref() == 1 ? "otro" : "auto");
 		std::printf(" | LAG render espera por la sombra: cerrojo buffers %.1f veces %.3f ms/fot, etiquetas %.1f %.3f ms/fot,"
 		            " publicar estado saltado %.1f/fot | cerrojos escritor buffers (tambien en A) %.1f/fot %.3f ms/fot",
@@ -1250,12 +1379,14 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			g_regdiff.sole.clear();
 		}
 		std::ranges::sort(any, [](const auto& a, const auto& b) { return a.second > b.second; });
-		std::printf("[tej] F1c registros distintos (paquetes/fot: %.1f, %.1f nombres/paquete): aparece", v[GPkRegs] / f,
-		            v[GPkRegs] != 0 ? static_cast<double>(v[GRegDiffNames]) / static_cast<double>(v[GPkRegs]) : 0.0);
-		for (size_t i = 0; i < any.size() && i < 10; ++i) std::printf(" [%s] %.1f", any[i].first, any[i].second / f);
+		std::printf("[tej] F1c registros distintos (paquetes/fot: %.1f, %.1f nombres/paquete; muestra 1/%u, cuentas x%u): aparece",
+		            v[GPkRegs] / f,
+		            v[GPkRegsSampled] != 0 ? static_cast<double>(v[GRegDiffNames]) / static_cast<double>(v[GPkRegsSampled]) : 0.0,
+		            RegDiffEvery, RegDiffEvery);
+		for (size_t i = 0; i < any.size() && i < 10; ++i) std::printf(" [%s] %.1f", any[i].first, static_cast<double>(any[i].second) * RegDiffEvery / f);
 		std::ranges::sort(sole, [](const auto& a, const auto& b) { return a.second > b.second; });
 		std::printf(" | unico (arreglarlo cose el paquete):");
-		for (size_t i = 0; i < sole.size() && i < 10; ++i) std::printf(" [%s] %.1f", sole[i].first, sole[i].second / f);
+		for (size_t i = 0; i < sole.size() && i < 10; ++i) std::printf(" [%s] %.1f", sole[i].first, static_cast<double>(sole[i].second) * RegDiffEvery / f);
 		std::printf("\n");
 		// (F1c) Resumen por llamada y cosibles con/sin espera supuesta.
 		std::printf("[tej] F1c llamadas render %.0f/fot (draws %.0f) | trabajador %.0f llamadas/fot, traducir %.2f us/llamada"
@@ -1270,11 +1401,13 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		std::printf("[tej] F1d COSIBLES regs de draws %.1f %% | + epocas por rangos %.1f %% (antes %.1f %%) | CS distinto ignorado"
 		            " (paquete sin dispatches) %.1f/fot, CS distinto con dispatches %.1f/fot | rangos salvan: buffers %.1f"
 		            " (fallan %.1f), imagenes %.1f (fallan %.1f), mapeos %.1f (fallan %.1f), sin lista %.1f /fot, %.1f rangos/paquete"
+		            " comprobados (de %.1f sin compactar; solo paquetes con registros que cosen)"
 		            " | validacion %.0f ns/paquete\n",
 		            pct(v[GDrawsOkGfx]), pct(v[GDrawsOkRanges]), pct(v[GDrawsOk]), v[GPkCsIgnored] / f, v[GPkCsDispatch] / f,
 		            v[GPkRgBuf] / f, v[GPkRgFailBuf] / f, v[GPkRgImg] / f, v[GPkRgFailImg] / f, v[GPkRgMap] / f,
 		            v[GPkRgFailMap] / f, v[GPkRgNoList] / f,
-		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
+		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0,
+		            v[GValN] != 0 ? static_cast<double>(v[GRgRaw]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
 	}
 	std::fflush(stdout);
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
