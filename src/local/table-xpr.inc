@@ -3304,8 +3304,13 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 	const bool same_index = !indexed || (emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
 	                                     emit.index_base == index_base && emit.index_bytes == index_bytes &&
 	                                     emit.index_type == index_type);
+	// (tej-huecos) only the shadow's InvalidateGraphicsState since (tej-gen.h): the same index buffer, not looked up
+	// (the lookup refused it in the speculation: "buffer lookup" holes)
+	const bool rebind_index = !same_index && Spec::Current() != nullptr && emit.command == buffer.Handle() && emit.index_handle &&
+	                          TejGen::OnlyShadowBump(emit.generation, buffer.GraphicsGeneration()) &&
+	                          emit.index_base == index_base && emit.index_bytes == index_bytes && emit.index_type == index_type;
 	std::pair<Buffer*, uint64_t> indices {};
-	if (!same_index) {
+	if (!same_index && !rebind_index) {
 		indices = obtain(table.indices[(index_base * 0x9e3779b97f4a7c15ull) >> 51u], index_base, index_bytes, [&] {
 			if (index_bytes <= BufferCache::CACHING_PAGESIZE && buffer_cache.IsRegionCpuModified(index_base, index_bytes) &&
 			    !buffer_cache.IsRegionGpuModified(index_base, index_bytes))
@@ -3478,7 +3483,12 @@ RenderExecutor::TableResult RenderExecutor::TableDraw(CommandBuffer& buffer, Tab
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                        push_dwords * sizeof(uint32_t), push_data.dwords.data());
-	if (!same_index) vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+	if (rebind_index) {
+		vk_buffer.bindIndexBuffer(emit.index_handle, emit.index_offset, index_type);
+	} else if (!same_index) {
+		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+		emit.index_handle = indices.first->Handle(), emit.index_offset = indices.second;
+	}
 	const auto push_cursor = [&](uint32_t cursor) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
 		                        HwScene::CursorDword * sizeof(uint32_t), sizeof(uint32_t), &cursor);

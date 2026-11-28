@@ -1,4 +1,5 @@
 #include "local/tej-coser-sonda.h" // (tej-coser)
+#include "local/tej-gen.h" // (tej-huecos: table-xpr.inc / native-xpr.inc)
 #include "local/indirect-tabla.h" // (indirect-tabla: table-xpr.inc)
 #include "local/bda-repite.h" // (bda-repite, KYTY_TECHO: solo mide; table-xpr.inc)
 #include "local/envio1.h" // (envio1: table-xpr.inc)

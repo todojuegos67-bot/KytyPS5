@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "local/tej-coser-sonda.h"
+#include "local/tej-gen.h"
 #include "local/tej-repro.h" // (tej-repro, paso A: captura + reproduccion en sombra)
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "local/vulkan-recording.h"
@@ -81,7 +82,11 @@ inline void WorkerOpen(PkInfo& p) {
 	if (t_on) {
 		// (paso A2) el camino directo del trabajador vuelve a grabar pipeline/estado dinamico/IB al abrir: la lista no
 		// depende de lo que SU buffer ya tenia (en el paso B se reproduce sobre el buffer del render). Solo binds de mas.
-		if (rec != nullptr && rec->command && !rec->command->IsInvalid()) rec->command->InvalidateGraphicsState();
+		if (rec != nullptr && rec->command && !rec->command->IsInvalid()) {
+			const uint64_t g0 = rec->command->GraphicsGeneration();
+			rec->command->InvalidateGraphicsState();
+			TejGen::Note(g0, rec->command->GraphicsGeneration()); // (tej-huecos: el IB ya ligado se reutiliza sin buscarlo)
+		}
 		// (tej-repro) captura de este paquete (la escriben los vkCmd* del trabajador y sus paquetes de draw/descriptores)
 		p.cap.clear(), p.own.clear();
 		TejRepro::t_cap = &p.cap, TejRepro::t_own = &p.own, TejRepro::t_bad = false;

@@ -1133,6 +1133,7 @@ bool RenderExecutor::Render1Draw(CommandBuffer& buffer, bool clean, std::span<co
 	emit.generation    = buffer.GraphicsGeneration();
 	emit.state         = &draw_state;
 	emit.pipeline      = &pipeline;
+	emit.index_handle  = vk::Buffer {}; // (tej-huecos: this path does not keep the handle)
 	emit.index_base    = index_base;
 	emit.index_bytes   = index_bytes;
 	emit.index_type    = index_type;

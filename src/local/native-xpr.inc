@@ -742,6 +742,8 @@ struct RenderExecutor::NativeXprCache {
 		const PipelineCache::Pipeline* pipeline   = nullptr;
 		uint64_t                       index_base = 0, index_bytes = 0;
 		vk::IndexType                  index_type = vk::IndexType::eUint16;
+		vk::Buffer                     index_handle {}; // (tej-huecos) the index buffer bound, at index_offset
+		uint64_t                       index_offset = 0;
 		// The dynamic state the emissions recorded into `command` (valid in the same command and generation, when
 		// `dynamic_held`): another state records only the values that differ (NativeXprEmitDynamic).
 		ResolvedDynamicState           dynamic {};
@@ -3456,8 +3458,12 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	const bool same_index = emit.command == buffer.Handle() && emit.generation == buffer.GraphicsGeneration() &&
 	                        emit.index_base == index_base && emit.index_bytes == index_bytes &&
 	                        emit.index_type == index_type;
+	// (tej-huecos) only the shadow's InvalidateGraphicsState since: the same index buffer again, not looked up
+	const bool rebind_index = !same_index && Spec::Current() != nullptr && emit.command == buffer.Handle() && emit.index_handle &&
+	                          TejGen::OnlyShadowBump(emit.generation, buffer.GraphicsGeneration()) &&
+	                          emit.index_base == index_base && emit.index_bytes == index_bytes && emit.index_type == index_type;
 	std::pair<Buffer*, uint64_t> indices {};
-	if (!same_index) {
+	if (!same_index && !rebind_index) {
 		// A small CPU-dirty index range is copied into the upload ring at every use and never cleaned
 		// (ObtainBuffer): ~1300 copies of ~250 ranges a frame (1-1, Latria). Clean it once, as a store cleans
 		// the SRT's buffers: a later CPU write faults and the range is copied again.
@@ -3517,8 +3523,11 @@ bool RenderExecutor::NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& recor
 	if (record.has_push)
 		vk_buffer.pushConstants(pipeline.pipeline_layout, record.push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
-	if (!same_index) {
+	if (rebind_index) {
+		vk_buffer.bindIndexBuffer(emit.index_handle, emit.index_offset, index_type);
+	} else if (!same_index) {
 		vk_buffer.bindIndexBuffer(indices.first->Handle(), indices.second, index_type);
+		emit.index_handle = indices.first->Handle(), emit.index_offset = indices.second;
 	}
 	if ((debug & 2u) == 0) {
 		if (direct != nullptr) {
