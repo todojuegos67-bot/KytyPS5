@@ -26,6 +26,7 @@ inline std::atomic<const char*> fg_now_word {"ahora"}; // "FG x (ahora x3)"
 inline std::atomic<float> fps_cap {0.0f};     // KYTY_FPS_CAP (with KYTY_FLIP_WHEN_READY); 0: as launched
 inline std::atomic<int>   rumble {-1};        // KYTY_HAPTIC_RUMBLE; < 0: the environment's
 inline std::atomic<float> rumble_gain {0.0f}; // KYTY_HAPTIC_RUMBLE_GAIN; 0: the environment's
+inline std::atomic<float> volumen {0.0f};     // [volumen-general] master gain (1 = 100 %); 0: KYTY_VOLUMEN_GENERAL
 inline std::atomic<bool>  menu_open {false};  // the options menu is shown: no frame generation, the game gets no input
 // The metrics panel's frame generation line (the port sets the name; the engine the multiplier it runs at now).
 inline std::atomic<const char*> fg_label {nullptr}; // null: no line

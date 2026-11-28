@@ -231,6 +231,7 @@ struct Settings {
 	bool        start_menu = true; // (10-27b) menu_inicio: the launcher-style menu before the game
 	bool        rumble = true;
 	float       rumble_gain = 4.0f;
+	float       volume = 100.0f; // [volumen-general] volumen_general: 50-300 %, 100 = as the game mixes it
 	// [Multijugador] (online5) multijugador=1: the online (messages, stains, ghosts, co-op, invasions) through our server
 	bool        multiplayer = false;
 	bool        randomizer = false;    // (rando1) randomizer=1: offline, "Trofeos Randomizer" (KYTY_DS_RANDOMIZER)

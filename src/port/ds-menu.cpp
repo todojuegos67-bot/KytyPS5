@@ -2661,6 +2661,7 @@ void ApplyLive(const Settings& s) {
 	PortLive::fps_cap     = s.fps_cap;
 	PortLive::rumble      = s.rumble ? 1 : 0;
 	PortLive::rumble_gain = s.rumble_gain > 0 ? s.rumble_gain : 4.0f;
+	PortLive::volumen     = std::clamp(s.volume, 50.0f, 300.0f) / 100.0f; // [volumen-general]
 	const int level       = 0; // (ds-pc-port37) Metricas is the launcher's window (metricas.ps1); the in-game panel stays on F8
 	for (int i = 0; i < 3 && PerfOverlay::Level() != level; i++) PerfOverlay::CycleLevel();
 	PortLive::rt_off = LiveRtOff(g_rt.launched, s); // (10-28) RT passes off live
@@ -3437,7 +3438,8 @@ void Draw(float width, float height) {
 			if (t == 5) DrawTrophyTab(unit);
 			else if (groups[t].empty()) {
 				Section("Sonido");
-				ImGui::TextWrapped( "%s", I18n::T("El sonido se ajusta en el menú del propio juego (Opciones > Sonido). El port no añade opciones de sonido."));
+				if (SliderRow("Volumen general", s.volume, 50.0f, 300.0f, "%.0f %%", "Volumen de todo el juego (en vivo). 100 % = sin cambios; hasta 300 % (+9.5 dB) con limitador para que no sature."))
+					live_changed = true;
 			}
 			for (const int section: groups[t]) {
 			if (groups[t].size() > 1) Section(section_names[section]);
@@ -5024,6 +5026,16 @@ void LauncherControls(Settings& s) {
 		ImGui::SliderFloat("##rumble", &s.rumble_gain, 1.0f, 8.0f, I18n::T("Fuerza %.1f"));
 		Tip("Fuerza de la vibración del mando.");
 		ImGui::EndDisabled();
+		RowEnd(y);
+	}
+	{ // [volumen-general]
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(5)});
+		ImGui::TextUnformatted(I18n::T("Volumen general"));
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(150), y + U(3)});
+		ImGui::SetNextItemWidth(U(256));
+		ImGui::SliderFloat("##volumen", &s.volume, 50.0f, 300.0f, "%.0f %%");
+		Tip("Volumen de todo el juego. 100 % = sin cambios; hasta 300 % (+9.5 dB) con limitador para que no sature.");
 		RowEnd(y);
 	}
 	{

@@ -14,6 +14,7 @@
 #include "libs/audio_internal.h"
 #include "libs/audio_latency.h"
 #include "local/audio-fix.h"
+#include "local/volumen-general.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
@@ -122,6 +123,7 @@ private:
 		uint64_t last_output_time = 0;
 		int      channels_num     = 0;
 		int      volume[12]       = {};
+		VolumenGeneral::Limiter volumen_limiter; // [volumen-general]
 
 		SDL_AudioDeviceID audio_device = 0;
 		SDL_AudioSpec     audio_spec   = {};
@@ -603,6 +605,22 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	const auto           output_channels = PreparedChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+
+	// [volumen-general] The launcher's master volume, with a peak limiter (100 %: untouched).
+	if (const float master = VolumenGeneral::Gain(); master != 1.0f && output_channels > 0) {
+		if (prepared_data != prepared_buffer.data()) {
+			prepared_buffer.assign(static_cast<const uint8_t*>(prepared_data),
+			                       static_cast<const uint8_t*>(prepared_data) + prepared_size);
+			prepared_data = prepared_buffer.data();
+		}
+		if (FormatIsFloat(port->format)) {
+			VolumenGeneral::Process(&port->volumen_limiter, reinterpret_cast<float*>(prepared_buffer.data()),
+			                        port->samples_num, output_channels, port->freq, master);
+		} else {
+			VolumenGeneral::ProcessS16(&port->volumen_limiter, reinterpret_cast<int16_t*>(prepared_buffer.data()),
+			                           port->samples_num, output_channels, port->freq, master);
+		}
+	}
 
 	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK) {
 		report_pad_samples(true);

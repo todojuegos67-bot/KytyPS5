@@ -300,6 +300,7 @@ bool LoadSettings(const std::string& path, Settings* s) {
 	boo("saltar_intro", s->skip_intro);
 	boo("vibracion", s->rumble);
 	num("vibracion_fuerza", s->rumble_gain);
+	num("volumen_general", s->volume);
 	str("extra", s->extra);
 	boo("multijugador", s->multiplayer);
 	str("multijugador_servidor", s->online_server);
@@ -649,7 +650,9 @@ bool SaveSettings(const std::string& path, const Settings& s) {
 	  << "saltar_intro=" << b(s.skip_intro) << "\n"
 	  << "; Vibracion del mando (el audio haptico del DualSense como vibracion; mandos Xbox, DualSense por Bluetooth)\n"
 	  << "vibracion=" << b(s.rumble) << "\n"
-	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n\n"
+	  << "vibracion_fuerza=" << Num(s.rumble_gain) << "\n"
+	  << "; Volumen general en % (50-300; 100 = sin cambios; con limitador para que no sature)\n"
+	  << "volumen_general=" << Num(s.volume) << "\n\n"
 	  << "[Multijugador]\n"
 	  << "; 1: online con el servidor propio (mensajes, manchas, fantasmas, cooperativo, invasiones). 0: sin conexión, como siempre\n"
 	  << "multijugador=" << b(s.multiplayer) << "\n"
@@ -1752,6 +1755,7 @@ LaunchPlan BuildLaunch(const Settings& s_in, const std::string& title_id, const 
 	env.Set("KYTY_FPS_HUD", ""); // (ds-pc-port37) Metricas: the emulator launcher's metricas.ps1 window (ds-main); F8 still shows the in-game panel
 	env.Set("KYTY_HAPTIC_RUMBLE", s.rumble ? "1" : "0");
 	env.Set("KYTY_HAPTIC_RUMBLE_GAIN", Num(s.rumble_gain > 0 ? s.rumble_gain : 4.0f));
+	env.Set("KYTY_VOLUMEN_GENERAL", Num(s.volume >= 50.0f && s.volume <= 300.0f ? s.volume : 100.0f));
 	plan.env   = env.list;
 	plan.ratio = ratio;
 
