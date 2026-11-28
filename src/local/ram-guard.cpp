@@ -40,6 +40,9 @@
 #include <psapi.h>
 #include <intrin.h>
 #endif
+#if defined(_WIN32)
+#include "ram-emu.h" // (ram-emu: the "[ram-emu]" line, game vs emulator private memory in RAM)
+#endif
 
 namespace Libs::LibKernel::Memory {
 void ReportGuestAccess(bool force);
@@ -310,6 +313,9 @@ void ApplyLowRamDefaults() {
 			std::fflush(stdout);
 			StartRam16Line();
 		}
+#if defined(_WIN32)
+		RamEmu::Start(); // (ram-emu: every 5 s, KYTY_RAM_EMU=0 off)
+#endif
 		const uint64_t ram    = LocalPlatform::PhysicalMemory();
 		const char*    forced = Env("KYTY_LOWRAM");
 		if (!LowRam()) {

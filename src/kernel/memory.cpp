@@ -4542,6 +4542,18 @@ uint64_t Ram16FreedReleasedNow() {
 #endif
 }
 
+// (ram-emu, ram-emu.h) The guest's reserved ranges as start/size pairs; 0 before the address space exists.
+size_t RamEmuGuestRanges(uint64_t* out, size_t max_pairs);
+size_t RamEmuGuestRanges(uint64_t* out, size_t max_pairs) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return g_guest_address_space != nullptr ? g_guest_address_space->CopyOwned(out, max_pairs) : 0;
+#else
+	(void)out;
+	(void)max_pairs;
+	return 0;
+#endif
+}
+
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();

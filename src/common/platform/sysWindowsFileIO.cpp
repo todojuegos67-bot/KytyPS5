@@ -93,7 +93,16 @@ static bool CacheCeroRead(void* data, uint32_t size, sys_file_t& f, DWORD* got) 
 	LARGE_INTEGER zero {}, pos {};
 	if (SetFilePointerEx(f.handle, zero, &pos, FILE_CURRENT) == 0) return false;
 	constexpr uint64_t Sector = 4096, Piece = uint64_t {4} << 20u, Bounce = Piece + 2 * Sector;
-	thread_local auto* bounce = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+	// (ram-emu) The 4 MiB bounce buffer is freed when its thread ends (before: a raw thread_local pointer, never freed:
+	// 4 MiB of private RAM left behind by every reader thread that ended).
+	struct BounceBuffer {
+		uint8_t* data = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		~BounceBuffer() {
+			if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
+		}
+	};
+	thread_local BounceBuffer bounce_buffer;
+	uint8_t* const            bounce = bounce_buffer.data;
 	if (bounce == nullptr) return false;
 	GuestLazyCommit::Prefault(data, size);
 	const auto offset = static_cast<uint64_t>(pos.QuadPart);

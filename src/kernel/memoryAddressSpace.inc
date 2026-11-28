@@ -4881,6 +4881,20 @@ public:
 		return it != m_mapped.end();
 	}
 
+	// (ram-emu) The guest's reserved ranges (start, size pairs), copied under the shared lock: the "[ram-emu]" line tells
+	// the game's private memory from the emulator's own by them.
+	size_t CopyOwned(uint64_t* out, size_t max_pairs) {
+		std::shared_lock lock(m_mutex);
+		size_t           n = 0;
+		for (const auto& [start, size]: m_owned) {
+			if (n >= max_pairs) break;
+			out[2 * n]     = start;
+			out[2 * n + 1] = size;
+			n++;
+		}
+		return n;
+	}
+
 	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
