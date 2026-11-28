@@ -34,6 +34,8 @@
 #include <unistd.h>
 #endif
 
+#include "local/tej-linea.h"
+
 namespace Libs::Graphics {
 
 class TrackingSpinLock final {
@@ -62,6 +64,7 @@ public:
 			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
+		if (TejLinea::t_shadow) TejLinea::Add(TejLinea::TrackLock); // (tej-linea: lo que queda compartido con el render)
 		// Odd while held: ReadShared retries a read that overlapped a holder.
 		m_seq.store(m_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		std::atomic_thread_fence(std::memory_order_release);

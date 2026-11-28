@@ -16,6 +16,8 @@
 #include <optional>
 #include <span>
 #include <shared_mutex>
+
+#include "local/tej-linea.h"
 #include <unordered_set>
 #include <vector>
 
@@ -513,8 +515,12 @@ private:
 	[[nodiscard]] RenderExecutor& Catalog() noexcept { return m_catalog != nullptr ? *m_catalog : *this; }
 	// The catalog's owner changes its pairs and dispatches, image sets, draw states and compute clears under its lock
 	// exclusively (CatalogWrite); another executor reads them under it shared (CatalogRead, on its own thread).
-	mutable std::shared_mutex m_catalog_mutex;
-	[[nodiscard]] std::unique_lock<std::shared_mutex> CatalogWrite() const {
+	// (tej-linea) Sin escritura compartida al leer (TejLinea::BrLock: contador por hilo lector en su linea) y en su
+	// propia linea: antes un std::shared_mutex junto a m_catalog/m_role/m_table_xpr, que los trabajadores escribian
+	// (lock_shared/unlock_shared) en cada draw y el render leia en cada draw.
+	using CatalogMutex = TejLinea::BrLock;
+	alignas(64) mutable CatalogMutex m_catalog_mutex;
+	[[nodiscard]] std::unique_lock<CatalogMutex> CatalogWrite() const {
 		// (tej-sinmutex) Si la sombra lo esta leyendo, el render espera: se cuenta (solo cuando lo encuentra ocupado).
 		std::unique_lock l(m_catalog_mutex, std::try_to_lock);
 		if (!l.owns_lock()) {
@@ -527,7 +533,7 @@ private:
 		}
 		return l;
 	}
-	[[nodiscard]] std::shared_lock<std::shared_mutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
+	[[nodiscard]] std::shared_lock<CatalogMutex> CatalogRead() { return std::shared_lock(Catalog().m_catalog_mutex); }
 	[[nodiscard]] uint32_t        Role() const noexcept { return m_role; }
 	// The catalog's table (null: nothing learned yet), and this executor's own table state.
 	[[nodiscard]] TableXpr*       CatalogTable() noexcept { return Catalog().m_table_xpr.get(); }

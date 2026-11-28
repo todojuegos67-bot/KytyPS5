@@ -29,6 +29,7 @@
 
 #include "local/techo.h"
 #include "local/tej-lag.h"
+#include "local/tej-linea.h"
 
 extern "C" { extern volatile std::atomic_uint32_t kyty_local_speculate_mode; } // (fix) misma linkage C que speculation.h
 
@@ -74,7 +75,17 @@ inline std::atomic<bool> g_ab_on {false};
 }
 
 inline constexpr uint32_t Shards = 64, GranuleBits = 24; // (16 MiB = un cubo de la tabla de paginas de BufferCache)
-inline std::shared_mutex  g_shard[Shards];
+// (tej-linea) Un fragmento por linea de 64 bytes: antes 8 por linea (SRWLOCK de 8 bytes), y el lock_shared de un trabajador
+// quitaba la linea a los demas fragmentos (los del render al registrar y los de los otros trabajadores).
+struct alignas(64) Shard {
+	std::shared_mutex m;
+	void lock() { m.lock(); }
+	bool try_lock() { return m.try_lock(); }
+	void unlock() { m.unlock(); }
+	void lock_shared() { m.lock_shared(); }
+	void unlock_shared() { m.unlock_shared(); }
+};
+inline Shard              g_shard[Shards];
 [[nodiscard]] inline uint32_t ShardOf(uint64_t vaddr) { return static_cast<uint32_t>(vaddr >> GranuleBits) & (Shards - 1); }
 
 // Contadores (por fotograma en [buffercache-par]).
@@ -92,12 +103,12 @@ inline void Refused(Why why) { g_refused[why].fetch_add(1, std::memory_order_rel
 
 // Lectura de un hilo de traduccion (no GPU): compartido sobre el fragmento del vaddr.
 struct ReadGuard {
-	std::shared_mutex* m = nullptr;
+	Shard* m = nullptr;
 	explicit ReadGuard(uint64_t vaddr) {
 		if (!t_reader || !ReadLocks()) return;
 		m = &g_shard[ShardOf(vaddr)];
 		m->lock_shared();
-		g_lookups.fetch_add(1, std::memory_order_relaxed);
+		TejLinea::Add(TejLinea::BcLookup); // (tej-linea: en el banco del hilo, antes fetch_add en una linea global)
 	}
 	~ReadGuard() {
 		if (m != nullptr) m->unlock_shared();

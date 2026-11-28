@@ -34,6 +34,8 @@
 #include <mutex>
 #include <vector>
 
+#include "local/tej-linea.h"
+
 namespace GestorMem {
 
 inline bool On() {
@@ -215,8 +217,13 @@ inline uint64_t Registrar(int tipo, int lugar, uint64_t bytes, uint32_t flags, v
 inline void Tocar(uint64_t id) {
 	uint32_t g;
 	Slot*    sl = SlotDe(id, &g);
-	if (sl != nullptr && sl->gen.load(std::memory_order_relaxed) == g)
-		sl->ultimo.store(g_frame.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	if (sl != nullptr && sl->gen.load(std::memory_order_relaxed) == g) {
+		// (tej-linea) Solo si cambia: una escritura por imagen y fotograma, no por draw (la linea se queda compartida
+		// en lectura entre nucleos en vez de ir y volver).
+		const auto f = static_cast<uint32_t>(g_frame.load(std::memory_order_relaxed));
+		if (sl->ultimo.load(std::memory_order_relaxed) != f) sl->ultimo.store(f, std::memory_order_relaxed);
+		else if (TejLinea::g_count_touch.load(std::memory_order_relaxed)) TejLinea::Add(TejLinea::TouchSame);
+	}
 }
 
 inline void Fijar(uint64_t id, bool fijado) {

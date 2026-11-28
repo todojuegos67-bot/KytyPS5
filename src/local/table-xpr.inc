@@ -565,7 +565,7 @@ RenderExecutor::TableResult RenderExecutor::TableTry(CommandBuffer& buffer, std:
 	}
 	if (LiveCensus::Mdraw::Active() && Role() == 0) LiveCensus::Mdraw::t_entry = __rdtsc(); // (mdraw C0: the call's clock)
 	// (Another executor's catalog is read under its lock.)
-	std::shared_lock<std::shared_mutex> catalog_read;
+	std::shared_lock<CatalogMutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
 	TableSweepPairs();
@@ -868,7 +868,7 @@ bool RenderExecutor::TableContinue(CommandBuffer& buffer, std::span<const uint64
                                    uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct) {
 	if (kyty_local_table_xpr_mode.load(std::memory_order_relaxed) < 2 || !m_table_xpr || !m_native_xpr) return false;
 	if (LiveCensus::Mdraw::Active() && Role() == 0) LiveCensus::Mdraw::t_entry = __rdtsc(); // (mdraw C0: the call's clock)
-	std::shared_lock<std::shared_mutex> catalog_read;
+	std::shared_lock<CatalogMutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
 	auto& table = OwnTable();
@@ -4043,7 +4043,7 @@ bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uin
 	// (Frame generation, DLSS-G or FSR 3, needs the normal path for one dispatch a frame, the TAA pass's, refused
 	// below; with every dispatch refused under DLSS-G, as before, the game ran at ~30 real fps where FSR 3 ran at 57.)
 	if (catalog == nullptr || (FrameCapture::Active() || SkipShader::g_any.load(std::memory_order_relaxed)) || XprCapture::Enabled()) return false;
-	std::shared_lock<std::shared_mutex> catalog_read;
+	std::shared_lock<CatalogMutex> catalog_read;
 	if (Role() != 0) catalog_read = CatalogRead();
 	DropStaleCatalog();
 	TableSweepPairs();

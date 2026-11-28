@@ -53,6 +53,7 @@
 #include "local/techo.h"
 #include "local/buffercache-par.h"
 #include "local/tej-lag.h"
+#include "local/tej-linea.h"
 #include "local/tej-coser.h" // (tej-coser: KYTY_TEJ=3 etapa 1, solo mide)
 
 
@@ -89,6 +90,7 @@ using Libs::Graphics::Speculation;
 		if (m != 0)
 			std::printf("[tej] KYTY_TEJ=%d (%s): F1b sombra paralela, SOLO MIDE (nada se cose ni se envia)\n", m,
 			            m == 1 ? "sombra encendida" : "A/B cada 5 s, B = sombra encendida");
+		if (m != 0 && Techo::On()) TejLinea::g_count_touch.store(true, std::memory_order_relaxed); // (tej-linea)
 		std::fflush(stdout);
 		return m;
 	}();
@@ -664,6 +666,7 @@ private:
 		LocalPlatform::MakeBackgroundThread(nullptr); // (tej-lag: por debajo del render, como los trabajadores)
 		t_bank = 1;
 		TejLag::t_shadow = true;
+	TejLinea::t_shadow = true; // (tej-linea)
 		m_reader_spec.ShadowThreadInit(); // (executors y ranura propios: la pasada de estado predice dispatches con el catalogo)
 		t_side       = 3;
 		t_no_predict = true;
@@ -897,6 +900,7 @@ inline void Worker::Run() {
 	LocalPlatform::MakeBackgroundThread(nullptr); // (por debajo del render)
 	m_spec.ShadowThreadInit();
 	TejLag::t_shadow = true;
+	TejLinea::t_shadow = true; // (tej-linea)
 	t_bank = 2 + (m_index % 6u);
 	Libs::Graphics::Spec::t_hole_hook = [](const uint32_t* packet, const char* reason) {
 		if (t_worker != nullptr && t_side == 2) t_worker->Hole(packet, reason);
@@ -2014,6 +2018,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	const double ghz    = v[WNs] != 0 ? static_cast<double>(v[WCycles]) / static_cast<double>(v[WNs]) : 0;
 	const uint64_t fn = g_free_n.exchange(0, std::memory_order_relaxed), fs = g_free_sum.exchange(0, std::memory_order_relaxed);
 	auto*          sh = g_shadow.load(std::memory_order_acquire);
+	TejLinea::Report(f); // (tej-linea) escrituras compartidas evitadas y lo que queda, por fot
 	std::printf("[tej] ventana %s: render ocupado %.2f ms, %.1f fps | N %u trabajadores | por fot: DCB %.1f (con sombra %.1f),"
 	            " draws %.0f | TRADUCIDOS A TIEMPO %.1f %% | COSIBLES %.1f %% (%.0f/fot; cota solo registros %.1f %%) |"
 	            " paquetes a tiempo %.1f %% (%.1f/fot validados, tarde %.1f, saltados %.1f, DCB acabadas antes que la sombra %.1f)"

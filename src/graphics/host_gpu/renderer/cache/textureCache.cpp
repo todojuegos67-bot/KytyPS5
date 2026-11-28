@@ -1516,12 +1516,15 @@ void TextureCache::FreeGuestAliases(ImageId written) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	GestorMem::Tocar(image.gestor_id); // (M7) sin locks
 	if (auto* spec = Spec::Current()) { // (touched when the speculative translation is committed)
+		// (tej-linea) Sin GestorMem::Tocar aqui: su commit (TouchSpeculated) o el draw del render lo tocan; la sombra
+		// escribia la linea del slot del gestor que el render escribe en el mismo draw.
+		if (TejLinea::g_count_touch.load(std::memory_order_relaxed)) TejLinea::Add(TejLinea::TexTouch);
 		auto& touched = spec->touched_images;
 		if (touched.empty() || touched.back().first != &image) touched.emplace_back(&image, image.serial);
 		return;
 	}
+	GestorMem::Tocar(image.gestor_id); // (M7) sin locks
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}

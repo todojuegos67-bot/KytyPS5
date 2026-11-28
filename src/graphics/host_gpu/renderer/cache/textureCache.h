@@ -514,7 +514,10 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
+	// (tej-linea) En su propia linea: la sombra lo toma en sus busquedas de imagen y antes arrastraba la linea de
+	// m_graphics/m_scheduler/m_page_manager/m_buffer_cache/m_slot_images, que el render lee en cada draw.
+	alignas(64) TrackingSpinLock                      m_lock;
+	char                                              m_lock_pad[64 - sizeof(TrackingSpinLock) % 64] {};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
