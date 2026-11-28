@@ -71,6 +71,7 @@
 #include <vector>
 #include <xxhash.h>
 #include "local/tiron6-seeds.h" // (tiron6)
+#include "local/picos-zona.h" // (picos-zona)
 
 extern "C" {
 // 1: find graphics pipelines through a block-hashed index of the full key.
@@ -4251,11 +4252,33 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 		const bool zone_warm = zona && m_scene_warmup && Tiron6::SoloUsados() && Tiron6::UsedKnown();
 		const auto zone_video = Tiron6::VideoCap(compute_video, m_graphics.GetTotalMemoryBudget());
 		uint64_t   zone_seen  = 0;
+		uint64_t   picos_seen = 0; // (picos-zona)
+		uint32_t   picos_scene = SceneTags::None;
+		bool       picos_pending = false;
+		std::unordered_set<uint32_t> picos_done;
 		auto       zone_saved = std::chrono::steady_clock::now();
 		// (The seeds this session adds go to the disk every 5 s, from this thread: none from the render thread.)
 		while (!m_warmup_stop.load(std::memory_order_relaxed)) {
 			for (int i = 0; i < 50 && !m_warmup_stop.load(std::memory_order_relaxed); ++i) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				// (picos-zona) Cada zona cargada: abre la ventana de 10 s de picos y, encendido, sus pipelines de fondo.
+				if (const auto generation = SceneTags::Generation(); generation != picos_seen && generation != 0 && m_scene_warmup) {
+					picos_seen       = generation;
+					picos_scene      = SceneTags::Current();
+					picos_pending    = true;
+					PicosZona::StartWindow();
+					if (PicosZona::On() && picos_scene != SceneTags::None && !picos_done.contains(picos_scene)) {
+						picos_done.insert(picos_scene);
+						PicosZonaWarm(picos_scene, zone_video);
+					}
+				}
+				if (picos_pending && PicosZona::NowMs() - PicosZona::g_load_ms.load() > 10000) {
+					picos_pending = false;
+					std::printf("[picos-zona] %s: SLOW Frame >25 ms en los 10 s tras la carga: %u (>33 ms: %u) [%s]\n",
+					            SceneTags::Name(picos_scene).c_str(), PicosZona::g_slow25.load(), PicosZona::g_slow33.load(),
+					            PicosZona::On() ? "B: ON" : "A: off");
+					std::fflush(stdout);
+				}
 				if (!zone_warm) continue;
 				if (const auto generation = SceneTags::Generation(); generation != zone_seen && generation != 0) {
 					zone_seen        = generation;
@@ -4278,6 +4301,102 @@ void PipelineCache::Tiron1WarmCompute(uint64_t compute_video) {
 			}
 		}
 	}
+}
+
+// (picos-zona, KYTY_PICOS_ZONA=1) Los pipelines de `scene` (graficos y compute, los de su lista de SceneTags) que aun no
+// existen: sus programas traducidos (solo esos) y sus pipelines creados por los hilos de fondo del warmup, con la puerta
+// de RAM de PicosZona::ShouldStop. Lo que el juego ya creo se queda (WarmPipelines lo quita de la lista). Mide la RAM
+// privada antes y despues: MB por pipeline (medida a).
+void PipelineCache::PicosZonaWarm(uint32_t scene, uint64_t compute_video) {
+	auto&      programs = *m_program_cache;
+	const auto begin    = std::chrono::steady_clock::now();
+	const auto name     = SceneTags::Name(scene);
+	if (!SceneTags::Knows(scene)) {
+		std::printf("[picos-zona] %s: zona nueva, sin lista (se apunta para la proxima)\n", name.c_str());
+		std::fflush(stdout);
+		return;
+	}
+	const auto avail = LocalPlatform::AvailablePhysicalMemory();
+	if (avail < PicosZona::FloorBytes() + (uint64_t {256} << 20u)) {
+		std::printf("[picos-zona] %s: no se hace (RAM disponible %llu MiB)\n", name.c_str(),
+		            static_cast<unsigned long long>(avail >> 20u));
+		std::fflush(stdout);
+		return;
+	}
+	const auto only = SceneTags::Recipes(scene);
+	std::vector<std::vector<uint32_t>> records, recipes;
+	if (!LocalShaderWarmup::Cache::ReadInputs(m_warmup_path, records, recipes)) {
+		std::printf("[picos-zona] %s: la grabacion no se pudo leer\n", name.c_str());
+		std::fflush(stdout);
+		return;
+	}
+	std::vector<uint8_t> needed(records.size(), 0);
+	std::vector<std::vector<uint32_t>> mine;
+	size_t graphics_wanted = 0, compute_wanted = 0;
+	for (auto& words: recipes) {
+		if (!only.contains(LocalShaderWarmup::RecipeKey(words))) continue;
+		LocalShaderWarmup::PipelineRecord recipe;
+		LocalShaderWarmup::Reader         reader {words};
+		if (!LocalShaderWarmup::VisitPipeline(reader, recipe)) continue;
+		if (recipe.compute != LocalShaderWarmup::NoShader) {
+			if (recipe.compute >= records.size()) continue;
+			needed[recipe.compute] = 1;
+			++compute_wanted;
+		} else {
+			if (recipe.vertex >= records.size() ||
+			    (recipe.pixel != LocalShaderWarmup::NoShader && recipe.pixel >= records.size()))
+				continue;
+			needed[recipe.vertex] = 1;
+			if (recipe.pixel != LocalShaderWarmup::NoShader) needed[recipe.pixel] = 1;
+			++graphics_wanted;
+		}
+		mine.push_back(std::move(words));
+	}
+	const auto mem_before = LocalPlatform::ProcessMemory();
+	size_t     graphics_before = 0, compute_before = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		programs.warming = true;
+		programs.warm_records.assign(records.begin(), records.end());
+		programs.warm_recipes = std::move(mine);
+		graphics_before       = m_graphics_pipelines.size();
+		compute_before        = m_compute_pipelines.size();
+	}
+	PicosZona::g_base_private.store(mem_before.private_bytes);
+	PicosZona::g_stopped.store(false);
+	PicosZona::g_stop_why.store(0);
+	PicosZona::g_gate.store(true, std::memory_order_release);
+	programs.TranslateWarmup(m_mutex, true, m_warmup_stop, &needed);
+	const auto mem_programs = LocalPlatform::ProcessMemory();
+	if (!PicosZona::ShouldStop() && !m_warmup_stop.load(std::memory_order_relaxed))
+		WarmPipelines(compute_video, true, &only);
+	PicosZona::g_gate.store(false, std::memory_order_release);
+	size_t graphics_made = 0, compute_made = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		graphics_made = m_graphics_pipelines.size() - std::min(m_graphics_pipelines.size(), graphics_before);
+		compute_made  = m_compute_pipelines.size() - std::min(m_compute_pipelines.size(), compute_before);
+		programs.warming = false;
+		programs.ReleaseRetired();
+		programs.warm_phase.store(0, std::memory_order_release);
+		programs.warm_permutations = {};
+		programs.warm_records      = {};
+		programs.warm_recipes      = {};
+	}
+	const auto mem_after = LocalPlatform::ProcessMemory();
+	const auto diff      = [](uint64_t a, uint64_t b) { return (static_cast<double>(a) - static_cast<double>(b)) / 1048576.0; };
+	const double mb_programs  = diff(mem_programs.private_bytes, mem_before.private_bytes);
+	const double mb_pipelines = diff(mem_after.private_bytes, mem_programs.private_bytes);
+	const auto   made         = graphics_made + compute_made;
+	const int    why          = PicosZona::g_stop_why.load();
+	std::printf("[picos-zona] %s: precreados %zu graficos de %zu + %zu compute de %zu en %lld ms; RAM privada %+.0f MB "
+	            "(programas %+.0f, pipelines %+.0f = %.3f MB/pipeline); parado por tope: %s; disponible %llu MiB\n",
+	            name.c_str(), graphics_made, graphics_wanted, compute_made, compute_wanted,
+	            static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count()),
+	            mb_programs + mb_pipelines, mb_programs, mb_pipelines, made ? mb_pipelines / static_cast<double>(made) : 0.0,
+	            why == 1 ? "si (RAM disponible)" : why == 2 ? "si (MB por zona)" : "no",
+	            static_cast<unsigned long long>(LocalPlatform::AvailablePhysicalMemory() >> 20u));
+	std::fflush(stdout);
 }
 
 void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const std::unordered_set<uint64_t>* only) {
@@ -4366,6 +4485,7 @@ void PipelineCache::WarmPipelines(uint64_t compute_video, bool background, const
 		for (size_t n; (n = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
 			if (m_warmup_stop.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= programs.warm_deadline)
 				return;
+			if (PicosZona::ShouldStop()) { ++left; continue; } // (picos-zona: RAM disponible o tope por zona)
 			auto& job      = jobs[n];
 			auto  pipeline = std::make_unique<Pipeline>();
 			if (job.compute) {

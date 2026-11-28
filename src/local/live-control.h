@@ -20,6 +20,7 @@
 // Without KYTY_LIVE_FILE nothing runs; the flip hook is one relaxed increment.
 
 #include "local/skip-shader.h"
+#include "local/picos-zona.h" // (picos-zona)
 #include "common/assert.h"
 #include "frame-capture.h"
 #include "par-audit.h" // (A0b) diagnostic only: KYTY_AUDIT off by default
@@ -667,6 +668,7 @@ inline void Flip() {
 				second.start = now;
 			}
 		}
+		if (last != std::chrono::steady_clock::time_point {} && ms > 25.0) PicosZona::NoteSlow(ms); // (picos-zona)
 		if (last != std::chrono::steady_clock::time_point {} && ms >= std::max(20.0, SlowLog::HitchThreshold())) {
 			std::printf("[tsc %llu] SLOW Frame %.1f ms idle=%.1f", static_cast<unsigned long long>(tsc), ms,
 			            static_cast<double>(g_render_idle_ns - last_idle) / 1e6);

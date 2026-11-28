@@ -503,6 +503,7 @@ private:
 	// nothing; never every recorded pipeline.
 	void                         WarmScene(uint32_t scene, uint64_t compute_video, bool in_memory, bool missing_seeds = false);
 	void                         SceneLoop(uint64_t compute_video);
+	void                         PicosZonaWarm(uint32_t scene, uint64_t compute_video); // (picos-zona)
 	// (tiron1, KYTY_TIRON1=1) A PC under 30 GB of RAM (no pipeline warmup): once the shader prefetch is done, the
 	// recording's compute recipes (newest first, at most KYTY_TIRON1_COMPUTE_MAX) made beside the game on
 	// m_warmup_thread, their programs translated first (local/tiron1.h). m_tiron1_quiet: GetPrefetchProgress leaves
