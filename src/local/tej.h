@@ -121,6 +121,8 @@ enum C : uint32_t {
 	GPkRgFailBuf, GPkRgFailImg, GPkRgFailMap,
 	// lector
 	LJobs, LSelf, LPassNs, LPassFail, LFromRender, LNoState, LBehind, LNoCpu, LOther, LDropFull, LAheadWaitNs, LCopyBytes,
+	// (tej-enq) juego (Enqueue) y lector: coste del gancho en el hilo del juego, despertares, copia y pasada
+	JEnqTicks, JEnqN, JWakes, LCopyNs, LCopyLate, LPassEndCopies, WOverlapNs,
 	// trabajadores
 	WJobs, WNs, WTransNs, WCycles, WDraws, WBehind, WFailed, WStops, WHolesDraw, WHolesOther, WOver, WRepins, WPassDiff,
 	WIdleNoCpu, WBiggest,
@@ -174,6 +176,10 @@ inline void FlushHooks() {
 		}
 }
 
+// (tej-enq) Lector: su pasada de estado NO predice dispatches (Spec::t_record se tira: PredictDispatch solo pedia el
+// CatalogRead y los IsRegionGpuModified de BufferCache, cerrojos que comparte con el render, para nada).
+inline thread_local bool     t_no_predict = false;
+inline std::atomic<bool>     g_render_in {false}; // (tej-enq: render dentro de una DCB de la cola 0, para el solape)
 inline std::atomic<uint64_t> g_gpu_serial {0};
 inline std::atomic<uint32_t> g_render_cpu {0xffffffffu};
 inline std::atomic<int64_t>  g_free_x100 {-100};
@@ -295,7 +301,7 @@ struct Item {
 	uint64_t                          serial = 0;
 	std::vector<uint32_t>             cmds;
 	std::unique_ptr<CommandProcessor> start, pass_end;
-	bool                              pass_ok = false;
+	bool                              pass_ok = false, has_end = false;
 };
 
 class Shadow;
@@ -344,16 +350,17 @@ class Shadow {
 public:
 	struct Job {
 		enum Kind : uint8_t { Graphics, Flip, Other };
-		uint64_t              serial = 0;
-		Kind                  kind   = Other;
-		bool                  reset  = false;
-		std::vector<uint32_t> cmds;
+		uint64_t        serial = 0;
+		const uint32_t* p      = nullptr; // (tej-enq) la DCB EN SITIO (memoria del juego): nada se copia en el hilo del juego
+		uint32_t        n      = 0;
+		Kind            kind   = Other;
+		bool            reset  = false;
 	};
 
 	explicit Shadow(RenderContext& r)
 	    : m_r(r), m_reader_spec(r, Speculation::ShadowTag {}, 0, 1, 1), m_chain(std::make_unique<CommandProcessor>(r, 0)),
-	      m_pass(std::make_unique<CommandProcessor>(r, 0)), m_published(std::make_unique<CommandProcessor>(r, 0)) {
-		m_pass->SetStateOnly(true);
+	      m_published(std::make_unique<CommandProcessor>(r, 0)) {
+		m_chain->SetStateOnly(true); // (tej-enq: la pasada corre sobre la cadena misma: 2 copias de estado menos por DCB)
 		// N: KYTY_TEJ_N o nucleos de rendimiento de la L3 del render sin el suyo (el render aun no corre: el de este hilo).
 		uint32_t n = 0;
 		if (const char* v = std::getenv("KYTY_TEJ_N"); v != nullptr) n = static_cast<uint32_t>(std::max(0, std::atoi(v)));
@@ -377,7 +384,8 @@ public:
 			std::lock_guard g(m_mutex);
 			m_quit = true;
 		}
-		m_cv.notify_all();
+		m_wake.fetch_add(1, std::memory_order_seq_cst);
+		m_wake.notify_all();
 		m_work_cv.notify_all();
 		if (m_reader.joinable()) m_reader.join();
 		for (auto& w: m_workers)
@@ -388,33 +396,30 @@ public:
 
 	[[nodiscard]] uint32_t N() const { return m_n; }
 
-	// Hilo del juego (Enqueue): la orden copiada.
+	// Hilo del juego (Enqueue, bajo m_queue_mutex de GuestGpu: un solo productor a la vez). (tej-enq) Nada de copia, ni
+	// cerrojo, ni condvar: un descriptor (puntero + tamano + serial) a un anillo SPSC y, solo si el lector duerme, un
+	// despertar (WakeByAddressSingle). Ghidra: el juego no reescribe la DCB hasta que la GPU firma la etiqueta de su
+	// fotograma (FUN_00904090), y esa etiqueta va en la ultima DCB del fotograma: mientras el render no haya EMPEZADO esta
+	// DCB, su memoria es la que el juego envio. El lector la copia y luego comprueba eso (serial del render < el suyo).
 	void Push(uint64_t serial, Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
-		t_bank = 8;
-		Job job;
-		{
-			std::lock_guard g(m_mutex);
-			if (m_jobs.size() >= MaxQueued) {
-				Add(LDropFull);
-				return;
-			}
-			if (!m_pool.empty()) job.cmds = std::move(m_pool.back()), m_pool.pop_back();
+		t_bank            = 8;
+		const uint64_t hd = m_head.load(std::memory_order_relaxed);
+		if (hd - m_tail.load(std::memory_order_acquire) >= RingN) {
+			Add(LDropFull);
+			return;
 		}
-		// (tej-lag) La copia FUERA del cerrojo: el lector no espera al juego ni el juego al lector.
+		Job& job   = m_ring[hd % RingN];
 		job.serial = serial;
 		job.kind   = kind;
 		job.reset  = reset;
-		if (kind == Job::Graphics) {
-			job.cmds.assign(commands.begin(), commands.end());
-			Add(LCopyBytes, commands.size() * 4u);
-		} else {
-			job.cmds.clear();
+		job.p      = kind == Job::Graphics ? commands.data() : nullptr;
+		job.n      = kind == Job::Graphics ? static_cast<uint32_t>(commands.size()) : 0u;
+		m_head.store(hd + 1, std::memory_order_seq_cst);
+		if (m_sleeping.load(std::memory_order_seq_cst)) {
+			m_wake.fetch_add(1, std::memory_order_seq_cst);
+			m_wake.notify_one();
+			Add(JWakes);
 		}
-		{
-			std::lock_guard g(m_mutex);
-			m_jobs.push_back(std::move(job));
-		}
-		m_cv.notify_all();
 	}
 
 	// Hilo de render, al acabar un envio de la cola 0.
@@ -528,39 +533,44 @@ private:
 		t_bank = 1;
 		TejLag::t_shadow = true;
 		m_reader_spec.ShadowThreadInit(); // (executors y ranura propios: la pasada de estado predice dispatches con el catalogo)
-		t_side = 3;
-		std::unique_lock lock(m_mutex);
+		t_side       = 3;
+		t_no_predict = true;
 		for (;;) {
-			m_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return m_quit || !m_jobs.empty(); });
-			if (m_quit) break;
-			lock.unlock();
+			if (Quit()) break;
+			const uint64_t tl = m_tail.load(std::memory_order_relaxed);
+			if (m_head.load(std::memory_order_acquire) == tl) {
+				// (sin trabajo: duerme hasta el siguiente Push; Dekker con m_sleeping/m_head, todo seq_cst)
+				const uint32_t seq = m_wake.load(std::memory_order_seq_cst);
+				m_sleeping.store(true, std::memory_order_seq_cst);
+				if (m_head.load(std::memory_order_seq_cst) == tl && !Quit()) m_wake.wait(seq, std::memory_order_seq_cst);
+				m_sleeping.store(false, std::memory_order_seq_cst);
+				continue;
+			}
+			const Job job = m_ring[tl % RingN];
+			m_tail.store(tl + 1, std::memory_order_release);
 			SampleCpu();
-			lock.lock();
-			if (m_jobs.empty()) continue;
-			Job job = std::move(m_jobs.front());
-			m_jobs.pop_front();
 			std::unique_ptr<Item> item;
-			if (!m_spare.empty()) item = std::move(m_spare.back()), m_spare.pop_back();
-			lock.unlock();
+			{
+				std::lock_guard g(m_mutex);
+				if (!m_spare.empty()) item = std::move(m_spare.back()), m_spare.pop_back();
+			}
 			if (!item) item = std::make_unique<Item>();
 			if (Handle(job, *item)) {
-				lock.lock();
-				m_items.push_back(std::move(item));
-				lock.unlock();
+				{
+					std::lock_guard g(m_mutex);
+					m_items.push_back(std::move(item));
+				}
 				m_work_cv.notify_all();
 			} else {
-				lock.lock();
+				std::lock_guard g(m_mutex);
 				Recycle(std::move(item));
-				lock.unlock();
 			}
-			lock.lock();
-			if (m_pool.size() < MaxQueued) m_pool.push_back(std::move(job.cmds));
 		}
 		t_side = 0;
 	}
 
 	// Lector: el estado inicial de la DCB y la pasada de estado que deja el de la siguiente; true: a los trabajadores.
-	bool Handle(Job& job, Item& item) {
+	bool Handle(const Job& job, Item& item) {
 		const bool consecutive = m_chain_ok && m_chain_serial + 1 == job.serial;
 		if (job.kind == Job::Flip) {
 			if (consecutive) m_chain_serial = job.serial;
@@ -600,7 +610,19 @@ private:
 			Add(LNoCpu);
 			return false;
 		}
-		const bool self = job.reset || SelfContained(job.cmds);
+		// (tej-enq) La copia, aqui (lector), no en el hilo del juego; valida si el render aun no empezo esta DCB.
+		{
+			const uint64_t c0 = Now();
+			item.cmds.assign(job.p, job.p + job.n);
+			Add(LCopyNs, Now() - c0);
+			Add(LCopyBytes, uint64_t {job.n} * 4u);
+			if (g_gpu_serial.load(std::memory_order_seq_cst) >= job.serial) {
+				m_chain_ok = false;
+				Add(LCopyLate);
+				return false;
+			}
+		}
+		const bool self = job.reset || SelfContained(item.cmds);
 		if (self) Add(LSelf);
 		if (!consecutive && !self) {
 			m_want_serial.store(job.serial - 1, std::memory_order_release);
@@ -629,21 +651,26 @@ private:
 		if (!item.start) item.start = std::make_unique<CommandProcessor>(m_r, 0);
 		if (!item.pass_end) item.pass_end = std::make_unique<CommandProcessor>(m_r, 0);
 		item.start->CopyStateFrom(*m_chain, false);
-		// Pasada de estado (solo registros; escrituras a memoria a un registro propio que nadie lee).
+		// Pasada de estado (solo registros; escrituras a memoria a un registro propio que nadie lee). (tej-enq) Sobre la
+		// cadena misma (antes: copia a m_pass y vuelta), sin predecir dispatches (t_no_predict).
 		const auto t0 = Now();
-		m_pass->CopyStateFrom(*m_chain, false);
-		m_pass->SetFlip({});
-		m_pass->SetChunking(0);
+		m_chain->SetFlip({});
+		m_chain->SetChunking(0);
 		m_record.Clear();
 		Libs::Graphics::Spec::t_record = &m_record;
 		Pm4Execution execution;
-		const auto   res               = m_pass->Process(execution, std::span<const uint32_t>(job.cmds.data(), job.cmds.size()));
+		const auto   res               = m_chain->Process(execution, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()));
 		Libs::Graphics::Spec::t_record = nullptr;
 		Add(LPassNs, Now() - t0);
-		item.pass_ok = res == Pm4ProcessResult::Complete;
+		item.pass_ok  = res == Pm4ProcessResult::Complete;
+		item.has_end  = false;
 		if (item.pass_ok) {
-			m_chain->CopyStateFrom(*m_pass, false);
-			item.pass_end->CopyStateFrom(*m_pass, false);
+			// (el estado final de la pasada solo para el diagnostico 'estado distinto de la pasada': 1 de cada 16 DCB)
+			if ((++m_end_k & 15u) == 0) {
+				item.pass_end->CopyStateFrom(*m_chain, false);
+				item.has_end = true;
+				Add(LPassEndCopies);
+			}
 			m_chain_serial = job.serial;
 			m_chain_ok     = true;
 		} else {
@@ -651,7 +678,6 @@ private:
 			Add(LPassFail);
 		}
 		item.serial = job.serial;
-		std::swap(item.cmds, job.cmds);
 		if (auto& rec = g_rec[job.serial % RecN]; rec.serial.load(std::memory_order_relaxed) == job.serial)
 			rec.ready.store(Now(), std::memory_order_relaxed);
 		return true;
@@ -659,17 +685,23 @@ private:
 
 	RenderContext&                        m_r;
 	Speculation                           m_reader_spec;
-	std::unique_ptr<CommandProcessor>     m_chain, m_pass, m_published;
+	std::unique_ptr<CommandProcessor>     m_chain, m_published;
 	Libs::Graphics::Spec::State           m_record;
 	uint32_t                              m_n = 1;
 	std::vector<std::unique_ptr<Worker>>  m_workers;
 	std::thread                           m_reader;
 	std::mutex                            m_mutex;
-	std::condition_variable               m_cv, m_work_cv;
-	std::deque<Job>                       m_jobs;
+	std::condition_variable               m_work_cv;
+	// (tej-enq) anillo SPSC juego -> lector (productor bajo m_queue_mutex del GuestGpu), lineas de cache separadas
+	static constexpr uint64_t             RingN = 64;
+	Job                                   m_ring[RingN];
+	alignas(64) std::atomic<uint64_t>     m_head {0};
+	alignas(64) std::atomic<uint64_t>     m_tail {0};
+	alignas(64) std::atomic<bool>         m_sleeping {false};
+	std::atomic<uint32_t>                 m_wake {0};
+	uint32_t                              m_end_k = 0;
 	std::deque<std::unique_ptr<Item>>     m_items;
 	std::vector<std::unique_ptr<Item>>    m_spare;
-	std::vector<std::vector<uint32_t>>    m_pool;
 	bool                                  m_quit = false;
 	bool                                  m_chain_ok = false;
 	uint64_t                              m_chain_serial = 0, m_last_idle = 0;
@@ -735,10 +767,13 @@ inline void Worker::Translate(Item& item) {
 	}
 	const uint64_t c0  = LocalPlatform::CurrentThreadCycles();
 	const auto     t0  = Now();
+	const bool     render_in0 = g_render_in.load(std::memory_order_relaxed);
 	TejLag::t_translating = true; // (tej-sinmutex: aqui una RecorderRefusal 'sin mutex' es hueco)
 	const auto     out = m_spec.Shadow(*item.start, std::span<const uint32_t>(item.cmds.data(), item.cmds.size()), *m_end);
 	TejLag::t_translating = false;
 	const auto     t1  = Now();
+	// (tej-enq) solape con el render: render dentro de una DCB al empezar y al acabar la traduccion (estimacion)
+	if (render_in0 && g_render_in.load(std::memory_order_relaxed)) Add(WOverlapNs, t1 - t0);
 	Close();
 	slot.done.store(true, std::memory_order_release);
 	m_slot = nullptr;
@@ -756,7 +791,7 @@ inline void Worker::Translate(Item& item) {
 	if (out.failed) Add(WFailed);
 	if (out.stop != nullptr) Add(WStops);
 	// (la pasada de estado del lector frente a la traduccion: el estado que deja cada una)
-	if (item.pass_ok && !out.failed && out.stop == nullptr && !m_end->SameState(*item.pass_end)) Add(WPassDiff);
+	if (item.pass_ok && item.has_end && !out.failed && out.stop == nullptr && !m_end->SameState(*item.pass_end)) Add(WPassDiff);
 	// (tej F1c) Coste por LLAMADA traducida (antes: tiempo total, con el fijo, entre draws solo: con la DCB cortada en
 	// la espera del principio daba 19.8 us/draw). Solo DCB con >= 32 llamadas (las cortas son casi todo fijo).
 	if (calls >= 32)
@@ -922,6 +957,11 @@ inline std::vector<DcbRec> g_dcbs;
 // Hilo del juego: un envio de la cola 0.
 inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Shadow::Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
 	if (queue_id != 0 || Mode() == 0) return;
+	// (tej-enq) Coste del gancho en el hilo del juego (dentro de SubmitJob FUN_00a18840, bajo m_queue_mutex), A y B.
+	struct EnqTimer {
+		uint64_t t0 = __rdtsc();
+		~EnqTimer() { g_bank[8].c[JEnqTicks].fetch_add(__rdtsc() - t0, std::memory_order_relaxed), g_bank[8].c[JEnqN].fetch_add(1, std::memory_order_relaxed); }
+	} enq_timer;
 	auto& rec = g_rec[serial % RecN];
 	const uint64_t now = Now();
 	rec.serial.store(serial, std::memory_order_relaxed);
@@ -962,6 +1002,7 @@ struct GpuSlice {
 			TejLag::t_render = true;
 			t_bank           = 0;
 			g_gpu_serial.store(serial, std::memory_order_release);
+			g_render_in.store(true, std::memory_order_relaxed);
 			g_render_cpu.store(LocalPlatform::CurrentCpu(), std::memory_order_relaxed);
 			g_gpu        = {};
 			g_gpu.serial = serial;
@@ -1175,6 +1216,7 @@ inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 // Hilo de render: un envio de la cola 0 acabado.
 inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 	if (Mode() == 0) return;
+	g_render_in.store(false, std::memory_order_relaxed);
 	const uint64_t t_in = __rdtsc();
 	const uint64_t now = Now();
 	const auto&    rec = g_rec[serial % RecN];
@@ -1309,6 +1351,14 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	            v[LFromRender] / f, v[GPublish] / f, v[LNoState] / f, v[LBehind] / f + v[WBehind] / f, v[LNoCpu] / f,
 	            v[LOther] / f, v[LDropFull] / f, v[LAheadWaitNs] / 1e6 / f, v[LCopyBytes] / 1024.0 / f, v[WRepins] / f,
 	            fn != 0 ? static_cast<double>(fs) / 100.0 / static_cast<double>(fn) : -1.0);
+	// (tej-enq) Coste fijo fuera del render: gancho en el hilo del juego (lo que alarga SubmitJob FUN_00a18840 y retiene
+	// m_queue_mutex), despertares del lector, copia del lector y la pasada (sin prediccion de dispatches).
+	std::printf(" | ENQ juego %.3f ms/fot (%.1f envios/fot, %.2f us/envio; alarga SubmitJob y m_queue_mutex) despertares %.1f/fot |"
+	            " lector copia %.3f ms/fot (%.1f us/DCB), copia tarde (render ya empezo) %.1f/fot, pasada %.3f ms/fot de CPU,"
+	            " copias de estado final 1/16 %.1f/fot | solape trabajador-render %.2f ms/fot",
+	            v[JEnqTicks] * ns_per_tick / 1e6 / f, v[JEnqN] / f, v[JEnqN] != 0 ? v[JEnqTicks] * ns_per_tick / 1e3 / v[JEnqN] : 0.0,
+	            v[JWakes] / f, v[LCopyNs] / 1e6 / f, v[LJobs] != 0 ? v[LCopyNs] / 1e3 / v[LJobs] : 0.0, v[LCopyLate] / f,
+	            v[LPassNs] / 1e6 / f, v[LPassEndCopies] / f, v[WOverlapNs] / 1e6 / f);
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)%s%s", cnt[0], cnt[1], delta,
 		            VarOn() && was ? " | variante " : "", VarOn() && was ? VarName[var] : "");

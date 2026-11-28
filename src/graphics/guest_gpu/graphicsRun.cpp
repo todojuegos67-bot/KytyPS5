@@ -4433,7 +4433,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
                                       uint64_t indirect_args) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	if (m_state_only) {
-		if (auto* record = Spec::t_record; record != nullptr && indirect_args == 0)
+		if (auto* record = Spec::t_record; record != nullptr && indirect_args == 0 && !Tej::t_no_predict) // (tej-enq)
 			m_renderer.GetComputeRenderExecutor().PredictDispatch(m_sh_ctx, thread_group_x, thread_group_y, thread_group_z,
 			                                                      mode, *record);
 		return;
