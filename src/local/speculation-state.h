@@ -589,12 +589,16 @@ struct EffectsLog {
 	uint64_t              base = 0;  // the index of entries.front() since the log began
 	std::atomic<uint64_t> end {0};   // entries since the log began (read where a speculation begins)
 	uint64_t*             cost_ticks = nullptr; // (tej-lag: si no es nulo, TSC gastado en Add; solo el registro de tej)
+	uint32_t              cost_k     = 0;
 	[[nodiscard]] uint64_t End() const noexcept { return end.load(std::memory_order_acquire); }
 	void                   Add(Kind kind, uint64_t address, uint64_t size) {
-		                  const uint64_t t0 = cost_ticks != nullptr ? __rdtsc() : 0;
+		                  // (tej-lag3) MEDIDA muestreada: el TSC solo en 1 de cada 16 entradas (x16); antes 2 rdtsc por entrada
+		                  // (3193/fot) eran casi todo el coste medido.
+		                  const bool     timed = cost_ticks != nullptr && (++cost_k & 15u) == 0;
+		                  const uint64_t t0    = timed ? __rdtsc() : 0;
 		                  entries.push_back({kind, t_effect_source, address, size});
 		                  end.store(base + entries.size(), std::memory_order_release);
-		                  if (cost_ticks != nullptr) *cost_ticks += __rdtsc() - t0;
+		                  if (timed) *cost_ticks += (__rdtsc() - t0) * 16u;
 	}
 	// The first write logged from `from` on over the range (null: none).
 	[[nodiscard]] const Entry* FirstWriteOver(uint64_t from, uint64_t address, uint64_t size) const {

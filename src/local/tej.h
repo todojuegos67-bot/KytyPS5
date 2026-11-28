@@ -5,6 +5,9 @@
 //   0 apagado (identico a antes: un static por gancho).
 //   1 sombra encendida.
 //   2 A/B cada ventana de 5 s de [techo] (KYTY_TECHO=1): B = sombra encendida; delta interpolado B-A.
+// (tej-lag3) SEPARACION: lo marcado MEDIDA (HookTimer, RenderWait, F2p Real/Before, coste del registro de efectos,
+// diagnosticos COS) solo corre con KYTY_TECHO=1; sin el, el render solo hace: epocas + validar regs + rangos (con filtro
+// de regiones) por paquete, y lee slot.count solo al alcanzar lo visto. NECESARIO: proteccion de RAM (g_mem_lvl).
 //   KYTY_TEJ_N=1..6: trabajadores (por defecto: nucleos de rendimiento de la L3 del render sin el suyo, tope 6).
 // F1b (frente a F1, que tenia un solo hilo que llegaba tarde: 1.1 de 15 DCB con sombra, 'render ya paso' 9/fot):
 // - Lector (Kyty.Tej.L) despertado en GuestGpu::Enqueue (hilo del juego: alli se COPIA la DCB): encadena el estado DCB a
@@ -93,8 +96,11 @@ inline std::atomic<bool> g_ab_on {false};
 //   la L3 del render) | 4 cortes (la sombra no pide el RenderMutex mientras el render esta dentro).
 // Linea [tej] VARIANTES: delta interpolado B-A de cada una. Una sola ejecucion dice cual quita el lag.
 //   5 sin mutex (KYTY_TEJ_SINMUTEX: la sombra nunca pide el RenderMutex; las variantes 0-4 lo piden, como antes).
-inline constexpr int    VarN = 6;
-inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes", "sin mutex"};
+//   6 N=1 otro CCD prioridad normal (tej-lag3: un solo trabajador, en la otra L3, a prioridad normal: termina antes y
+//   compite menos tiempo con el render por memoria/driver?).
+inline constexpr int    VarN = 7;
+inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "mismo CCD", "cortes", "sin mutex",
+                                              "N=1 otro CCD normal"};
 [[nodiscard]] inline bool VarOn() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_TEJ_VAR");
@@ -104,9 +110,28 @@ inline constexpr const char* VarName[VarN] = {"normal", "sin traducir", "N=1", "
 }
 inline std::atomic<int> g_var {0}; // (variante de la ventana B actual; 0 sin KYTY_TEJ_VAR)
 [[nodiscard]] inline int Var() { return g_var.load(std::memory_order_relaxed); }
+// (tej-lag3) NECESARIO: proteccion de RAM (equipos de 16 GB). Nivel 0 normal; 1 (disponible < 1 GiB): un solo trabajador;
+// 2 (< 0.5 GiB): sombra apagada (Active() falso: nada se copia ni se traduce). Histeresis: sube de nivel por debajo del
+// umbral, baja por encima de 1.5x (0.75 / 1.5 GiB). Comprobacion: GlobalMemoryStatusEx 1 de cada 2048 envios de la cola 0 (~2 s), en el
+// hilo del juego (OnEnqueue).
+inline std::atomic<int> g_mem_lvl {0};
+inline void             MemCheck() {
+	static uint32_t k = 0;
+	if ((++k & 2047u) != 1u) return;
+	const uint64_t av = LocalPlatform::SystemMemoryStatus().available;
+	if (av == 0) return;
+	constexpr uint64_t G = 1ull << 30;
+	const int          old = g_mem_lvl.load(std::memory_order_relaxed);
+	const int          lvl = av < G / 2 || (old == 2 && av < G * 3 / 4) ? 2 : av < G || (old >= 1 && av < G * 3 / 2) ? 1 : 0;
+	if (lvl != old) {
+		g_mem_lvl.store(lvl, std::memory_order_relaxed);
+		std::printf("[tej] RAM disponible %.2f GiB: %s\n", static_cast<double>(av) / G,
+		            lvl == 2 ? "sombra APAGADA (< 0.5 GiB)" : lvl == 1 ? "un solo trabajador (< 1 GiB)" : "normal");
+	}
+}
 [[nodiscard]] inline bool Active() {
 	const int m = Mode();
-	return m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed));
+	return (m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed))) && g_mem_lvl.load(std::memory_order_relaxed) < 2;
 }
 
 // (tej F2p) Registro de efectos del render (escrituras GPU, escrituras de CPU que ven los barridos, sets retirados) con
@@ -154,7 +179,7 @@ enum C : uint32_t {
 	// (tej-cos) embudo en draws (render): a tiempo sin huecos, registros de draws, rangos por tipo; draws por motivo F2p;
 	// buffers por rango EXACTO (anillo de BufferCache) frente a regiones de 4 MiB; imagenes solo sobre imagenes (Changed)
 	GCosSewn, GCosGfxOk, GCosCsBad, GCosLostBuf, GCosLostImg, GCosLostMap, GCosBufExactOk, GCosBufExactFail,
-	GCosBufExactLost, GCosImgOnlyOk, GCosImgOverOther, GCosReadGpu, GCosReadHost, GCosRegSampled,
+	GCosBufExactLost, GCosBufRegionOk, GCosImgOnlyOk, GCosImgOverOther, GCosReadGpu, GCosReadHost, GCosRegSampled,
 	GRkD0, GRkD1, GRkD2, GRkD3, GRkD4, GRkD5, GRkD6, GRkD7, GRkD8,
 	NCount
 };
@@ -175,7 +200,7 @@ inline void Add(C i, uint64_t v = 1) { g_bank[t_bank].c[i].fetch_add(v, std::mem
 enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HReal, HBefore, HEff, HN };
 inline constexpr const char* HName[HN] = {"inicio DCB", "draw (todo)", "validar regs", "rangos", "DiffState 1/64",
                                           "dispatch", "espera WAIT_REG_MEM", "flip (latencia)", "fin DCB", "publicar estado",
-                                          "F2p cosibles reales 1/8 DCB", "F2p Before 1/8",
+                                          "F2p cosibles reales 1/32 DCB", "F2p Before 1/8",
                                           "registro de efectos (entradas)"};
 struct alignas(64) HookAcc {
 	std::atomic<uint64_t> t[2][HN] {}, n[2][HN] {};
@@ -191,12 +216,17 @@ inline uint64_t               g_dcb_tsc0 = 0, g_dcb_cyc0 = 0;
 struct HookTimer {
 	H        h;
 	uint64_t t0;
-	explicit HookTimer(H k): h(k), t0(__rdtsc()) {}
-	~HookTimer() { t_hook.t[h] += __rdtsc() - t0, ++t_hook.n[h]; }
+	// (tej-lag3) MEDIDA: sin KYTY_TECHO=1 no lee el TSC (t0 = 0, nada que sumar).
+	explicit HookTimer(H k): h(k), t0(Techo::On() ? __rdtsc() : 0) {}
+	~HookTimer() {
+		if (t0 != 0) t_hook.t[h] += __rdtsc() - t0, ++t_hook.n[h];
+	}
 	HookTimer(const HookTimer&)            = delete;
 	HookTimer& operator=(const HookTimer&) = delete;
 };
+inline void RenderWaitsFlush(); // (tej-lag3, mas abajo)
 inline void FlushHooks() {
+	RenderWaitsFlush();
 	const int sd = g_hook_side ? 1 : 0;
 	for (uint32_t i = 0; i < HN; ++i)
 		if (t_hook.n[i] != 0) {
@@ -259,6 +289,8 @@ struct Packet {
 	// (mas estricta que la del paquete); rbx_ok: la lista esta entera. ri: solo imagenes (tocadas + usadas por los
 	// segmentos), lo que Speculation::Changed comprueba de imagenes.
 	std::vector<std::pair<uint64_t, uint64_t>> rbx, ri;
+	// (tej-lag3) rbxr: rbx redondeado a regiones de 4 MiB y fusionado (filtro previo del render, misma prueba).
+	std::vector<std::pair<uint64_t, uint64_t>> rbxr;
 	uint64_t                                   ep_buf0 = 0;
 	bool                                       rbx_ok  = false;
 	std::unique_ptr<CommandProcessor> cp;
@@ -314,7 +346,7 @@ inline thread_local int t_side = 0; // 1 hilo de render (DCB con sombra encendid
 	return v;
 }
 // (tej-var) La preferencia de CCD de la ventana: variante 3 = mismo.
-[[nodiscard]] inline int CcdNow() { return Var() == 3 ? 0 : CcdPref(); }
+[[nodiscard]] inline int CcdNow() { return Var() == 3 ? 0 : Var() == 6 ? 1 : CcdPref(); }
 // Mascara de los trabajadores: L3 elegida (o KYTY_RENDER_CPUS) & nucleos de rendimiento, sin el nucleo del render.
 [[nodiscard]] inline uint64_t WorkMask(uint32_t rc) {
 	if (rc >= 64) return 0;
@@ -388,6 +420,7 @@ private:
 	int                                       m_open = -1;
 	uint32_t                                  m_ord = 0, m_pinned_for = 0xffffffffu;
 	int                                       m_ccd = -9; // (tej-var: CCD de la ultima afinidad)
+	bool                                      m_prio_normal = false; // (tej-lag3)
 	uint64_t                                  m_last_key = 0;
 	uint32_t                                  m_calls = 0;
 	bool                                      m_assumed = false;
@@ -512,7 +545,7 @@ public:
 					++it;
 				}
 			if (!m_items.empty()) {
-				if (k >= 1 && Var() == 2) {
+				if (k >= 1 && (Var() == 2 || Var() == 6 || g_mem_lvl.load(std::memory_order_relaxed) >= 1)) {
 					Add(WVarIdle); // (tej-var N=1: los demas no toman)
 				} else if (static_cast<int64_t>(k + 1) * 100 > g_free_x100.load(std::memory_order_relaxed) &&
 				    g_free_x100.load(std::memory_order_relaxed) >= 0) {
@@ -801,6 +834,11 @@ inline void Worker::Translate(Item& item) {
 		m_ccd        = CcdNow();
 		if (const uint64_t m = WorkMask(rc); m != 0 && LocalPlatform::SetCurrentThreadMask(m)) Add(WRepins);
 	}
+	// (tej-lag3) variante 6: prioridad normal mientras dure (por debajo de normal en las demas).
+	if (const bool normal = Var() == 6; normal != m_prio_normal) {
+		m_prio_normal = normal;
+		LocalPlatform::SetThreadNormalPriority(LocalPlatform::ThreadId(), normal);
+	}
 	auto& slot = m_owner.SlotOf(item.serial);
 	slot.serial.store(0, std::memory_order_release);
 	slot.count.store(0, std::memory_order_release);
@@ -948,8 +986,13 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 				Merge(m_acc_bufs, 0);
 			}
 			p.rbx_ok = m_acc_ok;
-			if (m_acc_ok) p.rbx.assign(m_acc_bufs.begin(), m_acc_bufs.end());
-			else p.rbx.clear();
+			if (m_acc_ok) {
+				p.rbx.assign(m_acc_bufs.begin(), m_acc_bufs.end());
+				p.rbxr.assign(m_acc_bufs.begin(), m_acc_bufs.end()); // (tej-lag3: sus regiones de 4 MiB)
+				Merge(p.rbxr, Libs::Graphics::TRACKER_REGION_SIZE);
+			} else {
+				p.rbx.clear(), p.rbxr.clear();
+			}
 			p.ep_buf0 = m_slot->ep_buf0.load(std::memory_order_relaxed);
 			const size_t seg_close = st->closed.size();
 			p.metas.clear();
@@ -958,7 +1001,7 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 		} else {
 			p.wr.clear(), p.cur.clear(), p.copies.clear(), p.sets.clear(), p.chains.clear(), p.waits.clear(), p.metas.clear();
 			p.n_bda = p.n_inv = p.n_img = 0;
-			p.rbx.clear(), p.rbx_ok = false;
+			p.rbx.clear(), p.rbxr.clear(), p.rbx_ok = false;
 		}
 		Compact(p);
 	}
@@ -1079,6 +1122,7 @@ inline std::vector<DcbRec> g_dcbs;
 // Hilo del juego: un envio de la cola 0.
 inline void OnEnqueue(uint32_t queue_id, uint64_t serial, Shadow::Job::Kind kind, bool reset, std::span<const uint32_t> commands) {
 	if (queue_id != 0 || Mode() == 0) return;
+	MemCheck(); // (tej-lag3)
 	// (tej-enq) Coste del gancho en el hilo del juego (dentro de SubmitJob FUN_00a18840, bajo m_queue_mutex), A y B.
 	struct EnqTimer {
 		uint64_t t0 = __rdtsc();
@@ -1106,6 +1150,7 @@ struct GpuDcb {
 	uint64_t serial = 0, prev_tsc = 0, draws = 0, rs = 0, calls = 0;
 	Slot*    slot = nullptr;
 	uint32_t next = 0;
+	uint32_t n_seen = 0; // (tej-lag3) ultimo slot.count leido
 	bool     on   = false;
 };
 inline GpuDcb g_gpu;
@@ -1230,12 +1275,38 @@ struct RenderWaits {
 	std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_addr; // (cumplida al llegar, tuvo que esperar)
 };
 inline RenderWaits g_rwaits;
-inline void        RenderWait(uint64_t addr, bool satisfied) {
-	const HookTimer tm(HWait);
+// (tej-lag3) MEDIDA (solo KYTY_TECHO=1). Antes: mutex + unordered_map por espera (228/fot, 0.031 ms/fot en B). Ahora: tabla
+// plana del hilo de render (64 direcciones, sondeo lineal, sin cerrojo ni asignacion); se vuelca al mapa una vez por DCB
+// (RenderWaitsFlush, desde FlushHooks).
+struct RwLocal {
+	uint64_t addr[64] {}, sat[64] {}, wait[64] {};
+	uint32_t used = 0;
+};
+inline RwLocal g_rwl; // (solo el hilo de render)
+inline void    RenderWaitsFlush() {
+	if (g_rwl.used == 0) return;
 	std::lock_guard g(g_rwaits.mutex);
-	if (g_rwaits.by_addr.size() > 4096 && !g_rwaits.by_addr.contains(addr)) return;
-	auto& e = g_rwaits.by_addr[addr];
-	(satisfied ? e.first : e.second) += 1;
+	for (uint32_t i = 0; i < 64; ++i)
+		if (g_rwl.addr[i] != 0) {
+			if (g_rwaits.by_addr.size() <= 4096 || g_rwaits.by_addr.contains(g_rwl.addr[i])) {
+				auto& e = g_rwaits.by_addr[g_rwl.addr[i]];
+				e.first += g_rwl.sat[i], e.second += g_rwl.wait[i];
+			}
+			g_rwl.addr[i] = g_rwl.sat[i] = g_rwl.wait[i] = 0;
+		}
+	g_rwl.used = 0;
+}
+inline void RenderWait(uint64_t addr, bool satisfied) {
+	if (!Techo::On() || addr == 0) return;
+	const HookTimer tm(HWait);
+	uint32_t        i = static_cast<uint32_t>((addr >> 3) * 0x9E3779B97F4A7C15ull >> 58);
+	for (uint32_t k = 0; k < 64; ++k, i = (i + 1) & 63u) {
+		if (g_rwl.addr[i] == addr || g_rwl.addr[i] == 0) {
+			if (g_rwl.addr[i] == 0) g_rwl.addr[i] = addr, ++g_rwl.used;
+			++(satisfied ? g_rwl.sat[i] : g_rwl.wait[i]);
+			return;
+		}
+	}
 }
 
 // (tej F2p) COSIBLES REALES: un paquete que cose por registros y epocas/rangos (F1d) pasa ademas, en solo lectura, lo
@@ -1273,13 +1344,15 @@ struct EffCheck {
 	uint64_t ticks0   = 0;
 };
 inline EffCheck g_ec;
-inline constexpr uint32_t BeforeEvery = 8, RealEvery = 8; // (tej-lag: F2p muestreado por DCB; cuentas x RealEvery)
+// (tej-lag3) MEDIDA: F2p 1/32 DCB (antes 1/8: 0.232 ms/fot en B, 12 paquetes/fot a ~19 us cada uno, casi todo
+// RangeSet::Add de los efectos acumulados); cuentas x RealEvery, misma estimacion con 4x menos coste.
+inline constexpr uint32_t BeforeEvery = 8, RealEvery = 32;
 // (F2p) Render, inicio de DCB de la cola 0: fin del registro y poda de lo anterior a 32 DCB atras.
 inline void EffDcbStart() {
 	ClaimEff();
 	if (!t_eff_owner) return;
 	auto& e   = g_ec;
-	g_eff.cost_ticks = &g_eff_ticks;
+	g_eff.cost_ticks = Techo::On() ? &g_eff_ticks : nullptr; // (tej-lag3: MEDIDA)
 	e.dcb_end = g_eff.End();
 	// (tej-lag) Poda fija a 32 DCB atras (antes: tambien el inicio del ultimo paquete comprobado, que podia quedarse
 	// viejo y no podar nunca). Un paquete que empezo antes sale como 'registro de efectos perdido'.
@@ -1351,7 +1424,7 @@ inline void CosWhy(const Packet& p, RenderContext& r, const EffAcc& a, uint64_t 
 }
 inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 	auto& e = g_ec;
-	if (!e.sample) return; // (tej-lag: 1 de cada RealEvery DCB)
+	if (!e.sample || !Techo::On()) return; // (tej-lag: 1 de cada RealEvery DCB; tej-lag3: MEDIDA, solo KYTY_TECHO=1)
 	{
 		const HookTimer tm(HReal);
 		const uint64_t  from = s.eff_from.load(std::memory_order_relaxed);
@@ -1364,8 +1437,8 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 			e.pre.Reset(from);
 		}
 		e.all.TakeTo(g_eff, ~uint64_t {0});
-		e.pre.TakeTo(g_eff, e.dcb_end);
 		const uint32_t why = RealWhy(p, r, e.all, e.lost);
+		if (why != 0) e.pre.TakeTo(g_eff, e.dcb_end); // (tej-lag3: 'pre' solo hace falta si 'all' falla)
 		constexpr uint64_t k = RealEvery; // (muestra: cuentas escaladas)
 		Add(static_cast<C>(GRk0 + why), k);
 		Add(static_cast<C>(GRkD0 + why), sewn * k); // (tej-cos)
@@ -1405,10 +1478,19 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 	++c.draws;
 	Slot* const s = c.slot;
 	if (s == nullptr) return;
+	// (tej-lag3) slot.count es la linea que el trabajador escribe al publicar (en el otro CCD): antes se leia en CADA draw
+	// (3258/fot; cada lectura tras una publicacion = fallo de cache entre CCD). Ahora solo cuando el render alcanza lo ya
+	// visto; si el siguiente paquete conocido es de un draw posterior, sale sin tocar nada compartido.
+	if (c.next < c.n_seen && s->pk[c.next].key > key) return;
 	const HookTimer tm(HDraw);
 	const uint64_t  now = tm.t0;
-	const uint32_t  n   = s->count.load(std::memory_order_acquire);
-	while (c.next < n) {
+	uint32_t        n   = c.n_seen;
+	for (;;) {
+		if (c.next >= n) {
+			const uint32_t n2 = s->count.load(std::memory_order_acquire);
+			if (n2 <= n) break;
+			n = c.n_seen = n2;
+		}
 		const Packet& p = s->pk[c.next];
 		if (p.key > key) break;
 		++c.next;
@@ -1456,7 +1538,19 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 			uint64_t        k  = 0;
 			if (!b0) {
 				bool known = false;
-				if (p.rbx_ok) {
+				// (tej-lag3) Filtro previo EQUIVALENTE: las regiones de 4 MiB de rbx (rbxr) desde ep_buf0. Si ninguna region
+				// cambio, ningun registro/desregistro toco esos bytes desde ep_buf0: el anillo exacto daria 'sin choque'
+				// seguro, y no se recorre (hasta 4096 epocas con busqueda binaria: ~5.5 us/paquete, 0.094 ms/fot en B).
+				// Si alguna region cambio, el exacto como antes. Mismo resultado, mismas cosibles.
+				if (p.rbx_ok && !p.rbxr.empty() && p.rbxr.back().second <= Libs::Graphics::TRACKER_ADDRESS_SIZE) {
+					bool reg = true;
+					for (const auto& [a, e]: p.rbxr) {
+						++k;
+						if (bc.RegisteredSince(a, e - a, p.ep_buf0)) { reg = false; break; }
+					}
+					if (reg) known = true, rb = true, Add(GCosBufExactOk), Add(GCosBufRegionOk);
+				}
+				if (!known && p.rbx_ok) {
 					const bool hit = bc.RegisteredOverlapSince(p.rbx.data(), p.rbx.size(), p.ep_buf0, known);
 					k += p.rbx.size();
 					if (known) rb = !hit, Add(hit ? GCosBufExactFail : GCosBufExactOk);
@@ -1478,7 +1572,7 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 					++k;
 					if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { ri = false; break; }
 				}
-				if (ri) {
+				if (ri && Techo::On()) { // (tej-lag3: diagnostico = MEDIDA)
 					Add(GCosImgOnlyOk);
 					for (const auto& [a, e]: p.rx)
 						if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { Add(GCosImgOverOther); break; }
@@ -1755,6 +1849,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 				            dn / f, dw, dc, dw > 0 ? dc / dw : 0.0);
 		}
 		std::printf(" | CCD trabajadores %s", CcdNow() == 0 ? "mismo (L3 del render)" : CcdNow() == 1 ? "otro" : "auto");
+		std::printf(" | RAM proteccion %s", g_mem_lvl.load() == 2 ? "SOMBRA APAGADA" : g_mem_lvl.load() == 1 ? "N=1" : "no"); // (tej-lag3)
 		std::printf(" | LAG render espera por la sombra: cerrojo buffers %.1f veces %.3f ms/fot, etiquetas %.1f %.3f ms/fot,"
 		            " publicar estado saltado %.1f/fot | cerrojos escritor buffers (tambien en A) %.1f/fot %.3f ms/fot",
 		            wn[TejLag::BcWrite], wms[TejLag::BcWrite], wn[TejLag::Labels], wms[TejLag::Labels], wn[TejLag::Publish], bl, bt);
@@ -1909,12 +2004,12 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		const uint64_t c_reads = c_meta - std::min(c_meta, v[GRkD4]);
 		std::printf("[tej] COS embudo: draws %.0f/fot -> a tiempo %.1f %% -> sin huecos %.1f %% -> regs draws %.1f %% (CS con"
 		            " dispatches %.1f) -> rangos %.1f %% (pierde buffers %.1f, imagenes %.1f, mapeos %.1f) -> metadatos %.1f %% ->"
-		            " clean_reads %.1f %% -> PASA %.1f %% | buffers exactos: salvan %.1f pk/fot, fallan %.1f, sin anillo %.1f |"
+		            " clean_reads %.1f %% -> PASA %.1f %% | buffers exactos (de ellos por filtro de regiones %.1f): salvan %.1f pk/fot, fallan %.1f, sin anillo %.1f |"
 		            " imagenes solo sobre imagenes salvan %.1f pk/fot (de ellas tocarian buffers/lecturas %.1f) | clean_reads"
 		            " escritos por GPU %.1f pk/fot, por CPU %.1f\n",
 		            draws / f, pct(v[GDrawsOnTime]), pct(v[GCosSewn]), pct(v[GCosGfxOk]), pct(v[GCosCsBad]), pct(v[GDrawsOkRanges]),
 		            pct(v[GCosLostBuf]), pct(v[GCosLostImg]), pct(v[GCosLostMap]), pct(c_meta), pct(c_reads), pct(v[GRkD0]),
-		            v[GCosBufExactOk] / f, v[GCosBufExactFail] / f, v[GCosBufExactLost] / f, v[GCosImgOnlyOk] / f,
+		            v[GCosBufRegionOk] / f, v[GCosBufExactOk] / f, v[GCosBufExactFail] / f, v[GCosBufExactLost] / f, v[GCosImgOnlyOk] / f,
 		            v[GCosImgOverOther] / f, v[GCosReadGpu] / f, v[GCosReadHost] / f);
 		std::vector<std::pair<const char*, uint64_t>>  regs;
 		std::vector<std::pair<uint64_t, CosDiag::Rd>> reads;
@@ -1971,7 +2066,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		if (!was && VarOn()) {
 			g_var.store(next, std::memory_order_relaxed);
 			TejLag::g_polite.store(next == 4, std::memory_order_relaxed);
-			TejLag::g_sinmutex.store(next == 5, std::memory_order_relaxed); // (tej-sinmutex: solo su variante)
+			TejLag::g_sinmutex.store(next == 5 || next == 6, std::memory_order_relaxed); // (tej-sinmutex; tej-lag3: 6 tambien)
 			next = (next + 1) % VarN;
 		}
 		g_ab_on.store(!was, std::memory_order_relaxed);
