@@ -4,6 +4,7 @@
 #include "local/ds-nativo-sombras.h" // (F5 pase 2, =3/=1: el estado dinamico de los draws de la cascada marcada)
 #include "local/f0-measure.h" // (f0: table-xpr.inc, KYTY_F0)
 #include "local/trad1.h" // (trad1: table-xpr.inc, KYTY_TRAD1)
+#include "local/bloques-rapido.h" // (bloques-rapido: table-xpr.inc, KYTY_BLOQUES_RAPIDO)
 #include "local/live-control.h" // (trad1b: LiveControl::g_flips, the [trad1] line's frames)
 #include "local/skip-shader.h"
 #include "local/hwrt-scene.h"

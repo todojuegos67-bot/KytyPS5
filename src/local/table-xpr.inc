@@ -2179,10 +2179,16 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 							buffer_cache.Trad1EnableCoverage();
 							range = &table.Trad1Find(address, size);
 							if (range->address != address || range->size != size) why = Trad1::NoProof;
-							else if (range->registration != buffer_cache.RegistrationEpoch()) why = Trad1::Registration;
+							// (bloques-rapido, KYTY_BLOQUES_RAPIDO) the registration per 4 MiB region of the range, as the
+							// read-only V#s prove theirs; then restamped (no region of it changed since).
+							else if (!BloquesRapido::RegistrationHolds(buffer_cache, address, size, range->registration,
+							                                           TRACKER_REGION_SIZE,
+							                                           TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE))
+								why = Trad1::Registration;
 							else if (buffer_cache.GetBufferIfLive(range->owner) != range->owner_buffer) why = Trad1::BufferGone;
 							else if (buffer_cache.Trad1CoverageMoved(address, size, range->coverage)) why = Trad1::Coverage;
 							else eligible = true;
+							if (eligible) range->registration = buffer_cache.RegistrationEpoch(); // (bloques-rapido)
 							if (eligible && trad1 == 1) {
 								const bool     sample = Trad1::SampleFast();
 								const uint64_t start  = sample ? __rdtsc() : 0;
