@@ -181,6 +181,10 @@ enum C : uint32_t {
 	GCosSewn, GCosGfxOk, GCosCsBad, GCosLostBuf, GCosLostImg, GCosLostMap, GCosBufExactOk, GCosBufExactFail,
 	GCosBufExactLost, GCosBufRegionOk, GCosImgOnlyOk, GCosImgOverOther, GCosReadGpu, GCosReadHost, GCosRegSampled,
 	GRkD0, GRkD1, GRkD2, GRkD3, GRkD4, GRkD5, GRkD6, GRkD7, GRkD8,
+	// (tej-cos2) base de la muestra F2p (draws y paquetes F1d de las DCB muestreadas, SIN escalar: el % real es
+	// F1d x pasa/base); imagenes y mapeos por rango exacto (anillos); metadatos borrados sobre imagen del paquete o no
+	GRealBaseD, GRealBasePk, GCosImgExactOk, GCosImgExactFail, GCosImgExactLost, GCosMapExactOk, GCosMapExactFail,
+	GCosMapExactLost, GCosMetaOnImg, GCosMetaOffImg, GCosCsSampled,
 	NCount
 };
 // (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
@@ -1239,12 +1243,39 @@ struct CosDiag {
 	};
 	std::unordered_map<uint64_t, Rd>                        reads;
 	std::unordered_map<uint64_t, std::array<uint64_t, 16>> metas; // (por superficie: veces por origen)
+	// (tej-cos2) los cambios que tumban: imagen (begin -> end, alta/baja, veces) y desmapeo (begin -> end, origen, veces)
+	struct Hit {
+		uint64_t end = 0, n = 0;
+		uint8_t  tag = 0;
+	};
+	std::unordered_map<uint64_t, Hit> img_hits, map_hits;
 	const char*                                             names[64] {};
 	uint32_t                                                n = 0;
 };
 inline CosDiag              g_cos;
 inline uint32_t             g_cos_k = 0;
 inline constexpr uint32_t   CosRegEvery = 16;
+inline void CosHit(std::unordered_map<uint64_t, CosDiag::Hit>& m, uint64_t b, uint64_t e, uint8_t tag) {
+	std::lock_guard g(g_cos.mutex);
+	if (m.size() >= 4096 && !m.contains(b)) return;
+	auto& h = m[b];
+	h.end = e, h.tag = tag, ++h.n;
+}
+// (tej-cos2) Con dispatches y CS distinto (la perdida 'CS con dispatches'): solo los m_cs, mismo mapa.
+inline uint32_t g_cos_cs_k = 0;
+inline void     NoteCsDiff(const CommandProcessor& render, const CommandProcessor& worker) {
+	if (g_cos_cs_k++ % CosRegEvery != 0) return;
+	const HookTimer tm(HRegDiff);
+	Add(GCosCsSampled);
+	auto& d = g_cos;
+	d.n     = 0;
+	render.DiffState(worker, [](const char* name) {
+		if (g_cos.n < 64 && (std::strncmp(name, "m_cs", 4) == 0 || std::strncmp(name, "m_dispatch", 10) == 0))
+			g_cos.names[g_cos.n++] = name;
+	});
+	std::lock_guard g(d.mutex);
+	for (uint32_t i = 0; i < d.n; ++i) ++d.regs[d.names[i]];
+}
 inline void NoteGfxDiff(const CommandProcessor& render, const CommandProcessor& worker) {
 	if (g_cos_k++ % CosRegEvery != 0) return;
 	const HookTimer tm(HRegDiff);
@@ -1401,12 +1432,12 @@ inline void CosWhy(const Packet& p, RenderContext& r, const EffAcc& a, uint64_t 
 			const bool gw = !a.gw.Empty() && a.gw.Intersects(b, en - b);
 			const bool hw = !gw && !a.hw.Empty() && a.hw.Intersects(b, en - b);
 			if (!gw && !hw) continue;
-			Add(gw ? GCosReadGpu : GCosReadHost, RealEvery); // (muestra 1/RealEvery DCB: escalado)
+			Add(gw ? GCosReadGpu : GCosReadHost); // (muestra: sin escalar; la linea escala por F1d/base)
 			const auto*     w = g_eff.FirstWriteOver(from, b, en - b);
 			std::lock_guard g(d.mutex);
 			if (d.reads.size() >= 4096 && !d.reads.contains(b)) return;
 			auto& x = d.reads[b];
-			x.n += RealEvery, x.size = en - b, x.kind = gw ? 1 : 2;
+			x.n += 1, x.size = en - b, x.kind = gw ? 1 : 2;
 			if (w != nullptr) x.w_addr = w->address, x.w_size = w->size, x.source = static_cast<uint8_t>(w->source);
 			return;
 		}
@@ -1415,10 +1446,14 @@ inline void CosWhy(const Packet& p, RenderContext& r, const EffAcc& a, uint64_t 
 	auto& tc = r.GetTextureCache();
 	for (const auto& [addr, slice]: p.metas)
 		if (tc.IsMetaCleared(addr, slice)) {
-			const uint8_t   o = tc.MetaClearOrigin(addr) & 15u;
+			const uint8_t o = tc.MetaClearOrigin(addr) & 15u;
+			// (tej-cos2) la superficie dentro de una imagen del paquete (p.ri, ordenado) o fuera
+			const auto it  = std::upper_bound(p.ri.begin(), p.ri.end(), std::pair<uint64_t, uint64_t> {addr, ~uint64_t {0}});
+			const bool on  = it != p.ri.begin() && std::prev(it)->second > addr;
+			Add(on ? GCosMetaOnImg : GCosMetaOffImg);
 			std::lock_guard g(d.mutex);
 			if (d.metas.size() >= 4096 && !d.metas.contains(addr)) return;
-			d.metas[addr][o] += RealEvery;
+			d.metas[addr][o] += 1;
 			return;
 		}
 }
@@ -1439,7 +1474,10 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 		e.all.TakeTo(g_eff, ~uint64_t {0});
 		const uint32_t why = RealWhy(p, r, e.all, e.lost);
 		if (why != 0) e.pre.TakeTo(g_eff, e.dcb_end); // (tej-lag3: 'pre' solo hace falta si 'all' falla)
-		constexpr uint64_t k = RealEvery; // (muestra: cuentas escaladas)
+		// (tej-cos2) SIN escalar: antes x RealEvery, pero la DCB muestreada (serial % 8) cae siempre en las mismas
+		// posiciones del fotograma (las grandes) y salia 171 %. Ahora: base de la muestra y % = F1d x pasa / base.
+		constexpr uint64_t k = 1;
+		Add(GRealBaseD, sewn), Add(GRealBasePk);
 		Add(static_cast<C>(GRk0 + why), k);
 		Add(static_cast<C>(GRkD0 + why), sewn * k); // (tej-cos)
 		if (why == 3 || why == 4) CosWhy(p, r, e.all, e.from, why);
@@ -1568,21 +1606,43 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 				}
 			}
 			if (rb && !i0) {
-				for (const auto& [a, e]: p.ri) {
-					++k;
-					if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { ri = false; break; }
+				// (tej-cos2) Rango EXACTO (anillo de TextureCache, a paginas de 4 KiB) sobre las imagenes del paquete;
+				// antes paginas de 1 MiB (m_registration_pages): un alta de otra textura en el mismo MiB lo tumbaba.
+				bool                    known = false;
+				Libs::Graphics::TextureCache::RegHit h {};
+				const bool hit = tc.RegisteredOverlapSince(p.ri.data(), p.ri.size(), p.ep_img, known, &h);
+				k += p.ri.size();
+				if (known) {
+					ri = !hit;
+					Add(hit ? GCosImgExactFail : GCosImgExactOk);
+					if (hit && Techo::On()) CosHit(g_cos.img_hits, h.begin, h.end, h.reg ? 1 : 0);
+				} else {
+					Add(GCosImgExactLost);
+					for (const auto& [a, e]: p.ri) {
+						++k;
+						if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { ri = false; break; }
+					}
 				}
-				if (ri && Techo::On()) { // (tej-lag3: diagnostico = MEDIDA)
-					Add(GCosImgOnlyOk);
-					for (const auto& [a, e]: p.rx)
-						if (tc.RegisteredOverSince(a, e - a, p.ep_img)) { Add(GCosImgOverOther); break; }
+				if (ri && Techo::On()) Add(GCosImgOnlyOk); // (tej-lag3: diagnostico = MEDIDA)
+			}
+			if (rb && ri && !m0) {
+				// (tej-cos2) Desmapeos a nivel de byte (anillo de GpuResourceManager) sobre lo leido; antes granulos de 16 KiB.
+				bool                             known = false;
+				Libs::Graphics::GpuResourceManager::UnmapHit h {};
+				const bool hit = gr.UnmappedOverlapSince(p.rx.data(), p.rx.size(), p.ep_map, known, &h);
+				k += p.rx.size();
+				if (known) {
+					rm = !hit;
+					Add(hit ? GCosMapExactFail : GCosMapExactOk);
+					if (hit && Techo::On()) CosHit(g_cos.map_hits, h.begin, h.end, h.origin);
+				} else {
+					Add(GCosMapExactLost);
+					for (const auto& [a, e]: p.rx) {
+						++k;
+						if (gr.UnmappedSince(p.ep_map, a, e - a)) { rm = false; break; }
+					}
 				}
 			}
-			if (rb && ri && !m0)
-				for (const auto& [a, e]: p.rx) {
-					++k;
-					if (gr.UnmappedSince(p.ep_map, a, e - a)) { rm = false; break; }
-				}
 			Add(GRgEntries, k);
 			Add(GRgRaw, p.raw_ranges);
 			if (!b0) Add(rb ? GPkRgBuf : GPkRgFailBuf);
@@ -1590,7 +1650,10 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 			if (!m0 && rb && ri) Add(rm ? GPkRgMap : GPkRgFailMap);
 		}
 		Add(GCosSewn, sewn);
-		if (gfx && !csok) Add(GCosCsBad, sewn);
+		if (gfx && !csok) {
+			Add(GCosCsBad, sewn);
+			if (Techo::On()) NoteCsDiff(cp, *p.cp);
+		}
 		if (sewn != 0 && !gfx) NoteGfxDiff(cp, *p.cp);
 		if (gfx && csok) {
 			Add(GCosGfxOk, sewn);
@@ -1980,12 +2043,16 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0,
 		            v[GValN] != 0 ? static_cast<double>(v[GRgRaw]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
 		// (tej F2p) Cosibles reales: los F1d pasados por las comprobaciones de CommitSegments; Before estimado; prevision.
+		// (tej-cos2) La muestra F2p sin escalar: sc = draws F1d de todo / draws F1d de las DCB muestreadas.
+		const double sc = v[GRealBaseD] != 0 ? static_cast<double>(v[GDrawsOkRanges]) / static_cast<double>(v[GRealBaseD]) : 0.0;
+		const auto   pr = [&](uint64_t x) { return pct(static_cast<uint64_t>(static_cast<double>(x) * sc + 0.5)); };
 		uint64_t rk_all = 0;
 		for (uint32_t k = 0; k < RN; ++k) rk_all += v[GRk0 + k];
 		std::printf("[tej] F2p COSIBLES REALES %.1f %% (F1d %.1f %%; sin efectos de la propia DCB %.1f %%) | paquetes F1d"
 		            " comprobados %.1f/fot:",
-		            pct(v[GRealDraws]), pct(v[GDrawsOkRanges]), pct(v[GRealDrawsPre]), rk_all / f);
-		for (uint32_t k = 0; k < RN; ++k) std::printf(" [%s] %.1f", RNames[k], v[GRk0 + k] / f);
+		            pr(v[GRealDraws]), pct(v[GDrawsOkRanges]), pr(v[GRealDrawsPre]), rk_all * sc / f);
+		for (uint32_t k = 0; k < RN; ++k) std::printf(" [%s] %.1f", RNames[k], v[GRk0 + k] * sc / f);
+		std::printf(" | muestra %.0f draws/fot de %.0f (x%.2f)", v[GRealBaseD] / f, v[GDrawsOkRanges] / f, sc);
 		const double bf_us  = v[GBfPk] != 0 ? static_cast<double>(v[GBfTicks]) * ns_per_tick / 1e3 / static_cast<double>(v[GBfPk]) : 0.0;
 		const double bpk    = v[GBfPk] != 0 ? static_cast<double>(v[GBfPk]) : 1.0;
 		std::printf(" | efectos del render %.0f entradas/fot | Before (muestra 1/%u de las DCB 1/%u, %.1f paquetes/fot): consultas %.2f us/paquete,"
@@ -1994,28 +2061,39 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            v[GEffEntries] / f, BeforeEvery, RealEvery, v[GBfPk] / f, bf_us, v[GBfRanges] / bpk, v[GBfDirtyRanges] / bpk,
 		            static_cast<double>(v[GBfDirtyBytes]) / 1024.0 / bpk, v[GBfBda] / bpk, 100.0 * v[GBfBdaAll] / bpk,
 		            v[GBfInv] / bpk, v[GBfImg] / bpk);
-		const double calls_f = v[GRealCalls] / f, pk_f = v[GRealPk] / f;
+		const double calls_f = v[GRealCalls] * sc / f, pk_f = v[GRealPk] * sc / f;
 		std::printf("[tej] F2-prevision cosibles reales %.1f %% | llamadas cosibles reales %.0f/fot (%.1f paquetes/fot) | Before"
 		            " estimado %.2f us/paquete (solo consultas) | ahorro neto en el render = %.0f x 1.15 us - %.1f x %.2f us ="
 		            " %+.2f ms/fot (sin submit: con secundarios desaparece; sin el coste de subidas/BDA/imagenes)\n",
-		            pct(v[GRealDraws]), calls_f, pk_f, bf_us, calls_f, pk_f, bf_us, (calls_f * 1.15 - pk_f * bf_us) / 1e3);
+		            pr(v[GRealDraws]), calls_f, pk_f, bf_us, calls_f, pk_f, bf_us, (calls_f * 1.15 - pk_f * bf_us) / 1e3);
 		// (tej-cos) Embudo en % de todos los draws: cada paso y su caida, con el motivo principal.
-		const uint64_t c_meta  = v[GDrawsOkRanges] - std::min(v[GDrawsOkRanges], v[GRkD1] + v[GRkD2] + v[GRkD3]);
-		const uint64_t c_reads = c_meta - std::min(c_meta, v[GRkD4]);
+		const auto     scl     = [&](uint64_t x) { return static_cast<uint64_t>(static_cast<double>(x) * sc + 0.5); };
+		const uint64_t c_meta  = v[GDrawsOkRanges] - std::min(v[GDrawsOkRanges], scl(v[GRkD1] + v[GRkD2] + v[GRkD3]));
+		const uint64_t c_reads = c_meta - std::min(c_meta, scl(v[GRkD4]));
 		std::printf("[tej] COS embudo: draws %.0f/fot -> a tiempo %.1f %% -> sin huecos %.1f %% -> regs draws %.1f %% (CS con"
 		            " dispatches %.1f) -> rangos %.1f %% (pierde buffers %.1f, imagenes %.1f, mapeos %.1f) -> metadatos %.1f %% ->"
 		            " clean_reads %.1f %% -> PASA %.1f %% | buffers exactos (de ellos por filtro de regiones %.1f): salvan %.1f pk/fot, fallan %.1f, sin anillo %.1f |"
 		            " imagenes solo sobre imagenes salvan %.1f pk/fot (de ellas tocarian buffers/lecturas %.1f) | clean_reads"
 		            " escritos por GPU %.1f pk/fot, por CPU %.1f\n",
 		            draws / f, pct(v[GDrawsOnTime]), pct(v[GCosSewn]), pct(v[GCosGfxOk]), pct(v[GCosCsBad]), pct(v[GDrawsOkRanges]),
-		            pct(v[GCosLostBuf]), pct(v[GCosLostImg]), pct(v[GCosLostMap]), pct(c_meta), pct(c_reads), pct(v[GRkD0]),
+		            pct(v[GCosLostBuf]), pct(v[GCosLostImg]), pct(v[GCosLostMap]), pct(c_meta), pct(c_reads), pr(v[GRkD0]),
 		            v[GCosBufRegionOk] / f, v[GCosBufExactOk] / f, v[GCosBufExactFail] / f, v[GCosBufExactLost] / f, v[GCosImgOnlyOk] / f,
-		            v[GCosImgOverOther] / f, v[GCosReadGpu] / f, v[GCosReadHost] / f);
+		            v[GCosImgOverOther] / f, v[GCosReadGpu] * sc / f, v[GCosReadHost] * sc / f);
+		std::printf("[tej] COS2 exactos: imagenes (4 KiB, anillo) pasan %.1f pk/fot, fallan %.1f, sin anillo %.1f | desmapeos (bytes,"
+		            " anillo) pasan %.1f, fallan %.1f, sin anillo %.1f | metadatos borrados sobre imagen del paquete %.1f, fuera %.1f"
+		            " pk/fot | CS distinto muestreado %.1f/fot\n",
+		            v[GCosImgExactOk] / f, v[GCosImgExactFail] / f, v[GCosImgExactLost] / f, v[GCosMapExactOk] / f,
+		            v[GCosMapExactFail] / f, v[GCosMapExactLost] / f, v[GCosMetaOnImg] * sc / f, v[GCosMetaOffImg] * sc / f,
+		            v[GCosCsSampled] / f);
 		std::vector<std::pair<const char*, uint64_t>>  regs;
 		std::vector<std::pair<uint64_t, CosDiag::Rd>> reads;
 		std::vector<std::pair<uint64_t, std::array<uint64_t, 16>>> metas;
+		std::vector<std::pair<uint64_t, CosDiag::Hit>>              ihits, mhits;
 		{
 			std::lock_guard g(g_cos.mutex);
+			ihits.assign(g_cos.img_hits.begin(), g_cos.img_hits.end());
+			mhits.assign(g_cos.map_hits.begin(), g_cos.map_hits.end());
+			g_cos.img_hits.clear(), g_cos.map_hits.clear();
 			regs.assign(g_cos.regs.begin(), g_cos.regs.end());
 			reads.assign(g_cos.reads.begin(), g_cos.reads.end());
 			metas.assign(g_cos.metas.begin(), g_cos.metas.end());
@@ -2039,18 +2117,35 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 			std::printf(" [0x%llx +%llu <- %s %s 0x%llx +%llu] %.2f", static_cast<unsigned long long>(reads[i].first),
 			            static_cast<unsigned long long>(x.size), x.kind == 1 ? "GPU" : "CPU", src_name[x.source % 3],
 			            static_cast<unsigned long long>(x.w_addr), static_cast<unsigned long long>(x.w_size),
-			            static_cast<double>(x.n) / f);
+			            static_cast<double>(x.n) * sc / f);
 		}
 		std::printf(" | metadatos borrados (superficie: origen=veces, pk/fot):");
 		static constexpr const char* org[8] = {"otro", "compute clear", "depth clear draw", "CP fill", "DCC fill",
 		                                       "depth bind record", "?6", "?7"};
 		for (size_t i = 0; i < metas.size() && i < 8; ++i) {
-			std::printf(" [0x%llx %.2f:", static_cast<unsigned long long>(metas[i].first), static_cast<double>(msum(metas[i].second)) / f);
+			std::printf(" [0x%llx %.2f:", static_cast<unsigned long long>(metas[i].first), static_cast<double>(msum(metas[i].second)) * sc / f);
 			for (uint32_t o = 0; o < 16; ++o)
 				if (metas[i].second[o] != 0) std::printf(" %s%s=%llu", org[o & 7u], o >= 8 ? " en hueco" : "",
 				                                          static_cast<unsigned long long>(metas[i].second[o]));
 			std::printf("]");
 		}
+		std::printf("\n");
+		// (tej-cos2) Quien tumba imagenes y mapeos: el cambio exacto (direccion, tamano, alta/baja u origen), pk/fot.
+		const auto by_n = [](const auto& x, const auto& y) { return x.second.n > y.second.n; };
+		std::ranges::sort(ihits, by_n), std::ranges::sort(mhits, by_n);
+		static constexpr const char* uorg[11] = {"otro", "MapNamedFlexible", "SetPrtAperture", "munmap", "ReleaseDirect",
+		                                         "MapDirect", "ReplaceFixed", "ReserveVirtualRange", "AllocGuestRuntime",
+		                                         "FreeGuest", "PoolDecommit"};
+		std::printf("[tej] COS2 imagenes que tumban (%zu distintas):", ihits.size());
+		for (size_t i = 0; i < ihits.size() && i < 10; ++i)
+			std::printf(" [0x%llx +0x%llx %s] %.2f", static_cast<unsigned long long>(ihits[i].first),
+			            static_cast<unsigned long long>(ihits[i].second.end - ihits[i].first), ihits[i].second.tag ? "alta" : "baja",
+			            ihits[i].second.n / f);
+		std::printf(" | desmapeos que tumban (%zu distintos):", mhits.size());
+		for (size_t i = 0; i < mhits.size() && i < 10; ++i)
+			std::printf(" [0x%llx +0x%llx %s] %.2f", static_cast<unsigned long long>(mhits[i].first),
+			            static_cast<unsigned long long>(mhits[i].second.end - mhits[i].first), uorg[mhits[i].second.tag % 11],
+			            mhits[i].second.n / f);
 		std::printf("\n");
 	}
 	if (m == 2 && VarOn()) {

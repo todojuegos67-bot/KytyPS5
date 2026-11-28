@@ -1157,7 +1157,16 @@ bool TextureCache::RecentlyFailed(const ImageInfo& info) const {
 	});
 }
 
-void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch) {
+void TextureCache::StampRegistrationPages(const Image& image, uint64_t epoch, bool reg) {
+	{
+		// (tej-cos2) El rango exacto, con su epoca la ultima (bit 63 de end: alta).
+		auto& slot = m_reg_ring[epoch % RegLogN];
+		slot.epoch.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		slot.begin.store(image.info.data.address, std::memory_order_relaxed);
+		slot.end.store(image.info.data.End() | (reg ? uint64_t {1} << 63 : 0), std::memory_order_relaxed);
+		slot.epoch.store(epoch, std::memory_order_release);
+	}
 	if (m_registration_log.size() >= 8192) m_registration_log.erase(m_registration_log.begin(), m_registration_log.begin() + 4096);
 	m_registration_log.push_back({epoch, image.info.data.address, image.info.data.End()});
 	ImagePageTable::PageRange pages {};
@@ -1174,6 +1183,33 @@ bool TextureCache::RegistrationsOverlapSince(uint64_t address, uint64_t size, ui
 	const auto         begin = address & ~(page - 1), end = (address + size + page - 1) & ~(page - 1);
 	for (auto entry = log.rbegin(); entry != log.rend() && entry->epoch > epoch; ++entry)
 		if ((entry->begin & ~(page - 1)) < end && begin < ((entry->end + page - 1) & ~(page - 1))) return true;
+	return false;
+}
+
+bool TextureCache::RegisteredOverlapSince(const std::pair<uint64_t, uint64_t>* ranges, size_t n, uint64_t epoch, bool& known,
+                                          RegHit* hit) const {
+	const uint64_t now = m_resolution_epoch.load(std::memory_order_acquire);
+	known              = now <= epoch || now - epoch <= RegLogN;
+	if (!known || now <= epoch || n == 0) return !known;
+	constexpr uint64_t pg = TRACKER_PAGE_SIZE, top = uint64_t {1} << 63;
+	for (uint64_t e = epoch + 1; e <= now; ++e) {
+		const auto& slot = m_reg_ring[e % RegLogN];
+		if (slot.epoch.load(std::memory_order_acquire) != e) return known = false, true;
+		const uint64_t b0 = slot.begin.load(std::memory_order_relaxed), e0 = slot.end.load(std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (slot.epoch.load(std::memory_order_relaxed) != e) return known = false, true;
+		const uint64_t b = b0 & ~(pg - 1), en = ((e0 & ~top) + pg - 1) & ~(pg - 1);
+		size_t lo = 0, hi = n;
+		while (lo < hi) {
+			const size_t mid = (lo + hi) / 2;
+			if (((ranges[mid].second + pg - 1) & ~(pg - 1)) <= b) lo = mid + 1;
+			else hi = mid;
+		}
+		if (lo < n && (ranges[lo].first & ~(pg - 1)) < en) {
+			if (hit != nullptr) *hit = {b0, e0 & ~top, (e0 & top) != 0};
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -1296,7 +1332,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			if (it->second.empty()) by_base.erase(it);
 		}
 	}
-	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1);
+	StampRegistrationPages(image, m_resolution_epoch.fetch_add(1, std::memory_order_release) + 1, false);
 	++m_image_granule_releases;
 	UntrackImage(id, "unregister");
 	ImagePageTable::PageRange pages {};

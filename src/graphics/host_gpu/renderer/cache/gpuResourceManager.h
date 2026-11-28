@@ -19,6 +19,11 @@
 
 namespace Libs::Graphics {
 
+// (tej-cos2) Quien desmapea (kernel/memory.cpp, antes de UnmapGpuRange): 0 otro, 1 MapNamedFlexible, 2 SetPrtAperture,
+// 3 munmap, 4 ReleaseDirect, 5 MapDirect, 6 ReplaceFixed, 7 ReserveVirtualRange, 8 AllocateGuestRuntime, 9 FreeGuest,
+// 10 PoolDecommit.
+inline thread_local uint8_t t_unmap_origin = 0;
+
 class CommandScheduler;
 class GuestGpu;
 
@@ -110,6 +115,39 @@ public:
 	// Whether memory in [vaddr, vaddr + size) was unmapped after mapping epoch `epoch` (by 16 KiB
 	// granule). GPU thread, as UnmapMemory.
 	[[nodiscard]] bool UnmappedSince(uint64_t epoch, uint64_t vaddr, uint64_t size) const noexcept;
+	// (tej-cos2) Lo mismo a nivel de byte sobre `ranges` ([begin, end) ordenados, sin solaparse): un anillo de los ultimos
+	// MapLogN cambios de mapeo (los mapeos, vacios), epoca escrita la ultima, sin cerrojo. `known` false: no llega (el
+	// llamador usa UnmappedSince). `hit`: el desmapeo que choco (begin, end, origen t_unmap_origin).
+	struct UnmapHit {
+		uint64_t begin = 0, end = 0;
+		uint8_t  origin = 0;
+	};
+	[[nodiscard]] bool UnmappedOverlapSince(const std::pair<uint64_t, uint64_t>* ranges, size_t n, uint64_t epoch, bool& known,
+	                                        UnmapHit* hit = nullptr) const noexcept {
+		const uint64_t now = m_mapping_epoch.load(std::memory_order_acquire);
+		known              = now <= epoch || now - epoch <= MapLogN;
+		if (!known || now <= epoch || n == 0) return !known;
+		for (uint64_t e = epoch + 1; e <= now; ++e) {
+			const auto& slot = m_map_ring[e % MapLogN];
+			if (slot.epoch.load(std::memory_order_acquire) != e) return known = false, true;
+			const uint64_t b = slot.begin.load(std::memory_order_relaxed), x = slot.end.load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (slot.epoch.load(std::memory_order_relaxed) != e) return known = false, true;
+			const uint64_t en = x & ((uint64_t {1} << 56) - 1);
+			if (en <= b) continue; // (un mapeo: no quita nada)
+			size_t lo = 0, hi = n;
+			while (lo < hi) {
+				const size_t mid = (lo + hi) / 2;
+				if (ranges[mid].second <= b) lo = mid + 1;
+				else hi = mid;
+			}
+			if (lo < n && ranges[lo].first < en) {
+				if (hit != nullptr) *hit = {b, en, static_cast<uint8_t>(x >> 56)};
+				return true;
+			}
+		}
+		return false;
+	}
 
 	bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	// After each completed submission: its shaders' fault records and the image downloads.
@@ -156,6 +194,20 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::atomic<uint64_t> m_mapping_epoch {1};
+	// (tej-cos2) UnmappedOverlapSince: los ultimos MapLogN cambios de mapeo por epoca % MapLogN (end: bits 56.. origen).
+	static constexpr uint64_t MapLogN = 1024;
+	struct MapLogEntry {
+		std::atomic<uint64_t> epoch {0}, begin {0}, end {0};
+	};
+	std::unique_ptr<MapLogEntry[]> m_map_ring = std::make_unique<MapLogEntry[]>(MapLogN);
+	void NoteMapRing(uint64_t epoch, uint64_t begin, uint64_t end, uint8_t origin) noexcept {
+		auto& slot = m_map_ring[epoch % MapLogN];
+		slot.epoch.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		slot.begin.store(begin, std::memory_order_relaxed);
+		slot.end.store(end | (uint64_t {origin} << 56), std::memory_order_relaxed);
+		slot.epoch.store(epoch, std::memory_order_release);
+	}
 	// The mapping epoch of each 16 KiB granule's latest unmap, in 1 GiB leaves made at its first unmap
 	// (written by UnmapMemory's GPU-thread part). The latest 64 unmaps before: streaming textures in
 	// unmaps that many 64 KiB pool layers within frames, so a proof a few frames old counted as stale.

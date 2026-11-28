@@ -1084,7 +1084,7 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 		{
 			std::lock_guard lock(m_mapped_ranges_mutex);
 			m_mapped_ranges.Add(vaddr, size);
-			++m_mapping_epoch;
+			NoteMapRing(++m_mapping_epoch, 0, 0, 0); // (tej-cos2: un mapeo, vacio)
 			if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
 		}
 		FreshWatch(vaddr, size);
@@ -1109,7 +1109,9 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		     vaddr, size);
 	}
 	TextureOffload::OnHostAccess(vaddr, size, true, false);
-	const auto unmap = [this, vaddr, size, releasing] {
+	const uint8_t origin = t_unmap_origin; // (tej-cos2: quien desmapea; el hilo de la GPU lo aplica)
+	t_unmap_origin       = 0;
+	const auto unmap = [this, vaddr, size, releasing, origin] {
 		// Released memory loses its host protection with the mapping: the watchers removed
 		// below need not restore it page run by page run first.
 		struct UnmappingRange {
@@ -1154,6 +1156,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size, bool releasi
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		const auto epoch = ++m_mapping_epoch;
+		NoteMapRing(epoch, vaddr, vaddr + size, origin); // (tej-cos2)
 		if (registered) NoteBdaSpan(vaddr, size);
 		if (size == 0) return;
 		m_unmap_latest = epoch;

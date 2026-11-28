@@ -101,6 +101,17 @@ public:
 	[[nodiscard]] uint64_t ResolutionEpoch() const {
 		return m_resolution_epoch.load(std::memory_order_acquire);
 	}
+	// (tej-cos2) Alguna imagen registrada o quitada que solape (a paginas de TRACKER_PAGE_SIZE: lo que mira
+	// ImagePageRangesOverlap; las busquedas de resolucion miran bytes) alguno de `ranges` ([begin, end) ordenados, sin
+	// solaparse) desde `epoch`. Anillo de los ultimos RegLogN cambios (epoca escrita la ultima), sin m_lock; `known` false:
+	// el anillo no llega (o se reescribia): el llamador usa RegisteredOverSince. `hit` (opcional): el cambio que choco
+	// (begin, end, 1 alta / 0 baja).
+	struct RegHit {
+		uint64_t begin = 0, end = 0;
+		bool     reg   = false;
+	};
+	[[nodiscard]] bool RegisteredOverlapSince(const std::pair<uint64_t, uint64_t>* ranges, size_t n, uint64_t epoch, bool& known,
+	                                          RegHit* hit = nullptr) const;
 	// Moves whenever an image's slot is erased (EraseRetired, the only place): an id allocated when it was E is still
 	// allocated while it is E.
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
@@ -594,7 +605,13 @@ private:
 	// KYTY_TEXTURE_RESOLVE_PAGES: a resolution proven at an epoch still holds while no
 	// image over its range registered or unregistered since.
 	ImageEpochTable    m_registration_pages;
-	void               StampRegistrationPages(const Image& image, uint64_t epoch);
+	void               StampRegistrationPages(const Image& image, uint64_t epoch, bool reg = true);
+	// (tej-cos2) RegisteredOverlapSince: los ultimos RegLogN altas/bajas, por epoca % RegLogN.
+	static constexpr uint64_t RegLogN = 8192;
+	struct RegLogEntry {
+		std::atomic<uint64_t> epoch {0}, begin {0}, end {0};
+	};
+	std::unique_ptr<RegLogEntry[]> m_reg_ring = std::make_unique<RegLogEntry[]>(RegLogN);
 	[[nodiscard]] bool RegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch) const;
 	// The latest registrations and unregistrations, in order: the epoch each moved m_resolution_epoch to (one each) and
 	// the image's memory. Whether any after `epoch` reached [address, address + size)'s stamp pages; `known` false when

@@ -5841,7 +5841,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			(Libs::Graphics::t_unmap_origin = 1), UnmapGpuRange(in_addr, len);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -5863,7 +5863,7 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			(Libs::Graphics::t_unmap_origin = 1), UnmapGpuRange(out_addr, len);
 			residency_lock.lock();
 		}
 	}
@@ -5952,7 +5952,7 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 		old = g_prt_apertures[static_cast<size_t>(index)];
 	}
 	if (old.size != 0) {
-		UnmapGpuRange(old.address, old.size);
+		(Libs::Graphics::t_unmap_origin = 2), UnmapGpuRange(old.address, old.size);
 	}
 	{
 		Common::LockGuard lock(g_prt_aperture_mutex);
@@ -6161,7 +6161,7 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
 		return KERNEL_ERROR_EACCES;
 	}
-	UnmapGpuRange(vaddr, len, true);
+	(Libs::Graphics::t_unmap_origin = 3), UnmapGpuRange(vaddr, len, true);
 	const int result = UnmapMemoryRange(vaddr, len);
 	if (result != OK) {
 		RestoreGpuRangeProtection(vaddr, len);
@@ -6445,7 +6445,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 	}
 
 	for (const auto& alias: mapped_aliases) {
-		UnmapGpuRange(alias.map_vaddr, alias.map_size);
+		(Libs::Graphics::t_unmap_origin = 4), UnmapGpuRange(alias.map_vaddr, alias.map_size);
 	}
 
 	auto restore_gpu_aliases = [&mapped_aliases]() {
@@ -6625,7 +6625,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			(Libs::Graphics::t_unmap_origin = 5), UnmapGpuRange(in_addr, len);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -6654,7 +6654,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			(Libs::Graphics::t_unmap_origin = 5), UnmapGpuRange(in_addr, len);
 			residency_lock.lock();
 			consumed_range = reserved_ranges.front();
 			if (g_virtual_ranges->ConsumeReservedSpan(in_addr, len)) {
@@ -6669,7 +6669,7 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 			if (residency_lock.owns_lock()) residency_lock.unlock();
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
-				UnmapGpuRange(out_addr, len);
+				(Libs::Graphics::t_unmap_origin = 5), UnmapGpuRange(out_addr, len);
 				residency_lock.lock();
 				shared_backing = map_shared_fixed(out_addr);
 				if (!shared_backing) {
@@ -6881,7 +6881,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	// Existing pages remain logically owned throughout a successful replacement
 	// (or its rollback). Readers must not observe the temporary Remove/Add gap or
 	// a backing view halfway through replacement. GPU drains precede this lock.
-	UnmapGpuRange(start, size);
+	(Libs::Graphics::t_unmap_origin = 6), UnmapGpuRange(start, size);
 	std::unique_lock residency_lock(g_prt_residency_mutex);
 	auto restore_chunks = [&chunks, &residency_lock]() -> bool {
 		bool ok = true;
@@ -7076,7 +7076,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			(Libs::Graphics::t_unmap_origin = 7), UnmapGpuRange(out_addr, len);
 		}
 	}
 
@@ -7294,7 +7294,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	if (vaddr == 0 || g_virtual_ranges->HasOverlap(vaddr, mapped_size)) {
 		return 0;
 	}
-	UnmapGpuRange(vaddr, mapped_size);
+	(Libs::Graphics::t_unmap_origin = 8), UnmapGpuRange(vaddr, mapped_size);
 	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
 		return 0;
 	}
@@ -7455,7 +7455,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
-	UnmapGpuRange(vaddr, mapped_size, true);
+	(Libs::Graphics::t_unmap_origin = 9), UnmapGpuRange(vaddr, mapped_size, true);
 	const bool freed = FreeGuestMemoryOwner(vaddr, mapped_size);
 #if defined(_WIN32)
 	if (freed) PinWatched::Forget(vaddr, mapped_size);
@@ -7941,7 +7941,7 @@ int KYTY_SYSV_ABI KernelMemoryPoolDecommit(void* addr, size_t len, int flags) {
 		scan = next;
 	}
 
-	UnmapGpuRange(vaddr, len, true);
+	(Libs::Graphics::t_unmap_origin = 10), UnmapGpuRange(vaddr, len, true);
 	const int result = DecommitMemoryPoolRange(vaddr, len);
 	if (result != OK) {
 		RestoreGpuRangeProtection(vaddr, len);
