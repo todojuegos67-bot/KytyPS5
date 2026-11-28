@@ -11,7 +11,6 @@
 // HS 0x10c-0x12b) and the compute space (0x200+) never dirty it; dispatches,
 // synchronisation, index state and indirect bases never do either.
 #include "graphics/guest_gpu/pm4.h"
-#include "local/emision-draws.h"
 
 #include <array>
 #include <cstdint>
@@ -105,13 +104,6 @@ inline void Invalidate() {
 // Every packet the command processor is about to execute.
 inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
 	auto& s = g_shadow;
-	// (emision-draws) Cualquier paquete que no sea de registros o de indices mueve el serial (un draw tambien).
-	if (!(opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_SH_REG || opcode == Pm4::IT_SET_UCONFIG_REG ||
-	      opcode == Pm4::IT_SET_UCONFIG_REG_INDEX || opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT ||
-	      opcode == Pm4::IT_SET_SH_REG_INDIRECT || opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT || opcode == Pm4::IT_INDEX_BASE ||
-	      opcode == Pm4::IT_INDEX_BUFFER_SIZE || opcode == Pm4::IT_INDEX_TYPE || opcode == Pm4::IT_NUM_INSTANCES) ||
-	    predicated_skip)
-		++EmisionDraws::t_serial;
 	if (predicated_skip) {
 		s.dirty       = true;
 		s.key_changes = 7;
