@@ -362,6 +362,7 @@ struct AjmInstanceState {
 	AjmInstanceStats            stats;
 	bool                        produced      = false;
 	bool                        silent_logged = false;
+	uint32_t                    gapless_loops = 0;
 };
 
 static std::mutex                                     g_ajm_instances_mutex;
@@ -682,6 +683,23 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 	}
 
 	const bool was_end = state->gapless.IsEnd();
+	// (KYTY_AJM_LOOP, default on.) An instance at its gapless end that is given new input goes on with it: the
+	// counters start again from the stream's params (as at its start). Before, it stayed at its end and every later
+	// decode gave nothing ([ajm-vacio] "fin gapless 1->1"): the game's looping/streamed sounds (the fire of the main
+	// menu) went silent until it restarted them.
+	static const bool loop_on_input = [] {
+		const char* v = std::getenv("KYTY_AJM_LOOP");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (loop_on_input && was_end && input != nullptr && input_size != 0) {
+		state->gapless.Reset();
+		state->gapless_loops++;
+		if (state->gapless_loops <= 3 || state->gapless_loops % 100 == 0) {
+			std::printf("[ajm-bucle] instancia 0x%05x: fin gapless con %zu bytes nuevos, contadores reiniciados (#%u, limite %u)\n",
+			            instance, input_size, state->gapless_loops, state->gapless.init.total_samples);
+			std::fflush(stdout);
+		}
+	}
 	auto result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames, &state->gapless);
 	// [ajm-vacio] (always, once per instance and stretch): an instance that was producing gives nothing with input.
 	if (result.output_written != 0) {
