@@ -332,7 +332,7 @@ inline void Window(double busy_ms, double frames) {
 		std::printf(" | %s %.3f (%llu, %.1f %.1f %.1f, %.0f%%)", kName[&sc - g->s], ms,
 		            static_cast<unsigned long long>(sc.w_frames), sc.w_draws / d, sc.w_disp / d, sc.w_pipes / d,
 		            sd > 0 ? 100.0 * sc.w_same / sd : 0.0);
-		sc.w_draws = sc.w_disp = sc.w_pipes = sc.w_frames = sc.w_same = sc.w_diff = 0;
+		sc.w_draws = sc.w_disp = sc.w_pipes = sc.w_same = sc.w_diff = 0; // (w_frames: tras [luz-nativa])
 	}
 	std::printf("\n");
 	// (luz-nativa) dato decisivo de la fase 1: si el PM4 del tramo (y su user data) es igual palabra a palabra al del
@@ -347,6 +347,7 @@ inline void Window(double busy_ms, double frames) {
 		            sc.w_ud / d, 100.0 * sc.w_bsame / dp, 100.0 * sc.w_bssame / dp, 100.0 * sc.w_udsame / dp);
 		sc.w_bsame = sc.w_bssame = sc.w_udsame = sc.w_pk = sc.w_dw = sc.w_memw = sc.w_ud = 0;
 	}
+	for (auto& sc : g->s) sc.w_frames = 0;
 	std::printf("\n");
 	std::fflush(stdout);
 }
