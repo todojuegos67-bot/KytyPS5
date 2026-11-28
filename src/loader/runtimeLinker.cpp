@@ -907,6 +907,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					if (const auto* q = g_faulting_linker->FindProgramByAddr(ret); q != nullptr)
 						site = (ret - q->base_vaddr + 1u) | (uint64_t {1} << 40u);
 				}
+				if (site == 0) {
+					// (faltas-quien) la fila "?": rip del host + la primera ret del eboot en la pila.
+					uint64_t eboot_ret = 0;
+					if (info->rsp != 0)
+						for (int w = 0; w < 16 && eboot_ret == 0; ++w) {
+							const uint64_t v = reinterpret_cast<const uint64_t*>(info->rsp)[w];
+							if (const auto* q = g_faulting_linker->FindProgramByAddr(v); q != nullptr) eboot_ret = v - q->base_vaddr + 1u;
+						}
+					TechoFaltas::NoteUnknown(rip, eboot_ret, info->r8, cycles);
+				}
 			}
 			TechoFaltas::Note(info->access_violation_vaddr, cycles, site, sampled);
 		}

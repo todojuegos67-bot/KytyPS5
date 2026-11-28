@@ -135,6 +135,63 @@ struct EnvioScope {
 	EnvioScope& operator=(const EnvioScope&) = delete;
 };
 
+// (faltas-quien, KYTY_TECHO: solo mide) La fila "?" de sitios: falta en codigo que no es del eboot y cuyo [rsp] tampoco
+// lo es (memcpy/escritura del emulador mas hondo). Clave = rip del host + la primera direccion del eboot en las 16
+// primeras palabras de la pila (offset+1, 0 si ninguna). Tamano: r8 en la falta (en memcpy de Windows = bytes,
+// aproximado: el bucle lo va gastando), histograma <=64, <=4K, <=64K, mas.
+constexpr size_t QSlots = 256;
+struct QSlot {
+	std::atomic<uint64_t> rip {0}, ret {0}, n {0}, cyc {0}, h[4] {};
+};
+inline QSlot                 g_q[QSlots];
+inline std::atomic<uint64_t> g_q_lost {0};
+inline void NoteUnknown(uint64_t rip, uint64_t eboot_ret, uint64_t r8, uint64_t cycles) noexcept {
+	const uint64_t k = (rip ^ (eboot_ret * 0x9E3779B97F4A7C15ull));
+	size_t         i = static_cast<size_t>((k * 0x9E3779B97F4A7C15ull) >> 56u) % QSlots;
+	for (size_t p = 0; p < 16; ++p, i = (i + 1) % QSlots) {
+		uint64_t cur = g_q[i].rip.load(std::memory_order_relaxed);
+		if (cur == 0 && g_q[i].rip.compare_exchange_strong(cur, rip, std::memory_order_relaxed)) {
+			g_q[i].ret.store(eboot_ret, std::memory_order_relaxed);
+			cur = rip;
+		}
+		if (cur != rip || g_q[i].ret.load(std::memory_order_relaxed) != eboot_ret) continue;
+		g_q[i].n.fetch_add(1, std::memory_order_relaxed);
+		g_q[i].cyc.fetch_add(cycles, std::memory_order_relaxed);
+		g_q[i].h[r8 <= 64 ? 0 : r8 <= 4096 ? 1 : r8 <= 65536 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	g_q_lost.fetch_add(1, std::memory_order_relaxed);
+}
+inline void ReportUnknown(double frames, double ms_cyc) noexcept {
+	struct R {
+		uint64_t rip, ret, n, cyc, h[4];
+	};
+	R      top[8] {};
+	size_t used = 0;
+	for (auto& q: g_q) {
+		const uint64_t rip = q.rip.load(std::memory_order_relaxed);
+		if (rip == 0) continue;
+		R r {rip, q.ret.load(std::memory_order_relaxed), q.n.exchange(0), q.cyc.exchange(0), {q.h[0].exchange(0), q.h[1].exchange(0), q.h[2].exchange(0), q.h[3].exchange(0)}};
+		if (r.n == 0) continue;
+		size_t k = used < 8 ? used++ : 8;
+		if (k == 8) {
+			if (r.n <= top[7].n) continue;
+			k = 7;
+		}
+		while (k > 0 && top[k - 1].n < r.n) top[k] = top[k - 1], --k;
+		top[k] = r;
+	}
+	std::printf(" | quien-? (x4, rip del host; ancla Report=%p; eboot=primera ret del eboot en la pila; r8 <=64/<=4K/<=64K/mas):",
+	            reinterpret_cast<void*>(&ReportUnknown));
+	for (size_t k = 0; k < used; ++k)
+		std::printf(" rip %llx eboot %s%llx %.1f/fot %.2f ms [%llu/%llu/%llu/%llu]%s", static_cast<unsigned long long>(top[k].rip),
+		            top[k].ret == 0 ? "-" : "", static_cast<unsigned long long>(top[k].ret == 0 ? 0 : top[k].ret - 1u),
+		            static_cast<double>(top[k].n) * 4.0 / frames, static_cast<double>(top[k].cyc) * 4.0 * ms_cyc / frames,
+		            static_cast<unsigned long long>(top[k].h[0]), static_cast<unsigned long long>(top[k].h[1]),
+		            static_cast<unsigned long long>(top[k].h[2]), static_cast<unsigned long long>(top[k].h[3]), k + 1 < used ? "," : "");
+	std::printf(" (perdidos %llu)", static_cast<unsigned long long>(g_q_lost.exchange(0)));
+}
+
 // Desde Techo::Report (cada 5 s): `frames` fotogramas, `ms_cyc` ms por ciclo TSC.
 inline void Report(double frames, double ms_cyc) noexcept {
 	if (frames <= 0) return;
@@ -267,6 +324,7 @@ inline void Report(double frames, double ms_cyc) noexcept {
 		            was ? "B" : "A", a, cnt[0], b, cnt[1], (cnt[0] > 0 && cnt[1] > 0) ? b - a : 0.0);
 		FaltasReciclado::g_now.store(!was, std::memory_order_relaxed);
 	}
+	ReportUnknown(frames, ms_cyc);
 	std::printf(" | perdidos %llu\n", static_cast<unsigned long long>(g_lost.exchange(0, std::memory_order_relaxed)));
 	std::fflush(stdout);
 }
