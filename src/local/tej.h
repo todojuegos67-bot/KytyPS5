@@ -108,6 +108,20 @@ inline std::atomic<int> g_var {0}; // (variante de la ventana B actual; 0 sin KY
 	return m == 1 || (m == 2 && g_ab_on.load(std::memory_order_relaxed));
 }
 
+// (tej F2p) Registro de efectos del render (escrituras GPU, escrituras de CPU que ven los barridos, sets retirados) con
+// KYTY_TEJ: el mismo EffectsLog que CommitSegments lee (Spec::t_effects del hilo de render cuando no hay especulacion).
+// Solo el render escribe y lee las entradas; el trabajador lee End() (atomico) al empezar a traducir.
+// Dueno: el primer hilo que procesa una DCB de la cola 0 (GpuSlice), para siempre; los demas hilos no escriben.
+inline Libs::Graphics::Spec::EffectsLog g_eff;
+inline std::atomic<bool>                 g_eff_owned {false};
+inline thread_local bool                 t_eff_owner = false;
+[[nodiscard]] inline Libs::Graphics::Spec::EffectsLog* EffLog() { return Mode() != 0 && t_eff_owner ? &g_eff : nullptr; }
+inline void ClaimEff() {
+	if (t_eff_owner || g_eff_owned.load(std::memory_order_relaxed)) return;
+	bool no = false;
+	if (g_eff_owned.compare_exchange_strong(no, true)) t_eff_owner = true;
+}
+
 inline constexpr uint32_t PacketDraws = 64, MaxPackets = 16, Slots = 16, MaxAhead = 12, MaxQueued = 24, MaxWorkers = 6;
 
 enum C : uint32_t {
@@ -128,6 +142,12 @@ enum C : uint32_t {
 	WIdleNoCpu, WBiggest,
 	WCalls, WAssumed, WFixNs, WCallsMeasured, WTransMeasuredNs,
 	WVarIdle, WVarSkip, // (tej-var)
+	// (tej F2p) render: los cosibles F1d pasados por las comprobaciones de CommitSegments (solo lectura): paquetes por
+	// primer motivo de rechazo (RNames), draws/llamadas que pasan, y la variante sin los efectos de la propia DCB
+	GRk0, GRk1, GRk2, GRk3, GRk4, GRk5, GRk6, GRk7, GRk8, GRealDraws, GRealCalls, GRealPk, GRealDrawsPre, GRealPkPre,
+	GEffEntries,
+	// (tej F2p) render, 1 de cada BeforeEvery paquetes que pasan: lo que Before haria (consultas de solo lectura)
+	GBfPk, GBfTicks, GBfRanges, GBfDirtyRanges, GBfDirtyBytes, GBfBda, GBfBdaAll, GBfInv, GBfImg,
 	NCount
 };
 // (tej-lag) Contadores por hilo, cada banco alineado a 64: el render no comparte linea de cache con la sombra (antes un
@@ -144,9 +164,10 @@ inline void Add(C i, uint64_t v = 1) { g_bank[t_bank].c[i].fetch_add(v, std::mem
 // atomicos por draw) y vuelca por DCB (GpuDone); la linea [tej] coste lo da en ms/fot. Ademas, por DCB de la cola 0, el
 // tiempo de pared del render y sus ciclos de CPU (QueryThreadCycleTime): si en B sube la pared y no los ciclos, el render
 // espera / es expulsado; si suben los ciclos, calcula mas o mas lento (cache/memoria).
-enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HN };
+enum H : uint32_t { HSlice, HDraw, HVal, HRanges, HRegDiff, HDispatch, HWait, HFlip, HDone, HPublish, HReal, HBefore, HN };
 inline constexpr const char* HName[HN] = {"inicio DCB", "draw (todo)", "validar regs", "rangos", "DiffState 1/64",
-                                          "dispatch", "espera WAIT_REG_MEM", "flip (latencia)", "fin DCB", "publicar estado"};
+                                          "dispatch", "espera WAIT_REG_MEM", "flip (latencia)", "fin DCB", "publicar estado",
+                                          "F2p cosibles reales", "F2p Before 1/8"};
 struct alignas(64) HookAcc {
 	std::atomic<uint64_t> t[2][HN] {}, n[2][HN] {};
 	std::atomic<uint64_t> dcb_n[2] {}, dcb_wall[2] {}, dcb_cyc[2] {};
@@ -213,10 +234,22 @@ struct Packet {
 	// + imagenes ordenados y fusionados (solapados/contiguos: mismas direcciones, misma respuesta en imagenes y mapeos).
 	std::vector<std::pair<uint64_t, uint64_t>> rb, rx;
 	uint32_t                                   raw_ranges = 0;
+	// (tej F2p) Lo demas que CommitSegments comprueba, copiado por el trabajador al cerrar (el estado de la traduccion
+	// se reutiliza): copias de CPU, sets, lecturas de cadena, esperas, hechos de metadatos no borrados; y lo que Before
+	// haria (rangos escritos y actuales; BDA, invalidaciones e imagenes de los segmentos: solo cuentas).
+	size_t fi_wr = 0, fi_cur = 0, fi_bda = 0, fi_inv = 0, fi_copy = 0, fi_set = 0, fi_chain = 0, fi_wait = 0, seg_open = 0;
+	std::vector<std::pair<uint64_t, uint64_t>>      wr, cur, copies;
+	std::vector<uint64_t>                           sets;
+	std::vector<Libs::Graphics::Spec::ChainRead>    chains;
+	std::vector<Libs::Graphics::Spec::WaitCheck>    waits;
+	std::vector<std::pair<uint64_t, uint32_t>>      metas;
+	uint32_t n_bda = 0, n_inv = 0, n_img = 0;
+	bool     bda_all = false;
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
 	std::atomic<uint64_t> serial {0};
+	std::atomic<uint64_t> eff_from {0}; // (tej F2p) fin del registro de efectos del render al empezar la traduccion
 	std::atomic<uint32_t> count {0};
 	std::atomic<bool>     done {false};
 	Packet                pk[MaxPackets];
@@ -750,6 +783,7 @@ inline void Worker::Translate(Item& item) {
 	slot.serial.store(0, std::memory_order_release);
 	slot.count.store(0, std::memory_order_release);
 	slot.done.store(false, std::memory_order_release);
+	slot.eff_from.store(g_eff.End(), std::memory_order_relaxed);
 	slot.serial.store(item.serial, std::memory_order_release);
 	m_slot     = &slot;
 	m_open     = -1;
@@ -847,6 +881,34 @@ inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 				const auto* im = st->touched_images[i].first;
 				if (im != nullptr) p.imgs.emplace_back(im->info.data.address, im->info.data.address + im->info.data.size);
 			}
+			// (F2p) Lo demas de CommitSegments / Before (desde lo que habia al abrir; Note no repite los 8 ultimos)
+			const auto cp2 = [](auto& out, const auto& in, size_t from, auto f) {
+				out.clear();
+				for (size_t i = std::min(from, in.size()); i < in.size(); ++i) out.push_back(f(in[i]));
+			};
+			const auto rg = [](const auto& x) { return std::pair<uint64_t, uint64_t> {x.begin, x.end}; };
+			cp2(p.wr, st->written, p.fi_wr, rg);
+			cp2(p.cur, st->current, p.fi_cur, rg);
+			cp2(p.copies, st->cpu_copies, p.fi_copy, rg);
+			cp2(p.sets, st->sets, p.fi_set, [](uint64_t x) { return x; });
+			cp2(p.chains, st->chain_reads, p.fi_chain, [](const auto& x) { return x; });
+			cp2(p.waits, st->waits, p.fi_wait, [](const auto& x) { return x; });
+			p.n_bda = static_cast<uint32_t>(st->bda.size() - std::min(p.fi_bda, st->bda.size()));
+			p.n_inv = static_cast<uint32_t>(st->invalidated.size() - std::min(p.fi_inv, st->invalidated.size()));
+			p.bda_all = st->bda_all;
+			p.n_img   = 0;
+			for (size_t k = std::min(p.seg_open, st->closed.size()); k < st->closed.size(); ++k) {
+				p.n_img += static_cast<uint32_t>(st->closed[k].images.size());
+				p.bda_all = p.bda_all || st->closed[k].bda_all;
+			}
+			p.n_img += static_cast<uint32_t>(st->used.size()); // (las del segmento abierto)
+			const size_t seg_close = st->closed.size();
+			p.metas.clear();
+			for (const auto& fact: st->meta_facts)
+				if (!fact.cleared && fact.first <= seg_close && fact.last >= p.seg_open) p.metas.emplace_back(fact.address, fact.slice);
+		} else {
+			p.wr.clear(), p.cur.clear(), p.copies.clear(), p.sets.clear(), p.chains.clear(), p.waits.clear(), p.metas.clear();
+			p.n_bda = p.n_inv = p.n_img = 0;
 		}
 		Compact(p);
 	}
@@ -885,6 +947,16 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 			p.fi_buf  = back8(st->buffer_ranges.size(), sealed.buffer_ranges);
 			p.fi_read = back8(st->clean_reads.size(), sealed.clean_reads);
 			p.fi_img  = back8(st->touched_images.size(), sealed.touched_images);
+			// (F2p) los que Note deduplica, igual; los que se apilan sin mas, exactos
+			p.fi_wr    = back8(st->written.size(), sealed.written);
+			p.fi_cur   = back8(st->current.size(), sealed.current);
+			p.fi_inv   = back8(st->invalidated.size(), sealed.invalidated);
+			p.fi_copy  = back8(st->cpu_copies.size(), sealed.cpu_copies);
+			p.fi_set   = st->sets.empty() ? 0 : st->sets.size() - 1;
+			p.fi_bda   = st->bda.size();
+			p.fi_chain = st->chain_reads.size();
+			p.fi_wait  = st->waits.size();
+			p.seg_open = st->closed.size();
 		} else {
 			p.fi_buf = p.fi_read = p.fi_img = ~size_t {0};
 		}
@@ -989,6 +1061,7 @@ struct GpuDcb {
 inline GpuDcb g_gpu;
 
 
+inline void EffDcbStart(); // (tej F2p, mas abajo)
 struct GpuSlice {
 	bool set = false;
 	GpuSlice(bool graphics_q0, uint64_t serial, bool first_slice) {
@@ -1007,6 +1080,7 @@ struct GpuSlice {
 			g_gpu        = {};
 			g_gpu.serial = serial;
 			g_gpu.rs     = Now();
+			EffDcbStart(); // (tej F2p)
 			g_gpu.on     = Active();
 			if (g_gpu.on) {
 				Add(GDcbs);
@@ -1083,6 +1157,123 @@ inline void        RenderWait(uint64_t addr, bool satisfied) {
 	(satisfied ? e.first : e.second) += 1;
 }
 
+// (tej F2p) COSIBLES REALES: un paquete que cose por registros y epocas/rangos (F1d) pasa ademas, en solo lectura, lo
+// que CommitSegments comprueba antes de Before (sin Before/After, sin enviar), contra los efectos del render desde que
+// el trabajador empezo a traducir la DCB (EffectsLog propio, g_eff). Primer motivo, en el orden de CommitSegments:
+inline constexpr uint32_t RN = 9;
+inline constexpr const char* RNames[RN] = {"pasa", "registro de efectos perdido", "CPU escribio una imagen (barrido)",
+                                           "metadatos borrados", "escrito lo que leyo (clean_reads)", "set retirado",
+                                           "GPU escribio lo que copia", "cadena distinta", "espera no cumplida"};
+struct EffAcc {
+	Libs::Graphics::RangeSet gw, hw;
+	std::vector<uint64_t>    sets;
+	uint64_t                 next = 0;
+	void Reset(uint64_t from) { gw.Clear(), hw.Clear(), sets.clear(), next = from; }
+	void TakeTo(const Libs::Graphics::Spec::EffectsLog& log, uint64_t limit) {
+		using K = Libs::Graphics::Spec::EffectsLog::Kind;
+		limit   = std::min<uint64_t>(limit, log.base + log.entries.size());
+		for (next = std::max(next, log.base); next < limit; ++next) {
+			const auto& e = log.entries[next - log.base];
+			if (e.kind == K::GpuWrite) gw.Add(e.address, e.size);
+			else if (e.kind == K::HostWrite) hw.Add(e.address, e.size);
+			else sets.push_back(e.address);
+		}
+	}
+};
+struct EffCheck {
+	EffAcc   all, pre;            // (hasta ahora; hasta el inicio de la DCB que el render procesa)
+	uint64_t from = ~uint64_t {0}, serial = 0, dcb_end = 0;
+	bool     lost = false;
+	uint64_t ring[32] {};
+	uint32_t ring_k = 0;
+	uint32_t before_k = 0;
+};
+inline EffCheck g_ec;
+inline constexpr uint32_t BeforeEvery = 8;
+// (F2p) Render, inicio de DCB de la cola 0: fin del registro y poda de lo anterior a 32 DCB atras.
+inline void EffDcbStart() {
+	ClaimEff();
+	if (!t_eff_owner) return;
+	auto& e   = g_ec;
+	e.dcb_end = g_eff.End();
+	const uint64_t old = e.ring[e.ring_k % 32];
+	e.ring[e.ring_k++ % 32] = e.dcb_end;
+	if (old != 0) g_eff.DropBefore(std::min(old, e.from == ~uint64_t {0} ? old : e.from));
+	static uint64_t last = 0;
+	Add(GEffEntries, e.dcb_end - last);
+	last = e.dcb_end;
+}
+[[nodiscard]] inline uint32_t RealWhy(const Packet& p, RenderContext& r, const EffAcc& a, bool lost) {
+	if (lost) return 1;
+	const auto in = [](const Libs::Graphics::RangeSet& rs, const auto& v) {
+		if (rs.Empty()) return false;
+		for (const auto& [b, e]: v)
+			if (e > b && rs.Intersects(b, e - b)) return true;
+		return false;
+	};
+	if (in(a.hw, p.imgs)) return 2;
+	auto& tc = r.GetTextureCache();
+	for (const auto& [addr, slice]: p.metas)
+		if (tc.IsMetaCleared(addr, slice)) return 3;
+	if (in(a.gw, p.reads) || in(a.hw, p.reads)) return 4;
+	for (const auto set: a.sets)
+		if (std::find(p.sets.begin(), p.sets.end(), set) != p.sets.end()) return 5;
+	if (in(a.gw, p.copies)) return 6;
+	for (const auto& c: p.chains)
+		if (*reinterpret_cast<const uint32_t*>(c.address) != c.value) return 7;
+	for (const auto& w: p.waits) {
+		uint64_t value = 0;
+		std::memcpy(&value, reinterpret_cast<const void*>(w.address), w.bytes);
+		if (!Libs::Graphics::TestWaitRegMemValue(value, w.reference, w.mask, w.function)) return 8;
+	}
+	return 0;
+}
+inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
+	auto& e = g_ec;
+	{
+		const HookTimer tm(HReal);
+		const uint64_t  from = s.eff_from.load(std::memory_order_relaxed);
+		if (!t_eff_owner) return Add(GRk1);
+		if (e.from != from || e.serial != g_gpu_serial.load(std::memory_order_relaxed)) {
+			e.from   = from;
+			e.serial = g_gpu_serial.load(std::memory_order_relaxed);
+			e.lost   = from < g_eff.base;
+			e.all.Reset(from);
+			e.pre.Reset(from);
+		}
+		e.all.TakeTo(g_eff, ~uint64_t {0});
+		e.pre.TakeTo(g_eff, e.dcb_end);
+		const uint32_t why = RealWhy(p, r, e.all, e.lost);
+		Add(static_cast<C>(GRk0 + why));
+		if (why == 0) Add(GRealPk), Add(GRealDraws, sewn), Add(GRealCalls, sewn + p.dispatches);
+		if (why == 0 || RealWhy(p, r, e.pre, e.lost) == 0) Add(GRealPkPre), Add(GRealDrawsPre, sewn);
+		if (why != 0) return;
+	}
+	// (F2p) Lo que Before haria, 1 de cada BeforeEvery paquetes que pasan: solo las consultas de solo lectura del hilo
+	// de render (registrado + sucio de CPU por rango escrito/actual: el camino rapido de ObtainBuffer /
+	// EnsureBufferContents) y los bytes sucios que subiria; BDA, invalidaciones e imagenes: cuentas (no se tocan).
+	if (e.before_k++ % BeforeEvery != 0) return;
+	const HookTimer tb(HBefore);
+	const uint64_t  t0 = tb.t0;
+	auto&           bc = r.GetBufferCache();
+	uint64_t        dirty_n = 0, dirty_b = 0;
+	for (const auto* v: {&p.wr, &p.cur})
+		for (const auto& [b, en]: *v) {
+			if (en <= b) continue;
+			(void)bc.RegisteredBuffer(b, en - b);
+			if (bc.IsRegionCpuDirty(b, en - b)) ++dirty_n, dirty_b += en - b;
+		}
+	Add(GBfTicks, __rdtsc() - t0);
+	Add(GBfPk);
+	Add(GBfRanges, p.wr.size() + p.cur.size());
+	Add(GBfDirtyRanges, dirty_n);
+	Add(GBfDirtyBytes, dirty_b);
+	Add(GBfBda, p.n_bda);
+	if (p.bda_all) Add(GBfBdaAll);
+	Add(GBfInv, p.n_inv);
+	Add(GBfImg, p.n_img);
+}
+
 // Hilo de render: primer draw de cada paquete; epocas primero (baratas), registros solo si coinciden.
 inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 	auto& c = g_gpu;
@@ -1153,7 +1344,10 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 		}
 		if (gfx && csok) {
 			if (eb && ei && em) Add(GDrawsOkGfx, sewn);
-			if (rb && ri && rm) Add(GDrawsOkRanges, sewn);
+			if (rb && ri && rm) {
+				Add(GDrawsOkRanges, sewn);
+				if (p.lists) Real(p, r, sewn, *s); // (tej F2p)
+			}
 		}
 		Add(GValTicks, __rdtsc() - t0);
 		Add(GValN);
@@ -1382,7 +1576,7 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		for (uint32_t k = 0; k < HN; ++k) {
 			const double ms = static_cast<double>(g_hook.t[sd][k].exchange(0, std::memory_order_relaxed)) * ns_per_tick / 1e6 / f;
 			const double nn = static_cast<double>(g_hook.n[sd][k].exchange(0, std::memory_order_relaxed)) / f;
-			if (k != HVal && k != HRanges && k != HRegDiff && k != HPublish) tot += ms; // (esos van dentro de draw / fin DCB)
+			if (k != HVal && k != HRanges && k != HRegDiff && k != HPublish && k != HReal && k != HBefore) tot += ms; // (esos van dentro de draw / fin DCB)
 			std::printf(" [%s] %.3f (%.0f/fot)", HName[k], ms, nn);
 		}
 		std::printf(" = TOTAL %.3f ms/fot (objetivo <= 0.2)", tot);
@@ -1525,6 +1719,26 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		            v[GPkRgFailMap] / f, v[GPkRgNoList] / f,
 		            v[GValN] != 0 ? static_cast<double>(v[GRgEntries]) / static_cast<double>(v[GValN]) : 0.0,
 		            v[GValN] != 0 ? static_cast<double>(v[GRgRaw]) / static_cast<double>(v[GValN]) : 0.0, val_ns);
+		// (tej F2p) Cosibles reales: los F1d pasados por las comprobaciones de CommitSegments; Before estimado; prevision.
+		uint64_t rk_all = 0;
+		for (uint32_t k = 0; k < RN; ++k) rk_all += v[GRk0 + k];
+		std::printf("[tej] F2p COSIBLES REALES %.1f %% (F1d %.1f %%; sin efectos de la propia DCB %.1f %%) | paquetes F1d"
+		            " comprobados %.1f/fot:",
+		            pct(v[GRealDraws]), pct(v[GDrawsOkRanges]), pct(v[GRealDrawsPre]), rk_all / f);
+		for (uint32_t k = 0; k < RN; ++k) std::printf(" [%s] %.1f", RNames[k], v[GRk0 + k] / f);
+		const double bf_us  = v[GBfPk] != 0 ? static_cast<double>(v[GBfTicks]) * ns_per_tick / 1e3 / static_cast<double>(v[GBfPk]) : 0.0;
+		const double bpk    = v[GBfPk] != 0 ? static_cast<double>(v[GBfPk]) : 1.0;
+		std::printf(" | efectos del render %.0f entradas/fot | Before (muestra 1/%u, %.1f paquetes/fot): consultas %.2f us/paquete,"
+		            " %.1f rangos/paquete, sucios %.1f (%.1f KiB a subir), BDA %.1f rangos/paquete (todo %.1f %%), invalidaciones"
+		            " %.1f, imagenes %.1f (BDA/imagenes/subidas sin coste medido: no se ejecutan)\n",
+		            v[GEffEntries] / f, BeforeEvery, v[GBfPk] / f, bf_us, v[GBfRanges] / bpk, v[GBfDirtyRanges] / bpk,
+		            static_cast<double>(v[GBfDirtyBytes]) / 1024.0 / bpk, v[GBfBda] / bpk, 100.0 * v[GBfBdaAll] / bpk,
+		            v[GBfInv] / bpk, v[GBfImg] / bpk);
+		const double calls_f = v[GRealCalls] / f, pk_f = v[GRealPk] / f;
+		std::printf("[tej] F2-prevision cosibles reales %.1f %% | llamadas cosibles reales %.0f/fot (%.1f paquetes/fot) | Before"
+		            " estimado %.2f us/paquete (solo consultas) | ahorro neto en el render = %.0f x 1.15 us - %.1f x %.2f us ="
+		            " %+.2f ms/fot (sin submit: con secundarios desaparece; sin el coste de subidas/BDA/imagenes)\n",
+		            pct(v[GRealDraws]), calls_f, pk_f, bf_us, calls_f, pk_f, bf_us, (calls_f * 1.15 - pk_f * bf_us) / 1e3);
 	}
 	if (m == 2 && VarOn()) {
 		std::printf("[tej] VARIANTES delta interpolado B-A del render ms/fot (media [min..max] n):");

@@ -1222,6 +1222,11 @@ void GuestGpu::ParWake() {
 	m_work_available.SignalAll();
 }
 
+// (tej F2p, KYTY_TEJ) El registro de efectos de tej solo en el hilo GPU y sin la segunda cola de par1 (un solo escritor).
+static Spec::EffectsLog* TejEffLog() {
+	return !ParQueues::On() && GuestGpu::IsGpuThread() ? Tej::EffLog() : nullptr;
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -1443,7 +1448,7 @@ void GuestGpu::ThreadRun(void* data) {
 				ParQueues::WorkScope work; // (par1: nothing unless KYTY_PAR_QUEUES=1)
 				LiveCensus::Scope census(LiveCensus::GuestCommand, 0);
 				// (envio2: what a guest command writes while a compute submission is handed is logged for its commit.)
-				Spec::t_effects = gpu->m_acb_spec && gpu->m_acb_spec->Pending() ? &gpu->m_acb_spec->Log() : nullptr;
+				Spec::t_effects = gpu->m_acb_spec && gpu->m_acb_spec->Pending() ? &gpu->m_acb_spec->Log() : TejEffLog(); // (tej F2p)
 				command();
 				Spec::t_effects = nullptr;
 			}
@@ -1722,7 +1727,7 @@ bool GuestGpu::Process(Submission& submission) {
 		// (spec5: or for the graphics speculation's commits, with KYTY_SPECULATE under KYTY_NATIVE_MEMORY.)
 		Spec::t_effects = Envio3::Mode() != 0 && m_acb_spec && m_acb_spec->Pending() ? &m_acb_spec->Log()
 		                  : m_speculation                                            ? &m_speculation->Log()
-		                                                                             : nullptr;
+		                                                                             : TejEffLog(); // (tej F2p)
 		const uint64_t censo_sweep_t0 = DsCensoDcb::On() ? DsCensoDcb::NowNs() : 0; // (w7)
 		CensoPm4::Mark(CensoPm4::KSweep); // (w18)
 		m_renderer.GetGpuResources().SweepCpuWrites((PageManager::SweptSince(submission.sweep_stamp) ||
@@ -1757,7 +1762,7 @@ bool GuestGpu::Process(Submission& submission) {
 	// (What the translation does a speculation not committed yet must see.)
 	struct EffectsScope {
 		explicit EffectsScope(Speculation* speculation) {
-			Spec::t_effects = speculation != nullptr ? &speculation->Log() : nullptr;
+			Spec::t_effects = speculation != nullptr ? &speculation->Log() : TejEffLog(); // (tej F2p: KYTY_TEJ, su registro)
 		}
 		~EffectsScope() { Spec::t_effects = nullptr; }
 		KYTY_CLASS_NO_COPY(EffectsScope);

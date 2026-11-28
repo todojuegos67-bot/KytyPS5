@@ -1008,7 +1008,9 @@ void GpuResourceManager::InvalidateCpuWrittenPages(uint64_t vaddr, uint64_t size
 	// the buffers it reads there (Speculation::CommitSegments / Before). Off: nothing (t_effects is null).
 	// (spec5, KYTY_SPECULATE under KYTY_NATIVE_MEMORY: the same for the graphics speculation's commits; t_effects is its
 	// log at every sweep while it is on, GraphicsRun.)
-	if (Envio3::Mode() != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0) Spec::NoteHostWrite(vaddr, size);
+	// (tej F2p: con KYTY_TEJ el render lleva su propio registro en t_effects; sin nada, t_effects es nulo: lo mismo)
+	if (Envio3::Mode() != 0 || kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0 || Spec::t_effects != nullptr)
+		Spec::NoteHostWrite(vaddr, size);
 	// (Fresh memory stands down with native memory - no backing view -: a first write is noted all the same. Unlike
 	// the fault, the page is invalidated in any case: another watcher may hold it, and an extra invalidation is safe.)
 	if (FreshMemory::Get() != nullptr)
