@@ -682,7 +682,7 @@ const GameSetting kGameSettings[] = {
 	{"gs_sun", "Sombras", false, "Sombras del sol", {"r_virtualGeometryNumShadowCascades=1;sunShadowMaxDistance=60;sunShadowCascadeDistance0=60;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=125;sunShadowCascadeDistance0=22;sunShadowCascadeDistance1=125;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=2;sunShadowMaxDistance=250;sunShadowCascadeDistance0=40;sunShadowCascadeDistance1=250;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=400;sunShadowCascadeDistance0=27;sunShadowCascadeDistance1=61;sunShadowCascadeDistance2=131;sunShadowCascadeDistance3=400;sunShadowLightDistance=1000", "r_virtualGeometryNumShadowCascades=4;sunShadowMaxDistance=1000;sunShadowCascadeDistance0=65;sunShadowCascadeDistance1=142;sunShadowCascadeDistance2=300;sunShadowCascadeDistance3=1000;sunShadowLightDistance=1000"},
 	 "Sombras del sol del juego: hasta donde llegan y en cuantas cascadas se reparten. Bajo 60 m (1 cascada), Medio 125 m (2), Alto 250 m (2, el valor de fabrica), Ultra 400 m (4), Extremo 1000 m (4, el máximo del juego). Cuesta GPU y CPU (las sombras son unos 2600 dibujados por frame); Extremo puede costar un 10-15 % de FPS. Manda sobre el desplegable Sombras."},
 	{"gs_spot", "Sombras", true, "Sombras de antorchas", {"r_enableSpotShadows=false", "r_enableSpotShadows=true", nullptr, nullptr, nullptr},
-	 "Sombras que proyectan antorchas, hogueras y otras luces (unas 7 por escena en 1-1). No: más FPS, pero sin esas sombras. El juego no tiene ajuste de distancia ni de resolución para ellas.", 1},
+	 "Sombras que proyectan antorchas, hogueras y otras luces (unas 7 por escena en 1-1). No: más FPS, pero sin esas sombras. El juego no tiene ajuste de distancia ni de resolución para ellas.",  2},
 	{"gs_contact", "Sombras", false, "Sombras de contacto", {"r_contactShadowsEnabled=false", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.03", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.06", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.1", "r_contactShadowsEnabled=true;r_contactShadowsDistance=0.3;r_contactShadowsThickness=0.12;r_contactShadowsSoftness=0.2"},
 	 "Sombras de contacto del juego: sombras finas donde los objetos tocan el suelo y las paredes. Bajo: apagadas. Medio, Alto (de fabrica), Ultra y Extremo: alcance 0,03 / 0,06 / 0,10 / 0,30 (Extremo también más gruesas y más definidas). Cuesta poco; con mucho alcance pueden salir halos."},
 	{"gs_ambient", "Iluminación", false, "Sombreado ambiental", {"r_enableAmbientShadowing=false", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=50;r_ambientShadowCutoffFadeDistance=10", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=100;r_ambientShadowCutoffFadeDistance=20", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=250;r_ambientShadowCutoffFadeDistance=40", "r_enableAmbientShadowing=true;r_ambientShadowCutoffDistance=1000;r_ambientShadowCutoffFadeDistance=100"},
@@ -752,7 +752,7 @@ void SetGameSettingLevel(Settings* s, const char* id, int level) {
 void ResetGameSettings(Settings* s) {
 	std::string out;
 	for (const auto& g: kGameSettings)
-		if (g.def != 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=0";
+		if (g.def != 0) out += (out.empty() ? "" : ";") + std::string(g.id) + "=" + std::to_string(g.def); // (11-28) restablecer = el valor por defecto (gs_spot No)
 	s->game_settings = out;
 }
 
@@ -1816,6 +1816,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 	const auto post_on = [&]() { s->motion_blur = s->dof = s->vignette = s->bloom = s->eye_adapt = true; };
 	s->rt_light          = "0"; // (10-26) gone
 	s->ambient_occlusion = "0";
+	s->game_settings = "gs_spot=1"; // (11-28) en todos los modos: ajustes del juego predeterminados, sombras de antorchas No
 	if (preset == "ligero" || preset == "ligero-plus") {
 		// Set-PresetLight; FSR Calidad recommended (10-25); sharpness 75 %.
 		// (11-12) the user's screenshot: Texturas Medio, Distancia Alto, Sombras Alto, Detalle Alto (PS5 performance),
@@ -1890,7 +1891,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->quality        = "high";
 		// (11-22) and his in-game settings, sharpness and smoke (his settings.ini of 11-22 04:00).
 		s->sharpness     = "0.75";
-		s->game_settings = "gs_spot=1;gs_gi=2;gs_dist=2;gs_ssr=3";
+		s->game_settings = "gs_spot=1"; // (11-28) todo predeterminado menos sombras de antorchas No, en todos los modos
 		s->smoke         = "1";
 	} else if (preset == "low") {
 		// Set-PresetLowProfile: 900p-ish with FSR Calidad, everything low; what costs nearly nothing at its best.
@@ -1949,7 +1950,7 @@ void ApplyPreset(Settings* s, const std::string& preset) {
 		s->texture_sharpness = "2";
 		s->pure_game         = true;
 		s->smoke             = "1";
-		s->game_settings     = "gs_sun=2;gs_spot=1;gs_contact=2;gs_gi=1;gs_dist=2;gs_ssr=2;gs_tess=2;gs_fogden=2";
+		s->game_settings     = "gs_spot=1"; // (11-28) todo predeterminado menos sombras de antorchas No, en todos los modos
 	}
 }
 
