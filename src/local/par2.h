@@ -191,7 +191,7 @@ inline void Window(double busy_ms, double frames, bool keep) {
 	double why[WCount];
 	for (uint32_t i = 0; i < WCount; ++i) why[i] = take(g_c.why[i]);
 	const bool was   = g_ab_on.load(std::memory_order_relaxed);
-	double     delta = 0, cnt[2] {};
+	double     delta = 0, cnt[2] {}, raw[2] {}, raw_n[2] {};
 	if (m == 2) {
 		struct W { bool b; double busy; };
 		static W      win[4096];
@@ -205,6 +205,9 @@ inline void Window(double busy_ms, double frames, bool keep) {
 			}
 		const double db = cnt[1] > 0 ? sum[1] / cnt[1] : 0, da = cnt[0] > 0 ? sum[0] / cnt[0] : 0;
 		delta = (cnt[0] > 0 && cnt[1] > 0) ? 0.5 * (db - da) : cnt[1] > 0 ? db : -da;
+		// Medias simples de todas las ventanas A y B (sin interpolar): con pocas ventanas el delta interpolado tiene ruido
+		// de +-1 ms (T70: +0.90 con B 17.05 < A 17.18); si las dos medidas no coinciden en signo, es ruido.
+		for (size_t i = 0; i < k; ++i) raw[win[i].b ? 1 : 0] += win[i].busy, raw_n[win[i].b ? 1 : 0] += 1;
 	}
 	std::printf("[par2] ventana %s: render ocupado %.2f ms | DCB en carril %.1f/fot (trozos %.1f, enviadas en orden %.1f, "
 	            "FUERA DE ORDEN %.0f, reabiertas %.0f) prep %.1f/fot guardadas %.0f | coste propio %.4f ms/fot | fuera (",
@@ -213,7 +216,10 @@ inline void Window(double busy_ms, double frames, bool keep) {
 	for (uint32_t i = 0; i < WCount; ++i) std::printf("%s%s %.1f", i ? ", " : "", WhyNames[i], why[i] / frames);
 	std::printf(")");
 	if (m == 2)
-		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (objetivo 0 +-0.2)", cnt[0], cnt[1], delta);
+		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot | medias A %.2f (%.0f) B %.2f (%.0f) B-A %+.3f "
+		            "(objetivo 0 +-0.2; fiable si las dos coinciden)",
+		            cnt[0], cnt[1], delta, raw_n[0] > 0 ? raw[0] / raw_n[0] : 0.0, raw_n[0], raw_n[1] > 0 ? raw[1] / raw_n[1] : 0.0,
+		            raw_n[1], raw_n[0] > 0 && raw_n[1] > 0 ? raw[1] / raw_n[1] - raw[0] / raw_n[0] : 0.0);
 	std::printf("\n");
 	std::fflush(stdout);
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
