@@ -68,6 +68,7 @@
 #include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
 #include "local/recorrido-rapido.h" // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
 #include "local/indirect-tabla.h" // (indirect-tabla)
+#include "local/par2.h" // (par2, KYTY_PAR2: carril por hilo + envio en orden, fase 1)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -1607,6 +1608,11 @@ bool GuestGpu::Process(Submission& submission) {
 		return true;
 	}
 	const bool first_slice = !submission.started;
+	// (par2, KYTY_PAR2=1/2) Una DCB de la cola 0 en el carril 0 de este hilo: ticket = serial, enviada en orden al
+	// completarse (local/par2.h). Fase 1: identidad (mismos executors, buffer abierto y anillo): misma imagen.
+	Par2::DcbScope par2_dcb(submission.queue_id == 0 && submission.type == SubmissionType::Graphics, first_slice,
+	                        submission.serial, kyty_local_speculate_mode.load(std::memory_order_relaxed) != 0,
+	                        ParQueues::On(), CommandScheduler::ThreadRecorder() != nullptr);
 	// (w7) KYTY_CENSO_DCB=1: el tiempo de este trozo, al sitio del juego que envio la DCB (local/ds-censo-dcb.h).
 	std::optional<DsCensoDcb::Slice> censo_dcb;
 	if (DsCensoDcb::On())
@@ -2022,6 +2028,7 @@ bool GuestGpu::Process(Submission& submission) {
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
 
+	par2_dcb.Done(complete); // (par2)
 	return complete;
 }
 

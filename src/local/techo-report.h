@@ -14,6 +14,7 @@
 #include "local/recorrido-rapido.h" // (recorrido-rapido)
 #include "local/proteger-junto.h"
 #include "local/indirect-tabla.h"
+#include "local/par2.h" // (par2)
 #include "local/normal-why.h"
 #include "local/ds-censo-dcb.h"
 #include "local/ds-censo-escena.h"
@@ -227,6 +228,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		RecorridoRapido::Window(busy, n, keep);                 // (recorrido-rapido, KYTY_RECORRIDO_RAPIDO)
 		ProtegerJunto::Window(n);                              // (proteger-junto: contadores de proteccion del render)
 		IndirectTabla::Window(busy, n * 1e3 / wall_ms, n, keep); // (indirect-tabla, KYTY_INDIRECT_TABLA)
+		Par2::Window(busy, n, keep);                           // (par2, KYTY_PAR2)
 		NormalWhy::Report(n);                                // (vg1, porque los draws van al camino normal)
 		TechoFaltas::Report(n, ms_cyc); // (techo-faltas: the game threads' faults, a line beside this one)
 		if (keep && flip_ns - last_table >= 30'000'000'000ll) {
