@@ -4934,8 +4934,10 @@ void LauncherPerformance(Settings& s) {
 		if (s.cpu_auto) CpuAuto::Aplicar(s);
 		const CpuAuto::Decision d = CpuAuto::Calcular();
 		const char* cat = d.cat == CpuAuto::Cat::Vieja ? "Vieja" : d.cat == CpuAuto::Cat::Justa ? "Justa" : d.cat == CpuAuto::Cat::X3D ? "X3D (doble caché)" : "Moderna";
-		char        line[512];
-		std::snprintf(line, sizeof(line), I18n::T("CPU detectada: %s. %s: ayudas del procesador %s, precompilar %s, shaders al máximo %s."), I18n::T(cat),
+		// (cpu-auto) Modelo exacto de la CPU (cadena de marca de cpuid) delante de la categoria.
+		const std::string cpu_det = CpuAuto::Modelo().empty() ? std::string(I18n::T(cat)) : CpuAuto::Modelo() + " (" + I18n::T(cat) + ")";
+		char        line[640];
+		std::snprintf(line, sizeof(line), I18n::T("CPU detectada: %s. %s: ayudas del procesador %s, precompilar %s, shaders al máximo %s."), cpu_det.c_str(),
 		              I18n::T(s.cpu_auto ? "Aplicado" : "Manual"), I18n::T(s.perf_upload_help || s.perf_spin_gate ? "sí" : "no"),
 		              I18n::T(s.precompile_threads == "relajado" ? "relajado" : "todos"), I18n::T(s.shader_turbo ? "sí" : "no"));
 		const float ly = RowY();

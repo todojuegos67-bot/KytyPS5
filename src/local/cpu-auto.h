@@ -25,6 +25,7 @@ struct Decision {
 
 bool TieneAvx2();     // CPUAUTO_IMPL
 bool L3Asimetrica();  // CPUAUTO_IMPL
+const std::string& Modelo(); // CPUAUTO_IMPL: cadena de marca (cpuid 0x80000002..4), recortada; "" si no hay
 
 inline Decision Calcular() {
 	static const Decision d = [] {
@@ -63,9 +64,9 @@ template <class S>
 void Log(const S& s) {
 	const Decision d = Calcular();
 	const auto&    t = Cpu5::Get();
-	std::printf("[cpu-auto] optimizacion de CPU: %s; categoria %s (%d hilos, %d nucleos, %d P, %d E, AVX2 %s, L3 %s); "
+	std::printf("[cpu-auto] optimizacion de CPU: %s; modelo \"%s\"; categoria %s (%d hilos, %d nucleos, %d P, %d E, AVX2 %s, L3 %s); "
 	            "ayuda subidas=%d, sin espera activa=%d, precompilar=%s, shaders al maximo=%d, todos los CCD=%d\n",
-	            s.cpu_auto ? "automatico" : "manual", Nombre(d.cat), t.hilos, t.nucleos, t.p, t.e, d.avx2 ? "si" : "no",
+	            s.cpu_auto ? "automatico" : "manual", Modelo().c_str(), Nombre(d.cat), t.hilos, t.nucleos, t.p, t.e, d.avx2 ? "si" : "no",
 	            d.l3_asim ? "asimetrica" : "simetrica", s.perf_upload_help ? 1 : 0, s.perf_spin_gate ? 1 : 0,
 	            s.precompile_threads.c_str(), s.shader_turbo ? 1 : 0, s.all_ccds ? 1 : 0);
 	std::fflush(stdout);
@@ -79,7 +80,45 @@ void Log(const S& s) {
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#endif
+#include <cstring>
 namespace CpuAuto {
+const std::string& Modelo() {
+	static const std::string m = [] {
+		std::string r;
+#if defined(__x86_64__) || defined(_M_X64)
+		unsigned v[12] = {};
+#if defined(_MSC_VER) && !defined(__clang__)
+		int x[4];
+		__cpuid(x, 0x80000000);
+		if (static_cast<unsigned>(x[0]) < 0x80000004u) return r;
+		for (int i = 0; i < 3; i++) {
+			__cpuid(x, 0x80000002 + i);
+			std::memcpy(v + i * 4, x, 16);
+		}
+#else
+		if (__get_cpuid_max(0x80000000u, nullptr) < 0x80000004u) return r;
+		for (unsigned i = 0; i < 3; i++)
+			if (!__get_cpuid(0x80000002u + i, &v[i * 4], &v[i * 4 + 1], &v[i * 4 + 2], &v[i * 4 + 3])) return r;
+#endif
+		char b[49] = {};
+		std::memcpy(b, v, 48);
+		r = b;
+		const auto a = r.find_first_not_of(" \t");
+		const auto z = r.find_last_not_of(" \t");
+		r = a == std::string::npos ? std::string() : r.substr(a, z - a + 1);
+#endif
+		return r;
+	}();
+	return m;
+}
+
 bool TieneAvx2() {
 #if defined(__x86_64__) || defined(_M_X64)
 	unsigned a, b, c, d;
