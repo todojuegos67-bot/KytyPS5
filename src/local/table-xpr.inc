@@ -109,6 +109,8 @@ struct RenderExecutor::TableImageSet {
 	// The words select another specialization, or an image no set can hold: the draws take the native path
 	// (TableResolveSet tries again after TableImageSet::RetryFrames).
 	bool                  refused = false;
+	// (tej-sets) the hole's reason in the shadow by why the render refused it (a string literal: Spec::Refuse keeps it)
+	const char*           refused_hole = "table: refused set";
 	static constexpr uint64_t RetryFrames = 300;
 	// A dispatch's words that select another specialization of the pair's program whose table form is the same
 	// (TableInterchangeable: its images of other dimensions or formats): that program and its pipeline, which the set
@@ -931,6 +933,12 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			std::printf("Table: VS 0x%llx PS 0x%llx image set refused: %s\n", static_cast<unsigned long long>(pair.vs),
 			            static_cast<unsigned long long>(pair.ps), reason);
 		set->refused = true;
+		const std::string_view why(reason);
+		set->refused_hole = why == "an image no set can hold"       ? "table: refused set (image)"
+		                    : why == "another specialization (VS)" ? "table: refused set (VS spec)"
+		                    : why == "another specialization (PS)" ? "table: refused set (PS spec)"
+		                    : why == "another specialization"      ? "table: refused set (CS spec)"
+		                                                           : "table: refused set (other)";
 		return publish();
 	};
 	ShaderVertexInputInfo  vertex_info;
@@ -1601,7 +1609,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	// (tej-lagmedida) solo si cambia: la sombra y el render usan los mismos sets; una escritura por draw del trabajador
 	// quitaba la linea al render en cada draw (coherencia entre nucleos/CCD). Una vez por fotograma basta.
 	if (set->used_frame.load(std::memory_order_relaxed) != frame) set->used_frame.store(frame, std::memory_order_relaxed);
-	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse("table: refused set"), nullptr;
+	if (set->refused) return LiveCounters::Add(LiveCounters::TableRefusedSets), Spec::Refuse(set->refused_hole), nullptr;
 	if (!TableValidateSet(*set)) {
 		if (Spec::Current() != nullptr) return Spec::Refuse("table: set validation"), nullptr;
 		// Resolved again at the next draw that uses it.
