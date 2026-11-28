@@ -120,6 +120,23 @@ def generate(registry, header):
         mark = (f'LiveTrace::VulkanMark(commandBuffer, {mark_id}, {"true" if mark_id < 10 else "false"}); '
                 if mark_id is not None and ret == 'void' else '')
         declarations.append(f'static VKAPI_ATTR {ret} VKAPI_CALL Wrapped_{name}({", ".join(decl(p) for p in params)}) {{')
+        # (tej-coser, KYTY_TEJ=3) Sonda por hilo: clase y argumentos escalares de 32 bits (sin handles ni VkDeviceSize).
+        probe_cls = None
+        base = name[:-3] if name.endswith('KHR') else name
+        if re.match(r'vkCmd(Draw|ClearAttachments)', base): probe_cls = 'CDraw'
+        elif re.match(r'vkCmdDispatch', base): probe_cls = 'CDispatch'
+        elif re.match(r'vkCmd(Copy|Fill|ClearColorImage|ClearDepthStencilImage|Blit|Resolve|UpdateBuffer)', base): probe_cls = 'CCopy'
+        elif re.match(r'vkCmdPipelineBarrier', base): probe_cls = 'CBarrier'
+        elif base in ('vkCmdBeginRendering', 'vkCmdBeginRenderPass', 'vkCmdBeginRenderPass2'): probe_cls = 'CBegin'
+        elif base in ('vkCmdEndRendering', 'vkCmdEndRenderPass', 'vkCmdEndRenderPass2'): probe_cls = 'CEnd'
+        elif base == 'vkCmdExecuteCommands': probe_cls = 'CExec'
+        elif re.match(r'vkCmdWriteTimestamp', base): probe_cls = 'CStamp'
+        if probe_cls is not None and ret == 'void':
+            scalars = [p.findtext('name') for p in params
+                       if '*' not in decl(p) and '[' not in decl(p) and p.findtext('type') in ('uint32_t', 'int32_t', 'VkBool32')]
+            # (vkCmdDraw* de la ruta de paquetes, renderDraw.cpp LocalDrawRecording::Record, da los mismos Id y escalares)
+            declarations.append(f'    if (TejCoser::t_on) TejCoser::Call(TejCoser::Id("{base}"), TejCoser::{probe_cls}, '
+                                '{' + ', '.join(f'static_cast<uint64_t>({n})' for n in scalars) + '});')
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
             declarations.append('    ++g_work_calls;')

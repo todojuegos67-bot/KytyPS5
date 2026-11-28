@@ -1,3 +1,4 @@
+#include "local/tej-coser-sonda.h" // (tej-coser)
 #include "local/indirect-tabla.h" // (indirect-tabla: table-xpr.inc)
 #include "local/bda-repite.h" // (bda-repite, KYTY_TECHO: solo mide; table-xpr.inc)
 #include "local/envio1.h" // (envio1: table-xpr.inc)
@@ -721,6 +722,20 @@ void Record(const Draw& draw, std::span<const vk::Buffer> vertex_buffers,
         {vertex_offsets.data(), vertex_offsets.size_bytes()},
         {commands.data(), commands.size_bytes()}
     };
+    // (tej-coser, KYTY_TEJ=3) La sonda ve los draws de la ruta de paquetes como vkCmdDraw/vkCmdDrawIndexed directos
+    // (Replay los llama con el dispatcher original, que la sonda no ve): mismos Id y escalares que el generador.
+    if (TejCoser::t_on)
+        for (const auto& item : commands) {
+            if (draw.indexed)
+                TejCoser::Call(TejCoser::Id("vkCmdDrawIndexed"), TejCoser::CDraw,
+                    {static_cast<uint64_t>(item.indexCount), static_cast<uint64_t>(item.instanceCount),
+                     static_cast<uint64_t>(item.firstIndex), static_cast<uint64_t>(item.vertexOffset),
+                     static_cast<uint64_t>(item.firstInstance)});
+            else
+                TejCoser::Call(TejCoser::Id("vkCmdDraw"), TejCoser::CDraw,
+                    {static_cast<uint64_t>(item.indexCount), static_cast<uint64_t>(item.instanceCount),
+                     static_cast<uint64_t>(item.firstIndex), static_cast<uint64_t>(item.firstInstance)});
+        }
     if (!LocalVulkanRecording::EnqueuePacket(Replay, segments))
         LocalVulkanRecording::ReplayInline(Replay, segments);
 }

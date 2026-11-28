@@ -71,6 +71,7 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 #include "local/tiron7.h" // (tiron7)
+#include "local/tej-coser-sonda.h" // (tej-coser: maintenance7 con KYTY_TEJ=3)
 #include "local/frame-nativo2.h" // (FRAME-NATIVO2: its imports need VK_EXT_external_memory_host)
 
 // IWYU pragma: no_include <intrin.h>
@@ -226,6 +227,46 @@ static void ChainPixelInterlock(const GraphicContext& graphics, vk::DeviceCreate
 	create_info.pNext                                   = &interlock;
 	device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
 }
+
+// (tej-coser, KYTY_TEJ=3 etapa 1) VK_KHR_maintenance7 (renderingContentsInline: draws propios del render y comandos
+// secundarios en la misma instancia de rendering) SOLO con KYTY_TEJ=3 y si el driver lo anuncia; sin el, KYTY_TEJ=3
+// se degrada a 2 (Tej::Mode). Etapa 1: se activa la extension y su caracteristica, nada la usa todavia (sin cambio de imagen).
+static void AddTejCoserExtension(vk::PhysicalDevice physical_device, const std::vector<vk::ExtensionProperties>& available,
+                                 std::vector<const char*>& extensions) {
+	if (!TejCoser::Wanted()) return;
+	bool        ok  = false;
+	const char* why = "el driver no anuncia VK_KHR_maintenance7";
+#ifdef VK_KHR_maintenance7
+	if (HasExtension(available, VK_KHR_MAINTENANCE_7_EXTENSION_NAME)) {
+		VkPhysicalDeviceMaintenance7FeaturesKHR m7 {};
+		m7.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR;
+		vk::PhysicalDeviceFeatures2 features {};
+		features.pNext = &m7;
+		physical_device.getFeatures2(&features);
+		if (m7.maintenance7 == VK_TRUE) {
+			if (!HasExtension(extensions, VK_KHR_MAINTENANCE_7_EXTENSION_NAME)) extensions.push_back(VK_KHR_MAINTENANCE_7_EXTENSION_NAME);
+			ok = true;
+		} else {
+			why = "VK_KHR_maintenance7 anunciada pero maintenance7 = 0";
+		}
+	}
+#else
+	why = "cabeceras Vulkan sin VK_KHR_maintenance7 (compilacion)";
+#endif
+	TejCoser::g_m7.store(ok, std::memory_order_relaxed);
+	std::printf("[tej] F2 coser: VK_KHR_maintenance7 %s%s%s\n", ok ? "ACTIVADA (renderingContentsInline)" : "NO (",
+	            ok ? "" : why, ok ? "" : "): KYTY_TEJ=3 queda como 2");
+	std::fflush(stdout);
+}
+#ifdef VK_KHR_maintenance7
+static void ChainTejCoser(vk::DeviceCreateInfo& create_info, VkPhysicalDeviceMaintenance7FeaturesKHR& m7) {
+	if (!TejCoser::g_m7.load(std::memory_order_relaxed)) return;
+	m7.sType          = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR;
+	m7.maintenance7   = VK_TRUE;
+	m7.pNext          = const_cast<void*>(create_info.pNext);
+	create_info.pNext = &m7;
+}
+#endif
 
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
 	return std::any_of(layers.begin(), layers.end(),
@@ -1279,6 +1320,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	// (up1118) The pixel interlock and storage reads without a format, where PixelInterlockExtension enabled it.
 	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT pixel_interlock {};
 	ChainPixelInterlock(graphics, create_info, pixel_interlock, device_features);
+#ifdef VK_KHR_maintenance7
+	VkPhysicalDeviceMaintenance7FeaturesKHR tej_m7 {}; // (tej-coser)
+	ChainTejCoser(create_info, tej_m7);
+#endif
 	create_info.flags                   = {};
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
@@ -1835,6 +1880,7 @@ void WindowContext::CreateVulkan() {
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 		AddTiron7Extension(available_extensions, device_extensions); // (tiron7)
+		AddTejCoserExtension(graphic_ctx.physical_device, available_extensions, device_extensions); // (tej-coser)
 		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, true); // (up1118)
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
 		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);
@@ -2033,6 +2079,7 @@ bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 		AddTiron7Extension(available_extensions, device_extensions); // (tiron7)
+		AddTejCoserExtension(graphic_ctx.physical_device, available_extensions, device_extensions); // (tej-coser)
 		(void)PixelInterlockExtension(graphic_ctx.physical_device, available_extensions, device_extensions, graphic_ctx, false); // (up1118)
 		// KYTY_HWRT=1: acceleration structures and ray queries (local/hwrt-scene.h; nothing asked for without it).
 		Libs::Graphics::HwScene::AddDeviceExtensions(available_extensions, device_extensions);

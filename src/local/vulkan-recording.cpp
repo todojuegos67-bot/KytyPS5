@@ -7,6 +7,7 @@
 #include "par-audit.h"  // (A0b) diagnostic only: KYTY_AUDIT off by default
 #include "par-queues.h" // (A0b) ParQueues::t_side: which translating thread encodes (0 DCB, 1 ACB)
 #include "time-census.h"
+#include "tej-coser-sonda.h" // (tej-coser: sonda de llamadas por hilo, KYTY_TEJ=3)
 
 #include <array>
 #include <atomic>
@@ -336,7 +337,10 @@ thread_local uint64_t g_packets       = 0;
 #include "local-vulkan-recording.inc"
 } // namespace
 
-void Install() { InstallDispatch(); }
+void Install() {
+    InstallDispatch();
+    TejCoser::g_installed.store(true, std::memory_order_relaxed); // (tej-coser: la sonda ve los vkCmd)
+}
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
 void* ReplaceBindPipeline(void* entry) {
     auto* replaced = reinterpret_cast<void*>(original.vkCmdBindPipeline);

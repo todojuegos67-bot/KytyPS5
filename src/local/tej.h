@@ -53,6 +53,7 @@
 #include "local/techo.h"
 #include "local/buffercache-par.h"
 #include "local/tej-lag.h"
+#include "local/tej-coser.h" // (tej-coser: KYTY_TEJ=3 etapa 1, solo mide)
 
 
 namespace Tej {
@@ -67,6 +68,11 @@ using Libs::Graphics::Speculation;
 	static const int mode = [] {
 		const char* v = std::getenv("KYTY_TEJ");
 		int         m = v != nullptr ? std::atoi(v) : 0;
+		if (m == 3) { // (tej-coser) etapa 1: como 2 + medida de cose; sin maintenance7, 2 sin mas
+			std::printf("[tej] KYTY_TEJ=3: F2 coser etapa 1 %s\n", TejCoser::On() ? "(mide; imagen como KYTY_TEJ=2)"
+			                                                                  : "NO disponible (sin VK_KHR_maintenance7): KYTY_TEJ=2");
+			m = 2;
+		}
 		if (m != 1 && m != 2) m = 0;
 		if (m == 2 && !Techo::On()) {
 			std::printf("[tej] KYTY_TEJ=2 sin KYTY_TECHO=1: modo 1 (sombra siempre, sin linea)\n");
@@ -297,6 +303,7 @@ struct Packet {
 	std::vector<std::pair<uint64_t, uint64_t>> rbxr;
 	uint64_t                                   ep_buf0 = 0;
 	bool                                       rbx_ok  = false;
+	TejCoser::PkInfo                           coser; // (tej-coser)
 	std::unique_ptr<CommandProcessor> cp;
 };
 struct Slot {
@@ -935,6 +942,7 @@ inline void Compact(Packet& p) {
 
 inline void Worker::Close(const Libs::Graphics::Spec::State* st) {
 	if (m_slot == nullptr || m_open < 0) return;
+	TejCoser::WorkerClose(m_slot->pk[m_open].coser); // (tej-coser: fin de la sonda del paquete)
 	{
 		// (F1d) Lo que el paquete leyo: rangos de buffers, lecturas limpias e imagenes tocadas. Sin estado: sin lista.
 		auto& p = m_slot->pk[m_open];
@@ -1019,6 +1027,7 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 	m_last_key     = key;
 	const auto ord = m_ord++;
 	if (ord % PacketDraws == 0) {
+		if (m_slot != nullptr && m_open >= 0) m_slot->pk[m_open].coser.end_key = key; // (tej-coser)
 		Close();
 		const uint32_t j = ord / PacketDraws;
 		if (j >= MaxPackets) {
@@ -1058,6 +1067,7 @@ inline void Worker::WorkerDraw(const CommandProcessor& cp, RenderContext& r, uin
 			p.fi_buf = p.fi_read = p.fi_img = ~size_t {0};
 		}
 		m_open    = static_cast<int>(j);
+		TejCoser::WorkerOpen(p.coser); // (tej-coser: herencia de rendering + sonda desde aqui)
 	}
 	if (m_open >= 0) ++m_slot->pk[m_open].draws;
 }
@@ -1514,6 +1524,7 @@ inline void Real(const Packet& p, RenderContext& r, uint32_t sewn, Slot& s) {
 inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 	auto& c = g_gpu;
 	++c.draws;
+	TejCoser::RenderTick(key); // (tej-coser)
 	Slot* const s = c.slot;
 	if (s == nullptr) return;
 	// (tej-lag3) slot.count es la linea que el trabajador escribe al publicar (en el otro CCD): antes se leia en CADA draw
@@ -1649,6 +1660,7 @@ inline void GpuDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) 
 			if (!i0 && rb) Add(ri ? GPkRgImg : GPkRgFailImg);
 			if (!m0 && rb && ri) Add(rm ? GPkRgMap : GPkRgFailMap);
 		}
+		TejCoser::RenderOpen(p.coser, p.draws, gfx && csok && rb && ri && rm, p.holes == 0 && sewn != 0, r); // (tej-coser)
 		Add(GCosSewn, sewn);
 		if (gfx && !csok) {
 			Add(GCosCsBad, sewn);
@@ -1728,6 +1740,7 @@ inline void OnDraw(const CommandProcessor& cp, RenderContext& r, uint64_t key) {
 inline void GpuDone(uint64_t serial, const CommandProcessor& cp) {
 	if (Mode() == 0) return;
 	g_render_in.store(false, std::memory_order_relaxed);
+	TejCoser::RenderDcbEnd(); // (tej-coser)
 	const uint64_t t_in = __rdtsc();
 	const uint64_t now = Now();
 	const auto&    rec = g_rec[serial % RecN];
@@ -1819,6 +1832,8 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 		const double db = cnt[1] > 0 ? sum[1] / cnt[1] : 0, da = cnt[0] > 0 ? sum[0] / cnt[0] : 0;
 		delta = (cnt[0] > 0 && cnt[1] > 0) ? 0.5 * (db - da) : cnt[1] > 0 ? db : -da;
 	}
+	if (m != 2 || was) TejCoser::Print(frames); // (tej-coser: solo ventanas con sombra)
+	else TejCoser::Print(0);
 	uint64_t v[NCount] {};
 	for (auto& b: g_bank)
 		for (uint32_t i = 0; i < NCount; ++i) v[i] += b.c[i].exchange(0, std::memory_order_relaxed);
