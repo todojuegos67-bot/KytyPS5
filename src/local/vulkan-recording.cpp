@@ -8,6 +8,7 @@
 #include "par-queues.h" // (A0b) ParQueues::t_side: which translating thread encodes (0 DCB, 1 ACB)
 #include "time-census.h"
 #include "tej-coser-sonda.h" // (tej-coser: sonda de llamadas por hilo, KYTY_TEJ=3)
+#include "tej-repro.h"       // (tej-repro: captura y reproduccion en sombra, KYTY_TEJ=3)
 
 #include <array>
 #include <atomic>
@@ -334,6 +335,127 @@ void InvalidateRawState() {
 thread_local uint64_t g_work_calls    = 0;
 thread_local uint64_t g_writing_calls = 0;
 thread_local uint64_t g_packets       = 0;
+// (tej-repro) vkCmdPushDescriptorSet(KHR): VkWriteDescriptorSet lleva punteros segun el tipo; se capturan sus datos
+// (cada write: binding, elemento, cuenta, tipo y por descriptor sampler/vista/layout, buffer/offset/rango o vista texel).
+void TejPushDescriptors(bool capture, uint32_t id, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t set,
+                        uint32_t count, const VkWriteDescriptorSet* writes) {
+    using TejRepro::W;
+    TejRepro::Rec r(id, TejRepro::CSet, capture);
+    r.V(W(point), false), r.V(W(layout), true), r.V(W(set), false), r.V(W(count), false);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& w = writes[i];
+        if (w.pNext != nullptr) r.bad = true;
+        r.V(W(w.dstBinding), false), r.V(W(w.dstArrayElement), false), r.V(W(w.descriptorCount), false);
+        r.V(W(w.descriptorType), false);
+        for (uint32_t j = 0; j < w.descriptorCount; ++j) {
+            switch (w.descriptorType) {
+                case VK_DESCRIPTOR_TYPE_SAMPLER:
+                case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                    if (w.pImageInfo == nullptr) { r.bad = true; r.V(0, false), r.V(0, false), r.V(0, false); break; }
+                    r.V(W(w.pImageInfo[j].sampler), true), r.V(W(w.pImageInfo[j].imageView), true);
+                    r.V(W(w.pImageInfo[j].imageLayout), false);
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                    if (w.pBufferInfo == nullptr) { r.bad = true; r.V(0, false), r.V(0, false), r.V(0, false); break; }
+                    r.V(W(w.pBufferInfo[j].buffer), true), r.V(W(w.pBufferInfo[j].offset), false);
+                    r.V(W(w.pBufferInfo[j].range), false);
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                    if (w.pTexelBufferView == nullptr) { r.bad = true; r.V(0, false); break; }
+                    r.V(W(w.pTexelBufferView[j]), true);
+                    break;
+                default: r.bad = true; r.V(0, false); break;
+            }
+        }
+    }
+    r.Done();
+}
+bool TejReplayPush(uint32_t id, const uint64_t* p, const uint64_t* e, VkCommandBuffer cb,
+                   const vk::detail::DispatchLoaderDynamic& d) {
+    struct Scratch {
+        std::vector<VkWriteDescriptorSet> writes;
+        std::vector<VkDescriptorImageInfo> images;
+        std::vector<VkDescriptorBufferInfo> buffers;
+        std::vector<VkBufferView> views;
+        std::vector<size_t> start;
+    };
+    static thread_local Scratch s;
+    s.writes.clear(), s.images.clear(), s.buffers.clear(), s.views.clear(), s.start.clear();
+    if (e - p < 4) return false;
+    const auto point = TejRepro::From<VkPipelineBindPoint>(*p++);
+    const auto layout = TejRepro::From<VkPipelineLayout>(*p++);
+    const auto set = static_cast<uint32_t>(*p++);
+    const auto count = static_cast<uint32_t>(*p++);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (e - p < 4) return false;
+        VkWriteDescriptorSet w {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstBinding = static_cast<uint32_t>(*p++);
+        w.dstArrayElement = static_cast<uint32_t>(*p++);
+        w.descriptorCount = static_cast<uint32_t>(*p++);
+        w.descriptorType = TejRepro::From<VkDescriptorType>(*p++);
+        size_t at = 0;
+        for (uint32_t j = 0; j < w.descriptorCount; ++j) {
+            switch (w.descriptorType) {
+                case VK_DESCRIPTOR_TYPE_SAMPLER:
+                case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                    if (e - p < 3) return false;
+                    if (j == 0) at = s.images.size();
+                    s.images.push_back({TejRepro::From<VkSampler>(p[0]), TejRepro::From<VkImageView>(p[1]),
+                                        TejRepro::From<VkImageLayout>(p[2])});
+                    p += 3;
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                    if (e - p < 3) return false;
+                    if (j == 0) at = s.buffers.size();
+                    s.buffers.push_back({TejRepro::From<VkBuffer>(p[0]), p[1], p[2]});
+                    p += 3;
+                    break;
+                case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                    if (e - p < 1) return false;
+                    if (j == 0) at = s.views.size();
+                    s.views.push_back(TejRepro::From<VkBufferView>(*p++));
+                    break;
+                default: return false;
+            }
+        }
+        s.writes.push_back(w);
+        s.start.push_back(at);
+    }
+    if (p != e) return false;
+    // Punteros al final: los vectores ya no crecen.
+    for (size_t i = 0; i < s.writes.size(); ++i) {
+        auto& w = s.writes[i];
+        if (w.descriptorCount == 0) continue;
+        switch (w.descriptorType) {
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: w.pBufferInfo = s.buffers.data() + s.start[i]; break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: w.pTexelBufferView = s.views.data() + s.start[i]; break;
+            default: w.pImageInfo = s.images.data() + s.start[i]; break;
+        }
+    }
+    auto fn = id == TejCoser::Id("vkCmdPushDescriptorSet") ? d.vkCmdPushDescriptorSet : d.vkCmdPushDescriptorSetKHR;
+    if (fn == nullptr) return false;
+    fn(cb, point, layout, set, count, s.writes.data());
+    return true;
+}
 #include "local-vulkan-recording.inc"
 } // namespace
 
@@ -357,20 +479,121 @@ bool PacketsEnabled() {
 uint64_t StateEpoch() {
     return executing ? executing->state_epoch.load(std::memory_order_relaxed) : UINT64_MAX;
 }
+// (tej-repro) Replays seguros con el dispatcher de descarte (solo llaman vkCmd* por el dispatcher que reciben): los
+// registran sus sitios (draws, descriptores). Otro paquete (DLSS, hwrt) = no reproducible, y nunca se llama en sombra.
+namespace {
+std::atomic<ReplayPacket> g_tej_allowed[4] {};
+std::atomic<ReplayPacket> g_tej_owned[4] {}; // sus segmentos apuntan a un dueno: sin dueno no se capturan
+thread_local bool         t_tej_noted = false; // EnqueuePacket ya lo anoto y fallo: ReplayInline no lo repite
+bool TejAllowed(ReplayPacket replay) {
+    for (const auto& a : g_tej_allowed)
+        if (a.load(std::memory_order_relaxed) == replay) return true;
+    return false;
+}
+void TejNote(ReplayPacket replay, std::span<const Segment> segments, const std::shared_ptr<const void>& owner) {
+    if (!TejAllowed(replay) || segments.size() > 8) {
+        TejRepro::Bad(TejRepro::kPacket, TejRepro::CDraw);
+        return;
+    }
+    if (auto* c = TejRepro::t_cap) {
+        bool needs_owner = false;
+        for (const auto& a : g_tej_owned) needs_owner |= a.load(std::memory_order_relaxed) == replay;
+        if (needs_owner && (!owner || TejRepro::t_own == nullptr)) {
+            TejRepro::Bad(TejRepro::kPacket, TejRepro::CDraw);
+            return;
+        }
+        const size_t hdr = c->size();
+        c->push_back(TejRepro::kPacket);
+        c->push_back(0);
+        c->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(replay)));
+        c->push_back(segments.size());
+        for (const auto& segment : segments) {
+            c->push_back(segment.size);
+            const size_t at = c->size();
+            c->resize(at + (segment.size + 7) / 8, 0);
+            if (segment.size != 0) std::memcpy(c->data() + at, segment.data, segment.size);
+        }
+        (*c)[hdr + 1] = c->size() - hdr - 2;
+        if (owner && TejRepro::t_own) TejRepro::t_own->push_back(owner);
+    }
+    // Seguidor de estado: lo que el paquete grabara, por las funciones de descarte (nunca el driver).
+    if (TejRepro::t_acc) replay(segments, TejStubDispatch());
+}
+} // namespace
+void TejAllow(ReplayPacket replay, bool needs_owner) {
+    if (needs_owner)
+        for (auto& a : g_tej_owned) {
+            ReplayPacket none = nullptr;
+            if (a.load(std::memory_order_relaxed) == replay || a.compare_exchange_strong(none, replay)) break;
+        }
+    for (auto& a : g_tej_allowed) {
+        ReplayPacket none = nullptr;
+        if (a.load(std::memory_order_relaxed) == replay) return;
+        if (a.compare_exchange_strong(none, replay)) return;
+    }
+}
+const vk::detail::DispatchLoaderDynamic& TejStubDispatch() {
+    static const vk::detail::DispatchLoaderDynamic stub = [] {
+        auto d = original;
+        InstallTejStub(d);
+        return d;
+    }();
+    return stub;
+}
+bool TejReplay(const uint64_t* words, size_t count, VkCommandBuffer cb, const vk::detail::DispatchLoaderDynamic& d) {
+    const uint64_t* p = words;
+    const uint64_t* const e = words + count;
+    while (p != e) {
+        if (e - p < 2) return false;
+        const auto id = static_cast<uint32_t>(p[0]);
+        const uint64_t n = p[1];
+        const uint64_t* body = p + 2;
+        if (static_cast<uint64_t>(e - body) < n) return false;
+        const uint64_t* const be = body + n;
+        if (id == TejRepro::kPacket) {
+            if (n < 2 || body[1] > 8) return false;
+            const auto replay = reinterpret_cast<ReplayPacket>(static_cast<uintptr_t>(body[0]));
+            if (!TejAllowed(replay)) return false;
+            std::array<Segment, 8> segs {};
+            const auto nseg = static_cast<size_t>(body[1]);
+            const uint64_t* q = body + 2;
+            for (size_t i = 0; i < nseg; ++i) {
+                if (q >= be) return false;
+                const uint64_t bytes = *q++;
+                if (static_cast<uint64_t>(be - q) < (bytes + 7) / 8) return false;
+                segs[i] = {bytes ? static_cast<const void*>(q) : nullptr, static_cast<size_t>(bytes)};
+                q += (bytes + 7) / 8;
+            }
+            if (q != be) return false;
+            replay({segs.data(), nseg}, d);
+        } else if (id == TejCoser::Id("vkCmdPushDescriptorSetKHR") || id == TejCoser::Id("vkCmdPushDescriptorSet")) {
+            if (!TejReplayPush(id, body, be, cb, d)) return false;
+        } else {
+            const uint64_t* q = body;
+            if (!TejReplayCall(id, q, be, cb, d) || q != be) return false;
+        }
+        p = be;
+    }
+    return true;
+}
 bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner) {
     if (!PacketsEnabled() || !replay || segments.size() > 8) return false;
     for (const auto& segment : segments)
         if (segment.size && !segment.data) return false;
+    const bool noted = TejRepro::t_rec; // (tej-repro)
+    if (noted) TejNote(replay, segments, owner);
     ++g_packets;
     auto* stream = RecordingStream();
-    return stream->Enqueue([&](Writer& writer) {
+    const bool queued = stream->Enqueue([&](Writer& writer) {
         std::array<Segment, 8> copied {};
         for (size_t i = 0; i < segments.size(); ++i)
             copied[i] = {writer.Copy(segments[i].data, segments[i].size), segments[i].size};
         const auto count = segments.size();
         writer.Command([owner, copied, count, replay] { replay({copied.data(), count}, original); });
     });
+    if (!queued && noted) t_tej_noted = true; // (tej-repro) el llamador hara ReplayInline: no anotar dos veces
+    return queued;
 }
 bool DeferredSubmitEnabled() {
     return Producer() && kyty_local_vulkan_recording_mode.load(std::memory_order_relaxed) != 0 &&
@@ -408,6 +631,8 @@ void WaitDeferredSubmits() {
          done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);
 }
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments) {
+    if (t_tej_noted) t_tej_noted = false;               // (tej-repro) ya anotado por EnqueuePacket
+    else if (TejRepro::t_rec) TejNote(replay, segments, {});
     if (auto* producer = Producer()) producer->BeforeDirect();
     replay(segments, original);
 }

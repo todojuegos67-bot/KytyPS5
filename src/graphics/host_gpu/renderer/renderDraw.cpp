@@ -736,6 +736,9 @@ void Record(const Draw& draw, std::span<const vk::Buffer> vertex_buffers,
                     {static_cast<uint64_t>(item.indexCount), static_cast<uint64_t>(item.instanceCount),
                      static_cast<uint64_t>(item.firstIndex), static_cast<uint64_t>(item.firstInstance)});
         }
+    // (tej-repro, KYTY_TEJ=3) Replay solo graba por el dispatcher que recibe: reproducible en sombra.
+    static const bool tej_allowed = (LocalVulkanRecording::TejAllow(Replay), true);
+    (void)tej_allowed;
     if (!LocalVulkanRecording::EnqueuePacket(Replay, segments))
         LocalVulkanRecording::ReplayInline(Replay, segments);
 }

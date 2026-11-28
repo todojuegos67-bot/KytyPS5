@@ -6,6 +6,7 @@
 #include <span>
 
 namespace vk::detail { class DispatchLoaderDynamic; }
+struct VkCommandBuffer_T;
 
 // Vulkan command recording on a worker thread (KYTY_VULKAN_RECORDING). The
 // renderer remains the sole resource/cache owner; a producer scope transfers
@@ -34,6 +35,14 @@ bool EnqueuePacket(ReplayPacket replay, std::span<const Segment> segments,
                    std::shared_ptr<const void> owner = {});
 // Preserve order when a packet cannot fit. Does not retain any argument.
 void ReplayInline(ReplayPacket replay, std::span<const Segment> segments);
+// (tej-repro, KYTY_TEJ=3 paso A) A packet replay that records only through the dispatcher it is given (draws,
+// descriptors): it may be captured and replayed in shadow (needs_owner: its segments point into the owner, captured
+// only with it). The discard dispatcher: every vkCmd* only hashes into
+// TejRepro::t_acc (never the driver). TejReplay replays a capture (tej-repro.h format) into cb with dispatcher d;
+// false = malformed or not replayable.
+void TejAllow(ReplayPacket replay, bool needs_owner = false);
+const vk::detail::DispatchLoaderDynamic& TejStubDispatch();
+bool TejReplay(const uint64_t* words, size_t count, VkCommandBuffer_T* cb, const vk::detail::DispatchLoaderDynamic& d);
 // A packet's replay that records commands the recording does not see (a library's own: DLSS through Streamline)
 // ends the reuse of bound pipelines and dynamic state the draws' replays keep, as a direct call does.
 void InvalidateReplayState();

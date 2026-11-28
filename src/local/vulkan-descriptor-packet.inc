@@ -203,6 +203,9 @@ static bool RecordLocalDescriptors(RenderContext& context, vk::CommandBuffer com
     for (size_t i = 0; i < inputs.size(); ++i)
         segments[3 + i] = {inputs[i]->shader_data.data(), inputs[i]->shader_data.size() * sizeof(uint32_t)};
     const std::span data {segments, inputs.size() + 3};
+    // (tej-repro, KYTY_TEJ=3) ReplayLocalDescriptors solo graba por el dispatcher que recibe: reproducible en sombra.
+    static const bool tej_allowed = (LocalVulkanRecording::TejAllow(ReplayLocalDescriptors, true), true);
+    (void)tej_allowed;
     if (!LocalVulkanRecording::EnqueuePacket(ReplayLocalDescriptors, data, pipeline.local_descriptor_plan))
         LocalVulkanRecording::ReplayInline(ReplayLocalDescriptors, data);
     return true;

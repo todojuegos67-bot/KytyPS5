@@ -72,12 +72,16 @@ def generate(registry, header):
                 'vkCmdBlitImage': 40, 'vkCmdBlitImage2': 41, 'vkCmdResolveImage': 42, 'vkCmdResolveImage2': 43,
                 'vkCmdPipelineBarrier': 50, 'vkCmdPipelineBarrier2': 51}
     declarations, installs, names, deferred = [], [], [], []
+    stubs, stub_installs, tej_cases = [], [], []  # (tej-repro)
     section = header.read_text().split('class DispatchLoaderDynamic :', 1)[1].split(
         'DispatchLoaderDynamic()', 1)[0]
     for line in section.splitlines():
         if line.lstrip().startswith('#'):
             declarations.append(line.strip())
             installs.append(line.strip())
+            stubs.append(line.strip())
+            stub_installs.append(line.strip())
+            tej_cases.append(line.strip())
             continue
         match = re.match(r'\s*PFN_(vk\w+)\s+\1\s*=\s*0;', line)
         if not match: continue
@@ -137,6 +141,63 @@ def generate(registry, header):
             # (vkCmdDraw* de la ruta de paquetes, renderDraw.cpp LocalDrawRecording::Record, da los mismos Id y escalares)
             declarations.append(f'    if (TejCoser::t_on) TejCoser::Call(TejCoser::Id("{base}"), TejCoser::{probe_cls}, '
                                 '{' + ', '.join(f'static_cast<uint64_t>({n})' for n in scalars) + '});')
+        # (tej-repro, KYTY_TEJ=3 paso A) Captura de draws y sus binds (trabajador), seguidor de estado (render) y, para
+        # cada vkCmd*, un Stub_ que solo hashea (dispatcher de DESCARTE: la reproduccion en sombra nunca llega al driver).
+        if name.startswith('vkCmd') and ret == 'void':
+            rcat = None
+            if re.match(r'vkCmd(BindPipeline|BindShaders)', base): rcat = 'CPipe'
+            elif re.match(r'vkCmd(BindDescriptorSets|PushDescriptorSet|BindDescriptorBuffer|SetDescriptorBufferOffsets)', base): rcat = 'CSet'
+            elif re.match(r'vkCmdPushConstants', base): rcat = 'CPush'
+            elif re.match(r'vkCmdBind(VertexBuffers|IndexBuffer)', base): rcat = 'CVbib'
+            elif re.match(r'vkCmdSet', base) and not re.match(r'vkCmdSet(Event|Performance|Checkpoint|DeviceMask)', base): rcat = 'CDyn'
+            elif re.match(r'vkCmd(Draw|ClearAttachments)', base): rcat = 'CDraw'
+            custom_push = name in ('vkCmdPushDescriptorSetKHR', 'vkCmdPushDescriptorSet')
+            rparts, rok = [], rcat is not None and len(params) > 0 and params[0].findtext('type') == 'VkCommandBuffer'
+            for p in params[1:] if rok else []:
+                n, t, d = p.findtext('name'), p.findtext('type'), decl(p)
+                tt = types.get(t)
+                is_handle = tt is not None and tt.get('category') == 'handle'
+                if '*' not in d and '[' not in d:
+                    if tt is not None and tt.get('category') in ('struct', 'union'): rok = False; break
+                    rparts.append(('v', n, t, is_handle, None))
+                    continue
+                size = p.get('len')
+                array = re.search(r'\[(\d+)\]', d)
+                if array: size = array[1]
+                if '**' in d or not d.startswith('const ') or size is None or not (size.isdigit() or size in pnames):
+                    rok = False; break
+                if t == 'void': nbytes = f'static_cast<size_t>({size})'
+                elif flat(t): nbytes = f'static_cast<size_t>({size}) * sizeof({t})'
+                else: rok = False; break
+                rparts.append(('a', n, t, is_handle, nbytes))
+            def rec_body(capture):
+                out = [f'TejRepro::Rec r_(TejCoser::Id("{name}"), TejRepro::{rcat}, {capture});']
+                for kind, n, t, h, nbytes in rparts:
+                    hv = 'true' if h else 'false'
+                    out.append(f'r_.V(TejRepro::W({n}), {hv});' if kind == 'v' else f'r_.A({n}, {nbytes}, {hv});')
+                out.append('r_.Done();')
+                return ' '.join(out)
+            push_args = ', '.join(p.findtext('name') for p in params[1:])
+            if custom_push:
+                declarations.append(f'    if (TejRepro::t_rec) TejPushDescriptors(true, TejCoser::Id("{name}"), {push_args});')
+                stub_body = f'TejPushDescriptors(false, TejCoser::Id("{name}"), {push_args});'
+            elif rcat is not None and rok:
+                declarations.append(f'    if (TejRepro::t_rec) {{ {rec_body("true")} }}')
+                stub_body = rec_body('false')
+                dec = []
+                for i, (kind, n, t, h, nbytes) in enumerate(rparts):
+                    dec.append(f'const auto a{i} = TejRepro::From<{t}>(*p++);' if kind == 'v'
+                               else f'const auto* a{i} = TejRepro::Arr<{t}>(p, e);')
+                call = ', '.join(['cb'] + [f'a{i}' for i in range(len(rparts))])
+                tej_cases.append(f'case TejCoser::Id("{name}"): {{ if (e - p < {sum(1 for r in rparts)}) return false; '
+                                 f'{" ".join(dec)} if (p > e) return false; d.{name}({call}); return true; }}')
+            elif rcat is not None:
+                declarations.append(f'    if (TejRepro::t_rec) TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat});')
+                stub_body = f'TejRepro::Bad(TejCoser::Id("{name}"), TejRepro::{rcat});'
+            else:
+                stub_body = ''
+            stubs.append(f'static VKAPI_ATTR void VKAPI_CALL Stub_{name}({", ".join(decl(p) for p in params)}) {{ {stub_body} }}')
+            stub_installs.append(f'stub.{name} = Stub_{name};')
         # Commands that do GPU work or synchronize: unchanged between two barriers = none in between.
         if re.match(r'vkCmd(Draw|Dispatch|Copy|Fill|Clear|Blit|Resolve|UpdateBuffer|BeginRendering|PipelineBarrier|WriteTimestamp|ExecuteCommands)', name):
             declarations.append('    ++g_work_calls;')
@@ -176,7 +237,13 @@ def generate(registry, header):
     return ('// Generated; edit generate-vulkan-recording.py, not this file.\n' +
             '\n'.join(declarations) + '\nvoid InstallDispatch() {\n' +
             'auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;\noriginal = dispatcher;\n' +
-            '\n'.join(installs) + '\n}\n'), names, deferred
+            '\n'.join(installs) + '\n}\n' +
+            '// (tej-repro) Dispatcher de descarte y reproduccion de una llamada capturada.\n' +
+            '\n'.join(stubs) + '\nvoid InstallTejStub(vk::detail::DispatchLoaderDynamic& stub) {\n' +
+            '\n'.join(stub_installs) + '\n}\n' +
+            'bool TejReplayCall(uint32_t id, const uint64_t*& p, const uint64_t* e, VkCommandBuffer cb, '
+            'const vk::detail::DispatchLoaderDynamic& d) {\nswitch (id) {\n' +
+            '\n'.join(tej_cases) + '\ndefault: return false;\n}\n}\n'), names, deferred
 
 
 if __name__ == '__main__':
