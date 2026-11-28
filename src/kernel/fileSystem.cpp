@@ -492,7 +492,7 @@ bool IntroMovieBlocked(const char* path) {
 }
 
 int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
-	Golpes::InstallOnce(); // (golpes) solo con KYTY_TECHO=1: contador [golpes]
+	Golpes::InstallOnce(); // (golpes) detector [golpes] (KYTY_GOLPES=0 lo apaga)
 	F0Measure::WaitScope f0w_(8, KYTY_F0_RET()); // (esperas: the game thread's file call, KYTY_ESPERAS)
 	PRINT_NAME();
 	const Tiron4::FileScope tiron4_scope(true); // (tiron4: ms in the guest's file calls)
