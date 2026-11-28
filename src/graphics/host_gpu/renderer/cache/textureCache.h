@@ -117,6 +117,12 @@ public:
 	[[nodiscard]] uint64_t EraseEpoch() const { return m_erase_epoch.load(std::memory_order_acquire); }
 	// Only reuses discovery. FindTexture still refreshes contents and selects the current view.
 	[[nodiscard]] bool TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch);
+	// (tej-libre) TryReuseSampledImage de un hilo de la sombra sin m_lock (KYTY_TEJ_LIBRE=1): 1 si/0 no, -1 = no se pudo
+	// probar sin cerrojo (el llamador hace el camino normal).
+	[[nodiscard]] int TryReuseSampledImageLibre(ImageId id, const ImageDesc& desc, uint64_t& epoch);
+	// (tej-libre) RegistrationsSince(address, size, epoch) contestado con el anillo m_reg_ring a la pagina de los sellos
+	// (ImageEpochTable::kPageBits), sin m_lock. `known` false: el anillo no llega o se reescribia.
+	[[nodiscard]] bool RingRegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const;
 	// TryReuseSampledImage without the resolution-epoch proof, for caches that must
 	// survive image registrations elsewhere (native XPR records): the owner is
 	// still registered, not being rebound, and has the same backing and resources.

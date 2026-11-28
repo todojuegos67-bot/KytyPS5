@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <immintrin.h>
 #include <mutex>
 #include <shared_mutex>
@@ -30,11 +31,21 @@ enum C : uint32_t {
 	TouchSame,   // GestorMem::Tocar del render evitados (ya tenia ese fotograma: sin escritura)
 	BcLookup,    // lookups de BufferCache de la sombra contados en su banco (antes fetch_add en una linea global)
 	TrackLock,   // QUEDAN: cerrojos TrackingSpinLock (textura / regiones) tomados por la sombra
+	// (tej-libre, KYTY_TEJ_LIBRE=1) TryReuseSampledImage de la sombra sin m_lock: tomados y vueltas al cerrojo por motivo.
+	LibreHit,     // contestado sin cerrojo (solo lecturas de atomicos / slots estables)
+	LibreFbEpoch, // reserva: la epoca de resolucion se movio y el anillo de altas/bajas no lo cubre (o modo paginas apagado)
+	LibreFbRace,  // reserva: el render borro o registro mientras se leia (se repite con el cerrojo)
+	LibreFbSpec,  // reserva: sin Spec::Current (el camino normal escribe frame_accessed_last)
+	// QUEDAN por sitio (de TrackLock): quien tomo el cerrojo.
+	SiteReuse, SiteFindImage, SiteFindTexture, SiteOther,
 	NC
 };
 inline constexpr const char* Names[NC] = {"catalogo sin escritura", "catalogo reserva", "catalogo: render espero lectores",
                                           "Tocar sombra", "Tocar render repetido", "lookups buffer (banco)",
-                                          "QUEDAN cerrojos de seguimiento de la sombra"};
+                                          "QUEDAN cerrojos de seguimiento de la sombra",
+                                          "libre: reuse sin cerrojo", "libre reserva: epoca", "libre reserva: carrera",
+                                          "libre reserva: sin spec", "QUEDAN en TryReuse", "QUEDAN en FindImage",
+                                          "QUEDAN en FindTexture", "QUEDAN en otros"};
 struct alignas(64) Bank {
 	std::atomic<uint64_t> c[NC] {};
 };
@@ -47,6 +58,29 @@ inline std::atomic<uint32_t> g_next_bank {0};
 }
 // Hilo de la sombra (lector y trabajadores): lo pone tej.h, como TejLag::t_shadow (aqui sin depender de tej-lag.h).
 inline thread_local bool t_shadow = false;
+// (tej-libre) Sitio que toma los cerrojos de seguimiento en la sombra (solo se escribe si t_shadow: TLS del hilo).
+enum Site : uint8_t { SReuse, SFindImage, SFindTexture, SOther };
+inline thread_local uint8_t t_site = SOther;
+struct SiteScope {
+	uint8_t prev;
+	bool    on;
+	explicit SiteScope(Site s): prev(t_site), on(t_shadow) {
+		if (on) t_site = s;
+	}
+	~SiteScope() {
+		if (on) t_site = prev;
+	}
+};
+// KYTY_TEJ_LIBRE=1: la sombra contesta TryReuseSampledImage sin m_lock (textureCache.cpp). Por defecto 0.
+[[nodiscard]] inline bool Libre() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_TEJ_LIBRE");
+		const bool  r = v != nullptr && v[0] == '1';
+		std::printf("[tej] libre: %s (KYTY_TEJ_LIBRE)\n", r ? "encendido" : "apagado");
+		return r;
+	}();
+	return on;
+}
 // Contar lo del render (TouchSame) solo con KYTY_TEJ y KYTY_TECHO=1 (lo pone tej.h): sin ellos ni un acceso de mas.
 inline std::atomic<bool> g_count_touch {false};
 inline void Add(C i, uint64_t v = 1) {

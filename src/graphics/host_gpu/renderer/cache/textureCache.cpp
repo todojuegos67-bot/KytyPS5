@@ -4977,6 +4977,7 @@ void TextureCache::HoldLayers(ImageInfo& info, uint32_t& first) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, bool may_fail) {
+	const TejLinea::SiteScope site(TejLinea::SFindImage);
 	size_t         slow_candidates = 0;
 	SlowLog::Scope slow([&](double ms) {
 		std::printf("SLOW FindImage %.1f ms addr=0x%llx size=0x%llx type=%u fmt=%u %ux%ux%u levels=%u layers=%u "
@@ -5318,7 +5319,67 @@ bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested, uint6
 	return true;
 }
 
+bool TextureCache::RingRegistrationsSince(uint64_t address, uint64_t size, uint64_t epoch, bool& known) const {
+	const uint64_t now = m_resolution_epoch.load(std::memory_order_acquire);
+	known              = now <= epoch || now - epoch < RegLogN;
+	if (!known) return true;
+	if (now <= epoch) return false;
+	constexpr uint64_t pg = uint64_t {1} << ImageEpochTable::kPageBits, top = uint64_t {1} << 63;
+	const uint64_t     b  = address & ~(pg - 1), en = (address + size + pg - 1) & ~(pg - 1);
+	for (uint64_t e = epoch + 1; e <= now; ++e) {
+		const auto& slot = m_reg_ring[e % RegLogN];
+		if (slot.epoch.load(std::memory_order_acquire) != e) return known = false, true;
+		const uint64_t b0 = slot.begin.load(std::memory_order_relaxed), e0 = slot.end.load(std::memory_order_relaxed) & ~top;
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (slot.epoch.load(std::memory_order_relaxed) != e) return known = false, true;
+		if ((b0 & ~(pg - 1)) < en && b < ((e0 + pg - 1) & ~(pg - 1))) return true;
+	}
+	return false;
+}
+
+// (tej-libre) Lo mismo que TryReuseSampledImage, sin m_lock y sin escribir nada compartido: solo para hilos de la sombra
+// (su resultado se tira). Lee atomicos y el slot (SlotVector: trozos que no se mueven; el objeto solo se destruye en
+// EraseRetired, que marca alive=false ANTES de destruirlo): tras leer, la liveness y las dos epocas iguales = lo leido
+// no estaba a medio borrar ni a medio registrar; si no, -1 y el llamador lo repite con el cerrojo.
+int TextureCache::TryReuseSampledImageLibre(ImageId id, const ImageDesc& desc, uint64_t& epoch) {
+	auto* spec = Spec::Current();
+	if (spec == nullptr) return TejLinea::Add(TejLinea::LibreFbSpec), -1;
+	const uint64_t erase0  = m_erase_epoch.load(std::memory_order_acquire);
+	const uint64_t current = m_resolution_epoch.load(std::memory_order_acquire);
+	bool           epoch_holds = epoch == current;
+	if (!epoch_holds && kyty_local_texture_resolve_pages_mode.load(std::memory_order_relaxed) != 0 && epoch != 0) {
+		bool       known = false;
+		const bool over  = RingRegistrationsSince(desc.info.data.address, desc.info.data.size, epoch, known);
+		if (!known) return TejLinea::Add(TejLinea::LibreFbEpoch), -1;
+		epoch_holds = !over;
+	}
+	if (m_scheduler.Current().IsInvalid() || epoch == 0 || !epoch_holds || desc.type != BindingType::Texture ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() || desc.info.HasStencil() ||
+	    desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return TejLinea::Add(TejLinea::LibreHit), 0;
+	}
+	auto*      image = m_slot_images.try_get(id);
+	const bool ok    = image != nullptr && image->registered && !image->depth_id && !image->binding.needs_rebind &&
+	                !image->info.IsDepth() && !image->info.HasMetadata() && !image->info.HasStencil() &&
+	                SameBacking(image->info, desc.info, true) && image->info.resources == desc.info.resources;
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if ((image != nullptr && !m_slot_images.is_allocated(id)) || m_erase_epoch.load(std::memory_order_acquire) != erase0 ||
+	    m_resolution_epoch.load(std::memory_order_acquire) != current) {
+		return TejLinea::Add(TejLinea::LibreFbRace), -1;
+	}
+	TejLinea::Add(TejLinea::LibreHit);
+	if (!ok) return 0;
+	auto& touched = spec->touched_images; // (TouchImage con Spec::Current: solo la lista de la especulacion)
+	if (touched.empty() || touched.back().first != image) touched.emplace_back(image, image->serial);
+	epoch = current;
+	return 1;
+}
+
 bool TextureCache::TryReuseSampledImage(ImageId id, const ImageDesc& desc, uint64_t& epoch) {
+	if (TejLinea::t_shadow && TejLinea::Libre()) { // (tej-libre: solo hilos de la sombra)
+		if (const int r = TryReuseSampledImageLibre(id, desc, epoch); r >= 0) return r == 1;
+	}
+	const TejLinea::SiteScope site(TejLinea::SReuse);
 	std::scoped_lock lock {m_lock};
 	const auto current = m_resolution_epoch.load(std::memory_order_relaxed);
 	const bool epoch_holds =
@@ -5425,6 +5486,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	const TejLinea::SiteScope site(TejLinea::SFindTexture);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	SlowLog::Scope   slow([&](double ms) {
