@@ -9,6 +9,7 @@
 #include "local/techo-escena.h"
 #include "local/bloques-rapido.h"
 #include "local/regs-rapido.h"
+#include "local/otros-rapido.h"
 #include "local/normal-why.h"
 #include "local/ds-censo-dcb.h"
 #include "local/ds-censo-escena.h"
@@ -217,6 +218,7 @@ inline void Report(int64_t flip_ns, int64_t idle_ns_total) {
 		TechoEscena::Window(busy, n * 1e3 / wall_ms, n, keep);    // (techo-escena, solo prueba)
 		BloquesRapido::Window(busy, n * 1e3 / wall_ms, n, keep);  // (bloques-rapido)
 		RegsRapido::Window(busy, n, keep);                      // (regs-rapido, KYTY_REGS_RAPIDO)
+		OtrosRapido::Window(busy, n, keep);                     // (otros-rapido, KYTY_OTROS_RAPIDO)
 		NormalWhy::Report(n);                                // (vg1, porque los draws van al camino normal)
 		TechoFaltas::Report(n, ms_cyc); // (techo-faltas: the game threads' faults, a line beside this one)
 		if (keep && flip_ns - last_table >= 30'000'000'000ll) {

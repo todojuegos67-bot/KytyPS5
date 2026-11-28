@@ -65,6 +65,7 @@
 #include "local/normal-why.h" // (vg1)
 #include "local/techo-escena.h" // (techo-escena, KYTY_TECHO_ESCENA: solo prueba)
 #include "local/regs-rapido.h" // (regs-rapido, KYTY_REGS_RAPIDO)
+#include "local/otros-rapido.h" // (otros-rapido, KYTY_OTROS_RAPIDO)
 #include "f5p1-techo.h" // (f5p1 techo, KYTY_F5P1_TECHO)
 #include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "blackbox-run.h"
@@ -2271,7 +2272,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		pm4_clock.Next();
 		G1::WalkStep(); // (g1 NP1, KYTY_G1_PROBE: a draw packet's walk by stretch; one relaxed load when off)
 		if (spec != nullptr && spec->refused != nullptr) return refuse(spec->refused);
-		if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
+		// (otros-rapido, KYTY_OTROS_RAPIDO) Nothing for the preamble to do: it would return at once, so nothing waits
+		// and the look-ahead below is not needed (pre_skips back to 0, as after preamble()).
+		const bool otros_idle = OtrosRapido::Mode() != 0 && g_gpu_state != nullptr && spec == nullptr && Juego3::Mode() == 0 && !g_gpu_state->HasPendingCommands() &&
+		                        (preamble_cache == nullptr || !preamble_cache->FeedbackPending());
+		if (OtrosRapido::Mode() != 0 && g_gpu_state != nullptr && spec == nullptr) OtrosRapido::Note(otros_idle); // (KYTY_TECHO only)
+		if (otros_idle && OtrosRapido::Active()) {
+			pre_skips = 0;
+		} else if (g_gpu_state != nullptr && spec == nullptr) { // (a speculation's thread runs no guest commands)
 			bool can_wait = false;
 			if (otros2_mode != 0 && pre_skips < Otros2::MaxSkips) {
 				const auto& next = execution.m_buffer_stack.back();
