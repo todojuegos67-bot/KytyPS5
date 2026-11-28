@@ -21,6 +21,7 @@
 #include <cstdlib>
 
 #include "local/techo.h"
+#include "local/gancho2.h"
 
 namespace DiiRapido {
 
@@ -91,6 +92,36 @@ inline void Window(double busy_ms, double fps, double frames, bool keep) {
 	            fb / frames);
 	if (m == 2)
 		std::printf(" | ventanas A %.0f B %.0f | delta interpolado B-A %+.3f ms/fot (negativo = ahorro)", cnt[0], cnt[1], delta);
+	// Por que acaba cada racha (Gancho2::g_reason, lo anota TryNativeXprDraws con la via encendida), por fotograma;
+	// el paquete que corta el hueco (opcode; 256+R de un NOP; 512 marca 'hu' de otro id) y el registro SH distinto.
+	{
+		static uint64_t last_reason[Gancho2::Reasons] {}, last_end[513] {}, last_diff[0x300] {};
+		std::printf(" | motivos");
+		for (uint32_t r = Gancho2::REndMax; r < Gancho2::Reasons; ++r) {
+			const uint64_t d = Gancho2::g_reason[r] - last_reason[r];
+			last_reason[r]   = Gancho2::g_reason[r];
+			if (d != 0) std::printf(" %s=%.1f", Gancho2::ReasonNames[r], static_cast<double>(d) / frames);
+		}
+		const auto top = [&](const uint64_t* now, uint64_t* last, uint32_t n, const char* name, bool sh) {
+			uint32_t best[4] = {0, 0, 0, 0};
+			uint64_t val[4]  = {0, 0, 0, 0};
+			for (uint32_t i = 0; i < n; ++i) {
+				const uint64_t d = now[i] - last[i];
+				last[i]          = now[i];
+				for (uint32_t j = 0; j < 4; ++j)
+					if (d > val[j]) {
+						for (uint32_t q = 3; q > j; --q) val[q] = val[q - 1], best[q] = best[q - 1];
+						val[j] = d, best[j] = i;
+						break;
+					}
+			}
+			std::printf(" | %s", name);
+			for (uint32_t j = 0; j < 4 && val[j] != 0; ++j)
+				std::printf(sh ? " 0x%x=%.1f" : " %u=%.1f", best[j], static_cast<double>(val[j]) / frames);
+		};
+		top(Gancho2::g_end_packet, last_end, 513, "corta_paquete(op|256+R|512)", false);
+		top(Gancho2::g_diff_offset, last_diff, 0x300, "sh_distinto", true);
+	}
 	std::printf("\n");
 	std::fflush(stdout);
 	if (m == 2) g_ab_on.store(!was, std::memory_order_relaxed);
