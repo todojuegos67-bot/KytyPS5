@@ -41,7 +41,6 @@
 #include "live-census.h"
 #include "otros2.h" // (otros2)
 #include "gancho2.h" // (gancho2)
-#include "local/dii-rapido.h" // (dii-rapido, KYTY_DII_RAPIDO)
 #include "port1.h" // (port1, KYTY_PORT1)
 #include "port2.h" // (port2, KYTY_PORT2)
 #include "f0-measure.h" // (f0, KYTY_F0)
@@ -3307,11 +3306,6 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 	using G2         = Gancho2::Reason;
 	const auto mode2 = Gancho2::Mode();
 	bool       gap_runs = false;
-	// (dii-rapido, KYTY_DII_RAPIDO; local/dii-rapido.h) The same run over no-op gaps, its own switch and A/B window.
-	const bool dii_rapido = mode2 == 0 && DiiRapido::Mode() != 0;
-	if (dii_rapido)
-		gap_runs = DiiRapido::Active() && Spec::Current() == nullptr && !m_state_only && m_chunk_every == 0 &&
-		           m_stop_at == nullptr && !XprCapture::Enabled();
 	if (mode2 != 0) {
 		G2 off = G2::Reasons;
 		if (!Gancho2::Active()) off = G2::ROffWindow;
@@ -3490,13 +3484,11 @@ uint32_t CommandProcessor::TryNativeXprDraws(std::span<const uint32_t> packets, 
 		gap_skipped += gap_packets;
 	}
 	if (end != G2::Reasons && gap_runs) Gancho2::Note(end);
-	if (dii_rapido) DiiRapido::NoteRun(0, gap_runs && end != G2::REndMax && end != G2::REndBuffer && end != G2::REndPacket);
 	Gancho2::t_last_draws = count;
 	const auto drawn = [&] {
 		Gancho2::g_draws += gap_draws;
 		Gancho2::g_packets += gap_skipped;
 		Gancho2::g_reason[G2::RGapsTaken] += gap_draws;
-		if (dii_rapido && gap_draws != 0) DiiRapido::g_taken.fetch_add(gap_draws, std::memory_order_relaxed);
 		return consumed;
 	};
 	CheckBuffer();

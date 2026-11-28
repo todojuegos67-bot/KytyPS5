@@ -11,7 +11,6 @@
 // HS 0x10c-0x12b) and the compute space (0x200+) never dirty it; dispatches,
 // synchronisation, index state and indirect bases never do either.
 #include "graphics/guest_gpu/pm4.h"
-#include "local/do2-rapido.h" // (do2-rapido: t_seq)
 
 #include <array>
 #include <cstdint>
@@ -105,11 +104,6 @@ inline void Invalidate() {
 // Every packet the command processor is about to execute.
 inline void ObservePacket(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw, bool predicated_skip) {
 	auto& s = g_shadow;
-	// (do2-rapido) every packet that is not only registers (draws included) moves the sequence.
-	if (const uint32_t r = opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet[0]) : 0u; predicated_skip || !Do2Rapido::RegisterOnly(opcode, r)) {
-		++Do2Rapido::t_seq;
-		Do2Rapido::NoteBump(opcode == Pm4::IT_NOP ? 0x100u | r : opcode & 0xffu);
-	}
 	if (predicated_skip) {
 		s.dirty       = true;
 		s.key_changes = 7;
