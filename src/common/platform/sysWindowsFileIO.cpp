@@ -11,6 +11,7 @@
 
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
+#include "local/ram-dueno.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -96,8 +97,13 @@ static bool CacheCeroRead(void* data, uint32_t size, sys_file_t& f, DWORD* got) 
 	// (ram-emu) The 4 MiB bounce buffer is freed when its thread ends (before: a raw thread_local pointer, never freed:
 	// 4 MiB of private RAM left behind by every reader thread that ended).
 	struct BounceBuffer {
-		uint8_t* data = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		uint8_t* data = [] {
+			auto* d = static_cast<uint8_t*>(VirtualAlloc(nullptr, Bounce, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+			RamDueno::Add(reinterpret_cast<uint64_t>(d), Bounce, "emu:lector-ficheros");
+			return d;
+		}();
 		~BounceBuffer() {
+			RamDueno::Remove(reinterpret_cast<uint64_t>(data));
 			if (data != nullptr) VirtualFree(data, 0, MEM_RELEASE);
 		}
 	};

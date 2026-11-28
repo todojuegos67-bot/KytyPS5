@@ -14,6 +14,7 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 #include "local/mem-guard.h"
+#include "local/ram-dueno.h"
 
 #include <utility>
 
@@ -87,6 +88,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 			return SysVirtualAllocAligned(address, size, mode, 1);
 		}
 	}
+	RamDueno::Add(ptr, size, "emu:VirtualMemory::Alloc");
 	return ptr;
 }
 
@@ -165,6 +167,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 			return SysVirtualAllocAligned(address, size, mode, alignment << 1u);
 		}
 	}
+	RamDueno::Add(ptr, size, "emu:VirtualMemory::Alloc");
 	return ptr;
 }
 
@@ -187,6 +190,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 		return false;
 	}
 
+	RamDueno::Add(address, size, "emu:VirtualMemory::AllocFixed");
 	return true;
 }
 
@@ -224,6 +228,7 @@ uint64_t SysVirtualReserve(uint64_t address, uint64_t size) {
 			return SysVirtualReserveAligned(address, size, 1);
 		}
 	}
+	RamDueno::Add(ptr, size, "emu:VirtualMemory::Reserve");
 	return ptr;
 }
 
@@ -284,6 +289,7 @@ uint64_t SysVirtualReserveAligned(uint64_t address, uint64_t size, uint64_t alig
 			return SysVirtualReserveAligned(address, size, alignment << 1u);
 		}
 	}
+	RamDueno::Add(ptr, size, "emu:VirtualMemory::Reserve");
 	return ptr;
 }
 
@@ -304,6 +310,7 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 		return false;
 	}
 
+	RamDueno::Add(address, size, "emu:VirtualMemory::ReserveFixed");
 	return true;
 }
 
@@ -318,6 +325,7 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 }
 
 bool SysVirtualFree(uint64_t address) {
+	RamDueno::Remove(address);
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE) ==
 	    0) {
 		printf("VirtualFree() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));

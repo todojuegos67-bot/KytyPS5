@@ -7,6 +7,7 @@
 // the emulator's and where, so a cut is decided with data. Cost: one VirtualQuery walk and K32QueryWorkingSetEx (the
 // emulator's pages one sample per 64 KiB, the game's one per MiB), on its own lowest-priority thread, read-only.
 #include <windows.h>
+#include "ram-dueno.h"
 #include <psapi.h>
 #include <algorithm>
 #include <chrono>
@@ -149,7 +150,7 @@ inline void Line(std::unordered_map<uint64_t, uint64_t>* last_ram) {
 	std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(k), top.end(),
 	                  [&](uint32_t x, uint32_t y) { return allocs[x].ram > allocs[y].ram; });
 	constexpr double MiB = 1024.0 * 1024.0;
-	char             text[1600];
+	char             text[2400];
 	int              used = std::snprintf(
         text, sizeof(text),
         "[ram-emu] 5 s, MiB en RAM (commit): juego %.0f (%.0f) | EMULADOR %.0f (%.0f) = monton C++ %.0f + codigo JIT/ejecutable %.0f "
@@ -165,8 +166,9 @@ inline void Line(std::unordered_map<uint64_t, uint64_t>* last_ram) {
 		const Alloc&   a    = allocs[top[i]];
 		const auto     prev = last_ram->find(a.base);
 		const long long d   = prev == last_ram->end() ? 0 : (static_cast<long long>(a.ram) - static_cast<long long>(prev->second)) / (1 << 20);
-		used += std::snprintf(text + used, sizeof(text) - used, " 0x%llx=%.0f/%.0f%s%s%+lld", static_cast<unsigned long long>(a.base),
-		                      a.ram / MiB, a.commit / MiB, a.heap ? "(monton)" : a.exec ? "(exec)" : "",
+		const char* owner = a.heap ? "monton" : a.exec ? "exec" : RamDueno::Find(a.base);
+		used += std::snprintf(text + used, sizeof(text) - used, " 0x%llx=%.0f/%.0f[%s]%s%+lld", static_cast<unsigned long long>(a.base),
+		                      a.ram / MiB, a.commit / MiB, owner != nullptr ? owner : "desconocido (driver?)",
 		                      prev == last_ram->end() ? "(nuevo)" : "", d);
 	}
 	last_ram->swap(now);
