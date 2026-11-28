@@ -4683,6 +4683,22 @@ void LauncherImage(Settings& s) {
 	BoxEnd();
 }
 
+// [volumen-general] Siempre visible en el lanzador, justo debajo de la calidad grafica: barra 50-300 %.
+void LauncherVolume(Settings& s) {
+	BoxBegin("Sonido");
+	{
+		const float y = RowY();
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(5)});
+		ImGui::TextUnformatted(I18n::T("Volumen general"));
+		ImGui::SetCursorScreenPos({g_lbox.at.x + U(150), y + U(3)});
+		ImGui::SetNextItemWidth(U(256));
+		ImGui::SliderFloat("##volumen", &s.volume, 50.0f, 300.0f, "%.0f %%");
+		Tip("Volumen de todo el juego. 100 % = sin cambios; hasta 300 % (+9.5 dB) con limitador para que no sature.");
+		RowEnd(y);
+	}
+	BoxEnd();
+}
+
 void LauncherQuality(Settings& s) {
 	BoxBegin("Calidad gráfica");
 	LChoice("Texturas", kTextureReduce, kTextureReduceCount, s.texture_reduce, "Tamaño de las texturas: Medio = la mitad, Bajo = un cuarto. Lo que más VRAM ahorra.");
@@ -5026,16 +5042,6 @@ void LauncherControls(Settings& s) {
 		ImGui::SliderFloat("##rumble", &s.rumble_gain, 1.0f, 8.0f, I18n::T("Fuerza %.1f"));
 		Tip("Fuerza de la vibración del mando.");
 		ImGui::EndDisabled();
-		RowEnd(y);
-	}
-	{ // [volumen-general]
-		const float y = RowY();
-		ImGui::SetCursorScreenPos({g_lbox.at.x + U(12), y + U(5)});
-		ImGui::TextUnformatted(I18n::T("Volumen general"));
-		ImGui::SetCursorScreenPos({g_lbox.at.x + U(150), y + U(3)});
-		ImGui::SetNextItemWidth(U(256));
-		ImGui::SliderFloat("##volumen", &s.volume, 50.0f, 300.0f, "%.0f %%");
-		Tip("Volumen de todo el juego. 100 % = sin cambios; hasta 300 % (+9.5 dB) con limitador para que no sature.");
 		RowEnd(y);
 	}
 	{
@@ -6887,6 +6893,7 @@ void DrawLauncher(float width, float height) {
 		LauncherImage(s);
 		LauncherFrameGen(s);
 		LauncherQuality(s);
+		LauncherVolume(s);
 		{
 			// (ds-pc-port37) "Ajustes del juego": the emulator launcher's window, as a drop-down here.
 			g_lbox.at     = {origin.x + U(8), RowY()};
