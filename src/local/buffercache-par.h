@@ -29,7 +29,7 @@
 
 #include "local/techo.h"
 
-extern volatile std::atomic_uint32_t kyty_local_speculate_mode;
+extern "C" { extern volatile std::atomic_uint32_t kyty_local_speculate_mode; } // (fix) misma linkage C que speculation.h
 
 namespace BcPar {
 
