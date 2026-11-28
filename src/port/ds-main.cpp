@@ -24,6 +24,7 @@
 #include <shlobj.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include "local/cpu5-hibrido.h" // (cpu5-hibrido)
 #include <dxgi.h>
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
@@ -1784,6 +1785,7 @@ int main(int argc, char* argv[]) {
 		Port::SaveSettings(ini, next);
 	}
 	for (const auto& note: plan.notes) std::printf("[port] %s\n", note.c_str());
+	Cpu5::Log(); // (cpu5-hibrido) topologia P/E y decision "pocos hilos"
 
 	for (auto& [key, value]: plan.env) {
 		if ((key == "KYTY_RECORDING_CPUS" || key == "KYTY_RENDER_CPUS") && value == "auto") value = PerformanceCpus(mask);

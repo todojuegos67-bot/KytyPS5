@@ -3,6 +3,7 @@
 #include "port/ds-tables.h"
 #include "port/ds-i18n.h"
 #include "port/ds-online.h"
+#include "local/cpu5-hibrido.h" // (cpu5-hibrido)
 
 #include <algorithm>
 #include <atomic>
@@ -373,8 +374,8 @@ bool LoadSettings(const std::string& path, Settings* s) {
 		// (cpu-pocos-hilos) CPUs de 12 hilos o menos (i5/i3, portatiles): por defecto el render ayuda con las subidas
 		// y los hilos de ayuda no giran en vacio. Claves nuevas (_v2): las viejas se guardaban a 0 para todos; quien
 		// lo cambie en el lanzador conserva su eleccion.
-		const unsigned hw = std::thread::hardware_concurrency();
-		const bool     pocos = hw != 0 && hw <= 12;
+		// (cpu5-hibrido) Tambien hibridas con <=6 nucleos P (i5-13400F/14400F, 16 hilos); KYTY_HIBRIDO=0: solo hilos.
+		const bool pocos = Cpu5::Get().pocos;
 		s->perf_upload_help = pocos;
 		s->perf_spin_gate   = pocos;
 	}
@@ -2203,3 +2204,7 @@ std::vector<std::string> Optimize(const PcInfo& pc, Settings* s) {
 }
 
 } // namespace Port
+
+// (cpu5-hibrido) La deteccion de la topologia, la ultima (windows.h).
+#define CPU5_HIBRIDO_IMPL
+#include "local/cpu5-hibrido.h"
